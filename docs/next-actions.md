@@ -17,10 +17,60 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 生成)の次項目: **Window の hash partition + sort**。詳細は下記
 「2026-10-19 Window の hash 区画化」の節。
 
+2026-10-19 加筆(第40報)。統合TODO(`docs/todo.md` Phase 2 Window / UNNEST /
+生成)の次項目: **Window の spill**。詳細は下記「2026-10-19 Window の spill 形」
+の節。Window / UNNEST / 生成 の残りは `FunctionScan` / TVF のみになった。
+
 2026-10-19 加筆(第35報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-19 Window の spill 形
+
+- **[課題] window 演算子が全入力をメモリに持っていた。**
+  `WindowExecutor` は drain した全行 + 呼び出しごとの計算列を常駐させる。window
+  は区画全体を見る必要があるので、素朴には「1 区画以上」をメモリに置くことになり、
+  全表に対する `RANK` のような問い合わせでは入力サイズがそのまま上限になる。
+- **[修正] 区画単位のハッシュ分割 + 1 ファイル常駐。**
+  `WindowPlan` が `WindowMemoryPolicy{memory_budget_bytes,
+  spill_partition_count}` を持ち、`window` 実装ルールが子の行推定から
+  `WindowPolicyForRows(rows)` で選ぶ（既定 64MB ÷ 64byte/行 ≒ 104 万行）。
+  容量を超える推定のときだけ予算を渡し、executor は drain 中に PARTITION BY
+  タプルのハッシュで `SpillFile` へ振り分ける。ハッシュは
+  `detail/window_eval` の区画化と同じ `WindowPartitionKeyHash` なので、
+  「等しいキーは等しいハッシュ」が成り立ち、**区画全体が必ず 1 ファイルに
+  収まる**。後はファイルを 1 つずつ読んで `ComputeOneWindow` を回すだけ。
+  上限は入力ではなく最大ファイル（＝最悪で 1 区画）。
+- **[契約1] 順序の承諾は plan 時に降ろす。**
+  buffered 形は子の行順を保つので子の ordering claim を引き継げるが、spill 形は
+  ファイル順に出力する。実行時に spill したかどうかで claim を変えることは
+  できない（plan が先に決まる）ので、**容量を超え得る推定には予算を渡して
+  claim を落とす**。過小推定で実際に spill しなくても claim が嘘にならない側に
+  倒れる。推定が容量以下なら予算 0（buffered 固定）で従来と完全に同じ。
+- **[契約2] PARTITION BY が揃っているときだけ分割できる。**
+  ファイルは 1 つのキーで選ぶので、呼び出しごとに PARTITION BY が違うと、ある
+  呼び出しの区画が 2 ファイルに割れる。その場合は spill を諦めて buffered に
+  固定する（`WindowPlan::CallsShareOnePartitionKey`）。
+- **[落とし穴] 終端は粘着でなければならない。**
+  最初の実装は `NextChunk` の先頭で `read_offset_` を 0 に戻していたため、
+  終端の false のあとにもう一度引かれると常駐チャンクを再生していた。QUALIFY
+  経路の親が空バッチを「再試行」として引き続けるため、**行が無限に増える
+  ループ**になり、`WindowSqlCov.QualifyReferencingWindowResult` が 90 秒走って
+  spill file 枯渇で失敗した。`exhausted_` を立てて false を粘着にし、回帰
+  `WindowSpillTest.EndOfStreamIsStickyForBothShapes` を追加（再導入変異で落ちる）。
+- **[回帰] plan 側 `plan/window_shape_test.cpp`（3 件）。**
+  容量→形の選択と NaN/∞ 推定、buffered だけが子の claim を保つこと、
+  PARTITION BY 不一致で buffered に落ちること、Dump が spill 形だけを名乗ること。
+- **[回帰] executor 側 `executor/window_spill_test.cpp`（4 件）。**
+  spill と buffered が同じ行・同じ値を出すこと（順序は比較しない）、buffered が
+  入力順を保つこと、resident 上限 < 入力行数、batch がファイル境界を越えること、
+  PARTITION BY 不一致時の fallback、終端の粘着性。変異検証: 区画を order key で
+  切り直すと 2 件、全行を 1 ファイルにすると `SpillFileCount` と
+  `PeakResidentRows` が落ちる。
+- **[残りのレバー]** 1 区画が予算を超える場合の区画内 spill。frame 評価を
+  ストリーム化（ROWS frame は可能、RANGE/GROUPS は peer 境界の再計算が要る）
+  すれば、上限を「ファイル 1 つ」から「frame 1 つ」に下げられる。
 
 ## 2026-10-19 Window の hash 区画化
 

@@ -292,8 +292,14 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] オフセット（LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE）
 - [x] 累積 AGG（SUM/AVG OVER）
 - [x] 複数 window のソート共有
-- [ ] ハッシュ・パーティション + ソート（メモリ）
-- [ ] spill 付き window
+- [x] ハッシュ・パーティション + ソート（メモリ）
+- [x] spill 付き window
+      入力 drain を PARTITION BY ハッシュで `spill_partition_count` 個の
+      `SpillFile` に振り分け、1ファイルずつ常駐で評価・出力する（`WindowPlan::
+      Memory()` → `WindowExecutor::Options`）。buffered 形は入力順と ordering
+      claim を保ち、spill 形は claim を捨てる（`WindowPlan::IsOrderedBy`）。
+      PARTITION BY が呼び出し間で異なる場合は buffered に固定。演算子側の回帰は
+      `executor/window_spill_test.cpp`、plan 側は `plan/window_shape_test.cpp`。
 - [x] `QUALIFY` を Window の後段 Filter として実行
 
 ---

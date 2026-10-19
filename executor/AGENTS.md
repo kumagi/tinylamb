@@ -115,6 +115,22 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   the same way -- a hash collision cannot merge two partitions because
   `PartitionKeyEq` decides. Ordering inside each partition is a `stable_sort`
   over precomputed `order_values` with `peer_end` boundaries.
+  Two memory shapes, chosen by `WindowPlan::Memory()` and handed to
+  `WindowExecutor::Options{memory_budget_bytes, spill_partition_count}`:
+  **buffered** (budget 0, the historical shape) holds the whole input and emits
+  it in input order; **partitioned spill** drains into
+  `spill_partition_count` `SpillFile`s routed by
+  `relational_detail::WindowPartitionKeyHash` and keeps one file resident at a
+  time (the bound is one file -- i.e. the largest partition -- not one
+  partition). The routing hash is the grouping hash, so a partition is never
+  split across files. Spilling needs every call to share one PARTITION BY
+  expression list (`WindowExecutor::SharedPartitionKey`); otherwise the
+  operator stays buffered. `SpillEnabled()`, `SpillFileCount()` and
+  `PeakResidentRows()` expose the shape. End of stream is sticky
+  (`exhausted_`): a parent may keep pulling after a false return, so the
+  operator must never rewind onto its resident chunk. Tests:
+  `./build/window_spill_test` (operator) and `./build/window_shape_test` (plan,
+  in `plan/`).
 - DML/other: `insert`, `update`, `delete`, `truncate`, `merge`, `returning`,
   `values`, `generate_series`, `unnest`, `recursive_cte`, `set_operation`,
   `merge_append`, `limit`, `max1_row`, `minmax_index`, `materialize`,
@@ -137,4 +153,4 @@ Test: `./build/executor_test`, `relational_regression_test`,
 `late_materialization_join_test`, `hash_semi_reduction_test`,
 `multi_index_covering_scan_test`,
 `query_scheduler_test`, `query_memory_test`, `spill_file_test`,
-`executor_extra_test`.
+`window_spill_test`, `executor_extra_test`.

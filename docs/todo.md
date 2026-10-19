@@ -450,7 +450,35 @@ Cascades rule / cost / statistics
       `WindowSqlTest.NullAndNanPartitionKeysEachFormOneGroup`（NULL 3行が1区画・
       NaN 2行が1区画）。グループを再利用しない変異で両方が落ちる。
       既知の残り: 次項の Window spill（区画とソート状態のメモリ予算化）。
-- [ ] Windowのspillを実装する。
+- [x] Windowのspillを実装する。
+      `WindowPlan` に `WindowMemoryPolicy{memory_budget_bytes,
+      spill_partition_count}` を追加し、`window` 実装ルールが子の行推定から
+      `WindowPolicyForRows(rows)` で選ぶ（既定64MB ÷ 64byte/行 ≒ 104万行）。
+      推定が容量以下なら従来どおり **buffered**（全行常駐・入力順を保存）。
+      超えると **spill 可能**（spill-capable）: 入力の drain 時に PARTITION BY
+      タプルのハッシュで `spill_partition_count` 個の `SpillFile` へ振り分け、
+      1ファイルずつ常駐で評価・出力する。常駐は最大ファイル1つで、入力全体では
+      ない。ハッシュは `detail/window_eval` の区画化と `WindowPartitionKeyHash`
+      を共有し（一方向整合 = 等しいキーは等しいハッシュ）、区画全体が必ず
+      1ファイルに収まる。単一区画が予算を超える場合、そのファイルは常駐する
+      （上限は「区画1つ」ではなく「ファイル1つ」）。
+      **順序契約**: buffered は子の行順を保つので子の ordering claim を
+      引き継ぐが、spill 形はファイル順に出力するので claim を捨てる。claim は
+      実行時の行数を知る前に決まるため、容量を超え得る推定には予算を渡して
+      claim を落とし、過小推定でも claim が嘘にならない側にだけ倒す。
+      **分割条件**: 全 window 呼び出しの PARTITION BY 式リストが同一のときだけ
+      spill 可能。呼び出しごとに違うと、あるキーで選んだファイルが別呼び出しの
+      区画を切ってしまうので、その場合は buffered のままにする。
+      回帰: `plan/window_shape_test.cpp`（ポリシー選択・claim・分割条件・Dump）と
+      `executor/window_spill_test.cpp`（spill と buffered の行・値の一致、
+      resident 上限、batch 境界、PARTITION BY 不一致の fallback、
+      end-of-stream の粘着性 = 終端後に引き続き Next しても再送しない）。
+      「区画を order key で切り直す」変異で2件、「全行を1ファイルへ」変異で
+      `SpillFileCount`/`PeakResidentRows`、「終端で `read_offset_` を巻き戻す」
+      変異で粘着性テストが落ちることを確認（この巻き戻しは QUALIFY 経路の
+      無限ループとして実害が出た）。
+      既知の残り: 単一区画が予算を超える場合の区画内 spill（frame 評価の
+      ストリーム化が要る）。
 - [ ] `FunctionScan` / TVFを実装する。
 - [x] `GenerateSeriesExecutor` と `GENERATE_SERIES` のSQL接続を実装する。
 - [x] `GENERATE_ARRAY` のstep、型、NULL、上限を回帰テストで固定する。

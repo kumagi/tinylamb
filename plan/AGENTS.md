@@ -86,6 +86,22 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   keyed by relation-set + tag; each `Group` owns its scan filter so
   alternatives stay semantically identical; expression cap 4096 degrades
   gracefully (`Degraded`).
+- `window_plan.{hpp,cpp}` — one kWindow node, two memory shapes.
+  `WindowMemoryPolicy{memory_budget_bytes, spill_partition_count}` is the only
+  per-shape logical information: `WindowRowCapacity` turns the budget into a row
+  count and `WindowPolicyForRows(rows)` picks buffered-only (budget 0) while the
+  child estimate fits the default 64MB, the spill-capable shape above it (a NaN
+  estimate stays buffered; infinity spills). The buffered shape appends a column
+  per call to the rows the child produced, so it keeps the child's ordering
+  claim; the spill-capable shape drains the input into PARTITION BY hash spill
+  files and emits one file at a time, so `IsOrderedBy` returns false whenever
+  `SpillCapable()` — decided at plan time, before the runtime row count is
+  known, so a mis-estimate can only be conservative. `CallsShareOnePartitionKey`
+  is the safe-split condition: one row's file is chosen from that key, so calls
+  with different PARTITION BY lists would cut each other's partitions and stay
+  buffered. `Dump` names the shape only for the spill form. Test:
+  `./build/window_shape_test`; the operator half is
+  `./build/window_spill_test` (in `executor/`).
 - `multi_index_covering_scan_plan.{hpp,cpp}` — the covering case that no
   SINGLE index can serve: two or more indexes whose stored columns (key +
   INCLUDE, `Index::CoveredColumns()`) together cover every column the
@@ -152,7 +168,7 @@ is a compat include.
 Test: `./build/plan_test`, `optimizer_test`, `cascades_test`,
 `late_materialization_join_plan_test`, `plan_extra_test`,
 `full_scan_plan_test`, `collation_property_test`, `sort_shape_test`,
-`aggregate_shape_test`.
+`aggregate_shape_test`, `window_shape_test`.
 
 Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 46 physical
 registrations. Exploration retries dependent parents after a child changes.

@@ -55,6 +55,21 @@
 
 namespace tinylamb::relational_detail {
 
+// Hash of a PARTITION BY key tuple. It only has to agree with the partition
+// equality in the safe direction -- equal tuples must hash equally -- which is
+// exactly the canonicalization std::hash<Value> already applies: NULL is one
+// pattern, NaN folds to one pattern, and interval-shaped text hashes as the
+// interval it renders. A collision (an INT64 and a UINT64 sharing bits, say) is
+// harmless because the equality still decides.
+size_t WindowPartitionKeyHash(const std::vector<Value>& key) {
+  uint64_t hash = 0x9e3779b97f4a7c15ULL;
+  for (const Value& value : key) {
+    hash ^= std::hash<Value>()(value) + 0x9e3779b97f4a7c15ULL + (hash << 6) +
+            (hash >> 2);
+  }
+  return static_cast<size_t>(hash);
+}
+
 namespace {
 using FrameBounds = std::pair<size_t, size_t>;
 }  // namespace
@@ -247,20 +262,11 @@ bool ValuesEqual(const Value& a, const Value& b) {
   }
 }
 
-// Hash of a PARTITION BY key tuple. It only has to agree with ValuesEqual in
-// the safe direction -- equal tuples must hash equally -- which is exactly the
-// canonicalization std::hash<Value> already applies: NULL is one pattern, NaN
-// folds to one pattern, and interval-shaped text hashes as the interval it
-// renders. A collision (an INT64 and a UINT64 sharing bits, say) is harmless
-// because PartitionKeyEq still decides.
+// Hash of a PARTITION BY key tuple; see WindowPartitionKeyHash for the
+// contract. Kept as a functor so the grouping table can name it.
 struct PartitionKeyHash {
   size_t operator()(const std::vector<Value>& key) const {
-    uint64_t hash = 0x9e3779b97f4a7c15ULL;
-    for (const Value& value : key) {
-      hash ^= std::hash<Value>()(value) + 0x9e3779b97f4a7c15ULL + (hash << 6) +
-              (hash >> 2);
-    }
-    return static_cast<size_t>(hash);
+    return WindowPartitionKeyHash(key);
   }
 };
 

@@ -19,6 +19,15 @@ namespace tinylamb::relational_detail {
 // contains a window function call.
 bool HasWindowFunctions(const SelectStatement& statement);
 
+// Hash of a PARTITION BY key tuple, consistent with the partition equality in
+// the safe direction: equal tuples hash equally. `std::hash<Value>`
+// canonicalizes NULL, NaN and interval-shaped text exactly like
+// `ValuesEqual`, so a hash collision can never merge two partitions -- the
+// equality decides -- while an equal pair always lands in one bucket. Shared by
+// the in-memory grouping table and the spill-file router so the two can never
+// disagree about where a partition lives.
+size_t WindowPartitionKeyHash(const std::vector<Value>& key);
+
 struct WindowedInput {
   Relation input;  // rows extended with $winK columns
   std::shared_ptr<SelectStatement> statement;  // rewritten copy

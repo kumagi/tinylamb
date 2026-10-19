@@ -26,6 +26,7 @@
 #include "common/constants.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -65,12 +66,53 @@ TableStatistics MakeWindowStats(const Schema& schema, size_t rows) {
 
 }  // namespace
 
-WindowPlan::WindowPlan(Plan child, std::vector<NamedExpression> window_outputs)
+WindowPlan::WindowPlan(Plan child, std::vector<NamedExpression> window_outputs,
+                       WindowMemoryPolicy memory)
     : child_(std::move(child)),
       window_outputs_(std::move(window_outputs)),
       schema_(BuildWindowSchema(child_ ? child_->GetSchema() : Schema(),
                                 window_outputs_)),
-      stats_(MakeWindowStats(schema_, child_ ? child_->EmitRowCount() : 0)) {}
+      stats_(MakeWindowStats(schema_, child_ ? child_->EmitRowCount() : 0)),
+      memory_(memory) {}
+
+bool WindowPlan::CallsShareOnePartitionKey() const {
+  // No call means nothing to spill for: the operator would copy the child
+  // through, so the buffered shape (and its ordering claim) is the honest one.
+  if (window_outputs_.empty()) {
+    return false;
+  }
+  const std::vector<Expression>* shared = nullptr;
+  for (const NamedExpression& item : window_outputs_) {
+    if (item.expression == nullptr ||
+        item.expression->Type() != TypeTag::kWindowFunctionExp) {
+      return false;
+    }
+    const std::vector<Expression>& partition_by =
+        item.expression->AsWindowFunctionCallExpression().partition_by;
+    if (shared == nullptr) {
+      shared = &partition_by;
+      continue;
+    }
+    // Same expression list, not merely the same width: a row's spill file is
+    // chosen from this key, so two calls may only share it if their partitions
+    // are the same sets of rows. Two calls with different ORDER BY frames are
+    // fine -- they sort inside the same partition.
+    if (partition_by.size() != shared->size()) {
+      return false;
+    }
+    for (size_t i = 0; i < partition_by.size(); ++i) {
+      const std::string left = partition_by[i] == nullptr
+                                   ? std::string()
+                                   : partition_by[i]->ToString();
+      const std::string right =
+          (*shared)[i] == nullptr ? std::string() : (*shared)[i]->ToString();
+      if (left != right) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 bool WindowPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                              const std::vector<bool>& ascending) const {
@@ -81,6 +123,12 @@ bool WindowPlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
+  // A spill-capable shape emits one spill file at a time, so it cannot promise
+  // the child's order. Decided here, before the runtime row count is known: a
+  // plan that might spill must never leave a claim that it might violate.
+  if (SpillCapable()) {
+    return expressions.empty() && ascending.empty();
+  }
   if (child_ == nullptr) {
     return expressions.empty() && ascending.empty();
   }
@@ -95,7 +143,14 @@ void WindowPlan::Dump(std::ostream& output, int indent) const {
     }
     output << window_outputs_[i].name;
   }
-  output << "]\n" << Indent(static_cast<size_t>(indent) + 2);
+  output << "]";
+  // Only the spill shape is worth naming; the buffered one keeps the historical
+  // rendering every EXPLAIN golden test knows.
+  if (SpillCapable()) {
+    output << " (spill: partitions=" << memory_.spill_partition_count
+           << ", budget=" << memory_.memory_budget_bytes << ")";
+  }
+  output << "\n" << Indent(static_cast<size_t>(indent) + 2);
   if (child_ != nullptr) {
     child_->Dump(output, indent + 2);
   }

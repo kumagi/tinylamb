@@ -3995,7 +3995,10 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
     // the row count; the local cost prices the internal partition ordering
     // like a sort (the executor delegates to the canonical evaluator, so
     // framing and NULL placement agree with the relational path by
-    // construction).
+    // construction). The memory policy is decided here from the child's row
+    // estimate: a shape that may spill gives up the child's ordering claim
+    // (see WindowPlan), and one that fits keeps the buffered shape, whose
+    // cost is unchanged.
     built.Add(c::ImplementationRule(
         "window", cascades::dsl::Window(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
@@ -4012,9 +4015,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               return std::vector<PlanAlternative>{};
             }
           }
-          Plan window = std::make_shared<WindowPlan>(children[0].plan,
-                                                     logical.target_list);
           const double rows = children[0].estimated_rows;
+          Plan window = std::make_shared<WindowPlan>(
+              children[0].plan, logical.target_list, WindowPolicyForRows(rows));
           const double cost = rows * std::log2(std::max(2.0, rows));
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(window),

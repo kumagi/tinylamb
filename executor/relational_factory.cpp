@@ -159,8 +159,11 @@ Executor WindowPlan::EmitExecutor(TransactionContext& ctx) const {
   Executor child_exec =
       child_ ? child_->EmitExecutor(ctx)
              : std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
-  return std::make_shared<WindowExecutor>(ctx, std::move(child_exec),
-                                          GetSchema(), WindowOutputs());
+  return std::make_shared<WindowExecutor>(
+      ctx, std::move(child_exec), GetSchema(), WindowOutputs(),
+      WindowExecutor::Options{
+          .memory_budget_bytes = Memory().memory_budget_bytes,
+          .spill_partition_count = Memory().spill_partition_count});
 }
 
 // Streaming pass-through that surfaces a relation rename in EXPLAIN/Dump
