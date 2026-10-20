@@ -337,6 +337,15 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `LazySpool` / `ConsumerSpool`（再スキャン可能バッファ。`Relation` の
       `ForEachRow` を複数 consumer から利用）
 - [x] `CteScan`（実体化された CTE の読み。`LoadSource` の `CteMap` 経路）
+- [x] CTE の materialize / inline / filter pushdown のコスト選択
+      （`SqlEngine::PrepareStatement` の前処理列: 単一参照・非再帰は派生表へ
+      インラインし、以降の派生表フラット化で利用側の述語を本体スキャンまで
+      降ろす。複数参照は共有セル 1 個に materialize し、そのセルには
+      **利用側制約の選言**だけを押す — 単一利用側の述語を押すと他方の行が
+      消えるため。ゲートは「FROM 直下の平テーブル源・CROSS/INNER・各箇所に
+      自分専用の制約あり・本体は 1 平テーブルの無改名投影・推定選択率 < 1」
+      で、`LastCteRestrictionPushdowns()` で観測できる。回帰:
+      `SqlEnginePushesSharedCteRestrictionsDisjunctively`）
 - [x] `RecursiveUnion`（作業表の反復。`ExecuteRecursiveCte`: anchor 項で作業表を
       初期化し、再帰項には前回差分だけを CTE 名に束縛して反復。anchor が空でも
       再帰項内の非再帰分岐から反復を開始する）

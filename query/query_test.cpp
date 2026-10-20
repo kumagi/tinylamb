@@ -3004,6 +3004,140 @@ TEST_F(QueryTest, SqlEngineDerivedTableFallbackShapesStayCorrect) {
   ctx.txn_.Abort();
 }
 
+// M4 follow-up: a CTE that stays shared cannot take one consumer's filter --
+// the cell is built once and every reference reads it -- but it can take the
+// *disjunction* of every site's restriction: that keeps each row any site can
+// emit and drops the rest before the cell is built.  The estimate gates it, so
+// a restriction that keeps every row is not pushed.
+TEST_F(QueryTest, SqlEnginePushesSharedCteRestrictionsDisjunctively) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE big (k INT64, v INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO big SELECT k, k * 10 FROM UNNEST(GENERATE_SERIES(0, 63)) "
+         "AS k;");
+  RunSql(ctx, *db_, "ANALYZE big;");
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    std::vector<Row> rows;
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  // Both sites restrict the same column to the same value.
+  std::vector<Row> rows =
+      run("WITH c AS (SELECT k, v FROM big) "
+          "SELECT x.v + y.v FROM c x JOIN c y ON x.k = y.k "
+          "WHERE x.k = 1 AND y.k = 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(20));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 1U);
+
+  // Different restrictions: the cell keeps the union of both sides (k = 1 or
+  // k = 2), so x still sees k = 1 and y still sees k = 2.  A conjunction
+  // would leave the cell empty and the join with no row at all.
+  rows =
+      run("WITH c AS (SELECT k, v FROM big) "
+          "SELECT x.v, y.v FROM c x JOIN c y ON x.k + 1 = y.k "
+          "WHERE x.k = 1 AND y.k = 2;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(10));
+  EXPECT_EQ(rows[0][1], Value(20));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 1U);
+
+  // Restriction that keeps every row: the estimate says no reduction, so the
+  // cell stays unfiltered and the counter stays still.
+  rows =
+      run("WITH c AS (SELECT k, v FROM big) "
+          "SELECT COUNT(*) FROM c x JOIN c y ON x.k = y.k "
+          "WHERE x.k >= 0 AND y.k >= 0;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(64));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U);
+
+  // One site unrestricted: the disjunction is TRUE, so nothing is pushed.
+  rows =
+      run("WITH c AS (SELECT k, v FROM big) "
+          "SELECT x.v + y.v FROM c x JOIN c y ON x.k = y.k WHERE x.k = 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(20));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U);
+
+  // Sites inside subqueries are not read: reading a WHERE across a scope
+  // boundary is what the pushdown deliberately does not do.
+  rows =
+      run("WITH c AS (SELECT k, v FROM big) "
+          "SELECT (SELECT COUNT(*) FROM c WHERE c.k = 1) + "
+          "(SELECT COUNT(*) FROM c WHERE c.k = 2);");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(2));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U);
+
+  // A LIMIT pins the CTE's content, so a filter may not move above it.
+  rows =
+      run("WITH c AS (SELECT k, v FROM big LIMIT 10) "
+          "SELECT COUNT(*) FROM c x JOIN c y ON x.k = y.k "
+          "WHERE x.k = 1 AND y.k = 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U);
+
+  // A body may read a base table that shares the entry's name: a self-named
+  // source is not visible inside its own definition, so it is somebody else's
+  // relation and must not count as a reference site (it would look
+  // unrestricted and block the pushdown).
+  RunSql(ctx, *db_, "CREATE TABLE c (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO c VALUES (1, 10), (2, 20);");
+  RunSql(ctx, *db_, "ANALYZE c;");
+  rows =
+      run("WITH c AS (SELECT k, v FROM c) "
+          "SELECT x.v + y.v FROM c x JOIN c y ON x.k = y.k "
+          "WHERE x.k = 1 AND y.k = 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(20));
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 1U);
+
+  // The rewrite has to land before the cell is built: the shared cell then
+  // feeds both references at 1 row (k = 1) instead of 64, which the per-leaf
+  // scan statistics show.
+  const auto plan_text = [&](std::string_view sql) {
+    std::string text;
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    if (!prepared.HasValue()) {
+      return text;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      text += row[0].AsString() + "\n";
+    }
+    return text;
+  };
+  const std::string pushed = plan_text(
+      "EXPLAIN ANALYZE WITH c AS (SELECT k, v FROM big) "
+      "SELECT x.v + y.v FROM c x JOIN c y ON x.k = y.k "
+      "WHERE x.k = 1 AND y.k = 1;");
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 1U) << pushed;
+  EXPECT_EQ(pushed.find("rows_evaluated=64"), std::string::npos) << pushed;
+  const std::string unfiltered = plan_text(
+      "EXPLAIN ANALYZE WITH c AS (SELECT k, v FROM big) "
+      "SELECT x.v + y.v FROM c x JOIN c y ON x.k = y.k "
+      "WHERE x.k >= 0 AND y.k >= 0;");
+  EXPECT_EQ(engine.LastCteRestrictionPushdowns(), 0U) << unfiltered;
+  EXPECT_NE(unfiltered.find("rows_evaluated=64"), std::string::npos)
+      << unfiltered;
+  ctx.txn_.Abort();
+}
+
 // M4: a singly-referenced non-recursive CTE inlines into a derived source
 // (and flattens further through M5), reaching Cascades with the same rows.
 TEST_F(QueryTest, SqlEngineSingleUseCteInlinesToCascades) {

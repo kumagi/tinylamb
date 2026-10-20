@@ -3811,6 +3811,284 @@ bool InlineSingleUseCtes(SelectStatement* outer) {
   }
   return changed;
 }
+
+// --- shared-CTE restriction pushdown (M4 cost gate) -------------------------
+//
+// A CTE with several references cannot take any single consumer's filter: the
+// cell is built once and every reference reads it.  Every consumer still only
+// needs the rows its own filter keeps, so the *disjunction* of the per-site
+// restrictions is exact -- it keeps every row some consumer can emit and drops
+// the rest before the cell is built.  (Pushing a conjunction would delete rows
+// another consumer needs.)
+//
+// Gates (anything else keeps the unfiltered materialization):
+// - non-recursive entry with at least two reference sites, every one a plain
+//   FROM source of this statement or of a sibling CTE body, joined by
+//   CROSS/INNER (a null-extended side can turn "removed" rows into padding);
+// - no reference anywhere else (derived table, subquery, set-op branch), so
+//   every restriction is readable from a WHERE clause;
+// - every site has at least one restriction on that site's alias (a site
+//   without one makes the disjunction TRUE);
+// - the body is `SELECT <plain columns> FROM <one base table>` (no renaming,
+//   grouping, DISTINCT, LIMIT/OFFSET, QUALIFY, window, subquery, set-op), so
+//   stripping a qualifier still names a body column;
+// - the cost estimate says the disjunction actually reduces the row count
+//   (`EstimateSelectivity < 1`), so a tautology is not pushed just because it
+//   is syntactically present.
+Expression StripCteQualifier(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const std::string& qualifier) {
+  if (!expression || expression->Type() == TypeTag::kQueryExp) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (column.schema != qualifier) {
+      return expression;
+    }
+    return ColumnValueExp(ColumnName("", column.name));
+  }
+  std::vector<Expression> children = ExpressionChildren(expression);
+  bool changed = false;
+  for (Expression& child : children) {
+    Expression rewritten = StripCteQualifier(child, qualifier);
+    if (rewritten != child) {
+      changed = true;
+      child = std::move(rewritten);
+    }
+  }
+  if (!changed) {
+    return expression;
+  }
+  return WithExpressionChildren(expression, std::move(children));
+}
+
+// Counts references to `name` inside *nested* scopes of `statement` (derived
+// tables, subqueries, set-operation branches) but not in the statement's own
+// FROM list or in its sibling WITH bodies.
+size_t CountNestedCteReferences(const SelectStatement& statement,
+                                const std::string& name);
+
+void CountNestedCteReferencesInExpression(  // NOLINT(misc-no-recursion)
+    const Expression& expression, const std::string& name, size_t* count) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query = expression->AsQueryExpression();
+    if (query.Query() != nullptr) {
+      *count += CountNestedCteReferences(*query.Query(), name);
+    }
+    CountNestedCteReferencesInExpression(query.Test(), name, count);
+    return;
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CountNestedCteReferencesInExpression(child, name, count);
+  }
+}
+
+size_t CountNestedCteReferences(const SelectStatement& statement,
+                                const std::string& name) {
+  size_t count = 0;
+  for (const SelectSource& source : statement.Sources()) {
+    if (source.query != nullptr) {
+      count += CountNestedCteReferences(*source.query, name);
+    }
+    CountNestedCteReferencesInExpression(source.join_condition, name, &count);
+    CountNestedCteReferencesInExpression(source.unnest, name, &count);
+  }
+  CountNestedCteReferencesInExpression(statement.WhereClause(), name, &count);
+  for (const NamedExpression& item : statement.SelectList()) {
+    CountNestedCteReferencesInExpression(item.expression, name, &count);
+  }
+  for (const Expression& expression : statement.GroupBy()) {
+    CountNestedCteReferencesInExpression(expression, name, &count);
+  }
+  CountNestedCteReferencesInExpression(statement.Having(), name, &count);
+  CountNestedCteReferencesInExpression(statement.Qualify(), name, &count);
+  for (const auto& term : statement.OrderBy()) {
+    CountNestedCteReferencesInExpression(term.expression, name, &count);
+  }
+  for (const auto& branch : statement.UnionAll()) {
+    if (branch != nullptr) {
+      count += CountNestedCteReferences(*branch, name);
+    }
+  }
+  if (const auto& tree = statement.GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      count += CountNestedCteReferences(*tree->first, name);
+    }
+    for (const auto& branch : tree->branches) {
+      if (branch != nullptr) {
+        count += CountNestedCteReferences(*branch, name);
+      }
+    }
+  }
+  return count;
+}
+
+struct SharedCteSite {
+  SelectStatement* consumer{nullptr};
+  std::string alias;
+};
+
+// Collects every reference site of `name`, or returns false when a reference
+// exists that the pushdown cannot reason about.  `name`'s own body is not a
+// consumer: a self-named source there is not visible to the entry itself (it
+// resolves to the enclosing WITH or to a catalog table), so it is somebody
+// else's CTE.
+bool CollectSharedCteSites(SelectStatement* outer, const std::string& name,
+                           std::vector<SharedCteSite>* sites) {
+  std::vector<SelectStatement*> consumers{outer};
+  for (const auto& [entry, body] : outer->WithQueries()) {
+    if (entry != name && body != nullptr) {
+      consumers.push_back(body.get());
+    }
+  }
+  for (SelectStatement* consumer : consumers) {
+    if (CountNestedCteReferences(*consumer, name) != 0) {
+      return false;
+    }
+    for (const SelectSource& source : consumer->Sources()) {
+      if (source.table != name) {
+        continue;
+      }
+      if (source.query != nullptr || source.unnest || source.is_lateral ||
+          source.sample.has_value() ||
+          (source.join_type != JoinType::kCross &&
+           source.join_type != JoinType::kInner)) {
+        return false;
+      }
+      sites->push_back(
+          SharedCteSite{consumer, source.alias.empty() ? name : source.alias});
+    }
+  }
+  return true;
+}
+
+// The pushed predicate is written against the body's own scope, so the body
+// has to be a plain projection of one base table whose output names are the
+// base column names.
+bool CteBodyTakesRestriction(const SelectStatement& body,
+                             std::unordered_set<std::string>* outputs) {
+  if (body.Sources().size() != 1 || !body.GroupBy().empty() || body.Having() ||
+      body.Distinct() || !body.DistinctOn().empty() || body.HasLimit() ||
+      body.Offset() != 0 || body.Qualify() || !body.UnionAll().empty() ||
+      body.GetSetOperationTree() != nullptr || !body.WithQueries().empty() ||
+      relational_detail::HasWindowFunctions(body)) {
+    return false;
+  }
+  const SelectSource& source = body.Sources().front();
+  if (source.query != nullptr || source.unnest || source.is_lateral ||
+      source.table.empty() || source.sample.has_value() ||
+      !source.using_columns.empty() || source.from_nested_join ||
+      source.join_condition) {
+    return false;
+  }
+  for (const NamedExpression& item : body.SelectList()) {
+    if (item.expression == nullptr ||
+        item.expression->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
+    const ColumnName& column = item.expression->AsColumnValue().GetColumnName();
+    if (!column.schema.empty() && column.schema != source.alias &&
+        column.schema != source.table) {
+      return false;
+    }
+    if (column.name != item.name) {
+      return false;
+    }
+    outputs->insert(item.name);
+  }
+  return !outputs->empty();
+}
+
+size_t PushSharedCteRestrictions(SelectStatement* outer,
+                                 TransactionContext& ctx) {
+  if (outer == nullptr || outer->WithQueries().empty()) {
+    return 0;
+  }
+  std::vector<std::string> entries;
+  for (const auto& [name, body] : outer->WithQueries()) {
+    if (!outer->IsRecursiveWith(name) && body != nullptr &&
+        outer->RecursiveDepthOf(name) == nullptr) {
+      entries.push_back(name);
+    }
+  }
+  std::ranges::sort(entries);
+  size_t pushed = 0;
+  for (const std::string& name : entries) {
+    SelectStatement& body = *outer->WithQueries().at(name);
+    std::unordered_set<std::string> outputs;
+    if (!CteBodyTakesRestriction(body, &outputs)) {
+      continue;
+    }
+    std::vector<SharedCteSite> sites;
+    if (!CollectSharedCteSites(outer, name, &sites) || sites.size() < 2) {
+      continue;
+    }
+    std::vector<Expression> restrictions;
+    bool every_site_restricts = true;
+    for (const SharedCteSite& site : sites) {
+      std::vector<Expression> local;
+      for (const Expression& conjunct :
+           SplitConjuncts(site.consumer->WhereClause())) {
+        if (!conjunct || !ReferencesOnly(conjunct, {site.alias})) {
+          continue;
+        }
+        Expression stripped = StripCteQualifier(conjunct, site.alias);
+        const bool names_outputs = std::ranges::all_of(
+            stripped->TouchedColumns(), [&outputs](const ColumnName& column) {
+              return column.schema.empty() && outputs.contains(column.name);
+            });
+        if (!names_outputs) {
+          local.clear();
+          every_site_restricts = false;
+          break;
+        }
+        local.push_back(std::move(stripped));
+      }
+      if (local.empty()) {
+        every_site_restricts = false;
+        break;
+      }
+      restrictions.push_back(CombineConjuncts(local));
+    }
+    if (!every_site_restricts) {
+      continue;
+    }
+    Expression disjunction = restrictions.front();
+    for (size_t i = 1; i < restrictions.size(); ++i) {
+      disjunction = BinaryExpressionExp(disjunction, BinaryOperation::kOr,
+                                        restrictions[i]);
+    }
+    // Cost gate: only materialize a narrower cell when the estimate says the
+    // disjunction drops rows.  No statistics (no ANALYZE yet) means the
+    // reduction is unknown, and a shape the estimator cannot model answers
+    // 1.0; both keep the cell unfiltered.
+    const std::string& base_table = body.Sources().front().table;
+    const StatusOr<std::shared_ptr<Table>> found_table =
+        ctx.GetTable(base_table);
+    const StatusOr<std::shared_ptr<TableStatistics>> found_stats =
+        ctx.GetStats(base_table);
+    if (!found_table.HasValue() || !found_stats.HasValue() ||
+        found_stats.Value()->Rows() == 0) {
+      continue;
+    }
+    const double selectivity = found_stats.Value()->EstimateSelectivity(
+        found_table.Value()->GetSchema(), disjunction);
+    if (!(selectivity < 1.0)) {
+      continue;
+    }
+    std::vector<Expression> conjuncts;
+    if (body.WhereClause()) {
+      conjuncts.push_back(body.WhereClause());
+    }
+    conjuncts.push_back(std::move(disjunction));
+    body.SetWhereClause(CombineConjuncts(conjuncts));
+    ++pushed;
+  }
+  return pushed;
+}
 }  // namespace
 
 // M5 derived-table flattening (first slice): inline a FROM-subquery over a
@@ -8579,6 +8857,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return Status::kUnknown;
       }
       fused_sibling_aggregates_ = 0;
+      cte_restriction_pushdowns_ = 0;
       // A WITH list resolves in dependency order, so an entry may name a
       // sibling declared after it; a mutual reference between entries has no
       // evaluation order at all.  Reject it before any rewrite, so the error
@@ -8602,6 +8881,12 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // path untouched.
       (void)ReduceGroupByFunctionalDependencies(select.get(), ctx);
       (void)InlineSingleUseCtes(select.get());
+      // A CTE that stays shared cannot take one consumer's filter, but it can
+      // take the disjunction of every consumer's restriction: that keeps every
+      // row any reference can emit and drops the rest before the cell is
+      // built.  The estimate decides whether the narrower cell is worth it.
+      cte_restriction_pushdowns_ +=
+          PushSharedCteRestrictions(select.get(), ctx);
       LiftedCtes lifted;
       MaterializeCtes(select.get(), ctx, &lifted);
       LiftRecursiveCtes(select.get(), &lifted);

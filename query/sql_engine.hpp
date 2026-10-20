@@ -99,6 +99,11 @@ class SqlEngine {
   [[nodiscard]] size_t LastFusedSiblingAggregates() const {
     return fused_sibling_aggregates_;
   }
+  // Number of shared-CTE restriction pushdowns performed while preparing the
+  // most recent statement (0 otherwise; see PushSharedCteRestrictions).
+  [[nodiscard]] size_t LastCteRestrictionPushdowns() const {
+    return cte_restriction_pushdowns_;
+  }
 
   // Compliance-driver hook: when enabled, INSERT statements emulate
   // first_column_is_primary_key semantics (duplicate-key errors, and
@@ -227,6 +232,7 @@ class SqlEngine {
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;
   size_t fused_sibling_aggregates_{0};
+  size_t cte_restriction_pushdowns_{0};
 
   // True when this statement's WHERE/SET carried a subquery folded to
   // constants at prepare time (Bug 57): the folded values are valid only

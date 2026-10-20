@@ -218,6 +218,22 @@ the dependency-ordered relational route, which is why
 `ExecuteUnnestSelect` consults `RecursiveCteLiftable` before minting a
 work-table leaf.
 
+CTE execution strategy is decided before the plan is built, in
+`PrepareStatement`, and the order is load-bearing: `InlineSingleUseCtes`
+(non-recursive entry with exactly one reference becomes a derived source, so
+the body runs once and M5 flattening pushes the consumer's WHERE into the
+body's scan) → `PushSharedCteRestrictions` (an entry that stays shared
+materializes once, and only the **disjunction** of the per-site restrictions
+may be pushed into its body: one site's predicate alone would delete rows
+another site needs) → `MaterializeCtes` (one eager cell, shared `kValues`
+leaf) → `FlattenDerivedSources`. The pushdown is gated on plain FROM sites
+joined by CROSS/INNER, a self-only predicate at every site, a single-table
+unnamed projection body with no GROUP BY/DISTINCT/LIMIT/QUALIFY/window/
+set-op/subquery, and an `EstimateSelectivity < 1` estimate from the base
+table's statistics (no statistics ⇒ no pushdown). `LastCteRestrictionPushdowns()`
+reports it; `SqlEnginePushesSharedCteRestrictionsDisjunctively` pins the
+disjunction, the gates, and the shrunken cell (leaf `rows_evaluated`).
+
 Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_template_test`, `join_reduction_test`, `sql_clustered_order_test`,
 `sql_collation_test`,

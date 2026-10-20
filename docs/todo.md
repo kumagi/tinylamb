@@ -510,7 +510,7 @@ Cascades rule / cost / statistics
 
 ### CTE / Materialize / Recursive
 
-（以下はリレーショナル経路で実装済み: ExecuteRecursiveCte, CteMap, WorkTableScan via CteMap, MaterializePlan/SpoolExecutor, CteScanPlan, WorkTableScanPlan, RecursiveUnionPlan/Executor, WorkTableIndex, CtePredicatePropagation, RecursiveUnionSpill）
+（以下はリレーショナル経路で実装済み: ExecuteRecursiveCte, CteMap, WorkTableScan via CteMap, MaterializePlan/SpoolExecutor, CteScanPlan, WorkTableScanPlan, RecursiveUnionPlan/Executor, WorkTableIndex, 共有CTEの制約押し下げ (PushSharedCteRestrictions), RecursiveUnionSpill）
 
 - [x] `MaterializePlan` / `EagerSpool` をCascades専用planとして実装する。
 - [x] `LazySpool` / `ConsumerSpool` をCascades専用planとして実装する。
@@ -599,7 +599,35 @@ Cascades rule / cost / statistics
       `inserts` / `duplicates` でループが索引を引いたことを観測できる。
       回帰: `WorkTableIndexTest.*`（8 件）,
       `SqlEngineRecursiveCteDedupesThroughWorkTableIndex`。
-- [ ] CTE materialization / inlining / filter pushdownをコスト付きで選択する。
+- [x] CTE materialization / inlining / filter pushdownをコスト付きで選択する。
+      契約（`SqlEngine::PrepareStatement` の CTE 前処理パイプライン。
+      `InlineSingleUseCtes` → `PushSharedCteRestrictions` → `MaterializeCtes`
+      → `FlattenDerivedSources`、この順序が意味を持つ）:
+      (1) **単一参照の非再帰 CTE はインライン**する（`InlineSingleUseCtes`:
+      派生表へ置換し、本体は 1 回しか走らないので materialize より弱く劣化
+      しない）。置換後は M5 の派生表フラット化が効くため、利用側の WHERE は
+      本体のスキャンまで降りる（`EXPLAIN ANALYZE` の `scan_output_rows` が
+      全行走査でなく絞り込み後になる）。
+      (2) **複数参照の CTE は 1 回 materialize**する（`MaterializeCtes`:
+      共有セル 1 個・`kValues` 葉）。
+      (3) **共有 CTE への filter pushdown は「利用側制約の選言」だけ**を押す
+      （`PushSharedCteRestrictions`）。単一利用側の述語をそのまま押すのは
+      不正（他方の利用側が必要とする行が消える）が、全利用側の制約の選言は
+      「どの利用側も出し得る行」を過不足なく残す。ゲートは、
+      再帰エントリでない / 参照箇所が 2 以上ですべて「この文または兄弟 CTE
+      本文の FROM 直下の平テーブル源」/ 結合種別が CROSS・INNER（NULL 拡張側
+      だと除去が padding に化ける）/ 派生表・副問合せ・集合演算分岐に参照が
+      無い / 各参照箇所に自分自身の別名だけを見る制約が最低 1 つある（無い
+      箇所があると選言が TRUE）/ 本体が「1 平テーブルからの無改名の列投影」
+      で GROUP BY・DISTINCT・LIMIT/OFFSET・QUALIFY・window・集合演算・
+      副問合せ・USING・ON を持たない（別名を剥がしても本体の列名に戻る）/
+      コスト推定 `TableStatistics::EstimateSelectivity` が選言で 1.0 未満に
+      なる（統計が無い = Rows()==0 なら押さない）。判定と書き換えは
+      `SqlEngine::LastCteRestrictionPushdowns()` で観測でき、押した場合は
+      共有セルが実際に縮む（`EXPLAIN ANALYZE` の葉の `rows_evaluated`）。
+      回帰: `SqlEnginePushesSharedCteRestrictionsDisjunctively`（選言・
+      異なる制約同士・統計ゲート・無制約箇所・副問合せ箇所・LIMIT 本体・
+      セル縮小のプラン観測）。
 - [x] CTE predicate propagationを実装する。
 - [x] recursive CTE union rewriteを実装する。
 - [x] 再帰CTEのmemory capとspillを実装する。
