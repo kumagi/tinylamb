@@ -1,5 +1,9 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第41報)。統合TODO(`docs/todo.md` Phase 2 Window / UNNEST /
+生成)の次項目: **`FunctionScan` / TVF**。詳細は下記「2026-10-20 組み込み TVF
+(FROM GENERATE_SERIES)」の節。Window / UNNEST / 生成 の `[ ]` は無くなった。
+
 2026-10-19 加筆(第36報)。統合TODO(`docs/todo.md` Phase 2 Scan / Access
 Path)の次項目: **内側filterを index へ適用できない場合に heap 側へ残す契約**。
 詳細は下記「2026-10-19 LookupJoin の内側 filter 契約」の節。
@@ -25,6 +29,41 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 組み込み TVF (FROM GENERATE_SERIES)
+
+- **[課題] `FROM GENERATE_SERIES(1, 3)` が `unknown table function` で落ちていた。**
+  `TVF` AST 節は `CREATE TABLE FUNCTION` の UDF 登録簿しか引かず、組み込みの
+  テーブル関数を受ける表面がなかった。`UNNEST(GENERATE_SERIES(...))` は動くので、
+  欠けていたのは FROM へ直接書く形だけだった。
+- **[修正] 組み込み TVF を暗黙 UNNEST へ落とす。**
+  visitor の `TVF` 節で `generate_series` を UDF 参照より先に判定し、
+  `SelectSource.unnest = generate_series(...)` を作る。エンジンの
+  `GENERATE_SERIES` は ARRAY を返すスカラー関数なので、これは
+  `UNNEST(GENERATE_SERIES(...))` と同義で、リレーショナル経路の `LoadSource` と
+  Cascades の `kUnnest` の両方がそのまま行源化する。専用 `FunctionScanPlan`
+  は作らない（行源化の契約は UNNEST と共有）。
+  未別名の値列は BigQuery の TVF 出力に合わせて `value`、別名は UNNEST と
+  同じく値列を改名する。名前付き引数 (`START => 1, STOP => 7, STEP => 3`) は
+  `TVFArgument/NamedArgument` から位置引数へ並べ替え、重複・未知の名前・
+  不足/過多は文エラー。引数は先行ソース列を参照できる（暗黙 UNNEST と同じ
+  lateral 契約）。`TABLESAMPLE` は UNNEST と同じく拒否する。
+  Join 節のオペランド判定に `TVF` を加え、`FROM a JOIN GENERATE_SERIES(...)
+  ON ...` を 2 オペランドの join として扱う（従来は `join arity` エラー）。
+- **[付随修正] 無名 select item の `ORDER BY <番号>` が UNNEST 値列を見失っていた。**
+  `SELECT MOD(x, 2) FROM UNNEST(...) x ORDER BY 1` が `column x not found` で
+  落ちていた（列名の無い射影項目にいったん一致すると、ソートキーに元式を
+  そのまま使い、射影の上で再評価して `x` を探すため）。無名項目も隠し
+  `$order<i>` 射影列に載せる経路へ倒して修正。`value` 列しか持たない TVF でも
+  同じ形が踏める。
+- **[回帰]** `QueryTest.BuiltinTableFunctionBecomesRowSource`（列名・名前付き
+  引数・別名・lateral join・`JOIN ... ON`・`INSERT SELECT`・EXPLAIN が
+  `Unnest: generate_series(...)` で `RelationalPlan` でないこと・引数エラー
+  5種）と `QueryTest.UnnestAnonymousOrderByKeyRidesAHiddenColumn`。
+  変異検証: Join オペランドから `TVF` を外すと前者、無名項目を隠し列に
+  載せない変異で後者が落ちる。
+- **[残り]** `EXTERNAL_QUERY` / `ML.*` / `APPENDS` などの TVF は外部ソース・
+  時系列基盤が前提なので対象外（`ForeignScan` と同じ保留理由）。
 
 ## 2026-10-19 Window の spill 形
 

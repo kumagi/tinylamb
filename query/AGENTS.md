@@ -139,6 +139,14 @@ AS SELECT...` bodies are stored as AST clones in the UDF registry,
 trailing DEFAULT padding follows scalar -
     UDF binding rules.Regression :
   `QueryTest.TableValuedFunctionInvokesStoredBody`
+  Builtin table functions reach the same `TVF` AST node: `FROM
+  GENERATE_SERIES(start, stop[, step])` lowers to an implicit UNNEST of the
+  scalar generator's ARRAY value, so `LoadSource` (relational) and `kUnnest`
+  (Cascades) row-ify it without a dedicated scan operator. Unaliased value
+  column is `value`, `START`/`STOP`/`STEP` named arguments reorder into the
+  positional signature, `TABLESAMPLE` is rejected, and join operands accept
+  the `TVF` node. Regression:
+  `QueryTest.BuiltinTableFunctionBecomesRowSource`.
         .- `FuseSiblingDerivedAggregates` (kSelect rewrite chain)
                fuses sibling derived tables that aggregate the SAME base table
            under the SAME GROUP BY key list into one aggregation(

@@ -6112,6 +6112,109 @@ StatusOr<SelectSource> VisitTableSource(
     }
     ASSIGN_OR_RETURN(std::string, hv244001_0, (Path(*path)));
     const std::string function_name = std::move(hv244001_0);
+    // Builtin table-valued functions.  GENERATE_SERIES is a scalar function
+    // that yields an ARRAY value, so a FROM-level call is an implicit UNNEST
+    // of that array: the relational route row-ifies the value in LoadSource,
+    // and the Cascades route lowers the source to kUnnest over the current
+    // group.  Named arguments (START => 1, STOP => 3, STEP => 2) reorder into
+    // the positional signature; an unaliased call names its value column
+    // `value`, matching BigQuery's GENERATE_SERIES output.
+    if (Lower(function_name) == "generate_series") {
+      if (node.Child("SampleClause") != nullptr) {
+        return AstError<SelectSource>(
+            "TABLESAMPLE is not valid directly on a table function");
+      }
+      constexpr size_t kParameterCount = 3;
+      static constexpr std::string_view kParameters[kParameterCount] = {
+          "start", "stop", "step"};
+      std::vector<Expression> arguments(kParameterCount);
+      std::vector<bool> bound(kParameterCount, false);
+      size_t next_positional = 0;
+      for (const GoogleSqlAstNode* argument : node.Children("TVFArgument")) {
+        const GoogleSqlAstNode* expression_node = nullptr;
+        for (const auto& child : argument->children) {
+          if (child->kind != "Location") {
+            expression_node = child.get();
+            break;
+          }
+        }
+        if (expression_node == nullptr) {
+          return AstError<SelectSource>("table function " + function_name +
+                                        " has an empty argument");
+        }
+        std::string parameter;
+        if (expression_node->kind == "NamedArgument") {
+          const GoogleSqlAstNode* name_node =
+              expression_node->Child("Identifier");
+          if (name_node == nullptr) {
+            return AstError<SelectSource>(
+                "table function " + function_name +
+                " has a named argument without a name");
+          }
+          ASSIGN_OR_RETURN(std::string, hv244006_0, (Identifier(*name_node)));
+          parameter = Lower(std::move(hv244006_0));
+          const GoogleSqlAstNode* value_node = nullptr;
+          for (const auto& child : expression_node->children) {
+            if (child->kind == "Location" || child->kind == "Identifier") {
+              continue;
+            }
+            value_node = child.get();
+            break;
+          }
+          if (value_node == nullptr) {
+            return AstError<SelectSource>("table function " + function_name +
+                                          " argument " + parameter +
+                                          " is empty");
+          }
+          expression_node = value_node;
+        }
+        size_t parameter_index = 0;
+        if (!parameter.empty()) {
+          while (parameter_index < kParameterCount &&
+                 kParameters[parameter_index] != parameter) {
+            ++parameter_index;
+          }
+          if (parameter_index == kParameterCount) {
+            return AstError<SelectSource>("table function " + function_name +
+                                          " has no argument named " +
+                                          parameter);
+          }
+        } else {
+          parameter_index = next_positional++;
+          if (parameter_index >= kParameterCount) {
+            return AstError<SelectSource>(
+                "too many arguments for table function " + function_name);
+          }
+        }
+        if (bound[parameter_index]) {
+          return AstError<SelectSource>(
+              "duplicate argument " +
+              std::string(kParameters[parameter_index]) +
+              " for table function " + function_name);
+        }
+        ASSIGN_OR_RETURN(Expression, hv244007_0,
+                         (VisitExpression(*expression_node)));
+        arguments[parameter_index] = std::move(hv244007_0);
+        bound[parameter_index] = true;
+      }
+      if (!bound[0] || !bound[1]) {
+        return AstError<SelectSource>("table function " + function_name +
+                                      " requires START and STOP arguments");
+      }
+      std::vector<Expression> call_arguments;
+      call_arguments.reserve(bound[2] ? 3 : 2);
+      call_arguments.push_back(std::move(arguments[0]));
+      call_arguments.push_back(std::move(arguments[1]));
+      if (bound[2]) {
+        call_arguments.push_back(std::move(arguments[2]));
+      }
+      source.unnest =
+          FunctionCallExp("generate_series", std::move(call_arguments));
+      if (source.alias.empty()) {
+        source.alias = "value";
+      }
+      return source;
+    }
     const auto& udfs = UdfRegistry();
     const auto found = udfs.find(Lower(function_name));
     if (found == udfs.end()) {
@@ -6313,7 +6416,7 @@ Status AppendSources(
   for (const auto& child : node.children) {
     if (child->kind == "TablePathExpression" ||
         child->kind == "TableSubquery" || child->kind == "Join" ||
-        child->kind == "ParenthesizedJoin") {
+        child->kind == "ParenthesizedJoin" || child->kind == "TVF") {
       operands.push_back(child.get());
     } else if (child->kind == "OnClause") {
       on = child.get();

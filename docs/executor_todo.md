@@ -227,7 +227,14 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `DummyScan` / `OneRow`（`DummyScanPlan` + `ValuesExecutor`。SELECT 1 を
       Optimizer 経路で実行）
 - [x] `ValuesScan`（多行 VALUES の `ValuesPlan` / `ValuesExecutor`）
-- [ ] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）
+- [x] `FunctionScan` / TVF（関数由来の配列を `LoadSource` が行源化）。
+      組み込み TVF `GENERATE_SERIES(...)` を FROM で受けると、フロントエンドが
+      その配列の暗黙 UNNEST（`SelectSource.unnest`）へ落とすので、専用スキャン
+      演算子は持たない: リレーショナル経路は `LoadSource`、Cascades 経路は
+      `kUnnest`（＋`UnnestPlan`）が実行する。名前付き引数は位置引数へ並べ替え、
+      未別名の値列は `value`。回帰:
+      `QueryTest.BuiltinTableFunctionBecomesRowSource`。残り:
+      `EXTERNAL_QUERY` / `ML.*` などは外部ソース基盤が前提。
 - [x] `UnnestScan`（配列、STRUCT/PROTO、WITH OFFSET、相関 lateral 経路）
 - [x] `WorkTableScan`（再帰 CTE。反復ごとに CteMap の CTE 名を差分 Relation に
       束縛する形で実装。専用インデックスアクセスは `WorkTableIndex` が未実装）

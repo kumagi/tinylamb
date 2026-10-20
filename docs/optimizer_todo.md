@@ -71,6 +71,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       ・`unnest_filter_pushdown` まで接続。一般 TVF は UNNEST・GENERATE_SERIES
       以外の表面がなく将来枠）
       → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+      → 2026-10-20: FROM の組み込み TVF `GENERATE_SERIES(...)` は
+      フロントエンドが暗黙 UNNEST（`SelectSource.unnest`）へ落とすため、
+      `kUnnest` 経路がそのまま実行する（専用 `kFunctionScan` は作らない）。
+      回帰: `QueryTest.BuiltinTableFunctionBecomesRowSource`。残る一般 TVF は
+      `EXTERNAL_QUERY` / `ML.*` など外部ソース基盤が前提のものだけ。
 - [ ] `kExpand`（enum と `grouping_sets_expansion` で GROUPING SETS 系を展開。
       CUBE / ROLLUP 構文自体が parser 未対応のため到達不能）
       → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。

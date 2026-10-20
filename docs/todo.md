@@ -479,7 +479,29 @@ Cascades rule / cost / statistics
       無限ループとして実害が出た）。
       既知の残り: 単一区画が予算を超える場合の区画内 spill（frame 評価の
       ストリーム化が要る）。
-- [ ] `FunctionScan` / TVFを実装する。
+- [x] `FunctionScan` / TVFを実装する。
+      FROM の組み込みテーブル関数 `GENERATE_SERIES(start, stop[, step])` を受ける。
+      エンジンの `GENERATE_SERIES` は ARRAY を返すスカラー関数なので、呼び出しは
+      **その配列の暗黙 UNNEST** に落とす（`SelectSource.unnest` を立てる）:
+      リレーショナル経路は `LoadSource` が配列を行源化し、Cascades 経路は現在の
+      入力グループに対する `kUnnest` になる（専用スキャン演算子は増やさない）。
+      したがって専用の `FunctionScanPlan` は持たず、`UnnestPlan` / `kUnnest` が
+      実行契約を共有する。列名は BigQuery の TVF 出力に合わせて未別名なら
+      `value`、別名があれば UNNEST と同じく別名。名前付き引数
+      (`START => 1, STOP => 7, STEP => 3`) は位置引数へ並べ替え、重複・未知の
+      引数名・引数不足・過多は文エラー。`FROM a JOIN GENERATE_SERIES(...) ON ...`
+      は Join のオペランドとして扱い、引数は先行ソース列を参照できる（暗黙
+      UNNEST と同じ lateral 契約）。`TABLESAMPLE` は UNNEST と同様に拒否。
+      `CREATE TABLE FUNCTION` の TVF 展開（既存）と同じ `TVF` AST 節から分岐する。
+      回帰: `QueryTest.BuiltinTableFunctionBecomesRowSource`（列名・名前付き
+      引数・別名・テーブルとの lateral join・`JOIN ... ON`・`INSERT SELECT`・
+      EXPLAIN が `Unnest: generate_series(...)` になること・引数エラー5種）。
+      付随修正: `QueryTest.UnnestAnonymousOrderByKeyRidesAHiddenColumn`。
+      無名 select item を `ORDER BY <番号>` で並べると、ソートキーが射影の上で
+      元式を再評価して UNNEST 値列を見失う（`column x not found`）バグを、
+      隠し `$order<i>` 射影列に載せる形で修正。
+      残り: `EXTERNAL_QUERY` / `ML.*` / `APPENDS` など外部・時系列系 TVF は
+      外部ソース基盤が前提なので対象外。
 - [x] `GenerateSeriesExecutor` と `GENERATE_SERIES` のSQL接続を実装する。
 - [x] `GENERATE_ARRAY` のstep、型、NULL、上限を回帰テストで固定する。
 - [x] `GENERATE_DATE_ARRAY` のDATE / INTERVAL stepをSQL経路で通す。

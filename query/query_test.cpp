@@ -2311,6 +2311,109 @@ TEST_F(QueryTest, SqlEngineArrayGeneratorsFeedUnnest) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, BuiltinTableFunctionBecomesRowSource) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  // GENERATE_SERIES is a scalar generator returning an ARRAY, so a FROM-level
+  // call is an implicit UNNEST of that array: no UNNEST wrapper needed, and
+  // the unaliased value column keeps BigQuery's TVF output name.
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT * FROM GENERATE_SERIES(1, 4);"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)}),
+                              Row({Value(4)})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT value FROM GENERATE_SERIES(START => 1, STOP => 7, "
+             "STEP => 3) ORDER BY value DESC;"),
+      (std::vector<Row>{Row({Value(7)}), Row({Value(4)}), Row({Value(1)})}));
+  // An explicit alias renames the value column exactly like UNNEST's alias.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT g FROM GENERATE_SERIES(5, 1, -2) AS g ORDER BY g;"),
+      (std::vector<Row>{Row({Value(1)}), Row({Value(3)}), Row({Value(5)})}));
+  // The call is an implicit UNNEST over the preceding sources, so its
+  // arguments may reference them; the join form reaches the same path.
+  RunSql(ctx, *db_, "CREATE TABLE tfv_t (x INT);");
+  RunSql(ctx, *db_, "INSERT INTO tfv_t VALUES (1), (5);");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT tfv_t.x, value FROM tfv_t, "
+             "GENERATE_SERIES(tfv_t.x, tfv_t.x + 1) "
+             "ORDER BY tfv_t.x, value;"),
+      (std::vector<Row>{Row({Value(1), Value(1)}), Row({Value(1), Value(2)}),
+                        Row({Value(5), Value(5)}), Row({Value(5), Value(6)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT value FROM GENERATE_SERIES(1, 2) JOIN tfv_t "
+                   "ON tfv_t.x = value ORDER BY value;"),
+            (std::vector<Row>{Row({Value(1)})}));
+  // INSERT ... SELECT carries the TVF's column name into the target list.
+  RunSql(ctx, *db_, "CREATE TABLE tfv_target (v INT);");
+  RunSql(ctx, *db_,
+         "INSERT INTO tfv_target SELECT * FROM GENERATE_SERIES(1, 3);");
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*), SUM(v) FROM tfv_target;"),
+            (std::vector<Row>{Row({Value(int64_t{3}), Value(6)})}));
+
+  // Plan contract: the frontend lowers the call to kUnnest over the group's
+  // current input (here the empty one-row input), not to a second scan node.
+  StatusOr<Executor> explain =
+      engine.Prepare(ctx, "EXPLAIN SELECT * FROM GENERATE_SERIES(1, 2);");
+  ASSERT_TRUE(explain.HasValue()) << engine.LastError();
+  std::string plan_text;
+  Row row;
+  while (explain.Value()->Next(&row, nullptr)) {
+    plan_text += row[0].value.varchar_value;
+    plan_text += "\n";
+  }
+  EXPECT_NE(plan_text.find("Unnest"), std::string::npos) << plan_text;
+  EXPECT_NE(plan_text.find("generate_series"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  // Argument binding failures are statement errors, not silent empty reads.
+  const auto expect_prepare_error = [&](std::string_view sql,
+                                        std::string_view needle) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_FALSE(prepared.HasValue()) << sql;
+    EXPECT_NE(engine.LastError().find(needle), std::string::npos)
+        << sql << "\n"
+        << engine.LastError();
+  };
+  expect_prepare_error("SELECT * FROM GENERATE_SERIES(1);",
+                       "requires START and STOP");
+  expect_prepare_error("SELECT * FROM GENERATE_SERIES(1, 2, 3, 4);",
+                       "too many arguments");
+  expect_prepare_error(
+      "SELECT * FROM GENERATE_SERIES(START => 1, START => 2, STOP => 3);",
+      "duplicate argument start");
+  expect_prepare_error("SELECT * FROM GENERATE_SERIES(FOO => 1, STOP => 2);",
+                       "no argument named foo");
+  expect_prepare_error(
+      "SELECT * FROM GENERATE_SERIES(1, 3) TABLESAMPLE SYSTEM (10 PERCENT);",
+      "TABLESAMPLE");
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, UnnestAnonymousOrderByKeyRidesAHiddenColumn) {
+  TransactionContext ctx = db_->BeginContext();
+  // An anonymous select item has no output name for the sort to re-read, and
+  // re-evaluating its expression above the projection cannot see the UNNEST
+  // value column ("column x not found", seen with both UNNEST and TVF
+  // sources). The key must ride a hidden projection column instead.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT MOD(x, 2) FROM UNNEST([1, 2, 3, 4, 5]) x "
+                   "ORDER BY 1;"),
+            (std::vector<Row>{Row({Value(0)}), Row({Value(0)}), Row({Value(1)}),
+                              Row({Value(1)}), Row({Value(1)})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT DISTINCT x + 1 FROM UNNEST([1, 2, 3]) x "
+             "ORDER BY 1 DESC;"),
+      (std::vector<Row>{Row({Value(4)}), Row({Value(3)}), Row({Value(2)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT value * 10 FROM GENERATE_SERIES(3, 1, -1) "
+                   "ORDER BY 1 LIMIT 2;"),
+            (std::vector<Row>{Row({Value(10)}), Row({Value(20)})}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
   TransactionContext ctx = db_->BeginContext();
   SqlEngine engine(*db_);

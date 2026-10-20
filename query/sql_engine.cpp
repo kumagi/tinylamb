@@ -7830,7 +7830,13 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
           }
         }
       }
-      if (matched == nullptr) {
+      // An anonymous select item (`MOD(x, 2)` with no alias) has no output
+      // name to bind to, so it takes the hidden-column path even though the
+      // projection below already computes it: referencing the expression
+      // itself would re-evaluate it against the projection OUTPUT, where the
+      // source columns it reads (e.g. the UNNEST value column) no longer
+      // exist.
+      if (matched == nullptr || matched->name.empty()) {
         const std::string hidden = "$order" + std::to_string(sort_keys.size());
         projection_items.emplace_back(hidden, order_expression);
         sort_keys.emplace_back("", ColumnValueExp(ColumnName(hidden)));
@@ -7839,11 +7845,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       }
       // The sort consumes the projection OUTPUT, whose columns carry the
       // select-list names; bind a matched key to that output name.
-      if (!matched->name.empty()) {
-        sort_keys.emplace_back("", ColumnValueExp(ColumnName(matched->name)));
-      } else {
-        sort_keys.emplace_back("", order_expression);
-      }
+      sort_keys.emplace_back("", ColumnValueExp(ColumnName(matched->name)));
     }
   }
 
