@@ -148,8 +148,12 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   working table, so a missing anchor name or a duplicate/unnamed column is an
   error instead of a NULL-filled cell, and positional terms must keep the
   anchor width. `WITH DEPTH` appends its counter after the aligned columns.
-  Regressions: `QueryTest.SqlEngineRecursiveCteNameMatching*`,
-  `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`.
+  The leaf runs with no sibling CTE in scope, so `ExecuteUnnestSelect` only
+  mints one when `RecursiveCteLiftable` holds (single site, no sibling
+  reference); otherwise the statement falls through to the dependency-ordered
+  relational route. Regressions: `QueryTest.SqlEngineRecursiveCteNameMatching*`,
+  `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`,
+  `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`.
 - Infra: `data_chunk` (+ `selection_vector`), `query_scheduler`,
   `query_memory` (+ `operator_memory`, `numa_arena`), `vectorized_expression`,
   `simd_comparison`.

@@ -1,5 +1,9 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第43報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
+Recursive)の次項目: **CTE依存順 / 前方参照 / 相互再帰エラー**。詳細は下記
+「2026-10-20 CTE依存順と相互再帰」の節。CTE 節の `[ ]` は残り 3 件。
+
 2026-10-20 加筆(第42報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
 Recursive)の次項目: **recursive JOIN USING / BY NAME / CORRESPONDING の
 schema 契約**。詳細は下記「2026-10-20 再帰CTEの列一致契約」の節。CTE 節の
@@ -34,6 +38,64 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 CTE依存順と相互再帰 (WITH スコープの契約)
+
+- **[課題] 依存順の走査が浅かった。** `ExecuteQuery` の WITH ループは各エントリの
+  **直下の FROM** だけを見て依存を判定していた。`WITH b AS (SELECT * FROM
+  (SELECT * FROM a)), a AS (SELECT 1 AS x) SELECT * FROM b` は `b` が
+  `a` を知らないまま先に実行され "table a not found"。スカラーサブクエリ
+  （`WITH b AS (SELECT (SELECT MAX(x) FROM a) AS m), ...`）も同じ。集合演算の枝や
+  `WHERE x IN (SELECT ... FROM a)` が偶然動いていたのは、単一参照の CTE が
+  先にインライン化されて参照がトップレベルへ移っていたため。
+- **[課題] 相互再帰が "table not found" になっていた。** `WITH a AS (SELECT *
+  FROM b), b AS (SELECT * FROM a)` も、`WITH RECURSIVE a AS (... b ...),
+  b AS (... a ...)` も、旧コードは残りを map 順に実行して欠けた関係を
+  「table b not found」として報告していた。
+- **[課題] 再帰CTEの本体が兄弟 CTE を読むと壊れていた。** Cascades の
+  `RecursiveCteExecutor` は `ExecuteRecursiveCte(..., {})` と**継承 CTE なし**で
+  本体を実行する。`WITH RECURSIVE a AS (SELECT n FROM b UNION ALL ...),
+  b AS (SELECT 1 AS n) SELECT * FROM a` は `ExecuteUnnestSelect` が無条件に
+  work-table leaf を作るため "table b not found"（2サイトの自己結合だけは
+  lift されずリレーショナル経路で動いていた）。
+- **[修正] 走査を `executor/detail/subquery_runtime` へ集約した。**
+  `CollectStatementTableRefs` は、派生表・スカラーサブクエリ・JOIN 条件・
+  UNNEST 引数・集合演算の枝・入れ子 WITH 本体まで辿り、内側 WITH の名前で
+  外側を影にする。`CollectCteBodyOuterRefs` が 1 エントリ分の依存集合を作る。
+  置き場所は `executor/detail`（rank "relational"）: `executor/relational.cpp` と
+  `query/sql_engine.cpp` の両方から下向きに include でき、新しい layering
+  例外を増やさない（`query/query_data.*` へ置くと
+  `executor -> sql` の新規辺になった）。
+- **[契約] 非再帰エントリは自分の定義内では不可視。** 自己参照は外側
+  （外側 WITH、無ければカタログ表）へ解決する。コンプライアンス
+  `with_on_multiple_levels` が nested WITH でこの規則を固定している
+  （`(with q1 as (select x+100 x from q1) select x from q1)` の内側 q1 は
+  外側 q1=1 を読んで 101、隣の `q2` は外側 q1 を読んで 11）。したがって
+  **相互参照だけが循環**で、`WITH a AS (SELECT * FROM a)` は循環ではなく
+  未解決の関係（従来どおり "table a not found"）。自己参照が work table を
+  読むのは `WITH RECURSIVE` のときだけ。
+- **[修正] 循環は両層で同じ文言。** `ValidateCteDependencies`（WITH 1 スコープの
+  解決可能性検査）を `SqlEngine::PrepareStatement` の kSelect 入口で先に呼び、
+  `CteCycleStatus` の "cyclic CTE reference among a, b; mutual references
+  have no dependency order" を返す。実行器の CTE ループも同じ status を返す
+  （手組み `SelectStatement` 用の backstop）。
+- **[修正] 再帰 leaf のルートゲート。** `ExecuteUnnestSelect` は
+  `RecursiveCteLiftable(select, cte_name)` が成り立つときだけ work-table leaf を
+  作る（単一サイト・兄弟参照なし・出力名一意）。成り立たなければ失敗を返して
+  呼び出し側のフォールバックに任せ、依存順リレーショナル経路
+  （`ExecuteRecursiveCte` を WITH ループから駆動）が兄弟 CTE を解決する。
+- **[却下した案] 兄弟 CTE を `RecursiveCteExecutor` に渡す。** 渡すには
+  兄弟を先に materialize する必要があり、依存順・spill・スナップショットの
+  契約を Cascades 側へ二重実装することになる。ルートをリレーショナルへ
+  落とす方が小さく、既存の `RecursiveCteLiftable` ゲートとも整合する。
+- 回帰: `SqlEngineCteDependencyOrderFollowsNestedReferences`,
+  `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`,
+  `SqlEngineCyclicCteReferenceRejected`（変異検証: 依存走査を浅くする →
+  1 件失敗、自分の名前を依存に残す → 1 件失敗、フロントエンド検査を外す →
+  1 件失敗、unnest ルートのゲートを外す → 1 件失敗）。コンプライアンス
+  `with_queries_test` も通る（この検査を入れた直後に
+  `with_on_multiple_levels` が false cycle で落ち、自己参照の解決規則を
+  確定するきっかけになった）。
 
 ## 2026-10-20 再帰CTEの列一致契約 (JOIN USING / BY NAME / CORRESPONDING)
 

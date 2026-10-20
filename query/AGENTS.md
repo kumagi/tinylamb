@@ -187,6 +187,20 @@ set operations still match positionally and silently ignore the mode** — that
 gap is recorded in `docs/next-actions.md` (第42報), so no test should pin the
 positional answer for them.
 
+WITH lists are resolved in dependency order, not declaration order, and the
+check runs before any rewrite: `SqlEngine::PrepareStatement` calls
+`relational_detail::ValidateCteDependencies` (living in
+`executor/detail/subquery_runtime`, the lowest place both layers can include)
+and reports "cyclic CTE reference among a, b" for a mutual reference. A
+non-recursive entry is **not** visible inside its own definition — its
+self-named reference resolves to the enclosing WITH or to a catalog table
+(the compliance corpus's `with_on_multiple_levels` pins this for nested
+WITHs), so it is not a cycle. Only a `WITH RECURSIVE` entry reads its own
+name (as the work table). A recursive body that reads a sibling CTE must keep
+the dependency-ordered relational route, which is why
+`ExecuteUnnestSelect` consults `RecursiveCteLiftable` before minting a
+work-table leaf.
+
 Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_template_test`, `join_reduction_test`, `sql_clustered_order_test`,
 `sql_collation_test`,

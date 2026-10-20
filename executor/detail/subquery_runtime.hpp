@@ -482,6 +482,39 @@ StatusOr<Relation> ExecuteRecursiveCte(
     const CteMap& inherited_ctes,
     const RecursiveDepthSpec* depth_spec = nullptr);
 
+// Every table name a query tree reads, following nested WITH scope: a name an
+// inner WITH declares shadows the outer one, so it is not a reference to the
+// outer CTE.  The scan is deep (derived tables, scalar subqueries,
+// set-operation branches, nested WITH bodies) because the WITH dependency
+// order needs every reference, not just the FROM list -- a CTE that only
+// names a sibling inside a subquery depends on it just the same.
+//
+// A non-recursive entry is not visible inside its own definition (a self
+// reference there resolves to the enclosing WITH, or to a catalog table), so
+// descending into a WITH body drops that entry's own name from the scope.
+void CollectStatementTableRefs(const SelectStatement& statement,
+                               const std::unordered_set<std::string>& shadowed,
+                               std::unordered_set<std::string>* names);
+
+// Names one WITH entry's body reads from the enclosing scope, i.e. the
+// entries it depends on.  Siblings count (the list resolves in dependency
+// order), the entry's own name does not: a self reference either reads the
+// work table (WITH RECURSIVE) or resolves outward, never to itself.
+void CollectCteBodyOuterRefs(const SelectStatement& statement,
+                             const std::string& entry_name,
+                             std::unordered_set<std::string>* names);
+
+// Reports a WITH list whose entries wait on each other; `names` are the
+// entries that never became resolvable.
+Status CteCycleStatus(std::vector<std::string> names);
+
+// Checks one WITH scope: an entry may reference a sibling declared before or
+// after it (the list is resolved in dependency order, not declaration order),
+// and a WITH RECURSIVE entry may reference itself, but a cycle among distinct
+// entries (a mutual reference) can never be evaluated.  Returns kSuccess when
+// every entry is resolvable.
+Status ValidateCteDependencies(const SelectStatement& statement);
+
 // Applies one safe top-level derived-table boundary rewrite.  The relational
 // executor repeatedly calls this until it reaches a fixed point; EXPLAIN uses
 // the same helper so its displayed shape matches the executable query shape.

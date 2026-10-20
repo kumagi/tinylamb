@@ -366,7 +366,19 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       回帰: `SqlEngineRecursiveCteNameMatching*`,
       `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`）
 - [x] CTE 解決の依存順（WITH RECURSIVE 内の前方参照を許可。兄弟定義への参照を
-      トポロジカルに解決し、相互再帰はエラー化）
+      トポロジカルに解決し、相互再帰はエラー化）。依存走査は深く行う
+      （`executor/detail/subquery_runtime` の `CollectStatementTableRefs`:
+      派生表・スカラーサブクエリ・集合演算の枝・入れ子 WITH 本体まで。
+      `CollectCteBodyOuterRefs` がエントリごとの依存集合を作り、自分の名前は
+      外側へ解決するので依存に数えない）。相互参照は
+      `CteCycleStatus` の "cyclic CTE reference among a, b" になり、
+      `ValidateCteDependencies` が `PrepareStatement` で先に弾く（実行器の
+      CTE ループは手組み Statement 用の backstop）。再帰CTEの本体が兄弟 CTE を
+      読む場合は `ExecuteUnnestSelect` の `RecursiveCteLiftable` ゲートで
+      Cascades の work-table leaf を諦め、依存順リレーショナル経路へ落とす。
+      回帰: `SqlEngineCteDependencyOrderFollowsNestedReferences`,
+      `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`,
+      `SqlEngineCyclicCteReferenceRejected`
 - [x] テンプレート再構築でも再帰メタデータを保持（BindSelect が宣言順
       `WithQueryOrder()` でバインドし、`AddRecursiveWithQuery` /
       `SetRecursiveDepth` を再適用。従来はプランキャッシュ経由で recursive

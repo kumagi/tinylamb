@@ -33,6 +33,19 @@ Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
   filter is a `RuntimeFilterGroup`, not a bare key set),
   `ExecuteQuery/FinishQuery/ExecuteRecursiveCte`, correlated-index and
   uncorrelated-fingerprint caches, `OptimizeDerivedBoundaries`.
+  It also owns the WITH scope contract both this layer and the SQL frontend
+  call: `CollectStatementTableRefs` (every table a query tree reads, deep
+  through derived tables / scalar subqueries / set-operation branches / nested
+  WITH bodies, with inner WITH names shadowing outer ones),
+  `CollectCteBodyOuterRefs` (the entries one WITH body depends on; the
+  entry's own name is erased because a non-recursive entry is invisible
+  inside its own definition and resolves outward, while a WITH RECURSIVE one
+  reads the work table), `CteCycleStatus` and `ValidateCteDependencies`
+  (dependency-order resolvability of one WITH list; a mutual reference is
+  "cyclic CTE reference among a, b"). `ExecuteQuery` resolves the list in
+  dependency order and reports the same cycle status as the backstop for
+  hand-built statements — `SqlEngine::PrepareStatement` already validated
+  SQL input.
 - `window_eval.*`, `explain_format.*` — window evaluation, EXPLAIN rendering.
 
 ## Layering notes

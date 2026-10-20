@@ -539,7 +539,25 @@ Cascades rule / cost / statistics
       `SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns`。
       既知のギャップ: 非再帰の集合演算（`UNION ALL BY NAME` /
       `CORRESPONDING`）は依然として位置一致（`docs/next-actions.md` 第42報）。
-- [ ] CTE依存順、前方参照、相互再帰エラーを実装する。
+- [x] CTE依存順、前方参照、相互再帰エラーを実装する。
+      契約: WITH のエントリは宣言順ではなく依存順に解決する（前方参照可）。
+      依存の走査は深い（派生表・スカラーサブクエリ・集合演算の枝・入れ子 WITH の
+      本体まで。`executor/detail/subquery_runtime` の
+      `CollectStatementTableRefs` / `CollectCteBodyOuterRefs`。従来は直下の
+      FROM しか見ず、`WITH b AS (SELECT * FROM (SELECT * FROM a)), a AS (...)`
+      が "table a not found" になった）。非再帰エントリは自分の定義内では
+      不可視で、自己参照は外側（外側 WITH またはカタログ表）へ解決する
+      （コンプライアンス `with_on_multiple_levels` の nested WITH 規則と同じ。
+      再帰エントリの自己参照だけが work table を読む）。よって相互参照
+      （`a→b→a`）だけが循環で、`ValidateCteDependencies`（`PrepareStatement` の
+      kSelect 入口）と実行器の CTE ループが同じ
+      "cyclic CTE reference among a, b" を返す。実行器側は
+      手組み Statement 向けの backstop。再帰CTEの本体が兄弟 CTE を読む場合は
+      兄弟をスコープに持たない Cascades の work-table leaf へ流さず、
+      `RecursiveCteLiftable` ゲートで依存順リレーショナル経路へ落とす。
+      回帰: `SqlEngineCteDependencyOrderFollowsNestedReferences`,
+      `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`,
+      `SqlEngineCyclicCteReferenceRejected`。
 - [ ] plan template / cache再構築時にrecursive metadataを保持する。
 - [ ] WorkTableIndexを実装する。
 - [ ] CTE materialization / inlining / filter pushdownをコスト付きで選択する。

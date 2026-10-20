@@ -2726,4 +2726,150 @@ void MaterializeCacheRowsParallel(const std::string& cache_key,
   a.rows_boxed = true;
 }
 
+namespace {
+
+void CollectExpressionTableRefs(const Expression& expression,
+                                const std::unordered_set<std::string>& shadowed,
+                                std::unordered_set<std::string>* names) {
+  if (!expression) {
+    return;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const QueryExpression& query = expression->AsQueryExpression();
+    if (query.Query() != nullptr) {
+      CollectStatementTableRefs(*query.Query(), shadowed, names);
+    }
+    CollectExpressionTableRefs(query.Test(), shadowed, names);
+    return;
+  }
+  for (const Expression& child : ExpressionChildren(expression)) {
+    CollectExpressionTableRefs(child, shadowed, names);
+  }
+}
+
+}  // namespace
+
+void CollectStatementTableRefs(const SelectStatement& statement,
+                               const std::unordered_set<std::string>& shadowed,
+                               std::unordered_set<std::string>* names) {
+  std::unordered_set<std::string> local = shadowed;
+  for (const auto& [cte_name, body] : statement.WithQueries()) {
+    (void)body;
+    local.insert(cte_name);
+  }
+  for (const SelectSource& source : statement.Sources()) {
+    if (!source.table.empty() && !local.contains(source.table)) {
+      names->insert(source.table);
+    }
+    if (source.query != nullptr) {
+      CollectStatementTableRefs(*source.query, local, names);
+    }
+    CollectExpressionTableRefs(source.join_condition, local, names);
+    CollectExpressionTableRefs(source.unnest, local, names);
+  }
+  CollectExpressionTableRefs(statement.WhereClause(), local, names);
+  for (const NamedExpression& item : statement.SelectList()) {
+    CollectExpressionTableRefs(item.expression, local, names);
+  }
+  for (const Expression& expression : statement.GroupBy()) {
+    CollectExpressionTableRefs(expression, local, names);
+  }
+  CollectExpressionTableRefs(statement.Having(), local, names);
+  CollectExpressionTableRefs(statement.Qualify(), local, names);
+  for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    CollectExpressionTableRefs(term.expression, local, names);
+  }
+  for (const auto& branch : statement.UnionAll()) {
+    if (branch != nullptr) {
+      CollectStatementTableRefs(*branch, local, names);
+    }
+  }
+  if (const auto& tree = statement.GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      CollectStatementTableRefs(*tree->first, local, names);
+    }
+    for (const auto& branch : tree->branches) {
+      if (branch != nullptr) {
+        CollectStatementTableRefs(*branch, local, names);
+      }
+    }
+  }
+  for (const auto& [cte_name, body] : statement.WithQueries()) {
+    if (body == nullptr) {
+      continue;
+    }
+    std::unordered_set<std::string> body_scope = local;
+    if (!statement.IsRecursiveWith(cte_name) && !shadowed.contains(cte_name)) {
+      // A non-recursive entry is not visible inside its own definition, so a
+      // self-named reference there resolves to the enclosing scope (which may
+      // be an outer CTE) instead of the entry itself.
+      body_scope.erase(cte_name);
+    }
+    CollectStatementTableRefs(*body, body_scope, names);
+  }
+}
+
+void CollectCteBodyOuterRefs(const SelectStatement& statement,
+                             const std::string& entry_name,
+                             std::unordered_set<std::string>* names) {
+  const auto body_it = statement.WithQueries().find(entry_name);
+  if (body_it == statement.WithQueries().end() || body_it->second == nullptr) {
+    return;
+  }
+  // `{}` keeps the siblings visible (they are the entries this one may wait
+  // on); the body's own nested WITH names are added by the scan itself.
+  CollectStatementTableRefs(*body_it->second, {}, names);
+  names->erase(entry_name);
+}
+
+Status CteCycleStatus(std::vector<std::string> names) {
+  std::sort(names.begin(), names.end());
+  std::string listed;
+  for (const std::string& name : names) {
+    if (!listed.empty()) {
+      listed += ", ";
+    }
+    listed += name;
+  }
+  return StatusError(StatusCode::kInvalidArgument,
+                     "cyclic CTE reference among " + listed +
+                         "; mutual references have no dependency order");
+}
+
+Status ValidateCteDependencies(const SelectStatement& statement) {
+  if (statement.WithQueries().empty()) {
+    return Status::kSuccess;
+  }
+  std::unordered_set<std::string> pending;
+  for (const auto& [name, body] : statement.WithQueries()) {
+    (void)body;
+    pending.insert(name);
+  }
+  while (!pending.empty()) {
+    bool progress = false;
+    for (auto iter = pending.begin(); iter != pending.end();) {
+      const std::string& name = *iter;
+      std::unordered_set<std::string> referenced;
+      CollectCteBodyOuterRefs(statement, name, &referenced);
+      bool ready = true;
+      for (const std::string& table : referenced) {
+        if (pending.contains(table)) {
+          ready = false;
+          break;
+        }
+      }
+      if (ready) {
+        iter = pending.erase(iter);
+        progress = true;
+      } else {
+        ++iter;
+      }
+    }
+    if (!progress) {
+      return CteCycleStatus({pending.begin(), pending.end()});
+    }
+  }
+  return Status::kSuccess;
+}
+
 }  // namespace tinylamb::relational_detail

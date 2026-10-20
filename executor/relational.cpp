@@ -2381,20 +2381,6 @@ StatusOr<Relation> FinishQuery(TransactionContext& context,
 }
 namespace {
 
-bool ReferencesCte(const SelectStatement& statement, const std::string& name) {
-  for (const SelectSource& source : statement.Sources()) {
-    if (source.table == name) {
-      return true;
-    }
-    if (source.query && ReferencesCte(*source.query, name)) {
-      return true;
-    }
-  }
-  return std::ranges::any_of(statement.UnionAll(), [&name](const auto& branch) {
-    return branch && ReferencesCte(*branch, name);
-  });
-}
-
 bool IsIdentityDerived(const SelectStatement& statement) {
   if (statement.Sources().size() != 1 || statement.Sources()[0].query ||
       statement.Sources()[0].unnest || statement.Sources()[0].table.empty() ||
@@ -6351,10 +6337,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         const std::string& name = *iter;
         const SelectStatement& query = *statement.WithQueries().at(name);
         const bool recursive = statement.IsRecursiveWith(name);
+        std::unordered_set<std::string> referenced;
+        CollectCteBodyOuterRefs(statement, name, &referenced);
         bool ready = true;
-        for (const SelectSource& source : query.Sources()) {
-          if (!source.table.empty() && pending.contains(source.table) &&
-              !(recursive && source.table == name)) {
+        for (const std::string& table : referenced) {
+          if (pending.contains(table)) {
             ready = false;
             break;
           }
@@ -6375,16 +6362,13 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         }
       }
       if (!progress) {
-        // Cyclic references cannot be satisfied; run whatever remains in
-        // map order so the failure mirrors a missing relation.
-        for (const std::string& name : pending) {
-          ASSIGN_OR_RETURN(
-              Relation, cte_relation,
-              (ExecuteQuery(context, *statement.WithQueries().at(name), outer,
-                            ctes)));
-          ctes[name] = std::make_shared<Relation>(std::move(cte_relation));
-        }
-        break;
+        // Every remaining entry waits on another remaining entry, so the WITH
+        // list is a mutual reference with no dependency order.  Reporting it
+        // beats the "table not found" that executing the entries in map order
+        // used to produce.  The SQL frontend rejects the same shape before
+        // planning, so this is the backstop for statements handed straight to
+        // the executor.
+        return CteCycleStatus({pending.begin(), pending.end()});
       }
     }
   }

@@ -7479,6 +7479,17 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       if (it == select.WithQueries().end()) {
         return Status::kUnknown;
       }
+      // The leaf runs the body through the work-table driver with no sibling
+      // CTE in scope and one site to serve, so a body that reads another CTE
+      // of the same statement must keep the relational route -- only that one
+      // resolves the whole WITH list in dependency order.  The memo lift
+      // applies the same gate before minting an opaque leaf, and a rejected
+      // statement falls through to the relational route below.
+      if (!RecursiveCteLiftable(select, cte_name)) {
+        return StatusError(StatusCode::kNotImplemented,
+                           "recursive CTE " + cte_name +
+                               " needs the dependency-ordered route");
+      }
       const std::shared_ptr<SelectStatement>& rec_body = it->second;
       const RecursiveDepthSpec* depth_spec = select.RecursiveDepthOf(cte_name);
 
@@ -8566,6 +8577,19 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         return Status::kUnknown;
       }
       fused_sibling_aggregates_ = 0;
+      // A WITH list resolves in dependency order, so an entry may name a
+      // sibling declared after it; a mutual reference between entries has no
+      // evaluation order at all.  Reject it before any rewrite, so the error
+      // does not depend on which route plans the statement -- the executor
+      // keeps the same check as a backstop.
+      {
+        const Status cycle = relational_detail::ValidateCteDependencies(
+            dynamic_cast<const SelectStatement&>(*statement));
+        if (cycle != Status::kSuccess) {
+          last_error_ = cycle.GetMessage();
+          return cycle.GetCode();
+        }
+      }
       auto select = std::shared_ptr<SelectStatement>(
           dynamic_cast<SelectStatement*>(statement.release()));
       // M4: inline singly-referenced non-recursive CTEs into derived

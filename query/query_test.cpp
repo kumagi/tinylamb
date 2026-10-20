@@ -4202,6 +4202,105 @@ TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns) {
   ctx.txn_.Abort();
 }
 
+// CTE entries live in an unordered map, so the WITH list is resolved in
+// dependency order rather than declaration order -- and that order has to
+// follow the references wherever they sit.  A sibling named only inside a
+// derived table, a scalar subquery or a set-operation branch used to be
+// executed before its dependency existed ("table a not found").
+TEST_F(QueryTest, SqlEngineCteDependencyOrderFollowsNestedReferences) {
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH b AS (SELECT * FROM (SELECT * FROM a)), "
+                   "a AS (SELECT 1 AS x) SELECT * FROM b;"),
+            (std::vector<Row>{Row({Value(1)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH b AS (SELECT (SELECT MAX(x) FROM a) AS m), "
+                   "a AS (SELECT 1 AS x) SELECT * FROM b;"),
+            (std::vector<Row>{Row({Value(1)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH b AS (SELECT * FROM a UNION ALL SELECT * FROM a), "
+                   "a AS (SELECT 1 AS x) SELECT * FROM b ORDER BY x;"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+// A recursive body that reads a sibling CTE keeps the dependency-ordered
+// route: the work-table leaf runs with no sibling in scope, so the fixpoint
+// has to be driven by the route that resolved the whole WITH list first.
+TEST_F(QueryTest, SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder) {
+  TransactionContext ctx = db_->BeginContext();
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE a AS (SELECT n FROM b "
+             "UNION ALL SELECT n + 1 FROM a WHERE n < 3), b AS (SELECT 1 AS n) "
+             "SELECT * FROM a ORDER BY n;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0], Row({Value(1)}));
+  EXPECT_EQ(rows[2], Row({Value(3)}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH RECURSIVE a AS (SELECT n FROM b "
+                   "UNION ALL SELECT n + 1 FROM a WHERE n < 3), "
+                   "b AS (SELECT 1 AS n) SELECT SUM(n) FROM a;"),
+            (std::vector<Row>{Row({Value(6)})}));
+  ctx.txn_.Abort();
+}
+
+// A mutual reference among WITH entries has no evaluation order at all, so
+// it is rejected by name instead of surfacing as "table not found" (a plain
+// self reference is not a cycle -- it resolves outward; see below).
+TEST_F(QueryTest, SqlEngineCyclicCteReferenceRejected) {
+  TransactionContext ctx = db_->BeginContext();
+  const auto expect_cycle = [&](std::string_view sql, std::string_view listed) {
+    SqlEngine engine(*db_);
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_FALSE(prepared.HasValue()) << sql;
+    EXPECT_NE(engine.LastError().find("cyclic CTE reference among " +
+                                      std::string(listed)),
+              std::string::npos)
+        << sql << "\n"
+        << engine.LastError();
+  };
+  expect_cycle(
+      "WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) SELECT * FROM a;",
+      "a, b");
+  expect_cycle(
+      "WITH RECURSIVE a AS (SELECT * FROM b), b AS (SELECT * FROM a) "
+      "SELECT * FROM a;",
+      "a, b");
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH RECURSIVE a AS (SELECT 1 AS n "
+                   "UNION ALL SELECT n + 1 FROM a WHERE n < 2) "
+                   "SELECT * FROM a ORDER BY n;"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+  // A non-recursive entry is invisible inside its own definition, so a self
+  // reference resolves outward: the enclosing WITH, or a catalog table
+  // (`with_on_multiple_levels` in the compliance corpus pins the same rule
+  // for nested WITHs).  It is therefore not a cycle -- and with nothing to
+  // resolve to it is still a missing relation, not a false cycle report.
+  RunSql(ctx, *db_, "CREATE TABLE cte_outward (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO cte_outward VALUES (1);");
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH cte_outward AS (SELECT x + 1 AS x FROM cte_outward) "
+                   "SELECT * FROM cte_outward;"),
+            (std::vector<Row>{Row({Value(2)})}));
+  {
+    SqlEngine engine(*db_);
+    StatusOr<Executor> unresolved =
+        engine.Prepare(ctx, "WITH a AS (SELECT * FROM a) SELECT * FROM a;");
+    std::string message;
+    if (!unresolved.HasValue()) {
+      message = engine.LastError();
+    } else {
+      Row row;
+      while (unresolved.Value()->Next(&row, nullptr)) {
+      }
+      message = unresolved.Value()->GetStatus().GetMessage();
+    }
+    EXPECT_NE(message.find("not found"), std::string::npos) << message;
+  }
+  ctx.txn_.Abort();
+}
+
 // WITH DEPTH modifier: iteration count is bounded explicitly, every row
 // carries its depth, and the depth-0 anchor stays hidden below a non-zero
 // lower bound.
