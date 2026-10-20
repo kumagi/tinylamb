@@ -38,6 +38,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval.hpp"
+#include "executor/detail/work_table_index.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/set_operation.hpp"
 #include "executor/spill_file.hpp"
@@ -1529,52 +1530,13 @@ StatusOr<Relation> Project(TransactionContext& context,
   return output;
 }
 
-namespace {
-
-// GoogleSQL DISTINCT treats every NaN as equal (they collapse to a single
-// group) and folds -0.0 into +0.0.  The default Value/Row equality returns
-// false for NaN != NaN, so DISTINCT needs this canonical-aware comparison
-// (mirroring CompareForOrderBy / CanonicalDistinctValue). The rule itself
-// lives in type/collation.hpp so DISTINCT, ORDER BY ties and Top-N boundaries
-// all agree on which rows are peers.
-bool CanonicalValuesEqual(const Value& x, const Value& y) {
-  return EqualUnderCollation(x, y);
-}
-
-struct CanonicalRowEqual {
-  bool operator()(const Row& a, const Row& b) const {
-    if (a.values_.size() != b.values_.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < a.values_.size(); ++i) {
-      if (!CanonicalValuesEqual(a.values_[i], b.values_[i])) {
-        return false;
-      }
-    }
-    return true;
-  }
-};
-
-struct CanonicalRowHash {
-  size_t operator()(const Row& r) const {
-    size_t h = 1469598103934665603ULL;  // FNV-1a offset basis
-    for (const Value& value : r.values_) {
-      h ^= std::hash<Value>()(CanonicalDistinctValue(value));
-      h *= 1099511628211ULL;  // FNV-1a prime
-    }
-    return h;
-  }
-};
-
-}  // namespace
-
 StatusOr<Relation> DistinctOf(Relation input,
                               const std::vector<Expression>& distinct_on = {},
                               TransactionContext* ctx = nullptr,
                               const Scope* outer = nullptr,
                               const CteMap* ctes = nullptr) {
   if (distinct_on.empty()) {
-    std::unordered_set<Row, CanonicalRowHash, CanonicalRowEqual> seen;
+    WorkTableIndex seen;
     Relation distinct;
     distinct.schema = input.schema;
     CopyExecutionStats(&distinct, input);
@@ -1586,7 +1548,7 @@ StatusOr<Relation> DistinctOf(Relation input,
       for (Value& value : canonical.values_) {
         value = CanonicalDistinctValue(value);
       }
-      if (seen.insert(canonical).second) {
+      if (seen.Insert(canonical)) {
         distinct.AddRow(std::move(canonical));
       }
     }));
@@ -1621,7 +1583,7 @@ StatusOr<Relation> DistinctOf(Relation input,
       if (seen_k.size() == current_keys.size()) {
         bool match = true;
         for (size_t i = 0; i < seen_k.size(); ++i) {
-          if (!CanonicalValuesEqual(seen_k[i], current_keys[i])) {
+          if (!EqualUnderCollation(seen_k[i], current_keys[i])) {
             match = false;
             break;
           }
@@ -3046,30 +3008,6 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
 
 namespace {
 
-bool SameRow(const Row& left, const Row& right) {
-  if (left.values_.size() != right.values_.size()) {
-    return false;
-  }
-  for (size_t i = 0; i < left.values_.size(); ++i) {
-    const Value& a = left.values_[i];
-    const Value& b = right.values_[i];
-    if (a.IsNull() || b.IsNull()) {
-      if (!a.IsNull() || !b.IsNull()) {
-        return false;
-      }
-      continue;
-    }
-    try {
-      if (!(a == b)) {
-        return false;
-      }
-    } catch (...) {
-      return false;
-    }
-  }
-  return true;
-}
-
 // Recursive-union column contract.  The set-operation metadata names the
 // column-match mode per term: `BY NAME` / `STRICT CORRESPONDING` demand the
 // same column names on both sides, plain `CORRESPONDING` keeps only the
@@ -3262,18 +3200,13 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
   Relation delta(context.execution_runtime());
   delta.schema = result.schema;
 
-  std::vector<Row> seen;
+  // UNION (DISTINCT) has to drop a row any earlier round already produced.
+  // The working-table index answers that with one lookup; the linear scan it
+  // replaces was quadratic (a 320k-row recursion spent minutes in it).  It
+  // counts here (and only here) so a test can see the loop consult it.
+  WorkTableIndex seen(/*count_stats=*/true);
   auto already_seen = [&](const Row& row) {
-    if (!distinct) {
-      return false;
-    }
-    for (const Row& prior : seen) {
-      if (SameRow(prior, row)) {
-        return true;
-      }
-    }
-    seen.push_back(row);
-    return false;
+    return distinct && !seen.Insert(row);
   };
   auto add_anchor = [&](const Row& row) {
     if (already_seen(row)) {

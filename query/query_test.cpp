@@ -35,6 +35,7 @@
 #include "database/database.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/window_eval.hpp"
+#include "executor/detail/work_table_index.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/query_memory.hpp"
@@ -4037,6 +4038,67 @@ TEST_F(QueryTest, SqlEngineRecursiveCteTransitiveClosureWithUnionDistinct) {
   ASSERT_EQ(rows.size(), 1U);
   // Closure edges reachable from node 1: (1,2), (2,2), (2,3), (3,4).
   EXPECT_EQ(rows[0][0], Value(4));
+  ctx.txn_.Abort();
+}
+
+// UNION (DISTINCT) recursion drops a row any earlier round already produced.
+// The loop keeps that working-table set in a hash index (WorkTableIndex)
+// instead of scanning every row seen so far -- the scan was quadratic (a
+// 320k-row recursion spent minutes in it).  The counters prove the loop really
+// consults the index; the peer cases prove it keeps the DISTINCT rule while
+// doing so, so a recursive UNION DISTINCT and a top-level DISTINCT agree on
+// which rows are duplicates.
+TEST_F(QueryTest, SqlEngineRecursiveCteDedupesThroughWorkTableIndex) {
+  TransactionContext ctx = db_->BeginContext();
+  relational_detail::WorkTableIndexCounters& counters =
+      relational_detail::WorkTableIndexStats();
+  const uint64_t inserts_before = counters.inserts.load();
+  const uint64_t duplicates_before = counters.duplicates.load();
+  // Three distinct rounds: 1 (anchor), 2, 3.
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS n UNION DISTINCT SELECT n + 1 "
+             "FROM t WHERE n < 3) SELECT n FROM t ORDER BY n;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[2][0], Value(3));
+  EXPECT_EQ(counters.inserts.load() - inserts_before, 3U);
+  EXPECT_EQ(counters.duplicates.load() - duplicates_before, 0U);
+
+  // A term that reproduces its input is a duplicate, not a new round: the
+  // index has to stop the recursion after one round instead of walking to the
+  // iteration cap.  NaN, -0.0/+0.0 and NULL all have to collapse to one peer.
+  const uint64_t peer_inserts_before = counters.inserts.load();
+  const uint64_t peer_duplicates_before = counters.duplicates.load();
+  rows = RunSql(ctx, *db_,
+                "WITH RECURSIVE t AS (SELECT CAST('NaN' AS FLOAT64) AS x "
+                "UNION DISTINCT SELECT x FROM t) SELECT COUNT(*) FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  rows = RunSql(ctx, *db_,
+                "WITH RECURSIVE t AS (SELECT -0.0 AS x UNION DISTINCT "
+                "SELECT x + 0.0 FROM t) SELECT COUNT(*) FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  rows = RunSql(ctx, *db_,
+                "WITH RECURSIVE t AS (SELECT CAST(NULL AS INT64) AS x "
+                "UNION DISTINCT SELECT x FROM t) SELECT COUNT(*) FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  // Each statement indexed its anchor and its one duplicate round.
+  EXPECT_EQ(counters.inserts.load() - peer_inserts_before, 6U);
+  EXPECT_EQ(counters.duplicates.load() - peer_duplicates_before, 3U);
+
+  // Wide recursion: every round adds thousands of rows, so the seen set grows
+  // to the whole result.  This is the shape that made the linear scan
+  // quadratic; keep it as a scale guard.
+  rows = RunSql(
+      ctx, *db_,
+      "WITH RECURSIVE t AS (SELECT 0 AS v UNION DISTINCT SELECT v * 16 + k "
+      "FROM t CROSS JOIN UNNEST(GENERATE_SERIES(1, 16)) AS k WHERE v < 20000) "
+      "SELECT COUNT(*) FROM t;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(320001));
   ctx.txn_.Abort();
 }
 

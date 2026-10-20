@@ -1,9 +1,13 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第45報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
+Recursive)の次項目: **WorkTableIndex**。詳細は下記「2026-10-20 WorkTableIndex
+(再帰 UNION DISTINCT の作業テーブル索引)」の節。CTE 節の `[ ]` は残り 1 件
+(CTE materialization / inlining / filter pushdown のコスト選択)。
+
 2026-10-20 加筆(第44報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
 Recursive)の次項目: **plan template / cache 再構築時の recursive metadata 保持**。
-詳細は下記「2026-10-20 テンプレートキャッシュと再帰メタデータ」の節。CTE 節の
-`[ ]` は残り 2 件。
+詳細は下記「2026-10-20 テンプレートキャッシュと再帰メタデータ」の節。
 
 2026-10-20 加筆(第43報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
 Recursive)の次項目: **CTE依存順 / 前方参照 / 相互再帰エラー**。詳細は下記
@@ -43,6 +47,45 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 WorkTableIndex (再帰 UNION DISTINCT の作業テーブル索引)
+
+- **[課題] UNION DISTINCT 再帰の重複判定が二次だった。** `ExecuteRecursiveCte`
+  は「前のラウンドまでに同じ行が出たか」を `std::vector<Row> seen` の線形走査で
+  判定していた。再帰の各ラウンドは数千行を足せるので `seen` は結果全体まで育ち、
+  320001 行を生成する再帰（`v*16+k` を `GENERATE_SERIES` で展開）は **3分17秒**
+  かかっていた。反復上限 1024 は行数の上限ではないため、行予算 1000 万行まで
+  この二次コストは現実に効く。
+- **[実装] `WorkTableIndex`**（`executor/detail/work_table_index.{hpp,cpp}`）。
+  `Insert(row) -> bool`（新規なら true）と `Contains`。ピア規則は DISTINCT と
+  同一で、`EqualUnderCollation` + `CanonicalDistinctValue` の組を使う
+  （NaN は 1 ピア、-0.0 == +0.0、大文字小文字非依存の照合は畳み込み、NULL は
+  NULL 同値、幅と型タグは区別）。`DistinctOf` もしていた私家版の
+  `CanonicalRowHash`/`CanonicalRowEqual` を捨ててこの実装を共有する（規則が
+  1 箇所になる）。同じ 320001 行の再帰が **0.27 秒**。
+- **[契約] これは結合アクセス経路ではない。** CTE 名は前ラウンドのデルタに
+  束縛される（BigQuery の working-table 契約 = 再帰項は累積結果を読めない）。
+  よって各ラウンドの結合は join 演算子がそのデルタをハッシュ化しており、
+  ラウンドを跨ぐ永続索引は意味を持たない（累積テーブルを引くと意味論が変わる）。
+  ループ自身が索引を必要とするのは「どの行が新規か」の判定であり、
+  `WorkTableIndex` はそこだけを担う。
+- **[観測] ループが索引を引いたことをテストで見る。** `WorkTableIndexStats()` に
+  `inserts` / `duplicates` を置き、テストは差分で読む。`EXPLAIN` に出さないのは、
+  再帰CTEが Cascades の `RecursiveCteExecutor` 経由になり RelationalExecutor の
+  統計行が出ない経路があるため（`shared_exists_build_reuses` と違い、
+  ルート非依存に観測できる必要がある）。
+- 変異検証: (1) ループを線形走査に戻す → カウンタが動かず e2e 失敗（実行時間も
+  195 秒に戻る）、(2) ハッシュから `CanonicalDistinctValue` を外す →
+  大文字小文字非依存ペアの unit テスト失敗、(3) 等値判定を `Value::operator==`
+  に落とす → 同上（照合の畳み込みが消える）。
+- 回帰: `WorkTableIndexTest.*`（8 件）,
+  `QueryTest.SqlEngineRecursiveCteDedupesThroughWorkTableIndex`（3 ラウンドの
+  カウンタ、NaN / -0.0 / NULL のピア、320001 行のスケールガード）。
+- **[残課題] 結合側の索引アクセスは無い。** デルタ束縛のため、再帰項の結合は
+  毎ラウンド join 演算子のハッシュ表を作り直す。これを削るには「同一ラウンド内で
+  複数の CTE 参照が同じデルタを共有する」形（`t a JOIN t b`）でハッシュ表を
+  1 回にまとめる配管が要る（意味論は変わらない）。必要になったら
+  `CteMap` の束縛に索引を持たせる形で、`Relation` の共有ビューと一緒に設計する。
 
 ## 2026-10-20 テンプレートキャッシュと再帰メタデータ (再構築が実際に走るまで)
 

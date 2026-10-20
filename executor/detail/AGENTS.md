@@ -47,6 +47,18 @@ Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
   hand-built statements — `SqlEngine::PrepareStatement` already validated
   SQL input.
 - `window_eval.*`, `explain_format.*` — window evaluation, EXPLAIN rendering.
+- `work_table_index.{hpp,cpp}` — `WorkTableIndex`, the hash index over a
+  recursive CTE's working table. `ExecuteRecursiveCte` used to answer "did an
+  earlier round already produce this row?" (UNION DISTINCT recursion) with a
+  linear scan over every seen row, i.e. quadratic in the result (a 320k-row
+  recursion spent minutes there; 0.27s once indexed). The peer rule is the
+  DISTINCT rule (`EqualUnderCollation` + `CanonicalDistinctValue`, so NaN is
+  one peer, -0.0 == +0.0, a case-insensitive pair folds, NULL == NULL) — the
+  same pair `DistinctOf` uses. It is *not* a join access path: the CTE name is
+  bound to the previous round's delta (BigQuery working-table contract), so
+  each round's join hashes that delta itself and the term must never read the
+  accumulated table. `WorkTableIndexStats()` counts `inserts`/`duplicates`
+  so tests can prove the loop consults the index.
 
 ## Layering notes
 

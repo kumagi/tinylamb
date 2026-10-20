@@ -440,6 +440,7 @@ tinylamb_add_layer(tinylamb_executor
         executor/detail/scan_filter.cpp
         executor/detail/planning_heuristics.cpp
         executor/detail/explain_format.cpp
+        executor/detail/work_table_index.cpp
         executor/index_scan.cpp
         executor/index_only_scan.cpp
         executor/parallel_index_scan.cpp
@@ -837,6 +838,7 @@ add_simple_test(executor/sort_shape_executor_test.cpp)
 add_simple_test(executor/grouped_aggregate_test.cpp)
 add_simple_test(executor/window_spill_test.cpp)
 add_simple_test(executor/detail/flat_int_key_map_test.cpp)
+add_simple_test(executor/detail/work_table_index_test.cpp)
 add_simple_test(executor/merge_append_test.cpp)
 add_simple_test(expression/function_call_test.cpp)
 add_simple_test(expression/json_text_test.cpp)

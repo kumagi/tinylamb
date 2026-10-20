@@ -582,7 +582,23 @@ Cascades rule / cost / statistics
       回帰: `TemplateCacheKeepsRecursiveCteMetadata`,
       `SqlTemplateTest.BindsRecursiveWithSetOperationOnce`,
       `SqlTemplateTest.BindsRecursiveWithDepthBounds`。
-- [ ] WorkTableIndexを実装する。
+- [x] WorkTableIndexを実装する。
+      契約: 再帰CTEの作業テーブル（累積結果）に対するハッシュ索引
+      `WorkTableIndex`（`executor/detail/work_table_index.{hpp,cpp}`）。
+      `UNION DISTINCT` 再帰の「前のラウンドまでに同じ行が出たか」を 1 回の
+      ハッシュ参照で判定する。従来は既出全行の線形走査で、結果サイズに対して
+      二次だった（320001 行を生成する再帰が 3分17秒 → 0.27 秒）。
+      ピア規則は DISTINCT と同一（`EqualUnderCollation` +
+      `CanonicalDistinctValue`: NaN は 1 ピア、-0.0 は +0.0 と同値、
+      大文字小文字非依存の照合は畳み込み、NULL は NULL 同値、幅・型は区別）で、
+      `DistinctOf` も同じ実装を共有する。**これは結合アクセス経路ではない**:
+      CTE 名は前ラウンドのデルタに束縛される（BigQuery の working-table 契約）
+      ため、各ラウンドの結合は join 演算子がそのデルタをハッシュ化し、再帰項は
+      累積テーブルを参照できない。ループ自身が索引を必要とするのは
+      「どの行が新規か」であり、そこを担う。`WorkTableIndexStats()` の
+      `inserts` / `duplicates` でループが索引を引いたことを観測できる。
+      回帰: `WorkTableIndexTest.*`（8 件）,
+      `SqlEngineRecursiveCteDedupesThroughWorkTableIndex`。
 - [ ] CTE materialization / inlining / filter pushdownをコスト付きで選択する。
 - [x] CTE predicate propagationを実装する。
 - [x] recursive CTE union rewriteを実装する。
