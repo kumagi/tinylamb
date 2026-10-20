@@ -688,6 +688,102 @@ TEST(SqlTemplateTest, BindSelectPreservesRecursiveWithMetadata) {
   EXPECT_EQ(depth->upper, 10);
 }
 
+TEST(SqlTemplateTest, BindsRecursiveWithSetOperationOnce) {
+  // A set operation keeps two views of the same operands: the flat
+  // `UnionAll()` vectors and the explicit `SetOperationTree`, and both hold
+  // the SAME branch nodes (plus a pre-branch copy of the head as `first`).
+  // Binding both views consumed every literal twice, so the bind ended in a
+  // parameter underflow and no recursive WITH body (whose body is a set
+  // operation) could ever enter the template cache.
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  auto original = ParseSql(
+      "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 3) SELECT n FROM t ORDER BY n;");
+  ASSERT_NE(original, nullptr);
+  const SqlTemplate templated = ExtractSqlTemplate(
+      "WITH RECURSIVE t AS (SELECT 10 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 12) SELECT n FROM t ORDER BY n;");
+  ASSERT_TRUE(templated.templatable);
+  ASSERT_EQ(templated.parameters.size(), 3U);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or.GetStatus().GetMessage();
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound_or.Value());
+  EXPECT_TRUE(select.IsRecursiveWith("t"));
+  const auto& body =
+      dynamic_cast<const SelectStatement&>(*select.WithQueries().at("t"));
+  ASSERT_EQ(body.SelectList().size(), 1U);
+  EXPECT_EQ(body.SelectList()[0].expression->ToString(), "10");
+  ASSERT_EQ(body.UnionAll().size(), 1U);
+  EXPECT_EQ(body.UnionAll()[0]->SelectList()[0].expression->ToString(),
+            "(n + 1)");
+  // The tree's branches are the same nodes that were just bound, and its head
+  // copy was bound from the parameters the head consumed -- not from the ones
+  // that follow.
+  const auto& tree = body.GetSetOperationTree();
+  ASSERT_NE(tree, nullptr);
+  ASSERT_EQ(tree->branches.size(), 1U);
+  EXPECT_EQ(tree->branches[0].get(), body.UnionAll()[0].get());
+  ASSERT_NE(tree->first, nullptr);
+  EXPECT_EQ(tree->first->SelectList()[0].expression->ToString(), "10");
+}
+
+TEST(SqlTemplateTest, BindsRecursiveWithDepthBounds) {
+  // `WITH DEPTH ... BETWEEN <lower> AND <upper>` keeps the bounds in the CTE's
+  // metadata, not in an expression tree, but each bound written as an integer
+  // literal is still a text literal and gets extracted as a parameter.  A
+  // replay must take the new bounds; an UNBOUNDED side contributes none.
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  auto original = ParseSql(
+      "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 3) WITH DEPTH BETWEEN 0 AND 2 SELECT n, depth FROM t;");
+  ASSERT_NE(original, nullptr);
+  const SqlTemplate templated = ExtractSqlTemplate(
+      "WITH RECURSIVE t AS (SELECT 10 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 12) WITH DEPTH BETWEEN 5 AND 7 SELECT n, depth FROM t;");
+  ASSERT_TRUE(templated.templatable);
+  ASSERT_EQ(templated.parameters.size(), 5U);
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue()) << bound_or.GetStatus().GetMessage();
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound_or.Value());
+  const RecursiveDepthSpec* depth = select.RecursiveDepthOf("t");
+  ASSERT_NE(depth, nullptr);
+  EXPECT_EQ(depth->lower, 5);
+  EXPECT_EQ(depth->upper, 7);
+  EXPECT_TRUE(depth->lower_is_literal);
+  EXPECT_TRUE(depth->upper_is_literal);
+  const auto& body =
+      dynamic_cast<const SelectStatement&>(*select.WithQueries().at("t"));
+  EXPECT_EQ(body.SelectList()[0].expression->ToString(), "10");
+
+  auto unbounded_original = ParseSql(
+      "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 3) WITH DEPTH BETWEEN 0 AND UNBOUNDED SELECT n, depth FROM "
+      "t;");
+  ASSERT_NE(unbounded_original, nullptr);
+  const SqlTemplate unbounded = ExtractSqlTemplate(
+      "WITH RECURSIVE t AS (SELECT 10 AS n UNION ALL SELECT n + 1 FROM t "
+      "WHERE n < 12) WITH DEPTH BETWEEN 5 AND UNBOUNDED SELECT n, depth FROM "
+      "t;");
+  ASSERT_TRUE(unbounded.templatable);
+  ASSERT_EQ(unbounded.parameters.size(), 4U);
+  auto unbounded_bound =
+      BindStatementLiterals(*unbounded_original, unbounded.parameters);
+  ASSERT_TRUE(unbounded_bound.HasValue())
+      << unbounded_bound.GetStatus().GetMessage();
+  const auto& unbounded_select =
+      dynamic_cast<const SelectStatement&>(*unbounded_bound.Value());
+  const RecursiveDepthSpec* unbounded_depth =
+      unbounded_select.RecursiveDepthOf("t");
+  ASSERT_NE(unbounded_depth, nullptr);
+  EXPECT_EQ(unbounded_depth->lower, 5);
+  EXPECT_TRUE(unbounded_depth->lower_is_literal);
+  EXPECT_FALSE(unbounded_depth->upper_is_literal);
+}
+
 TEST(SqlTemplateTest, BindPreservesUpdateAndDeleteAliases) {
   // "UPDATE tbl AS alias" / "DELETE FROM tbl AS alias" make bare alias
   // references denote the whole row; a rebind must not drop the alias.

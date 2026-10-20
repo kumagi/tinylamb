@@ -382,7 +382,19 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] テンプレート再構築でも再帰メタデータを保持（BindSelect が宣言順
       `WithQueryOrder()` でバインドし、`AddRecursiveWithQuery` /
       `SetRecursiveDepth` を再適用。従来はプランキャッシュ経由で recursive
-      フラグが落ちて自己参照が unknown table になっていた）
+      フラグが落ちて自己参照が unknown table になっていた）。さらに、その
+      再構築が実際に走るように 2 つのバインド失敗を修正: 集合演算が flat な
+      `UnionAll()` と `SetOperationTree` を同じ枝ノードで共有するため両方を
+      バインドして全リテラルを二重消費していた（tree は flat の結果を共有し、
+      `first` はヘッドのパラメータ範囲から複製）。`WITH DEPTH` の上下限は
+      メタデータに載るがテキスト上は整数リテラルなので、`RecursiveDepthSpec`
+      の `*_is_literal` を見て本文の直後に消費し、新しい値を書き戻す
+      （`UNBOUNDED` は消費しない）。複数エントリ WITH でリテラル深さ上限が
+      ある場合は宣言順を復元できないためテンプレート化を拒否。キャッシュの
+      実効性は `PlanCacheStats().template_fills` / `template_hits` で観測。
+      回帰: `TemplateCacheKeepsRecursiveCteMetadata`,
+      `SqlTemplateTest.BindsRecursiveWithSetOperationOnce`,
+      `SqlTemplateTest.BindsRecursiveWithDepthBounds`
 - [ ] `WorkTableIndex`（再帰結合用）
 - [x] `CacheSubquery`（`ExecuteCachedUncorrelated` が非相関サブクエリを 1 回だけ
       materialize。再利用と cache hit を回帰テスト）

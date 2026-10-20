@@ -61,6 +61,23 @@ a SELECT replay slower than 50 ms and
   hpp, cpp
 }` — optimizer input (compiled into `tinylamb_executor`
   for the `plan/ → query_data` edge). `join_reduction.*` — join simplification.
+- **Template-cache contract.** The parsed-tree cache (`FindTemplate` /
+  `RememberTemplate` in `sql_engine.cpp`, keyed by the literal-free
+  fingerprint) replays through `SqlTemplate::BindSelect`, which must rebuild
+  the tree in *text order* and carry every piece of metadata a route depends
+  on: `WITH RECURSIVE` markers, `RecursiveDepthSpec` (including its bounds,
+  which are metadata rather than expressions, so the binder consumes their
+  literals from the parameter list itself), per-branch
+  `SetOperationMatch`/`SetOperationKind`, and the `SetOperationTree`. A set
+  operation keeps two views of the same operands (the flat `UnionAll()`
+  vectors and the tree, sharing the branch nodes) — bind the flat vectors
+  once and rebuild the tree from them, or every literal is consumed twice and
+  the bind dies with a parameter underflow. Tests can distinguish "the cache
+  served this statement" from "it parsed verbatim" with
+  `PlanCacheStats().template_fills` / `template_hits`.
+  Regressions: `QueryTest.TemplateCacheKeepsRecursiveCteMetadata`,
+  `SqlTemplateTest.BindsRecursiveWithSetOperationOnce`,
+  `SqlTemplateTest.BindsRecursiveWithDepthBounds`.
 - `testdata/googlesql_compliance/` + `googlesql_compliance_{file,test}.*` —
   corpus-driven compliance (`[mode=explain]` / `[mode=explain_analyze]`
   fragments). `sql_oracle_fuzzer.*`, `expr_oracle_fuzzer.*`,

@@ -98,6 +98,13 @@ struct PlanCacheCounters {
   std::atomic<uint64_t> fills{0};
   std::atomic<uint64_t> evictions{0};
   std::atomic<uint64_t> epoch_invalidations{0};
+  // The parsed-tree cache (`FindTemplate`/`RememberTemplate` in sql_engine) is
+  // separate from compiled plans and is keyed by the literal-free fingerprint.
+  // `template_fills` counts a stored tree; `template_hits` counts a lookup
+  // whose literals rebound successfully (a failed rebind parses the SQL
+  // verbatim, so it is neither a hit nor a fill).
+  std::atomic<uint64_t> template_fills{0};
+  std::atomic<uint64_t> template_hits{0};
 };
 
 inline PlanCacheCounters& PlanCacheStats() {

@@ -8157,7 +8157,11 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                 }
               }
               const auto bounds = depth_modifier->Children("IntOrUnbounded");
-              auto bound_value = [&](size_t index, int64_t fallback) {
+              bool lower_is_literal = false;
+              bool upper_is_literal = false;
+              auto bound_value = [&](size_t index, int64_t fallback,
+                                     bool* is_literal) {
+                *is_literal = false;
                 if (index >= bounds.size()) {
                   return fallback;
                 }
@@ -8165,14 +8169,18 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                   if (child->kind == "IntLiteral") {
                     auto h_lit = ParseUnsignedLiteral(*child);
                     if (h_lit.HasValue()) {
+                      *is_literal = true;
                       return static_cast<int64_t>(h_lit.MoveValue());
                     }
                   }
                 }
                 return fallback;
               };
-              spec.lower = bound_value(0, 0);
-              spec.upper = bound_value(1, std::numeric_limits<int64_t>::max());
+              spec.lower = bound_value(0, 0, &lower_is_literal);
+              spec.upper = bound_value(1, std::numeric_limits<int64_t>::max(),
+                                       &upper_is_literal);
+              spec.lower_is_literal = lower_is_literal;
+              spec.upper_is_literal = upper_is_literal;
               statement->SetRecursiveDepth(cte_name, std::move(spec));
             }
           }

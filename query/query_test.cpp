@@ -4689,6 +4689,60 @@ TEST_F(QueryTest, SqlEnginePlanCacheHitsOnRepeatedStatement) {
   ctx.txn_.Abort();
 }
 
+// The template cache replays a WITH body through `SqlTemplate::BindSelect`, so
+// the rebuilt tree has to carry the recursive flags and the depth spec:
+// dropping the flags turns the self reference into an unknown table, and
+// keeping a stale depth spec changes how many rounds the work table runs.
+// Literals are rebound on top, so a same-shape replay also proves the anchor,
+// the term and the depth bounds take the new values.
+TEST_F(QueryTest, TemplateCacheKeepsRecursiveCteMetadata) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  const auto template_hits = [] {
+    return PlanCacheStats().template_hits.load();
+  };
+  const std::string sql =
+      "WITH RECURSIVE t AS (SELECT 1 AS n "
+      "UNION ALL SELECT n + 1 FROM t WHERE n < 3) "
+      "SELECT n FROM t ORDER BY n;";
+  const std::vector<Row> expected = {Row({Value(1)}), Row({Value(2)}),
+                                     Row({Value(3)})};
+  EXPECT_EQ(RunPrepared(&engine, &ctx, sql), expected);
+  const uint64_t hits_before = template_hits();
+  EXPECT_EQ(RunPrepared(&engine, &ctx, sql), expected);
+  EXPECT_EQ(template_hits(), hits_before + 1);
+  const uint64_t changed_before = template_hits();
+  EXPECT_EQ(
+      RunPrepared(&engine, &ctx,
+                  "WITH RECURSIVE t AS (SELECT 10 AS n "
+                  "UNION ALL SELECT n + 1 FROM t WHERE n < 12) "
+                  "SELECT n FROM t ORDER BY n;"),
+      (std::vector<Row>{Row({Value(10)}), Row({Value(11)}), Row({Value(12)})}));
+  EXPECT_EQ(template_hits(), changed_before + 1);
+
+  // WITH DEPTH: the bounds live in CTE metadata, and the second statement has
+  // the same fingerprint with a smaller upper bound, so a replay that kept the
+  // cached spec would emit one round too many.
+  EXPECT_EQ(RunPrepared(&engine, &ctx,
+                        "WITH RECURSIVE t AS (SELECT 0 AS n "
+                        "UNION ALL BY NAME SELECT n + 1 AS n FROM t "
+                        "WHERE n < 5) WITH DEPTH BETWEEN 0 AND 2 "
+                        "SELECT n, depth FROM t ORDER BY n;"),
+            (std::vector<Row>{Row({Value(0), Value(int64_t{0})}),
+                              Row({Value(1), Value(int64_t{1})}),
+                              Row({Value(2), Value(int64_t{2})})}));
+  const uint64_t depth_before = template_hits();
+  EXPECT_EQ(RunPrepared(&engine, &ctx,
+                        "WITH RECURSIVE t AS (SELECT 0 AS n "
+                        "UNION ALL BY NAME SELECT n + 1 AS n FROM t "
+                        "WHERE n < 5) WITH DEPTH BETWEEN 0 AND 1 "
+                        "SELECT n, depth FROM t ORDER BY n;"),
+            (std::vector<Row>{Row({Value(0), Value(int64_t{0})}),
+                              Row({Value(1), Value(int64_t{1})})}));
+  EXPECT_EQ(template_hits(), depth_before + 1);
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest,
        SqlEnginePlanCacheRevalidatesSnapshotDependentJoinElimination) {
   TransactionContext ctx = db_->BeginContext();

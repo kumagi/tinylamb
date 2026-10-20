@@ -48,6 +48,13 @@ struct RecursiveDepthSpec {
   std::string column{"depth"};
   int64_t lower{0};
   int64_t upper{0};
+  // Whether each bound was written as an integer literal.  The template binder
+  // needs this: literals in the text are extracted as parameters, but the
+  // bound lives in this struct instead of an expression tree, so it has to be
+  // consumed from the parameter list by hand (an UNBOUNDED side contributes
+  // no parameter).
+  bool lower_is_literal{false};
+  bool upper_is_literal{false};
 };
 
 // Column matching for CORRESPONDING/BY NAME set operations.  Plain set

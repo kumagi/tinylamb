@@ -558,7 +558,30 @@ Cascades rule / cost / statistics
       回帰: `SqlEngineCteDependencyOrderFollowsNestedReferences`,
       `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`,
       `SqlEngineCyclicCteReferenceRejected`。
-- [ ] plan template / cache再構築時にrecursive metadataを保持する。
+- [x] plan template / cache再構築時にrecursive metadataを保持する。
+      契約: パース済みテンプレートキャッシュ（`FindTemplate` /
+      `RememberTemplate`、キーはリテラル非依存の fingerprint）の再構築は
+      `SqlTemplate::BindSelect` が担い、テキスト順にパラメータを消費しながら
+      再帰フラグ（`AddRecursiveWithQuery`）、`RecursiveDepthSpec`、枝ごとの
+      `SetOperationKind` / `SetOperationMatch`、`SetOperationTree` を保持する。
+      従来はキャッシュに載る前に 2 つの理由でバインドが失敗していた:
+      (a) 集合演算は flat な `UnionAll()` と `SetOperationTree` の二表現を
+      同じ枝ノードで共有するが、両方をバインドして全リテラルを二重消費し
+      "parameter underflow" になっていた（再帰CTEの本体は必ず集合演算なので
+      再帰CTEは一切キャッシュされなかった）。flat 側で 1 回だけバインドし、
+      tree は同じ枝を共有、`first` はヘッドが消費したパラメータ範囲から複製する。
+      (b) `WITH DEPTH ... BETWEEN <lower> AND <upper>` の上下限は式ではなく
+      CTE メタデータに載るが、テキスト上は整数リテラルなので抽出器が
+      パラメータとして数えていた。`RecursiveDepthSpec` の
+      `lower_is_literal` / `upper_is_literal` で区別し、本文の直後
+      （メイン SELECT の前）で消費して新しい値を書き戻す。`UNBOUNDED` 側は
+      パラメータを消費しない。複数エントリの WITH にリテラルの深さ上限がある
+      場合は宣言順を復元できないのでテンプレート化を拒否する（本文リテラルと
+      同じ扱い）。キャッシュが実際に効いたかは
+      `PlanCacheStats().template_fills` / `template_hits` で観測できる。
+      回帰: `TemplateCacheKeepsRecursiveCteMetadata`,
+      `SqlTemplateTest.BindsRecursiveWithSetOperationOnce`,
+      `SqlTemplateTest.BindsRecursiveWithDepthBounds`。
 - [ ] WorkTableIndexを実装する。
 - [ ] CTE materialization / inlining / filter pushdownをコスト付きで選択する。
 - [x] CTE predicate propagationを実装する。

@@ -1,5 +1,10 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第44報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
+Recursive)の次項目: **plan template / cache 再構築時の recursive metadata 保持**。
+詳細は下記「2026-10-20 テンプレートキャッシュと再帰メタデータ」の節。CTE 節の
+`[ ]` は残り 2 件。
+
 2026-10-20 加筆(第43報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
 Recursive)の次項目: **CTE依存順 / 前方参照 / 相互再帰エラー**。詳細は下記
 「2026-10-20 CTE依存順と相互再帰」の節。CTE 節の `[ ]` は残り 3 件。
@@ -38,6 +43,54 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 テンプレートキャッシュと再帰メタデータ (再構築が実際に走るまで)
+
+- **[課題] 再帰CTEはテンプレートキャッシュに一度も載っていなかった。**
+  `Prepare` は fingerprint 一致で `FindTemplate` を引き、`BindStatementLiterals`
+  でリテラルを差し替える。失敗すれば黙って「毎回パース」に落ちるので、結果は
+  正しいまま性能だけが失われ、テストでは見えなかった。`BindStatementLiterals`
+  にリテラル入りの再帰CTEを渡すと "SQL template parameter underflow" で失敗する。
+- **[原因1] 集合演算の二表現を両方バインドしていた。** ビジターは集合演算を
+  (a) `UnionAll()` / `SetOperationKinds()` / `Matches()` の flat 表現と
+  (b) グループ化用の `SetOperationTree`（`first` は枝を足す前のヘッドのコピー、
+  `branches` は flat と同じノード）の両方で持つ。`BindSelect` は flat の枝を
+  バインドした後に tree の `first` と `branches` をもう一度バインドしていたため、
+  本文のリテラルを二重に消費して underflow。再帰CTEの本体は必ず集合演算なので、
+  再帰CTEは常にキャッシュ対象外だった（`WITH DEPTH` の有無に関係なく）。
+- **[修正1] flat を正とし、tree は結果を共有する。** 枝は flat 側で 1 回だけ
+  バインドし、tree の `branches` は `result->UnionAll()` をそのまま共有。
+  `first` は「ヘッドが消費したパラメータ範囲（`head_begin`..`head_end`）」を
+  スクラッチ index で複製バインドし、消費数が一致しなければ
+  "cannot re-bind the set operation tree" を返してパースに落とす。枝の同一性は
+  ポインタ比較（`source_tree->branches[i].get() == select.UnionAll()[i].get()`）
+  で確認する。flat と tree が別物の手組み Statement では従来どおり両方バインド。
+- **[原因2] `WITH DEPTH` の上下限がパラメータとして数えられていた。**
+  この上下限は `RecursiveDepthSpec`（`int64_t`）に載り式木には無いが、テキスト
+  上はただの整数リテラルなので `ExtractSqlTemplate` がパラメータに変換する。
+  バインド側は 1 つも消費しないため、常に "parameter count mismatch"。
+- **[修正2] 上下限もテキスト順に消費して書き戻す。** `RecursiveDepthSpec` に
+  `lower_is_literal` / `upper_is_literal` を追加（ビジターが `IntLiteral` を
+  見たときだけ true）。`BindSelect` は CTE 本文をバインドした直後（メイン
+  SELECT の前＝テキスト順）に上下限を消費し、キャッシュされた値ではなく新しい
+  値を `SetRecursiveDepth` する。`UNBOUNDED` 側は消費しない。リテラルの深さ
+  上限を持つエントリが複数ある WITH は宣言順を復元できないため、本文リテラルと
+  同じくテンプレート化を拒否する（"cannot recover WITH declaration order"）。
+- **[観測] キャッシュが効いたことをテストで見る。** `PlanCacheCounters` に
+  `template_fills`（保存）と `template_hits`（再バインド成功）を追加。従来は
+  「毎回パースに落ちた」ことを検出する手段が無く、`BindSelect` の退行が
+  性能劣化としてしか現れなかった。これで退行をテストで殺せる
+  （変異検証: 二重バインドに戻す → unit テスト失敗、深さ上限をキャッシュ値の
+  ままにする → e2e で 1 ラウンド多く出て失敗、再帰フラグのコピーを落とす →
+  e2e で "table t not found"）。
+- 回帰: `QueryTest.TemplateCacheKeepsRecursiveCteMetadata`,
+  `SqlTemplateTest.BindsRecursiveWithSetOperationOnce`,
+  `SqlTemplateTest.BindsRecursiveWithDepthBounds`。
+- **[残課題] コンパイル済みプランキャッシュは CTE / 集合演算を保存しない。**
+  保存は Cascades 経路の `!multi_relation` 側だけで、リレーショナル経路へ
+  落ちる文は対象外（`query/plan_cache.hpp` 冒頭の方針）。今回直したのは
+  パース済みテンプレート（AST）キャッシュ。プラン側を広げるなら
+  「リレーショナル経路のプランはスナップショット依存」の監査が別途要る。
 
 ## 2026-10-20 CTE依存順と相互再帰 (WITH スコープの契約)
 

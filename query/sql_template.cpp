@@ -507,6 +507,42 @@ bool ContainsBindableConstant(
   }
 }
 
+// `WITH DEPTH ... BETWEEN <lower> AND <upper>` keeps its bounds in the CTE's
+// metadata, but each bound written as an integer literal is still a literal in
+// the text, so ExtractSqlTemplate counted it as a parameter.  Consume it here
+// in text order; an UNBOUNDED side contributes no parameter.
+StatusOr<int64_t> BindDepthBound(bool is_literal, int64_t fallback,
+                                 const std::vector<Value>& parameters,
+                                 size_t* index) {
+  if (!is_literal) {
+    return fallback;
+  }
+  if (*index >= parameters.size()) {
+    return Status(Status::kInvalidArgument, "SQL template parameter underflow");
+  }
+  const Value& value = parameters[(*index)++];
+  if (value.type != ValueType::kInt64) {
+    return Status(Status::kInvalidArgument,
+                  "SQL template WITH DEPTH bound is not an integer");
+  }
+  return value.value.int_value;
+}
+
+StatusOr<RecursiveDepthSpec> BindRecursiveDepth(
+    const RecursiveDepthSpec& depth, const std::vector<Value>& parameters,
+    size_t* index) {
+  RecursiveDepthSpec bound = depth;
+  ASSIGN_OR_RETURN(
+      int64_t, lower,
+      (BindDepthBound(depth.lower_is_literal, depth.lower, parameters, index)));
+  bound.lower = lower;
+  ASSIGN_OR_RETURN(
+      int64_t, upper,
+      (BindDepthBound(depth.upper_is_literal, depth.upper, parameters, index)));
+  bound.upper = upper;
+  return bound;
+}
+
 StatusOr<std::shared_ptr<SelectStatement>>
 BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
              // design; trees are parser-bounded in depth.
@@ -514,6 +550,9 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     size_t* index) {
   std::vector<std::pair<std::string, std::shared_ptr<SelectStatement>>> withs;
   withs.reserve(select.WithQueries().size());
+  // Depth specs are bound with their body (that is where their parameters
+  // sit) but applied once `result` exists.
+  std::vector<std::pair<std::string, RecursiveDepthSpec>> depths;
   if (select.WithQueries().size() > 1) {
     // CTE bodies precede the main SELECT in the text, but WithQueries() is an
     // unordered_map that lost their declaration order; binding by sorted name
@@ -521,8 +560,10 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     // Refuse such statements instead -- the engine falls back to parsing the
     // SQL verbatim.
     for (const auto& [name, query] : select.WithQueries()) {
-      (void)name;
-      if (SelectHasBindableConstant(*query)) {
+      const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name);
+      const bool literal_depth = depth != nullptr && (depth->lower_is_literal ||
+                                                      depth->upper_is_literal);
+      if (SelectHasBindableConstant(*query) || literal_depth) {
         return Status(Status::kInvalidArgument,
                       "SQL template cannot recover WITH declaration order");
       }
@@ -543,8 +584,19 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
           (BindSelect(*select.WithQueries().at(name), parameters, index)));
       auto bound = std::move(hv16241_0);
       withs.emplace_back(name, std::move(bound));
+      if (const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name)) {
+        // The depth modifier follows the body in the text, so its bounds are
+        // the next parameters -- before the main SELECT's.
+        ASSIGN_OR_RETURN(RecursiveDepthSpec, rebound_depth,
+                         (BindRecursiveDepth(*depth, parameters, index)));
+        depths.emplace_back(name, std::move(rebound_depth));
+      }
     }
   }
+  // The WITH bodies are bound; everything from here to the branch list is the
+  // statement's own head.  The set-operation tree holds a second view of that
+  // head (see below), which has to be bound from this same parameter range.
+  const size_t head_begin = *index;
 
   std::vector<Expression> bound_distinct_on;
   if (select.HasDistinctOn()) {
@@ -663,6 +715,7 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   }
   result->SetWithTies(select.WithTies());
   result->SetAsStruct(select.AsStruct());
+  const size_t head_end = *index;
   // UNION ALL branches appear after the main SELECT in SQL text, so bind
   // them last (after every main-select parameter) in branch order. Dropping
   // them silently shrank re-bound statements to their first branch.
@@ -680,19 +733,46 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
         (BindSelect(*select.UnionAll()[branch_index], parameters, index)));
     result->AddSetOperation(kind, std::move(hv19796_0), match);
   }
-  if (select.GetSetOperationTree() != nullptr) {
+  if (const auto& source_tree = select.GetSetOperationTree();
+      source_tree != nullptr) {
     auto tree = std::make_shared<SetOperationTree>();
-    ASSIGN_OR_RETURN(
-        std::shared_ptr<SelectStatement>, hv20027_0,
-        (BindSelect(*select.GetSetOperationTree()->first, parameters, index)));
-    tree->first = std::move(hv20027_0);
-    tree->kinds = select.GetSetOperationTree()->kinds;
-    tree->grouped = select.GetSetOperationTree()->grouped;
-    tree->branches.reserve(select.GetSetOperationTree()->branches.size());
-    for (const auto& branch : select.GetSetOperationTree()->branches) {
-      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv20383_0,
-                       (BindSelect(*branch, parameters, index)));
-      tree->branches.push_back(std::move(hv20383_0));
+    tree->kinds = source_tree->kinds;
+    tree->grouped = source_tree->grouped;
+    // The visitor keeps two views of one set operation: the flat branch
+    // vectors and this tree, and both hold the SAME branch nodes (plus a
+    // pre-branch copy of the head as `first`).  Binding both views consumed
+    // every literal twice -- a parameter underflow that kept every statement
+    // with a set operation (recursive WITH bodies included) out of the
+    // template cache.  Reuse the branches that were just bound and bind the
+    // head copy from the parameters the head itself consumed.
+    bool shares_branches =
+        source_tree->first != nullptr && !select.UnionAll().empty() &&
+        source_tree->branches.size() == select.UnionAll().size();
+    for (size_t i = 0; shares_branches && i < source_tree->branches.size();
+         ++i) {
+      shares_branches =
+          source_tree->branches[i].get() == select.UnionAll()[i].get();
+    }
+    if (shares_branches) {
+      size_t scratch = head_begin;
+      StatusOr<std::shared_ptr<SelectStatement>> bound_first =
+          BindSelect(*source_tree->first, parameters, &scratch);
+      if (!bound_first.HasValue() || scratch != head_end) {
+        return Status(Status::kInvalidArgument,
+                      "SQL template cannot re-bind the set operation tree");
+      }
+      tree->first = bound_first.MoveValue();
+      tree->branches = result->UnionAll();
+    } else if (source_tree->first != nullptr) {
+      ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv20027_0,
+                       (BindSelect(*source_tree->first, parameters, index)));
+      tree->first = std::move(hv20027_0);
+      tree->branches.reserve(source_tree->branches.size());
+      for (const auto& branch : source_tree->branches) {
+        ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv20383_0,
+                         (BindSelect(*branch, parameters, index)));
+        tree->branches.push_back(std::move(hv20383_0));
+      }
     }
     result->SetSetOperationTree(std::move(tree));
   }
@@ -700,17 +780,18 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
     result->MarkUnionDistinct(select.UnionByName());
   }
   for (auto& [name, query] : withs) {
-    // WITH RECURSIVE markers and depth specs must survive a re-bind, or a
-    // template-cache hit replays a recursive CTE as a plain one (the
-    // executor's work-table route and the depth column both disappear).
+    // WITH RECURSIVE markers must survive a re-bind, or a template-cache hit
+    // replays a recursive CTE as a plain one (the executor's work-table route
+    // and the depth column both disappear).  The depth spec itself was bound
+    // with the body above, where its parameters sit.
     if (select.IsRecursiveWith(name)) {
       result->AddRecursiveWithQuery(name, std::move(query));
     } else {
       result->AddWithQuery(name, std::move(query));
     }
-    if (const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name)) {
-      result->SetRecursiveDepth(name, *depth);
-    }
+  }
+  for (auto& [name, depth] : depths) {
+    result->SetRecursiveDepth(name, std::move(depth));
   }
   if (select.RequiresRelationalEvaluation()) {
     result->MarkComplex();

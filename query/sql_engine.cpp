@@ -1797,6 +1797,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
           rebound.HasValue()) {
         statement = rebound.MoveValue();
         cache_hit = true;
+        PlanCacheStats().template_hits.fetch_add(1, std::memory_order_relaxed);
       }
       // A literal shape that drifted from the cached tree falls through and
       // parses the original SQL.
@@ -1967,6 +1968,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     if (auto rebound = BindStatementLiterals(*statement, templated.parameters);
         rebound.HasValue()) {
       RememberTemplate(templated.fingerprint, rebound.MoveValue());
+      PlanCacheStats().template_fills.fetch_add(1, std::memory_order_relaxed);
     }
   }
   // Arm the compiled-plan fill sites inside PrepareStatement; the guard
