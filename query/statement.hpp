@@ -537,6 +537,22 @@ class SelectStatement : public Statement {
   const std::vector<SetOperationMatch>& Matches() const {
     return set_operation_matches_;
   }
+  // Column-match mode declared for the pair that introduces the branch at
+  // `pair_index` (`BY NAME`, `CORRESPONDING`, or an ON/BY column list).
+  // Statements assembled without per-pair metadata (hand-built plans, legacy
+  // callers) fall back to the head-level BY NAME flag that
+  // MarkUnionDistinct records.
+  [[nodiscard]] SetOperationMatch MatchFor(size_t pair_index) const {
+    if (pair_index < set_operation_matches_.size()) {
+      const SetOperationMatch& match = set_operation_matches_[pair_index];
+      if (match.by_name || match.corresponding || !match.columns.empty()) {
+        return match;
+      }
+    }
+    SetOperationMatch fallback;
+    fallback.by_name = union_by_name_;
+    return fallback;
+  }
   void AddSetOperation(SetOperationKind kind,
                        std::shared_ptr<SelectStatement> query,
                        SetOperationMatch match = {}) {

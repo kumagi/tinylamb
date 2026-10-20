@@ -135,6 +135,21 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   `values`, `generate_series`, `unnest`, `recursive_cte`, `set_operation`,
   `merge_append`, `limit`, `max1_row`, `minmax_index`, `materialize`,
   `exchange`, `pipeline_breaker.hpp`.
+  `ExecuteRecursiveCte` (relational.cpp) is the work-table loop: it evaluates
+  the anchor once, then re-binds the CTE name to the previous round's delta.
+  **The anchor fixes the CTE's shape** — every round must produce those
+  columns, which is what keeps `SELECT * FROM <cte>` stable. Set-operation
+  metadata adds a per-term column match (`SetOperationMatch`, resolved with
+  `SelectStatement::MatchFor(term)`): `BY NAME` / `STRICT CORRESPONDING`
+  require the term to produce exactly the anchor's names, plain
+  `CORRESPONDING` also matches by name but drops the term's extra columns, and
+  an ON/BY list has to cover the working shape (it may not drop an anchor
+  column). Name matching reorders the term's values; it never shrinks the
+  working table, so a missing anchor name or a duplicate/unnamed column is an
+  error instead of a NULL-filled cell, and positional terms must keep the
+  anchor width. `WITH DEPTH` appends its counter after the aligned columns.
+  Regressions: `QueryTest.SqlEngineRecursiveCteNameMatching*`,
+  `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`.
 - Infra: `data_chunk` (+ `selection_vector`), `query_scheduler`,
   `query_memory` (+ `operator_memory`, `numa_arena`), `vectorized_expression`,
   `simd_comparison`.

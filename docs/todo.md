@@ -38,7 +38,7 @@ Cascades rule / cost / statistics
 
 （以下はすべてテスト合格・修正を確認済み:
 - `CteIsMaterializedOnceAndCanBeReadByMultipleConsumers`
-- 再帰CTE基本、UNION DISTINCT、依存CTE、BY NAME、DEPTH（`SqlEngineRecursiveCteByNameUnionDedupesAlignedRows`, `SqlEngineRecursiveCteDepthModifierBoundsIterations`）
+- 再帰CTE基本、UNION DISTINCT、依存CTE、BY NAME、DEPTH（`SqlEngineRecursiveCteByNameUnionDedupesAlignedRows`, `SqlEngineRecursiveCteNameMatchingAlignsEveryUnionMode`, `SqlEngineRecursiveCteDepthModifierBoundsIterations`）
 - `ZoneMapMayMatchDegenerateCases`
 - DROP TABLE後のCatalog / TransactionContext cache無効化（`SqlEngineDistinctAndDropTable`, `DropTableRemovesCatalogAndStatistics`, `DropTableInvalidatesContextCache`）
 - BPlusTreeIterator 空ページ初期化バグ（`row_count_ > 0` 判定・Foster traversal）
@@ -520,7 +520,25 @@ Cascades rule / cost / statistics
 - [x] UNIONとUNION ALLの再帰差分を実装する。
 - [x] 再帰のサイクル検出、深さ上限、累積行予算を実装する。
 - [x] `WITH DEPTH` の列生成、範囲表示、UNBOUNDEDを実装する。
-- [ ] recursive JOIN USING、BY NAME、CORRESPONDINGをschema契約として実装する。
+- [x] recursive JOIN USING、BY NAME、CORRESPONDINGをschema契約として実装する。
+      契約: 再帰CTEの列は常に anchor 項が決める（各ラウンドは anchor の列を
+      作らなければならない。`SELECT * FROM <cte>` が anchor の名前で固定される
+      理由）。集合演算メタデータは項ごとの `SetOperationMatch` を持ち
+      （`SelectStatement::MatchFor(term)` で解決。visitor が `BY NAME` /
+      `STRICT CORRESPONDING` → `by_name`、`CORRESPONDING` → `corresponding`、
+      `ON/BY (col_list)` → `columns` を per-pair で記録する）、名前一致は
+      値の並びだけを変える: `BY NAME` / `STRICT CORRESPONDING` は項の列名集合が
+      anchor と完全一致することを要求、素の `CORRESPONDING` は同名一致＋項だけの
+      列を落とす、`ON/BY (col_list)` は列挙列だけを一致対象にし、working shape を
+      覆う必要がある（anchor 列を落とす指定はエラー）。anchor 列を項が作れない /
+      重複名 / 無名列は NULL 埋めせずエラー、位置一致の項は anchor 幅を要求。
+      `WITH DEPTH` の depth 列は整列後の末尾。回帰:
+      `SqlEngineRecursiveCteNameMatchingAlignsEveryUnionMode`,
+      `SqlEngineRecursiveCteNameMatchingKeepsDepthLast`,
+      `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`,
+      `SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns`。
+      既知のギャップ: 非再帰の集合演算（`UNION ALL BY NAME` /
+      `CORRESPONDING`）は依然として位置一致（`docs/next-actions.md` 第42報）。
 - [ ] CTE依存順、前方参照、相互再帰エラーを実装する。
 - [ ] plan template / cache再構築時にrecursive metadataを保持する。
 - [ ] WorkTableIndexを実装する。

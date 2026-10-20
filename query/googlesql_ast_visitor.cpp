@@ -6958,6 +6958,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         auto first_stmt = std::move(hv175800_0);
         bool union_by_name = false;
         std::vector<SetOperationKind> per_pair;
+        std::vector<SetOperationMatch> per_pair_match;
         SetOperationKind head_kind = SetOperationKind::kUnionAll;
         const std::string set_detail = UpperCopy(set_op->detail);
         if (set_detail.find("INTERSECT") != std::string::npos) {
@@ -6999,9 +7000,41 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                          : SetOperationKind::kUnion;
             }
             per_pair.push_back(kind);
-            if (metadata->Child("SetOperationColumnMatchMode") != nullptr) {
-              union_by_name = true;
+            SetOperationMatch match;
+            if (const GoogleSqlAstNode* match_node =
+                    metadata->Child("SetOperationColumnMatchMode")) {
+              // `BY NAME` and `STRICT CORRESPONDING` require the same column
+              // names on both sides; plain CORRESPONDING keeps the columns
+              // both inputs produce (GoogleSQL's INNER default).  An ON/BY
+              // list restricts either mode to the listed columns.
+              const std::string match_text = UpperCopy(SliceSource(match_node));
+              if (match_text.find("STRICT") != std::string::npos ||
+                  match_text.find("BY NAME") != std::string::npos) {
+                match.by_name = true;
+              } else if (match_text.find("CORRESPONDING") !=
+                         std::string::npos) {
+                match.corresponding = true;
+              } else {
+                match.by_name = true;
+              }
+              // `BY NAME ON (a, b)` / `CORRESPONDING BY (a, b)` hang the
+              // column list off the metadata item, next to the mode node.
+              const GoogleSqlAstNode* list_node =
+                  metadata->Child("ExpressionList");
+              if (list_node != nullptr) {
+                for (const auto& child : list_node->children) {
+                  if (child->kind != "Identifier") {
+                    continue;
+                  }
+                  ASSIGN_OR_RETURN(std::string, hv243501_0,
+                                   (Identifier(*child)));
+                  match.columns.push_back(std::move(hv243501_0));
+                }
+              }
+              union_by_name = union_by_name || match.by_name ||
+                              match.corresponding || !match.columns.empty();
             }
+            per_pair_match.push_back(std::move(match));
           }
         }
         while (per_pair.size() + 1 < operands.size()) {
@@ -7020,8 +7053,11 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv178940_0,
                            (VisitQuery(*operands[i])));
           auto branch = std::move(hv178940_0);
+          const SetOperationMatch match = i - 1 < per_pair_match.size()
+                                              ? per_pair_match[i - 1]
+                                              : SetOperationMatch{};
           branches.push_back(branch);
-          first_stmt->AddSetOperation(kind, std::move(branch));
+          first_stmt->AddSetOperation(kind, std::move(branch), match);
         }
         // Keep explicit parenthesized groups available to the relational
         // executor.  The legacy vectors above intentionally remain populated

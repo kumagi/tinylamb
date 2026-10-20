@@ -4066,6 +4066,142 @@ TEST_F(QueryTest, SqlEngineRecursiveCteByNameUnionDedupesAlignedRows) {
   ctx.txn_.Abort();
 }
 
+// Every name-matched union mode binds a recursive term's values by column
+// name.  UNION ALL used to ignore BY NAME entirely (the flag was only
+// recorded for UNION DISTINCT), so the term stayed positional and the second
+// row came out as (100, 200) instead of the aligned (200, 100).
+TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingAlignsEveryUnionMode) {
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
+                   "UNION ALL BY NAME "
+                   "SELECT a * 100 AS b, b * 100 AS a FROM t WHERE a = 1) "
+                   "SELECT * FROM t ORDER BY a, b;"),
+            (std::vector<Row>{Row({Value(1), Value(2)}),
+                              Row({Value(200), Value(100)})}));
+  // STRICT CORRESPONDING is BY NAME under its standard-SQL spelling.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "WITH RECURSIVE t AS (SELECT 1 AS x, 2 AS y "
+                   "UNION ALL STRICT CORRESPONDING "
+                   "SELECT x * 10 AS y, y * 10 AS x FROM t WHERE x = 1) "
+                   "SELECT * FROM t ORDER BY x, y;"),
+            (std::vector<Row>{Row({Value(1), Value(2)}),
+                              Row({Value(20), Value(10)})}));
+  // Plain CORRESPONDING matches by name and drops the term's extra columns;
+  // the anchor still fixes the CTE's shape.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
+             "UNION ALL CORRESPONDING "
+             "SELECT 3 AS b, 4 AS a, 5 AS c FROM t WHERE a = 1) "
+             "SELECT * FROM t ORDER BY a, b;"),
+      (std::vector<Row>{Row({Value(1), Value(2)}), Row({Value(4), Value(3)})}));
+  // An ON/BY list keeps only the listed columns as name-match targets; it has
+  // to cover the working shape, so here it is BY NAME.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b "
+             "UNION ALL BY NAME ON (a, b) "
+             "SELECT 5 AS b, 6 AS a FROM t WHERE a = 1) "
+             "SELECT * FROM t ORDER BY a, b;"),
+      (std::vector<Row>{Row({Value(1), Value(2)}), Row({Value(6), Value(5)})}));
+  ctx.txn_.Abort();
+}
+
+// The working shape stays the anchor's even when a term is name matched, so
+// WITH DEPTH still appends its counter after the aligned columns.
+TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingKeepsDepthLast) {
+  TransactionContext ctx = db_->BeginContext();
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b UNION ALL BY NAME "
+             "SELECT b + 10 AS b, a + 100 AS a FROM t WHERE a < 50) "
+             "WITH DEPTH BETWEEN 0 AND 2 SELECT a, b, depth FROM t "
+             "ORDER BY depth;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(2), Value(int64_t{0})}));
+  EXPECT_EQ(rows[1], Row({Value(101), Value(12), Value(int64_t{1})}));
+  ctx.txn_.Abort();
+}
+
+// JOIN USING merges its key into one column, and that merged name is what a
+// name-matched recursive term aligns on.
+TEST_F(QueryTest, SqlEngineRecursiveCteJoinUsingFeedsNameMatching) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE rc_left (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE rc_right (k INT64, w INT64);");
+  RunSql(ctx, *db_, "INSERT INTO rc_left VALUES (1, 1), (2, 2);");
+  RunSql(ctx, *db_, "INSERT INTO rc_right VALUES (1, 10), (2, 20);");
+  std::vector<Row> rows =
+      RunSql(ctx, *db_,
+             "WITH RECURSIVE t AS (SELECT l.k, l.v, r.w FROM rc_left l "
+             "JOIN rc_right r USING (k) WHERE l.k = 1 "
+             "UNION ALL BY NAME SELECT w AS w, k * 10 AS k, v + 1 AS v FROM t "
+             "WHERE v < 3) SELECT k, v, w FROM t ORDER BY v;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0],
+            Row({Value(int64_t{1}), Value(int64_t{1}), Value(int64_t{10})}));
+  EXPECT_EQ(rows[1],
+            Row({Value(int64_t{10}), Value(int64_t{2}), Value(int64_t{10})}));
+  EXPECT_EQ(rows[2],
+            Row({Value(int64_t{100}), Value(int64_t{3}), Value(int64_t{10})}));
+  ctx.txn_.Abort();
+}
+
+// A recursive CTE fixes its shape from the anchor, so name matching never
+// drops a column silently: a missing name, an extra strict name, a duplicate
+// name, or an ON list that leaves a column out are all errors, and a
+// positional term must keep the anchor width.
+TEST_F(QueryTest, SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns) {
+  TransactionContext ctx = db_->BeginContext();
+  const auto expect_error = [&](std::string_view sql, std::string_view needle) {
+    SqlEngine engine(*db_);
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    std::string message;
+    if (!prepared.HasValue()) {
+      message = engine.LastError();
+    } else {
+      Row row;
+      while (prepared.Value()->Next(&row, nullptr)) {
+      }
+      message = prepared.Value()->GetStatus().GetMessage();
+    }
+    EXPECT_NE(message.find(needle), std::string::npos) << sql << "\n"
+                                                       << message;
+  };
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b UNION ALL BY NAME "
+      "SELECT 3 AS a FROM t) SELECT * FROM t;",
+      "term has no column b");
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL BY NAME "
+      "SELECT 2 AS a, 3 AS c FROM t) SELECT * FROM t;",
+      "produces a column the anchor does not name: c");
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b UNION ALL BY NAME ON (a) "
+      "SELECT 3 AS a, 4 AS b FROM t) SELECT * FROM t;",
+      "cannot drop column b");
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL BY NAME ON (zzz) "
+      "SELECT 2 AS a FROM t) SELECT * FROM t;",
+      "has no column zzz");
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL "
+      "SELECT 2 AS a, 3 AS b FROM t) SELECT * FROM t;",
+      "columns but the working table");
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS a UNION ALL BY NAME "
+      "SELECT a FROM t) SELECT * FROM t;",
+      "cannot match duplicate column a");
+  // A star term's names are only known once it runs, so the same strict
+  // check runs against the executed schema.
+  expect_error(
+      "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL BY NAME "
+      "SELECT * FROM (SELECT 2 AS a, 3 AS c)) SELECT * FROM t;",
+      "produces column c that the working table does not name");
+  ctx.txn_.Abort();
+}
+
 // WITH DEPTH modifier: iteration count is bounded explicitly, every row
 // carries its depth, and the depth-0 anchor stays hidden below a non-zero
 // lower bound.

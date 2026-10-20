@@ -3084,6 +3084,79 @@ bool SameRow(const Row& left, const Row& right) {
   return true;
 }
 
+// Recursive-union column contract.  The set-operation metadata names the
+// column-match mode per term: `BY NAME` / `STRICT CORRESPONDING` demand the
+// same column names on both sides, plain `CORRESPONDING` keeps only the
+// columns both sides produce (GoogleSQL's INNER default), and an ON/BY
+// column list restricts either mode to the listed columns.  Positional
+// unions keep the anchor's column order and require the same width.
+
+bool NameMatchedUnion(const SetOperationMatch& match) {
+  return match.by_name || match.corresponding || !match.columns.empty();
+}
+
+// Column names a term writes, as the author spelled them.  nullopt when the
+// width is only known after execution (an unexpanded `*`).
+std::optional<std::vector<std::string>> StaticTermNames(
+    const SelectStatement& statement) {
+  std::vector<std::string> names;
+  names.reserve(statement.SelectList().size());
+  for (const NamedExpression& item : statement.SelectList()) {
+    if (item.name == "*" || item.star_modifiers != nullptr) {
+      return std::nullopt;
+    }
+    names.push_back(item.name);
+  }
+  return names;
+}
+
+bool ContainsColumnName(const std::vector<std::string>& names,
+                        std::string_view wanted) {
+  return std::any_of(names.begin(), names.end(),
+                     [&](const std::string& candidate) {
+                       return IdentifierEquals(candidate, wanted);
+                     });
+}
+
+// Maps `targets` (the working table's columns, in output order) onto `source`
+// by name.  `strict` also rejects a source column the working table does not
+// name, which is what BY NAME / STRICT CORRESPONDING require.
+StatusOr<std::vector<size_t>> ResolveNameAlignment(
+    const std::vector<std::string>& targets, const Schema& source, bool strict,
+    const std::string& context) {
+  std::vector<size_t> alignment;
+  alignment.reserve(targets.size());
+  for (const std::string& wanted : targets) {
+    size_t found = source.ColumnCount();
+    for (slot_t index = 0; index < source.ColumnCount(); ++index) {
+      if (!IdentifierEquals(source.GetColumn(index).Name().name, wanted)) {
+        continue;
+      }
+      if (found != source.ColumnCount()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           context + " produces duplicate column " + wanted);
+      }
+      found = index;
+    }
+    if (found == source.ColumnCount()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         context + " has no column named " + wanted);
+    }
+    alignment.push_back(found);
+  }
+  if (strict) {
+    for (slot_t index = 0; index < source.ColumnCount(); ++index) {
+      const std::string& name = source.GetColumn(index).Name().name;
+      if (!ContainsColumnName(targets, name)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           context + " produces column " + name +
+                               " that the working table does not name");
+      }
+    }
+  }
+  return alignment;
+}
+
 }  // namespace
 
 StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
@@ -3112,7 +3185,88 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
 
   const bool track_depth = depth_spec != nullptr;
   const bool distinct = body.UnionDistinct();
-  const bool by_name = body.UnionByName();
+  // Per-term column matching: the set-operation metadata is per pair, so one
+  // body may mix positional and BY NAME pairs.
+  std::vector<SetOperationMatch> term_matches;
+  term_matches.reserve(body.UnionAll().size());
+  for (size_t index = 0; index < body.UnionAll().size(); ++index) {
+    term_matches.push_back(body.MatchFor(index));
+  }
+  const bool any_name_matching =
+      std::ranges::any_of(term_matches, NameMatchedUnion);
+
+  // Working-table schema.  A recursive CTE fixes its shape from the anchor
+  // term: every round must produce the anchor's columns, so `SELECT *` over
+  // the CTE keeps those names.  Name matching (BY NAME / STRICT
+  // CORRESPONDING / CORRESPONDING) changes how a term's values bind to them,
+  // never which columns the CTE has, and an anchor column the term cannot
+  // produce is an error instead of a NULL-filled cell.
+  std::vector<std::string> working_names;
+  working_names.reserve(anchor_result.schema.ColumnCount());
+  for (slot_t index = 0; index < anchor_result.schema.ColumnCount(); ++index) {
+    working_names.push_back(anchor_result.schema.GetColumn(index).Name().name);
+  }
+  if (any_name_matching) {
+    for (size_t index = 0; index < term_matches.size(); ++index) {
+      const SetOperationMatch& match = term_matches[index];
+      if (!NameMatchedUnion(match)) {
+        continue;
+      }
+      std::optional<std::vector<std::string>> term_names;
+      if (body.UnionAll()[index] != nullptr) {
+        term_names = StaticTermNames(*body.UnionAll()[index]);
+      }
+      for (const std::string& listed : match.columns) {
+        if (!ContainsColumnName(working_names, listed)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "recursive CTE " + name + " has no column " +
+                                 listed + " to match by name");
+        }
+      }
+      for (const std::string& wanted : working_names) {
+        if (wanted.empty()) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "recursive CTE " + name + " needs named columns for BY NAME");
+        }
+        if (!match.columns.empty() &&
+            !ContainsColumnName(match.columns, wanted)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "recursive CTE " + name + " cannot drop column " +
+                                 wanted + " in a name-matched recursive term");
+        }
+        if (term_names.has_value() &&
+            !ContainsColumnName(*term_names, wanted)) {
+          return StatusError(
+              StatusCode::kInvalidArgument,
+              "recursive CTE " + name + " term has no column " + wanted);
+        }
+      }
+      if (match.by_name && term_names.has_value()) {
+        for (const std::string& candidate : *term_names) {
+          if (candidate.empty() ||
+              !ContainsColumnName(working_names, candidate)) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "recursive CTE " + name +
+                    " term produces a column the anchor does not name: " +
+                    (candidate.empty() ? std::string("<unnamed>") : candidate));
+          }
+        }
+      }
+    }
+    for (size_t left = 0; left < working_names.size(); ++left) {
+      for (size_t right = left + 1; right < working_names.size(); ++right) {
+        if (IdentifierEquals(working_names[left], working_names[right])) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "recursive CTE " + name +
+                                 " cannot match duplicate column " +
+                                 working_names[left] + " by name");
+        }
+      }
+    }
+  }
+
   Relation result(context.execution_runtime());
   result.schema = anchor_result.schema;
   if (track_depth) {
@@ -3164,38 +3318,58 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
     loop_ctes[name] = std::make_shared<Relation>(std::move(materialized_delta));
     Relation next(context.execution_runtime());
     next.schema = result.schema;
-    for (const auto& branch_statement : body.UnionAll()) {
+    for (size_t term_index = 0; term_index < body.UnionAll().size();
+         ++term_index) {
+      const std::shared_ptr<SelectStatement>& branch_statement =
+          body.UnionAll()[term_index];
       if (!branch_statement) {
         continue;
       }
+      const SetOperationMatch match = term_matches[term_index];
       ASSIGN_OR_RETURN(
           Relation, branch,
           (ExecuteQuery(context, *branch_statement, outer, loop_ctes)));
+      std::vector<size_t> alignment;
+      if (NameMatchedUnion(match)) {
+        ASSIGN_OR_RETURN(
+            std::vector<size_t>, resolved_alignment,
+            (ResolveNameAlignment(working_names, branch.schema,
+                                  match.by_name && match.columns.empty(),
+                                  "recursive CTE " + name + " term")));
+        alignment = std::move(resolved_alignment);
+      } else {
+        for (size_t index = 0; index < working_names.size(); ++index) {
+          alignment.push_back(index);
+        }
+      }
+      // Name matching reads the columns the working table names, so the term
+      // may carry extra columns (CORRESPONDING drops them); positional
+      // matching requires exactly the working width.
+      const bool name_matched = NameMatchedUnion(match);
+      size_t required_width = 0;
+      for (size_t index : alignment) {
+        required_width = std::max(required_width, index + 1);
+      }
+      Status width_status = Status::kSuccess;
+      std::string width_error;
       RETURN_IF_FAIL(branch.ForEachRow([&](const Row& row) {
-        Row payload = row;
-        if (by_name) {
-          std::vector<Value> aligned;
-          aligned.reserve(static_cast<size_t>(result.schema.ColumnCount()) -
-                          (track_depth ? 1U : 0U));
-          const size_t payload_width =
-              static_cast<size_t>(result.schema.ColumnCount()) -
-              (track_depth ? 1U : 0U);
-          for (size_t target = 0; target < payload_width; ++target) {
-            const std::string& wanted =
-                result.schema.GetColumn(target).Name().name;
-            size_t found = payload.values_.size();
-            for (size_t source = 0; source < branch.schema.ColumnCount();
-                 ++source) {
-              if (branch.schema.GetColumn(source).Name().name == wanted) {
-                found = source;
-                break;
-              }
-            }
-            aligned.push_back(found < payload.values_.size()
-                                  ? payload.values_[found]
-                                  : Value());
-          }
-          payload.values_ = std::move(aligned);
+        if (width_status != Status::kSuccess) {
+          return;
+        }
+        if (name_matched ? row.values_.size() < required_width
+                         : row.values_.size() != working_names.size()) {
+          width_status = Status(StatusCode::kInvalidArgument);
+          width_error = "recursive CTE " + name + " term produces " +
+                        std::to_string(row.values_.size()) +
+                        " columns but the working table reads " +
+                        std::to_string(name_matched ? required_width
+                                                    : working_names.size());
+          return;
+        }
+        Row payload;
+        payload.values_.reserve(working_names.size() + (track_depth ? 1U : 0U));
+        for (size_t index : alignment) {
+          payload.values_.push_back(row.values_[index]);
         }
         if (already_seen(payload)) {
           return;
@@ -3205,6 +3379,9 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
         }
         next.AddRow(std::move(payload));
       }));
+      if (width_status != Status::kSuccess) {
+        return Status(width_status.GetCode(), std::move(width_error));
+      }
     }
     RETURN_IF_FAIL(next.FinishSpill());
     RETURN_IF_FAIL(next.GetStatus());

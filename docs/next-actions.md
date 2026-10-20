@@ -1,5 +1,10 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第42報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
+Recursive)の次項目: **recursive JOIN USING / BY NAME / CORRESPONDING の
+schema 契約**。詳細は下記「2026-10-20 再帰CTEの列一致契約」の節。CTE 節の
+`[ ]` は残り 4 件。
+
 2026-10-20 加筆(第41報)。統合TODO(`docs/todo.md` Phase 2 Window / UNNEST /
 生成)の次項目: **`FunctionScan` / TVF**。詳細は下記「2026-10-20 組み込み TVF
 (FROM GENERATE_SERIES)」の節。Window / UNNEST / 生成 の `[ ]` は無くなった。
@@ -29,6 +34,50 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 再帰CTEの列一致契約 (JOIN USING / BY NAME / CORRESPONDING)
+
+- **[課題] `UNION ALL BY NAME` が位置一致のままだった。** `union_by_name_` は
+  `MarkUnionDistinct` でしか立たず、`UNION ALL` では一度も立たなかった。結果、
+  `WITH RECURSIVE t AS (SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT a*100 AS b,
+  b*100 AS a FROM t WHERE a = 1)` が `(1,2),(100,200)`（正しくは `(200,100)`）を
+  返していた。`CORRESPONDING` も同じ経路で位置一致になり、名前不一致は
+  NULL 埋めで黙って通っていた。
+- **[修正] 集合演算メタデータを per-pair で `SetOperationMatch` に落とす。**
+  visitor は `SetOperationMetadataList` を項順に走査し、`BY NAME` /
+  `STRICT CORRESPONDING` → `by_name`、`CORRESPONDING` → `corresponding`、
+  `ON/BY (col_list)`（`ExpressionList` 子）→ `columns` を記録して
+  `AddSetOperation(kind, branch, match)` に渡す。項ごとの解決は
+  `SelectStatement::MatchFor(pair_index)`（per-pair が無ければ head の
+  `union_by_name_` へフォールバック）で、`sql_template` の再構築も
+  `Matches()` をコピーするのでキャッシュ経由でも落ちない。
+- **[契約] anchor が再帰CTEの形を決める。** 名前一致は「項の値をどの列へ
+  束ねるか」だけを変え、CTE の列集合は anchor のまま（`SELECT * FROM <cte>`
+  の可視列がラウンドごとに変わらないための前提）。したがって:
+  `BY NAME` / `STRICT CORRESPONDING` は項の列名集合が anchor と完全一致する
+  ことを要求、素の `CORRESPONDING` は同名一致＋項だけの列を落とす、
+  `ON/BY (col_list)` は列挙列だけを一致対象にし、working shape を覆う必要が
+  ある（anchor 列を落とす指定はエラー）。anchor 列を作れない項、重複名、
+  無名列は NULL 埋めせずエラー。位置一致の項は anchor 幅を要求（従来は
+  余剰列が行に漏れていた）。`WITH DEPTH` の depth 列は整列後の末尾。
+- **[却下した案] `CORRESPONDING` で anchor 列を削る（INNER の縮小）。**
+  CTE の静的スキーマは anchor の select list から作られるため、実行時に
+  縮むと `SELECT * FROM <cte>` の射影が範囲外を読み SIGSEGV した
+  （`Projection::NextBatch` → `ColumnVector::ValueAt`）。縮小を成立させるには
+  フロントエンドの CTE スキーマ推論まで名前一致を教える必要があり、再帰CTEの
+  形を固定する方が契約として素直なので却下。
+- **[既知のギャップ] 非再帰の集合演算は依然として位置一致。**
+  `SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT b, a FROM (...)` は
+  `[2,1]`（`BY NAME` 無視）。一般集合演算（grouped tree / INTERSECT / EXCEPT /
+  Cascades `SetOperationPlan`）へ同じ契約を広げるのは別項目。再帰CTEの
+  テストでこの誤挙動を固定しない。
+- 回帰: `SqlEngineRecursiveCteNameMatchingAlignsEveryUnionMode`,
+  `SqlEngineRecursiveCteNameMatchingKeepsDepthLast`,
+  `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`,
+  `SqlEngineRecursiveCteNameMatchingRejectsMismatchedColumns`
+  （変異検証: `MatchFor` を常にフォールバック → 3 件失敗、
+  `ResolveNameAlignment` の strict 検査除去 → star 項のテスト失敗、
+  位置一致の幅検査除去 → 幅エラーのテスト失敗）。
 
 ## 2026-10-20 組み込み TVF (FROM GENERATE_SERIES)
 

@@ -355,9 +355,16 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       出力に二重に入る不具合を修正。anchor も seen セットで dedupe）
 - [x] JOIN の USING 句を両辺修飾で生成（無修飾 `a = a` が同名列結合で
       曖昧になる問題を修正。FULL/RIGHT JOIN の CTE オペランドが解決）
-- [x] 再帰項の BY NAME / CORRESPONDING アライメント（各ラウンドで蓄積側と項出力を
-      列名で整列してから dedupe/追加。出力スキーマが拡張/縮小した場合は既存行も
-      再射影。`matches[term_index-1]` で項対応の match を解決）
+- [x] 再帰項の BY NAME / CORRESPONDING アライメント（各ラウンドで項出力を
+      蓄積側の列名へ整列してから dedupe/追加。`SelectStatement::MatchFor(term)`
+      で項対応の match を解決し、visitor は `BY NAME` / `STRICT CORRESPONDING`
+      / `CORRESPONDING` / `ON/BY (col_list)` を per-pair で記録する。契約は
+      「anchor が CTE の形を決める」: 名前一致は値の並びだけを変え、項が
+      anchor 列を作れない・重複名・無名列は NULL 埋めせずエラー。素の
+      `CORRESPONDING` は項だけの列を落とし、`ON/BY (col_list)` は working
+      shape を覆う必要がある。`WITH DEPTH` の depth 列は整列後の末尾。
+      回帰: `SqlEngineRecursiveCteNameMatching*`,
+      `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`）
 - [x] CTE 解決の依存順（WITH RECURSIVE 内の前方参照を許可。兄弟定義への参照を
       トポロジカルに解決し、相互再帰はエラー化）
 - [x] テンプレート再構築でも再帰メタデータを保持（BindSelect が宣言順

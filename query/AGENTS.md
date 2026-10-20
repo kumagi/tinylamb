@@ -176,6 +176,17 @@ ordinal (`ORDER BY 1 COLLATE 'spec'`) keeps its collator across the deferred
 ordinal resolution. Without that the clause parsed but silently ordered binary,
 and an unresolved ordinal left a constant key that ordered nothing.
 
+`query/statement.hpp` records set-operation column matching per pair: the
+visitor turns `BY NAME` / `STRICT CORRESPONDING` into `SetOperationMatch::by_name`,
+plain `CORRESPONDING` into `corresponding`, and an `ON/BY (col_list)` into
+`columns`, then hands the match to the `AddSetOperation` that introduces the
+branch. `SelectStatement::MatchFor(pair_index)` resolves it per term (falling
+back to the head-level `union_by_name_` flag for hand-built statements).
+`ExecuteRecursiveCte` is the consumer that binds values by name; **non-recursive
+set operations still match positionally and silently ignore the mode** — that
+gap is recorded in `docs/next-actions.md` (第42報), so no test should pin the
+positional answer for them.
+
 Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_template_test`, `join_reduction_test`, `sql_clustered_order_test`,
 `sql_collation_test`,
