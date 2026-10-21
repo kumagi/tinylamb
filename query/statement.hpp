@@ -445,6 +445,12 @@ class SelectStatement : public Statement {
     distinct_ = true;
     complex_ = true;
   }
+  // SELECT ... FOR UPDATE (GoogleSQL's only locking clause): the rows the
+  // scan visits are write-intent locked and stay locked until the transaction
+  // ends.  GoogleSQL has no FOR SHARE / NOWAIT / SKIP LOCKED, so a single flag
+  // is the whole grammar.
+  bool ForUpdate() const { return for_update_; }
+  void SetForUpdate(bool for_update) { for_update_ = for_update; }
   bool WithTies() const { return with_ties_; }
   void SetWithTies(bool with_ties) {
     with_ties_ = with_ties;
@@ -753,6 +759,9 @@ class SelectStatement : public Statement {
     } else {
       o << "(null)";
     }
+    if (for_update_) {
+      o << " for_update=true";
+    }
     for (const SelectSource& source : sources_) {
       if (!source.sample) {
         continue;
@@ -773,6 +782,7 @@ class SelectStatement : public Statement {
   bool distinct_{false};
   std::vector<Expression> distinct_on_;
   bool with_ties_{false};
+  bool for_update_{false};
   std::unordered_map<std::string, std::string> aliases_;
   std::vector<SelectSource> sources_;
   std::vector<Expression> group_by_;

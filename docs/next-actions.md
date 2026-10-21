@@ -1,5 +1,17 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第49報)。同節の続き: **SkipLocked / NOWAIT**。GoogleSQL に
+文法が無いため NOWAIT はエンジン API(`ForUpdateWaitMode::kNoWait`)として実装し、
+プランキャッシュ key に方針を混ぜた。SKIP LOCKED は「ロックしてから WHERE」の
+契約と両立しない(述語一致行まで結果から消える)ため見送り、理由と将来の
+出発点を記録した。詳細は下記「2026-10-20 FOR UPDATE の待機方針は
+エンジン API / SKIP LOCKED は見送り」の節。
+
+2026-10-20 加筆(第48報)。統合TODO(`docs/todo.md` Phase 2 DML / Lock)の次項目:
+**LockRows / SELECT FOR UPDATE**。`LockMode` を取り込み、DML ソース契約
+(`require_row_position` → スキャン `lock_rows`)を再利用して行ロックを実装。
+詳細は下記「2026-10-20 SELECT ... FOR UPDATE は DML ソース契約で行ロック」の節。
+
 2026-10-20 加筆(第47報)。統合TODO(`docs/todo.md` Phase 2 DML / Lock)の次項目:
 **UPDATE FROM / DELETE USING**。`UPDATE ... FROM` は MERGE 脱糖として実装済みで、
 `DELETE ... USING` は GoogleSQL に構文が無いため等価形（相関 EXISTS / IN）を
@@ -58,6 +70,73 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 FOR UPDATE の待機方針はエンジン API / SKIP LOCKED は見送り
+
+- **[文法] `NOWAIT` / `SKIP LOCKED` は GoogleSQL に無い。** パーサは
+  `SELECT * FROM t FOR UPDATE NOWAIT` を構文エラーにする（`FOR UPDATE` だけが
+  `LockMode` ノードになる）。フロントエンドは外部パーサなので、構文を足す
+  手段は無い。
+- **[実装] NOWAIT = 非ブロッキング予約。** `SqlEngine::SetForUpdateWaitMode(
+  ForUpdateWaitMode::kNoWait)` が `QueryData::wait_for_write_intent_=false` に
+  落ち、スキャンは `TryAddWriteSet` で予約する。これは DELETE のソース
+  スキャンが既に使っている方針（5 秒待ちでインデックス読み取りガードを
+  占有しないため）で、競合した瞬間に `kConflicts` で文が落ちる。
+  `kWait`（既定）は従来どおりブロッキング + デッドロック被害者の wounding。
+- **[必須] 方針はプランキャッシュ key の一部。** 待機方針は
+  `PhysicalProperties::wait_for_write_intent` としてプランに焼き込まれる。
+  `kNoWait` のときだけ `FOR UPDATE` を含む SQL の fingerprint に接尾辞を足し、
+  `kWait` で埋めたプランを `kNoWait` のエンジンが再生しないようにする
+  （接尾辞を消す変異は 5 秒待ちになり `SqlEngineForUpdateNoWaitFailsFast` が
+  落ちる）。テンプレートキャッシュ側は AST だけを持つので影響しない
+  （方針は plan 時に読む）。
+- **[見送り] SKIP LOCKED。** 本エンジンのロックは DML ソース契約で
+  「ロックしてから WHERE」なので、ロック済み行を飛ばすと**述語に一致する行まで
+  結果から消える**（例: 3 行中 1 行が他トランザクションにロックされていると
+  2 行だけ返る）。PostgreSQL の SKIP LOCKED は「述語に一致した行のうち
+  ロックできた行」を返すので、意味を保つにはスキャン側に
+  「述語評価後にロックし、取れなかった行だけ飛ばす」第三のモードが要る。
+  SQL 面が無いまま plan property を増やすのは割に合わないため見送り。
+  将来 `FOR UPDATE` に文法が入ったら `table/scan_options.hpp` の
+  `lock_rows`/`wait_for_write_intent` を三値モードにし、
+  `PhysicalProperties::Key()` に混ぜるのが出発点。
+
+## 2026-10-20 SELECT ... FOR UPDATE は DML ソース契約で行ロック
+
+- **[実装] `FOR UPDATE` は新しいロック層を足さず、DML ソース契約を再利用した。**
+  パーサは `LockMode` ノードを出す（GoogleSQL には `FOR UPDATE` しか無く、
+  `FOR SHARE`/`NOWAIT`/`SKIP LOCKED` は構文エラー）。visitor が
+  `SelectStatement::ForUpdate()` を立て、`PrepareStatement` が
+  `PlanRequirements.require_row_position=true` を要求 → スキャンが
+  `lock_rows` になり、行を読む前に `Transaction::AddWriteSet` で write-intent を
+  取る。意図はトランザクション終了まで保持され、他トランザクションの
+  `TryAddWriteSet` は失敗する。
+- **[契約] 述語はロックの後。** UPDATE/DELETE のソースと同じ規則なので、
+  索引範囲に落ちない述語ではスキャンが訪れた行（フルスキャンなら全行）を
+  ロックする。PostgreSQL の「一致行だけ」より広いが、取りこぼしは無い。
+  索引範囲が取れる述語ならその範囲に限定される。`WHERE` が索引範囲に
+  落ちるかは実行計画依存なので、「条件に一致した行だけがロックされる」とは
+  書かない。
+- **[契約] head 版をロックして head 版を返す。** ロックは行解決の前に行うので、
+  「スナップショットの古い版にロックを付けて新しい版を返す」ことはない。
+- **[ゲート] 行位置を持たない形は明示エラー。** JOIN/集計/DISTINCT/GROUP BY/
+  HAVING/window/集合演算/CTE/派生表/TABLE SAMPLE は
+  `SELECT ... FOR UPDATE requires a single base table ...` で拒否。
+  relational 経路（row position を運ばない）に落ちる形も拒否する。
+  黙ってロック無しで返す経路を作らないのが要点。
+- **[キャッシュ] テンプレート再束縛でフラグを落とさない。**
+  `BindSelect` が `SetForUpdate()` を複写しないと、テンプレートキャッシュヒットで
+  ロック無しの読みに化ける。`SqlTemplateTest.BindSelectPreservesForUpdate` が固定。
+  コンパイル済みプランキャッシュは Plan 自体（`lock_rows` 込み）を再生するので
+  ロックは保たれ、同じ SQL テキストしか同じ fingerprint にならない。
+- 回帰: `QueryTest.SqlEngineForUpdateLocksScannedRows`（ロック取得・
+  非ロック読みは write set を汚さない・abort で解放・同一文の再実行でも
+  ロック）, `QueryTest.SqlEngineForUpdateRejectsUnlockableShapes`,
+  `SqlTemplateTest.BindSelectPreservesForUpdate`。
+- 変異: visitor のフラグ設定削除 / `require_row_position_` 代入削除 /
+  形ゲート無効化 / 再束縛のフラグ複写削除 → すべて kill 確認。
+- **[残課題] `SkipLocked` / `NOWAIT` は文法が無い。** ZetaSQL のパーサが
+  `USING`/`NOWAIT` を拒否するため SQL からは到達できない（次項目の判断材料）。
 
 ## 2026-10-20 UPDATE FROM は MERGE 脱糖 / DELETE USING は等価形が契約
 

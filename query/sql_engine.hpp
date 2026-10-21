@@ -115,6 +115,22 @@ class SqlEngine {
   void SetForceRelationalFallback(bool force) {
     force_relational_fallback_ = force;
   }
+  // SELECT ... FOR UPDATE lock acquisition policy.  GoogleSQL has no
+  // NOWAIT/SKIP LOCKED grammar (the frontend's parser stops at FOR UPDATE), so
+  // the policy is an embedder knob rather than SQL syntax:
+  //   kWait   - blocking acquisition (the default; the engine's 5s cap and
+  //             deadlock-victim wounding apply).
+  //   kNoWait - try-lock: a conflicting writer fails the statement at once with
+  //             a kConflicts error, the same policy DELETE's source scan uses.
+  // The mode is part of the compiled-plan cache key, so a cached plan can never
+  // replay the other policy.
+  enum class ForUpdateWaitMode { kWait, kNoWait };
+  void SetForUpdateWaitMode(ForUpdateWaitMode mode) {
+    for_update_wait_mode_ = mode;
+  }
+  [[nodiscard]] ForUpdateWaitMode ForUpdateWaitModeValue() const {
+    return for_update_wait_mode_;
+  }
   [[nodiscard]] bool ForceRelationalFallback() const {
     return force_relational_fallback_;
   }
@@ -240,6 +256,7 @@ class SqlEngine {
   bool dml_fold_applied_{false};
   std::vector<Value> plan_cache_parameters_;
   bool force_relational_fallback_{false};
+  ForUpdateWaitMode for_update_wait_mode_{ForUpdateWaitMode::kWait};
   std::vector<SharedGroupingCore> shared_grouping_cores_;
   uint64_t views_registered_epoch_{~uint64_t{0}};
 };

@@ -659,8 +659,63 @@ Cascades rule / cost / statistics
       `SqlEngineDeleteJoinsThroughCorrelatedSubqueries`,
       `GoogleSqlAstTest.DeleteRejectsUsingClauseInsteadOfDroppingIt`。
 - [x] ReturningExecutorを実装する。
-- [ ] LockRows / SELECT FOR UPDATEを実装する。
-- [ ] SkipLocked / NOWAITを実装する。
+- [x] LockRows / SELECT FOR UPDATEを実装する。
+      GoogleSQL 唯一のロック句 `FOR UPDATE`（パーサの `LockMode` ノード）を
+      `SelectStatement::ForUpdate()` として取り込み、**DML ソース契約を再利用**して
+      実装した: `QueryData::require_row_position_=true` → プラン要求
+      `row_position=true` → スキャンが `lock_rows` になり、訪れた行を
+      読み出し前に write-intent で予約する（`txn.AddWriteSet`/`TryAddWriteSet`）。
+      予約はトランザクション終了（commit/abort）まで保持され、他トランザクションの
+      同じ行への予約を拒否する。
+      契約:
+      - WHERE はロックの**後**に評価される（UPDATE/DELETE のソースと同じ規則）。
+        したがってインデックス範囲で絞れない述語ではスキャンが訪れた行
+        （フルスキャンならテーブル全体）をロックする。安全側（取りこぼしが無い）
+        だが PostgreSQL の「一致行だけ」より広い。索引範囲が取れる形なら
+        その範囲に限定される。
+      - ロック対象はスキャンが解決した head（最新コミット）版なので、
+        「古い版をロックして新しい版を返す」状態にはならない。
+      - 単一基底テーブル・JOIN/集計/DISTINCT/GROUP BY/HAVING/window/集合演算/
+        CTE/派生表/サンプリング無しの形のみ受理。行位置を持たない形
+        （集計・JOIN・集合演算）は**明示エラー**にする（黙ってロック無し実行に
+        しない）。relational 経路に落ちる形も row position を運べないのでエラー。
+      - `BindSelect` はテンプレート再束縛でもフラグを保持する
+        （`SqlTemplateTest.BindSelectPreservesForUpdate`）。
+      - `FOR SHARE` / `NOWAIT` / `SKIP LOCKED` は GoogleSQL の文法に無く
+        パーサが拒否する（次項の課題を参照）。
+      回帰: `QueryTest.SqlEngineForUpdateLocksScannedRows`（ロック取得・
+      非ロック読みとの差・abort 解放・再実行でもロック）,
+      `QueryTest.SqlEngineForUpdateRejectsUnlockableShapes`（集計/GROUP BY/
+      DISTINCT/JOIN/CTE の拒否）,
+      `SqlTemplateTest.BindSelectPreservesForUpdate`。
+      変異（visitor のフラグ設定削除 / `require_row_position_` 代入削除 /
+      形ゲート無効化 / 再束縛のフラグ複写削除）はすべてテストで kill 確認。
+- [x] SkipLocked / NOWAITを実装する。
+      GoogleSQL には `NOWAIT` / `SKIP LOCKED` の**文法が無い**（パーサが
+      `FOR UPDATE` の後で syntax error にする）ので SQL からは指定できない。
+      そのため **NOWAIT はエンジン API として実装**した:
+      `SqlEngine::SetForUpdateWaitMode(ForUpdateWaitMode::kNoWait)`。
+      `kNoWait` は `QueryData::wait_for_write_intent_=false` に落ち、スキャンが
+      `TryAddWriteSet` で予約する（DELETE のソーススキャンと同じ非ブロッキング
+      方針）。競合した時点で文が即座に `kConflicts` で落ちる（既定の `kWait` は
+      5 秒上限のブロッキング）。待機方針はプランに焼き込まれるので、
+      **fingerprint に方針を混ぜる**（`SELECT ... FOR UPDATE` のテキスト +
+      `kNoWait` のときだけ接尾辞）。これが無いと `kWait` で埋めた
+      コンパイル済みプランを `kNoWait` のエンジンが再生して 5 秒待つ。
+      回帰: `QueryTest.SqlEngineForUpdateNoWaitFailsFast`（`kWait` の
+      プランキャッシュを埋めた後に同一テキストを `kNoWait` で実行し、
+      2 秒未満で `kConflicts`、行は返らない）。
+      変異（fingerprint の接尾辞削除 / `wait_for_write_intent_` を常に true）は
+      いずれも 5 秒待ちになってテストが落ちることを確認。
+      **SKIP LOCKED は実装しない**（スキップ判断）。理由: (1) 文法が無く
+      エンジン API にしか出せない、(2) 本エンジンのロック取得は DML ソース契約で
+      「ロックしてから WHERE」なので、ロック済み行を飛ばすと**述語に一致する行まで
+      結果から消える**（部分的に空の結果が返る）。意味を保つには
+      「スキャンが述語評価後にロックし、失敗行だけ飛ばす」モード
+      （新しいスキャンロックモード + plan property の追加）が必要で、
+      SQL 面が無いまま property 配管だけ増えるため見送る。将来 `FOR UPDATE`
+      に文法が入ったら `ScanOptions` に三値モードを足すのが出発点
+      （`docs/lock_order.md` の 4 番、LockManager 行ロックの層）。
 - [x] Truncate executorを実装する。
 - [x] before / after trigger hookを実装する。
 - [ ] DML logical / physical planを導入し、INSERT / UPDATE / DELETEをCascadesへ接続する。

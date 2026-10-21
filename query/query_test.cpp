@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -475,6 +476,166 @@ TEST_F(QueryTest, TableSampleExecutorSemantics) {
     EXPECT_EQ(second_repeat[i][0].value.int_value,
               first_repeat[i][0].value.int_value);
   }
+}
+
+// SELECT ... FOR UPDATE reuses the DML source contract (`require_row_position`
+// -> scan `lock_rows`): every row the access path visits is write-intent locked
+// before the WHERE is applied, exactly as UPDATE/DELETE lock their sources, so
+// a full scan reserves the whole scanned table.  The intent lives until
+// commit/abort and blocks another transaction's reservation of the same row.
+// A plain read takes no intent, and the flag survives a template-cache re-bind.
+TEST_F(QueryTest, SqlEngineForUpdateLocksScannedRows) {
+  // The seeding transaction must finish first: an inserting transaction keeps
+  // its write intents, and a locking scan would wait on them.
+  TransactionContext seed = db_->BeginContext();
+  RunSql(seed, *db_, "CREATE TABLE fu (k INT64, v INT64);");
+  RunSql(seed, *db_, "INSERT INTO fu VALUES (1, 10), (2, 20), (3, 30);");
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  TransactionContext ctx = db_->BeginContext();
+  TransactionContext locker = db_->BeginContext();
+  SqlEngine engine(*db_);
+  const auto drain_for_update = [&](std::string_view sql) {
+    std::vector<Row> rows;
+    StatusOr<Executor> prepared = engine.Prepare(locker, sql);
+    EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+  std::vector<Row> rows =
+      drain_for_update("SELECT k FROM fu WHERE k = 1 FOR UPDATE;");
+  ASSERT_EQ(rows.size(), 1U);
+
+  // Physical positions come from a plain read.
+  Table table = db_->GetTable(ctx, "fu").Value();
+  std::unordered_map<int64_t, RowPosition> positions;
+  for (Iterator it = table.BeginFullScan(ctx.txn_); it.IsValid(); ++it) {
+    for (int64_t k = 1; k <= 3; ++k) {
+      if ((*it).values_[0] == Value(k)) {
+        positions[k] = it.Position();
+      }
+    }
+  }
+  ASSERT_EQ(positions.size(), 3U);
+  // The reader above ran the same table without FOR UPDATE: no intents at all.
+  EXPECT_FALSE(ctx.txn_.HasWriteSet(positions[1]));
+  EXPECT_FALSE(ctx.txn_.HasWriteSet(positions[2]));
+  EXPECT_FALSE(ctx.txn_.HasWriteSet(positions[3]));
+  // The locking scan reserved the rows it visited, before the WHERE dropped
+  // the non-matching ones (the DML source contract).
+  EXPECT_TRUE(locker.txn_.HasWriteSet(positions[1]));
+  EXPECT_TRUE(locker.txn_.HasWriteSet(positions[2]));
+  EXPECT_TRUE(locker.txn_.HasWriteSet(positions[3]));
+
+  // A second transaction cannot reserve a locked row.
+  TransactionContext writer = db_->BeginContext();
+  EXPECT_FALSE(writer.txn_.TryAddWriteSet(positions[1]));
+  // Aborting the locker releases the row to the writer.
+  locker.txn_.Abort();
+  EXPECT_TRUE(writer.txn_.TryAddWriteSet(positions[1]));
+  writer.txn_.Abort();
+
+  // Re-running the same text locks again: a cached plan must not turn the
+  // statement into an unlocked read.
+  TransactionContext again = db_->BeginContext();
+  for (int run = 0; run < 2; ++run) {
+    StatusOr<Executor> prepared =
+        engine.Prepare(again, "SELECT k FROM fu WHERE k = 1 FOR UPDATE;");
+    ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_TRUE(again.txn_.HasWriteSet(positions[1]));
+  }
+  again.txn_.Abort();
+  ctx.txn_.Abort();
+}
+
+// GoogleSQL has no NOWAIT, so the locking select's wait policy is an embedder
+// knob.  kNoWait must fail the statement as soon as the scan meets a held row
+// (try-lock, the policy DELETE's source scan uses) instead of parking for the
+// engine's 5s wait cap.  The policy is part of the plan-cache key: filling the
+// cache under kWait must not make a kNoWait engine replay the blocking plan.
+TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
+  TransactionContext seed = db_->BeginContext();
+  RunSql(seed, *db_, "CREATE TABLE fu_nowait (k INT64, v INT64);");
+  RunSql(seed, *db_, "INSERT INTO fu_nowait VALUES (1, 10), (2, 20);");
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  // kWait engine: this fills the compiled-plan cache for the text below while
+  // it locks every scanned row.  The literal keeps the statement templatable,
+  // so the compiled-plan cache is live for the repeat below -- that is the path
+  // the policy key must guard.
+  TransactionContext holder = db_->BeginContext();
+  SqlEngine holder_engine(*db_);
+  {
+    StatusOr<Executor> held = holder_engine.Prepare(
+        holder, "SELECT k FROM fu_nowait WHERE k >= 1 FOR UPDATE;");
+    ASSERT_TRUE(held.HasValue()) << holder_engine.LastError();
+    Row row;
+    size_t rows = 0;
+    while (held.Value()->Next(&row, nullptr)) {
+      ++rows;
+    }
+    EXPECT_TRUE(held.Value()->ok()) << held.Value()->GetStatus().GetMessage();
+    EXPECT_EQ(rows, 2U);
+  }
+  TransactionContext reader = db_->BeginContext();
+  Table table = db_->GetTable(reader, "fu_nowait").Value();
+  RowPosition first;
+  for (Iterator it = table.BeginFullScan(reader.txn_); it.IsValid(); ++it) {
+    if ((*it).values_[0] == Value(1)) {
+      first = it.Position();
+    }
+  }
+  ASSERT_TRUE(first.IsValid());
+  EXPECT_TRUE(holder.txn_.HasWriteSet(first));
+
+  SqlEngine nowait_engine(*db_);
+  nowait_engine.SetForUpdateWaitMode(SqlEngine::ForUpdateWaitMode::kNoWait);
+  TransactionContext other = db_->BeginContext();
+  const auto started = std::chrono::steady_clock::now();
+  StatusOr<Executor> prepared = nowait_engine.Prepare(
+      other, "SELECT k FROM fu_nowait WHERE k >= 1 FOR UPDATE;");
+  ASSERT_TRUE(prepared.HasValue()) << nowait_engine.LastError();
+  Row row;
+  EXPECT_FALSE(prepared.Value()->Next(&row, nullptr));
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+  EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
+  // The blocking policy would sit here for the 5s wait cap.
+  EXPECT_LT(elapsed_ms, 2000.0) << elapsed_ms << "ms";
+  other.txn_.Abort();
+  holder.txn_.Abort();
+  reader.txn_.Abort();
+}
+
+// The shapes FOR UPDATE cannot lock are refused with a message naming the
+// supported shape, instead of returning rows that are not actually locked.
+TEST_F(QueryTest, SqlEngineForUpdateRejectsUnlockableShapes) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE fu_bad (k INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO fu_bad VALUES (1, 10), (2, 20);");
+  SqlEngine engine(*db_);
+  for (const std::string& sql :
+       {"SELECT COUNT(*) FROM fu_bad FOR UPDATE;",
+        "SELECT k FROM fu_bad GROUP BY k FOR UPDATE;",
+        "SELECT DISTINCT k FROM fu_bad FOR UPDATE;",
+        "SELECT a.k FROM fu_bad a JOIN fu_bad b ON a.k = b.k FOR UPDATE;",
+        "WITH c AS (SELECT k FROM fu_bad) SELECT k FROM c FOR UPDATE;"}) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_FALSE(prepared.HasValue()) << sql;
+    EXPECT_NE(engine.LastError().find("FOR UPDATE"), std::string::npos)
+        << sql << ": " << engine.LastError();
+  }
+  ctx.txn_.Abort();
 }
 
 // GoogleSQL has no DELETE ... USING, so the join spelling is a correlated

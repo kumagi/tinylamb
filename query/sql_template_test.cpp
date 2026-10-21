@@ -125,6 +125,27 @@ TEST(SqlTemplateTest, BindSelectPreservesLimitAndAttributes) {
   EXPECT_TRUE(select.Distinct());
 }
 
+TEST(SqlTemplateTest, BindSelectPreservesForUpdate) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "skipped";
+  }
+  // FOR UPDATE is part of the statement's meaning, not a literal: a re-bind
+  // that dropped the flag would replay a locking read as an unlocked one on
+  // every template-cache hit.
+  auto original = ParseSql("SELECT a FROM t WHERE a = 1 FOR UPDATE;");
+  ASSERT_TRUE(original);
+  EXPECT_TRUE(dynamic_cast<const SelectStatement&>(*original).ForUpdate());
+  const SqlTemplate templated =
+      ExtractSqlTemplate("SELECT a FROM t WHERE a = 9 FOR UPDATE;");
+  auto bound_or = BindStatementLiterals(*original, templated.parameters);
+  ASSERT_TRUE(bound_or.HasValue());
+  auto bound = bound_or.MoveValue();
+  const auto& select = dynamic_cast<const SelectStatement&>(*bound);
+  EXPECT_TRUE(select.ForUpdate());
+  ASSERT_TRUE(select.WhereClause());
+  EXPECT_NE(select.WhereClause()->ToString().find('9'), std::string::npos);
+}
+
 TEST(SqlTemplateTest, BindsCompositeStockLookup) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";

@@ -234,6 +234,40 @@ table's statistics (no statistics ⇒ no pushdown). `LastCteRestrictionPushdowns
 reports it; `SqlEnginePushesSharedCteRestrictionsDisjunctively` pins the
 disjunction, the gates, and the shrunken cell (leaf `rows_evaluated`).
 
+## Locking selects
+
+`SELECT ... FOR UPDATE` is GoogleSQL's only lock clause (the AST's `LockMode`
+node; `FOR SHARE`/`NOWAIT`/`SKIP LOCKED` are parser errors). It is not a new
+lock layer: the statement takes the **DML source contract**, i.e.
+`QueryData::require_row_position_ = true` makes the access path `lock_rows`,
+so the scan reserves a write intent (`Transaction::AddWriteSet`) on every row
+it visits *before* the WHERE drops it, and the intent lives until
+commit/abort. Consequences to keep in mind when touching the select route:
+
+- The predicate is applied after the lock, exactly like UPDATE/DELETE sources;
+  a full scan reserves the whole scanned table (safe, wider than PostgreSQL's
+  matched-rows-only rule). An index range still bounds the visited rows.
+- Shapes with no single row position per output row (JOIN, aggregate, DISTINCT,
+  GROUP BY, HAVING, window, set operation, CTE, derived source, table sample)
+  are refused with an explicit diagnostic, as is the relational route (it does
+  not carry positions). Never fall back to an unlocked read.
+- `BindSelect` must re-apply `ForUpdate()`; otherwise a template-cache hit
+  replays the statement as an unlocked read.
+- Rows come from the locking scan's head-version resolution, so the returned
+  image and the locked image are the same version.
+
+The wait policy is an embedder knob, not syntax: GoogleSQL has no
+`NOWAIT`/`SKIP LOCKED` (the parser stops after `FOR UPDATE`).
+`SqlEngine::SetForUpdateWaitMode(kNoWait)` makes the statement use the
+try-lock path (`QueryData::wait_for_write_intent_ = false`, the same policy
+DELETE's source scan uses) so a conflicting writer fails the statement at once
+with `kConflicts` instead of parking for the 5s cap. The mode is part of the
+plan-cache fingerprint for `FOR UPDATE` text; without that, a plan filled under
+`kWait` would be replayed by a `kNoWait` engine.
+
+Regressions: `QueryTest.SqlEngineForUpdate*`,
+`SqlTemplateTest.BindSelectPreservesForUpdate`.
+
 Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_template_test`, `join_reduction_test`, `sql_clustered_order_test`,
 `sql_collation_test`,

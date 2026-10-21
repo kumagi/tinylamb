@@ -1782,6 +1782,14 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       upper_query.find("PROTO") != std::string::npos) {
     templated.templatable = false;
   }
+  // The FOR UPDATE wait policy is baked into the plan (it becomes the scan's
+  // lock mode) and GoogleSQL has no syntax for it, so the policy joins the
+  // fingerprint: a cached plan filled under kWait must never replay a blocking
+  // acquisition for a kNoWait engine.
+  if (for_update_wait_mode_ == ForUpdateWaitMode::kNoWait &&
+      upper_query.find("FOR UPDATE") != std::string::npos) {
+    templated.fingerprint.append("\n-- for-update-nowait");
+  }
   // Phase 2-1: consult the compiled-plan cache before any parse/bind/plan
   // work. Only non-EXPLAIN, templatable statements participate.
   if (!explain && !force_relational_fallback_ && templated.templatable) {
@@ -8873,6 +8881,39 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       auto select = std::shared_ptr<SelectStatement>(
           dynamic_cast<SelectStatement*>(statement.release()));
+      // SELECT ... FOR UPDATE locks the rows its scan visits, which is the DML
+      // source contract (`require_row_position` -> scan `lock_rows`): one base
+      // table, no join, no aggregate/window/set-op/CTE/derived source.  A join
+      // or an aggregate has no single row position to lock per output row, and
+      // the relational route does not carry positions at all, so the shape is
+      // refused up front instead of silently running an unlocked read.
+      const bool for_update = select->ForUpdate();
+      if (for_update) {
+        const SelectSource* only_source = select->Sources().size() == 1
+                                              ? &select->Sources().front()
+                                              : nullptr;
+        const bool has_aggregate =
+            std::ranges::any_of(
+                select->SelectList(),
+                [](const NamedExpression& item) {
+                  return relational_detail::ContainsAggregate(item.expression);
+                }) ||
+            relational_detail::ContainsAggregate(select->Having());
+        if (only_source == nullptr || only_source->query != nullptr ||
+            only_source->unnest || only_source->is_lateral ||
+            only_source->table.empty() || only_source->sample.has_value() ||
+            !select->WithQueries().empty() || !select->UnionAll().empty() ||
+            select->GetSetOperationTree() != nullptr || select->Distinct() ||
+            select->HasDistinctOn() || !select->GroupBy().empty() ||
+            has_aggregate || select->Having() || select->Qualify() ||
+            relational_detail::HasWindowFunctions(*select)) {
+          last_error_ =
+              "SELECT ... FOR UPDATE requires a single base table with no "
+              "join, aggregate, DISTINCT, GROUP BY, HAVING, window function, "
+              "set operation, sampled source, or CTE";
+          return Status(Status::kInvalidArgument, last_error_);
+        }
+      }
       // M4: inline singly-referenced non-recursive CTEs into derived
       // sources, then lift the remaining layer (shared eager cells plus
       // opaque recursive leaves) when atomic; M5 flattens the single-table
@@ -8972,6 +9013,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           select->Sources(),
           [](const SelectSource& source) { return source.sample.has_value(); });
       const auto emit_relational = [&]() -> StatusOr<Executor> {
+        if (for_update) {
+          last_error_ =
+              "SELECT ... FOR UPDATE cannot run on the relational route: this "
+              "query shape has no row positions to lock (a plain single-table "
+              "WHERE/ORDER BY/LIMIT shape is supported)";
+          return Status(Status::kInvalidArgument, last_error_);
+        }
         std::vector<Column> columns;
         columns.reserve(result_column_names_.size());
         for (const std::string& name : result_column_names_) {
@@ -9315,6 +9363,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // a post-plan SortExecutor covers plans that do not enforce ordering,
       // so computed ordering no longer forces the relational path.
       QueryData query;
+      // FOR UPDATE reuses the DML source contract: scans reserve a write
+      // intent (and a row lock) on every row they visit, and the transaction
+      // holds them until commit/abort.  Positions also have to survive the
+      // projection for the plan to be accepted.
+      query.require_row_position_ = for_update;
+      if (for_update) {
+        query.wait_for_write_intent_ =
+            for_update_wait_mode_ != ForUpdateWaitMode::kNoWait;
+      }
       // Stamp literals in SQL-text order before the optimizer sorts
       // conjuncts. Identical values (warehouse 1 AND district 1) would
       // otherwise be numbered by plan-tree position and bind swapped.

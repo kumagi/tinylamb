@@ -796,6 +796,12 @@ BindSelect(  // NOLINT(misc-no-recursion) // Recursive statement-tree binding by
   if (select.RequiresRelationalEvaluation()) {
     result->MarkComplex();
   }
+  // FOR UPDATE is part of the statement's meaning, not a literal: a re-bind
+  // that dropped it would replay the query as an unlocked read on every
+  // template-cache hit.
+  if (select.ForUpdate()) {
+    result->SetForUpdate(true);
+  }
   return result;
 }
 

@@ -9855,6 +9855,17 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     ASSIGN_OR_RETURN(std::shared_ptr<SelectStatement>, hv239690_0,
                      (VisitQuery(*query)));
     auto statement = std::move(hv239690_0);
+    if (const GoogleSqlAstNode* lock_mode = query->Child("LockMode")) {
+      // The parser accepts exactly one lock mode (`FOR UPDATE`); FOR SHARE and
+      // NOWAIT/SKIP LOCKED are syntax errors before this point.  Refuse an
+      // unknown mode instead of silently running an unlocked read.
+      if (UpperCopy(SliceSource(lock_mode)).find("UPDATE") ==
+          std::string::npos) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: unsupported LockMode (only FOR UPDATE exists)");
+      }
+      statement->SetForUpdate(true);
+    }
     return std::make_unique<SelectStatement>(*statement);
   }
   if (root.kind == "CreateConstantStatement") {
