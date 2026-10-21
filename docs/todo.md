@@ -719,6 +719,34 @@ Cascades rule / cost / statistics
 - [x] Truncate executorを実装する。
 - [x] before / after trigger hookを実装する。
 - [ ] DML logical / physical planを導入し、INSERT / UPDATE / DELETEをCascadesへ接続する。
+      **スキップ（判断理由）**: 部分は既に接続済みで、残りは Cascades の
+      memo/rule を拡張する大規模リファクタになる。現状:
+      - UPDATE / DELETE は対象テーブルを一時的な `QueryData`
+        (`require_row_position_=true`, `where_`, 出力列) に落とし、
+        **Cascades の `Optimizer::Optimize` でソース側のアクセスパスを選ばせて**
+        から `UpdateExecutor` / `DeleteExecutor` で変更を適用する。
+        つまりソース選択（index / full scan / filter 順 / row position）は
+        Cascades の担当で、変更適用だけが手書き executor。
+      - INSERT ... SELECT はソース問合せを materialize し、
+        INSERT VALUES は plan を必要としない。
+      - MERGE / TRUNCATE / nested array update / struct field update は
+        文固有の前処理（sql_engine 内）を通る。
+      残っているのは「DML 自体を `LogicalOperator::kInsert/kUpdate/kDelete` +
+      物理 `DmlPlan` として memo に入れ、ソースと一緒に探索・コスト比較する」
+      部分で、必要な作業は:
+      1. `LogicalOperator` に DML 3 種を追加し、`LogicalScan` 側の
+         memo グループ化（`InsertLogicalToPhysical` 相当の規則）を書く。
+      2. row position と write-intent 方針を `PhysicalProperties` の
+         制約として扱い、`DmlPlan` が `require_row_position` を子に要求する形に
+         する（現状は QueryData 経由で暗黙に立てている）。
+      3. 対象テーブルへの適用（SET 式評価、制約・トリガ・RETURNING・
+         ASSERT_ROWS_MODIFIED・値テーブルの別名束縛）を plan ノードの
+         データに移す。これは sql_engine の kUpdate/kDelete/kInsert 分岐で
+         文あたり 300〜400 行あり、移設は回帰リスクが高い。
+      4. コスト比較（index 経由の点更新 vs スキャン + 適用）を定義する。
+      SQL 上の観測結果は現状で変わらない（EXPLAIN も UPDATE/DELETE 非対応のまま）
+      ため、**この項目はペンディング**とし、`docs/next-actions.md` に
+      着手点と分割案を残した。
 
 ### Sampling / 実行時統計
 

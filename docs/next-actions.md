@@ -1,5 +1,9 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第50報)。DML logical / physical plan(Cascades 接続の残り)は
+**ペンディング**と判断し、現状の接続範囲・必要な分割・着手点を記録した
+(下記「2026-10-20 DML を Cascades の memo に載せる作業の分割」)。
+
 2026-10-20 加筆(第49報)。同節の続き: **SkipLocked / NOWAIT**。GoogleSQL に
 文法が無いため NOWAIT はエンジン API(`ForUpdateWaitMode::kNoWait`)として実装し、
 プランキャッシュ key に方針を混ぜた。SKIP LOCKED は「ロックしてから WHERE」の
@@ -70,6 +74,35 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 DML を Cascades の memo に載せる作業の分割
+
+- **[現状] 「Cascades へ接続」の半分は済んでいる。** UPDATE / DELETE は
+  対象テーブルを一時 `QueryData`（`from_`, `where_`, 出力列,
+  `require_row_position_=true`）に落として `Optimizer::Optimize` に渡し、
+  **ソース側のアクセスパス（index range / full scan / filter 順 / row position）は
+  Cascades が選ぶ**。その `Plan` の executor を `UpdateExecutor` /
+  `DeleteExecutor` が引いて変更を適用する。INSERT ... SELECT はソースを
+  materialize し、INSERT VALUES は plan を持たない。
+- **[未了] DML ノード自体が memo に無い。** 追加するなら:
+  1. `LogicalOperator::kInsert/kUpdate/kDelete` + 物理 `DmlPlan`
+     （`plan/` に宣言、`executor/relational_factory.cpp` で executor を組む
+     既存パターンに合わせる）。
+  2. `PlanRequirements`/`PhysicalProperties` に「子は row position を出す」
+     「write-intent 方針（wait / try-lock）」を明示し、`DmlPlan` が子に要求する。
+     現状は `QueryData::require_row_position_` / `wait_for_write_intent_` が
+     暗黙にその役をしている。
+  3. 適用ロジック（SET 評価、制約、トリガ、RETURNING、
+     ASSERT_ROWS_MODIFIED、値テーブル別名、nested array / struct field 更新）を
+     ノードのデータへ移す。sql_engine の kUpdate/kDelete/kInsert 分岐は
+     文あたり 300〜400 行あり、ここが最大のリスク。
+  4. コスト比較（index 点更新 vs スキャン + 適用）と、
+     `EXPLAIN UPDATE/DELETE`（現状 EXPLAIN は SELECT/WITH のみ）の解禁。
+- **[判断] 見送り。** SQL から見た振る舞いは現状で変わらず、得られるのは
+  探索の一般性と EXPLAIN の見通し。300〜400 行 × 3 文の移設は
+  回帰リスクに対して割に合わないため、`docs/todo.md` では `[ ]` のまま
+  理由を書いてペンディングにした。着手するなら 4 → 2 → 1 → 3 の順
+  （先に EXPLAIN と property を整えると、移設の正しさをテストで観測できる）。
 
 ## 2026-10-20 FOR UPDATE の待機方針はエンジン API / SKIP LOCKED は見送り
 
