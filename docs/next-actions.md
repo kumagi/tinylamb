@@ -1,5 +1,11 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第47報)。統合TODO(`docs/todo.md` Phase 2 DML / Lock)の次項目:
+**UPDATE FROM / DELETE USING**。`UPDATE ... FROM` は MERGE 脱糖として実装済みで、
+`DELETE ... USING` は GoogleSQL に構文が無いため等価形（相関 EXISTS / IN）を
+契約にし、USING 句を黙って落とさないガードを追加した。詳細は下記
+「2026-10-20 UPDATE FROM は MERGE 脱糖 / DELETE USING は等価形が契約」の節。
+
 2026-10-20 加筆(第46報)。統合TODO(`docs/todo.md` Phase 2 CTE / Materialize /
 Recursive)の次項目: **CTE materialization / inlining / filter pushdown のコスト
 選択**。詳細は下記「2026-10-20 共有CTEへの制約押し下げ (選言だけを押す)」の節。
@@ -52,6 +58,39 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 UPDATE FROM は MERGE 脱糖 / DELETE USING は等価形が契約
+
+- **[判明] `UPDATE ... FROM` は既に実装済みだった。** `VisitUpdate` が
+  `UPDATE t SET ... FROM src WHERE <join>` を
+  `MERGE INTO t USING src ON <WHERE> WHEN MATCHED THEN UPDATE SET ...` に脱糖する
+  （`MergeStatement::DesugaredFromUpdate()`）。診断・`StatementType`・
+  `EXPLAIN` は UPDATE のまま（`Update Rows`）。BigQuery と同じく、1 対象行に
+  複数ソース行が一致したら拒否する（"MERGE attempted to UPDATE or DELETE the
+  same target row more than once"）。`MergeTest.UpdateFrom*` が
+  副問合せ源・テーブル源 + 残余 WHERE・無 WHERE・重複一致拒否・コマンド報告を
+  固定している。
+- **[不可能] `DELETE ... USING` は GoogleSQL に存在しない。** フロントエンドは
+  外部パーサ（`execute_query --mode=parse`）なので、`DELETE FROM t USING u` は
+  構文エラーになる。よって等価な綴りを契約にする:
+  `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)` と
+  `DELETE FROM t WHERE k IN (SELECT k FROM u)`。どちらも対象行が複数ソース行に
+  一致しても 1 回だけ削除する（MERGE 由来の UPDATE FROM とは規則が違う。
+  UPDATE は「1 対象行 1 ソース行」を要求し、DELETE は集合一致で 1 回）。
+- **[修正] USING 句を黙って捨てていた。** `VisitDelete` は WHERE 候補から
+  `FromClause` を skip していた。パーサが拒否するので SQL 経由では起きないが、
+  将来の文法や手組み AST で句が来ると「JOIN の無い WHERE」で誤削除になる。
+  句を見つけたら「USING は GoogleSQL に無い + 相関サブクエリで書く」と
+  明示エラーにする（`GoogleSqlAstTest.DeleteRejectsUsingClauseInsteadOfDroppingIt`
+  が、FromClause を持つ dump でエラーになることを固定）。変異（skip に戻す）は
+  このテストで kill 確認。
+- 回帰: `MergeTest.UpdateFrom*`（5 件）,
+  `QueryTest.SqlEngineDeleteJoinsThroughCorrelatedSubqueries`（EXISTS 綴り・
+  IN 綴り・重複一致でも 1 回削除）,
+  `GoogleSqlAstTest.DeleteRejectsUsingClauseInsteadOfDroppingIt`。
+- **[残課題] DELETE 側の `FROM` 拡張は無し。** 将来 ZetaSQL が `USING` を足したら、
+  MERGE 脱糖（`WHEN MATCHED THEN DELETE`）へ寄せるのが自然 — そのとき
+  このガードを外して脱糖に差し替える。
 
 ## 2026-10-20 共有CTEへの制約押し下げ (選言だけを押す)
 

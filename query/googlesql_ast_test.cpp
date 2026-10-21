@@ -81,6 +81,28 @@ TEST(GoogleSqlAstTest, ParserRejectsMalformedDepthJumps) {
   EXPECT_FALSE(ast.HasValue());
 }
 
+// GoogleSQL has no DELETE ... USING, and the frontend's parser rejects the
+// syntax.  A dump that carries a FromClause must still be refused instead of
+// dropping the clause: a silently ignored join would delete rows the WHERE
+// never matched.
+TEST(GoogleSqlAstTest, DeleteRejectsUsingClauseInsteadOfDroppingIt) {
+  const std::string dump =
+      "DeleteStatement\n"
+      "  PathExpression\n"
+      "    Identifier(t)\n"
+      "  FromClause\n"
+      "    TableExpression\n"
+      "      PathExpression\n"
+      "        Identifier(u)\n";
+  const auto ast = GoogleSqlAstParser::Parse(dump);
+  ASSERT_TRUE(ast.HasValue());
+  const StatusOr<std::unique_ptr<Statement>> visited =
+      GoogleSqlAstVisitor::Visit(*ast.Value(), "DELETE FROM t USING u");
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("USING"), std::string::npos)
+      << visited.GetStatus().GetMessage();
+}
+
 TEST(GoogleSqlAstTest, PreservesNestedSetOperationKinds) {
   const std::string sql =
       "(SELECT 1 UNION ALL SELECT 1) INTERSECT DISTINCT SELECT 1;";

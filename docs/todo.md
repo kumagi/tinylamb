@@ -634,11 +634,30 @@ Cascades rule / cost / statistics
 
 ### DML / Lock
 
-（以下はリレーショナル経路で実装済み: Insert, Update, Delete, BatchInsert, Upsert/ON CONFLICT, TableTriggers）
+（以下はリレーショナル経路で実装済み: Insert, Update, UpdateFrom(MERGE脱糖), Delete, BatchInsert, Upsert/ON CONFLICT, TableTriggers）
 
 - [x] Upsert / ON CONFLICTを実装する。
 - [x] MATCHED / NOT MATCHEDのMergeExecutorを実装する。
-- [ ] UPDATE FROM / DELETE USINGを実装する。
+- [x] UPDATE FROM / DELETE USINGを実装する。
+      `UPDATE ... FROM` は実装済み（フロントエンドが
+      `MERGE INTO t USING src ON <WHERE> WHEN MATCHED THEN UPDATE SET ...` へ
+      脱糖し、`DesugaredFromUpdate()` で UPDATE 由来と分かる。診断は
+      `Update Rows` / `StatementType::kUpdate`、`EXPLAIN` も UPDATE として出る）。
+      契約: SET 値はソース別名経由でソース列を参照でき、FROM 副問合せは別名必須
+      （無い場合は AST 段階でエラー）。1 対象行に複数ソース行が一致した場合は
+      BigQuery と同じく拒否する（"MERGE attempted to UPDATE or DELETE the same
+      target row more than once"）。
+      `DELETE ... USING` は **GoogleSQL に構文が無い**（フロントエンドの
+      パーサが `USING` で syntax error にする）ため実装対象外とし、等価な
+      綴りを契約にする: `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE
+      u.k = t.k)` と `DELETE FROM t WHERE k IN (SELECT k FROM u)`。前者は対象行が
+      複数ソース行に一致しても 1 回だけ削除する（UPDATE FROM の重複一致エラーとは
+      規則が違う）。なお AST に `FromClause` を持つ DELETE が来た場合は句を
+      黙って落とさず「USING は GoogleSQL に無い + 相関サブクエリで書く」と
+      明示エラーにする（句を捨てると JOIN の無い WHERE で誤削除になる）。
+      回帰: `MergeTest.UpdateFrom*`（5 件）,
+      `SqlEngineDeleteJoinsThroughCorrelatedSubqueries`,
+      `GoogleSqlAstTest.DeleteRejectsUsingClauseInsteadOfDroppingIt`。
 - [x] ReturningExecutorを実装する。
 - [ ] LockRows / SELECT FOR UPDATEを実装する。
 - [ ] SkipLocked / NOWAITを実装する。

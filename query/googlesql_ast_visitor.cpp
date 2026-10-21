@@ -9202,8 +9202,20 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
     if (child.get() == path || child->kind == "Location" ||
         child->kind == "Hint" || child->kind == "Alias" ||
         child->kind == "AssertRowsModified" ||
-        child->kind == "ReturningClause" || child->kind == "FromClause") {
+        child->kind == "ReturningClause") {
       continue;
+    }
+    if (child->kind == "FromClause") {
+      // GoogleSQL has no DELETE ... USING.  Dropping the clause silently would
+      // turn `DELETE FROM t USING u WHERE ...` into a delete whose WHERE can no
+      // longer see the join, which deletes the wrong rows.  The parser rejects
+      // the syntax, so reaching here means a future grammar or a hand-built
+      // AST; either way the safe answer is an explicit error that names the
+      // supported spelling.
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: DELETE ... USING is not part of GoogleSQL; write the "
+          "join as a subquery (WHERE EXISTS (SELECT 1 FROM u WHERE u.k = "
+          "t.k))");
     }
     where_candidates.push_back(child.get());
   }

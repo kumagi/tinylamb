@@ -477,6 +477,34 @@ TEST_F(QueryTest, TableSampleExecutorSemantics) {
   }
 }
 
+// GoogleSQL has no DELETE ... USING, so the join spelling is a correlated
+// subquery (or an IN list).  Both must delete exactly the joined rows, and a
+// target row matched by several source rows is deleted once -- unlike
+// UPDATE ... FROM, whose shared MERGE machinery rejects more than one match.
+TEST_F(QueryTest, SqlEngineDeleteJoinsThroughCorrelatedSubqueries) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE dt (k INT64, v INT64);");
+  RunSql(ctx, *db_, "CREATE TABLE du (k INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO dt VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+  RunSql(ctx, *db_, "INSERT INTO du VALUES (1), (3), (3);");
+  RunSql(ctx, *db_,
+         "DELETE FROM dt WHERE EXISTS (SELECT 1 FROM du WHERE du.k = dt.k);");
+  std::vector<Row> rows = RunSql(ctx, *db_, "SELECT k FROM dt ORDER BY k;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(2));
+  EXPECT_EQ(rows[1][0], Value(4));
+
+  // The IN spelling deletes the same set; du holds no NULL, so the
+  // NULL-propagating IN rule cannot change it.
+  RunSql(ctx, *db_, "INSERT INTO du VALUES (2);");
+  RunSql(ctx, *db_, "DELETE FROM dt WHERE k IN (SELECT k FROM du);");
+  rows = RunSql(ctx, *db_, "SELECT k FROM dt ORDER BY k;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(4));
+  ctx.txn_.Abort();
+}
+
 // Bug 48 regression: UPDATE/DELETE with a non-correlated `x IN (SELECT ...)`
 // must actually apply.  Before DecorateDmlWhere the predicate fell into the
 // scalar evaluator ("requires relational evaluation", masked as a sticky
