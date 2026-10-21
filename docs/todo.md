@@ -776,7 +776,35 @@ Cascades rule / cost / statistics
 - [x] DISTINCTとGROUP BYの相互変換を実装する。
 - [x] COUNT(*) without GROUP rewriteを実装する。
 - [x] 極端な選択性のためのfilter pull-upを探索候補にする。
-- [ ] Calc merge / split方針を決めて実装する。
+- [x] Calc merge / split方針を決めて実装する。
+      **方針: Calc ノードは導入しない**（merge は既存規則 + スキャン側の融合、
+      split は転置規則で達成する）。理由:
+      - `Selection` も `Projection` も既に `NextBatch` でバッチ単位に評価する
+        （Selection は zone-map / SIMD 比較 / JIT filter、Projection は CSE /
+        bytecode / JIT）。1 ノードに融合して節約できるのはバッチ境界のコピー
+        1 回で、SIMD / JIT パイプラインを二重実装するリスクに見合わない。
+      - フィルタは `push_selection_into_scan` でスキャン直上まで降りる
+        （`SelectionPlan` が `FullScanPlan` の peek / zone-map と協調する）。
+      - 恒等 projection はスキャン側で消える（`fallback_select` が全列なら
+        `ProjectionPlan` を作らない）。隣接 projection は `merge_projections`、
+        隣接 selection は `merge_selections` が畳む。
+      - split 側は `push_selection_through_projection` が計算列へのフィルタを
+        投影の下（入力列）へ書き換える。書き換え不能なら上に残す。
+      **実装した不足分: 押し下げ済みフィルタの二重評価。** スキャン規則は
+      group filter を `SelectionPlan` として巻き、さらに selection ノードの
+      `SelectionPlan` がもう一枚載ると、同じ述語を 1 行 2 回評価し、通過行を
+      余分なバッチ境界に通していた（`EXPLAIN` に `Selection:` が 2 回、
+      `SelectionStats rows_evaluated` も 2 段）。"selection" 実装規則で、
+      子プラン（`Rename: t AS x` ラッパは透過）が既に同じ述語の
+      `SelectionPlan` なら外側を恒等として畳む。比較は修飾子を無視する
+      （`DropQualifiers`）: 押し下げ側は物理テーブル名、論理側はクエリの別名を
+      話すため、文字列一致だけでは別名付きの形が畳めない。
+      回帰: `QueryTest.SqlEngineCalcMergesDuplicateScanFilters`（非別名 /
+      別名 / 残差述語の 3 形で `Selection:` が 1 回、結果と NULL が不変）。
+      変異（畳み込み無効化 / 修飾子無視の無効化）はいずれも
+      `Selection:` が 2 回になりテストが落ちることを確認。
+      再検討条件: プロファイルで Selection→Projection のバッチ境界コピーが
+      支配的になったら `CalcPlan`（filter + target list）を検討する。
 - [x] duplicate column、unused expression pruningを実装する。
 - [x] ProjectionのCSEを実装し、同一式を行ごとに一度だけ評価する。
 - [x] projection内のconstant propagationとpredicate pushdownを実装する。

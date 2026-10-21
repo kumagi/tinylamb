@@ -617,6 +617,69 @@ TEST_F(QueryTest, SqlEngineForUpdateNoWaitFailsFast) {
   reader.txn_.Abort();
 }
 
+// Calc merge policy: a filter that the scan already applies (the scan rule
+// wraps the pushed group filter in one SelectionPlan) must not be evaluated a
+// second time by the selection node that produced it.  The merge compares
+// predicates up to relation qualifiers, so the aliased spelling merges too, and
+// it never changes which rows survive.
+TEST_F(QueryTest, SqlEngineCalcMergesDuplicateScanFilters) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  RunSql(ctx, *db_, "CREATE TABLE calc_t (a INT64, b INT64);");
+  RunSql(ctx, *db_,
+         "INSERT INTO calc_t VALUES (1, 10), (2, 20), (3, 30), (4, NULL);");
+  const auto explain = [&](std::string_view sql) {
+    std::string text;
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      text += row[0].AsString();
+    }
+    return text;
+  };
+  const auto filters = [](std::string_view text) {
+    size_t count = 0;
+    for (size_t at = text.find("Selection: ("); at != std::string_view::npos;
+         at = text.find("Selection: (", at + 1)) {
+      ++count;
+    }
+    return count;
+  };
+
+  const std::string plain =
+      explain("EXPLAIN SELECT a + b AS c FROM calc_t WHERE a > 1;");
+  EXPECT_EQ(filters(plain), 1U) << plain;
+  const std::string aliased =
+      explain("EXPLAIN SELECT x.a + x.b AS c FROM calc_t AS x WHERE x.a > 1;");
+  EXPECT_EQ(filters(aliased), 1U) << aliased;
+  // A conjunct that is not a simple scan filter still reaches the executor.
+  const std::string residual =
+      explain("EXPLAIN SELECT a + b AS c FROM calc_t WHERE a > 1 AND b > 15;");
+  EXPECT_EQ(filters(residual), 1U) << residual;
+
+  // Results are unchanged by the merge: a>1 keeps 2, 3 and 4, and the NULL
+  // sum stays NULL.
+  const std::vector<Row> rows =
+      RunSql(ctx, *db_, "SELECT a + b AS c FROM calc_t WHERE a > 1;");
+  ASSERT_EQ(rows.size(), 3U);
+  size_t nulls = 0;
+  for (const Row& row : rows) {
+    if (row[0].type == ValueType::kNull) {
+      ++nulls;
+      continue;
+    }
+    EXPECT_TRUE(row[0] == Value(22) || row[0] == Value(33));
+  }
+  EXPECT_EQ(nulls, 1U);
+  const std::vector<Row> filtered = RunSql(
+      ctx, *db_, "SELECT a + b AS c FROM calc_t WHERE a > 1 AND b > 15;");
+  ASSERT_EQ(filtered.size(), 2U);
+  EXPECT_EQ(filtered[0][0], Value(20 + 2));
+  EXPECT_EQ(filtered[1][0], Value(30 + 3));
+  ctx.txn_.Abort();
+}
+
 // The shapes FOR UPDATE cannot lock are refused with a message naming the
 // supported shape, instead of returning rows that are not actually locked.
 TEST_F(QueryTest, SqlEngineForUpdateRejectsUnlockableShapes) {

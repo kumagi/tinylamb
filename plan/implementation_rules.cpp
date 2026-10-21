@@ -342,6 +342,51 @@ Expression QualifyDown(
   return WithExpressionChildren(expression, children);
 }
 
+// Drops relation qualifiers from column references.  The pushed group filter
+// speaks physical table names (QualifyDown) while the logical selection keeps
+// the query's alias, so the two spellings of the same conjunct differ only in
+// their qualifier.  Used by the "selection" rule to recognize that the child
+// plan already applies exactly this filter.
+Expression DropQualifiers(
+    const Expression& expression) {  // NOLINT(misc-no-recursion) // AST rewrite
+                                     // recursion mirrors expression tree depth;
+                                     // bounded by parser depth guard.
+  if (!expression) {
+    return expression;
+  }
+  if (expression->Type() == TypeTag::kColumnValue) {
+    const ColumnName& column = expression->AsColumnValue().GetColumnName();
+    if (column.schema.empty()) {
+      return expression;
+    }
+    return ColumnValueExp(ColumnName("", column.name));
+  }
+  std::vector<Expression> children;
+  const std::vector<Expression> original = ExpressionChildren(expression);
+  children.reserve(original.size());
+  bool changed = false;
+  for (const Expression& child : original) {
+    Expression dropped = DropQualifiers(child);
+    changed |= dropped.get() != child.get();
+    children.push_back(std::move(dropped));
+  }
+  return changed ? WithExpressionChildren(expression, std::move(children))
+                 : expression;
+}
+
+// True when both predicates describe the same filter over one relation, up to
+// the relation qualifier on their column references.
+bool SameFilterIgnoringQualifier(const Expression& left,
+                                 const Expression& right) {
+  if (!left || !right) {
+    return !left && !right;
+  }
+  if (left->ToString() == right->ToString()) {
+    return true;
+  }
+  return DropQualifiers(left)->ToString() == DropQualifiers(right)->ToString();
+}
+
 // Wraps a scan-level candidate so its output schema is named by the relation
 // identity instead of the physical table (self-join support): rows stream
 // through unchanged while downstream operators resolve `alias.column`
@@ -3649,6 +3694,35 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                   .local_cost = 0,
                                   .estimated_rows = 0}};
             }
+          }
+          // Calc merge: a scan implementation already wraps the group filter in
+          // a SelectionPlan ("The group filter carries the single-relation
+          // conjuncts ... it must be applied in full"), and the selection node
+          // that produced it can still be the logical parent.  Stacking a
+          // second SelectionPlan with the same predicate evaluates the filter
+          // twice per row and copies every surviving row across an extra batch
+          // boundary, so keep the inner node (its statistics already fold the
+          // predicate) and treat the outer selection as the identity.  The
+          // comparison ignores relation qualifiers: the pushed filter speaks
+          // physical table names, the logical one keeps the query's alias.
+          // A relation-rename wrapper (`Rename: t AS x`) only relabels the
+          // schema: the rows the filter keeps are identical, so look through it
+          // before deciding the filter is already applied.  The wrapper stays
+          // in place (the consumer still resolves `x.*` against it).
+          Plan already_filtered = children[0].plan;
+          while (const auto* rename = dynamic_cast<const RelationRenamePlan*>(
+                     already_filtered.get())) {
+            already_filtered = rename->GetSource();
+          }
+          if (const auto* inner =
+                  dynamic_cast<const SelectionPlan*>(already_filtered.get());
+              inner != nullptr && SameFilterIgnoringQualifier(
+                                      inner->Predicate(), *logical.predicate)) {
+            Plan merged = children[0].plan;
+            return std::vector<PlanAlternative>{
+                PlanAlternative{.plan = std::move(merged),
+                                .local_cost = children[0].cost,
+                                .estimated_rows = children[0].estimated_rows}};
           }
           Plan selection = std::make_shared<SelectionPlan>(
               children[0].plan, *logical.predicate,

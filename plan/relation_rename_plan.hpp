@@ -38,6 +38,7 @@ class RelationRenamePlan final : public PlanBase {
     return src_->InstallParameterSlots(parameters, cursor, slots);
   }
 
+  [[nodiscard]] const Plan& GetSource() const { return src_; }
   [[nodiscard]] const Table* ScanSource() const override {
     return src_->ScanSource();
   }

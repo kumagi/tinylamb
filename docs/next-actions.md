@@ -1,5 +1,9 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第51報)。Calc merge / split は **Calc ノードを作らない**方針で
+決着し、不足していた「押し下げ済みフィルタの二重評価」を実装した。詳細は下記
+「2026-10-20 Calc merge はスキャン側の融合で足りる / split は転置規則」の節。
+
 2026-10-20 加筆(第50報)。DML logical / physical plan(Cascades 接続の残り)は
 **ペンディング**と判断し、現状の接続範囲・必要な分割・着手点を記録した
 (下記「2026-10-20 DML を Cascades の memo に載せる作業の分割」)。
@@ -74,6 +78,46 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 Calc merge はスキャン側の融合で足りる / split は転置規則
+
+- **[方針] `LogicalOperator::kCalc` / `CalcPlan` は作らない。** Calcite の Calc は
+  「filter と projection を 1 プログラムに融合する」ノードだが、本エンジンでは
+  `Selection` も `Projection` も既に `NextBatch` でバッチ単位に評価し、
+  それぞれ zone-map / SIMD 比較 / JIT filter と CSE / bytecode / JIT という
+  別々の高速パスを持つ。融合で節約できるのはバッチ境界のコピー 1 回だけで、
+  2 つのパイプラインを 1 ノードに統合する（あるいは片方を捨てる）コストと
+  回帰リスクに見合わない。
+- **[merge] 既存の経路で達成済み。** フィルタは
+  `push_selection_into_scan` でスキャン直上の `SelectionPlan` になり、
+  `FullScanPlan` の peek 比較 / zone-map と協調する。恒等 projection は
+  `fallback_select` が全列のとき作られず、隣接 projection は
+  `merge_projections`、隣接 selection（`Selection(p2, Selection(p1, X))`）は
+  `merge_selections` が 1 ノードに畳む。
+- **[split] 転置で達成済み。** `push_selection_through_projection` が
+  計算列に掛かるフィルタを投影の入力列へ書き換えて下へ降ろす。書き換え不能
+  （volatile / 集約など）なら上に残す。consumers が要求する列だけを出す
+  段（`fallback_select` / scan narrowing）も同じ分割の一部。
+- **[実装] 欠けていたのは「同じフィルタの二重評価」。** スキャン規則は
+  group filter を `SelectionPlan` として巻き（「The group filter carries the
+  single-relation conjuncts ... it must be applied in full」）、その上に
+  selection ノード由来の `SelectionPlan` がもう一枚載ることがあった。
+  `EXPLAIN` に `Selection:` が 2 回出て、`SelectionStats rows_evaluated` も
+  2 段（3 行 → 2 行 → 2 行）になっていた。selection 実装規則で、子プラン
+  （`RelationRenamePlan` は透過）が同じ述語の `SelectionPlan` なら外側を
+  恒等として返す。統計は内側（述語を織り込み済み）をそのまま使う。
+- **[比較] 修飾子を無視する。** 押し下げ側の述語は `QualifyDown` で物理
+  テーブル名（`t.a`）に、論理側はクエリの別名（`x.a`）になっているので、
+  文字列一致だけでは別名付きの形が畳めない。`DropQualifiers` で列参照の
+  修飾子を落としてから比較する。この位置（同じ子プランの直上）では対象は
+  単一リレーションなので、修飾子の差は別名か物理名かの違いに限られる。
+- 回帰: `QueryTest.SqlEngineCalcMergesDuplicateScanFilters`。変異
+  （畳み込みを `false &&` で無効化 / `DropQualifiers` を恒等化）はどちらも
+  `Selection:` の数が 2 になり落ちる。
+- **[再検討条件]** Selection→Projection のバッチ境界コピーがプロファイルで
+  支配的になったら、`CalcPlan`（filter + target list、行位置を透過）を
+  導入する。その時も SIMD / JIT のパイプラインは `Selection` / `Projection`
+  側の実装を共有すること（複製しない）。
 
 ## 2026-10-20 DML を Cascades の memo に載せる作業の分割
 

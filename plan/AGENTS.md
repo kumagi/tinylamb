@@ -170,6 +170,19 @@ Test: `./build/plan_test`, `optimizer_test`, `cascades_test`,
 `full_scan_plan_test`, `collation_property_test`, `sort_shape_test`,
 `aggregate_shape_test`, `window_shape_test`.
 
+Calc policy: there is deliberately no `kCalc`/`CalcPlan`.  Filters merge
+scan-ward (`push_selection_into_scan` leaves a `SelectionPlan` directly above
+the scan, where the zone-map/SIMD/JIT batch filter lives) and projections merge
+with each other (`merge_projections`), while identity projections disappear in
+the scan's `fallback_select`.  Splitting is the transpose
+`push_selection_through_projection`.  The "selection" implementation rule also
+collapses a selection whose child plan (through `RelationRenamePlan`) already
+applies the same predicate, comparing with `DropQualifiers` because the pushed
+group filter speaks physical table names and the logical node speaks the query
+alias; without that merge the filter runs twice per row.  Revisit (a fused
+`CalcPlan`) only if profiling shows the Selection→Projection batch copy
+dominating.
+
 Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 46 physical
 registrations. Exploration retries dependent parents after a child changes.
 `OptimizeGrouping` lowers the supported single-table grouped SQL slice into the
