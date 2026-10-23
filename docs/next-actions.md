@@ -1,5 +1,28 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第58報)。**[回帰修正]** 第55報の constant-residual 境界
+(`CompileScanFilter` の `TryDecideConstantConjunct`) が **列参照入り
+conjunct を compile 時定数として「決定」していた**。境界の自己ゲート前提
+(「列参照は空スキーマ TryEvaluate の失敗で弾かれる)」が誤りで、非束縛列は
+その評価で可靠に失敗せず、ISERROR/NULLIFERROR のような
+エラー吸収 call がその評価結果を値に変換したため、
+`GROUP BY A HAVING ISERROR(A + 1/A)` (A∈{0,1,2}) が全 group 生き残り /
+NULLIFERROR 比較版が全 group 死滅するという逆転常が compliance
+`iserror`/`nulliferror` で発露した。空スキーマ評価の結果は初期化不確定値を
+含むため dispatch 単位で結果が替わり (同一 binary でも出力が替わる)、
+これが「nn_counts スイープ 4001 pass / limithint スイープで compliance 2 件
+fail」という一見矛盾した観測の正体。直ちに介した triage 経過:
+transpose (第56報) と境界呼出を一時停止しても症状が消えなかったのは、
+ツール側の試行錯誤の間にビルドが stale になっていたため
+(最終 instrumentation 実行で境界の決定の事実を直接確認)。
+修正: `TryDecideConstantConjunct` に列参照の明示ゲート
+(`predicate->TouchedColumns().empty()` でのみ決定許可) を追加。
+回帰 pin: `ScanFilterTest.ConstantResidualBoundaryNeverDecidesColumnConjuncts`
+(compile level・mutate 検証済) + `QueryTest.GroupedHavingErrorAbsorptionStaysPerRow`
+(SQL level・mutate 検証済)。教訓: 「CompileScanFilter が compile_decided_reject
+を立てるのは列なし木だけ」を契約として明文化 (scan_filter.hpp 側
+コメントは既存のまま、決定側だけで担保)。
+
 2026-10-23 加筆(第57報)。NOT NULL COUNT(*) rewrite + DDL NOT NULL 配線
 (todo.md「集約」節 1234): GoogleSQL DDL の `NOT NULL` がパーサーでは出力されて
 いたが訪問者で黙って捨てられ、列制約スロットが常に空だったため

@@ -251,6 +251,64 @@ TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
   ctx.txn_.Abort();
 }
 
+// Error-absorbing calls (ISERROR / NULLIFERROR) in a grouped HAVING must be
+// evaluated per group, per row: `A + 1/A` raises only for the A == 0 group,
+// ISERROR keeps it and NULLIFERROR's absorbed-NULL comparison rejects it.
+// The query used to lose whole groups when the scan-filter compile boundary
+// "decided" the column-bearing conjunct against the result of an
+// empty-schema evaluation, so these statements are pinned at the SQL level
+// (the compile-level half lives in ScanFilterTest.
+// ConstantResidualBoundaryNeverDecidesColumnConjuncts).
+TEST_F(QueryTest, GroupedHavingErrorAbsorptionStaysPerRow) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE T AS SELECT 0 AS A, 0 AS B, 0.0 AS C UNION ALL "
+         "SELECT 1, 10, 100.0 UNION ALL SELECT 2, 20, 200.0;");
+  ASSERT_SUCCESS(ctx.PreCommit());
+
+  TransactionContext probe = db_->BeginContext();
+  // Group order is unspecified: compare as sorted multisets.
+  const auto sorted = [](std::vector<Row> rows) {
+    std::sort(rows.begin(), rows.end(), [](const Row& l, const Row& r) {
+      return l[0].AsString() < r[0].AsString();
+    });
+    return rows;
+  };
+
+  // ISERROR(A + 1/A): true only for the A == 0 group; the other two groups
+  // must be filtered by a per-group FALSE, not silently decided away.
+  EXPECT_EQ(sorted(RunSql(probe, *db_,
+                          "SELECT MAX(B) FROM T GROUP BY A "
+                          "HAVING ISERROR(A + 1/A);")),
+            (std::vector<Row>{Row({Value(int64_t{0})})}));
+  // NULLIFERROR(A + 1/A) >= 0: the raising group absorbs to NULL and is
+  // rejected; the clean groups (2 >= 0, 2.5 >= 0) survive.
+  EXPECT_EQ(
+      sorted(RunSql(probe, *db_,
+                    "SELECT MAX(B) FROM T GROUP BY A "
+                    "HAVING NULLIFERROR(A + 1/A) >= 0;")),
+      (std::vector<Row>{Row({Value(int64_t{10})}), Row({Value(int64_t{20})})}));
+  // The identical expressions behave the same in grouping-key position.
+  EXPECT_EQ(
+      sorted(
+          RunSql(probe, *db_, "SELECT COUNT(B) FROM T GROUP BY ISERROR(1/A);")),
+      (std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})}));
+  EXPECT_EQ(
+      sorted(RunSql(probe, *db_,
+                    "SELECT MAX(B) FROM T GROUP BY NULLIFERROR(1/A);")),
+      (std::vector<Row>{Row({Value(int64_t{0})}), Row({Value(int64_t{10})}),
+                        Row({Value(int64_t{20})})}));
+  // The same shapes with the transpose available (key-only conjunct) and
+  // through the wrapped-operand spelling stay correct as well: lifting the
+  // conjunct into the scan filter must not change its verdict per group.
+  EXPECT_EQ(
+      sorted(RunSql(probe, *db_,
+                    "SELECT MAX(B) FROM T GROUP BY A HAVING "
+                    "IFERROR(1/A, -999) > -100;")),
+      (std::vector<Row>{Row({Value(int64_t{10})}), Row({Value(int64_t{20})})}));
+  probe.txn_.Abort();
+}
+
 TEST_F(QueryTest, ColumnDefaultKeywordInValuesResolvesTargetColumn) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE tk (a INT64, b INT64 DEFAULT 42);");

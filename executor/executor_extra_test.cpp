@@ -429,6 +429,59 @@ TEST(ScanFilterTest, CompileTimeResolvesDeterministicConstantConjuncts) {
   }
 }
 
+// The constant-residual boundary is for column-free trees only.  The
+// empty-schema TryEvaluate it relies on is not a column gate: an unbound
+// column does not reliably fail there, and an error-absorbing call
+// (ISERROR / NULLIFERROR) turns whatever that evaluation produced into a
+// value.  A column-bearing conjunct "decided" that way silently filtered
+// whole grouped results (every group of `GROUP BY A HAVING ISERROR(A+1/A)`
+// survived, every group of the NULLIFERROR spelling vanished), so the
+// boundary must check touched columns explicitly and leave such conjuncts
+// to the per-row evaluation -- which agrees with the ground truth of the
+// same expression in SELECT-list position.  The full statement semantics
+// are pinned at the SQL level (QueryTest.
+// GroupedHavingErrorAbsorptionStaysPerRow).
+TEST(ScanFilterTest, ConstantResidualBoundaryNeverDecidesColumnConjuncts) {
+  const Schema schema("boundary_col", {Column("key", ValueType::kInt64)});
+  {
+    // ISERROR(key + 1/key) touches the key column: stays per-row.
+    const Expression conjunct = FunctionCallExp(
+        "iserror", {BinaryExpressionExp(
+                       ColumnValueExp("key"), BinaryOperation::kAdd,
+                       BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
+                                           BinaryOperation::kDivide,
+                                           ColumnValueExp("key")))});
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter({conjunct}, schema);
+    EXPECT_FALSE(filter.compile_decided_reject);
+    EXPECT_FALSE(filter.simple.empty() && filter.residual.empty());
+  }
+  {
+    // NULLIFERROR(key + 1/key) >= 0: still column-bearing after the fold.
+    const Expression conjunct = BinaryExpressionExp(
+        FunctionCallExp(
+            "nulliferror",
+            {BinaryExpressionExp(
+                ColumnValueExp("key"), BinaryOperation::kAdd,
+                BinaryExpressionExp(ConstantValueExp(Value(int64_t{1})),
+                                    BinaryOperation::kDivide,
+                                    ColumnValueExp("key")))}),
+        BinaryOperation::kGreaterThanEquals,
+        ConstantValueExp(Value(int64_t{0})));
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter({conjunct}, schema);
+    EXPECT_FALSE(filter.compile_decided_reject);
+    // The comparison stays a live runtime predicate in some component
+    // (simple / residual list / residual bytecode / prebuilt compare).
+    EXPECT_FALSE(filter.simple.empty() && filter.residual.empty() &&
+                 filter.prebuilt_scalar_compare.empty() &&
+                 filter.prefix_in.empty() &&
+                 filter.prebuilt_membership.empty() &&
+                 !filter.residual_bytecode.has_value() &&
+                 filter.disjunctive_branches.empty());
+  }
+}
+
 TEST(SortExecutorTest, UnsignedInt64AscendingAndDescendingOrder) {
   Column unsigned_col("id", ValueType::kInt64);
   unsigned_col.SetUnsigned(true);

@@ -1162,6 +1162,16 @@ std::optional<Value> TryDecideConstantConjunct(const Expression& predicate) {
       ContainsQuery(predicate)) {
     return std::nullopt;
   }
+  // Hard column gate: the empty-schema TryEvaluate below is NOT a reliable
+  // column gate by itself.  An unbound column value does not necessarily
+  // fail there, so a conjunct that references a column could otherwise be
+  // "decided" at compile time against an accident of the empty-row
+  // evaluation (observed: ISERROR/NULLIFERROR over `A + 1/A` decided to
+  // constant TRUE/NULL and silently filtered whole groups).  Only genuinely
+  // column-free trees may be decided as compile-time facts.
+  if (!predicate->TouchedColumns().empty()) {
+    return std::nullopt;
+  }
   StatusOr<Value> decided = predicate->TryEvaluate(Row(), Schema());
   if (!decided.HasValue()) {
     return std::nullopt;
