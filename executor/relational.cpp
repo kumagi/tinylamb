@@ -85,6 +85,43 @@ namespace {
 // HAVING may reference select-list aliases (`HAVING double_avg > 0.7`).
 // Alias references that are not real input columns are rewritten to the
 // aliased expression so aggregate aliases resolve during grouping.
+// Forward: case-insensitive comparison defined further down this file.
+bool IdentifierEquals(std::string_view left, std::string_view right);
+
+// HAVING transpose helper (aggregate <-> filter): true when every column the
+// conjunct touches is a bare grouping-key column (qualifier-insensitive) and
+// the conjunct holds no aggregate or query subtree.  Within a group every row
+// shares the key values, so the group's fate is a row-level fact; the
+// group-all shape is excluded by the caller (it forms a group even over a
+// fully rejected input).
+bool IsKeyOnlyHavingConjunct(const Expression& conjunct,
+                             const SelectStatement& resolved) {
+  if (!conjunct) {
+    return false;
+  }
+  if (ContainsAggregate(conjunct) || ContainsQuery(conjunct)) {
+    return false;
+  }
+  for (const ColumnName& column : conjunct->TouchedColumns()) {
+    bool is_key = false;
+    for (const Expression& key : resolved.GroupBy()) {
+      if (!key || key->Type() != TypeTag::kColumnValue) {
+        continue;
+      }
+      const ColumnName& key_name = key->AsColumnValue().GetColumnName();
+      if (key_name.name != "*" &&
+          IdentifierEquals(key_name.name, column.name)) {
+        is_key = true;
+        break;
+      }
+    }
+    if (!is_key) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Expression InlineHavingAliases(const SelectStatement& statement,
                                const Schema& schema) {
   const Expression& having = statement.Having();
@@ -6549,21 +6586,58 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
 
     std::vector<Expression> scan_predicates =
         SplitConjuncts(stmt.WhereClause());
-    CompiledScanFilter scan_filter =
-        CompileScanFilter(scan_predicates, scan_schema);
 
     Relation input;
     input.schema = qualified_schema;
     // Project aggregates against the qualified schema; feed rows one at a time
     // without retaining them in input.rows.
     const Expression having_expr = InlineHavingAliases(statement, input.schema);
+
+    // HAVING transpose (aggregate <-> filter): within a grouping every row of
+    // a group carries the same key values, so a conjunct that touches only
+    // bare grouping-key columns (and no aggregate / subquery) is a row-level
+    // fact for the whole group.  Moving it into the scan filter drops the
+    // rows of doomed groups before groups form; the aggregate-referencing
+    // remainder stays post-aggregate, where the prepared aggregate results
+    // are available.  A group-all aggregation is exempt: it yields one group
+    // even over a completely rejected input, so a branch-constant conjunct
+    // lifted pre-aggregate would wrongly resurrect that group.
+    Expression having_residual = having_expr;
+    {
+      std::vector<Expression> lifted_conjuncts;
+      std::vector<Expression> residual_conjuncts;
+      const std::vector<Expression> having_conjuncts =
+          having_expr ? SplitConjuncts(having_expr) : std::vector<Expression>{};
+      for (const Expression& conjunct : having_conjuncts) {
+        if (!stmt.IsGroupAll() && !stmt.GroupBy().empty() &&
+            IsKeyOnlyHavingConjunct(conjunct, stmt)) {
+          lifted_conjuncts.push_back(conjunct);
+        } else {
+          residual_conjuncts.push_back(conjunct);
+        }
+      }
+      if (!lifted_conjuncts.empty()) {
+        scan_predicates.reserve(scan_predicates.size() +
+                                lifted_conjuncts.size());
+        scan_predicates.insert(scan_predicates.end(), lifted_conjuncts.begin(),
+                               lifted_conjuncts.end());
+        having_residual = residual_conjuncts.empty()
+                              ? Expression{}
+                              : CombineConjuncts(residual_conjuncts);
+      }
+    }
+
+    CompiledScanFilter scan_filter =
+        CompileScanFilter(scan_predicates, scan_schema);
+
     std::vector<const AggregateExpression*> aggregate_expressions;
     std::unordered_set<const AggregateExpression*> seen_aggregates;
     for (const NamedExpression& projection_item : stmt.SelectList()) {
       CollectAggregates(projection_item.expression, &aggregate_expressions,
                         &seen_aggregates);
     }
-    CollectAggregates(having_expr, &aggregate_expressions, &seen_aggregates);
+    CollectAggregates(having_residual, &aggregate_expressions,
+                      &seen_aggregates);
     // ORDER BY terms may reference select aliases or spell out an aggregate
     // ("ORDER BY SUM(v) DESC").  The AggregateResultMap is keyed by node
     // pointer, so aggregate subtrees dedupe onto the identical select-list
@@ -6829,12 +6903,12 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         std::getenv("TINYLAMB_DISABLE_REUSABLE_TYPED_AGG") != nullptr;
     if (!reusable || !reusable_typed_disabled) {
       TypedAggregationPlan typed_plan =
-          PlanTypedAggregation(stmt, having_expr, qualified_schema,
+          PlanTypedAggregation(stmt, having_residual, qualified_schema,
                                aggregate_expressions, scan_predicates);
       if (typed_plan.eligible) {
         StatusOr<Relation> typed = RunTypedParallelStreamAggregate(
-            context, stmt, having_expr, *table.Value(), source.table, reusable,
-            projection, qualified_schema, table_schema, peek_compares,
+            context, stmt, having_residual, *table.Value(), source.table,
+            reusable, projection, qualified_schema, table_schema, peek_compares,
             aggregate_expressions, ctes, std::move(typed_plan));
         if (!typed.HasValue()) {
           return typed.GetStatus();
@@ -7092,8 +7166,9 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       // Correlated subqueries in HAVING / SELECT resolve aggregate aliases
       // against this group's values through the scope chain.
       scope.aggregates = &aggregate_results;
-      if (having_expr && !Truthy(Evaluate(having_expr, scope,
-                                          &aggregate_results, context, ctes))) {
+      if (having_residual &&
+          !Truthy(Evaluate(having_residual, scope, &aggregate_results, context,
+                           ctes))) {
         continue;
       }
       std::vector<Value> values;

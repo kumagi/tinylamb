@@ -1225,7 +1225,41 @@ Cascades rule / cost / statistics
 （以下はCascadesルールとして実装済み: push_selection_through_aggregation, distinct_over_group_by, unique_group_key_aggregate_elimination, aggregate_union_transpose）
 
 - [x] aggregateとprojectをmergeする。
-- [ ] aggregateとfilterをtransposeし、HAVING残余を整理する。
+- [x] aggregateとfilterをtransposeし、HAVING残余を整理する。
+  - **実装（aggregate ↔ filter transpose + HAVING residual 分化）**:
+    memo 側は既存の `push_selection_through_aggregation`
+    （FilterAggregateTranspose: group key のみを触る conjunct を aggregate の
+    下へ、集約参照の残余を上に残す、述語の併記系
+    `push_selection_through_join` / `split_selection_over_join` と協調）が
+    担当。この項で欠けていたのは **relational 経路（単一表 GROUP BY の既定
+    ルート）の HAVING**——関数を含むWHERE と同じく
+    `NeedsRelationalEvaluation` が課すルート選択のため、HAVING が
+    恒常的に relational 側に流れ、key のみの HAVING conjunct（
+    `HAVING k > 1`）が **group 形成後** に 1 group ごとに評価されていた。
+    `ExecuteAggregatedQuery`（`executor/relational.cpp` stream_agg 経路）に
+    HAVING 転置を実装: `InlineHavingAliases` 済み conjunct を分割し、
+    **裸の group key 列のみを触り集約/副問い合わせを持たない conjunct**
+    （`IsKeyOnlyHavingConjunct`）は scan filter（`scan_predicates`）に入れ、
+    group 形成前に deny する（group 内の全行は key 値が同一なので
+    group 単位判定は行単位判定に等しい; NULL 値 group も `k IS NULL` 型の
+    conjunct は全行が同一結果なので sound）。集約参照の残余は
+    post-aggregate（finish step）の元どおり。**group-all
+    (`IsGroupAll()`) は例え**——全入力が棄却されても 1 group 形成される
+    (`COUNT(*) FROM empty`) ので、branch 定数の conjunct を pre-aggregate に
+    持つとその group が復活してしまう。
+    転置は typed parallel aggregation 計画（`PlanTypedAggregation` /
+    `RunTypedParallelStreamAggregate`）・並列 morsel 経路
+    （`scan_predicates` を共有する report）・serial 端末評価のすべてで
+    `having_residual` を見るので、いずれの実装経路でも 2 重評価の
+    残骸が生じない。
+  - テスト: `ExecutorTest.RelationalKeyOnlyHavingTransposesIntoScanFilter`
+    （行集合: `HAVING k>1` / `HAVING k>1 AND SUM(v)>25` interleaved /
+    `HAVING k IS NULL` の NULL 値 group 生存、および転置の観測面:
+    `HAVING k>1` で `aggregate_input_rows / aggregate_groups = 1` になる
+    EXPLAIN ANALYZE 解析）。
+  - 変異検証: 転置の発火条件を無効化 → `groups=4 / input_rows=4` になり
+    同テストの解析 assert が fail（行集合は等価なので语义は不変——転置の
+    効果は group 形成削減）。確認済み。
 - [x] unique / key preservationを守るaggregate-join transposeを実装する。
 - [x] aggregate-union transposeを実装する。
 - [ ] partial / finalへaggregateを分割する。

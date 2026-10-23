@@ -4337,6 +4337,60 @@ TEST_F(ExecutorTest, RelationalPartitionedAggregationSpillsUnderBudget) {
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
 
+TEST_F(ExecutorTest, RelationalKeyOnlyHavingTransposesIntoScanFilter) {
+  // HAVING transpose (aggregate <-> filter): within a grouping every row of a
+  // group carries the same key values, so a conjunct over only grouping-key
+  // columns is decided inside the scan filter; doomed groups never form and
+  // the aggregate-referencing remainder stays post-aggregate.
+  constexpr std::string_view kHavingTable = "HavingTranspose";
+  {
+    TransactionContext writer = rs_->BeginContext();
+    Schema schema{
+        std::string(kHavingTable),
+        {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)}};
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    ASSERT_SUCCESS(
+        table.Insert(writer.txn_, Row({Value(int64_t{0}), Value(int64_t{1})}))
+            .GetStatus());
+    ASSERT_SUCCESS(
+        table.Insert(writer.txn_, Row({Value(int64_t{1}), Value(int64_t{10})}))
+            .GetStatus());
+    ASSERT_SUCCESS(
+        table.Insert(writer.txn_, Row({Value(int64_t{2}), Value(int64_t{30})}))
+            .GetStatus());
+    ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value(), Value(int64_t{5})}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  // Rows are identical with or without the transpose (semantics guard).
+  const auto strictly = RelationalRun(
+      *rs_,
+      "SELECT k, SUM(v) FROM HavingTranspose GROUP BY k HAVING k > 1 ORDER "
+      "BY k;");
+  ASSERT_EQ(strictly.size(), 1U);
+  EXPECT_EQ(strictly[0], Row({Value(2), Value(30)}));
+  const auto mixed = RelationalRun(
+      *rs_,
+      "SELECT k, SUM(v) FROM HavingTranspose GROUP BY k HAVING k > 1 AND "
+      "SUM(v) > 25 ORDER BY k;");
+  ASSERT_EQ(mixed.size(), 1U);
+  EXPECT_EQ(mixed[0], Row({Value(2), Value(30)}));
+  const auto null_group = RelationalRun(
+      *rs_,
+      "SELECT k, SUM(v) FROM HavingTranspose GROUP BY k HAVING k IS NULL "
+      "ORDER BY k;");
+  ASSERT_EQ(null_group.size(), 1U);
+  EXPECT_EQ(null_group[0][0], Value());
+  // The transpose is observable in the runtime counters: with the key-only
+  // conjuncts evaluated in the scan filter, the surviving group's rows are
+  // all that reach the aggregator.
+  const std::string plan = RelationalExplain(
+      *rs_, "SELECT k, SUM(v) FROM HavingTranspose GROUP BY k HAVING k > 1;",
+      /*analyze=*/true);
+  EXPECT_EQ(StatsValue(plan, "aggregate_groups="), 1);
+  EXPECT_EQ(StatsValue(plan, "aggregate_input_rows="), 1);
+}
+
 TEST_F(ExecutorTest, RelationalGroupByOrderBySpillsUnderBudget) {
   CreateWideTable(*rs_, "WideSort", 200);
   ScopedQueryMemory memory(65536);

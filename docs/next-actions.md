@@ -1,5 +1,11 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第56報)。aggregate↔filter transpose / HAVING residual 分化
+(todo.md「集約」節): 単一表 GROUP BY の既定ルート(relational)に対して
+key のみの HAVING conjunct を `ExecuteAggregatedQuery` の scan filter に入れ
+group 形成前に棄てる転置を追加した(`IsKeyOnlyHavingConjunct`、group-all は
+例え)。`groups / input_rows` の EXPLAIN ANALYZE 削減で観測・mutate 済み。
+
 2026-10-23 加筆(第55報)。residual側のConstantFolding境界整備(todo.md
 「実行側の filter / projection 最適化」節): `CompileScanFilter` に
 constant-residual 境界を追加した。決定的定数 conjunct は compile 時 1 回
