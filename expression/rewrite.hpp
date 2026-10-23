@@ -216,6 +216,11 @@ enum class Volatility : uint8_t {
 // or aggregate subtrees. Rewrites that duplicate an expression (x + x ->
 // x * 2, predicate fan-out into several FILTER clauses) must gate on this.
 [[nodiscard]] bool SafeToReduceEvaluationCount(const Expression& expression);
+// True when any reachable function call is volatile (rand / random / uuid /
+// generate_uuid / newid): a rewrite that changes how often such a call runs
+// also changes its result.  Stable calls (now / current_timestamp / ...) are
+// NOT counted: their within-statement value is fixed once execution starts.
+[[nodiscard]] bool ContainsVolatileCall(const Expression& expression);
 [[nodiscard]] bool ExpressionCannotThrowForPlanner(
     const Expression& expression);
 

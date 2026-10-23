@@ -101,6 +101,21 @@ bool SafeToReduceEvaluationCount(  // NOLINT(misc-no-recursion)
                              SafeToReduceEvaluationCount);
 }
 
+bool ContainsVolatileCall(  // NOLINT(misc-no-recursion)
+    const Expression& expression) {
+  if (!expression) {
+    return false;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp &&
+      GetFunctionVolatility(
+          expression->AsFunctionCallExpression().FuncName()) ==
+          Volatility::kVolatile) {
+    return true;
+  }
+  return std::ranges::any_of(ExpressionChildren(expression),
+                             ContainsVolatileCall);
+}
+
 namespace {
 
 // Mirrors the timestamp-shape detection in EvaluateBinary: `=` on two

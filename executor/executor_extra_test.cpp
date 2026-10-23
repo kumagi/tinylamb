@@ -37,6 +37,7 @@
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "page/row_position.hpp"
@@ -348,6 +349,84 @@ TEST(ScanFilterTest, UnsignedComparisonsMatchGroundTruth) {
   Row tagged = row;
   tagged[0] = tagged[0].WithUnsigned();
   EXPECT_FALSE(relational_detail::MatchSimpleCompare(tagged, pred));
+}
+
+TEST(ScanFilterTest, CompileTimeResolvesDeterministicConstantConjuncts) {
+  // Constant-residual boundary: a deterministic conjunct with a compile-time
+  // value is decided once by CompileScanFilter, not per row.  TRUE
+  // discharges the conjunct; FALSE / NULL rejects the whole conjunction
+  // (same three-valued rule the row loop applies, so sibling errors that a
+  // rejecting conjunct would suppress stay suppressed); volatile conjuncts
+  // stay runtime predicates.
+  const Schema schema("const_k", {Column("key", ValueType::kInt64)});
+  const auto with_constant = [](const Expression& conjunct) {
+    return std::vector<Expression>{
+        conjunct, BinaryExpressionExp(ColumnValueExp("key"),
+                                      BinaryOperation::kGreaterThan,
+                                      ConstantValueExp(Value(int64_t{2})))};
+  };
+  const Row row_pass({Value(int64_t{3})});
+  const Row row_reject({Value(int64_t{2})});
+
+  {
+    // Constant TRUE (upper('A') = 'A'): discharged into nothing.
+    const Expression true_conjunct = BinaryExpressionExp(
+        FunctionCallExp("upper", {ConstantValueExp(Value("A"))}),
+        BinaryOperation::kEquals, ConstantValueExp(Value("A")));
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter(with_constant(true_conjunct),
+                                             schema);
+    EXPECT_FALSE(filter.compile_decided_reject);
+    EXPECT_TRUE(filter.residual.empty());
+    ASSERT_EQ(filter.simple.size(), 1U);
+    const relational_detail::WorkerScanFilterPrograms programs =
+        relational_detail::CompileWorkerFilter(filter, schema);
+    EXPECT_EQ(relational_detail::MatchScanFilterWorker(row_pass, schema, filter,
+                                                       programs),
+              1);
+    EXPECT_EQ(relational_detail::MatchScanFilterWorker(row_reject, schema,
+                                                       filter, programs),
+              0);
+  }
+  {
+    // Constant FALSE (upper('A') = 'B'): decided once, rejects every row.
+    const Expression false_conjunct = BinaryExpressionExp(
+        FunctionCallExp("upper", {ConstantValueExp(Value("A"))}),
+        BinaryOperation::kEquals, ConstantValueExp(Value("B")));
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter(with_constant(false_conjunct),
+                                             schema);
+    EXPECT_TRUE(filter.compile_decided_reject);
+    EXPECT_TRUE(filter.simple.empty());
+    EXPECT_TRUE(filter.residual.empty());
+    const relational_detail::WorkerScanFilterPrograms programs =
+        relational_detail::CompileWorkerFilter(filter, schema);
+    EXPECT_EQ(relational_detail::MatchScanFilterWorker(row_pass, schema, filter,
+                                                       programs),
+              0);
+    EXPECT_EQ(relational_detail::MatchScanFilterWorker(row_reject, schema,
+                                                       filter, programs),
+              0);
+  }
+  {
+    // Constant NULL: the three-valued rule rejects the conjunction.
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter(
+            with_constant(ConstantValueExp(Value())), schema);
+    EXPECT_TRUE(filter.compile_decided_reject);
+  }
+  {
+    // A volatile call keeps its per-row evaluation count: folding would
+    // change how often it runs, so the conjunct stays residual.
+    const Expression volatile_conjunct = BinaryExpressionExp(
+        FunctionCallExp("rand", {}), BinaryOperation::kLessThan,
+        ConstantValueExp(Value(0.0)));
+    const relational_detail::CompiledScanFilter filter =
+        relational_detail::CompileScanFilter(with_constant(volatile_conjunct),
+                                             schema);
+    EXPECT_FALSE(filter.compile_decided_reject);
+    ASSERT_EQ(filter.residual.size(), 1U);
+  }
 }
 
 TEST(SortExecutorTest, UnsignedInt64AscendingAndDescendingOrder) {

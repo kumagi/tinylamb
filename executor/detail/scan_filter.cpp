@@ -35,6 +35,7 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
 #include "query/statement.hpp"
@@ -1144,6 +1145,30 @@ CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
   return branch;
 }
 
+// Constant-residual boundary (see CompileScanFilter): decides whether a
+// conjunct carries a compile-time value and evaluates it once if so.
+// Returns nullopt when the conjunct must stay a runtime predicate.  Volatile
+// calls (rand/...) must not change in evaluation count, stable calls keep
+// per-row timing meaning inside one statement (conservatively -- kImmutable
+// only), parameter slots bind later than this compile, and subqueries /
+// aggregates need the runtime context.  Anything referencing a column
+// fails the empty-schema evaluation and stays runtime, which makes this
+// self-gating: only genuinely constant trees pass.
+std::optional<Value> TryDecideConstantConjunct(const Expression& predicate) {
+  if (!predicate) {
+    return std::nullopt;
+  }
+  if (ContainsVolatileCall(predicate) || ContainsParameterSlot(predicate) ||
+      ContainsQuery(predicate)) {
+    return std::nullopt;
+  }
+  StatusOr<Value> decided = predicate->TryEvaluate(Row(), Schema());
+  if (!decided.HasValue()) {
+    return std::nullopt;
+  }
+  return decided.MoveValue();
+}
+
 }  // namespace
 
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
@@ -1157,6 +1182,25 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
   std::vector<CompiledScanFilter::DisjunctiveBranch> branches;
   for (const Expression& predicate : predicates) {
     if (!predicate) {
+      continue;
+    }
+    // Constant-residual boundary: a conjunct with a compile-time value is a
+    // fact, not a per-row predicate.  Deterministic gate: no volatile call
+    // (rand/... change per evaluation), no parameter slot (the slot table
+    // arrives with the statement, after this compile), no subquery.  The
+    // empty-schema TryEvaluate is itself the column gate: a conjunct that
+    // references a column cannot be resolved and stays a runtime predicate.
+    if (std::optional<Value> decided = TryDecideConstantConjunct(predicate);
+        decided.has_value()) {
+      // Mirror MatchRow's conjunct rule exactly once instead of per row:
+      // non-NULL truthy decides TRUE (discharge), FALSE or NULL rejects the
+      // conjunction cleanly (sibling errors never surface with a
+      // rejecting conjunct present; EvaluateConjunctsTolerant).
+      const Value& verdict = *decided;
+      if (verdict.IsNull() || !verdict.Truthy()) {
+        compiled.compile_decided_reject = true;
+        break;
+      }
       continue;
     }
     // Decompose OR expressions into disjunctive branches.
@@ -1331,6 +1375,11 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
                      const CompiledScanFilter& filter, const Scope* outer,
                      TransactionContext& context, const CteMap& ctes,
                      Status* error, ColumnLookupCache* lookup_cache) {
+  // A compile-time FALSE / NULL conjunct decides the whole conjunction; see
+  // CompiledScanFilter::compile_decided_reject.
+  if (filter.compile_decided_reject) {
+    return false;
+  }
   // Stored rows carry INT64 bit patterns for UINT64 columns; the catalog
   // schema retains the unsigned declaration. Reattach it before matching so
   // both the simple fast path and residual evaluation observe the same
@@ -1598,6 +1647,12 @@ WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
 int MatchScanFilterWorker(const Row& row, const Schema& schema,
                           const CompiledScanFilter& filter,
                           const WorkerScanFilterPrograms& programs) {
+  // A compile-time FALSE / NULL conjunct decides the whole conjunction; the
+  // programs are vacuously complete for the empty residual and would
+  // otherwise accept every row.
+  if (filter.compile_decided_reject) {
+    return 0;
+  }
   // Column binding happens at compile time (name-bound bytecode), so the
   // schema is only part of the interface symmetry with MatchScanFilter.
   (void)schema;

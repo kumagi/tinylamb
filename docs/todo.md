@@ -1129,8 +1129,82 @@ Cascades rule / cost / statistics
   - 変異検証: JIT 昇格の第一臂（`rows_seen_ >= jit_threshold_rows_`）を外す →
     `SelectionUsesJitForLargeIntegerBatches` fail。確認済み。
 - [ ] VirtualComputedColumnの遅延評価を実装する。
+      **スキップ（判断理由）**: 2 つの読み方があり、片方は実装済み、もう片方
+      はストレージ / DataChunk 層の全面再設計が前提。
+      - 実行パイプラインの意味（投影が定義する計算列を、消費者が要求するまで
+        評価しない）は既存の 3 機構で達成済み:
+        (1) `push_selection_through_projection`（FilterProjectTranspose）が
+        計算列へ掛るフィルタを入力列式へ書き換えて投影の下へ降ろす
+        （非通過行の計算列評価をそもそも消す）;
+        (2) `fallback_select` / スキャン narrowing が consumers の要求列だけを
+        出力・decode する（`TINYLAMB_SCAN_PROJECTION=1` で decode floor まで
+        narrowing）;
+        (3) `topn_push_through_projection` が上位 N 行以外の計算列評価を省く。
+      - 残る意味（DataChunk 内の列単位 on-demand materialization、ならびに
+        DDL `GENERATED ALWAYS AS ... VIRTUAL` のスキーマ仮想列）は DataChunk /
+        行形式 / カタログ / WAL の全面再設計（列を Value 配列から遅延スロット
+        へ変える、仮想列は行 payload を増やさず read時に合成）を要求する。
+        ハイブリッド PAX + morsel 並列の現物理（行単位 materialize 前提）と
+        噛み合わず、単独で入れる利得はバッチ境界コピー削除程度に留まる。
+        - **将来の着手点**: `DataChunk::ColumnAt` を仮想化し、遅延列は
+          (producer 式, 元列参照) で保持、consumer が最初に触った時点でバッチ
+          単位評価（`Selection::NextBatch` の SIMD / JIT 契約と同じく
+          NULL 反映の selection vector を返す）。スキーマ仮想列はカタログに
+          列単位の生成式を置き、全スキャン経路（full / index / LSM /
+          morsel 並列）の出力合成から着手。
 - [ ] DictionaryProjectionを実装する。
-- [ ] residual側のConstantFolding境界を整理する。
+      **スキップ（判断理由）**: 辞書符号化射影（VarChar を dict + code で
+      流す）は `ColumnVector` に新表現を足し、比較 / join / sort / 集約 /
+      bytecode·JIT すべての消費者が code 域（または展開）を扱える必要が
+      ある。辞書の供給源も未決で、スキャン側辞書ページ（ストレージ層の
+      新 column セグメント形式）か実行時構築（投影が入力バッチから辞書を
+      継ぎ足す; morsel 並列の局所辞書併合が WiscKey 読みと競合）のどちらを
+      採るかの設計判断が先。TPC-H 全問の varchar 比較が対数域に落ちる潜在的
+      利得は大きいが、表現 1 つ足すだけで executor 差分面が全域に波及する。
+      - **将来の着手点**: まず `ColumnVector` に 2 成分（`dictionary` 共有
+        ストリングプール + `code` int32）を追加し、`CompareVarCharForOrderBy`
+        相当を code 域比較に置換する babysitter 実装から始め、バッチの
+        `TryEvaluateBatch` / `SimdComparisonKernel::CompareStringPrefix` を
+        code 域で処理できる経路を diff テスト（`differential_test` の述語
+        直交 set）で守る。
+- [x] residual側のConstantFolding境界を整理する。
+  - **現境界の整理（本項の成果）**: 定数畳み込みは 4 層で行われる——
+    (1) Scalar rewrite（`fold_binary/unary/in/function` 等、評価は
+    `ExpressionRuleSet::Default()`）: 列参照なしの部分式を AST 変換で折る。
+    memo 経路はここで恒 TRUE conjunct が AND 簡約によって既に消える
+    （`TRUE AND x>1` → `x>1`）。(2) 関数を含む WHERE は
+    `NeedsRelationalEvaluation` が課すハッチ（
+    `TINYLAMB_SCALAR_FN_CASCADES`=off が既定）のため SQL 全体が relational
+    経路に流れ、relational AST は生述語のまま `CompileScanFilter` /
+    `FinishQuery` に到達する——ここが従来の穴: 定数 conjunct
+    （`UPPER('A')='A'`）が 1 行ごとに評価されていた。
+    (3) **本実装**: `CompileScanFilter`
+    （`executor/detail/scan_filter.cpp`）に constant-residual 境界を追加
+    ——決定的 conjunct（volatile 呼び出し `ContainsVolatileCall`（
+    expression 層に新設）なし、パラメータスロットなし、subquery なし、かつ
+    空スキーマ `TryEvaluate` が成功＝列参照は空スキーマで失敗するので
+    自己ゲート）は compile 時に 1 回評価し、`Truthy()` で
+    **TRUE → conjunct 放棄** / **FALSE・NULL →
+    `compile_decided_reject`**（結合全体を compile 時確定 + 全行 reject は
+    `MatchScanFilter` / morsel 並列の `MatchScanFilterWorker` でも
+    ミラー）。行時評価と同一の 3 値規則を 1 回だけ適用するので、
+    rejecting conjunct による sibling error 抑制
+    （`EvaluateConjunctsTolerant` 契約）も compile 時決定が肩代わりする。
+    stable（`CURRENT_TIMESTAMP` 等）は保守的に kImmutable のみ fold
+    （文内固定値を保つ）。OR 分岐内は行動単位の評価のまま
+    （sibling 意味論が conjunct と異なる）。
+    - 新規公開: `expression::ContainsVolatileCall`（rand/random/uuid/
+      generate_uuid/newid の到達可能性; plan_cache の
+      `ContainsNonDeterministicCall` は query 層に留まり layering 順を守る）。
+  - テスト: `executor_extra_test.cpp`
+    `ScanFilterTest.CompileTimeResolvesDeterministicConstantConjuncts`
+    （TRUE 放棄 / FALSE 全行 reject / NULL / volatile 残留）、
+    `query/query_test.cpp`
+    `QueryTest.ConstantConjunctsDecidedAtScanFilterCompile`
+    （relational 経路の行集合 + volatile でない stable も残留）。
+  - 変異検証: `TryDecideConstantConjunct` を常時 nullopt にすると単体テスト
+    fail（SQL 行集合は等価なので不変——本境界の価値は評価回数削減）。
+    確認済み。
 
 ### Scalar rewrite（ExpressionRuleSet）
 

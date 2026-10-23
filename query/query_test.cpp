@@ -2458,6 +2458,44 @@ TEST_F(QueryTest, ComparisonAgainstNullLiteralIsUnknownNotError) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, ConstantConjunctsDecidedAtScanFilterCompile) {
+  // Constant-residual boundary: a deterministic conjunct whose value is a
+  // compile-time fact is resolved once by CompileScanFilter (TRUE discharges
+  // it, FALSE / NULL rejects the whole conjunction), including on the
+  // relational route where expressions stay on the AST.  Results must equal
+  // the per-row evaluation, and a rejecting conjunct still suppresses
+  // sibling errors (WHERE tolerant semantics).
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cc (x INT64);");
+  RunSql(ctx, *db_, "INSERT INTO cc VALUES (1), (5);");
+  // Constant TRUE keeps only the runtime compare.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT x FROM cc WHERE UPPER('A') = 'A' AND x > 1 "
+                   "ORDER BY x;"),
+            (std::vector<Row>{Row({Value(5)})}));
+  // Constant FALSE decides once: no rows, and the sibling ABS never raises.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT x FROM cc WHERE UPPER('A') = 'B' AND x > 1 "
+                   "ORDER BY x;"),
+            (std::vector<Row>{}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT x FROM cc WHERE 1 = 0 AND ABS(x) > 100 ORDER BY x;"),
+            (std::vector<Row>{}));
+  // Constant NULL (three-valued): rejects the conjunction.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT x FROM cc WHERE NULL AND ABS(x) > 100 ORDER BY x;"),
+            (std::vector<Row>{}));
+  // A stable call is NOT folded either: the conservative gate (kImmutable
+  // only) keeps the conjunct a runtime predicate, so its within-statement
+  // timing meaning is untouched.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT x FROM cc WHERE CURRENT_TIMESTAMP IS NOT NULL AND x > 1 "
+             "ORDER BY x;"),
+      (std::vector<Row>{Row({Value(5)})}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, AndOfOrPredicatesKeepConjunctionInScanFilter) {
   // CompileScanFilter decomposes each top-level OR conjunct into
   // disjunctive branches; appending the branch lists of SEPARATE OR

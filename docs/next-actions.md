@@ -1,5 +1,14 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第55報)。residual側のConstantFolding境界整備(todo.md
+「実行側の filter / projection 最適化」節): `CompileScanFilter` に
+constant-residual 境界を追加した。決定的定数 conjunct は compile 時 1 回
+評価し TRUE で放棄 / FALSE・NULL で結合全体確定(並列 worker もミラー)。
+`expression::ContainsVolatileCall` を新設。mutate 済み。同節の
+selection vector / JIT filter 選択経路の 2 項は既存実装・既存テストの
+契約を文書化して [x] にした。`VirtualComputedColumn` / `DictionaryProjection`
+は辞書判定と着手点を todo.md に記録済み([ ] 維持)。
+
 2026-10-23 加筆(第54報)。小さい generate series⇒Values(todo.md「UNNEST」節):
 `constant_unnest_to_values` 実装済み。副次変更: GENERATE_SERIES を AST
 `ExecuteFunction` に純実装し detail evaluator を委譲(3 経路要素一致)、

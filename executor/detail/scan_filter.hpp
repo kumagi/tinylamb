@@ -110,6 +110,15 @@ struct CompiledScanFilter {
   std::vector<PrebuiltMembershipPredicate> prebuilt_membership;
   std::vector<PrebuiltScalarComparePredicate> prebuilt_scalar_compare;
   std::vector<Expression> residual;
+  // Constant-residual boundary: CompileScanFilter resolves conjuncts that are
+  // already fixed at compile time (no column lookup is even possible against
+  // an empty schema, no volatile call, no parameter slot, no subquery).
+  // TRUE discharges such a conjunct; FALSE / NULL discharges the whole
+  // conjunction (WHERE tolerates sibling errors for conjuncts that actually
+  // evaluate, so the compile-time decision just takes their place).  When
+  // this flag is set, no other component of the filter is meaningful and
+  // every row rejects.
+  bool compile_decided_reject{false};
   // Disjunctive branches: OR(AND(pred1, pred2, ...), AND(pred3, pred4, ...),
   // ...) Each inner vector is one AND branch.  MatchScanFilter returns true if
   // ALL predicates in ANY branch pass.  Falls back to residual evaluation
