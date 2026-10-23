@@ -133,6 +133,124 @@ TEST_F(QueryTest, ColumnDefaultSubstitutesForOmittedColumns) {
   EXPECT_EQ(overridden[0][1], Value("override"));
 }
 
+// NOT NULL DDL contract: the frontend attaches the parsed
+// NotNullColumnAttribute to the catalog column (it used to be silently
+// dropped), the table writer enforces it for INSERT and UPDATE alike
+// (Table::CheckRowConstraints)--and because every writer funnels through
+// that check, the planner may treat the guarantee as grounded and rewrite
+// COUNT over a NOT NULL column into the argument-free COUNT(*): the per-row
+// null test can never reject a row, so the scan stops decoding the
+// argument. COUNT(DISTINCT col) keeps its argument--the dedup set is part
+// of the result definition, not a null filter. A PRIMARY KEY column needs
+// no extra spelling: key constraints are already enforced non-NULL.
+TEST_F(QueryTest, NotNullColumnEnforcesInsertAndUpdateAndRewritesCount) {
+  TransactionContext seed = db_->BeginContext();
+  RunSql(seed, *db_, "CREATE TABLE nn (a INT64 NOT NULL, b INT64, g INT64);");
+  RunSql(seed, *db_, "CREATE TABLE pk (k INT64 PRIMARY KEY, v INT64);");
+  RunSql(seed, *db_,
+         "INSERT INTO nn VALUES (1, NULL, 1), (2, 4, 1), (3, 9, 2);");
+  RunSql(seed, *db_, "INSERT INTO pk VALUES (1, 10), (2, 20), (3, 30);");
+  ASSERT_SUCCESS(seed.PreCommit());
+
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+
+  // Writer enforcement, INSERT and UPDATE alike.  A violating statement
+  // trains out to a failed QueryResult: the DML applies rows off the
+  // statement drain, so the rejection surfaces in the drain status.
+  const auto expect_rejection = [&](std::string_view sql) {
+    TransactionContext probe = db_->BeginContext();
+    SqlEngine probe_engine(*db_);
+    StatusOr<QueryResult> result = probe_engine.Execute(probe, sql);
+    ASSERT_TRUE(result.HasValue()) << sql;
+    if (result.HasValue()) {
+      QueryResult drained = result.MoveValue();
+      Row row;
+      while (drained.Next(&row)) {
+      }
+      EXPECT_NE(drained.GetStatus(), Status::kSuccess) << sql;
+      // Table::CheckRowConstraints' own message surfaces for INSERT;
+      // the UPDATE wrapper reports a generic DML failure with the same
+      // underlying rejection.
+      const std::string message =
+          drained.GetStatus().GetMessage() + " " + probe_engine.LastError();
+      const bool non_nullable_message =
+          message.find("non-nullable") != std::string::npos ||
+          message.find("update failed on table") != std::string::npos;
+      EXPECT_TRUE(non_nullable_message) << message;
+    }
+    probe.txn_.Abort();
+  };
+  expect_rejection("INSERT INTO nn VALUES (NULL, 1, 0);");
+  expect_rejection("UPDATE nn SET a = NULL WHERE a = 1;");
+  expect_rejection("INSERT INTO pk VALUES (NULL, 1);");
+  // The writes were rejected as a whole: the surviving state is intact.
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*) FROM nn;"),
+            (std::vector<Row>{Row({Value(int64_t{3})})}));
+
+  // Planner rewrite: argument-free plan for NOT NULL arguments.
+  const auto explain = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
+    std::string text;
+    Row row;
+    while (prepared.HasValue() && prepared.Value()->Next(&row, nullptr)) {
+      text += row[0].AsString();
+    }
+    return text;
+  };
+  const std::string not_null_plan = explain("EXPLAIN SELECT COUNT(a) FROM nn;");
+  EXPECT_NE(not_null_plan.find(": COUNT(*)"), std::string::npos)
+      << not_null_plan;
+  EXPECT_EQ(not_null_plan.find("COUNT(nn."), std::string::npos)
+      << not_null_plan;
+  // The decode win: the scan projection under the aggregate lost its only
+  // column.
+  EXPECT_NE(not_null_plan.find("Projection: []"), std::string::npos)
+      << not_null_plan;
+  const std::string primary_key_plan =
+      explain("EXPLAIN SELECT COUNT(k) FROM pk;");
+  EXPECT_NE(primary_key_plan.find(": COUNT(*)"), std::string::npos)
+      << primary_key_plan;
+  // Nullable and DISTINCT arguments keep their spelling.
+  const std::string nullable_plan = explain("EXPLAIN SELECT COUNT(b) FROM nn;");
+  EXPECT_NE(nullable_plan.find(": COUNT(nn.b)"), std::string::npos)
+      << nullable_plan;
+  const std::string distinct_plan =
+      explain("EXPLAIN SELECT COUNT(DISTINCT a) FROM nn;");
+  EXPECT_NE(distinct_plan.find(": COUNT("), std::string::npos) << distinct_plan;
+
+  // Values are identical under the rewrite: full table, filtered, empty,
+  // and grouped shapes.  The grouped shape is a value-only check: a plain
+  // GROUP BY key next to aggregates routes through the relational bridge,
+  // which does not apply the rewrite (the memo path covers the
+  // all-aggregate select lists the rewrite fires on).
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*), COUNT(a), COUNT(b) FROM nn;"),
+            (std::vector<Row>{Row(
+                {Value(int64_t{3}), Value(int64_t{3}), Value(int64_t{2})})}));
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(a) FROM nn WHERE a > 2;"),
+            (std::vector<Row>{Row({Value(int64_t{1})})}));
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(a) FROM nn WHERE a > 100;"),
+            (std::vector<Row>{Row({Value(int64_t{0})})}));
+  // SUM keeps its argument and its empty-input semantics: over an empty
+  // prefix SUM stays NULL -- a zero identity only applies inside a formed
+  // group, so the argument-free COUNT rewrite never extends to SUM.
+  const auto empty_sum =
+      RunSql(ctx, *db_, "SELECT SUM(b) FROM nn WHERE a > 100;");
+  ASSERT_EQ(empty_sum.size(), 1U);
+  EXPECT_TRUE(empty_sum[0][0].IsNull());
+  EXPECT_EQ(
+      RunSql(ctx, *db_, "SELECT k, COUNT(k) FROM pk GROUP BY k ORDER BY k;"),
+      (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{1})}),
+                        Row({Value(int64_t{2}), Value(int64_t{1})}),
+                        Row({Value(int64_t{3}), Value(int64_t{1})})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_, "SELECT g, COUNT(a) FROM nn GROUP BY g ORDER BY g;"),
+      (std::vector<Row>{Row({Value(int64_t{1}), Value(int64_t{2})}),
+                        Row({Value(int64_t{2}), Value(int64_t{1})})}));
+  ctx.txn_.Abort();
+}
+
 TEST_F(QueryTest, ColumnDefaultKeywordInValuesResolvesTargetColumn) {
   TransactionContext ctx = db_->BeginContext();
   RunSql(ctx, *db_, "CREATE TABLE tk (a INT64, b INT64 DEFAULT 42);");

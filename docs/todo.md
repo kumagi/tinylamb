@@ -1263,17 +1263,73 @@ Cascades rule / cost / statistics
 - [x] unique / key preservationを守るaggregate-join transposeを実装する。
 - [x] aggregate-union transposeを実装する。
 - [ ] partial / finalへaggregateを分割する。
+  - 判定記録 (2026-10-23, スキップ維持): 実行系は既に partial/final 分離を持つ
+    (`executor/partial_aggregate.{hpp,cpp}` 直列完成化、
+    `ParallelAggregationExecutor` の worker ローカル partial + merge、
+    EXPLAIN 注記付き)。残る欠落は plan node level の分割だけだが、単一ノードでは
+    都合がつかない (同一 address space で partial materialization は追加コスト)。
+    分布実行 (todo 1301 分布プラン) が初めて実利を生む局面。着手点: グループexpr
+    のワイヤーフォーマット (partial aggregate state serialization) を
+    `docs/wal_format.md` 流に定義してから。
 - [x] join前のeager aggregationとlazy aggregationを選択する。
 - [x] unique group keyによるaggregate除去を実装する。
-- [ ] NOT NULL条件のCOUNT(*) rewriteとSUM zero identityを実装する。
+- [x] NOT NULL条件のCOUNT(*) rewriteとSUM zero identityを実装する。
+  - 実装契約 (not-null count rewrite): GoogleSQLフロントエンドが`
+    NotNullColumnAttribute` (パーサーは出力済み。従来は訪問者で黙って捨てられて
+    いた) を列の制約スロットへ展開する (`query/googlesql_ast_visitor.cpp`)。
+    PK / FOREIGN KEY / DEFAULT が既にスロットを占める場合はそちら優先 (PK は
+    Table::CheckRowConstraints が非NULL強制、FK/DEFAULT+NOT NULL の二重制約は
+    スロット非表現 — 従来どおり未強制、コメントに記載)。
+  - 強制は table 層の既存一本道: `Table::CheckRowConstraints` が INSERT と
+    UPDATE の両方で kNotNull/kPrimaryKey を NULL 拒否 → 全ライターが通るので
+    プランナーはこの保証を信頼できる。
+  - rewrite: `RewriteNotNullCounts` (`plan/optimizer.cpp`、memo版図作成の直前、
+    scan_projections 計算の前) — kCount (!distinct、引数が裸の解決済み列、
+    "*") で単一relation確定・列が kNotNull/kPrimaryKey なら引数を NULL 子の
+    正準 `COUNT(*)` へ置換。曖昧な複数relation列・DISTINCT はそのまま。
+    EXPLAIN: `: COUNT(*)` + 空の子投影 (`Projection: []`) = 列decode削減。
+  - SUM zero identity: executor側は既に単位元を正しく扱う (group-all 空入力は
+    SUM=NULL、COUNT=0 — zero identity は group 形成後にのみ適用)。planner に
+    おける SUM は引数を捨てられないため rewrite 対象外。空prefixで SUM が
+    NULL のままの契約をテストで固定。
+  - テスト: `QueryTest.NotNullColumnEnforcesInsertAndUpdateAndRewritesCount`
+    (query_test; INSERT/UPDATE/PK-INSERT の NULL 拒否、EXPLAIN plan 文言、
+    nullable/DISTINCT 非書き換え、値等価 (full/filtered/empty/grouped)、
+    空prefix SUM=NULL)。変異検証: 訪問者配線無効化 → 拒否2件+plan assert
+    失敗; rewrite ゲート無効化 → plan assert 失敗 (拒否系は生きる)。
 - [x] `COUNT(DISTINCT)` のdistinct aggregate expansionを実装する。
 - [x] grouping sets expansion、grouping sets-to-union、ROLLUP / CUBE変換を実装する。
 - [ ] grouping_id simplificationを実装する。
 - [x] HAVINGをaggregate後filterへ明示変換する。
 - [x] FILTER aggregate ruleを実装する。
 - [ ] approximate aggregate rewriteを実装する。
+  - 判定記録 (2026-10-23, スキップ維持): APPROX_* 準拠の SQL 表面 (APPROX_COUNT_
+    DISTINCT / APPROX_QUANTILES 等) がカタログの関数レジストリに存在しないため
+    rewrite 先が無い。HLL による NDV 推定は `table/hyper_log_log.hpp` で統計側に
+    実装済み ([x] の統計項目)。着手点: APPROX 集約関数シグネチャ (近似であること
+    の結果型/NULL 契約込み) のセマンティクスを expression 層の differential
+    oracle に入れてから、rewrite はパターン照合で済む。
 - [ ] group keyのfunctional dependency reductionを実装する。
-- [ ] aggregateをprojectionの下へ安全に押し下げる。
+  - 判定記録 (2026-10-23, スキップ維持): FD マップ自体が統計に無い
+    (`table/table_statistics.hpp` は NDV/ヒストグラム/行質量だけで、列間の
+    「determines」関係は保持しない)。ルール時点 (rule time) で統計が参照できる
+    配線も ImplementationRule 系のみで transform 系には RuleContext が無い。
+    着手点: (1) catalog 層で declared UNIQUE/PK から FD を初期化、(2) 統計に
+    `FdMap` (+ 我慢強い sample-based 推定 → 検証) を追加、(3) memo の
+    冗長 group key 除去 (`SupportsGrouping`/join unique key 推論,
+    plan/optimizer.cpp) と同じ derived-group タグ戦略で eliminate 規則を書く。
+    declared FD に限れば (1)(3) だけでも sound。
+- [x] aggregateをprojectionの下へ安全に押し下げる。
+  - 実装契約: 既存 `push_projection_through_aggregation`
+    (`plan/cascades.cpp` ~4565 定義) が担当。Projection(Aggregation(Any)) の
+    上位 projection が全て裸列 target のときだけ発火 (それ以外は即 return で
+    「安全側」)、必要列集合 (`needed_cols` = grouping sets + 集約引数の
+    touched columns + apply/sort 配下) を元 group の派生 group に
+    kProjection として再下層化し、集約はその上に再構成される。以後 memo 内で
+    集約は常に「生の基底列」を参照し、decode 縮小は scan_projections と
+    (今回の) RewriteNotNullCounts が同じ必要列集合から得る。rule 名は「projection
+    を集約の下へ押し込む」読みで、todo 語句 (aggregate を projection の下へ)
+    の転置表記と同一の結果形になる。
 
 ---
 

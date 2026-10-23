@@ -1,5 +1,18 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第57報)。NOT NULL COUNT(*) rewrite + DDL NOT NULL 配線
+(todo.md「集約」節 1234): GoogleSQL DDL の `NOT NULL` がパーサーでは出力されて
+いたが訪問者で黙って捨てられ、列制約スロットが常に空だったため
+`Table::CheckRowConstraints` の NULL 拒否が到達不能だった。`NotNullColumnAttribute`
+を列スロット (PK が占める場合は PK 優先) へ展開し、INSERT/UPDATE 両方の
+NULL 挿入が拒否されるようになった。その上でプランナー `RewriteNotNullCounts`:
+kCount(!distinct・裸列・単一relation) で引数が kNotNull/kPrimaryKey なら
+正準引数なし `COUNT(*)` へ置換し、scan 必要列集合から外れる (decode 削減、
+EXPLAIN で `Projection: []` に観測)。SUM の空入力 NULL と COUNT 空入力 0 の
+違いはテスト固定。DDL NOT NULL 無視が NULL 挿入を許していた逸脱はこれで
+解消 (differential fuzz は NULL 制約列を生成していない — 制約スロットの
+セマンティクスは従来コードが kPrimaryKey で同じ強制を既に持っていた)。
+
 2026-10-23 加筆(第56報)。aggregate↔filter transpose / HAVING residual 分化
 (todo.md「集約」節): 単一表 GROUP BY の既定ルート(relational)に対して
 key のみの HAVING conjunct を `ExecuteAggregatedQuery` の scan filter に入れ

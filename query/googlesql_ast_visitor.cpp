@@ -8646,6 +8646,23 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
                                   Constraint(Constraint::kPrimaryKey));
           columns.back().SetUnsigned(was_unsigned);
         }
+        // NOT NULL rides the column's constraint slot: a key constraint or
+        // an attribute with slot payload keeps its slot.  Kept semantics:
+        //  - PRIMARY KEY: key constraints are enforced non-NULL by the table
+        //    writer (CheckRowConstraints treats kPrimaryKey as kNotNull), so
+        //    the slot stays kPrimaryKey and the declaration adds nothing.
+        //  - FOREIGN KEY / DEFAULT: their slot payload has no NOT NULL side
+        //    channel, so the conflicting dual constraint is not representable;
+        //    the key/default keeps the slot (previous behavior for these
+        //    columns is unchanged; the NOT NULL half stays unenforced).
+        if (attrs->Child("NotNullColumnAttribute") != nullptr &&
+            columns.back().GetConstraint().ctype == Constraint::kNothing) {
+          const bool was_unsigned = columns.back().IsUnsigned();
+          columns.back() =
+              Column(columns.back().Name().name, columns.back().Type(),
+                     Constraint(Constraint::kNotNull));
+          columns.back().SetUnsigned(was_unsigned);
+        }
         for (const GoogleSqlAstNode* attr :
              attrs->Children("ForeignKeyColumnAttribute")) {
           const GoogleSqlAstNode* reference =

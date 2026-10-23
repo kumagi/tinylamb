@@ -225,6 +225,56 @@ std::unordered_set<std::string> ColumnRelations(
   }
   return result;
 }
+// NOT NULL COUNT(*) rewrite: replace COUNT(col) -- not DISTINCT, argument a
+// bare column, never "*") with the argument-free canonical COUNT(*) when the
+// referenced column cannot be NULL.  Keeps the pinned output name; the value
+// is provably the same because the per-row null test is a no-op.  Only fires
+// when the column resolves to exactly one relation in this query's catalog
+// slice (ambiguous multi-relation columns stay untouched).
+std::vector<NamedExpression> RewriteNotNullCounts(
+    const std::vector<NamedExpression>& outputs,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
+  std::vector<NamedExpression> rewritten;
+  rewritten.reserve(outputs.size());
+  bool changed = false;
+  for (const NamedExpression& output : outputs) {
+    Expression expression = output.expression;
+    if (expression && expression->Type() == TypeTag::kAggregateExp) {
+      const auto& aggregate = expression->AsAggregateExpression();
+      if (aggregate.GetType() == AggregationType::kCount &&
+          !aggregate.Distinct() && aggregate.Child() &&
+          aggregate.Child()->Type() == TypeTag::kColumnValue) {
+        const ColumnName column =
+            aggregate.Child()->AsColumnValue().GetColumnName();
+        if (column.name != "*") {
+          const std::unordered_set<std::string> relations =
+              ColumnRelations(column, tables);
+          if (relations.size() == 1 && !column.name.empty()) {
+            const Table& table = *tables.find(*relations.begin())->second;
+            const int offset =
+                table.GetSchema().Offset(ColumnName("", column.name));
+            if (std::getenv("TINYLAMB_DBG_CNT") != nullptr) {
+            }
+            if (offset >= 0) {
+              const Constraint& constraint =
+                  table.GetSchema()
+                      .GetColumn(static_cast<size_t>(offset))
+                      .GetConstraint();
+              if (constraint.ctype == Constraint::kNotNull ||
+                  constraint.ctype == Constraint::kPrimaryKey) {
+                expression = AggregateExpressionExp(AggregationType::kCount,
+                                                    nullptr, false);
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+    rewritten.emplace_back(output.name, std::move(expression));
+  }
+  return changed ? rewritten : outputs;
+}
 
 struct CrossColumnEquality {
   ColumnName left;
@@ -2787,6 +2837,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // order, and the memo has no operator between the two.
   std::vector<DecorrelationSpec> decorrelations;
   std::vector<NamedExpression> projection_items = expanded_select;
+  // NOT NULL COUNT(*) rewrite: COUNT over a NOT NULL (or primary-key)
+  // column equals COUNT(*) -- the per-row null test can never reject a
+  // row -- so the aggregate argument is dropped and the scan no longer
+  // decodes a column it does not need (the touched-column merge below and
+  // the scan_projections computed from it both see the rewritten list).
+  // Runs before the scan-projection computation so the decoding win is
+  // realized, and COUNT(DISTINCT col) keeps its argument: the dedup set is
+  // part of the result definition, not a null filter.
+  projection_items =
+      RewriteNotNullCounts(projection_items, rule_context.tables);
   // True when a hidden `$semiN` correlation key was appended to
   // projection_items: DISTINCT must then run above the final trim (over the
   // caller-visible columns only), not over the hidden-key superset.
@@ -3421,6 +3481,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
   }
   if (has_aggregate) {
+    // NOT NULL COUNT(*) rewrite (SUM zero identity / aggregate split family):
     const cascades::GroupId aggregation =
         memo.EnsureDerivedGroup(query.from_, "aggregation");
     memo.AddExpression(aggregation,
