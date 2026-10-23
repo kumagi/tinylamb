@@ -371,12 +371,101 @@ bool ExpressionIsAlwaysFalse(const Expression& expression) {
   }
 }
 
+// Structural evaluation-cost class used to order conjuncts (lower runs first).
+// The point is short-circuit efficiency: a literal comparison on one column is
+// an index-friendly, branch-cheap test, while LIKE, function calls and
+// subqueries cost far more per row.  The class is purely structural (no
+// statistics), so the canonical order stays deterministic and memo fingerprints
+// never depend on catalog state; ToString() still breaks ties, which keeps the
+// previous alphabetical order inside one class.
+int ConjunctCostClass(const Expression& conjunct) {
+  const auto is_ordered_comparison = [](BinaryOperation op) {
+    switch (op) {
+      case BinaryOperation::kEquals:
+      case BinaryOperation::kNotEquals:
+      case BinaryOperation::kLessThan:
+      case BinaryOperation::kLessThanEquals:
+      case BinaryOperation::kGreaterThan:
+      case BinaryOperation::kGreaterThanEquals:
+        return true;
+      default:
+        return false;
+    }
+  };
+  if (!conjunct) {
+    return 4;
+  }
+  switch (conjunct->Type()) {
+    case TypeTag::kConstantValue:
+      return 0;
+    case TypeTag::kColumnValue:
+      return 1;
+    case TypeTag::kUnaryExp:
+      switch (conjunct->AsUnaryExpression().Op()) {
+        case UnaryOperation::kIsNull:
+        case UnaryOperation::kIsNotNull:
+        case UnaryOperation::kIsTrue:
+        case UnaryOperation::kIsNotTrue:
+        case UnaryOperation::kIsFalse:
+        case UnaryOperation::kIsNotFalse:
+          return 2;
+        default:
+          return 6;
+      }
+    case TypeTag::kBinaryExp: {
+      const BinaryExpression& binary = conjunct->AsBinaryExpression();
+      if (binary.Op() == BinaryOperation::kOr) {
+        return 7;
+      }
+      if (binary.Op() == BinaryOperation::kAnd) {
+        return 6;
+      }
+      if (binary.Op() == BinaryOperation::kLike ||
+          binary.Op() == BinaryOperation::kNotLike) {
+        return 5;
+      }
+      const bool left_column = binary.Left()->Type() == TypeTag::kColumnValue;
+      const bool right_column = binary.Right()->Type() == TypeTag::kColumnValue;
+      const bool left_constant =
+          binary.Left()->Type() == TypeTag::kConstantValue;
+      const bool right_constant =
+          binary.Right()->Type() == TypeTag::kConstantValue;
+      if ((left_column && right_constant) || (left_constant && right_column)) {
+        return is_ordered_comparison(binary.Op()) ? 1 : 3;
+      }
+      if (left_column && right_column) {
+        return is_ordered_comparison(binary.Op()) ? 2 : 4;
+      }
+      return 4;
+    }
+    case TypeTag::kInExp:
+      return 3;
+    case TypeTag::kCastExp:
+      return 3;
+    case TypeTag::kFunctionCallExp:
+      return 5;
+    case TypeTag::kCaseExp:
+      return 6;
+    case TypeTag::kQueryExp:
+    case TypeTag::kAggregateExp:
+    case TypeTag::kWindowFunctionExp:
+      return 8;
+    default:
+      return 4;
+  }
+}
+
 Expression CanonicalizeConjuncts(const Expression& predicate) {
   if (!predicate) {
     return nullptr;
   }
   std::vector<Expression> conjuncts = SplitConjuncts(predicate);
   std::ranges::sort(conjuncts, [](const Expression& a, const Expression& b) {
+    const int left = ConjunctCostClass(a);
+    const int right = ConjunctCostClass(b);
+    if (left != right) {
+      return left < right;
+    }
     return a->ToString() < b->ToString();
   });
   conjuncts.erase(

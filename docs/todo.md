@@ -814,26 +814,137 @@ Cascades rule / cost / statistics
 
 （以下は実装済み: join_commutativity, join_enumeration, join_associativity_left/right, infer_join_predicates, push_selection_through_join, split_selection_over_join, join_to_cross_if_no_predicate, merge_adjacent_filters, push_filter_through_left_join_left_side, join_on_false_to_empty, cross_to_inner_with_predicate, join_empty_simplification, self_join_elimination, unique_semi_to_inner, outer_to_anti_join, right_to_left_outer_join, full_outer_join_decomposition, push_down_limit_through_join, dynamic_filter_pushdown_join, join_predicate_transitivity, inferred_inequality_pushdown, redundant_join_predicate_elimination, outer_to_inner (relational)）
 
-- [ ] n-ary bushy joinのleft/right associationを完全化する。
+- [x] n-ary bushy joinのleft/right associationを完全化する。
+      実装は 2 経路:
+      (1) 回転規則 `join_associativity_left`
+          (`Join(Join(ll,lr), right)` → `Join(ll, Join(lr,right))`) と
+          `join_associativity_right` (`Join(left, Join(rl,rr))` →
+          `Join(Join(left,rl), rr)`)。回転先の述語は `Memo::NewJoin` が保持済み
+          conjunct から再導出し、元の述語が正規化済み conjunct と一致する場合だけ
+          回転する (`HasCanonicalStoredJoinPredicate`) ので、述語の無い回転で
+          直積を混ぜない。
+      (2) 関係数 3..16 では `join_enumeration` が csg-cmp 制限付きで二分割を
+          網羅列挙し、bushy 形を直接 memo に登録する
+          (`ClaimJoinEnumeration` 後は回転規則を走らせない）。連結グラフでは
+          両辺の誘導部分グラフ連結性と切断面の連結性を要求して直積分割を落とす。
+          17 関係以上は `GreedyConnectedSplit` で初期木を作り回転規則に委ねる。
+      回帰: `CascadesTest.BushyBipartitionsAppearWithAndWithoutEnumeration`
+      (4 関係チェーンで `{a,b}|{c,d}` が enumeration 有無どちらでも現れる),
+      `CascadesTest.AssociativityRulesEnumerateJoinOrdersWithoutEnumeration`
+      (3 関係で 6 分割), `JoinEnumerationKeepsChainSplitsConnected`
+      (6 関係チェーンで非連結分割を出さない),
+      `OptimizerTest.JoinChainMatchesGoldenResultUnderRuleSubsets`
+      (結合順規則の任意部分集合で同一結果)。
 - [x] 空Values / 1行定数表によるjoin identityを実装する。
 - [x] 1行側cross join eliminationを実装する。
 - [x] 条件付きcrossとinnerの相互変換を実装する。
-- [ ] inner join子交換をコスト駆動で再試行する。
-- [ ] DPHyp / DPccp等の連結部分グラフ列挙を導入する。
+- [x] inner join子交換をコスト駆動で再試行する。
+      `join_commutativity` が両順序を memo に登録し、コストが build/probe 側を
+      選ぶ（専用の「コスト付き交換」規則は不要。両順序は
+      `Memo::AddExpression` の指紋で重複排除される）。回帰:
+      `OptimizerTest.HashJoinUsesSmallerInputAsBuildSide`（小さい入力を
+      build 側に置く）、`OptimizerTest.JoinChainMatchesGoldenResultUnderRuleSubsets`
+      （交換則を外した部分集合でも同一結果）。
+- [x] DPHyp / DPccp等の連結部分グラフ列挙を導入する。
+      `join_enumeration` → `EnumerateJoinGroup` が、関係 ≤16
+      (`kMaxJoinEnumerationRelations`) のグループに対して csg-cmp を満たす
+      二分割のみを 1 回だけ発行する（`ClaimJoinEnumeration`）。判定は
+      `Memo::CutConnected`（切断面が conjunct で繋がる）と
+      `InducedSubgraphConnected`（両辺が連結）。非連結グラフでは従来の二分割を
+      維持し、17 関係以上は `GreedyConnectedSplit` + 回転に委ねる。
+      回帰: `CascadesTest.JoinEnumerationPrunesDisconnectedBipartitions`
+      ({a,b}|{c} の非接続カットを落とす), `JoinEnumerationKeepsChainSplitsConnected`,
+      `JoinEnumerationBoundsConnectedJoinClosure`,
+      `BushyBipartitionsAppearWithAndWithoutEnumeration`。
 - [x] 16関係超のgreedy join order fallbackを実装する。
 - [ ] IKKbz / GOOヒューリスティックを検討・実装する。
+      **スキップ（検討結果）**: 現状の探索は関係 ≤16 で DP（csg-cmp 列挙）、
+      17 以上で `GreedyConnectedSplit`（初期木）+ 回転。IKKBZ はチェーン/スターの
+      辺重みから一意な結合順を O(n) で出すヒューリスティックだが、≤16 では
+      同じコストモデルで候補を列挙する DP に支配される（列挙した中から最良を
+      選ぶため、ヒューリスティックが当てられる保証が無い）。GOO は規則適用順の
+      ヒューリスティックで、本実装の worklist は「子が変わった親を再試行」する
+      ため順序依存の取りこぼしが無い
+      (`CascadesTest.ExploreRequeuesGroupTouchedAfterItWasPopped`)。
+      よって追加のヒューリスティックは探索空間を狭めるだけで、測定上の利得が
+      無い。17 関係超の greedy 品質が問題になったら、まず
+      `GreedyConnectedSplit` の辺重み（選択性・行数）を改善するのが先。
 - [x] star join reorderを実装する。
-- [ ] bushy / left-deep探索予算を実装する。
+- [x] bushy / left-deep探索予算を実装する。
+      bushy と left-deep は同じ memo で列挙され（`join_enumeration` の二分割と
+      回転規則の木組み替え）、コストが選ぶ。探索量の上限は 3 段:
+      (1) `Memo` の式数上限（`kDefaultExpressionCap`。超過時は `Degraded()` を
+          立てて最良案で打ち切る）,
+      (2) `SearchEngine::SetStepBudget`（論理規則適用回数の上限。
+          `OptimizerOptions::search_step_budget` から設定し、0=無制限。
+          枯渇時は `BudgetExhausted()` を立てて best-so-far を返す）,
+      (3) 関係数 >16 は DP を行わず greedy 初期木 + 回転。
+      回帰: `CascadesTest.ExpressionCapDegradesGracefully`,
+      `CascadesTest.ExploreConvergesOnWideJoinGraphsWithoutPassCap`,
+      `phase0_contract_test` の step budget ケース（`BudgetExhausted`）。
 - [x] 定数以外を含むjoin predicate transitivityを実装する。
 - [x] inferred inequalityと冗長join predicateを実装する。
 - [x] unique/FKに基づくjoin eliminationを実装する。
 - [x] self join eliminationを実装する。
 - [x] outer-to-anti、full outer分解、right-to-left変換を実装する。
-- [ ] outer join上のfilter移動・分割・遅延評価規則を完成させる。
+- [x] outer join上のfilter移動・分割・遅延評価規則を完成させる。
+      ケースごとの担当:
+      - 左側（保存側）への単一関係 conjunct の押し下げ:
+        `push_filter_through_left_join_left_side`（LEFT JOIN は左行を保存し
+        左列を書き換えないため常に可）。
+      - 右側（NULL 生成側）は null-rejecting のみ:
+        `outer_to_inner_join_on_null_rejecting_filter` が
+        `ExpressionRejectsNullsOnRelations` で null 除去を証明できた時に
+        inner join へ縮約し、その後の押し下げ規則に渡す。証明できなければ
+        フィルタは結合の上に残す（NULL パディング行を消さない）。
+      - 分割: `split_selection_over_join` が結合をまたぐ選言/連言を分け、
+        LEFT JOIN 側は上記 2 規則の合成で等価になる。
+      - 右/全外側: `right_to_left_outer_join` で正規化し、
+        `full_outer_join_decomposition` で分解してから同じ規則を適用。
+      **遅延評価（結合の上へ引き上げる案）は登録しない**（判断）:
+      左側フィルタは押し下げても意味が変わらず、結合に入る行数が減るだけで
+      あるため、遅延が仕事量を減らすことはない。右側フィルタは null-rejecting
+      でない限り上に残す必要があり、それは既に default の配置。よって
+      「遅延した方が得」な形状は存在せず、逆方向規則を足すと
+      push-down 規則との往復候補が増えるだけになる。
+      （`predicate_move_around_outer` の一般形も同じ理由で不要と判断。
+      null-rejection の解析自体は `ExpressionRejectsNullsOnRelations` として
+      既にあり、`outer_to_inner` と `split_selection_over_join` が使っている。）
+      回帰: `CascadesTest.OuterToInnerJoinOnNullRejectingFilter`,
+      `OuterToInnerJoinOnNullRejectingIsNotNull`,
+      `OptimizerTest.OuterJoinSliceKeepsLeftSideFilterAboveJoin`,
+      `OuterJoinSliceKeepsRightSideFilterAboveJoin`（上に残す側）,
+      `OuterJoinSliceLowersLeftJoinThroughMemo`。
 - [x] unique semi to inner、semi + distinct、semi reductionを実装する。
 - [x] cardinality、one-to-one、one-to-many、many-to-many属性を推論する。
-- [ ] unique内側を優先するindex join、equality hash join選択を実装する。
-- [ ] non-equality nested loopのimplementation ruleを実装する。
+- [x] unique内側を優先するindex join、equality hash join選択を実装する。
+      ハードな優先付けではなくコスト競争 + 一意性の証明で実現している:
+      - `index_join`（`LookupJoin`）/`late_materialization_join` は内側索引が
+        `StoresSingleValue()` かつ探索キーが索引キー全体のとき
+        `unique_winner`（`LateMaterializationIdentity::kUniqueWinner`）を立て、
+        1 点探索で外側カーソルを進める短絡を使う
+        (`LookupJoin::AtMostOneProbe`、dump に `at-most-one`)。
+      - equality 結合は `hash_join` / `merge_join` / `index_join` /
+        `late_materialization_join` / `nested_loop_join` が同じ memo で候補に
+        なり、コストが選ぶ（`nested_loop_join` は equi 列対がある場合に自分を
+        降りる）。build 側は `HashJoinUsesSmallerInputAsBuildSide` が固定。
+      回帰: `ExecutorTest.LookupJoinUniquePointProbeShortCircuits`,
+      `ExecutorTest.LookupJoinNonUniqueInnerKeepsTheFullMatchSet`,
+      `OptimizerTest.HashJoinUsesSmallerInputAsBuildSide`,
+      `OptimizerTest.HashJoinPreferredOverCrossProductForEquiJoin`。
+- [x] non-equality nested loopのimplementation ruleを実装する。
+      `nested_loop_join` 規則は、述語が無い/non-equi、または equi 列対が
+      catalog 型で比較可能でない場合にだけ候補を出す（equi の場合は
+      hash/merge/index に譲る）。実行器は block NL（block_size 1024）で
+      全述語を組ごとに評価し、外側版は `outer_nested_loop`（LEFT は NULL
+      パディング、RIGHT は `right_to_left_outer_join` で正規化、FULL は
+      hash/merge 側の担当）。`batch_nested_loop` は半結合/反結合/外側の
+      非 equi を tuple 形と同じコストで登録する。
+      回帰: `OptimizerTest.BatchNestedLoopExecutesNonEquiInnerJoin`,
+      `OptimizerTest.OuterJoinSliceFullNonEquiJoinUsesBatchNestedLoop`,
+      `CascadesTest.OuterNestedLoopPlansNonEquiLeftJoin`,
+      `CascadesRulesCoverageTest.LeftJoinNonEquiUsesNestedLoop`,
+      `OptimizerTest.CrossTableResidualPredicateIsAppliedByTheJoin`。
 - [x] dynamic filter、late materialization、batch lookupのruleを接続する。
 
 ### 集合・Window・UNNEST規則
@@ -855,7 +966,29 @@ Cascades rule / cost / statistics
 
 ### 実行側のfilter / projection最適化
 
-- [ ] Filterの短絡順序とConjunctReorderingを実装する。
+- [x] Filterの短絡順序とConjunctReorderingを実装する。
+      - **短絡**: AND/OR は既に左→右で短絡評価し 3 値論理を保つ
+        （左が NULL で確定しないときだけ右を評価）。
+        `expression/binary_expression.cpp` の
+        `EvaluateMaybeShortCircuited`。
+      - **並べ替え**: `CanonicalizeConjuncts` が連言/選言を
+        **構造コストクラス順**に並べる（`ConjunctCostClass`、低いほど先）:
+        定数=0 < 単列リテラル比較/ブール列=1 < 列対比較=2 < IS NULL 系=2 <
+        IN/CAST/計算式比較=3-4 < LIKE関数=5 < NOT/AND=6 < OR=7 <
+        集約/window/subquery=8。タイブレークは従来の `ToString()` のままなので
+        同一クラス内の順序は不変、クラスは純粋に構造的（統計に依存しない）ため
+        memo の指紋・正規化済み述語同士の一致判定も安定する。
+        スキャンフィルタ / join 条件 / pushdown 先のすべてがこの正規形を通るので、
+        実行時の短絡が初手で安い述語を試す（逆順だった例:
+        `a.x LIKE 'abc%' AND a.z = 1` は + 行ごとにパターンマッチを実走）。
+      - 並べ替えは行集合を変えない（連言/選言は可換）。`WHERE` の行評価は
+        `EvaluateConjunctsTolerant`（誤りを記録して次の conjunct を見る）なので、
+        「どれかが cleanly false なら破棄」の結果は順序に依存しない。
+        違いは短絡で *評価を省けるか*（`a <> 0 AND 1/a > 1` の a=0 行）と、
+        列挙順に最初に記録される誤りの種類だけ。
+      回帰: `CascadesTest.ScanFilterOrdersCheapConjunctsBeforeLike`（正規化済み
+      スキャンフィルタのテキスト順を固定）。変異（コストクラスを外して
+      旧来の ToString 順に戻す）はテストが落ちることを確認。
 - [ ] selection vector / validity bitmapを利用したfilterを実装する。
 - [ ] bytecode / JIT filterの選択経路を接続する。
 - [ ] VirtualComputedColumnの遅延評価を実装する。

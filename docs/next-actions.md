@@ -1,5 +1,9 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-20 加筆(第52報)。Filter の短絡順序と ConjunctReordering:
+短絡は既存、並べ替えを `CanonicalizeConjuncts` に構造コストクラスとして実装。
+詳細は下記「2026-10-20 conjunct は安い述語から評価する」の節。
+
 2026-10-20 加筆(第51報)。Calc merge / split は **Calc ノードを作らない**方針で
 決着し、不足していた「押し下げ済みフィルタの二重評価」を実装した。詳細は下記
 「2026-10-20 Calc merge はスキャン側の融合で足りる / split は転置規則」の節。
@@ -78,6 +82,33 @@ Path)の次項目: **ソート済み外側からの lookup locality の cost 化
 Path)の次項目: **複数インデックスを用いた covering 判定**。詳細は下記
 「2026-10-19 複数インデックス covering scan」の節。ForeignScan は外部
 ソース形式が未定のため保留のまま。
+
+## 2026-10-20 conjunct は安い述語から評価する
+
+- **[現状]** AND/OR の短絡評価は既にあった
+  （`EvaluateMaybeShortCircuited`: 左が cleanly false/true なら右を評価しない、
+  NULL では続行）。欠けていたのは**並べ替え**: `CanonicalizeConjuncts` は
+  `ToString()` の辞書順に並べていたので、`a.x LIKE 'abc%' AND a.z = 1` のように
+  重い述語（x < z）が先に評価されていた。
+- **[実装] `ConjunctCostClass` による構造順。** 定数 < 単列リテラル比較 /
+  ブール列 < 列対比較 / IS NULL 系 < IN・CAST・計算式比較 < LIKE・関数 <
+  NOT・AND < OR < 集約・window・subquery。タイブレークは `ToString()`。
+  要点は 2 つ:
+  1. クラスは**構造だけ**から決まる（統計・カタログを見ない）→ 正規化済み
+     述語のテキストがカタログ状態で変わらず、memo の指紋、
+     `HasCanonicalStoredJoinPredicate` の一致判定、グループ間の述語同一性
+     がすべて安定する。統計を使った順序（安いが非決定的）にしないこと。
+  2. 正規化の唯一の入口を変えるので、スキャンフィルタ / join 条件 /
+     pushdown 先のどこに載っても同じ順序になる。
+- **[安全性]** 連言/選言は可換なので行集合は不変。`WHERE` の行評価は
+  `EvaluateConjunctsTolerant` で「誤りを記録して次を見る」ため、
+  どれかの conjunct が cleanly false なら行は破棄され、順序に依存しない。
+  順序で変わるのは (a) 短絡で評価を省けるか（`a <> 0 AND 1/a > 1` の a=0 行
+  は inexpensive-first では除算を評価しない）、(b) 全部 truthy のとき
+  `first_error` として報告される誤りの種類のみ。
+- 回帰: `CascadesTest.ScanFilterOrdersCheapConjunctsBeforeLike`（スキャン
+  フィルタの正規形で `a.z = 1` が `a.x LIKE` の前に来ること。旧順では LIKE が
+  先）。変異: ソートを `ToString()` のみに戻すと落ちる。
 
 ## 2026-10-20 Calc merge はスキャン側の融合で足りる / split は転置規則
 

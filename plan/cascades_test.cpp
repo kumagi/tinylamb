@@ -754,6 +754,35 @@ TEST(CascadesTest, MergeSelectionsCollapsesSelectionChain) {
   EXPECT_TRUE(group.expressions[1].children == std::vector<GroupId>{scan});
 }
 
+TEST(CascadesTest, ScanFilterOrdersCheapConjunctsBeforeLike) {
+  // Arrange: one relation carries a LIKE (per-row pattern match) and a literal
+  // comparison. Canonical order used to be plain ToString() order, which put
+  // "a.x LIKE ..." (x < z) ahead of "a.z = 1" and paid the pattern match on
+  // rows the comparison would have rejected.
+  Memo memo;
+  const GroupId root = memo.Build(
+      {"a", "b"},
+      {{BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kLike,
+                            ConstantValueExp(Value(std::string("abc%")))),
+        {"a"}},
+       {EqExp("a.z", Value(int64_t{1})), {"a"}},
+       {BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kEquals,
+                            ColumnValueExp("b.y")),
+        {"a", "b"}}});
+
+  // Act: memo construction merges the single-relation conjuncts into the scan.
+  const Group& scan = memo.Get(memo.EnsureGroup({"a"}));
+
+  // Assert: the cheap comparison is evaluated first, LIKE last; the spanning
+  // conjunct still belongs to the join above.
+  ASSERT_TRUE(scan.filter);
+  const std::string text = scan.filter->ToString();
+  EXPECT_NE(text.find("a.z = 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("a.x LIKE"), std::string::npos) << text;
+  EXPECT_LT(text.find("a.z = 1"), text.find("a.x LIKE")) << text;
+  EXPECT_FALSE(memo.Get(root).filter) << "spanning conjunct leaked into a scan";
+}
+
 TEST(CascadesTest, PushSelectionThroughJoinMovesSingleRelationConjuncts) {
   // Arrange: a hand-built memo (no build-time distribution) where a
   // Selection over the join root mixes a single-relation conjunct with a
@@ -863,6 +892,54 @@ TEST(CascadesTest, JoinEnumerationKeepsChainSplitsConnected) {
     }
   }
   EXPECT_FALSE(saw_disconnected);
+}
+
+TEST(CascadesTest, BushyBipartitionsAppearWithAndWithoutEnumeration) {
+  // Arrange: a four-relation chain a-b-c-d. The {a,b}|{c,d} split crosses the
+  // b-c conjunct and is connected on both sides, so a complete bushy search
+  // must derive it; memo construction only produces a 1+3 split, so the shape
+  // cannot come from the initial tree alone.
+  std::vector<ConjunctInfo> conjuncts;
+  const std::vector<std::string> relations = {"a", "b", "c", "d"};
+  for (size_t i = 0; i + 1 < relations.size(); ++i) {
+    conjuncts.push_back(
+        {BinaryExpressionExp(ColumnValueExp(relations[i] + ".x"),
+                             BinaryOperation::kEquals,
+                             ColumnValueExp(relations[i + 1] + ".x")),
+         {relations[i], relations[i + 1]}});
+  }
+  const auto saw_bushy_split = [](const Memo& memo, GroupId root) {
+    for (const LogicalExpression& expression : memo.Get(root).expressions) {
+      if (expression.operation != LogicalOperator::kJoin ||
+          expression.children.size() != 2) {
+        continue;
+      }
+      if (memo.Get(expression.children[0]).relations.size() >= 2 &&
+          memo.Get(expression.children[1]).relations.size() >= 2) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Act + Assert: the full rule set, where join_enumeration claims the group
+  // and enumerates the csg-cmp bipartitions directly.
+  Memo enumerated;
+  const GroupId enumerated_root = enumerated.Build(relations, conjuncts);
+  SearchEngine enumerated_search(std::move(enumerated), RuleSet::Default());
+  enumerated_search.Explore(enumerated_root);
+  EXPECT_TRUE(saw_bushy_split(enumerated_search.GetMemo(), enumerated_root));
+
+  // Act + Assert: with enumeration removed, commutativity plus the two
+  // associativity rotations must still reach a bushy topology (the right
+  // rotation turns a JOIN (b JOIN (c JOIN d)) into (a JOIN b) JOIN (c JOIN d)).
+  Memo rotated;
+  const GroupId rotated_root = rotated.Build(relations, conjuncts);
+  RuleSet rules = RuleSet::Default();
+  ASSERT_TRUE(rules.Remove("join_enumeration"));
+  SearchEngine rotated_search(std::move(rotated), std::move(rules));
+  rotated_search.Explore(rotated_root);
+  EXPECT_TRUE(saw_bushy_split(rotated_search.GetMemo(), rotated_root));
 }
 
 TEST(CascadesTest, ExploreConvergesOnWideJoinGraphsWithoutPassCap) {
