@@ -26,3 +26,4 @@ ironlamb-compliance-*
 *.last_checkpoint.tmp
 .fuzzscratch/
 __pycache__/
+.freebuff/
