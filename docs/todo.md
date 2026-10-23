@@ -1008,7 +1008,44 @@ Cascades rule / cost / statistics
 - [x] no-op windowを除去する。
 - [x] window prefix sort共有を実装する。
 - [x] UNNESTとfilter、JOIN順序、Values変換を最適化する。
-- [ ] 小さいgenerate seriesをValuesへ変換する。
+- [x] 小さいgenerate seriesをValuesへ変換する。
+  - **実装**: Cascades 変換規則 `constant_unnest_to_values`
+    （`plan/cascades.cpp`、`unnest_filter_pushdown` の直後）。FROM 系の
+    `UNNEST(<定数配列>)` / `UNNEST(GENERATE_SERIES(<定数>))`（TVF lowering は
+    kUnnest ノード、alias 未指定なら列名 `value`）を子が 1 行 dummy scan の
+    場合に限り kValues ノードへ折りたたむ。1 行 = [要素, WITH OFFSET 時の
+    0-based counter]。要素数上限 1024（`kConstantUnnestValuesThreshold`）。
+    - 折りたたみ拒否は実行側に委譲: 非配列定数（`UNNEST(スカラー)` は実行時
+      エラー）、ネスト配列 / struct・PROTO 展開幅（セクション schema 幅が
+      スカラレイアウト(1+offset)と食い違う）、dummy 以外の 1 行リーフでない
+      駆動入力（テーブルSources は行倍率未知）、plan キャッシュ凍結リスクの
+      ある非決定的生成（GENERATE_SERIES 以外の builtin は pure 評価で折る
+      だけでなく関数 gate で GENERATE_SERIES のみ）。
+    - **評価の単一化**: `GENERATE_SERIES` はこれまで executor detail evaluator
+      のみに実装があり plan 層の純関数評価が不能だった。AST ground truth
+      に合わせた純実装を `expression/function_call_expression.cpp`
+      `ExecuteFunction`（`ExecuteBuiltin` anon ヘルパーから rename 外出し・
+      ヘッダに宣言）へ追加し、`executor/detail/expression_eval.cpp` は
+      generate_series をそれへ委譲し、front end / plan fold / 実行 3 経路の
+      要素一致を保証（int64 厳密ステップ、2^53 超でも exact、繰り返し加算の
+      float 契約、エラーメッセージ一致）。2 引数の降順既定ステップは
+      PostgreSQL 流「空配列」（既存挙動維持）。
+    - **コスト**: `unnest` implementation rule の local_cost を child 行数 →
+      `estimated_rows`（= child × 10 展開係数）へ修正し、kValues（自己行数
+      コスト）と公平比較。これが無いと_values ノードが cost 負けして
+      折りたたみが採用されない。
+  - テスト: `expression/function_call_test.cpp`
+    `ScalarFunctionSqlTest.GenerateSeriesSemanticsMatchesRuntime`（昇順/降順/
+    既定ステップ/逆Dir空配列/double 反復加算/2^53 超の exact/NULL⇒0 行/
+    arity・step0・非数値エラー）; `plan/cascades_test.cpp`
+    `ConstantUnnestArrayFoldsToValues`（3 行 + offset 列・schema）、
+    `ConstantUnnestKeepsRuntimeWhenNotFoldable`（非配列定数／スキャン駆動は
+    折らない）; `query/query_test.cpp` `BuiltinTableFunctionBecomesRowSource`
+    ・`CascadesOptimizesUnnestPlans` を新契約へ更新（定数⇒Values、相関⇒
+    Unnest を EXPLAIN 断言）; `query/sql_explain_format_coverage_test.cpp`
+    `DerivedUnnestAndLimit` 更新。
+  - 変異検証: dummy チェックを外す→`ConstantUnnestKeepsRuntimeWhenNotFoldable`
+    fail / offset 無し化→`ConstantUnnestArrayFoldsToValues` fail。確認済み。
 - [x] recursive termination predicate pushdownを実装する。
 
 ### 実行側のfilter / projection最適化

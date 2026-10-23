@@ -998,8 +998,8 @@ StatusOr<Value> FormatFunction(const std::string& name,
   return Value(std::move(result));
 }
 
-StatusOr<Value> ExecuteFunction(const std::string& name,
-                                const std::vector<Value>& values) {
+StatusOr<Value> ExecuteBuiltin(const std::string& name,
+                               const std::vector<Value>& values) {
   auto raw_str = [](const Value& val) -> std::string {
     if (val.type == ValueType::kVarChar) {
       return std::string(val.value.varchar_value);
@@ -4033,6 +4033,106 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
     return Value::Array(std::move(elements), element_type);
   }
 
+  // GENERATE_SERIES (PostgreSQL spelling) is the element-wise twin of
+  // GENERATE_ARRAY with integer-exact stepping and its own error surface.
+  // The body mirrors the executor's detail evaluator one-to-one; both and
+  // the plan-layer folds share this exact code, so the engines cannot
+  // diverge element-wise.
+  if (name == "generate_series") {
+    if (values.size() < 2 || values.size() > 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_SERIES requires 2 or 3 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() == 3 && values[2].IsNull())) {
+      return Value();
+    }
+    const bool integral =
+        values[0].type == ValueType::kInt64 &&
+        values[1].type == ValueType::kInt64 &&
+        (values.size() < 3 || values[2].type == ValueType::kInt64);
+    if (!integral &&
+        ((values[0].type != ValueType::kInt64 &&
+          values[0].type != ValueType::kDouble) ||
+         (values[1].type != ValueType::kInt64 &&
+          values[1].type != ValueType::kDouble) ||
+         (values.size() == 3 && values[2].type != ValueType::kInt64 &&
+          values[2].type != ValueType::kDouble))) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_SERIES requires numeric arguments");
+    }
+    if (integral) {
+      // Keep integer stepping exact near INT64 boundaries (the double loop
+      // loses precision well below them).
+      const int64_t begin = values[0].value.int_value;
+      const int64_t end = values[1].value.int_value;
+      const int64_t step =
+          values.size() == 3 ? values[2].value.int_value : int64_t{1};
+      if (step == 0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_SERIES step must be non-zero");
+      }
+      if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
+        return Value::Array({}, "INT64");
+      }
+      std::vector<Value> elements;
+      constexpr size_t kMaxGeneratedElements = 1'000'000;
+      for (int64_t current = begin;;) {
+        if (elements.size() == kMaxGeneratedElements) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "GENERATE_SERIES generated too many elements");
+        }
+        elements.emplace_back(current);
+        if (current == end) {
+          break;
+        }
+        int64_t next = 0;
+        if (__builtin_add_overflow(current, step, &next)) {
+          break;
+        }
+        current = next;
+        if ((step > 0 && current > end) || (step < 0 && current < end)) {
+          break;
+        }
+      }
+      return Value::Array(std::move(elements), "INT64");
+    }
+    const auto number = [](const Value& value) {
+      return value.type == ValueType::kDouble
+                 ? value.value.double_value
+                 : static_cast<double>(value.value.int_value);
+    };
+    const double begin = number(values[0]);
+    const double end = number(values[1]);
+    const double step = values.size() == 3 ? number(values[2]) : 1.0;
+    if (!std::isfinite(begin) || !std::isfinite(end) || !std::isfinite(step) ||
+        step == 0.0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "GENERATE_SERIES step and bounds must be finite; step must be "
+          "non-zero");
+    }
+    if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
+      return Value::Array({}, "DOUBLE");
+    }
+    std::vector<Value> elements;
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    // Repeated addition (not start + i*step) is the observable contract;
+    // an integer-bound rewrite changes accumulated FP results.
+    for (double current = begin; (step > 0 ? current <= end : current >= end);
+         current += step) {  // NOLINT(cert-flp30-c) - float semantics pinned
+      if (elements.size() == kMaxGeneratedElements) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_SERIES generated too many elements");
+      }
+      elements.emplace_back(current);
+      if (!std::isfinite(current + step)) {
+        break;
+      }
+    }
+    return Value::Array(std::move(elements), "DOUBLE");
+  }
+
   if (name == "generate_date_array") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -4156,6 +4256,14 @@ StatusOr<Value> ExecuteFunction(const std::string& name,
 }
 
 }  // namespace
+
+StatusOr<Value> ExecuteFunction(const std::string& name,
+                                const std::vector<Value>& values) {
+  // Declared in function_call_expression.hpp: the executor's detail
+  // evaluator and the plan-layer constant folds share the builtin table
+  // (the anonymous-namespace definition above is the single body).
+  return ExecuteBuiltin(name, values);
+}
 
 std::string UnicodeUpper(std::string_view value) {
   return ConvertUnicodeCase(value, UnicodeCaseMode::kUpper, {}, false);

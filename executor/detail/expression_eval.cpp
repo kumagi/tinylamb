@@ -9995,96 +9995,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // GENERATE_SERIES is the PostgreSQL-compatible spelling of the numeric
   // array generator.  It deliberately returns an array so the existing
   // UNNEST source path can consume it without introducing a second scan
-  // operator.  Keep integer stepping exact near INT64 boundaries.
+  // operator.  The implementation lives in the expression layer
+  // (ExecuteFunction): AST evaluation is the semantic ground truth and the
+  // plan-layer constant folds share this exact code path, so delegating
+  // here keeps the two engines element-wise identical (integer stepping
+  // stays exact near INT64 boundaries).
   if (name == "generate_series") {
-    if (arguments.size() < 2 || arguments.size() > 3) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "GENERATE_SERIES requires 2 or 3 arguments");
-    }
-    if (arguments[0].IsNull() || arguments[1].IsNull() ||
-        (arguments.size() == 3 && arguments[2].IsNull())) {
-      return Value();
-    }
-    const Value& start = arguments[0];
-    const Value& stop = arguments[1];
-    const bool integral =
-        start.type == ValueType::kInt64 && stop.type == ValueType::kInt64 &&
-        (arguments.size() < 3 || arguments[2].type == ValueType::kInt64);
-    if (!integral &&
-        ((start.type != ValueType::kInt64 &&
-          start.type != ValueType::kDouble) ||
-         (stop.type != ValueType::kInt64 && stop.type != ValueType::kDouble) ||
-         (arguments.size() == 3 && arguments[2].type != ValueType::kInt64 &&
-          arguments[2].type != ValueType::kDouble))) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "GENERATE_SERIES requires numeric arguments");
-    }
-    if (integral) {
-      const int64_t begin = start.value.int_value;
-      const int64_t end = stop.value.int_value;
-      const int64_t step =
-          arguments.size() == 3 ? arguments[2].value.int_value : int64_t{1};
-      if (step == 0) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "GENERATE_SERIES step must be non-zero");
-      }
-      if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
-        return Value::Array({}, "INT64");
-      }
-      std::vector<Value> values;
-      constexpr size_t kMaxGeneratedElements = 1'000'000;
-      for (int64_t current = begin;;) {
-        if (values.size() == kMaxGeneratedElements) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "GENERATE_SERIES generated too many elements");
-        }
-        values.emplace_back(current);
-        if (current == end) {
-          break;
-        }
-        int64_t next = 0;
-        if (__builtin_add_overflow(current, step, &next)) {
-          break;
-        }
-        current = next;
-        if ((step > 0 && current > end) || (step < 0 && current < end)) {
-          break;
-        }
-      }
-      return Value::Array(std::move(values), "INT64");
-    }
-    const auto number = [](const Value& value) {
-      return value.type == ValueType::kDouble
-                 ? value.value.double_value
-                 : static_cast<double>(value.value.int_value);
-    };
-    const double begin = number(start);
-    const double end = number(stop);
-    const double step = arguments.size() == 3 ? number(arguments[2]) : 1.0;
-    if (!std::isfinite(begin) || !std::isfinite(end) || !std::isfinite(step) ||
-        step == 0.0) {
-      return StatusError(
-          StatusCode::kInvalidArgument,
-          "GENERATE_SERIES step and bounds must be finite; step must be "
-          "non-zero");
-    }
-    if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
-      return Value::Array({}, "DOUBLE");
-    }
-    std::vector<Value> values;
-    constexpr size_t kMaxGeneratedElements = 1'000'000;
-    for (double current = begin; (step > 0 ? current <= end : current >= end);
-         current += step) {  // NOLINT(cert-flp30-c) - float semantics pinned.
-      if (values.size() == kMaxGeneratedElements) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "GENERATE_SERIES generated too many elements");
-      }
-      values.emplace_back(current);
-      if (!std::isfinite(current + step)) {
-        break;
-      }
-    }
-    return Value::Array(std::move(values), "DOUBLE");
+    return ExecuteFunction(name, arguments);
   }
 
   if (name == "generate_date_array") {

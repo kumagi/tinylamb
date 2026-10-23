@@ -56,6 +56,13 @@ bool JsonTextToValue(const std::string& text, Value* parsed);
 // EXC-SHIM: deprecated throwing wrapper (common/exc_shim.hpp).
 std::string EncodeStructMemberJson(const Value& value);
 
+// Single-implementation builtin dispatch over already-evaluated arguments.
+// AST evaluation is the semantic reference; the executor's detail evaluator
+// and plan-layer constant folds delegate here so three engines cannot
+// diverge on the same builtin (see generate_series).
+[[nodiscard]] StatusOr<Value> ExecuteFunction(const std::string& name,
+                                              const std::vector<Value>& values);
+
 // Sets a (possibly dotted) field on a struct-typed JSON text value and
 // returns the rewritten JSON. Missing intermediates are created; a NULL base
 // stays NULL.

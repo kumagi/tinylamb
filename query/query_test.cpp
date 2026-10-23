@@ -2607,6 +2607,8 @@ TEST_F(QueryTest, BuiltinTableFunctionBecomesRowSource) {
 
   // Plan contract: the frontend lowers the call to kUnnest over the group's
   // current input (here the empty one-row input), not to a second scan node.
+  // Constant args fold: constant_unnest_to_values expands the series into a
+  // kValues node, so no runtime Unnest executor remains for this shape.
   StatusOr<Executor> explain =
       engine.Prepare(ctx, "EXPLAIN SELECT * FROM GENERATE_SERIES(1, 2);");
   ASSERT_TRUE(explain.HasValue()) << engine.LastError();
@@ -2616,9 +2618,22 @@ TEST_F(QueryTest, BuiltinTableFunctionBecomesRowSource) {
     plan_text += row[0].value.varchar_value;
     plan_text += "\n";
   }
-  EXPECT_NE(plan_text.find("Unnest"), std::string::npos) << plan_text;
-  EXPECT_NE(plan_text.find("generate_series"), std::string::npos) << plan_text;
+  EXPECT_NE(plan_text.find("Values"), std::string::npos) << plan_text;
+  EXPECT_EQ(plan_text.find("Unnest"), std::string::npos) << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos) << plan_text;
+
+  // A correlated series keeps the runtime unnest: the fold is for constant
+  // args only.
+  StatusOr<Executor> explain_correlated = engine.Prepare(
+      ctx, "EXPLAIN SELECT * FROM tfv_t, GENERATE_SERIES(tfv_t.x, 3);");
+  ASSERT_TRUE(explain_correlated.HasValue()) << engine.LastError();
+  std::string correlated_plan;
+  while (explain_correlated.Value()->Next(&row, nullptr)) {
+    correlated_plan += row[0].value.varchar_value;
+    correlated_plan += "\n";
+  }
+  EXPECT_NE(correlated_plan.find("Unnest"), std::string::npos)
+      << correlated_plan;
 
   // Argument binding failures are statement errors, not silent empty reads.
   const auto expect_prepare_error = [&](std::string_view sql,
@@ -2671,6 +2686,8 @@ TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
   TransactionContext ctx = db_->BeginContext();
   SqlEngine engine(*db_);
 
+  // A constant array argument folds to a kValues node (no runtime unnest)
+  // via constant_unnest_to_values.
   StatusOr<Executor> explain =
       engine.Prepare(ctx, "EXPLAIN SELECT x FROM UNNEST([1, 2, 3]) x;");
   ASSERT_TRUE(explain.HasValue()) << engine.LastError();
@@ -2680,7 +2697,8 @@ TEST_F(QueryTest, CascadesOptimizesUnnestPlans) {
     plan_text += row[0].value.varchar_value;
     plan_text += "\n";
   }
-  EXPECT_NE(plan_text.find("Unnest"), std::string::npos);
+  EXPECT_NE(plan_text.find("Values"), std::string::npos);
+  EXPECT_EQ(plan_text.find("Unnest"), std::string::npos) << plan_text;
   EXPECT_EQ(plan_text.find("RelationalPlan"), std::string::npos);
 
   const std::vector<Row> filtered =

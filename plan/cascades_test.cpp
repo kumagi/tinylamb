@@ -3826,6 +3826,89 @@ TEST(CascadesTest, UnnestFilterPushdown) {
   EXPECT_TRUE(found_pushed);
 }
 
+TEST(CascadesTest, ConstantUnnestArrayFoldsToValues) {
+  // A stand-alone UNNEST over the one-row dummy leaf with a constant array
+  // argument IS the expanded element list: constant_unnest_to_values adds
+  // the equivalent kValues node (with WITH OFFSET folded into the counter).
+  Memo memo;
+  const GroupId dummy = memo.EnsureDerivedGroup({}, "dummy_unnest");
+  memo.AddExpression(
+      dummy, LogicalExpression{.operation = LogicalOperator::kDummyScan});
+  const GroupId unnest_group = memo.EnsureDerivedGroup({}, "unnest_grp");
+  memo.AddExpression(
+      unnest_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kUnnest,
+          .children = {dummy},
+          .predicate = ConstantValueExp(Value::Array(
+              {Value(int64_t{9}), Value(int64_t{4}), Value(int64_t{7})},
+              "INT64")),
+          .unnest_alias = "x",
+          .offset_alias = "o"});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(unnest_group);
+
+  const LogicalExpression* folded = nullptr;
+  for (const LogicalExpression& expression :
+       search.GetMemo().Get(unnest_group).expressions) {
+    if (expression.operation == LogicalOperator::kValues) {
+      folded = &expression;
+    }
+  }
+  ASSERT_TRUE(folded != nullptr);
+  ASSERT_EQ(folded->values.size(), 3U);
+  EXPECT_EQ(folded->values[0], Row({Value(9), Value(int64_t{0})}));
+  EXPECT_EQ(folded->values[1], Row({Value(4), Value(int64_t{1})}));
+  EXPECT_EQ(folded->values[2], Row({Value(7), Value(int64_t{2})}));
+  ASSERT_EQ(folded->output_schema.ColumnCount(), 2U);
+  auto lower = [](std::string_view text) {
+    std::string out(text);
+    std::ranges::transform(out, out.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return out;
+  };
+  EXPECT_EQ(lower(folded->output_schema.GetColumn(0).Name().name), "x");
+  EXPECT_EQ(lower(folded->output_schema.GetColumn(1).Name().name), "o");
+  EXPECT_EQ(folded->output_schema.GetColumn(1).Type(), ValueType::kInt64);
+}
+
+TEST(CascadesTest, ConstantUnnestKeepsRuntimeWhenNotFoldable) {
+  // Two refusals: a non-array constant keeps the runtime UNNEST (the
+  // executor produces the UNNEST(scalar) error), and a driving input that is
+  // more than the one-row dummy leaf cannot become a plain Values node.
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId scalar_group = memo.EnsureDerivedGroup({}, "unnest_scalar");
+  memo.AddExpression(
+      scalar_group,
+      LogicalExpression{.operation = LogicalOperator::kUnnest,
+                        .children = {memo.EnsureDerivedGroup({}, "dummy_two")},
+                        .predicate = ConstantValueExp(Value(int64_t{5})),
+                        .unnest_alias = "x"});
+  const GroupId scan_group = memo.EnsureDerivedGroup({"t1"}, "unnest_scan");
+  memo.AddExpression(
+      scan_group,
+      LogicalExpression{.operation = LogicalOperator::kUnnest,
+                        .children = {scan},
+                        .predicate = ConstantValueExp(Value::Array(
+                            {Value(int64_t{9}), Value(int64_t{7})}, "INT64")),
+                        .unnest_alias = "x"});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(scalar_group);
+  search.Explore(scan_group);
+
+  for (const GroupId group : {scalar_group, scan_group}) {
+    for (const LogicalExpression& expression :
+         search.GetMemo().Get(group).expressions) {
+      EXPECT_NE(expression.operation, LogicalOperator::kValues);
+    }
+  }
+}
+
 TEST(CascadesTest, RecursiveTerminationPredicatePushdown) {
   // Production shape: an opaque childless kRecursiveCte leaf with a depth
   // column; a depth-window Selection above it narrows the driver's depth

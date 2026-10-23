@@ -1,5 +1,11 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第54報)。小さい generate series⇒Values(todo.md「UNNEST」節):
+`constant_unnest_to_values` 実装済み。副次変更: GENERATE_SERIES を AST
+`ExecuteFunction` に純実装し detail evaluator を委譲(3 経路要素一致)、
+unnest implementation rule の local_cost を展開係数込みに修正。詳細は
+todo.md 項目の実装契約を参照。
+
 2026-10-23 加筆(第53報)。window下の LIMIT の安全な例外(todo.md「集合・Window・
 UNNEST規則」節): **実装済み**。Cascades 変換規則 `limit_prefix_unordered_window`
 (order 無し window に Limit を差し込む)と `limit_prefix_ordered_window`

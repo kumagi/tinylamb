@@ -946,7 +946,58 @@ TEST_F(ScalarFunctionSqlTest, UnsignedMathAndScalarFunctionsSql) {
   EXPECT_GT(sqrt_v.value.double_value, 4000000000.0);
 }
 
+TEST_F(ScalarFunctionSqlTest, GenerateSeriesSemanticsMatchesRuntime) {
+  // The Executor's detail evaluator delegates generate_series to the
+  // expression layer (ExecuteFunction), so the SQL front end, the plan-layer
+  // constant fold (constant_unnest_to_values) and the runtime unnest all
+  // share one implementation.  Pin the observable contract on the folded
+  // path (constant args) and on the runtime path (correlated args).
+  EXPECT_EQ(
+      RunSql("SELECT value FROM UNNEST(GENERATE_SERIES(1, 5, 2)) value;"),
+      (std::vector<Row>{Row({Value(1)}), Row({Value(3)}), Row({Value(5)})}));
+  EXPECT_EQ(
+      RunSql("SELECT value FROM UNNEST(GENERATE_SERIES(3, 1, -1)) value;"),
+      (std::vector<Row>{Row({Value(3)}), Row({Value(2)}), Row({Value(1)})}));
+  // Two-arg calls keep PostgreSQL's step convention: a descending range
+  // with the implicit +1 step is an empty series (the original detail
+  // evaluator's behavior, preserved by the delegation).
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(5, 1)) x;"),
+            (std::vector<Row>{}));
+  // Reverse direction with the default step is an empty series.
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(1, 5)) x;"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)}),
+                              Row({Value(4)}), Row({Value(5)})}));
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(1, 5, -2)) x;"),
+            (std::vector<Row>{}));
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(1, 0)) x;"),
+            (std::vector<Row>{}));
+  // Double series accumulate by repeated addition (pinned float semantics).
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(0, 1, 0.25)) x;"),
+            (std::vector<Row>{Row({Value(0.0)}), Row({Value(0.25)}),
+                              Row({Value(0.5)}), Row({Value(0.75)}),
+                              Row({Value(1.0)})}));
+  // Integer stepping stays exact past the double-precision boundary.
+  EXPECT_EQ(RunSql("SELECT x FROM UNNEST(GENERATE_SERIES(9007199254740992, "
+                   "9007199254740994, 1)) x;"),
+            (std::vector<Row>{Row({Value(int64_t{9007199254740992})}),
+                              Row({Value(int64_t{9007199254740993})}),
+                              Row({Value(int64_t{9007199254740994})})}));
+  // NULL bounds produce a NULL array: UNNEST yields nothing.
+  EXPECT_EQ(Scalar("SELECT COUNT(*) FROM (SELECT 1), UNNEST(GENERATE_SERIES(1, "
+                   "NULL));"),
+            Value(int64_t{0}));
+  // Errors and arity violations surface as statement errors.
+  EXPECT_TRUE(SqlFails("SELECT value FROM UNNEST(GENERATE_SERIES(1)) x;"));
+  EXPECT_TRUE(
+      SqlFails("SELECT value FROM UNNEST(GENERATE_SERIES(1, 5, 0)) x;"));
+  EXPECT_TRUE(
+      SqlFails("SELECT value FROM UNNEST(GENERATE_SERIES(1, 5, 2, 1)) x;"));
+  EXPECT_TRUE(
+      SqlFails("SELECT value FROM UNNEST(GENERATE_SERIES('a', 'b', 'c')) x;"));
+}
+
 TEST_F(ScalarFunctionSqlTest, BitwiseAndShiftOperatorsConformance) {
+  EXPECT_EQ(Scalar("SELECT ABS(-5)"), Value(int64_t{5}));
   EXPECT_EQ(Scalar("SELECT ~0").value.int_value, -1);
   EXPECT_EQ(Scalar("SELECT ~1").value.int_value, -2);
   EXPECT_EQ(Scalar("SELECT ~(-1)").value.int_value, 0);

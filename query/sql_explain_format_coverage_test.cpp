@@ -162,10 +162,10 @@ TEST_F(SqlExplainFormatCoverageTest, WindowsSetsAndCtes) {
 }
 
 TEST_F(SqlExplainFormatCoverageTest, DerivedUnnestAndLimit) {
-  ExpectExplain(
-      "EXPLAIN SELECT * FROM (SELECT c, SUM(amt) AS s FROM o GROUP BY c) d",
-      {"Scan", "Aggregate"});
-  ExpectExplain("EXPLAIN SELECT * FROM UNNEST([1, 2, 3]) AS x", {"Unnest"});
+  ExpectExplain("EXPLAIN SELECT * FROM (SELECT c, SUM(amt) AS s FROM o GROUP BY c) d",
+                {"Scan", "Aggregate"});
+  // A constant array unnest folds to kValues (constant_unnest_to_values).
+  ExpectExplain("EXPLAIN SELECT * FROM UNNEST([1, 2, 3]) AS x", {"Values"});
   ExpectExplain("EXPLAIN SELECT id FROM o ORDER BY id LIMIT 2 OFFSET 1",
                 {"Sort", "Limit", "Scan"});
 }

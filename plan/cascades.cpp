@@ -61,6 +61,11 @@ namespace {
 // connected-split order built during Memo::Build is the plan.
 constexpr size_t kMaxJoinEnumerationRelations = 16;
 
+// constant_unnest_to_values: elements materialized as memo literals beyond
+// this count keep the runtime unnest path (memo blow-up and plan-cache
+// bloat risk; the executor expands them lazily anyway).
+constexpr size_t kConstantUnnestValuesThreshold = 1024;
+
 bool IdentifierEquals(std::string_view left, std::string_view right) {
   return left.size() == right.size() &&
          std::equal(left.begin(), left.end(), right.begin(),
@@ -7055,6 +7060,134 @@ const RuleSet& RuleSet::Default() {
           }
         },
         LogicalOperator::kSelection));
+
+    // constant_unnest_to_values: A stand-alone UNNEST over a one-row leaf
+    // (the dummy that a FROM-level UNNEST gets when no other source exists)
+    // whose array argument folds to a constant IS the expanded element list,
+    // with each row = [element, offset?].  Fold it into a kValues node.
+    // Refusals keep the executor path: nested-array element layouts,
+    // non-constant shapes the pure evaluator cannot fold, struct/PROTO
+    // widening layouts the rule cannot mirror, driving inputs wider than
+    // the dummy leaf, and beyond-threshold element counts
+    // (kConstantUnnestValuesThreshold).
+    built.Add(Rule(
+        "constant_unnest_to_values", Unnest(Any("input"), "unnest"),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (!expression.predicate) {
+            return;
+          }
+          const Expression& predicate = *expression.predicate;
+          // Only shapes the runtime evaluator treats as deterministic
+          // constants: a literal (possibly folded earlier by constant
+          // folding), an ARRAY literal of constants, or a GENERATE_SERIES
+          // over constants.  A generative builtin like CURRENT_DATE must
+          // not freeze into a plan-cached literal.
+          if (predicate->Type() == TypeTag::kFunctionCallExp) {
+            if (!IdentifierEquals(
+                    "GENERATE_SERIES",
+                    predicate->AsFunctionCallExpression().FuncName())) {
+              return;
+            }
+          } else if (predicate->Type() == TypeTag::kArrayExp) {
+            bool constant_children = true;
+            for (const Expression& child : ExpressionChildren(predicate)) {
+              if (!child || child->Type() != TypeTag::kConstantValue) {
+                constant_children = false;
+                break;
+              }
+            }
+            if (!constant_children) {
+              return;
+            }
+          } else if (predicate->Type() != TypeTag::kConstantValue) {
+            return;
+          }
+          const StatusOr<Value> evaluated =
+              predicate->TryEvaluate(Row(), Schema());
+          if (!evaluated.HasValue() || !evaluated.Value().IsArray()) {
+            return;
+          }
+          const std::vector<Value> elements = evaluated.Value().ArrayElements();
+          if (elements.size() > kConstantUnnestValuesThreshold) {
+            return;
+          }
+          for (const Value& element : elements) {
+            if (element.IsArray()) {
+              return;
+            }
+          }
+          // The fold reproduces the executor's scalar layout (elem column
+          // then the 0-based counter) exactly; a section schema that
+          // disagrees comes from a struct/PROTO element layout.
+          const bool with_offset = !expression.offset_alias.empty();
+          const size_t expected_width = with_offset ? 2U : 1U;
+          const std::string rel_name = expression.unnest_alias.empty()
+                                           ? "unnest"
+                                           : expression.unnest_alias;
+          Schema section = expression.output_schema;
+          if (section.ColumnCount() == expected_width) {
+            for (size_t i = 0; i < section.ColumnCount(); ++i) {
+              if (!IdentifierEquals(section.GetColumn(i).Name().schema,
+                                    rel_name)) {
+                return;
+              }
+            }
+          } else if (section.ColumnCount() != 0) {
+            return;
+          } else {
+            ValueType element_type = ValueType::kNull;
+            for (const Value& element : elements) {
+              if (!element.IsNull()) {
+                element_type = element.type;
+                break;
+              }
+            }
+            std::vector<Column> derived;
+            derived.emplace_back(ColumnName(rel_name, rel_name), element_type);
+            if (with_offset) {
+              derived.emplace_back(
+                  ColumnName(rel_name, expression.offset_alias),
+                  ValueType::kInt64);
+            }
+            section = Schema(rel_name, std::move(derived));
+          }
+          // Only a one-row driving leaf folds to plain Values.  The dummy
+          // group owns the FROM-level route; VALUES leaves never reach the
+          // unnest builder today, so treat anything else as unsupported.
+          bool dummy_leaf = false;
+          if (bindings.at("input") != group &&
+              !memo.Get(bindings.at("input")).expressions.empty()) {
+            dummy_leaf = std::ranges::all_of(
+                memo.Get(bindings.at("input")).expressions,
+                [](const LogicalExpression& leaf) {
+                  return leaf.operation == LogicalOperator::kDummyScan;
+                });
+          }
+          if (!dummy_leaf) {
+            return;
+          }
+          for (const LogicalExpression& existing :
+               memo.Get(group).expressions) {
+            if (existing.operation == LogicalOperator::kValues) {
+              return;
+            }
+          }
+          std::vector<Row> folded;
+          folded.reserve(elements.size());
+          for (size_t index = 0; index < elements.size(); ++index) {
+            folded.emplace_back(
+                with_offset
+                    ? Row({elements[index], Value(static_cast<int64_t>(index))})
+                    : Row({elements[index]}));
+          }
+          LogicalExpression values_expression{};
+          values_expression.operation = LogicalOperator::kValues;
+          values_expression.values = std::move(folded);
+          values_expression.output_schema = std::move(section);
+          memo.AddExpression(group, std::move(values_expression));
+        },
+        LogicalOperator::kUnnest));
 
     // recursive_termination_predicate_pushdown: narrow a recursive CTE's
     // depth window from a Selection directly above it. The opaque leaf

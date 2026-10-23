@@ -3578,7 +3578,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           const double rows = children[0].estimated_rows * 10.0;
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(plan),
-                              .local_cost = children[0].estimated_rows * 1.0,
+                              .local_cost = rows,
                               .estimated_rows = rows}};
         },
         c::LogicalOperator::kUnnest));
