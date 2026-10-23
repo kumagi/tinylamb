@@ -1073,8 +1073,61 @@ Cascades rule / cost / statistics
       回帰: `CascadesTest.ScanFilterOrdersCheapConjunctsBeforeLike`（正規化済み
       スキャンフィルタのテキスト順を固定）。変異（コストクラスを外して
       旧来の ToString 順に戻す）はテストが落ちることを確認。
-- [ ] selection vector / validity bitmapを利用したfilterを実装する。
-- [ ] bytecode / JIT filterの選択経路を接続する。
+- [x] selection vector / validity bitmapを利用したfilterを実装する。
+  - **実装**: `Selection::NextBatch`（`executor/selection.cpp`）は行ループで
+    なくバッチ単位で動く。`DataChunk` の型付き `ColumnVector` + 列ごと
+    `ZoneMap` を 1 次入力とし、Survivor を selection vector に貯めて
+    `AppendGather` で一括コピーする。
+    - **zone-map 最適化**: `BatchMayMatch`（`executor/detail/scan_filter.hpp`）
+      で確実に全行 reject のバッチは評価もせず skip
+      （`SelectionSkipsImpossibleZoneMapBatch`）。
+    - **SIMD + ValidityBitmap**: 述語が「int64/date 列 ⟨比較⟩ 同型定数」
+      （符号なし列/定数を除く、`SimdIntFilter` gate は ctor で構造判定）なら
+      `SimdComparisonKernel::CompareInt64` が raw int64 配列を直接食べて
+      `ValidityBitmap` を填め、`ToSelectionVector` → gather。ビット語末尾
+      (`inputs.size() % 64`) も SelectionVector 側で処理済み
+      （`DataChunkTest.SelectionVectorTest.*`,
+      `SimdComparisonKernelTest.*`）。
+    - **bytecode バッチ**: `BytecodeProgram::TryEvaluateBatch` が bool
+      `ColumnVector` を型付き格納のまま返し、1 行 1 `Value` の boxing 無しで
+      bits を読んで selection vector を組む。NULL は non-pass
+      （`!IsNull(i) && bits[i] != 0`）。
+    - **2 層 conjunct**: 全述語がコンパイル不能なとき（IN over 関数 / LIKE /
+      IS NOT NULL 等が 1 つ混ざる）個別 conjunct のコンパイル可否を判定し、
+      compile 可能なものはバッチ評価・tier 2 は survivor だけ行評価
+      （`EvaluateConjunctsTolerant` で WHERE 可換セマンティクス維持）。
+      compile 済みが 0 なら行のみフォールバック。
+    - カウンタ `rows_seen_ / rows_selected_ / skipped_batches_ / jit_batches_`
+      は EXPLAIN ANALYZE の `SelectionStats` / `ZoneMap blocks_skipped` に出る
+      （EXPLAIN 無しは全カウンタ抑止）。
+  - 変異検証: bytecode バッチ bits 条件を反転 → `Selection*` 2 件 fail、
+    確認済み。
+- [x] bytecode / JIT filterの選択経路を接続する。
+  - **実装**: Selection の compile 経路選択は ctor で確定し、NextBatch の
+    優先順位は zone-map skip → `SimdIntFilter`(SIMD gate) → JIT kernel →
+    全述語 bytecode バッチ → 2 層 conjunct → 行評価フォールバック。
+    - **JIT 発火（選択経路の本体）**:
+      1. ctor: `BytecodeCompiler::Compile(exp, schema, kFilter)` で全体述語の
+         bytecode を作る。`BytecodeEnabled()` が差分テストフック
+         （無効化すれば JIT も無効、`expression/jit_test.cpp`）。
+      2. NextBatch: `jit_attempted_` 未設定で
+         `rows_seen_ >= jit_threshold_rows_`（実行側が与える閾値。短い /
+         断片的なスキャン向けの累積フォールバック）または
+         `rows_seen_ >= kJitEarlyPromotionRows(512K) && 満杯バッチ`
+         （スキャン全体の行数が break-even を超える場合の早期昇格、
+         `docs/jit_profile.md`）で 1 回だけ JIT compile を試みる。
+      3. compile 可否は bytecode 命令列の形で判定
+         （`kLoadColumn / kLoadConstant / kBinaryInt64` の 3 命令、定数 /
+         列が unsigned でないこと——JIT kernel は signed 比較のため）。
+         成立なら `JitInt64Kernels::CompileFilter` が以後のバッチを 0/1
+         バイト列で処理（`AppendBoolBatch` で boxing 無し、`++jit_batches_`）。
+    - compile 不成立なら bytecode バッチ / 行フォールバックへ静かに落ちる。
+      Projection 側の同種昇格は `ProjectionUsesJitForLargeAffineIntegerBatches`。
+  - テスト: `ExecutorTest.Selection*`（基本 / zone-map skip / JIT 発火 /
+    左定数反転 / OR）、`JitTest.CompileFilter_*`、`SelectionVectorTest.*`、
+    `SimdComparisonKernelTest.*`。
+  - 変異検証: JIT 昇格の第一臂（`rows_seen_ >= jit_threshold_rows_`）を外す →
+    `SelectionUsesJitForLargeIntegerBatches` fail。確認済み。
 - [ ] VirtualComputedColumnの遅延評価を実装する。
 - [ ] DictionaryProjectionを実装する。
 - [ ] residual側のConstantFolding境界を整理する。
