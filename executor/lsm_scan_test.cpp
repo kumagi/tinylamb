@@ -135,6 +135,62 @@ TEST_F(LsmScanTest, RuleSelectsThePlanAndEmitsTheSameRows) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
+// Top-N propagation (todo.md Phase 4): the LSM view streams keys in
+// structural order, so a caller whose required properties carry a limit
+// hint and query-ordering expectation may price the lazy prefix read
+// instead of the full walk. The helper's gates live in ApplyLimitHint;
+// this test pins that the hint reaches the lsm_scan rule (through an
+// explicit RuleContext) and that an unrelated ordering gets the full cost.
+TEST_F(LsmScanTest, LimitHintDiscountsTheStructuredOrderedScan) {
+  SeedTree();
+  Memo memo;
+  const GroupId group = memo.EnsureDerivedGroup({}, "lsm");
+  LogicalExpression expression;
+  expression.operation = LogicalOperator::kLsmScan;
+  expression.lsm_tree = tree_.get();
+  expression.lsm_estimated_rows = 4;
+  ASSERT_TRUE(memo.AddExpression(group, expression));
+
+  QueryData context_query;
+  context_query.order_expressions_ = {ColumnValueExp("key")};
+  context_query.order_ascending_ = {true};
+  cascades::RuleContext context;
+  context.query = &context_query;
+
+  PhysicalProperties prefix;
+  prefix.limit_hint = 2;
+  SearchEngine prefixed(std::move(memo), RuleSet::Default());
+  const auto discounted =
+      prefixed.Optimize(group, prefix, DefaultImplementationRules(), context);
+  // The hint caps the prefix read: cost joins the estimated rows at the
+  // prefix size, well under the 4-row full walk.
+  ASSERT_TRUE(discounted.has_value());
+  EXPECT_EQ(discounted->estimated_rows, 2.0);
+  EXPECT_NEAR(discounted->cost, 2.0, 1e-9);
+
+  // Value equality is untouched: the prefix plan still runs to completion
+  // for a caller that keeps draining (the discount only changes pricing).
+  TransactionContext run = db_->BeginContext();
+  const std::vector<Row> rows = Drain(discounted->plan->EmitExecutor(run));
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0], Row({Value("a"), Value("alpha")}));
+  EXPECT_EQ(rows[2], Row({Value("d"), Value("delta")}));
+  ASSERT_SUCCESS(run.PreCommit());
+
+  // The discount is ordering-specific: no query ordering means no prefix
+  // (the planner cannot know the caller would stop early), so the full
+  // walk keeps its cost and row estimate.
+  Memo plain_memo;
+  const GroupId plain_group = plain_memo.EnsureDerivedGroup({}, "lsm");
+  ASSERT_TRUE(plain_memo.AddExpression(plain_group, expression));
+  SearchEngine plain(std::move(plain_memo), RuleSet::Default());
+  const auto undiscounted = plain.Optimize(
+      plain_group, PhysicalProperties{}, DefaultImplementationRules(), context);
+  ASSERT_TRUE(undiscounted.has_value());
+  EXPECT_EQ(undiscounted->cost, 4.0);
+  EXPECT_EQ(undiscounted->estimated_rows, 4.0);
+}
+
 TEST_F(LsmScanTest, EmptyTreeYieldsNoRows) {
   ASSERT_SUCCESS(tree_->Sync());
   LsmScan scan(*tree_);

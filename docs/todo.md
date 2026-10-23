@@ -1347,26 +1347,113 @@ Cascades rule / cost / statistics
 - [x] memory許可量とspill確率、parallel speedupをモデル化する。
 - [x] index clustering factor(correlation)のモデル化は済。
 - [ ] page cache hit率のモデル化。
+  - 判定記録 (2026-10-23, スキップ維持): 2案とも構成物が大きい。(a) cost 側:
+    先行の clustering penalty (RangeClusteringPenalty, 非相関で最大 3x/row) は
+    再訪局所性の近似で既に効いている。上界の精度化 (= ヒット率 modeled な
+    予定ミス数 min(matched, pages)) には ANALYZE が page 数を測る stats 拡張
+    (永続化ラウンドトリップ) と ルール時点の pool capacity (実行時 env
+    `TINYLAMB_PAGE_POOL_BYTES`、コンパイル時には無い) が要る — capacity を
+    cost の定数に焼くと plan cache 再生中の env 変更と契約が衝突する。
+    (b) runtime 側: `PagePool::CacheHits()/CacheMisses()` は実測計器として
+    既に存在 (page/page_pool.hpp)。modeling を見る前にこの計器を
+    EXPLAIN ANALYZE に出す導線 (実行 feedback 節の [x] 項目の延長) が低-cost
+    の第一着手点。着手順: 計器公開 → 分布観測 → capacity 有りモデル。
 - [x] PAX / zone map選択性をcostへ反映する。
-- [ ] Top-N limit hintを全implementation ruleへ伝播する。
+- [x] Top-N limit hintを全implementation ruleへ伝播する。
+  - 実装契約 (limit hint 伝播): `ApplyLimitHint` (plan/implementation_rules.cpp
+    ~505) が全発火点 — index_scan (point / ranging / covering の各 variant)、
+    full_scan (limit pushdown + ordered prefix discount)、
+    late_materialization_join、lsm_scan (今回追加; structural key order なので
+    prefix 読み割引が有利 — `LsmScanTest.LimitHintDiscountsTheStructured
+    OrderedScan`、無効化変異で cost=4 に戻り fail)。
+  - 残る rule は構造上 input-holistic で割引対象外: aggregation / window /
+    hash 族 build 側 (全行要)、sort 家族 (TopN rule `topn` / `sort_incremental`
+    が sorted-prefix の代役)、DISTINCT 家族 (前段で切れない)。NL 族の外側
+    割引は外側子 group の割引済み estimate 経由で流れ込む。全 rule への
+    無差別伝播は非 sound になるため、この集合を持って「伝播済」とする。
 - [x] estimated rowsとactual rowsをEXPLAIN ANALYZEへ出す。
 - [x] interesting orderを全演算子へ伝播する。
 - [x] interesting partitioningを伝播する。
 - [x] sort / merge join / sort agg / hash agg / stream aggのruleを分離する。
 - [x] set-op hash/sort、materialize、spool、window ruleを実装する。
 - [ ] ルール優先度・重み、探索timeout、best-so-farを実装する。
+  - 判定記録 (2026-10-23, 部分実装のためスキップ維持): best-so-far と бюджета
+    相当は既存 — `OptimizerOptions::search_step_budget` (rule 適用上限、0=無制限)
+    + `SearchEngine::Explore` の `budget_exhausted_` / `kMaxExploreSteps` /
+    `kMaxExploreRuleSteps` (`explore_limit_reached_`)。枯渇時は graceful degrade
+    (追加 explored を打ち切り、発見済み alternatives だけで Optimize が最良を
+    返す = best-so-far)。未実装: (a) rule 優先度/重み付け (現在は set 順; 統計
+    hint `TINYLAMB_RULE_STATS` の計時が priority の材料になる), (b) 壁時計
+    timeout (step ベースのみ)。着手点: rule_stats_ 計時の workloadprofilへの
+    昇華 (1269) と重み入り MayApply 段階の導入から。
 - [ ] join order freeze等のquery hintを実装する。
+  - 判定記録 (2026-10-23, スキップ維持): SQL 表面 (comment hint / SET variable /
+    統計 hint) が現状どれも未導入で、optimizer options (`OptimizerOptions`) は
+    全文共通。freeze は join order の search front を固定するだけで、
+    memo 単系 (`join_on_false_to_empty` 等が同じ group を書く) との相互作用で
+    derived-group タグ契約を壊しやすいため、先に hint の解決位置 (statement
+    normalizer → OptimizerOptions の per-query 拡張) を設計する必要。
+    着手点: `--with_hint` 類を statement AST field に付けて OptimizerOptions
+    へ折り込むパスを先に切る。
 - [ ] workload別rule profileを実装する。
+  - 判定記録 (2026-10-23, スキップ維持): 注入点は既に `OptimizerOptions`
+    (relational_rules / expression_rules / search_step_budget) に揃っており、
+    profile はそこに contract table を追加する薄い層 — ただし「workload 分類」
+    (DDL/OLTP scan/analytical) の健全な各测试の fingerprint と、profile 間の
+    等価 (plan 結果不変) を型付けする回帰面が必要。`TINYLAMB_RULE_STATS`
+    (計時) が材料になる (1267)。着手点: profile enum → rule set 差分表 +
+    `sql_engine_coverage_test` 系の全 profile 等価テスト。
 - [ ] group表現上限を適応制御する。
-- [ ] plan cacheのparameter sniffing対策を実装する。
-- [ ] generic planとcustom planの選択を実装する。
+  - 判定記録 (2026-10-23, スキップ維持): 既存は全体 budget (`search_step_budget`
+    + hard caps, group cursor で settle 実装済み) で、per-group の適応 cap は無い。
+    per-group cap は「bookmark」alternatives の早期打ち切り (例: group に
+    property-satisfying candidate が 1 つ出来たらたまっている logical 展開を
+    停める) を意図するが、memo の追加合成可能な
+    derived-group タグと収束を壊さず打ち切る条件の安全性検証が難しい。
+    着手点: `memo_.DrainTouchedGroups` の直後に per-group expression 数の
+    換え条件 (property 達成かつ上限超) を入れて budget 系と同じ graceful
+    degrade 契約を踏襲。
+- [x] plan cacheのparameter sniffing対策を実装する。
+  - 実装契約 (compile-time plan cache, phase 2-1): `query/plan_cache.hpp` /
+    `query/sql_engine.cpp`。SELECT 再実行は `TimedSelectReuse` が計る
+    (初回完了 = baseline。それを 50ms 超かつ 8 倍以上遅くなった一度目の完成で
+    thread-local plan を廃棄し、次回は再plan)。ParameterSlot を保持できない
+    形状は identical-parameter 再生に落ちて permanent retirement しない。
+    テスト: `SelectReuseThresholdTest.RetiresOnlyExtremeRegressions`、
+    `ParameterSlotTest.BindUpdatesSniffedValue` 系 (query/plan_cache_unit_test.cpp)。
+- [x] generic planとcustom planの選択を実装する。
+  - 実装契約 (achieved differently): PG流の「実行ごとに generic/custom を
+    選ぶ」の代わりに単一 parametric artifact が両面を担う。bindable literal を
+    ParameterSlot 化した形状は受信値を注入する generic 再生
+    (plan_cache.hpp header 契約) に入り、slot 化できない形状は identical-parameter
+    再生 (custom 相当) に落ちる。実行時タイミング閾値 (50ms かつ 8x) が
+    generic underperformance を検知して再plan するので、実効的に選択の役を
+    果たす。`SelectReuseThresholdTest.RetiresOnlyExtremeRegressions` が契約を
+    固定。Phase 6 の「prepared statementのgeneric/custom経路を完成させる」は
+    プロトコル側の別項目 ([ ] 維持)。
 - [ ] DOP、batch size、morsel sizeをcost化する。
+  - 判定記録 (2026-10-23, スキップ維持): 並列形状は memo implementation rule では
+    なく関係実行 lane (`executor/relational_factory.cpp` の
+    ParallelAggregationExecutor 等に固定 DOP heuristic) で結ばれているため、
+    cost 材料になる DOP/batch/morsel の参数が rule 时点に存在しない。
+    PhysicalProperties は Distribution (kAny/kSingleNode) だけ。
+    着手点: PhysicalProperties に DOP/batch の要求面を足し、
+    implementation rule に並列 variants (現 relational lane 側の形状を
+    mirroring) を生やすのが順序。
 
 ---
 
 ## Phase 5 — ベクトル化、memory、並列・分散
 
 - [ ] 全operatorのDataChunk入出力を統一する。
+  - 判定記録 (2026-10-23, 全面再設計系スキップ; 1131/1155 判定と同族): 現行の
+    executor 契約は Row ストリーム + DataChunk バッチの併存
+    (`executor/data_chunk.*` は selection vector 経路で到達済み)。全面統一は
+    operator 全般の write し直しで、実行パイプ側の on-demand については既存
+    (`push_selection_through_projection` / `fallback_select` /
+    `topn_push_through_projection`) が実効面を担う。着手点: DataChunk 契約の
+    正本仕様 (ownership・lifecycle・selection vector 不変量) を
+    `docs/` に切り出してから operator 単位で段階移行。
 - [x] selection vector / validity bitmapを全operatorへ適用する。
 - [x] late materializationの列batchを実装する。
 - [x] PipelineBreakerをHash build / Sort / Materializeへ明示する。
@@ -1386,6 +1473,15 @@ Cascades rule / cost / statistics
       `executor/grouped_aggregate_test.cpp` の
       `APartitionedHashBuildHoldsOnePartitionsGroups` がその現状を固定。）
 - [ ] statement timeoutのcancelを全operatorへ伝播する。
+  - 判定記録 (2026-10-23, スキップ維持): 文単位の deadline 表面が現状無い
+    (transaction には write-intent wait limit があり、server 層は idle sweep
+    のみで statement deadline は無い)。実装に必要なのは `ExecutorBase::Next`
+    を通る全 operator での deadline/abort チェック (morsel 辺) と、
+    transaction の『失敗に落とす』経路 —
+    `executor/relational.cpp` の stream すべてに横断するので、
+    DataChunk 化 (todo 全 operator DataChunk 入出力) との相性で設計しないと
+    2 度手間。着手点: `Row` ストリーム近くに cancellation token を置く大枠を
+    先に切る。
 - [x] memory不足時のgraceful degradeを実装する。
 - [x] distributed any / singleton / hash / broadcast / rangeを実装する。
 - [ ] enforce distribution、colocated join、broadcast vs shuffle costを実装する。

@@ -3,7 +3,8 @@
 2026-10-23 加筆(第57報)。NOT NULL COUNT(*) rewrite + DDL NOT NULL 配線
 (todo.md「集約」節 1234): GoogleSQL DDL の `NOT NULL` がパーサーでは出力されて
 いたが訪問者で黙って捨てられ、列制約スロットが常に空だったため
-`Table::CheckRowConstraints` の NULL 拒否が到達不能だった。`NotNullColumnAttribute`
+`Table::CheckRowConstraints` の NULL 拒否が到達不能だった。
+`NotNullColumnAttribute`
 を列スロット (PK が占める場合は PK 優先) へ展開し、INSERT/UPDATE 両方の
 NULL 挿入が拒否されるようになった。その上でプランナー `RewriteNotNullCounts`:
 kCount(!distinct・裸列・単一relation) で引数が kNotNull/kPrimaryKey なら
@@ -12,6 +13,17 @@ EXPLAIN で `Projection: []` に観測)。SUM の空入力 NULL と COUNT 空入
 違いはテスト固定。DDL NOT NULL 無視が NULL 挿入を許していた逸脱はこれで
 解消 (differential fuzz は NULL 制約列を生成していない — 制約スロットの
 セマンティクスは従来コードが kPrimaryKey で同じ強制を既に持っていた)。
+
+同日 同報。Top-N limit hint を lsm_scan 実装規則へ伝播 (todo Phase 4
+「Top-N limit hintを全implementation ruleへ伝播する」を [x] 化)。LSM view は
+structural 順序主張を持つので、`ApplyLimitHint` の既存ゲート (required
+ordering 照合・measured order 除外) を通って prefix 割引が効く。
+`LsmScanTest.LimitHintDiscountsTheStructuredOrderedScan` (無効化変異済み)。
+残り rule は input-holistic / 別系統 (topn ・子 estimate 流入) で非 sound と
+todo に記載。docs 側判定記録: 1231 partial/final (実行系既存、plan level は
+分布待ち)、1240 approx (APPROX 表面なし)、1241 FD (stats に FD マップなし)、
+1259 page cache hit (実行計器はある、cost 側は capacity 問題)、1267-1270、
+1273、1298、DataChunk 統一、1271/1272 plan cache (実装済みの [x] 化 + 契約文)。
 
 2026-10-23 加筆(第56報)。aggregate↔filter transpose / HAVING residual 分化
 (todo.md「集約」節): 単一表 GROUP BY の既定ルート(relational)に対して

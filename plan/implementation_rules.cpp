@@ -3547,18 +3547,26 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         "lsm_scan", c::dsl::LsmScan(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children, const PhysicalProperties&,
-           const c::RuleContext&) {
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext& context) {
           if (!children.empty() || logical.lsm_tree == nullptr) {
             return std::vector<PlanAlternative>{};
           }
           Plan plan = std::make_shared<LsmScanPlan>(*logical.lsm_tree,
                                                     logical.lsm_estimated_rows);
           const auto rows = static_cast<double>(logical.lsm_estimated_rows);
+          // The view streams keys in structural order, so a Top-N caller
+          // reading the required ordering gets the lazy prefix read like any
+          // other ordered scan (the hint helper gates on the plan actually
+          // delivering the query's order expressions).
+          double local_cost = rows;
+          double estimated_rows = rows;
+          ApplyLimitHint(plan, required, context, 1.0, &local_cost,
+                         &estimated_rows);
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(plan),
-                              .local_cost = rows,
-                              .estimated_rows = rows}};
+                              .local_cost = local_cost,
+                              .estimated_rows = estimated_rows}};
         },
         c::LogicalOperator::kLsmScan));
     built.Add(c::ImplementationRule(
