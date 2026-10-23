@@ -2926,6 +2926,174 @@ void EnumerateJoinGroup(Memo& memo, GroupId group,
   }
 }
 
+// The safe exception for Limit under Window (todo: window下のLIMITの
+// 安全な例外).  A window emits its rows in child order (the evaluator appends
+// computed values per original index), so Limit(k) over a window keeps
+// exactly the first k child rows.  Moving the limit below the window keeps
+// those same rows but computes their values over truncated partitions; the
+// values survive that when every value-determining row of a survivor sits at
+// or before it in partition order (backward-only frames, prefix-counting
+// ranking calls) AND truncation can only remove later rows (the child emits
+// rows in partition order).  The helpers below encode each half.
+
+// Length-prefixed ordering signature of one window call (raw separators
+// collide when a key's own text contains them, mirroring the window-layer
+// grouping in optimizer.cpp).
+std::string WindowSpecSignature(const WindowFunctionCallExpression& call) {
+  std::string signature = std::to_string(call.partition_by.size()) + ":";
+  for (const Expression& key : call.partition_by) {
+    const std::string text = key ? key->ToString() : std::string("<null>");
+    signature += std::to_string(text.size()) + "/" + text + ";";
+  }
+  signature += std::to_string(call.order_by.size()) + ":";
+  for (const WindowOrderTerm& term : call.order_by) {
+    const std::string text =
+        term.expression ? term.expression->ToString() : std::string("<null>");
+    signature += std::to_string(text.size()) + "/" + text + "/a";
+    signature += term.ascending ? "1" : "0";
+    signature += "/n";
+    signature += !term.nulls_first.has_value()
+                     ? "d"
+                     : (term.nulls_first.value() ? "1" : "0");
+    signature += ";";
+  }
+  return signature;
+}
+
+// Does this call keep producing the same value for a row after some of its
+// partition's later rows were truncated away?
+bool WindowValueStableUnderTruncation(
+    const WindowFunctionCallExpression& call) {
+  // Ranking values are prefix counts in partition order: ROW_NUMBER numbers
+  // the rows 1..m, RANK counts strictly smaller keys (+1), DENSE_RANK counts
+  // key groups.  Removing a row strictly after a survivor in partition order
+  // cannot change any of them for rows the truncation keeps.
+  if (call.function == "ROW_NUMBER" || call.function == "RANK" ||
+      call.function == "DENSE_RANK") {
+    return true;
+  }
+  // Every other call needs an explicit ROWS frame that starts and ends at or
+  // before the current row: both bounds then read rows the survivor keeps.
+  // The default frame (RANGE ... CURRENT ROW, peer-inclusive, or the whole
+  // partition when there are no order keys), RANGE/GROUPS frames, calls that
+  // need the partition size (NTILE, PERCENT_RANK, CUME_DIST) and forward
+  // peering calls (LEAD) change value under truncation and stay excluded.
+  if (!call.has_frame || call.frame_unit != WindowFrameUnit::kRows) {
+    return false;
+  }
+  const auto reads_backward = [](WindowFrameBoundType type) {
+    return type == WindowFrameBoundType::kUnboundedPreceding ||
+           type == WindowFrameBoundType::kOffsetPreceding ||
+           type == WindowFrameBoundType::kCurrentRow;
+  };
+  return reads_backward(call.frame_start.type) &&
+         reads_backward(call.frame_end.type);
+}
+
+// Gate for the two limit-prefix window rules.  Returns nullopt when the
+// window node cannot take the transform at all (non-call targets or calls
+// with mixed specs); otherwise the shared spec, the shared order-term count
+// (one call's count decides all of them) and whether all calls keep their
+// values under truncation.
+struct WindowPrefixGateResult {
+  std::string spec;
+  size_t order_terms{0};
+  bool stable{true};
+};
+std::optional<WindowPrefixGateResult> WindowPrefixGate(
+    const LogicalExpression& window) {
+  if (window.children.size() != 1 || window.target_list.empty()) {
+    return std::nullopt;
+  }
+  WindowPrefixGateResult gate;
+  for (const NamedExpression& target : window.target_list) {
+    if (!target.expression ||
+        target.expression->Type() != TypeTag::kWindowFunctionExp) {
+      return std::nullopt;
+    }
+    const auto& call = target.expression->AsWindowFunctionCallExpression();
+    const std::string spec = WindowSpecSignature(call);
+    if (gate.spec.empty()) {
+      gate.spec = spec;
+      gate.order_terms = call.order_by.size();
+    } else if (gate.spec != spec) {
+      return std::nullopt;
+    }
+    if (!WindowValueStableUnderTruncation(call)) {
+      gate.stable = false;
+    }
+  }
+  return gate;
+}
+
+// Any window reachable below the window's child group: the transform only
+// cuts rows between the bound window and its child, so a deeper window
+// feeding this one would see a truncated input without having the same
+// proof made for it — refuse (the gate can learn to recurse later).
+bool ReachableChildHasWindow(const Memo& memo, GroupId start) {
+  std::vector<char> seen(memo.GroupCount(), 0);
+  std::vector<GroupId> pending{start};
+  while (!pending.empty()) {
+    const GroupId next = pending.back();
+    pending.pop_back();
+    if (static_cast<size_t>(next) >= seen.size() || seen[next]) {
+      continue;
+    }
+    seen[next] = 1;
+    for (const LogicalExpression& expression : memo.Get(next).expressions) {
+      if (expression.operation == LogicalOperator::kWindow) {
+        return true;
+      }
+      pending.insert(pending.end(), expression.children.begin(),
+                     expression.children.end());
+    }
+  }
+  return false;
+}
+
+// Does a sort node implement exactly the window spec's emitted order (the
+// partition keys as a contiguous prefix — grouping only needs contiguity,
+// so their sort flags are free — followed by the order terms with their
+// exact ascending and NULLS placement)?
+bool SortDeliversWindowSpec(const LogicalExpression& sort,
+                            const WindowFunctionCallExpression& call) {
+  if (sort.target_list.size() != sort.sort_ascending.size() ||
+      sort.target_list.size() !=
+          call.partition_by.size() + call.order_by.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < call.partition_by.size(); ++i) {
+    const Expression& part = call.partition_by[i];
+    const std::string text = part ? part->ToString() : std::string("<null>");
+    if (!sort.target_list[i].expression ||
+        sort.target_list[i].expression->ToString() != text) {
+      return false;
+    }
+  }
+  for (size_t j = 0; j < call.order_by.size(); ++j) {
+    const WindowOrderTerm& term = call.order_by[j];
+    const size_t index = call.partition_by.size() + j;
+    if (!term.expression || !sort.target_list[index].expression ||
+        term.expression->ToString() !=
+            sort.target_list[index].expression->ToString() ||
+        term.ascending != sort.sort_ascending[index]) {
+      return false;
+    }
+    // Engine default NULLS placement: NULLS FIRST on ascending, LAST on
+    // descending; SortExecutor resolves an absent flag with the same rule
+    // (sort.cpp: nulls_first = value_or(ascending)), so compare the
+    // resolved values.
+    const std::optional<bool> null_flag = index < sort.sort_nulls_first.size()
+                                              ? sort.sort_nulls_first[index]
+                                              : std::nullopt;
+    if (term.nulls_first.value_or(term.ascending) !=
+        null_flag.value_or(sort.sort_ascending[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 const RuleSet& RuleSet::Default() {
@@ -4517,6 +4685,187 @@ const RuleSet& RuleSet::Default() {
                                   .with_ties = expression.with_ties,
                                   .output_schema = sort.output_schema});
             return;
+          }
+        },
+        LogicalOperator::kLimit));
+
+    // limit_prefix_{unordered,ordered}_window: the safe exception for
+    // pushing a Limit below a Window, which the general push cannot do
+    // (push_limit_through_window - a window is row-preserving, so a
+    // truncated input changes partition-relative computations).
+    //
+    // The engine's window emits rows in child order and scatters per-row
+    // values back to their original positions, and a Limit truncates the
+    // emitted stream at a fixed prefix.  So Window(Limit(X)) keeps exactly
+    // the rows Limit(Window(X)) emits, and every surviving row's value is
+    // unchanged when (a) the window call reads only rows at or before the
+    // survivor in partition order (ranking calls; explicit ROWS frames
+    // bounded by CURRENT ROW) and (b) the truncated suffix cannot hold a
+    // row that earlier in partition order either by having no order keys at
+    // all (partition order IS input order) or by a child sort that
+    // implements the spec exactly, fused into a TopN.  WITH TIES keeps peers
+    // of the boundary row and is refused; OFFSET is a wider prefix cut and
+    // is allowed.  A nested window layer under the transformed one is
+    // refused (its stability would need the same gate recursively).
+    built.Add(Rule(
+        "limit_prefix_unordered_window", Limit(Window(Any("input"), "window")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.with_ties || expression.limit_count == 0) {
+            return;
+          }
+          const GroupId window_group_id = bindings.at("window");
+          if (window_group_id == group ||
+              memo.Get(window_group_id).tag.rfind("window-prefix-window:", 0) ==
+                  0) {
+            return;
+          }
+          for (const LogicalExpression& window :
+               memo.Get(window_group_id).expressions) {
+            if (window.operation != LogicalOperator::kWindow ||
+                window.children.size() != 1 || window.children[0] == group) {
+              continue;
+            }
+            const GroupId input_id = window.children[0];
+            const auto gate = WindowPrefixGate(window);
+            if (!gate.has_value() || !gate->stable || gate->order_terms != 0 ||
+                memo.Get(input_id).tag.rfind("window-prefix-limit:", 0) == 0 ||
+                ReachableChildHasWindow(memo, input_id)) {
+              continue;
+            }
+            const std::string signature =
+                gate->spec + std::to_string(expression.limit_count) + ":" +
+                std::to_string(expression.limit_offset);
+            const GroupId limited =
+                memo.EnsureDerivedGroup(memo.Get(input_id).relations,
+                                        "window-prefix-limit:" + signature);
+            if (limited == group || limited == input_id) {
+              continue;
+            }
+            memo.AddExpression(
+                limited,
+                LogicalExpression{.operation = LogicalOperator::kLimit,
+                                  .children = {input_id},
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = expression.limit_offset});
+            const GroupId windowed =
+                memo.EnsureDerivedGroup(memo.Get(input_id).relations,
+                                        "window-prefix-window:" + signature);
+            if (windowed == group) {
+              continue;
+            }
+            memo.AddExpression(
+                windowed,
+                LogicalExpression{.operation = LogicalOperator::kWindow,
+                                  .children = {limited},
+                                  .target_list = window.target_list,
+                                  .output_schema = window.output_schema,
+                                  .partition_by = window.partition_by});
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kLimit,
+                                  .children = {windowed},
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = expression.limit_offset});
+          }
+        },
+        LogicalOperator::kLimit));
+
+    built.Add(Rule(
+        "limit_prefix_ordered_window",
+        Limit(Window(Sort(Any(), "sort"), "window")),
+        [](const Bindings& bindings, Memo& memo, GroupId group,
+           const LogicalExpression& expression) {
+          if (expression.with_ties || expression.limit_count == 0) {
+            return;
+          }
+          const GroupId sort_group_id = bindings.at("sort");
+          if (sort_group_id == group ||
+              memo.Get(sort_group_id).tag.rfind("window-prefix-limit:", 0) ==
+                  0) {
+            return;
+          }
+          const GroupId window_group_id = bindings.at("window");
+          if (window_group_id == group ||
+              memo.Get(window_group_id).tag.rfind("window-prefix-window:", 0) ==
+                  0) {
+            return;
+          }
+          for (const LogicalExpression& window :
+               memo.Get(window_group_id).expressions) {
+            if (window.operation != LogicalOperator::kWindow ||
+                window.children.size() != 1 ||
+                window.children[0] != sort_group_id) {
+              continue;
+            }
+            const auto gate = WindowPrefixGate(window);
+            if (!gate.has_value() || !gate->stable || gate->order_terms == 0 ||
+                ReachableChildHasWindow(memo, sort_group_id)) {
+              continue;
+            }
+            const WindowFunctionCallExpression* reference = nullptr;
+            for (const NamedExpression& target : window.target_list) {
+              if (target.expression) {
+                reference =
+                    &target.expression->AsWindowFunctionCallExpression();
+                break;
+              }
+            }
+            if (reference == nullptr) {
+              continue;
+            }
+            const LogicalExpression* sort_node = nullptr;
+            for (const LogicalExpression& sort :
+                 memo.Get(sort_group_id).expressions) {
+              if (sort.operation == LogicalOperator::kSort &&
+                  sort.children.size() == 1 && sort.children[0] != group &&
+                  SortDeliversWindowSpec(sort, *reference)) {
+                sort_node = &sort;
+                break;
+              }
+            }
+            if (sort_node == nullptr) {
+              continue;
+            }
+            const std::string signature =
+                gate->spec + std::to_string(expression.limit_count) + ":" +
+                std::to_string(expression.limit_offset);
+            const GroupId limited =
+                memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,
+                                        "window-prefix-limit:" + signature);
+            if (limited == group || limited == window_group_id ||
+                limited == sort_group_id) {
+              continue;
+            }
+            memo.AddExpression(
+                limited, LogicalExpression{
+                             .operation = LogicalOperator::kTopN,
+                             .children = sort_node->children,
+                             .target_list = sort_node->target_list,
+                             .sort_ascending = sort_node->sort_ascending,
+                             .sort_nulls_first = sort_node->sort_nulls_first,
+                             .limit_count = expression.limit_count,
+                             .limit_offset = expression.limit_offset,
+                             .with_ties = false});
+            const GroupId windowed =
+                memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,
+                                        "window-prefix-window:" + signature);
+            if (windowed == group) {
+              continue;
+            }
+            memo.AddExpression(
+                windowed,
+                LogicalExpression{.operation = LogicalOperator::kWindow,
+                                  .children = {limited},
+                                  .target_list = window.target_list,
+                                  .output_schema = window.output_schema,
+                                  .partition_by = window.partition_by});
+            memo.AddExpression(
+                group,
+                LogicalExpression{.operation = LogicalOperator::kLimit,
+                                  .children = {windowed},
+                                  .limit_count = expression.limit_count,
+                                  .limit_offset = expression.limit_offset});
           }
         },
         LogicalOperator::kLimit));

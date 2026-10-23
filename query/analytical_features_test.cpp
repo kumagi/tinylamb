@@ -216,6 +216,61 @@ TEST_F(AnalyticalFeaturesTest, LimitDoesNotTruncatePartitionWideWindows) {
   EXPECT_EQ(plain.size(), 2U);
 }
 
+TEST_F(AnalyticalFeaturesTest, LimitStaysOutsidePartitionWideDefaultFrame) {
+  // The whole-partition default frame reads rows the limit truncates away,
+  // so its values must stay computed over the full input (pins the default
+  // frame half of the limit-prefix window gate; if the gate dropped this
+  // case, the first row's SUM would shrink to the truncated partition).
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE wide (id INT64, g INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO wide VALUES (1, 1), (2, 1);");
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT id, SUM(id) OVER (PARTITION BY g) AS s FROM wide LIMIT 1;");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value(3));  // whole partition: 1 + 2
+}
+
+TEST_F(AnalyticalFeaturesTest, UnorderedWindowKeepsRanksUnderLimit) {
+  // Emit order (scan) disagrees with partition order (ORDER BY v): the
+  // surviving rows' ROW_NUMBER values must come from the full partition
+  // (pins the has-order-keys half of the gate; a limit pushed into the
+  // window over the unsorted scan would shift the first row's rank 3 -> 2).
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE shifts (id INT64, v INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO shifts VALUES (1, 9), (2, 1), (3, 5);");
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM shifts LIMIT 2;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value(3));  // v=9 sorts third in the full partition
+  EXPECT_EQ(rows[1][0], Value(2));
+  EXPECT_EQ(rows[1][1], Value(1));
+}
+
+TEST_F(AnalyticalFeaturesTest, RunningWindowSurvivesLimitWithRowsFrame) {
+  // ROWS UNBOUNDED PRECEDING .. CURRENT ROW is backward-only, the exact
+  // shape the limit-prefix exception covers: pushing the limit below the
+  // window must keep the running sums of the emitted rows.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE running (id INT64, v INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO running VALUES (1, 10), (2, 20), (3, 30);");
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT id, SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+      "AND CURRENT ROW) AS s FROM running LIMIT 2;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(1));
+  EXPECT_EQ(rows[0][1], Value(10));
+  EXPECT_EQ(rows[1][0], Value(2));
+  EXPECT_EQ(rows[1][1], Value(30));
+}
+
 TEST_F(AnalyticalFeaturesTest, QualifyFiltersGroupedAggregates) {
   // SUM(amt): 'a' sums to 30, 'b' to 70.
   const auto sum_filtered =

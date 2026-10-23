@@ -641,6 +641,13 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `push_limit_through_window`（適用不能として確定。Window は行保存演算子の
       ため LIMIT の押し下げは一般に非等価。no-op window は
       `no_op_window_elimination` で先に除去される）
+  → 2026-10-23 補遺: 一般 push は非等価だが**安全な例外**を 2 規則として実装
+  （todo.md「window下のLIMITの安全な例外」節参照）:
+  `limit_prefix_unordered_window`（order 無し window + emit 順安定 call のみ
+  Limit を子へ差し込み）と `limit_prefix_ordered_window`（子 Sort が window
+  spec を完璧に届ける場合のみ TopN 畳み込み）。ゲート
+  `WindowPrefixGate` = 値の安定性（ranking 白名単 or 後方 ROWS frame）×
+  emit 順＝partition 順 × window 被り無し × with_ties 拒否。
 - [x] `window_to_aggregate`（適用不能として確定。全フレーム集計への置換は行複製
       を伴わないと非等価（Window N 行 vs 集約 1 行）のため、単純置換の余地なし。
       一時集約＋cross 結合の形は将来の decorrelation 枠）

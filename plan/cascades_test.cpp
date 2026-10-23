@@ -2693,6 +2693,378 @@ TEST(CascadesTest, NoOpWindowElimination) {
   EXPECT_TRUE(found_proj);
 }
 
+namespace {
+std::shared_ptr<WindowFunctionCallExpression> PrefixWindowCall(
+    std::string function, std::vector<Expression> args,
+    std::vector<Expression> partition_by = {},
+    std::vector<WindowOrderTerm> order_by = {}, bool has_frame = false) {
+  auto call = std::make_shared<WindowFunctionCallExpression>();
+  call->function = std::move(function);
+  call->args = std::move(args);
+  call->partition_by = std::move(partition_by);
+  call->order_by = std::move(order_by);
+  call->has_frame = has_frame;
+  if (has_frame) {
+    call->frame_unit = WindowFrameUnit::kRows;
+    call->frame_start.type = WindowFrameBoundType::kUnboundedPreceding;
+    call->frame_end.type = WindowFrameBoundType::kCurrentRow;
+  }
+  return call;
+}
+
+// True when some kWindow node in the memo has a child group holding a
+// Limit/TopN over the window's input (the limit-prefix shape).  The
+// negative tests assert this stays absent.
+bool AnyWindowHasLimitedChild(const Memo& memo) {
+  for (size_t id = 0; id < memo.GroupCount(); ++id) {
+    for (const LogicalExpression& window : memo.Get(GroupId(id)).expressions) {
+      if (window.operation != LogicalOperator::kWindow ||
+          window.children.size() != 1) {
+        continue;
+      }
+      for (const LogicalExpression& child :
+           memo.Get(window.children[0]).expressions) {
+        if (child.operation == LogicalOperator::kLimit ||
+            child.operation == LogicalOperator::kTopN) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool GroupHasLimitWithDifferentChild(const Memo& memo, GroupId limit_group,
+                                     GroupId original_child) {
+  for (const LogicalExpression& limit : memo.Get(limit_group).expressions) {
+    if (limit.operation != LogicalOperator::kLimit ||
+        limit.children.size() != 1 || limit.children[0] == original_child) {
+      continue;
+    }
+    for (const LogicalExpression& window :
+         memo.Get(limit.children[0]).expressions) {
+      if (window.operation == LogicalOperator::kWindow &&
+          window.children.size() == 1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+}  // namespace
+
+TEST(CascadesTest, LimitPrefixThroughUnorderedWindowFires) {
+  Memo memo;
+  // A values leaf stands in for the base relation: window-row estimates then
+  // dominate the cost comparison without a catalog-backed scan. Build only
+  // registers the relation in the join graph.
+  (void)memo.Build({"t1"});
+  std::vector<Row> wide_rows;
+  for (int64_t i = 1; i <= 1000; ++i) {
+    wide_rows.push_back(Row({Value(i), Value(int64_t{i % 5})}));
+  }
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  memo.AddExpression(
+      scan, LogicalExpression{.operation = LogicalOperator::kValues,
+                              .values = std::move(wide_rows),
+                              .output_schema = Schema(
+                                  "t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)})});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {scan},
+          .target_list = {NamedExpression(
+              "rn", Expression(PrefixWindowCall("ROW_NUMBER", {},
+                                                {ColumnValueExp("t1.part")})))},
+          .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)}),
+          .partition_by = {ColumnValueExp("t1.part")}});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3,
+                                       .limit_offset = 2});
+
+  RuleSet rules;
+  for (const auto& rule : RuleSet::Default().Rules()) {
+    if (rule.Name() == "limit_prefix_unordered_window") {
+      rules.Add(rule);
+    }
+  }
+  SearchEngine search(std::move(memo), rules);
+  search.Explore(limit_group);
+
+  const auto& all = search.GetMemo();
+  EXPECT_TRUE(GroupHasLimitWithDifferentChild(all, limit_group, win_group));
+  EXPECT_TRUE(AnyWindowHasLimitedChild(all));
+
+  // And costing must prefer the transformed shape once the base relation is
+  // non-trivial: the window only materializes the kept prefix. The rendered
+  // tree nests the window BETWEEN two limits; the untransformed shape keeps
+  // the window above the single limit.
+  SearchEngine costing(all, RuleSet());
+  const std::optional<BestPlan> best = costing.Optimize(
+      limit_group, PhysicalProperties{}, DefaultImplementationRules());
+  ASSERT_TRUE(best.has_value());
+  ASSERT_TRUE(best->plan);
+  std::ostringstream rendered;
+  rendered << best->plan;
+  const std::string tree = rendered.str();
+  const size_t window_at = tree.find("Window");
+  ASSERT_NE(window_at, std::string::npos);
+  EXPECT_NE(tree.find("Limit:", window_at + 1), std::string::npos);
+}
+
+TEST(CascadesTest, LimitPrefixThroughOrderedWindowFusesTopN) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId sort_group = memo.EnsureDerivedGroup({"t1"}, "sort_below");
+  memo.AddExpression(
+      sort_group,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {scan},
+                        .target_list = {NamedExpression(
+                            "", ColumnValueExp(ColumnName("t1", "id")))},
+                        .sort_ascending = {true}});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {sort_group},
+          .target_list = {NamedExpression(
+              "run", Expression(PrefixWindowCall(
+                         "SUM", {ColumnValueExp("t1.val")}, {},
+                         {{.expression = ColumnValueExp(ColumnName("t1", "id")),
+                           .ascending = true}},
+                         true)))},
+          .output_schema = Schema("t1", {Column("id", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)})});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3});
+
+  RuleSet rules;
+  for (const auto& rule : RuleSet::Default().Rules()) {
+    if (rule.Name() == "limit_prefix_ordered_window") {
+      rules.Add(rule);
+    }
+  }
+  SearchEngine search(std::move(memo), rules);
+  search.Explore(limit_group);
+
+  ASSERT_TRUE(AnyWindowHasLimitedChild(search.GetMemo()));
+  // Sharpen it: some kWindow's child group holds the fused TopN with the
+  // original limit count.
+  bool found_fused_topn = false;
+  const Memo& after = search.GetMemo();
+  for (size_t id = 0; id < after.GroupCount(); ++id) {
+    for (const LogicalExpression& window : after.Get(GroupId(id)).expressions) {
+      if (window.operation != LogicalOperator::kWindow ||
+          window.children.size() != 1) {
+        continue;
+      }
+      for (const LogicalExpression& limited :
+           after.Get(window.children[0]).expressions) {
+        if (limited.operation == LogicalOperator::kTopN &&
+            limited.limit_count == 3) {
+          found_fused_topn = true;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(found_fused_topn);
+}
+
+TEST(CascadesTest, DefaultFrameWindowKeepsLimitAbove) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {scan},
+          .target_list = {NamedExpression(
+              "wide",
+              Expression(PrefixWindowCall("SUM", {ColumnValueExp("t1.val")},
+                                          {ColumnValueExp("t1.part")})))},
+          .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)}),
+          .partition_by = {ColumnValueExp("t1.part")}});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+
+  // The default frame spans the whole partition, so truncating the input
+  // would change every value: the exception must not fire.
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
+TEST(CascadesTest, CumeDistWindowKeepsLimitAbove) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId sort_group = memo.EnsureDerivedGroup({"t1"}, "sort_below");
+  memo.AddExpression(
+      sort_group,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {scan},
+                        .target_list = {NamedExpression(
+                            "", ColumnValueExp(ColumnName("t1", "id")))},
+                        .sort_ascending = {true}});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {sort_group},
+          .target_list = {NamedExpression(
+              "cd", Expression(PrefixWindowCall(
+                        "CUME_DIST", {}, {},
+                        {{.expression = ColumnValueExp(ColumnName("t1", "id")),
+                          .ascending = true}})))},
+          .output_schema = Schema("t1", {Column("id", ValueType::kInt64)})});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+
+  // CUME_DIST divides by the partition size, so truncating the input
+  // changes the surviving values even though the sort delivers the spec.
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
+TEST(CascadesTest, OrderedWindowRejectsMismatchedSortKeys) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId sort_group = memo.EnsureDerivedGroup({"t1"}, "sort_other");
+  memo.AddExpression(
+      sort_group,
+      LogicalExpression{.operation = LogicalOperator::kSort,
+                        .children = {scan},
+                        .target_list = {NamedExpression(
+                            "", ColumnValueExp(ColumnName("t1", "val")))},
+                        .sort_ascending = {true}});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {sort_group},
+          .target_list = {NamedExpression(
+              "rn", Expression(PrefixWindowCall(
+                        "ROW_NUMBER", {}, {},
+                        {{.expression = ColumnValueExp(ColumnName("t1", "id")),
+                          .ascending = true}})))},
+          .output_schema = Schema("t1", {Column("id", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)})});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 3});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+
+  // The sort below the window does not deliver the window's order; the
+  // truncated stream would not be a partition-order prefix.
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
+TEST(CascadesTest, NestedWindowLayerRefusesLimitPrefix) {
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId inner_group = memo.EnsureDerivedGroup({"t1"}, "win_inner");
+  memo.AddExpression(
+      inner_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {scan},
+          .target_list = {NamedExpression(
+              "wide",
+              Expression(PrefixWindowCall("SUM", {ColumnValueExp("t1.val")},
+                                          {ColumnValueExp("t1.part")})))},
+          .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)}),
+          .partition_by = {ColumnValueExp("t1.part")}});
+  const GroupId outer_group = memo.EnsureDerivedGroup({"t1"}, "win_outer");
+  memo.AddExpression(
+      outer_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {inner_group},
+          .target_list = {NamedExpression(
+              "rn", Expression(PrefixWindowCall("ROW_NUMBER", {})))},
+          .output_schema = Schema("t1", {Column("part", ValueType::kInt64),
+                                         Column("val", ValueType::kInt64)})});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {outer_group},
+                                       .limit_count = 3});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+
+  // The outer call is prefix-stable, but truncating between the layers
+  // would also cut the inner whole-partition window; refusing is the safe
+  // stance until the gate learns to check the layers recursively.
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
+TEST(CascadesTest, UnorderedRuleRefusesOrderedWindow) {
+  // Rule A (the Sort-less route) only covers order-free windows: with order
+  // keys, emit order disagrees with partition order and a limit under the
+  // window would shift the surviving rows' ranks (M3 guard).
+  Memo memo;
+  (void)memo.Build({"t1"});
+  const GroupId scan = memo.EnsureGroup({"t1"});
+  const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+  memo.AddExpression(
+      win_group,
+      LogicalExpression{
+          .operation = LogicalOperator::kWindow,
+          .children = {scan},
+          .target_list = {NamedExpression(
+              "rn", Expression(PrefixWindowCall(
+                        "ROW_NUMBER", {},
+                        /*partition_by=*/{},
+                        /*order_by=*/
+                        {{.expression = ColumnValueExp(ColumnName("t1", "v")),
+                          .ascending = true}})))},
+          .output_schema = Schema("t1", {Column("v", ValueType::kInt64)})});
+  const GroupId limit_group = memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+  memo.AddExpression(limit_group,
+                     LogicalExpression{.operation = LogicalOperator::kLimit,
+                                       .children = {win_group},
+                                       .limit_count = 2});
+
+  SearchEngine search(std::move(memo), RuleSet::Default());
+  search.Explore(limit_group);
+  EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+}
+
 TEST(CascadesTest, ProjectionCseAndPruning) {
   Memo memo;
   (void)memo.Build({"t1"});

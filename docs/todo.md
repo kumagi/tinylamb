@@ -955,8 +955,55 @@ Cascades rule / cost / statistics
 - [x] UNION DISTINCTのhash/sort選択を実装する。
 - [x] windowを分割・統合し、互換frameでsortを共有する。
 - [x] window後のfilterをpartitionキー条件に限って押し下げる。
-- [ ] window下のLIMITの安全な例外を定義する。
+- [x] window下のLIMITの安全な例外を定義する。
+  - **実装**: Cascades 変換規則 2 本（`plan/cascades.cpp`、
+    `limit_push_through_sort` の直後に登録）。
+    - `limit_prefix_unordered_window`: `Limit(Window(input))` の被る行が同一
+      であることを利用し、Window とその子(input)の間に `Limit` を差し込む。
+      input group は derived group (`window-prefix-limit:<signature>`)、新
+      Window は `window-prefix-window:<signature>`。signature =
+      window spec(partition+order keys, nulls flags) + count + offset。
+    - `limit_prefix_ordered_window`: `Limit(Window(Sort(input)))` を TopN
+      fusion 形 (`Window(TopN-like Limit)` は Sort を Limit(count+offset)
+      へ畳む＝`push_limit_through_sort` と同型) に落とす。projection 越しは
+      既存 `push_limit_through_projection` との組合せで到達する。
+  - の前置条件 (2 本とも同じ `WindowPrefixGate`):
+    (a) **値の安定性** `WindowValueStableUnderTruncation`: 前方参照しない
+      call のみ。ranking 白名単 (ROW_NUMBER/RANK/DENSE_RANK) か、明示 ROWS
+      frame で start/end とも `UNBOUNDED PRECEDING|OFFSET PRECEDING|
+      CURRENT ROW`。default frame・RANGE/GROUPS・NTILE/PERCENT_RANK/
+      CUME_DIST・LEAD は不変でないので拒否。
+    (b) **emit 順 = partition 順**: 全 call の order_by が空 (rule A のみ)
+      か、全 call が同一 spec を共有し子が (partition keys ++ order keys,
+      昇降/NULLS 一致) の Sort であること (`SortDeliversWindowSpec`)。
+    さらに `with_ties` 拒否、offset は許容 (prefix cut を広げるだけ)、
+    window 層の下に別 window がいれば BFS (`ReachableChildHasWindow`) で拒否、
+    再発火は derived group tag prefix ガード、冪等は fingerprint 重複排除。
+  - 根拠: `executor/window.cpp` はemit 順に rows_ を保持し
+    `ComputeOneWindowImpl` が `(*out)[ordered[k]]` で元 index へ散開するた
+    め `Window(Limit(X))` と `Limit(Window(X))` の先頭行集合が一致する。
+  - テスト: `plan/cascades_test.cpp` 7 件
+    (`LimitPrefixThroughUnorderedWindowFires` は発火＋コスト選択まで検証,
+    `LimitPrefixThroughOrderedWindowFusesTopN`,
+    `DefaultFrameWindowKeepsLimitAbove`, `CumeDistWindowKeepsLimitAbove`,
+    `UnorderedRuleRefusesOrderedWindow`, `OrderedWindowRejectsMismatchedSortKeys`,
+    `NestedWindowLayerRefusesLimitPrefix`)。
+    `query/analytical_features_test.cpp` 3 件
+    (`LimitStaysOutsidePartitionWideDefaultFrame`,
+    `UnorderedWindowKeepsRanksUnderLimit`, `RunningWindowSurvivesLimitWithRowsFrame`)。
+    変異検証 M1-M5: 白名単削除→positive テスト fail / frame gate 削除→負テスト
+    2件fail / rule A order gate 削除→`UnorderedRuleRefusesOrderedWindow` fail /
+    sort 照合削除→`OrderedWindowRejectsMismatchedSortKeys` fail /
+    階層ガード削除→`NestedWindowLayerRefusesLimitPrefix` fail。全て確認済み。
+  - 対象外 (将来): 外側 ORDER BY+LIMIT の TopN fusion (window が sort を
+    共有するケース)、LEAD/NTILE/PERCENT_RANK/CUME_DIST/default frame。
 - [ ] 全体frameのwindow-to-aggregateを実装する。
+  - **2026-10-23 判定: 適用不能として確定済み（スキップ）。**
+    `docs/optimizer_todo.md` の `window_to_aggregate` 項参照: 全フレーム
+    (partition 全体) 集計への置換は、Window が行を保存する (N 行出力) のに
+    対し集約は 1 行/グループを返すため、行複製 (一時集約 + グループ結合
+    / cross 結合による持ち上げ) を伴わないと非等価。単純置換の余地なし。
+    一時集約＋結合の形は将来の decorrelation 枠とし、本項はスキップ。
 - [x] rank / row_number filterをTopNへ変換する。
 - [x] no-op windowを除去する。
 - [x] window prefix sort共有を実装する。

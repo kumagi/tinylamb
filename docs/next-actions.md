@@ -1,5 +1,20 @@
 # 次に対処すべき指摘事項(設計バックログ)
 
+2026-10-23 加筆(第53報)。window下の LIMIT の安全な例外(todo.md「集合・Window・
+UNNEST規則」節): **実装済み**。Cascades 変換規則 `limit_prefix_unordered_window`
+(order 無し window に Limit を差し込む)と `limit_prefix_ordered_window`
+(子 Sort が window spec を共有する場合の TopN 畳み込み)を
+`limit_push_through_sort` の直後に追加。ゲート `WindowPrefixGate`:
+ranking 白名単 (ROW_NUMBER/RANK/DENSE_RANK) または後方 ROWS frame の
+「前方参照しない」call × 全 call 同一 spec × 子が partition+order keys を
+完璧に届ける Sort(order 無し時は入力順) × window 被り BFS 拒否 ×
+with_ties 拒否。根拠は executor/window.cpp の emit 順書き戻し
+(`(*out)[ordered[k]]`)。50k 行クエリで EXPLAIN ANALYZE 102ms→0.35ms
+(実測)。変異検証 M1-M5 済み。テーブル統計が未取得(行数 0 推定)のときは
+全代替がコスト 0 になり tie-break で元形が選ばれる(changed: ANALYZE 併用推奨)。
+対象外: 外側 ORDER BY+LIMIT fusion、LEAD/NTILE/PERCENT_RANK/CUME_DIST、
+default frame。
+
 2026-10-20 加筆(第52報)。Filter の短絡順序と ConjunctReordering:
 短絡は既存、並べ替えを `CanonicalizeConjuncts` に構造コストクラスとして実装。
 詳細は下記「2026-10-20 conjunct は安い述語から評価する」の節。
