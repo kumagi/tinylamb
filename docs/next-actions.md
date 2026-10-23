@@ -14,6 +14,19 @@ EXPLAIN で `Projection: []` に観測)。SUM の空入力 NULL と COUNT 空入
 解消 (differential fuzz は NULL 制約列を生成していない — 制約スロットの
 セマンティクスは従来コードが kPrimaryKey で同じ強制を既に持っていた)。
 
+同日 同報 Phase 6 収口。todo.md 残る全項目の判定記録を書き切った (全 28 項が
+[x] 契約つき or [ ] 判定記録つき)。新規判定記録: 1000 全体frame
+window-to-aggregate (window executor と変換先が漸近同等 — 利得が薄い)、
+1499 LATERAL コスト付き選択 (展開自体は既存、コスト付き選択は統計前提の
+閾値形状テストが必要)、1501 MATCH_RECOGNIZE、1509 prepared statement
+extended protocol (AGENTS §2.9 不変契約との関係 — ADR 先行)、1510 batch
+INSERT 値リスト結合、1518 partition exclusion (分割定義自体が未導入)、
+1519 generated/partial/expression index (DDL 表面なし)、1520 collation DDL
+伝播 (実行側 collation は既存)、1521 view expansion/predicate 残存
+(materialized 判別が前提)、1522 security barrier / RLS (session user 配線が
+前提)。grouping_id simplification (1302) は実装済み (`RewriteGroupingSetBranch`
+の branch 定数化) を [x] 化。
+
 同日 同報。Top-N limit hint を lsm_scan 実装規則へ伝播 (todo Phase 4
 「Top-N limit hintを全implementation ruleへ伝播する」を [x] 化)。LSM view は
 structural 順序主張を持つので、`ApplyLimitHint` の既存ゲート (required

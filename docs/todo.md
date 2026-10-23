@@ -998,6 +998,17 @@ Cascades rule / cost / statistics
   - 対象外 (将来): 外側 ORDER BY+LIMIT の TopN fusion (window が sort を
     共有するケース)、LEAD/NTILE/PERCENT_RANK/CUME_DIST/default frame。
 - [ ] 全体frameのwindow-to-aggregateを実装する。
+      **スキップ（判断理由）**: 適用面が考えたより薄い。空 partition (OVER ())
+      も window executor は全行バッファして評価する (`WindowAggregate fused`
+      注記は「同 shape の複数 window call が同一バッファを共有」であって
+      scalar 集約への置換ではない)。変換先 (scalar aggregate + cross join)
+      も入力をバッファする必要があり漸近で勝てない — 利得は evaluate 一回化と
+      バッファの共用のみ。変換対象は SUM/AVG/MIN/MAX/COUNT の空 partition +
+      完全 frame に限定され (RANK/LAG/FIRST_VALUE 系は置換不可)、
+      差が EXPLAIN ANALYZE で見える形状が少ない。
+      着手点: `window_fns` の layout_keys が空 partition + 全体 frame のとき
+      scalar agg + broadcast plan への変換規則を memo 側に書き、
+      空入力の 0 行挙動 (window=0行、agg+cross=0行) を回帰に先に固定。
   - **2026-10-23 判定: 適用不能として確定済み（スキップ）。**
     `docs/optimizer_todo.md` の `window_to_aggregate` 項参照: 全フレーム
     (partition 全体) 集計への置換は、Window が行を保存する (N 行出力) のに
@@ -1299,7 +1310,14 @@ Cascades rule / cost / statistics
     失敗; rewrite ゲート無効化 → plan assert 失敗 (拒否系は生きる)。
 - [x] `COUNT(DISTINCT)` のdistinct aggregate expansionを実装する。
 - [x] grouping sets expansion、grouping sets-to-union、ROLLUP / CUBE変換を実装する。
-- [ ] grouping_id simplificationを実装する。
+- [x] grouping_id simplificationを実装する。
+  - 実装契約 (grouping-set 展開時の定数化): `RewriteGroupingSetBranch`
+    (`query/googlesql_ast_visitor.cpp` — 本エンジンの GROUPING SETS 展開は
+    UNION ALL 連結の branch 分解) が branch 拡張で GROUPING()/GROUPING_ID()
+    を引数列の活性/非活性から作る per-branch 定数へ折りたたみ、非活性キー参照
+    は NULL 化。GROUPING SETS / ROLLUP / CUBE の全テストは既存
+    (`sql_grouping_sets_test` 系)。素の GROUP BY に GROUPING() を書いた場合
+    は GoogleSQL と同じくエラーになる (エラー文言は素朴だが挙動は正しい)。
 - [x] HAVINGをaggregate後filterへ明示変換する。
 - [x] FILTER aggregate ruleを実装する。
 - [ ] approximate aggregate rewriteを実装する。
@@ -1485,6 +1503,15 @@ Cascades rule / cost / statistics
 - [x] memory不足時のgraceful degradeを実装する。
 - [x] distributed any / singleton / hash / broadcast / rangeを実装する。
 - [ ] enforce distribution、colocated join、broadcast vs shuffle costを実装する。
+      **スキップ（判断理由）**: 分散経路の OSS 実装 (Exchange/Broadcast/
+      RemoteScan/DistributedAggFinalize と partial agg/window 再分散) は既存
+      [x] だが、PhysicalProperties の Distribution は今日 kAny/kSingleNode の
+      2 値で、enforce される property が「分布要求」しか方向を持たない。
+      colocated join / broadcast vs shuffle の cost 比較にはネットワーク転送
+      (行数×幅) と局所性 (node 配置) の統計が必要で、単一ノード既定の
+      テスト木では期待値が張れない。着手点: Distribution 型の拡張
+      (もしくは dedicated DistributionRequirement property) —
+      分布 v2 の契約 (todo 分布節の残項目) と同じ設計セッションで。
 - [x] partial agg/finalize、two-phase distinctを分散経路へ接続する。
 - [x] window partition再分散、scan range分割を実装する。
 - [x] ExchangeHash / Broadcast / Gather / Rangeを実装する。
@@ -1497,8 +1524,24 @@ Cascades rule / cost / statistics
 ### SQL機能
 
 - [ ] LATERALのコスト付き展開を実装する。
+  - 判定記録 (2026-10-23, スキップ維持): 展開自体は既存 — LATERAL のパース
+    (`HasExplicitLateral`、明示子の無い相関も WHERE が外側表を参照することで
+    検出)、単表等価 LATERAL の decorrelation (`DecorrelateOneLateralSource`、
+    LEFT null-pad 込み) が query_test の 3a 系テストと EXPLAIN で固定済み、
+    それ以外の形状は per-row apply 路線へ流れる。未実装は「コスト付き」:
+    decorrelation と per-row apply の両方を見積もって選ぶ仕組みが無い
+    (現行は形状ゲートで決める)。見積り自体は作れる (decorrelation:
+    内側行数×外側行数、apply: per-row index seek モデル、統計は RuleContext
+    に既にある) が、見積りの差が安定して計画を分ける表形状を先にテストとして
+    固定する必要がある。着手点: 内側行数の閾値表を OptimizerTest で並べてから
+    選択仕様を書く。
 - [x] PIVOT / UNPIVOTを展開する。
 - [ ] MATCH_RECOGNIZEを実装する。
+      **スキップ（判断理由）**: パーサー構文面が存在せず、意味論 (row pattern
+      状態機械) も executor 単位の新 operator で、実装量が大きい。
+      他の window 系 (QUALIFY / WITH TIES) と同型の接続作業をしても項目の
+      実質 (RE 実装) が残る。着手点: パターン DSL の抽出機 (expression layer
+      に golden records で) が先。
 - [x] TABLESAMPLEを実装する。
 - [x] QUALIFYを専用logical/physical filterとしてCascadesへ接続する。
 - [x] GROUP BY ALL / GROUP BY DISTINCTを実装する。
@@ -1507,7 +1550,21 @@ Cascades rule / cost / statistics
 - [x] FOR UPDATE / SKIP LOCKEDのaccess path制約を実装する。
 - [x] MERGE、RETURNINGをSQLからplanへ接続する。
 - [ ] prepared statementのgeneric/custom経路を完成させる。
+      **スキップ（判断理由）**: server 層は Simple Query 専用が不変契約
+      (AGENTS.md §2.9 — extended protocol は ErrorResponse で拒否) で、
+      PostgreSQL 文流 PREPARE/EXECUTE 文型も未導入。コンパイル済み plan cache
+      側の generic replay / identical-parameter fallback と sniffer
+      (上の 1271/1272 [x]) が実効的に同じ役割を果たしている。
+      着手点: extended protocol (Parse/Bind/Execute) を ErrorResponse でなく
+      受理する一案は server 層の仕様変更になるので
+      別契約 (ADR) をまず切る。
 - [ ] batch INSERTの値リスト結合を実装する。
+      **スキップ（判断理由）**: 複数行 VALUES は既に単文で一括実行、
+      行単位の write は `Table::Insert` に一本道で、値リスト結合
+      (VALUES 間の同一リテラル fold / 索引挿入のバッチ化) はそれを超える意味が
+      小さい。着手点: plan cache (kInsert artifact) の値注入と合わせて、
+      INSERT 行数の morsel 化 (実行側) が既存項目 (operator memory
+      reservation) に含まれるかの確認を先に。
 
 ### 制約・カタログ
 
@@ -1516,10 +1573,44 @@ Cascades rule / cost / statistics
 - [x] CHECK制約をpredicateへ取り込む。
 - [x] FKでjoin除去とcardinality上界を推定する。
 - [ ] partition constraint exclusionを実装する。
+      **スキップ（判断理由）**: 分割テーブル機能自体が未導入 (CREATE TABLE
+      PARTITION BY / パーティション定義は visitor・catalog ともに存在しない)。
+      着手点: 分割定義 (range/hash/list) の DDL と catalog persistence、
+      分割列の統計境界を先に; exclusion はその直後に predicate 境界判定
+      (既存の zone map 拡張 [x] 項目と同型) として来れる。
 - [ ] generated column、partial index、expression indexを照合する。
+      **スキップ（判断理由）**: GENERATED ALWAYS / partial index / 式索引の
+      DDL 表面が存在しない (visitor は DEFAULT のみ)。partial/expression index
+      は索引宣言に predicate/式を含める catalog schema 拡張のあとで、
+      照合器は既存の predicate/coverage machinery ([x] multi-index covering) を
+      再利用可能。着手点: CREATE INDEX … WHERE/式の visitor + catalog
+      persistence + Table::IndexCount への統合。
 - [ ] collationをschema・properties・ruleへ伝播する。
+      **スキップ（判断理由）**: collation は実行/equality 契約にまで実装済み
+      (`type/collation.hpp`: 値に添付される collation、KEY 経由の共有契約、
+      `query/googlesql_ast_visitor.cpp` で COLLATE 式の解決)。未達成は DDL 経路
+      (`ALTER TABLE` / 列定義の COLLATE 句) からの schema/column への attach と、
+      (b) properties / rule 段階での統計添付 (`interesting order` / 統計内 collation の別扱い)。
+      着手点: 列定義 COLLATE の visitor + catalog persistence を先に
+      (NOT NULL 配線と同じスロット展開経路)、その後 rule 段階での添付態度を
+      differential で確認する。
 - [ ] view expansionとpredicate残存を実装する。
+      **スキップ（判断理由）**: view の登録・参照は既存 (catalog 永続
+      `ListViewDefinitions`/`GetViewDefinition`、epoch 再登録
+      `EnsureViewsRegistered`)。本項の判定点は「predicate 残存」: 展開が
+      文合成方式なら pushdown は通常の optimizer 経由で自然に来るが、
+      materialized view (matview_test あり) では pushdown できず、
+      残す predicate の位置契約が別決めになる。着手点: view 参照の展開方式を
+      確認し、(a) 合成方式なら pushdown 等価性を EXPLAIN で確認して [x] 化、
+      (b) materialized なら残存 predicate の位置契約を決めてから。
 - [ ] security barrier viewとRLS predicateのpushdown制限を実装する。
+      **スキップ（判断理由）**: 前提が不足している (server 層に session user
+      の概念がなく、DDL にも SECURITY 句が未導入)。実装は
+      (1) server session 状態から statement の TransactionContext へ
+      session user を届ける配線、(2) view 定義への barrier flag の持ち込み、
+      (3) barrier つき view 参照で pushdown 規則群 (既存 [x] の selection 系) の
+      適用を止めるゲート、の三段で、(1) が server 層の仕様決めを伴うため
+      先に ADR 化が望ましい。
 
 ### 実行品質・安全網
 
