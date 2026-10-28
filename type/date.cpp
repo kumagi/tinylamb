@@ -34,7 +34,10 @@ int64_t FloorDiv(int64_t a, int64_t b) {
   return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
 }
 
-int64_t FloorMod(int64_t a, int64_t b) { return a - (FloorDiv(a, b) * b); }
+int64_t FloorMod(int64_t a, int64_t b) {
+  const int64_t r = a % b;
+  return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r;
+}
 
 // Shift `base` by whole years plus extra months, computed in int64 because
 // chrono::months/chrono::years truncate to their internal int representation.
@@ -68,7 +71,7 @@ StatusOr<sys_days> ShiftYMDClamped(const year_month_day& base,
     // e.g. 2024-01-31 + 1 month: clamp Feb 31 down to the month end.
     ymd = year_month_day{year_month_day_last{y, month_day_last{m}}};
   }
-  return sys_days{ymd};
+  return ToSysDays(sys_days{ymd}.time_since_epoch().count());
 }
 
 Status InvalidDate() {
@@ -130,7 +133,9 @@ StatusOr<int64_t> TryParseDateDays(std::string_view date) {
   if (!ymd.ok()) {
     return InvalidDate();
   }
-  return sys_days{ymd}.time_since_epoch().count();
+  const int64_t days = sys_days{ymd}.time_since_epoch().count();
+  ASSIGN_OR_RETURN(sys_days, checked, ToSysDays(days));
+  return checked.time_since_epoch().count();
 }
 
 StatusOr<std::string> TryFormatDateDays(int64_t days) {

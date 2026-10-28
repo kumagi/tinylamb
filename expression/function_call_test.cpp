@@ -684,6 +684,66 @@ TEST(FunctionCallTest, UnsignedInt64_MathematicalFunctions) {
   EXPECT_EQ(trunc_res, umax);
 }
 
+TEST(FunctionCallTest, GenerateArrayKeepsExactIntegerBounds) {
+  for (const int64_t start :
+       {INT64_MIN, int64_t{9007199254740993}, INT64_MAX - 2}) {
+    SCOPED_TRACE(start);
+    const auto result =
+        ExecuteFunction("generate_array", {Value(start), Value(start + 2)});
+    ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+    EXPECT_EQ(result.Value().ArrayElementSqlType(), "INT64");
+    EXPECT_EQ(
+        result.Value().ArrayElements(),
+        (std::vector<Value>{Value(start), Value(start + 1), Value(start + 2)}));
+  }
+  const Value high = Value(-1).WithUnsigned();
+  const auto unsigned_result =
+      ExecuteFunction("generate_array", {Value(-3).WithUnsigned(), high});
+  ASSERT_TRUE(unsigned_result.HasValue());
+  EXPECT_EQ(unsigned_result.Value().ArrayElementSqlType(), "UINT64");
+  EXPECT_EQ(unsigned_result.Value().ArrayElements(),
+            (std::vector<Value>{Value(-3).WithUnsigned(),
+                                Value(-2).WithUnsigned(), high}));
+  const auto descending = ExecuteFunction(
+      "generate_array", {high, Value(-3).WithUnsigned(), Value(-1)});
+  ASSERT_TRUE(descending.HasValue());
+  EXPECT_EQ(descending.Value().ArrayElements(),
+            (std::vector<Value>{high, Value(-2).WithUnsigned(),
+                                Value(-3).WithUnsigned()}));
+}
+
+TEST(FunctionCallTest, GenerateArrayDefaultStepAndNaNValidation) {
+  for (const auto& args : {std::vector<Value>{Value(5), Value(1)},
+                           std::vector<Value>{Value(5.0), Value(1.0)}}) {
+    const auto result = ExecuteFunction("generate_array", args);
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_TRUE(result.Value().ArrayElements().empty());
+  }
+  for (size_t position = 0; position < 3; ++position) {
+    std::vector<Value> args{Value(1.0), Value(3.0), Value(1.0)};
+    args[position] = Value(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_FALSE(ExecuteFunction("generate_array", args).HasValue());
+  }
+}
+
+TEST(FunctionCallTest, GenerateArrayStopsBeforeSteppingOutsideIntegerRange) {
+  const std::vector<std::vector<Value>> cases = {
+      {Value(INT64_MAX - 1), Value(INT64_MAX), Value(2)},
+      {Value(INT64_MIN + 1), Value(INT64_MIN), Value(-2)},
+      {Value(-2).WithUnsigned(), Value(-1).WithUnsigned(), Value(2)},
+      {Value(1).WithUnsigned(), Value(0).WithUnsigned(), Value(-2)},
+      {Value(0), Value(INT64_MIN), Value(INT64_MIN)}};
+  for (const auto& arguments : cases) {
+    const auto result = ExecuteFunction("generate_array", arguments);
+    ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+    std::vector<Value> expected{arguments[0]};
+    if (arguments[2] == Value(INT64_MIN)) {
+      expected.push_back(Value(INT64_MIN));
+    }
+    EXPECT_EQ(result.Value().ArrayElements(), expected);
+  }
+}
+
 TEST(FunctionCallTest, GenerateArray_AstEvaluation) {
   Row dummy_row;
   Schema dummy_schema;

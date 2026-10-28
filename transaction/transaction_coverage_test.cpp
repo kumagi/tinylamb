@@ -956,6 +956,29 @@ TEST_F(TransactionCoverageTest, WaitDieRefusesYoungerWaiterImmediately) {
   ASSERT_EQ(tm_->Abort(younger), Status::kSuccess);
 }
 
+TEST_F(TransactionCoverageTest, NoWaitFailsOlderWaiterImmediately) {
+  // kNoWait (single-threaded executors such as the PostgreSQL server's
+  // event loop): even the older transaction that wait-die would let wait
+  // fails at once, because its holder cannot progress while it waits.
+  tm_->SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kNoWait);
+  tm_->SetWriteIntentWaitLimit(std::chrono::milliseconds(5000));
+  const RowPosition rp(76, 1);
+  Transaction older = tm_->Begin();
+  Transaction younger = tm_->Begin();
+  ASSERT_TRUE(younger.AddWriteSet(rp));
+  const auto begin = std::chrono::steady_clock::now();
+  EXPECT_FALSE(older.AddWriteSet(rp));
+  EXPECT_LT(std::chrono::steady_clock::now() - begin,
+            std::chrono::milliseconds(1000));
+  // The holder keeps its intent and finishes normally; afterwards the row
+  // is free again.
+  ASSERT_EQ(tm_->Abort(younger), Status::kSuccess);
+  Transaction later = tm_->Begin();
+  EXPECT_TRUE(later.AddWriteSet(rp));
+  ASSERT_EQ(tm_->Abort(later), Status::kSuccess);
+  ASSERT_EQ(tm_->Abort(older), Status::kSuccess);
+}
+
 TEST_F(TransactionCoverageTest, WaitDieOlderWaitsThenProceedsWhenHolderAborts) {
   tm_->SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kWaitDie);
   const RowPosition rp(72, 1);

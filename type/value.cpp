@@ -490,6 +490,7 @@ size_t Value::Serialize(char* dst) const {
 size_t Value::DeserializeInto(const char* src, ValueType as_type,
                               Status* out_status) {
   type = as_type;
+  collation_ = 0;
   switch (as_type) {
     case ValueType::kNull:
       *out_status = StatusError(StatusCode::kInvalidArgument,
@@ -957,6 +958,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
                        "corrupt memcomparable value: empty buffer");
   }
   const auto prefix = static_cast<uint8_t>(*cursor++);
+  collation_ = 0;
   switch (prefix) {
     case static_cast<uint8_t>(ValueType::kNull):
       // Mirror of the 1-byte NULL encoding above: an index key carrying a
@@ -1513,6 +1515,7 @@ Encoder& operator<<(Encoder& a, const Value& v) {
 }
 
 Decoder& operator>>(Decoder& e, Value& v) {
+  v.collation_ = 0;
   e >> v.type;
   switch (v.type) {
     case tinylamb::ValueType::kNull:

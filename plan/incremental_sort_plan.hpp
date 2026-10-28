@@ -50,6 +50,7 @@ class IncrementalSortPlan final : public PlanBase {
   [[nodiscard]] bool EnforcesDistinct() const override {
     return child_->EnforcesDistinct();
   }
+  [[nodiscard]] Collation OrderCollation() const override;
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

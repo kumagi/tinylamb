@@ -66,6 +66,12 @@ class RelationRenamePlan final : public PlanBase {
   [[nodiscard]] bool EnforcesDistinct() const override {
     return src_->EnforcesDistinct();
   }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return src_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return src_->OrderIsMeasured();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

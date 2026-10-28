@@ -6627,8 +6627,11 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       }
     }
 
+    // The predicates name alias-qualified columns (`x0.b`); compile and
+    // evaluate them against the qualified view of the scan row, or a residual
+    // conjunct (function call, CASE, ...) cannot resolve its columns.
     CompiledScanFilter scan_filter =
-        CompileScanFilter(scan_predicates, scan_schema);
+        CompileScanFilter(scan_predicates, qualified_schema);
 
     std::vector<const AggregateExpression*> aggregate_expressions;
     std::unordered_set<const AggregateExpression*> seen_aggregates;
@@ -7018,7 +7021,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
         if (!scan_accumulate_error.ok()) {
           return;
         }
-        if (!MatchScanFilter(row, scan_schema, scan_filter, outer, context,
+        if (!MatchScanFilter(row, qualified_schema, scan_filter, outer, context,
                              ctes, &scan_accumulate_error)) {
           return;
         }
@@ -7051,7 +7054,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       }();
       Status scan_filter_error{Status::kSuccess};
       while (iterator.IsValid()) {
-        if (!MatchScanFilter(*iterator, scan_schema, scan_filter, outer,
+        if (!MatchScanFilter(*iterator, qualified_schema, scan_filter, outer,
                              context, ctes, &scan_filter_error)) {
           RETURN_IF_FAIL(scan_filter_error);
           ++iterator;

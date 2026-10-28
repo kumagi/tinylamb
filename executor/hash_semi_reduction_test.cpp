@@ -303,6 +303,25 @@ TEST_F(HashSemiReductionSqlTest, SemiJoinReducesTheHashBuildAndKeepsTheRows) {
   EXPECT_EQ(Text(rows), (std::vector<std::string>{"10", "11", "20"}));
 }
 
+TEST_F(HashSemiReductionSqlTest, OrderedLimitSurvivesRuntimeMemoryPressure) {
+  for (const size_t budget : {size_t{0}, size_t{128}}) {
+    SCOPED_TRACE(budget);
+    ScopedQueryMemory memory(budget);
+    std::vector<Row> rows;
+    ASSERT_SUCCESS(
+        Run("SELECT u.k FROM uniq u WHERE u.k IN (SELECT k FROM build) "
+            "ORDER BY u.k LIMIT 2 OFFSET 1",
+            &rows));
+    EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+    ASSERT_SUCCESS(
+        Run("SELECT u.k FROM uniq u WHERE NOT EXISTS "
+            "(SELECT 1 FROM build b WHERE b.k = u.k + 1000) "
+            "ORDER BY u.k LIMIT 2 OFFSET 1",
+            &rows));
+    EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+  }
+}
+
 TEST_F(HashSemiReductionSqlTest, ProfitableShapeEngagesTheReduction) {
   const std::string plan =
       Explain("SELECT p.v FROM probe p WHERE p.k IN (SELECT k FROM build)");

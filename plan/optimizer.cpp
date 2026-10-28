@@ -1282,9 +1282,33 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
     classes.erase(classes.begin() + static_cast<std::ptrdiff_t>(right));
   }
 
-  for (const Expression& conjunct : *conjuncts) {
-    const std::optional<SimpleComparison> comparison =
+  // Every `expr = constant` conjunct (either orientation, non-NULL constant)
+  // is absorbed into its class and re-emitted below.  Only absorbed
+  // conjuncts may be dropped: the mirrored form `5 = b` used to be dropped
+  // without its constant ever being checked against the class constant, so
+  // `5 = b AND b = 6` silently became `b = 6`.
+  std::vector<char> absorbed(conjuncts->size(), 0);
+  for (size_t i = 0; i < conjuncts->size(); ++i) {
+    const Expression& conjunct = (*conjuncts)[i];
+    std::optional<SimpleComparison> comparison =
         ExtractSimpleComparison(conjunct);
+    Expression constant_node;
+    if (comparison) {
+      constant_node = conjunct->AsBinaryExpression().Right();
+    } else if (conjunct && conjunct->Type() == TypeTag::kBinaryExp &&
+               conjunct->AsBinaryExpression().Op() ==
+                   BinaryOperation::kEquals) {
+      const auto& binary = conjunct->AsBinaryExpression();
+      if (binary.Left()->Type() == TypeTag::kConstantValue &&
+          binary.Right()->Type() != TypeTag::kConstantValue &&
+          !binary.Left()->AsConstantValue().GetValue().IsNull()) {
+        comparison = SimpleComparison{
+            .key = binary.Right(),
+            .operation = BinaryOperation::kEquals,
+            .constant = binary.Left()->AsConstantValue().GetValue()};
+        constant_node = binary.Left();
+      }
+    }
     if (!comparison || comparison->operation != BinaryOperation::kEquals) {
       continue;
     }
@@ -1295,23 +1319,27 @@ bool PropagateEqualityConstants(std::vector<Expression>* conjuncts) {
       return false;
     }
     equality_class.constant = comparison->constant;
-    // ExtractSimpleComparison only accepts a constant on the right. Keep that
-    // node so a one-column equality does not lose its ParameterSlot.
-    equality_class.constant_expr = conjunct->AsBinaryExpression().Right();
+    // Keep the constant node so a one-column equality does not lose its
+    // ParameterSlot.
+    equality_class.constant_expr = constant_node;
+    absorbed[i] = 1;
   }
 
   std::vector<Expression> rewritten;
   rewritten.reserve(conjuncts->size() + classes.size());
-  for (const Expression& conjunct : *conjuncts) {
-    bool replaced = false;
-    if (conjunct && conjunct->Type() == TypeTag::kBinaryExp &&
+  for (size_t i = 0; i < conjuncts->size(); ++i) {
+    const Expression& conjunct = (*conjuncts)[i];
+    bool replaced = static_cast<bool>(absorbed[i]);
+    if (!replaced && conjunct && conjunct->Type() == TypeTag::kBinaryExp &&
         conjunct->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
+      // A column-column equality inside a constant class is implied by the
+      // per-member constant equalities re-emitted below.
       const auto& binary = conjunct->AsBinaryExpression();
-      const Expression& candidate =
-          binary.Left()->Type() == TypeTag::kConstantValue ? binary.Right()
-                                                           : binary.Left();
-      const size_t group = FindEqualityClass(&classes, candidate);
-      replaced = classes[group].constant.has_value();
+      if (binary.Left()->Type() != TypeTag::kConstantValue &&
+          binary.Right()->Type() != TypeTag::kConstantValue) {
+        const size_t group = FindEqualityClass(&classes, binary.Left());
+        replaced = classes[group].constant.has_value();
+      }
     }
     if (!replaced) {
       rewritten.push_back(conjunct);

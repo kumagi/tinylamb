@@ -291,6 +291,31 @@ namespace {
 // Translates a plan sort key list into the operator's key list; both shapes
 // (BufferedSortPlan / ExternalMergeSortPlan) and the base node use it, so the
 // ORDER BY contract reaches the operator identically in every case.
+// The stale-index fallbacks below replace an ordered index walk with a heap
+// scan.  The plan above may already have elided a sort on the index order
+// (ORDER BY, merge / band joins rely on IsOrderedBy of the index plan), so the
+// fallback restores that order explicitly.  Inside one transaction a DELETE +
+// INSERT is enough to make the keys "stale" and the heap order arbitrary
+// (`ORDER BY k` returned 0, 21, 2, 4 and BandJoin failed with "input is not
+// ordered").
+Executor SortedByIndexKey(Executor scan, const Schema& output_schema,
+                          const Table& table, const Index& index,
+                          bool ascending) {
+  std::vector<SortExecutor::Key> keys;
+  keys.reserve(index.sc_.key_.size());
+  for (const slot_t offset : index.sc_.key_) {
+    keys.push_back(SortExecutor::Key{
+        .expression =
+            ColumnValueExp(table.GetSchema().GetColumn(offset).Name()),
+        .ascending = ascending});
+  }
+  if (keys.empty()) {
+    return scan;
+  }
+  return std::make_shared<SortExecutor>(std::move(scan), output_schema,
+                                        std::move(keys));
+}
+
 std::vector<SortExecutor::Key> ExecutorSortKeys(
     const std::vector<SortKey>& keys) {
   std::vector<SortExecutor::Key> out;
@@ -617,11 +642,17 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     Executor scan = std::make_shared<FullScan>(
         txn.txn_, table_, std::numeric_limits<size_t>::max(), lock_rows_,
         wait_for_write_intent_);
-    if (!where_) {
+    if (where_) {
+      scan = std::make_shared<Selection>(where_, table_.GetSchema(),
+                                         std::move(scan));
+    }
+    // DML source scans (lock_rows_) need row positions, which a sort does
+    // not carry, and never depend on the key order.
+    if (lock_rows_) {
       return scan;
     }
-    return std::make_shared<Selection>(where_, table_.GetSchema(),
-                                       std::move(scan));
+    return SortedByIndexKey(std::move(scan), table_.GetSchema(), table_, index_,
+                            ascending_);
   };
   if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
     return stale_fallback();
@@ -735,8 +766,20 @@ Executor IndexOnlyScanPlan::EmitExecutor(TransactionContext& txn) const {
     for (slot_t offset : index_.sc_.include_) {
       columns.emplace_back(table_.GetSchema().GetColumn(offset).Name());
     }
-    return std::make_shared<Projection>(std::move(columns), table_.GetSchema(),
-                                        std::move(executor));
+    std::vector<Column> projected_columns;
+    projected_columns.reserve(columns.size());
+    for (slot_t offset : index_.sc_.key_) {
+      projected_columns.push_back(table_.GetSchema().GetColumn(offset));
+    }
+    for (slot_t offset : index_.sc_.include_) {
+      projected_columns.push_back(table_.GetSchema().GetColumn(offset));
+    }
+    Executor projected = std::make_shared<Projection>(
+        std::move(columns), table_.GetSchema(), std::move(executor));
+    return SortedByIndexKey(
+        std::move(projected),
+        Schema(table_.GetSchema().Name(), std::move(projected_columns)), table_,
+        index_, ascending_);
   };
   if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
     return stale_fallback();
@@ -865,10 +908,15 @@ void BuildKeyOffsets(const Schema& schema,
   offsets->reserve(columns.size());
   for (const auto& col : columns) {
     bool found = false;
+    // Exactly one offset per key: a child projection may carry the same
+    // column twice (`[x.k, x.b, x.b]` when two correlation equalities both
+    // bind x.b), and emitting every match made the key vectors of the two
+    // sides differ in length, so the hash join compared misaligned keys.
     for (size_t i = 0; i < schema.ColumnCount(); ++i) {
       if (schema.GetColumn(i).Name() == col) {
         offsets->push_back(static_cast<slot_t>(i));
         found = true;
+        break;
       }
     }
     if (!found) {

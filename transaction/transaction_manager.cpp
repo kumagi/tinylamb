@@ -1033,9 +1033,9 @@ bool TransactionManager::AcquireWriteIntent(
     }
   };
   // Try-lock path: caller (TryAddWriteSet) does not want to wait, regardless
-  // of the policy. The current pending owner is enough information to make
-  // the decision.
-  if (!wait) {
+  // of the policy, or the kNoWait policy forbids every wait. The current
+  // pending owner is enough information to make the decision.
+  if (!wait || policy == DeadlockPolicy::kNoWait) {
     if (available_for_self()) {
       VersionChain& chain = GetOrCreateVersionChain(shard, rp);
       if (chain.pending) {
@@ -1296,6 +1296,9 @@ bool TransactionManager::AcquireWriteIntent(
       }
       break;
     }
+    case DeadlockPolicy::kNoWait:
+      // Unreachable: kNoWait takes the try-lock path above.
+      break;
   }
   txn.DebugSetPhase(nullptr);
   VersionChain& chain = GetOrCreateVersionChain(shard, rp);

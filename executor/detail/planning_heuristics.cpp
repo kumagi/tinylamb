@@ -4320,6 +4320,17 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               !IsSubset(predicate.sources, available)) {
             continue;
           }
+          // Same rule as the single-source pre-filters above: a conjunct
+          // over a source that a LATER RIGHT/FULL join NULL-supplies must
+          // not filter below that join.  `a CROSS JOIN b RIGHT JOIN c ...
+          // WHERE f(a, b) IS NULL` evaluated f before the RIGHT join, turned
+          // c rows whose matches all failed f into NULL-padded rows, and the
+          // padded rows then passed the IS NULL test.
+          if (!std::ranges::all_of(predicate.sources, [&](size_t source_index) {
+                return static_cast<bool>(filter_safe[source_index]);
+              })) {
+            continue;
+          }
           applicable.push_back(predicate.expression);
           predicate_placed[p] = true;
         }
@@ -4593,9 +4604,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         if (relations[i].schema.GetColumn(*offset).Type() != membership_type) {
           continue;
         }
-        const std::string& table = statement.Sources()[i].table;
         TableKeyFilter& stored =
-            context.execution_runtime()->table_key_filters[table];
+            context.execution_runtime()
+                ->table_key_filters[TableKeyFilterKey(statement.Sources()[i])];
         if (stored.empty() || membership_keys < stored.key_count) {
           // shared_ptr copy (refcount bump), not a move: the loop below keeps
           // handing the same group to every eligible source.
@@ -4636,7 +4647,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       }
       if (context.execution_runtime() != nullptr) {
         const auto stored = context.execution_runtime()->table_key_filters.find(
-            statement.Sources()[i].table);
+            TableKeyFilterKey(statement.Sources()[i]));
         if (stored != context.execution_runtime()->table_key_filters.end() &&
             stored->second.owner == &statement) {
           return 0;
@@ -4785,7 +4796,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           (context.execution_runtime() != nullptr && [&] {
             const auto stored =
                 context.execution_runtime()->table_key_filters.find(
-                    statement.Sources()[other].table);
+                    TableKeyFilterKey(statement.Sources()[other]));
             return stored !=
                        context.execution_runtime()->table_key_filters.end() &&
                    stored->second.owner == &statement;
@@ -4974,7 +4985,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               (context.execution_runtime() != nullptr && [&] {
                 const auto stored =
                     context.execution_runtime()->table_key_filters.find(
-                        statement.Sources()[member.rel].table);
+                        TableKeyFilterKey(statement.Sources()[member.rel]));
                 return stored != context.execution_runtime()
                                      ->table_key_filters.end() &&
                        stored->second.owner == &statement;
@@ -5040,7 +5051,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       const slot_t full_slot = proj[*key_column];
       TableKeyFilter& stored =
           context.execution_runtime()
-              ->table_key_filters[statement.Sources()[idx].table];
+              ->table_key_filters[TableKeyFilterKey(statement.Sources()[idx])];
       stored.filter = key_filter;
       stored.type = key_filter_type;
       stored.key_count = key_filter->DistinctKeys();
@@ -5054,7 +5065,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       // an uncorrelated IN pushdown). Entries owned by other statements are
       // never applied here.
       const auto stored = context.execution_runtime()->table_key_filters.find(
-          statement.Sources()[idx].table);
+          TableKeyFilterKey(statement.Sources()[idx]));
       if (stored != context.execution_runtime()->table_key_filters.end() &&
           stored->second.owner == &statement && !stored->second.empty()) {
         const auto& proj = projections[idx];

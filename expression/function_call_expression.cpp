@@ -51,6 +51,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3976,13 +3977,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, end, (numeric(values[1])));
     ASSIGN_OR_RETURN(
         double, step,
-        (values.size() == 3 ? numeric(values[2]) : StatusOr<double>(0.0)));
+        (values.size() == 3 ? numeric(values[2]) : StatusOr<double>(1.0)));
+    if (std::isnan(start) || std::isnan(end) || std::isnan(step)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GENERATE_ARRAY arguments must not be NaN");
+    }
     if (step == 0.0) {
-      if (values.size() == 3) {
-        return StatusError(StatusCode::kIsInfinity,
-                           "Sequence step cannot be 0.");
-      }
-      step = start <= end ? 1.0 : -1.0;
+      return StatusError(StatusCode::kIsInfinity, "Sequence step cannot be 0.");
     }
     const bool saw_double =
         values[0].type == ValueType::kDouble ||
@@ -3994,19 +3995,70 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         saw_uint = true;
       }
     }
-    const bool integral =
-        !saw_double &&
-        start == static_cast<double>(static_cast<int64_t>(start)) &&
-        step == static_cast<double>(static_cast<int64_t>(step));
-    const std::string element_type =
-        integral ? (saw_uint ? "UINT64" : "INT64") : "DOUBLE";
+    constexpr size_t kMaxGeneratedElements = 1'000'000;
+    if (!saw_double) {
+      const Value step_value = values.size() == 3 ? values[2] : Value(1);
+      const bool descending =
+          !step_value.IsUnsigned() && step_value.value.int_value < 0;
+      const std::string element_type = saw_uint ? "UINT64" : "INT64";
+      // A double loses integer precision above 2^53 and can round INT64_MAX
+      // or UINT64_MAX out of range. Keep every integer operation exact and
+      // stop when the next step would leave the representable domain.
+      const auto generate = [&](auto current, auto stop,
+                                auto stride) -> StatusOr<Value> {
+        using Integer = decltype(current);
+        std::vector<Value> elements;
+        while (descending ? current >= stop : current <= stop) {
+          if (elements.size() == kMaxGeneratedElements) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "GENERATE_ARRAY generated too many elements");
+          }
+          Value element(static_cast<int64_t>(current));
+          if (saw_uint) {
+            element.SetUnsigned();
+          }
+          elements.push_back(std::move(element));
+          if (current == stop) {
+            break;
+          }
+          Integer next = 0;
+          bool overflow = false;
+          if constexpr (std::is_unsigned_v<Integer>) {
+            overflow = descending
+                           ? __builtin_sub_overflow(current,
+                                                    Integer{0} - stride, &next)
+                           : __builtin_add_overflow(current, stride, &next);
+          } else {
+            overflow = __builtin_add_overflow(current, stride, &next);
+          }
+          if (overflow) {
+            break;
+          }
+          current = next;
+        }
+        return Value::Array(std::move(elements), element_type);
+      };
+      if (saw_uint) {
+        for (size_t i = 0; i < 2; ++i) {
+          if (!values[i].IsUnsigned() && values[i].value.int_value < 0) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "GENERATE_ARRAY UINT64 bounds must be nonnegative");
+          }
+        }
+        return generate(static_cast<uint64_t>(values[0].value.int_value),
+                        static_cast<uint64_t>(values[1].value.int_value),
+                        static_cast<uint64_t>(step_value.value.int_value));
+      }
+      return generate(values[0].value.int_value, values[1].value.int_value,
+                      step_value.value.int_value);
+    }
 
     if ((step > 0 && start > end) || (step < 0 && start < end)) {
-      return Value::Array({}, element_type);
+      return Value::Array({}, "DOUBLE");
     }
 
     std::vector<Value> elements;
-    constexpr size_t kMaxGeneratedElements = 1'000'000;
     // Repeated addition (not start + i*step) is the observable contract:
     // an integer-bound rewrite changes accumulated FP results element-wise.
     for (double value = start; (step > 0 ? value <= end : value >= end);
@@ -4015,22 +4067,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kInvalidArgument,
                            "GENERATE_ARRAY generated too many elements");
       }
-      if (integral) {
-        if (saw_uint) {
-          elements.emplace_back(
-              Value(static_cast<int64_t>(static_cast<uint64_t>(value)))
-                  .WithUnsigned());
-        } else {
-          elements.emplace_back(static_cast<int64_t>(value));
-        }
-      } else {
-        elements.emplace_back(value);
-      }
-      if (!std::isfinite(value + step)) {
+      elements.emplace_back(value);
+      if (value == end || !std::isfinite(value + step)) {
         break;
       }
     }
-    return Value::Array(std::move(elements), element_type);
+    return Value::Array(std::move(elements), "DOUBLE");
   }
 
   // GENERATE_SERIES (PostgreSQL spelling) is the element-wise twin of

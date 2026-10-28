@@ -148,6 +148,10 @@ std::string CommandTag(StatementType type, int64_t affected_rows) {
       return "CREATE MATERIALIZED VIEW";
     case StatementType::kDropMaterializedView:
       return "DROP MATERIALIZED VIEW";
+    case StatementType::kCreateView:
+      return "CREATE VIEW";
+    case StatementType::kDropView:
+      return "DROP VIEW";
   }
   return "OK";
 }
@@ -180,12 +184,16 @@ class PostgresServer::Impl {
         Database::Create(database_path);
     if (created.HasValue()) {
       database_ = created.MoveValue();
-      // Production default: wait-die. The manager's kLegacy policy aborts a
-      // conflicting writer after a 5 ms bounded wait, which under concurrent
-      // OLTP load turns transient row contention into abort storms; wait-die
-      // is deadlock-free by construction and only dies the younger waiter.
-      // The kLegacy default stays for the deterministic fuzz/test harnesses.
-      database_->SetDeadlockPolicy(Database::DeadlockPolicy::kWaitDie);
+      // Every write statement and COMMIT/ROLLBACK of every session runs on
+      // the single event-loop thread (only bare SELECTs go to read workers,
+      // and those never take write intents).  A writer that WAITS for
+      // another session's write intent therefore blocks the only thread
+      // that could ever commit or roll back the holder: the wait can never
+      // succeed and every row conflict stalled the whole server for the
+      // 5 s escape hatch before failing anyway (wait-die let the older
+      // transaction wait).  Fail the conflicting statement at once instead;
+      // the client sees the same conflict error immediately and retries.
+      database_->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
     } else {
       startup_error_ = "failed to open database " + database_path + ": " +
                        ToString(created.GetStatus());

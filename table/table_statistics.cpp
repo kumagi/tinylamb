@@ -449,6 +449,18 @@ int ResolveColumn(const Schema& schema, const ColumnName& column) {
   return -1;
 }
 
+// ResolveColumn for a statistics lookup: an offset past the statistics'
+// column vector (a derived plan whose stats are narrower than its schema)
+// is treated as unresolved instead of indexing out of range.
+int ResolveStatsColumn(const TableStatistics& table, const Schema& schema,
+                       const ColumnName& column) {
+  const int offset = ResolveColumn(schema, column);
+  if (offset < 0 || static_cast<size_t>(offset) >= table.Columns()) {
+    return -1;
+  }
+  return offset;
+}
+
 double ClampProbability(double probability) {
   if (!std::isfinite(probability)) {
     return 0;
@@ -646,8 +658,8 @@ double EstimatePredicate(const TableStatistics& table,
     if ((unary.Op() == UnaryOperation::kIsNull ||
          unary.Op() == UnaryOperation::kIsNotNull) &&
         unary.Child()->Type() == TypeTag::kColumnValue) {
-      const int offset =
-          ResolveColumn(schema, unary.Child()->AsColumnValue().GetColumnName());
+      const int offset = ResolveStatsColumn(
+          table, schema, unary.Child()->AsColumnValue().GetColumnName());
       if (offset < 0 || table.Rows() == 0) {
         return 0;
       }
@@ -670,8 +682,8 @@ double EstimatePredicate(const TableStatistics& table,
     if (in.child_->Type() != TypeTag::kColumnValue) {
       return 0.25;
     }
-    const int offset =
-        ResolveColumn(schema, in.child_->AsColumnValue().GetColumnName());
+    const int offset = ResolveStatsColumn(
+        table, schema, in.child_->AsColumnValue().GetColumnName());
     if (offset < 0) {
       return 0.25;
     }
@@ -753,8 +765,8 @@ double EstimatePredicate(const TableStatistics& table,
   const bool left_constant = binary.Left()->Type() == TypeTag::kConstantValue;
   const bool right_constant = binary.Right()->Type() == TypeTag::kConstantValue;
   if (left_column && right_constant) {
-    const int offset =
-        ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName());
+    const int offset = ResolveStatsColumn(
+        table, schema, binary.Left()->AsColumnValue().GetColumnName());
     if (offset < 0) {
       return 0.25;
     }
@@ -763,8 +775,8 @@ double EstimatePredicate(const TableStatistics& table,
         binary.Right()->AsConstantValue().GetValue());
   }
   if (left_constant && right_column) {
-    const int offset =
-        ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName());
+    const int offset = ResolveStatsColumn(
+        table, schema, binary.Right()->AsColumnValue().GetColumnName());
     if (offset < 0) {
       return 0.25;
     }
@@ -774,10 +786,10 @@ double EstimatePredicate(const TableStatistics& table,
         binary.Left()->AsConstantValue().GetValue());
   }
   if (left_column && right_column && binary.Op() == BinaryOperation::kEquals) {
-    const int left_offset =
-        ResolveColumn(schema, binary.Left()->AsColumnValue().GetColumnName());
-    const int right_offset =
-        ResolveColumn(schema, binary.Right()->AsColumnValue().GetColumnName());
+    const int left_offset = ResolveStatsColumn(
+        table, schema, binary.Left()->AsColumnValue().GetColumnName());
+    const int right_offset = ResolveStatsColumn(
+        table, schema, binary.Right()->AsColumnValue().GetColumnName());
     if (left_offset < 0 || right_offset < 0 || table.Rows() == 0) {
       return 0.1;
     }

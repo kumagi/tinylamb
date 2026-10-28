@@ -21,6 +21,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -910,6 +911,37 @@ TEST(PostgresServerTest, SyncAndFlushMessages) {
   database.DeleteAll();
 }
 
+TEST(PostgresServerTest, ViewCommandTagsOverTcp) {
+  const std::string path = "postgres_server_view_tag_test-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    ASSERT_TRUE(server.Listen(&listen_error)) << listen_error;
+    std::string run_error;
+    int run_result = -1;
+    std::jthread server_thread([&] { run_result = server.Run(&run_error); });
+    StopGuard stop_guard{&server};
+    const int client = ConnectClient(server.BoundPort());
+    ASSERT_GE(client, 0);
+    for (const auto& [sql, tag] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"CREATE VIEW protocol_view AS SELECT 1 AS id", "CREATE VIEW"},
+             {"DROP VIEW protocol_view", "DROP VIEW"}}) {
+      ASSERT_TRUE(SendAll(client, QueryMessage(sql)));
+      const std::string response = ReadUntilReady(client);
+      EXPECT_NE(response.find(tag), std::string::npos) << sql;
+    }
+    close(client);
+    server.RequestStop();
+    server_thread.join();
+    EXPECT_EQ(run_result, 0) << run_error;
+  }
+  auto database = Database::Create(path).MoveValue();
+  database->DeleteAll();
+}
+
 TEST(PostgresServerTest, DropTableCommandTagOverTcp) {
   const std::string path = "postgres_server_drop_test-" + RandomString();
   {
@@ -1759,6 +1791,75 @@ TEST(PostgresServerTest, ConcurrentWriteTransactionsOverTcp) {
   CHECK(database_holder != nullptr);
   Database& database = *database_holder;
   database.DeleteAll();
+}
+
+// Every write statement of every session runs on the single event-loop
+// thread, so a writer that WAITED for another session's write intent blocked
+// the only thread able to commit the holder: each row conflict stalled the
+// whole server for the 5 s write-intent escape hatch.  The conflicting
+// statement must fail at once and the holder must commit normally.
+TEST(PostgresServerTest, RowConflictFailsFastInsteadOfStallingTheLoop) {
+  const std::string path = "postgres_server_conflict_test-" + RandomString();
+  {
+    PostgresServerOptions options;
+    options.port = 0;
+    PostgresServer server(path, options);
+    std::string listen_error;
+    ASSERT_TRUE(server.Listen(&listen_error)) << listen_error;
+    std::string run_error;
+    int run_result = -1;
+    std::jthread server_thread([&] { run_result = server.Run(&run_error); });
+    StopGuard stop_guard{&server};
+
+    const int holder = ConnectClient(server.BoundPort());
+    const int waiter = ConnectClient(server.BoundPort());
+    ASSERT_GE(holder, 0);
+    ASSERT_GE(waiter, 0);
+    ASSERT_TRUE(SendAll(
+        holder, QueryMessage("CREATE TABLE hot (id INT64 PRIMARY KEY, v "
+                             "INT64);")));
+    ASSERT_FALSE(ReadUntilReady(holder).empty());
+    ASSERT_TRUE(
+        SendAll(holder, QueryMessage("INSERT INTO hot VALUES (1, 0);")));
+    ASSERT_FALSE(ReadUntilReady(holder).empty());
+
+    ASSERT_TRUE(SendAll(holder, QueryMessage("BEGIN;")));
+    ASSERT_FALSE(ReadUntilReady(holder).empty());
+    ASSERT_TRUE(SendAll(
+        holder, QueryMessage("UPDATE hot SET v = v + 1 WHERE id = 1;")));
+    EXPECT_NE(ReadUntilReady(holder).find("UPDATE 1"), std::string::npos);
+
+    // Act -- a second session updates the same row while the intent is held.
+    const auto begin = std::chrono::steady_clock::now();
+    ASSERT_TRUE(SendAll(
+        waiter, QueryMessage("UPDATE hot SET v = v + 10 WHERE id = 1;")));
+    const std::string conflicted = ReadUntilReady(waiter);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+
+    // Assert -- the conflict is reported promptly (no multi-second stall)...
+    EXPECT_NE(conflicted.find('E'), std::string::npos);
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    // ...and the holder still commits its own update.
+    ASSERT_TRUE(SendAll(holder, QueryMessage("COMMIT;")));
+    EXPECT_NE(ReadUntilReady(holder).find("COMMIT"), std::string::npos);
+    ASSERT_TRUE(
+        SendAll(waiter, QueryMessage("SELECT v FROM hot WHERE id = 1;")));
+    const std::string selected = ReadUntilReady(waiter);
+    EXPECT_NE(selected.find("SELECT 1"), std::string::npos);
+    // DataRow cell: 4-byte length 1 followed by the text "1" (v = 0 + 1).
+    EXPECT_NE(selected.find(std::string("\0\0\0\x01"
+                                        "1",
+                                        5)),
+              std::string::npos);
+    close(holder);
+    close(waiter);
+    server.RequestStop();
+    server_thread.join();
+    EXPECT_EQ(run_result, 0) << run_error;
+  }
+  auto database_holder = Database::Create(path).MoveValue();
+  CHECK(database_holder != nullptr);
+  database_holder->DeleteAll();
 }
 
 TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {

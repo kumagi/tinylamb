@@ -110,6 +110,17 @@ TEST(IntervalTest, JustifyInterval) {
   EXPECT_THROW((void)Iv(INT64_MAX, 0, 0).JustifyInterval(), std::runtime_error);
 }
 
+TEST(IntervalTest, JustifyPreservesMinimumInt64Components) {
+  constexpr int64_t min = INT64_MIN;
+  EXPECT_EQ(Iv(7, 0, min).TryJustifyHours().MoveValue(),
+            Iv(7, min / kDayNanos, min % kDayNanos));
+  EXPECT_EQ(Iv(0, min, 7).TryJustifyDays().MoveValue(),
+            Iv(min / 30, min % 30, 7));
+  EXPECT_EQ(
+      Iv(0, 0, min).TryJustifyInterval().MoveValue(),
+      Iv(min / kMonthNanos, (min % kMonthNanos) / kDayNanos, min % kDayNanos));
+}
+
 // ---------------------------------------------------------------- output ---
 
 TEST(IntervalTest, ToStringShapes) {

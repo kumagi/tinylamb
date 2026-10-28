@@ -110,6 +110,14 @@ struct CorrelatedIndex {
 // statement so unrelated scans of the same table (e.g. sibling subqueries) are
 // never filtered by it.  `column` is a full-schema slot; consumers remap it
 // into their own projection.
+// `ExecutionRuntime::table_key_filters` is keyed by the source's in-statement
+// name (alias, else table name), never the bare base table: a self-join names
+// the same table twice, and a key domain derived for one alias (from that
+// alias's join predicate) must never prune another alias's scan.
+inline std::string TableKeyFilterKey(const SelectSource& source) {
+  return source.alias.empty() ? source.table : source.alias;
+}
+
 struct TableKeyFilter {
   std::shared_ptr<const RuntimeFilterGroup> filter;
   // ValueType of `column`. A filter built over INT64 keys must never prune a

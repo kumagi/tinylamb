@@ -71,7 +71,8 @@ class LimitPlan final : public PlanBase {
     return limit_count == limit_count_ && limit_offset == limit_offset_;
   }
   [[nodiscard]] bool EnforcesDistinct() const override {
-    return limit_count_ <= 1 || src_->EnforcesDistinct();
+    // Zero is the unbounded sentinel used by OFFSET-only execution.
+    return limit_count_ == 1 || src_->EnforcesDistinct();
   }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;

@@ -46,6 +46,7 @@ class SetOperationPlan final : public PlanBase {
   [[nodiscard]] const Schema& GetSchema() const override { return schema_; }
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
+  [[nodiscard]] Collation OrderCollation() const override;
   [[nodiscard]] bool IsOrderedBy(
       const std::vector<Expression>& expressions,
       const std::vector<bool>& ascending) const override;

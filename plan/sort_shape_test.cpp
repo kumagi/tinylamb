@@ -29,6 +29,9 @@
 #include "database/transaction_context.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/hash_join_mode.hpp"
+#include "executor/join_kind.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -37,9 +40,20 @@
 #include "expression/named_expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "plan/cascades.hpp"
+#include "plan/distinct_plan.hpp"
 #include "plan/implementation_rules.hpp"
+#include "plan/incremental_sort_plan.hpp"
+#include "plan/limit_plan.hpp"
+#include "plan/materialize_plan.hpp"
+#include "plan/max1_row_plan.hpp"
 #include "plan/plan.hpp"
+#include "plan/product_plan.hpp"
+#include "plan/relation_rename_plan.hpp"
+#include "plan/sample_plan.hpp"
+#include "plan/set_operation_plan.hpp"
+#include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
+#include "plan/window_plan.hpp"
 #include "table/table_statistics.hpp"
 #include "type/collation.hpp"
 #include "type/column.hpp"
@@ -197,6 +211,188 @@ class SortShapeTest : public ::testing::Test {
 }  // namespace
 
 // ------------------------------------------------------- logical contract ---
+
+TEST_F(SortShapeTest, SpillingSemiAntiJoinCannotElideParentSort) {
+  struct RestoreBudget {
+    size_t saved = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(saved); }
+  } restore;
+  TransactionContext context = database_->BeginContext();
+  for (const JoinKind kind :
+       {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kNullAwareAnti}) {
+    for (const HashJoinMode mode :
+         {HashJoinMode::kInMemory, HashJoinMode::kHybrid}) {
+      for (const bool reduction : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << static_cast<int>(kind) << "," << static_cast<int>(mode)
+                     << "," << reduction);
+        QueryMemoryBudget::Global().ResetForTest(1024);
+        std::vector<Row> probe;
+        std::vector<Row> build;
+        for (int64_t key = 0; key < 128; ++key) {
+          probe.emplace_back(Row({Value(key), Value(std::string(64, 'x'))}));
+          if (key % 2 == 0) {
+            build.emplace_back(Row({Value(key), Value("build")}));
+          }
+        }
+        const Plan sorted = std::make_shared<BufferedSortPlan>(
+            LeafWith(std::move(probe)), KeysOf({BinaryKey(KKey())}));
+        const auto join = std::make_shared<ProductPlan>(
+            sorted, std::vector<ColumnName>{ColumnName("k")},
+            LeafWith(std::move(build)),
+            std::vector<ColumnName>{ColumnName("k")}, mode, kind);
+        if (reduction) {
+          join->PreferSemiReduction();
+        }
+        const auto alternatives = ApplySortRule("sort", join, 64);
+        ASSERT_EQ(alternatives.size(), 1U);
+        const Plan limited =
+            std::make_shared<LimitPlan>(alternatives[0].plan, 4, 1);
+        const Executor executor = limited->EmitExecutor(context);
+        const std::vector<Row> output = Drain(executor);
+        ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
+        ASSERT_EQ(output.size(), 4U);
+        for (size_t i = 0; i < output.size(); ++i) {
+          EXPECT_EQ(output[i][0], Value(static_cast<int64_t>(2 * (i + 1)) +
+                                        (kind == JoinKind::kSemi ? 0 : 1)));
+        }
+        EXPECT_FALSE(join->IsOrderedBy({KKey()}, {true}));
+      }
+    }
+  }
+}
+
+TEST_F(SortShapeTest, OffsetOnlyLimitDoesNotProveDistinctness) {
+  const Plan limited = std::make_shared<LimitPlan>(
+      LeafWith({Row({Value(1), Value("x")}), Row({Value(1), Value("x")}),
+                Row({Value(1), Value("x")})}),
+      0, 1);
+  EXPECT_EQ(limited->EmitRowCount(), 2U);
+  EXPECT_FALSE(limited->EnforcesDistinct());
+  // Mirror the SQL facade's DISTINCT safety net: an unbounded limit must
+  // not convince its consumer to omit duplicate elimination.
+  Plan output = limited;
+  if (!output->EnforcesDistinct()) {
+    output = std::make_shared<DistinctPlan>(output);
+  }
+  TransactionContext context = database_->BeginContext();
+  const Executor executor = output->EmitExecutor(context);
+  EXPECT_EQ(Drain(executor), (std::vector<Row>{Row({Value(1), Value("x")})}));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  EXPECT_TRUE(std::make_shared<LimitPlan>(limited, 1, 0)->EnforcesDistinct());
+}
+
+TEST_F(SortShapeTest, OrderedWrappersKeepTheChildCollation) {
+  const SortKey folded{.expression = NameKey(),
+                       .ascending = true,
+                       .nulls_first = std::nullopt,
+                       .collation = Collation::kCaseInsensitive};
+  for (int wrapper = 0; wrapper < 7; ++wrapper) {
+    SCOPED_TRACE(wrapper);
+    const Plan sorted = std::make_shared<BufferedSortPlan>(
+        LeafWith({Row({Value(1), Value("a")}), Row({Value(2), Value("B")})}),
+        KeysOf({folded}));
+    Plan input;
+    switch (wrapper) {
+      case 0:
+        input = std::make_shared<DistinctPlan>(sorted);
+        break;
+      case 1:
+        input = std::make_shared<SortDistinctPlan>(sorted);
+        break;
+      case 2:
+        input = std::make_shared<RelationRenamePlan>(sorted, "alias", "");
+        break;
+      case 3:
+        input = std::make_shared<MaterializePlan>(sorted);
+        break;
+      case 4:
+        input = std::make_shared<WindowPlan>(sorted,
+                                             std::vector<NamedExpression>{});
+        break;
+      case 5:
+        input = std::make_shared<SamplePlan>(
+            sorted, TableSampleSpec{.size = ConstantValueExp(Value(100)),
+                                    .repeatable_seed = std::nullopt,
+                                    .partition_by = {}});
+        break;
+      default:
+        input = std::make_shared<SetOperationPlan>(std::vector<Plan>{sorted},
+                                                   SetOperationKind::kUnionAll,
+                                                   KeysOf({folded}));
+        break;
+    }
+    EXPECT_EQ(input->OrderCollation(), Collation::kCaseInsensitive);
+    cascades::Memo memo;
+    const auto root = memo.Build({"leaf"});
+    const auto alternatives =
+        RuleByName("sort").Apply(memo, root, SortLogical(root, NameKey()),
+                                 {BestPlan{.plan = input, .estimated_rows = 2}},
+                                 PhysicalProperties{}, RuleContext::Empty());
+    ASSERT_EQ(alternatives.size(), 1U);
+    auto context = database_->BeginContext();
+    const Executor executor = alternatives[0].plan->EmitExecutor(context);
+    const auto rows = Drain(executor);
+    ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(rows[0][1], Value("B"));
+    EXPECT_EQ(rows[1][1], Value("a"));
+  }
+}
+
+TEST_F(SortShapeTest, IncrementalSortKeepsItsSuffixCollation) {
+  const auto input = std::make_shared<IncrementalSortPlan>(
+      LeafWith({Row({Value(1), Value("a")}), Row({Value(1), Value("B")})}),
+      KeysOf({BinaryKey(KKey())}),
+      KeysOf({SortKey{.expression = NameKey(),
+                      .ascending = true,
+                      .nulls_first = std::nullopt,
+                      .collation = Collation::kCaseInsensitive}}));
+  EXPECT_EQ(input->OrderCollation(), Collation::kCaseInsensitive);
+  EXPECT_EQ(std::make_shared<Max1RowPlan>(input)->OrderCollation(),
+            Collation::kCaseInsensitive);
+  cascades::Memo memo;
+  const auto root = memo.Build({"leaf"});
+  auto logical = SortLogical(root, KKey());
+  logical.target_list.emplace_back("name", NameKey());
+  logical.sort_ascending.push_back(true);
+  const auto alternatives = RuleByName("sort").Apply(
+      memo, root, logical, {BestPlan{.plan = input, .estimated_rows = 2}},
+      PhysicalProperties{}, RuleContext::Empty());
+  ASSERT_EQ(alternatives.size(), 1U);
+  auto context = database_->BeginContext();
+  const auto executor = alternatives[0].plan->EmitExecutor(context);
+  EXPECT_EQ(Drain(executor), (std::vector<Row>{Row({Value(1), Value("B")}),
+                                               Row({Value(1), Value("a")})}));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+}
+
+TEST_F(SortShapeTest, SortedDistinctRequiresTheSameCollationAsItsInput) {
+  const Plan input = std::make_shared<BufferedSortPlan>(
+      LeafWith({Row({Value(1), Value("a")}), Row({Value(1), Value("A")}),
+                Row({Value(1), Value("a")})}),
+      KeysOf({BinaryKey(KKey()),
+              SortKey{.expression = NameKey(),
+                      .ascending = true,
+                      .nulls_first = std::nullopt,
+                      .collation = Collation::kCaseInsensitive}}));
+  cascades::Memo memo;
+  const auto root = memo.Build({"leaf"});
+  const LogicalExpression logical{.operation = LogicalOperator::kDistinct,
+                                  .children = {root}};
+  const auto alternatives =
+      RuleByName("sort_distinct")
+          .Apply(memo, root, logical,
+                 {BestPlan{.plan = input, .estimated_rows = 3}},
+                 PhysicalProperties{}, RuleContext::Empty());
+  ASSERT_EQ(alternatives.size(), 1U);
+  auto context = database_->BeginContext();
+  const auto executor = alternatives[0].plan->EmitExecutor(context);
+  const auto rows = Drain(executor);
+  ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
+  EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1), Value("A")}),
+                                    Row({Value(1), Value("a")})}));
+}
 
 TEST_F(SortShapeTest, BothShapesCarryTheSameOrderContract) {
   const std::shared_ptr<SortPlan> buffered =

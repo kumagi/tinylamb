@@ -172,11 +172,19 @@ class TransactionManager {
   //                     and lock-hold time is hard to bound.
   //   kLegacy        -- the pre-policy behavior: wait up to a short timeout,
   //                     then abort self. No deadlock prevention, no detection.
+  //   kNoWait        -- never wait: a conflicting writer fails at once (the
+  //                     try-lock path), so the caller aborts and retries.
+  //                     Required when every transaction executes on ONE
+  //                     thread (the PostgreSQL server's event loop): there the
+  //                     holder can only make progress after the waiter
+  //                     returns, so any wait is a self-deadlock that rides the
+  //                     5 s escape hatch and then fails anyway.
   enum class DeadlockPolicy : uint8_t {
     kLegacy = 0,
     kWaitDie = 1,
     kWoundWait = 2,
     kDeadlockDetect = 3,
+    kNoWait = 4,
   };
   void SetDeadlockPolicy(DeadlockPolicy policy) {
     deadlock_policy_.store(static_cast<uint8_t>(policy),

@@ -59,6 +59,51 @@ TEST(RowTest, SerializeDeserialize_WithNullValues_PreservesNulls) {
   EXPECT_EQ(restored[2], Value(3.5));
 }
 
+TEST(RowTest, ReusedDecodeSlotsDoNotRetainPreviousUnsignedTags) {
+  for (int mode = 0; mode < 3; ++mode) {
+    for (bool variable : {false, true}) {
+      for (bool nullable : {false, true}) {
+        for (bool subset : {false, true}) {
+          SCOPED_TRACE(::testing::Message() << mode << "," << variable << ","
+                                            << nullable << "," << subset);
+          const ValueType second_type =
+              variable ? ValueType::kVarChar : ValueType::kInt64;
+          const Schema schema(
+              "t", {Column("a", ValueType::kInt64), Column("b", second_type)});
+          const Row source({Value(-1), nullable   ? Value()
+                                       : variable ? Value("plain")
+                                                  : Value(2)});
+          std::string image(source.Size(), '\0');
+          source.Serialize(image.data());
+          const std::vector<slot_t> columns =
+              subset ? std::vector<slot_t>{0} : std::vector<slot_t>{0, 1};
+          const size_t width = mode == 0 ? 2 : columns.size();
+          Row restored(std::vector<Value>(width, Value(1).WithUnsigned()));
+          RowDecodePlan plan;
+          plan.stored_count = 2;
+          plan.kept_count = width;
+          plan.stored_types = {ValueType::kInt64, second_type};
+          plan.stored_slot = {0, subset ? RowDecodePlan::kNoSlot : 1};
+          plan.slot_unsigned.resize(width);
+          plan.all_fixed = !variable;
+          const auto decoded =
+              mode == 0   ? restored.TryDeserialize(image.data(), schema)
+              : mode == 1 ? restored.TryDeserializeProjected(image.data(),
+                                                             schema, columns)
+                          : restored.TryDeserializePlanned(image.data(), plan);
+          ASSERT_TRUE(decoded.HasValue());
+          EXPECT_EQ(decoded.Value(), image.size());
+          ASSERT_EQ(restored.Count(), width);
+          for (size_t i = 0; i < width; ++i) {
+            EXPECT_EQ(restored[i].Collation(), 0);
+            EXPECT_EQ(restored[i], source[i]);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(RowTest,
      DeserializeProjected_WithSubsetIndices_KeepsOnlyRequestedColumns) {
   const Schema schema("projected", {Column("id", ValueType::kInt64),

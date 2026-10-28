@@ -49,6 +49,12 @@ class Max1RowPlan final : public PlanBase {
     return child_->IsOrderedBy(expressions, ascending, nulls_first);
   }
   [[nodiscard]] bool EnforcesDistinct() const override { return true; }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return child_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return child_->OrderIsMeasured();
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override { return "Max1Row"; }
 

@@ -99,17 +99,11 @@ StatusOr<IntervalValue> IntervalValue::TryJustifyHours() const {
     return StatusError(StatusCode::kInvalidArgument,
                        "INTERVAL computation out of range");
   }
-  bool neg = (total_nanos < 0);
-  int64_t abs_nanos = std::abs(total_nanos);
-
-  int64_t res_days = abs_nanos / kDayNanos;
-  int64_t res_nanos = abs_nanos % kDayNanos;
-
-  if (neg) {
-    return IntervalValue{
-        .months = months, .days = -res_days, .nanos = -res_nanos};
-  }
-  return IntervalValue{.months = months, .days = res_days, .nanos = res_nanos};
+  // Signed quotient/remainder already preserve the input sign, including
+  // INT64_MIN, whose absolute value is not representable.
+  return IntervalValue{.months = months,
+                       .days = total_nanos / kDayNanos,
+                       .nanos = total_nanos % kDayNanos};
 }
 
 StatusOr<IntervalValue> IntervalValue::TryJustifyDays() const {
@@ -119,17 +113,8 @@ StatusOr<IntervalValue> IntervalValue::TryJustifyDays() const {
     return StatusError(StatusCode::kInvalidArgument,
                        "INTERVAL computation out of range");
   }
-  bool neg = (total_days < 0);
-  int64_t abs_days = std::abs(total_days);
-
-  int64_t res_months = abs_days / 30;
-  int64_t res_days = abs_days % 30;
-
-  if (neg) {
-    return IntervalValue{
-        .months = -res_months, .days = -res_days, .nanos = nanos};
-  }
-  return IntervalValue{.months = res_months, .days = res_days, .nanos = nanos};
+  return IntervalValue{
+      .months = total_days / 30, .days = total_days % 30, .nanos = nanos};
 }
 
 StatusOr<IntervalValue> IntervalValue::TryJustifyInterval() const {
@@ -138,21 +123,10 @@ StatusOr<IntervalValue> IntervalValue::TryJustifyInterval() const {
 
   // Overflow-checked via TryTotalNanos().
   ASSIGN_OR_RETURN(int64_t, total_nanos, TryTotalNanos());
-  bool neg = (total_nanos < 0);
-  int64_t abs_nanos = std::abs(total_nanos);
-
-  int64_t res_months = abs_nanos / kMonthNanos;
-  int64_t rem_after_months = abs_nanos % kMonthNanos;
-
-  int64_t res_days = rem_after_months / kDayNanos;
-  int64_t res_nanos = rem_after_months % kDayNanos;
-
-  if (neg) {
-    return IntervalValue{
-        .months = -res_months, .days = -res_days, .nanos = -res_nanos};
-  }
-  return IntervalValue{
-      .months = res_months, .days = res_days, .nanos = res_nanos};
+  const int64_t rem_after_months = total_nanos % kMonthNanos;
+  return IntervalValue{.months = total_nanos / kMonthNanos,
+                       .days = rem_after_months / kDayNanos,
+                       .nanos = rem_after_months % kDayNanos};
 }
 
 StatusOr<std::string> IntervalValue::TryToString() const {

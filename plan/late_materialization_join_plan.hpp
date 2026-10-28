@@ -86,6 +86,10 @@ class LateMaterializationJoinPlan final : public PlanBase {
 
  private:
   void InitializeProjection(const Schema& declared_output);
+  // Appends the payload columns' statistics so stats_ has one column per
+  // output column (stats_ started as the left input's statistics only, and a
+  // Selection over this join then indexed past the end of the column stats).
+  void AppendPayloadStats(const TableStatistics* right_statistics);
 
   Plan left_;
   const Table* right_table_{nullptr};

@@ -49,6 +49,12 @@ class DistinctPlan final : public PlanBase {
     return child_->IsOrderedBy(expressions, ascending, nulls_first);
   }
   [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return child_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return child_->OrderIsMeasured();
+  }
   [[nodiscard]] const std::vector<Expression>& DistinctOn() const {
     return distinct_on_;
   }

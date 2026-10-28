@@ -186,7 +186,16 @@ std::string SharedBuildParallelHashJoin::MakeKey(
         key.push_back('\0');
         continue;
       }
-      key += value.EncodeMemcomparableFormat();
+      // Numeric equality matches a nonnegative INT64 against the same
+      // UINT64. Their index encodings have different type tags, so normalize
+      // the overlapping domain before hashing. High UINT64s keep their tag
+      // and cannot collide with negative signed values sharing their bits.
+      if (value.type == ValueType::kInt64 && value.IsUnsigned() &&
+          value.value.int_value >= 0) {
+        key += Value(value.value.int_value).EncodeMemcomparableFormat();
+      } else {
+        key += value.EncodeMemcomparableFormat();
+      }
     }
   }
   return key;
@@ -423,9 +432,9 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
       num_threads);
 
   // Fixed-width int fast path: the build side decided the uniform key type.
-  // A probe row whose key deviates from it cannot equal any build key under
-  // the byte encoding either (different type tags), so it takes the
-  // no-match path for every kind.
+  // UINT64 probes in the nonnegative INT64 domain compare numerically with
+  // signed build keys. A high UINT64 cannot match a signed key, even when its
+  // raw bits look like a negative integer. DATE remains a separate domain.
   const bool int_mode = shared_hash_table_.IntKeyMode();
   const size_t key_parts = std::min(probe_cols.size(), size_t{4});
   auto probe_qualifies = [&](const Row& candidate) {
@@ -434,9 +443,9 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
         return false;
       }
       const Value& v = candidate[col];
-      return int_key_type_ == 1
-                 ? (v.type == ValueType::kInt64 && !v.IsUnsigned())
-                 : v.type == ValueType::kDate;
+      return int_key_type_ == 1 ? (v.type == ValueType::kInt64 &&
+                                   (!v.IsUnsigned() || v.value.int_value >= 0))
+                                : v.type == ValueType::kDate;
     });
   };
 

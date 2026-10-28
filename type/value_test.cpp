@@ -830,6 +830,67 @@ TEST(DateTest, AddDateIntervalDays_WithUnknownUnits_ThrowsRuntimeError) {
                std::runtime_error);
 }
 
+TEST(DateTest, ParseAndArithmeticRejectUnformattableDates) {
+  EXPECT_FALSE(TryParseDateDays("32767-12-31").HasValue());
+  for (const int64_t boundary : {kDateMinDays, kDateMaxDays}) {
+    SCOPED_TRACE(boundary);
+    EXPECT_TRUE(TryFormatDateDays(boundary).HasValue());
+    EXPECT_EQ(TryAddDateIntervalDays(boundary, 0, "months").MoveValue(),
+              boundary);
+    EXPECT_FALSE(
+        TryAddDateIntervalDays(boundary, boundary < 0 ? -1 : 1, "years")
+            .HasValue());
+    EXPECT_FALSE(
+        TryAddDateIntervalDays(boundary, boundary < 0 ? -1 : 1, "months")
+            .HasValue());
+  }
+}
+
+TEST(DateTest, ExtremeMonthOffsetsFailWithoutOverflow) {
+  const int64_t base = ParseDateDays("2024-01-31");
+  EXPECT_FALSE(TryAddDateIntervalDays(base, INT64_MIN, "months").HasValue());
+  EXPECT_FALSE(TryAddDateIntervalDays(base, INT64_MAX, "months").HasValue());
+}
+
+TEST(ValueTest, DeserializeReusedValueClearsPreviousAttributes) {
+  for (const Value& original :
+       {Value(-1), Value("plain"), Value(2.5), Value::DateFromDays(0),
+        Value::Array({Value(1)}, "INT64")}) {
+    std::string image(original.Size(), '\0');
+    original.Serialize(image.data());
+    Value restored = Value(1).WithUnsigned();
+    ASSERT_TRUE(
+        restored.TryDeserialize(image.data(), original.type).HasValue());
+    EXPECT_EQ(restored.Collation(), 0);
+    EXPECT_EQ(restored, original);
+
+    restored = Value(1).WithUnsigned();
+    std::stringstream stream;
+    Encoder encoder(stream);
+    encoder << original;
+    Decoder decoder(stream);
+    decoder >> restored;
+    ASSERT_FALSE(decoder.Failed());
+    EXPECT_EQ(restored.Collation(), 0);
+    EXPECT_EQ(restored, original);
+
+    restored = Value("old").WithCollation(2);
+    ASSERT_TRUE(
+        restored
+            .TryDecodeMemcomparableFormat(original.EncodeMemcomparableFormat())
+            .HasValue());
+    EXPECT_EQ(restored.Collation(), 0);
+    EXPECT_EQ(restored, original);
+  }
+  Value restored = Value(1).WithUnsigned();
+  ASSERT_TRUE(
+      restored
+          .TryDecodeMemcomparableFormat(Value(-1).EncodeMemcomparableFormat())
+          .HasValue());
+  EXPECT_FALSE(restored.IsUnsigned());
+  EXPECT_EQ(restored, Value(-1));
+}
+
 TEST(DateTest, ValueDateFromDays_ValidDays_ConstructsExpectedValue) {
   const std::vector<int64_t> day_counts = {ParseDateDays("1970-01-01"),
                                            ParseDateDays("2020-02-29"),

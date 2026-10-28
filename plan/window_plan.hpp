@@ -137,6 +137,12 @@ class WindowPlan final : public PlanBase {
       const std::vector<bool>& ascending,
       const std::vector<std::optional<bool>>& nulls_first) const override;
   [[nodiscard]] const Plan& GetSource() const { return child_; }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return child_ != nullptr ? child_->OrderCollation() : Collation::kNone;
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return child_ != nullptr && child_->OrderIsMeasured();
+  }
   [[nodiscard]] const std::vector<NamedExpression>& WindowOutputs() const {
     return window_outputs_;
   }

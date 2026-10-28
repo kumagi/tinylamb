@@ -477,6 +477,16 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
       if (!references_outer) {
         continue;
       }
+      // Mirror TryDecorrelate: a NOT IN whose subquery carries its own
+      // correlation equality has tuple-valued UNKNOWN semantics the
+      // null-aware anti join does not model, so the optimizer keeps that
+      // conjunct as a plain filter -- which has no subquery evaluation
+      // context and fails at run time ("query expression requires
+      // relational evaluation").  Keep the statement on the scope-aware
+      // relational evaluator instead.
+      if (!query.Exists() && query.Negated()) {
+        return false;
+      }
       // The QueryData decorrelator intentionally accepts only column-to-column
       // equality keys. Expressions such as `outer.k + 1 = inner.k` must stay
       // on the scope-aware evaluator rather than becoming a residual filter
@@ -488,6 +498,19 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
               TypeTag::kColumnValue ||
           inner_conjunct->AsBinaryExpression().Right()->Type() !=
               TypeTag::kColumnValue) {
+        return false;
+      }
+      // ...and the key must cross the scopes: exactly one operand outer.
+      // An outer-only equality (`x.a = x.b` inside the subquery) is rejected
+      // by TryDecorrelate and would otherwise be stranded on a context-free
+      // physical filter.
+      const auto is_outer = [&](const Expression& operand) {
+        const ColumnName& column = operand->AsColumnValue().GetColumnName();
+        return !column.schema.empty() && outer_names.contains(column.schema) &&
+               !inner_names.contains(column.schema);
+      };
+      if (is_outer(inner_conjunct->AsBinaryExpression().Left()) ==
+          is_outer(inner_conjunct->AsBinaryExpression().Right())) {
         return false;
       }
     }

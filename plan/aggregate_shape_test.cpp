@@ -54,11 +54,13 @@
 #include "plan/implementation_rules.hpp"
 #include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
+#include "plan/sort_plan.hpp"
 #include "query/sql_engine.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/constraint.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -323,6 +325,251 @@ class AggregateShapeTest : public ::testing::Test {
 };
 
 }  // namespace
+
+TEST_F(AggregateShapeTest, ComputedGroupingDoesNotProveAtMostOneRow) {
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode);
+    cascades::Memo memo;
+    (void)memo.Build({"leaf"});
+    const auto values = memo.EnsureDerivedGroup({"leaf"}, "values");
+    const Schema input("leaf", {Column("k", ValueType::kInt64),
+                                Column("v", ValueType::kInt64)});
+    ASSERT_TRUE(memo.AddExpression(
+        values, LogicalExpression{.operation = LogicalOperator::kValues,
+                                  .values = {Row({Value(0), Value(1)}),
+                                             Row({Value(0), Value(2)}),
+                                             Row({Value(0), Value(3)})},
+                                  .output_schema = input}));
+    const auto aggregate = memo.EnsureDerivedGroup({"leaf"}, "grouped");
+    LogicalExpression grouping;
+    grouping.operation = LogicalOperator::kAggregation;
+    grouping.children = {values};
+    grouping.target_list = {CountStar()};
+    const Expression key = FunctionCallExp("abs", {ColumnValueExp("leaf.v")});
+    (mode == 1 ? grouping.partition_by : grouping.grouping_sets) = {key};
+    if (mode == 2) {
+      grouping.grouping_sets.push_back(ColumnValueExp("leaf.k"));
+    }
+    ASSERT_TRUE(memo.AddExpression(aggregate, grouping));
+    EXPECT_FALSE(memo.Get(aggregate).logical_properties.max_1_row);
+    EXPECT_FALSE(memo.Get(aggregate).logical_properties.IsUniqueOn({"leaf.k"}));
+    const auto projection = memo.EnsureDerivedGroup({"leaf"}, "counts");
+    ASSERT_TRUE(memo.AddExpression(
+        projection, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                      .children = {aggregate},
+                                      .target_list = {NamedExpression("n")}}));
+    const auto root = memo.EnsureDerivedGroup({"leaf"}, "distinct_counts");
+    ASSERT_TRUE(memo.AddExpression(
+        root, LogicalExpression{.operation = LogicalOperator::kDistinct,
+                                .children = {projection}}));
+    cascades::SearchEngine search(std::move(memo),
+                                  cascades::RuleSet::Default());
+    search.Explore(root);
+    const auto best = search.Optimize(root, PhysicalProperties{},
+                                      DefaultImplementationRules());
+    ASSERT_TRUE(best.has_value());
+    auto context = database_->BeginContext();
+    const auto executor = best->plan->EmitExecutor(context);
+    std::vector<Row> rows;
+    Row row;
+    while (executor->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
+    EXPECT_EQ(rows, (std::vector<Row>{Row({Value(1)})}));
+  }
+}
+
+TEST_F(AggregateShapeTest, CountOfNullSupplyingOuterColumnKeepsItsArgument) {
+  for (const bool project_right : {false, true}) {
+    SCOPED_TRACE(project_right);
+    cascades::Memo memo;
+    const Schema left_schema("l", {Column("id", ValueType::kInt64,
+                                          Constraint(Constraint::kNotNull))});
+    const Schema right_schema("r", {Column("id", ValueType::kInt64,
+                                           Constraint(Constraint::kNotNull))});
+    memo.SetTableSchemas({{"l", left_schema}, {"r", right_schema}});
+    (void)memo.Build({"l", "r"});
+    const auto left = memo.EnsureDerivedGroup({"l"}, "left_values");
+    const auto right = memo.EnsureDerivedGroup({"r"}, "right_values");
+    ASSERT_TRUE(memo.AddExpression(
+        left, LogicalExpression{.operation = LogicalOperator::kValues,
+                                .values = {Row({Value(1)}), Row({Value(2)})},
+                                .output_schema = left_schema}));
+    ASSERT_TRUE(memo.AddExpression(
+        right, LogicalExpression{.operation = LogicalOperator::kValues,
+                                 .values = {Row({Value(1)})},
+                                 .output_schema = right_schema}));
+    const auto outer = memo.EnsureDerivedGroup({"l", "r"}, "outer");
+    ASSERT_TRUE(memo.AddExpression(
+        outer,
+        LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                          .children = {left, right},
+                          .predicate = BinaryExpressionExp(
+                              ColumnValueExp("l.id"), BinaryOperation::kEquals,
+                              ColumnValueExp("r.id")),
+                          .join_type = 0,
+                          .output_schema = left_schema + right_schema}));
+    EXPECT_FALSE(memo.Get(outer).logical_properties.IsNotNull("r.id"));
+    auto input = outer;
+    if (project_right) {
+      input = memo.EnsureDerivedGroup({"l", "r"}, "project_outer");
+      ASSERT_TRUE(memo.AddExpression(
+          input, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                   .children = {outer},
+                                   .target_list = {NamedExpression(
+                                       "id", ColumnValueExp("r.id"))},
+                                   .output_schema = right_schema}));
+      EXPECT_FALSE(memo.Get(input).logical_properties.IsNotNull("r.id"));
+    }
+    const auto root = memo.EnsureDerivedGroup({"l", "r"}, "count_outer");
+    ASSERT_TRUE(memo.AddExpression(
+        root, LogicalExpression{
+                  .operation = LogicalOperator::kAggregation,
+                  .children = {input},
+                  .target_list = {NamedExpression(
+                      "n", AggregateExpressionExp(AggregationType::kCount,
+                                                  ColumnValueExp("r.id")))}}));
+    cascades::SearchEngine search(std::move(memo),
+                                  cascades::RuleSet::Default());
+    search.Explore(root);
+    EXPECT_FALSE(
+        search.AppliedRuleNames().contains("count_star_rewrite_on_not_null"));
+    const auto best = search.Optimize(root, PhysicalProperties{},
+                                      DefaultImplementationRules());
+    ASSERT_TRUE(best.has_value());
+    auto context = database_->BeginContext();
+    const auto executor = best->plan->EmitExecutor(context);
+    Row row;
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(1)}));
+    EXPECT_FALSE(executor->Next(&row, nullptr));
+    EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+  }
+}
+
+TEST_F(AggregateShapeTest, ReplacingANotNullColumnWithNullDoesNotRewriteCount) {
+  cascades::Memo memo;
+  const Schema base(
+      "t", {Column("id", ValueType::kInt64, Constraint(Constraint::kNotNull))});
+  memo.SetTableSchemas({{"t", base}});
+  (void)memo.Build({"t"});
+  const auto values = memo.EnsureDerivedGroup({"t"}, "values");
+  ASSERT_TRUE(memo.AddExpression(
+      values, LogicalExpression{.operation = LogicalOperator::kValues,
+                                .values = {Row({Value(1)}), Row({Value(2)})},
+                                .output_schema = base}));
+  const auto project = memo.EnsureDerivedGroup({"t"}, "null_projection");
+  ASSERT_TRUE(memo.AddExpression(
+      project,
+      LogicalExpression{
+          .operation = LogicalOperator::kProjection,
+          .children = {values},
+          .target_list = {NamedExpression("id", ConstantValueExp(Value()))},
+          .output_schema = Schema("t", {Column("id", ValueType::kInt64)})}));
+  EXPECT_FALSE(memo.Get(project).logical_properties.IsNotNull("t.id"));
+  const auto root = memo.EnsureDerivedGroup({"t"}, "count_null");
+  ASSERT_TRUE(memo.AddExpression(
+      root, LogicalExpression{
+                .operation = LogicalOperator::kAggregation,
+                .children = {project},
+                .target_list = {NamedExpression(
+                    "n", AggregateExpressionExp(AggregationType::kCount,
+                                                ColumnValueExp("t.id")))}}));
+  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
+  search.Explore(root);
+  EXPECT_FALSE(
+      search.AppliedRuleNames().contains("count_star_rewrite_on_not_null"));
+  const auto best =
+      search.Optimize(root, PhysicalProperties{}, DefaultImplementationRules());
+  ASSERT_TRUE(best.has_value());
+  auto context = database_->BeginContext();
+  const auto executor = best->plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(0)}));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+}
+
+TEST_F(AggregateShapeTest, JoinFanoutDoesNotPreserveBasePrimaryKeyUniqueness) {
+  cascades::Memo memo;
+  const Schema left_schema("l", {Column("id", ValueType::kInt64,
+                                        Constraint(Constraint::kPrimaryKey))});
+  const Schema right_schema("r", {Column("id", ValueType::kInt64)});
+  memo.SetTableSchemas({{"l", left_schema}, {"r", right_schema}});
+  (void)memo.Build({"l", "r"});
+  const auto left = memo.EnsureDerivedGroup({"l"}, "one_left");
+  const auto right = memo.EnsureDerivedGroup({"r"}, "many_right");
+  ASSERT_TRUE(memo.AddExpression(
+      left, LogicalExpression{.operation = LogicalOperator::kValues,
+                              .values = {Row({Value(1)})},
+                              .output_schema = left_schema}));
+  ASSERT_TRUE(memo.AddExpression(
+      right, LogicalExpression{.operation = LogicalOperator::kValues,
+                               .values = {Row({Value(1)}), Row({Value(1)})},
+                               .output_schema = right_schema}));
+  const auto join = memo.EnsureDerivedGroup({"l", "r"}, "fanout");
+  ASSERT_TRUE(memo.AddExpression(
+      join,
+      LogicalExpression{.operation = LogicalOperator::kJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp("l.id"), BinaryOperation::kEquals,
+                            ColumnValueExp("r.id")),
+                        .output_schema = left_schema + right_schema}));
+  EXPECT_FALSE(memo.Get(join).logical_properties.IsUniqueOn({"l.id"}));
+  const auto project = memo.EnsureDerivedGroup({"l", "r"}, "project_left");
+  ASSERT_TRUE(memo.AddExpression(
+      project, LogicalExpression{.operation = LogicalOperator::kProjection,
+                                 .children = {join},
+                                 .target_list = {NamedExpression(
+                                     "id", ColumnValueExp("l.id"))},
+                                 .output_schema = left_schema}));
+  EXPECT_FALSE(memo.Get(project).logical_properties.IsUniqueOn({"l.id"}));
+  const auto root = memo.EnsureDerivedGroup({"l", "r"}, "unique_left");
+  ASSERT_TRUE(memo.AddExpression(
+      root, LogicalExpression{.operation = LogicalOperator::kDistinct,
+                              .children = {project}}));
+  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
+  search.Explore(root);
+  const auto best =
+      search.Optimize(root, PhysicalProperties{}, DefaultImplementationRules());
+  ASSERT_TRUE(best.has_value());
+  auto context = database_->BeginContext();
+  const auto executor = best->plan->EmitExecutor(context);
+  Row row;
+  ASSERT_TRUE(executor->Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1)}));
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+}
+
+TEST_F(AggregateShapeTest, StreamingRequiresTheGroupKeysCollation) {
+  const Plan input = std::make_shared<BufferedSortPlan>(
+      LeafWith({Row({Value(1), Value("a"), Value(1.0)}),
+                Row({Value(1), Value("A"), Value(1.0)}),
+                Row({Value(1), Value("a"), Value(1.0)})}),
+      std::vector<SortKey>{SortKey{.expression = Name(),
+                                   .ascending = true,
+                                   .nulls_first = std::nullopt,
+                                   .collation = Collation::kCaseInsensitive}});
+  const auto alternatives = ApplyAggregationRule(input, {Name()}, 3);
+  auto context = database_->BeginContext();
+  for (const auto& alternative : alternatives) {
+    SCOPED_TRACE(ShapeName(alternative.plan));
+    EXPECT_EQ(std::dynamic_pointer_cast<StreamAggregatePlan>(alternative.plan),
+              nullptr);
+    const auto executor = alternative.plan->EmitExecutor(context);
+    Row row;
+    size_t groups = 0;
+    while (executor->Next(&row, nullptr)) {
+      ++groups;
+    }
+    EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+    EXPECT_EQ(groups, 2U);
+  }
+}
 
 TEST_F(AggregateShapeTest, SearchCanChooseOrderedInputAndStreamAggregate) {
   cascades::Memo memo;

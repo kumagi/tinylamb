@@ -65,6 +65,12 @@ class SamplePlan final : public PlanBase {
   [[nodiscard]] bool EnforcesDistinct() const override {
     return child_->EnforcesDistinct();
   }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return child_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return child_->OrderIsMeasured();
+  }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

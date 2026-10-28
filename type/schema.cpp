@@ -181,6 +181,9 @@ Encoder& operator<<(Encoder& a, const Schema& sc) {
 }
 
 Decoder& operator>>(Decoder& e, Schema& sc) {
+  // Decoding changes column offsets just like assignment; cached lookups
+  // keyed by the old identity must not survive even a partial decode.
+  sc.identity_ = Schema::NextLookupIdentity();
   e >> sc.name_ >> sc.columns_;
   return e;
 }

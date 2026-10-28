@@ -910,6 +910,7 @@ target_link_libraries(postgres_server_extra_test PRIVATE tinylamb::postgres_serv
 add_simple_test(table/table_statistics_extra_test.cpp)
 add_simple_test(index/lsm_cache_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
+add_simple_test(query/sql_bugfix_regression_test.cpp)
 add_simple_test(query/analytical_features_test.cpp)
 add_simple_test(query/foreign_key_test.cpp)
 add_simple_test(query/merge_test.cpp)

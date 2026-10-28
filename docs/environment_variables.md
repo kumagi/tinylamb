@@ -100,6 +100,7 @@ documented SQL semantics; flipping one must not change results, only speed
 | `TINYLAMB_LEGACY_ESTIMATE` | Pre-blend cardinality estimation. |
 | `TINYLAMB_GROUPED_ROUTE` | `=relational` prefers the hand-rolled relational route (scan projections, runtime filters, typed folds, grouped-join fusion) for grouped statements; the default keeps the Cascades-first order because the Cascades core infers OR-branch equijoins the relational heuristic does not (TPC-DS q13 degrades to nested loops under the relational route). |
 | `TINYLAMB_RULE_STATS` | Print Cascades rule application counters. |
+| `TINYLAMB_DEBUG_DUMP_MEMO` | Dump every Cascades memo group (tag, scan filter, expression fingerprints) to stderr after exploration. Diagnostic for D1 (one group, one meaning) violations. |
 | `TINYLAMB_PLAN_PROFILE` | `=1` prints plan-time profiling (rule wall time table, parse-subprocess and prepare-statement timings). |
 | `TINYLAMB_JOIN_CARD_DEBUG` | Prints per-key selectivity inputs and hash-join orientation candidates so a collapsed estimate or a wrong build side is visible. |
 | `TINYLAMB_FUSION_DEBUG` | Trace grouped-join fusion decisions. |

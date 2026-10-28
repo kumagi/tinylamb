@@ -457,6 +457,7 @@ class Value {
   // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when
   // either operand carries it; serialization and hashing ignore it.
   [[nodiscard]] uint8_t Collation() const { return collation_; }
+  void SetCollation(uint8_t collation) { collation_ = collation; }
   [[nodiscard]] bool IsCaseInsensitive() const { return collation_ == 2; }
   // UINT64 values share the INT64 storage representation, so retain their
   // SQL signedness in the otherwise-unused collation tag.  This lets joins

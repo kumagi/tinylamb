@@ -50,6 +50,12 @@ class MaterializePlan final : public PlanBase {
       const std::vector<std::optional<bool>>& nulls_first) const override {
     return child_->IsOrderedBy(expressions, ascending, nulls_first);
   }
+  [[nodiscard]] Collation OrderCollation() const override {
+    return child_->OrderCollation();
+  }
+  [[nodiscard]] bool OrderIsMeasured() const override {
+    return child_->OrderIsMeasured();
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override { return "Materialize"; }
 

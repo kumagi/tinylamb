@@ -1036,6 +1036,35 @@ TEST(DifferentialTest,
   EXPECT_TRUE(SameValue(detail_extract.value, Value(int64_t{1996})));
 }
 
+TEST(DifferentialTest, GenerateArrayIntegerBoundariesAgreeAcrossEngines) {
+  for (const std::vector<Value>& arguments :
+       {std::vector<Value>{Value(INT64_MAX - 2), Value(INT64_MAX)},
+        std::vector<Value>{Value(INT64_MIN), Value(INT64_MIN + 2)},
+        std::vector<Value>{Value(-3).WithUnsigned(), Value(-1).WithUnsigned()},
+        std::vector<Value>{Value(5), Value(1)}}) {
+    std::vector<Expression> expressions;
+    for (const Value& value : arguments) {
+      expressions.push_back(ConstantValueExp(value));
+    }
+    const auto expression = FunctionCallExp("generate_array", expressions);
+    const Schema schema;
+    const Row row;
+    const Attempt ast = EvaluateAst(expression, row, schema);
+    const Attempt detail = EvaluateDetailPath(expression, row, schema);
+    ASSERT_EQ(ast.kind, Attempt::Kind::kValue) << ast.note;
+    ASSERT_EQ(detail.kind, Attempt::Kind::kValue) << detail.note;
+    EXPECT_EQ(detail.value.ArrayElementSqlType(),
+              ast.value.ArrayElementSqlType());
+    EXPECT_EQ(detail.value.ArrayElements(), ast.value.ArrayElements());
+    const auto bytecode = BytecodeCompiler::Compile(expression, schema);
+    if (bytecode.has_value()) {
+      const Attempt vm = EvaluateBytecode(bytecode, schema, row);
+      ASSERT_EQ(vm.kind, Attempt::Kind::kValue) << vm.note;
+      EXPECT_EQ(vm.value.ArrayElements(), ast.value.ArrayElements());
+    }
+  }
+}
+
 // Former XFAIL (improvement3.md A6-1), now resolved: the relational_detail
 // interpreter used to collapse SQL three-valued logic to two-valued logic in
 // three places (AND with a NULL left operand returned FALSE, OR with a NULL

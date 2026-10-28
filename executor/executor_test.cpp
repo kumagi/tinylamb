@@ -3169,6 +3169,71 @@ TEST_F(ExecutorTest, ParallelHashJoinEmittedForLargeInputs) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+TEST_F(ExecutorTest, StaleRowEstimatesCannotChangeMixedSignednessJoinResults) {
+  TransactionContext setup = rs_->BeginContext();
+  Column unsigned_key("k", ValueType::kInt64);
+  unsigned_key.SetUnsigned(true);
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, signed_table,
+      rs_->CreateTable(
+          setup, Schema("signed_keys", {Column("k", ValueType::kInt64)})));
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, unsigned_table,
+      rs_->CreateTable(setup, Schema("unsigned_keys", {unsigned_key})));
+  for (const int64_t value : {int64_t{-1}, int64_t{5}, int64_t{6}}) {
+    ASSERT_SUCCESS(
+        signed_table.Insert(setup.txn_, Row({Value(value)})).GetStatus());
+  }
+  for (const int64_t bits : {int64_t{5}, int64_t{-1}}) {
+    ASSERT_SUCCESS(
+        unsigned_table.Insert(setup.txn_, Row({Value(bits).WithUnsigned()}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(setup.PreCommit());
+  // Actual cardinality picks the byte-key build first, then the signed-int
+  // build after adding unmatched unsigned rows. Estimates independently pick
+  // serial vs parallel execution over exactly the same visible rows.
+  for (const bool larger_unsigned : {false, true}) {
+    if (larger_unsigned) {
+      TransactionContext write = rs_->BeginContext();
+      for (const int64_t value : {int64_t{100}, int64_t{101}}) {
+        ASSERT_SUCCESS(
+            unsigned_table
+                .Insert(write.txn_, Row({Value(value).WithUnsigned()}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(write.PreCommit());
+    }
+    for (const size_t estimate : {size_t{3}, size_t{8192}}) {
+      SCOPED_TRACE(::testing::Message() << larger_unsigned << "," << estimate);
+      TransactionContext context = rs_->BeginContext();
+      Plan left = std::make_shared<FullScanPlan>(
+          signed_table,
+          TableStatistics(signed_table.GetSchema()).ScaleToRows(estimate));
+      Plan right = std::make_shared<FullScanPlan>(
+          unsigned_table,
+          TableStatistics(unsigned_table.GetSchema()).ScaleToRows(estimate));
+      const ProductPlan join(left, {ColumnName("signed_keys", "k")}, right,
+                             {ColumnName("unsigned_keys", "k")});
+      const Executor executor = join.EmitExecutor(context);
+      std::ostringstream dump;
+      executor->Dump(dump, 0);
+      EXPECT_EQ(
+          dump.str().find("SharedBuildParallelHashJoin") != std::string::npos,
+          estimate == 8192);
+      std::vector<Row> rows;
+      Row row;
+      while (executor->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
+      ASSERT_EQ(executor->GetStatus(), Status::kSuccess);
+      EXPECT_EQ(rows,
+                (std::vector<Row>{Row({Value(5), Value(5).WithUnsigned()})}));
+      ASSERT_SUCCESS(context.PreCommit());
+    }
+  }
+}
+
 TEST_F(ExecutorTest, SequentialHashJoinEmittedForSmallInputs) {
   std::vector<Row> left_rows;
   std::vector<Row> right_rows;

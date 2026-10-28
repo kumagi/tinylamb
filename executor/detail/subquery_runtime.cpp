@@ -719,7 +719,7 @@ void StashBuildDomainFilter(
   if (same_table != 1) {
     return;
   }
-  TableKeyFilter& stored = runtime.table_key_filters[source.table];
+  TableKeyFilter& stored = runtime.table_key_filters[TableKeyFilterKey(source)];
   stored.filter = filter->group;
   stored.type = filter->type;
   stored.key_count = filter->group->DistinctKeys();

@@ -15,6 +15,16 @@
 
 namespace tinylamb {
 
+Collation IncrementalSortPlan::OrderCollation() const {
+  Collation resolved = Collation::kNone;
+  for (const auto* keys : {&prefix_keys_, &suffix_keys_}) {
+    for (const SortKey& key : *keys) {
+      resolved = ResolveCollation(resolved, key.collation);
+    }
+  }
+  return resolved;
+}
+
 IncrementalSortPlan::IncrementalSortPlan(Plan child,
                                          std::vector<SortKey> prefix_keys,
                                          std::vector<SortKey> suffix_keys)

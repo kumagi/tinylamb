@@ -8,10 +8,13 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -124,6 +127,29 @@ TEST(ExpressionEvalDetailTest, TryLookupResolvesScopeColumns) {
       Value("x"));
   EXPECT_FALSE(relational_detail::TryLookup(ColumnName("t", "missing"), scope)
                    .HasValue());
+}
+
+TEST(ExpressionEvalDetailTest, DecodingSchemaInvalidatesCachedColumnOffsets) {
+  Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  const Row row({Value(7), Value(42)});
+  relational_detail::ColumnLookupCache cache;
+  const relational_detail::Scope scope{
+      .row = &row, .schema = &schema, .lookup_cache = &cache};
+  EXPECT_EQ(
+      relational_detail::TryLookup(ColumnName("t", "a"), scope).MoveValue(),
+      Value(7));
+  const Schema reordered(
+      "t", {Column("b", ValueType::kInt64), Column("a", ValueType::kInt64)});
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << reordered;
+  Decoder decoder(stream);
+  decoder >> schema;
+  ASSERT_FALSE(decoder.Failed());
+  EXPECT_EQ(
+      relational_detail::TryLookup(ColumnName("t", "a"), scope).MoveValue(),
+      Value(42));
 }
 
 // ------------------------------------------------------------- SQL sweeps --

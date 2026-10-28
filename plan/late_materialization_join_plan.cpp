@@ -71,6 +71,7 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
         "LateMaterializationJoinPlan payload column is outside the table");
   }
   InitializeProjection(schema_);
+  AppendPayloadStats(&right_statistics);
 }
 
 LateMaterializationJoinPlan::LateMaterializationJoinPlan(
@@ -101,6 +102,24 @@ LateMaterializationJoinPlan::LateMaterializationJoinPlan(
         "LateMaterializationJoinPlan payload column is outside the table");
   }
   InitializeProjection(schema_);
+  AppendPayloadStats(nullptr);
+}
+
+void LateMaterializationJoinPlan::AppendPayloadStats(
+    const TableStatistics* right_statistics) {
+  const size_t right_width = right_table_->GetSchema().ColumnCount();
+  const bool usable =
+      right_statistics != nullptr && right_statistics->Columns() == right_width;
+  std::vector<ColumnStats> payload;
+  payload.reserve(right_projection_.size());
+  for (const slot_t column : right_projection_) {
+    payload.push_back(usable ? right_statistics->Column(column)
+                             : ColumnStats());
+  }
+  TableStatistics payload_stats{Schema()};
+  payload_stats.Assign(usable ? right_statistics->Rows() : stats_.Rows(),
+                       std::move(payload));
+  stats_.Concat(payload_stats.ScaleCardinality(stats_.Rows()));
 }
 
 void LateMaterializationJoinPlan::InitializeProjection(const Schema& declared) {

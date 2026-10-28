@@ -602,10 +602,15 @@ bool ProductPlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
-  if (!IsSemiOrAnti(kind_)) {
-    return false;
-  }
-  return left_src_->IsOrderedBy(expressions, ascending, nulls_first);
+  // Even an in-memory semi/anti hash join may reactively spill its probe
+  // side. Replaying hash partitions loses the child's ordering; statistics
+  // and the planned hash mode cannot prove that the runtime budget will fit.
+  // Keep the parent's sort rather than promise an order the executor can
+  // revoke after planning.
+  static_cast<void>(expressions);
+  static_cast<void>(ascending);
+  static_cast<void>(nulls_first);
+  return false;
 }
 
 void ProductPlan::Dump(std::ostream& o, int indent) const {

@@ -23,6 +23,8 @@
 #include <unordered_set>
 
 #include "column_name.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/log_message.hpp"
 #include "common/test_util.hpp"
 #include "constraint.hpp"
@@ -55,6 +57,22 @@ TEST(SchemaTest, LookupIdentity_ChangesForIndependentSchemas) {
   EXPECT_NE(first.LookupIdentity(), copy.LookupIdentity());
   copy = second;
   EXPECT_NE(copy.LookupIdentity(), first.LookupIdentity());
+}
+
+TEST(SchemaTest, LookupIdentityChangesWhenDecodingIntoExistingSchema) {
+  Schema schema("t", {Column("a", ValueType::kInt64)});
+  const auto previous_identity = schema.LookupIdentity();
+  const Schema replacement(
+      "t", {Column("b", ValueType::kInt64), Column("a", ValueType::kInt64)});
+  std::stringstream stream;
+  Encoder encoder(stream);
+  encoder << replacement;
+  Decoder decoder(stream);
+  decoder >> schema;
+  ASSERT_FALSE(decoder.Failed());
+  EXPECT_EQ(schema, replacement);
+  EXPECT_EQ(schema.Offset(ColumnName("a")), 1);
+  EXPECT_NE(schema.LookupIdentity(), previous_identity);
 }
 
 TEST(SchemaTest, WithName_RenamesSchemaAndQualifiesEveryColumn) {

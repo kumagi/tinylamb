@@ -274,6 +274,7 @@ StatusOr<size_t> Row::TryDeserializeProjected(
         src += DeserializeU64(src, &bits);
         value.value.int_value = static_cast<int64_t>(bits);
         value.type = type;
+        value.SetCollation(0);
         src += fixed - sizeof(int64_t);
       } else {
         const size_t consumed = value.DeserializeInto(src, type, &error);
@@ -310,6 +311,7 @@ StatusOr<size_t> Row::TryDeserializeProjected(
         src += DeserializeU64(src, &bits);
         value.value.int_value = static_cast<int64_t>(bits);
         value.type = type;
+        value.SetCollation(0);
         src += fixed - sizeof(int64_t);
       } else {
         const size_t consumed = value.DeserializeInto(src, type, &error);
@@ -383,6 +385,7 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
           src += sizeof(bits);
           out[i].value.int_value = static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
           out[i].type = types[i];
+          out[i].SetCollation(0);
         }
       } else {
         const char* const payload = src;
@@ -396,6 +399,7 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
           out[slot].value.int_value =
               static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
           out[slot].type = types[i];
+          out[slot].SetCollation(0);
         }
         src = payload + static_cast<size_t>(count) * sizeof(uint64_t);
       }
@@ -416,8 +420,10 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
       std::memcpy(&bits, src, sizeof(bits));
       src += sizeof(bits);
       if (slot != RowDecodePlan::kNoSlot) {
-        out[slot].value.int_value = static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
+        out[slot].value.int_value =
+            static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
         out[slot].type = types[i];
+        out[slot].SetCollation(0);
       }
     }
     return static_cast<size_t>(src - original_offset);
@@ -457,6 +463,7 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
       src += DeserializeU64(src, &bits);
       value.value.int_value = static_cast<int64_t>(bits);
       value.type = types[i];
+      value.SetCollation(0);
       src += fixed - sizeof(int64_t);
     } else {
       const size_t consumed = value.DeserializeInto(src, types[i], &error);
@@ -498,6 +505,7 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
       src += DeserializeU64(src, &bits);
       value.value.int_value = static_cast<int64_t>(bits);
       value.type = types[i];
+      value.SetCollation(0);
       src += fixed - sizeof(int64_t);
     } else {
       const size_t consumed = value.DeserializeInto(src, types[i], &error);

@@ -89,6 +89,14 @@ bool SetOperationPlan::IsOrderedBy(const std::vector<Expression>& expressions,
   return IsOrderedBy(expressions, ascending, {});
 }
 
+Collation SetOperationPlan::OrderCollation() const {
+  Collation resolved = Collation::kNone;
+  for (const SortKey& key : order_keys_) {
+    resolved = ResolveCollation(resolved, key.collation);
+  }
+  return resolved;
+}
+
 bool SetOperationPlan::IsOrderedBy(
     const std::vector<Expression>& expressions,
     const std::vector<bool>& ascending,

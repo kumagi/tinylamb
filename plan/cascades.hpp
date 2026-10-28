@@ -200,6 +200,12 @@ struct Group {
   // should shrink the hash build.
   std::vector<ColumnName> semi_reduction_probe_keys{};
   bool sample_barrier{false};
+  // True when the Selections in this group carry a predicate that holds for
+  // only ONE branch of a set operation (an or_to_union partition, a filter
+  // pushed past a set operation) or was derived from such a predicate.  Such
+  // a predicate must never be merged into the shared single-relation scan
+  // groups: other branches read the same scans and need their rows.
+  bool branch_local{false};
   LogicalProperties logical_properties{};
   std::optional<size_t> logical_properties_expression_count{};
   bool logical_properties_stale{true};

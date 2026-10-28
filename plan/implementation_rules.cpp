@@ -3416,7 +3416,8 @@ bool ChildDeliversGroupKeyOrder(const BestPlan& child,
   }
   std::vector<bool> ascending(keys.size(), true);
   std::vector<std::optional<bool>> nulls_first(keys.size(), true);
-  return child.plan->IsOrderedBy(keys, ascending, nulls_first);
+  return child.plan->OrderCollation() == CollationOfOrdering(keys) &&
+         child.plan->IsOrderedBy(keys, ascending, nulls_first);
 }
 
 }  // namespace
@@ -4238,7 +4239,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // compare sort+dedup against hash+sort without an artificial tie.
           double cost = children[0].estimated_rows * 0.8;
           const std::vector<bool> ascending(ordering.size(), true);
-          if (!input->IsOrderedBy(ordering, ascending)) {
+          if (input->OrderCollation() != CollationOfOrdering(ordering) ||
+              !input->IsOrderedBy(ordering, ascending)) {
             const double rows = children[0].estimated_rows;
             cost += rows * std::log2(std::max(2.0, rows));
             input = MakeSortPlan(std::move(input), std::move(keys), rows);
