@@ -393,6 +393,29 @@ TEST(GoogleSqlAstTest, CreateTableColumnTypes) {
   EXPECT_EQ(create.Columns()[9].Type(), ValueType::kInt64);
 }
 
+TEST(GoogleSqlAstTest, CreateIndexPreservesKeysStoringAndModifiers) {
+  auto statement = VisitSql(
+      "CREATE /*comment*/ UNIQUE INDEX IF NOT EXISTS "
+      "idx ON t(a, b) STORING(c)");
+  ASSERT_NE(statement, nullptr);
+  ASSERT_EQ(statement->Type(), StatementType::kCreateIndex);
+  const auto& index = dynamic_cast<const CreateIndexStatement&>(*statement);
+  EXPECT_EQ(index.Name(), "idx");
+  EXPECT_EQ(index.TableName(), "t");
+  EXPECT_EQ(index.Keys(), (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(index.Storing(), (std::vector<std::string>{"c"}));
+  EXPECT_TRUE(index.Unique());
+  EXPECT_TRUE(index.IfNotExists());
+  for (const auto* sql :
+       {"CREATE INDEX idx ON t(a DESC)", "CREATE INDEX idx ON t((a + 1))",
+        "CREATE INDEX idx ON t(a) OPTIONS(foo=1)",
+        "CREATE OR REPLACE INDEX idx ON t(a)",
+        "CREATE SEARCH INDEX idx ON t(ALL COLUMNS)"}) {
+    SCOPED_TRACE(sql);
+    EXPECT_EQ(VisitSql(sql), nullptr);
+  }
+}
+
 TEST(GoogleSqlAstTest, CreateTableExtendedColumnTypes) {
   auto statement = VisitSql(
       "CREATE TABLE t (u UINT64, u32 UINT32, i32 INT32, f32 FLOAT32, "
@@ -571,11 +594,10 @@ TEST(GoogleSqlAstTest, TableValuedFunctionExpandsStoredBody) {
 
 TEST(GoogleSqlAstTest, UnsupportedStatementKindsThrow) {
   // Statements beyond SELECT / CREATE TABLE / INSERT / UPDATE / DELETE / DROP
-  // TABLE / MERGE / ALTER TABLE RENAME have no translation and must be
-  // rejected explicitly.
-  for (const char* sql :
-       {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;", "COMMIT;",
-        "CREATE INDEX i ON t(a);", "CREATE SCHEMA s;", "DESCRIBE t;"}) {
+  // TABLE / CREATE INDEX / MERGE / ALTER TABLE RENAME have no translation and
+  // must be rejected explicitly.
+  for (const char* sql : {"EXPLAIN SELECT 1;", "SHOW TABLES;", "BEGIN;",
+                          "COMMIT;", "CREATE SCHEMA s;", "DESCRIBE t;"}) {
     const std::string message = ThrowMessage([sql] { VisitSqlOrThrow(sql); });
     EXPECT_NE(message.find("unsupported statement"), std::string::npos)
         << sql << "\n"

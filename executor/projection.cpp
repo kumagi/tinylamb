@@ -242,21 +242,6 @@ Projection::Projection(std::vector<NamedExpression> expressions,
   }
 }
 
-bool Projection::Next(Row* dst, RowPosition* rp) {
-  if (output_offset_ >= output_batch_.Size()) {
-    if (NextBatch(&output_batch_) == 0) {
-      return false;
-    }
-    output_offset_ = 0;
-  }
-  *dst = output_batch_.RowAt(output_offset_);
-  if (rp != nullptr) {
-    *rp = output_batch_.PositionAt(output_offset_);
-  }
-  ++output_offset_;
-  return true;
-}
-
 size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   destination->Reserve(max_rows);

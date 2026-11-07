@@ -27,34 +27,13 @@ class Decoder;
 
 enum class PageType : uint8_t {
   kUnknown = 0,
-  kFreePage,
-  kMetaPage,
-  kRowPage,
-  kLeafPage,
-  kBranchPage,
-  kPaxPage,
-};
-
-enum class PageAllocationKind : uint8_t {
-  kFresh,
-  kRecycled,
-  kInPlace,
+  kRowPage = 1,
 };
 
 inline std::string PageTypeString(enum PageType type) {
   switch (type) {
-    case PageType::kFreePage:
-      return "FreePage";
-    case PageType::kMetaPage:
-      return "MetaPage";
     case PageType::kRowPage:
       return "RowPage";
-    case PageType::kLeafPage:
-      return "LeafPage";
-    case PageType::kBranchPage:
-      return "BranchPage";
-    case PageType::kPaxPage:
-      return "PaxPage";
     default:
       return "(unknown)";
   }

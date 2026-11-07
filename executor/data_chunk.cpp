@@ -30,9 +30,17 @@ void UpdateZoneMapFrom(const ColumnVector& column, size_t index,
     zone_map->AddNull();
     return;
   }
+  if (column.IsHeterogeneous()) {
+    zone_map->Add(column.ValueAt(index));
+    return;
+  }
   switch (column.Type()) {
     case ValueType::kInt64:
-      zone_map->AddInt(column.IntegerData()[index]);
+      if (column.IsUnsigned()) {
+        zone_map->Add(column.ValueAt(index));
+      } else {
+        zone_map->AddInt(column.IntegerData()[index]);
+      }
       break;
     case ValueType::kDate:
       zone_map->AddDate(column.IntegerData()[index]);
@@ -41,7 +49,11 @@ void UpdateZoneMapFrom(const ColumnVector& column, size_t index,
       zone_map->AddDouble(column.DoubleData()[index]);
       break;
     case ValueType::kVarChar:
-      zone_map->AddString(column.StringData()[index]);
+      if (column.ColumnCollation() == Collation::kCaseInsensitive) {
+        zone_map->Add(column.ValueAt(index));
+      } else {
+        zone_map->AddString(column.StringData()[index]);
+      }
       break;
     case ValueType::kArray:
       // Arrays are non-NULL values with no scalar envelope; record them so
@@ -59,12 +71,19 @@ ColumnVector::ColumnVector(ValueType type, size_t capacity) : type_(type) {
 }
 
 void ColumnVector::ObserveSourceCollation(const ColumnVector& source) {
-  if (mixed_collation_) {
+  if (mixed_collation_ || !source.observed_collation_) {
+    return;
+  }
+  if (source.mixed_collation_) {
+    observed_collation_ = true;
+    mixed_collation_ = true;
+    collation_ = Collation::kNone;
     return;
   }
   const Collation observed = source.ColumnCollation();
-  if (collation_ == Collation::kNone && size_ == 0) {
+  if (!observed_collation_) {
     collation_ = observed;
+    observed_collation_ = true;
     return;
   }
   if (observed != collation_) {
@@ -81,8 +100,9 @@ void ColumnVector::ObserveCollation(const Value& value) {
     return;
   }
   const Collation observed = CollationOf(value);
-  if (collation_ == Collation::kNone && size_ == 0) {
+  if (!observed_collation_) {
     collation_ = observed;
+    observed_collation_ = true;
     return;
   }
   if (observed != collation_) {
@@ -93,13 +113,43 @@ void ColumnVector::ObserveCollation(const Value& value) {
   }
 }
 
+void ColumnVector::PromoteToHeterogeneous() {
+  if (heterogeneous_) {
+    return;
+  }
+  std::vector<Value> boxed;
+  boxed.reserve(size_);
+  for (size_t i = 0; i < size_; ++i) {
+    boxed.push_back(ValueAt(i));
+  }
+  integers_.clear();
+  doubles_.clear();
+  strings_.clear();
+  nested_ = std::move(boxed);
+  heterogeneous_ = true;
+  type_ = ValueType::kNull;
+}
+
 void ColumnVector::Append(const Value& value) {
   const bool is_null = value.IsNull();
+  if (heterogeneous_) {
+    EnsureNullBit(size_, is_null);
+    nested_.push_back(is_null ? Value() : value);
+    ++size_;
+    return;
+  }
   if (!is_null && type_ == ValueType::kNull) {
     type_ = value.type;
     unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
   } else if (!is_null && type_ != value.type) {
+    if (allow_heterogeneous_) {
+      PromoteToHeterogeneous();
+      EnsureNullBit(size_, false);
+      nested_.push_back(value);
+      ++size_;
+      return;
+    }
     CHECK_MSG(false, "column vector type mismatch: column=" +
                          std::string(ValueTypeToString(type_)) + " value=" +
                          std::string(ValueTypeToString(value.type)));
@@ -132,11 +182,24 @@ void ColumnVector::Append(const Value& value) {
 
 void ColumnVector::Append(Value&& value) {
   const bool is_null = value.IsNull();
+  if (heterogeneous_) {
+    EnsureNullBit(size_, is_null);
+    nested_.push_back(is_null ? Value() : std::move(value));
+    ++size_;
+    return;
+  }
   if (!is_null && type_ == ValueType::kNull) {
     type_ = value.type;
     unsigned_ = value.IsUnsigned();
     MaterializeInferredStorage();
   } else if (!is_null && type_ != value.type) {
+    if (allow_heterogeneous_) {
+      PromoteToHeterogeneous();
+      EnsureNullBit(size_, false);
+      nested_.push_back(std::move(value));
+      ++size_;
+      return;
+    }
     CHECK_MSG(false, "column vector type mismatch: column=" +
                          std::string(ValueTypeToString(type_)) + " value=" +
                          std::string(ValueTypeToString(value.type)));
@@ -173,11 +236,29 @@ void ColumnVector::Append(Value&& value) {
 
 void ColumnVector::AppendFrom(const ColumnVector& source, size_t index) {
   const bool is_null = source.IsNull(index);
+  if (heterogeneous_ || source.heterogeneous_) {
+    if (allow_heterogeneous_) {
+      PromoteToHeterogeneous();
+      EnsureNullBit(size_, is_null);
+      nested_.push_back(is_null ? Value() : source.ValueAt(index));
+      ++size_;
+      return;
+    }
+    Append(source.ValueAt(index));
+    return;
+  }
   if (!is_null && type_ == ValueType::kNull) {
     type_ = source.type_;
     unsigned_ = source.unsigned_;
     MaterializeInferredStorage();
   } else if (!is_null && source.type_ != type_) {
+    if (allow_heterogeneous_) {
+      PromoteToHeterogeneous();
+      EnsureNullBit(size_, false);
+      nested_.push_back(source.ValueAt(index));
+      ++size_;
+      return;
+    }
     CHECK_MSG(false, "column vector type mismatch");
   }
   EnsureNullBit(size_, is_null);
@@ -212,11 +293,23 @@ void ColumnVector::AppendRange(const ColumnVector& source) {
   if (source.size_ == 0 || this == &source) {
     return;
   }
+  if (heterogeneous_ || source.heterogeneous_) {
+    for (size_t i = 0; i < source.size_; ++i) {
+      AppendFrom(source, i);
+    }
+    return;
+  }
   if (type_ == ValueType::kNull && source.type_ != ValueType::kNull) {
     type_ = source.type_;
     unsigned_ = source.unsigned_;
     MaterializeInferredStorage();
   } else if (source.type_ != ValueType::kNull && type_ != source.type_) {
+    if (allow_heterogeneous_) {
+      for (size_t i = 0; i < source.size_; ++i) {
+        AppendFrom(source, i);
+      }
+      return;
+    }
     CHECK_MSG(false, "column vector type mismatch");
   }
   if (source.type_ == ValueType::kVarChar) {
@@ -290,7 +383,9 @@ void ColumnVector::AppendBoolBatch(const uint8_t* bits, size_t count) {
 void ColumnVector::Reset() {
   size_ = 0;
   unsigned_ = false;
+  heterogeneous_ = false;
   collation_ = Collation::kNone;
+  observed_collation_ = false;
   mixed_collation_ = false;
   null_bitmap_.clear();
   integers_.clear();
@@ -383,6 +478,9 @@ Value ColumnVector::ValueAt(size_t index) const {
   if (IsNull(index)) {
     return {};
   }
+  if (heterogeneous_) {
+    return nested_[index];
+  }
   switch (type_) {
     case ValueType::kInt64:
       return unsigned_ ? Value(integers_[index]).WithUnsigned()
@@ -415,6 +513,8 @@ DataChunk::DataChunk(const std::vector<ValueType>& types, size_t capacity) {
 }
 
 void DataChunk::Initialize(const Schema& schema, size_t capacity) {
+  schema_fixed_ = false;
+  rebind_on_first_row_ = false;
   // Same-layout chunks (the per-batch Reset path) keep their allocated
   // ColumnVectors: rebuilding the column vector would free and re-allocate
   // every column's storage each 1024-row batch. Only a column-count or type
@@ -424,7 +524,8 @@ void DataChunk::Initialize(const Schema& schema, size_t capacity) {
       zone_maps_.size() == columns_.size()) {
     bool match = true;
     for (size_t i = 0; i < columns_.size(); ++i) {
-      if (columns_[i].Type() != schema.GetColumn(i).Type()) {
+      if (columns_[i].Type() != schema.GetColumn(i).Type() ||
+          columns_[i].IsHeterogeneous()) {
         match = false;
         break;
       }
@@ -432,6 +533,7 @@ void DataChunk::Initialize(const Schema& schema, size_t capacity) {
     if (match) {
       for (size_t i = 0; i < columns_.size(); ++i) {
         columns_[i].Reset();
+        columns_[i].SetAllowHeterogeneous(true);
         // ColumnVector::Reset clears the unsigned marker; restore the
         // schema's per-column flag the constructor would have set.
         columns_[i].SetUnsigned(schema.GetColumn(i).IsUnsigned());
@@ -449,6 +551,7 @@ void DataChunk::Initialize(const Schema& schema, size_t capacity) {
   columns_.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
     columns_.emplace_back(schema.GetColumn(i).Type(), capacity);
+    columns_.back().SetAllowHeterogeneous(true);
     if (schema.GetColumn(i).IsUnsigned()) {
       columns_.back().SetUnsigned(true);
     }
@@ -462,10 +565,12 @@ void DataChunk::Initialize(const Schema& schema, size_t capacity) {
 
 void DataChunk::Initialize(const std::vector<ValueType>& types,
                            size_t capacity) {
+  schema_fixed_ = true;
+  rebind_on_first_row_ = false;
   if (columns_.size() == types.size() && zone_maps_.size() == columns_.size()) {
     bool match = true;
     for (size_t i = 0; i < columns_.size(); ++i) {
-      if (columns_[i].Type() != types[i]) {
+      if (columns_[i].Type() != types[i] || columns_[i].IsHeterogeneous()) {
         match = false;
         break;
       }
@@ -473,6 +578,7 @@ void DataChunk::Initialize(const std::vector<ValueType>& types,
     if (match) {
       for (ColumnVector& column : columns_) {
         column.Reset();
+        column.SetAllowHeterogeneous(false);
       }
       for (ZoneMap& zone_map : zone_maps_) {
         zone_map.Reset();
@@ -487,6 +593,7 @@ void DataChunk::Initialize(const std::vector<ValueType>& types,
   columns_.reserve(types.size());
   for (ValueType type : types) {
     columns_.emplace_back(type, capacity);
+    columns_.back().SetAllowHeterogeneous(false);
   }
   zone_maps_.clear();
   zone_maps_.resize(types.size());
@@ -496,8 +603,11 @@ void DataChunk::Initialize(const std::vector<ValueType>& types,
 }
 
 void DataChunk::Reset() {
+  schema_fixed_ = false;
+  rebind_on_first_row_ = true;
   for (ColumnVector& column : columns_) {
     column.Reset();
+    column.SetAllowHeterogeneous(true);
   }
   for (ZoneMap& zone_map : zone_maps_) {
     zone_map.Reset();
@@ -534,17 +644,39 @@ void DataChunk::Reserve(size_t capacity) {
 }
 
 void DataChunk::EnsureLayout(const Row& row) {
-  if (columns_.empty() && size_ == 0) {
+  if (size_ == 0 &&
+      (columns_.empty() ||
+       (!schema_fixed_ && columns_.size() != row.values_.size()))) {
     std::vector<ValueType> types;
     types.reserve(row.values_.size());
     for (const Value& value : row.values_) {
       types.push_back(value.IsNull() ? ValueType::kNull : value.type);
     }
     Initialize(types);
+    schema_fixed_ = false;
     for (size_t i = 0; i < row.values_.size(); ++i) {
+      columns_[i].SetAllowHeterogeneous(true);
       if (row.values_[i].IsUnsigned()) {
         columns_[i].SetUnsigned(true);
       }
+    }
+    return;
+  }
+  if (size_ == 0 && !schema_fixed_) {
+    for (size_t i = 0; i < row.values_.size(); ++i) {
+      if (row.values_[i].IsNull() && !rebind_on_first_row_ &&
+          !columns_[i].IsHeterogeneous()) {
+        columns_[i].SetAllowHeterogeneous(true);
+        continue;
+      }
+      const ValueType vt =
+          row.values_[i].IsNull() ? ValueType::kNull : row.values_[i].type;
+      if (columns_[i].Type() != vt ||
+          columns_[i].IsUnsigned() != row.values_[i].IsUnsigned() ||
+          columns_[i].IsHeterogeneous()) {
+        columns_[i].RebindEmptyType(vt, row.values_[i].IsUnsigned());
+      }
+      columns_[i].SetAllowHeterogeneous(true);
     }
     return;
   }
@@ -577,14 +709,16 @@ void DataChunk::Append(const DataChunk& source, size_t row_index) {
   if (row_index >= source.Size()) {
     CHECK_MSG(false, "data chunk append row out of range");
   }
-  if (columns_.empty() && size_ == 0) {
+  if (size_ == 0 && (columns_.empty() || !schema_fixed_)) {
     std::vector<ValueType> types;
     types.reserve(source.ColumnCount());
     for (size_t i = 0; i < source.ColumnCount(); ++i) {
       types.push_back(source.ColumnAt(i).Type());
     }
     Initialize(types);
+    schema_fixed_ = false;
     for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      columns_[i].SetAllowHeterogeneous(true);
       if (source.ColumnAt(i).IsUnsigned()) {
         columns_[i].SetUnsigned(true);
       }
@@ -610,14 +744,16 @@ void DataChunk::AppendRowFromColumns(
       CHECK_MSG(false, "data chunk append row out of range");
     }
   }
-  if (columns_.empty() && size_ == 0) {
+  if (size_ == 0 && (columns_.empty() || !schema_fixed_)) {
     std::vector<ValueType> types;
     types.reserve(sources.size());
     for (const ColumnVector* source : sources) {
       types.push_back(source->Type());
     }
     Initialize(types);
+    schema_fixed_ = false;
     for (size_t i = 0; i < sources.size(); ++i) {
+      columns_[i].SetAllowHeterogeneous(true);
       if (sources[i]->IsUnsigned()) {
         columns_[i].SetUnsigned(true);
       }
@@ -642,13 +778,20 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
       CHECK_MSG(false, "data chunk append row out of range");
     }
   }
-  if (columns_.empty() && size_ == 0) {
+  if (size_ == 0 && (columns_.empty() || !schema_fixed_)) {
     std::vector<ValueType> types;
     types.reserve(source.ColumnCount());
     for (size_t i = 0; i < source.ColumnCount(); ++i) {
       types.push_back(source.ColumnAt(i).Type());
     }
     Initialize(types);
+    schema_fixed_ = false;
+    for (size_t i = 0; i < source.ColumnCount(); ++i) {
+      columns_[i].SetAllowHeterogeneous(true);
+      if (source.ColumnAt(i).IsUnsigned()) {
+        columns_[i].SetUnsigned(true);
+      }
+    }
   }
   if (ColumnCount() != source.ColumnCount()) {
     CHECK_MSG(false, "data chunk width mismatch");

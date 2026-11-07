@@ -44,8 +44,6 @@
 #include "plan/implementation_rules.hpp"
 #include "plan/incremental_sort_plan.hpp"
 #include "plan/limit_plan.hpp"
-#include "plan/materialize_plan.hpp"
-#include "plan/max1_row_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/relation_rename_plan.hpp"
@@ -287,7 +285,7 @@ TEST_F(SortShapeTest, OrderedWrappersKeepTheChildCollation) {
                        .ascending = true,
                        .nulls_first = std::nullopt,
                        .collation = Collation::kCaseInsensitive};
-  for (int wrapper = 0; wrapper < 7; ++wrapper) {
+  for (int wrapper = 0; wrapper < 6; ++wrapper) {
     SCOPED_TRACE(wrapper);
     const Plan sorted = std::make_shared<BufferedSortPlan>(
         LeafWith({Row({Value(1), Value("a")}), Row({Value(2), Value("B")})}),
@@ -304,13 +302,10 @@ TEST_F(SortShapeTest, OrderedWrappersKeepTheChildCollation) {
         input = std::make_shared<RelationRenamePlan>(sorted, "alias", "");
         break;
       case 3:
-        input = std::make_shared<MaterializePlan>(sorted);
-        break;
-      case 4:
         input = std::make_shared<WindowPlan>(sorted,
                                              std::vector<NamedExpression>{});
         break;
-      case 5:
+      case 4:
         input = std::make_shared<SamplePlan>(
             sorted, TableSampleSpec{.size = ConstantValueExp(Value(100)),
                                     .repeatable_seed = std::nullopt,
@@ -349,8 +344,6 @@ TEST_F(SortShapeTest, IncrementalSortKeepsItsSuffixCollation) {
                       .nulls_first = std::nullopt,
                       .collation = Collation::kCaseInsensitive}}));
   EXPECT_EQ(input->OrderCollation(), Collation::kCaseInsensitive);
-  EXPECT_EQ(std::make_shared<Max1RowPlan>(input)->OrderCollation(),
-            Collation::kCaseInsensitive);
   cascades::Memo memo;
   const auto root = memo.Build({"leaf"});
   auto logical = SortLogical(root, KKey());

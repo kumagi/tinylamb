@@ -34,6 +34,10 @@ namespace tinylamb {
 class Encoder {
  public:
   explicit Encoder(std::ostream& os) : os_(&os) {}
+  // Appends the same binary representation without the per-field ostream
+  // sentry/virtual stream-buffer dispatch. The destination must not also
+  // back a string_view being encoded.
+  explicit Encoder(std::string& bytes) : bytes_(&bytes) {}
   Encoder& operator<<(std::string_view sv);
   Encoder& operator<<(uint8_t u8);
   Encoder& operator<<(uint32_t u32);
@@ -61,15 +65,23 @@ class Encoder {
   }
 
  private:
-  std::ostream* os_;
+  void Write(const char* data, size_t size) {
+    if (bytes_) {
+      bytes_->append(data, size);
+    } else {
+      os_->write(data, static_cast<std::streamsize>(size));
+    }
+  }
+  std::ostream* os_{nullptr};
+  std::string* bytes_{nullptr};
 };
 
 template <typename T>
 std::string Encode(const T& src) {
-  std::stringstream ss;
-  Encoder enc(ss);
+  std::string bytes;
+  Encoder enc(bytes);
   enc << src;
-  return ss.str();
+  return bytes;
 }
 
 }  // namespace tinylamb

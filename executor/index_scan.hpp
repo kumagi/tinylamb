@@ -26,6 +26,7 @@
 
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
+#include "expression/named_expression.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "transaction/transaction_manager.hpp"
@@ -43,13 +44,15 @@ class IndexScan : public ExecutorBase {
             const Value& begin, const Value& end, bool ascending,
             Expression where, const Schema& sc, bool lock_rows = false,
             bool wait_for_write_intent = true,
-            TransactionManager::IndexReadGuard index_read_guard = {});
+            TransactionManager::IndexReadGuard index_read_guard = {},
+            bool prefetch = true);
   IndexScan(Transaction& txn, const Table& table, const Index& index,
             const std::vector<Value>& begin_key,
             const std::vector<Value>& end_key, bool ascending, Expression where,
             Schema sc, bool lock_rows = false,
             bool wait_for_write_intent = true,
-            TransactionManager::IndexReadGuard index_read_guard = {});
+            TransactionManager::IndexReadGuard index_read_guard = {},
+            bool prefetch = true);
   // Point-union access (Phase 8 IN lists): scans each [begin,end] key range
   // in sequence. Ranges must be sorted and disjoint for ordered output.
   IndexScan(
@@ -57,17 +60,23 @@ class IndexScan : public ExecutorBase {
       std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,
       bool ascending, Expression where, Schema sc, bool lock_rows = false,
       bool wait_for_write_intent = true,
-      TransactionManager::IndexReadGuard index_read_guard = {});
+      TransactionManager::IndexReadGuard index_read_guard = {},
+      bool prefetch = true);
   IndexScan(const IndexScan&) = delete;
   IndexScan(IndexScan&&) = delete;
   IndexScan& operator=(const IndexScan&) = delete;
   IndexScan& operator=(IndexScan&&) = delete;
   ~IndexScan() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
+  bool EnforcesIntegerPredicate(const Expression& predicate) const;
+  bool TrySetProjection(const std::vector<NamedExpression>& columns,
+                        const Schema& output_schema);
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  void CompileIntegerPeeks();
   void OpenRange(const std::vector<Value>& begin_key,
                  const std::vector<Value>& end_key);
   // PrefetchingIndexScan: (re)builds the look-ahead cursor for a range and
@@ -95,7 +104,7 @@ class IndexScan : public ExecutorBase {
   std::vector<std::pair<std::vector<Value>, std::vector<Value>>> pending_;
   size_t pending_offset_{0};
   TransactionManager::IndexReadGuard index_read_guard_;
-  Iterator iter_;
+  std::unique_ptr<IndexScanIterator> iter_;
   // PrefetchingIndexScan: look-ahead cursor running
   // |kIndexScanPrefetchDistance| entries ahead of |iter_|; null when
   // prefetching is off (A/B hatch).
@@ -107,6 +116,9 @@ class IndexScan : public ExecutorBase {
   std::vector<Expression> cond_conjuncts_;
   // Held by value (not reference): callers often pass a temporary Schema.
   Schema schema_;
+  std::optional<std::vector<slot_t>> projection_;
+  std::optional<Schema> projected_schema_;
+  bool prefetch_enabled_{true};
 };
 
 // EXPLAIN-facing wrapper over an index scan executor: marks the access path
@@ -121,9 +133,6 @@ class IndexSkipScanExecutor final : public ExecutorBase {
   IndexSkipScanExecutor& operator=(IndexSkipScanExecutor&&) = delete;
   ~IndexSkipScanExecutor() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override {
-    return inner_->Next(dst, rp);
-  }
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     return inner_->NextBatch(destination, max_rows);
   }

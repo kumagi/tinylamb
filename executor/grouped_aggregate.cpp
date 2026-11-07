@@ -376,20 +376,6 @@ void AggregateGroupTable::Clear() {
 
 // ==================================================== GroupedAggregateBase ===
 
-bool GroupedAggregateBase::Next(Row* dst, RowPosition* rp) {
-  if (Materialize() != Status::kSuccess) {
-    return false;
-  }
-  if (cursor_ >= output_rows_.size()) {
-    return false;
-  }
-  *dst = output_rows_[cursor_++];
-  if (rp != nullptr) {
-    *rp = RowPosition();
-  }
-  return true;
-}
-
 size_t GroupedAggregateBase::NextBatch(DataChunk* destination,
                                        size_t max_rows) {
   destination->Reset();

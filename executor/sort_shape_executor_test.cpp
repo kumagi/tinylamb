@@ -74,16 +74,14 @@ std::vector<Row> MakeRows(size_t count, size_t peers = 5) {
 class PositionedRows final : public ExecutorBase {
  public:
   explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
-  bool Next(Row* dst, RowPosition* rp) override {
-    if (offset_ >= rows_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
+    while (offset_ < rows_.size() && dst->Size() < max_rows) {
+      dst->Append(rows_[offset_],
+                  RowPosition(11, static_cast<slot_t>(offset_)));
+      ++offset_;
     }
-    *dst = rows_[offset_];
-    if (rp != nullptr) {
-      *rp = RowPosition(11, static_cast<slot_t>(offset_));
-    }
-    ++offset_;
-    return true;
+    return dst->Size();
   }
   void Dump(std::ostream& out, int /*indent*/) const override {
     out << "PositionedRows";
@@ -100,16 +98,21 @@ class FailingRows final : public ExecutorBase {
  public:
   FailingRows(std::vector<Row> rows, size_t fail_after)
       : rows_(std::move(rows)), fail_after_(fail_after) {}
-  bool Next(Row* dst, RowPosition* rp) override {
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
     if (offset_ >= fail_after_) {
-      return FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      return 0;
     }
-    *dst = rows_[offset_];
-    if (rp != nullptr) {
-      *rp = RowPosition(0, static_cast<slot_t>(offset_));
+    const size_t limit = std::min(max_rows, fail_after_ - offset_);
+    while (offset_ < rows_.size() && dst->Size() < limit) {
+      dst->Append(rows_[offset_], RowPosition(0, static_cast<slot_t>(offset_)));
+      ++offset_;
     }
-    ++offset_;
-    return true;
+    if (offset_ >= fail_after_) {
+      FailWith(StatusError(StatusCode::kIOError, "source failed"));
+    }
+    return dst->Size();
   }
   void Dump(std::ostream& out, int /*indent*/) const override {
     out << "FailingRows";

@@ -14,23 +14,14 @@
  * limitations under the License.
  */
 
-#include "row_page.hpp"
+#include "page/row_page.hpp"
 
-#include <algorithm>
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <functional>
-#include <limits>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "common/constants.hpp"
-#include "common/debug.hpp"
 #include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "transaction/transaction.hpp"
@@ -40,87 +31,44 @@ namespace tinylamb {
 StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
                                          slot_t slot, bool resolve_head) const {
   const RowPosition position(page_id, slot);
-  if (row_max_ <= slot || rows_[slot].offset == 0) {
+  if (slot >= slots_.size() || slots_[slot].empty()) {
     return txn.ReadVersion(position, std::nullopt, resolve_head);
   }
   return txn.ReadVersion(position, GetRow(slot), resolve_head);
 }
 
-/*
- *           = before =
- * +-------------------------------+
- * | RowPointer(0, 0) |            |
- * +-------------------------------+
- * |                               |
- * +-------------------------------+
- *                                 ^ free_ptr_
- *           = after =
- * *-------------------------------+
- * | RowPointer(PosX, Size) |      |
- * +-------------------------------+
- * |                      | Record |
- * +-------------------------------+
- *                        ^ PosX == free_ptr_
- */
 StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
                                  std::string_view record) {
-  // Holes (vacant slots) decide the capacity picture. A hole whose deleting
-  // transaction is STILL ACTIVE holds a write intent on its RowPosition: this
-  // insert can neither reuse the slot nor consume the bytes that delete
-  // credited back to free_size_ -- an aborting deleter must be able to put
-  // its row back, and before the reservation below a concurrent fresh-slot
-  // insert could eat exactly those bytes inside the deleter's intent window
-  // (TPC-C delivery: a 5 s latch-cycle abort then failed its undo re-insert
-  // with kNoSpace and fail-stopped the engine -- and a restart replayed the
-  // same undo against the same full page, wedging the open). Bytes of a hole
-  // this transaction CAN acquire belong to the page again; the deleter of
-  // such a hole has resolved, so its undo can no longer need them.
   size_t locked_hole_bytes = 0;
-  // First usable hole, with its intent already acquired; row_max_ when none.
-  slot_t hole_slot = row_max_;
-  for (slot_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset != 0) {
+  const auto row_max = static_cast<slot_t>(slots_.size());
+  slot_t hole_slot = row_max;
+  for (slot_t i = 0; i < row_max; ++i) {
+    if (!slots_[i].empty()) {
       continue;
     }
     const RowPosition hole(page_id, i);
-    // Non-blocking acquisition ONLY: this method runs under the page's
-    // exclusive content latch, and a blocking wait here parks the latch on a
-    // foreign write intent -- the exact latch×intent cycle whose only
-    // in-engine escape is the multi-second write-intent hatch (the aborting
-    // owner of that intent needs this very latch for its undo walk, the
-    // detector cannot see the latch edge, and every queued inserter behind
-    // us piles onto the same park). A hole whose deleter is mid-abort simply
-    // keeps its bytes reserved for that undo, exactly like the
-    // still-running deleter below.
     if (txn.TryAddWriteSet(hole)) {
-      if (hole_slot == row_max_ && !txn.SnapshotSeesRow(hole)) {
+      if (hole_slot == row_max && !txn.SnapshotSeesRow(hole)) {
         hole_slot = i;
         continue;
       }
-      // Either a later duplicate we cannot use, or one whose pre-delete
-      // image this transaction's snapshot still sees: staging an insert
-      // there would mask the snapshot-visible version behind our own
-      // pending value (ReadVersion consults pending first), silently
-      // dropping the old row from the inserter's view. Release and move on;
-      // once we hold the intent no other writer can publish a version
-      // covering our snapshot at this position.
       txn.ReleaseWriteIntent(hole);
       continue;
     }
-    // Foreign pending delete: its bytes stay reserved for the deleter's
-    // abort undo (DeleteRow kept the row size on the hole for exactly this).
-    locked_hole_bytes += rows_[i].size;
+    if (i < hole_sizes_.size()) {
+      locked_hole_bytes += hole_sizes_[i];
+    }
   }
+  const size_t free_bytes = FreeSize();
   const size_t available =
-      free_size_ >= locked_hole_bytes ? free_size_ - locked_hole_bytes : 0;
+      free_bytes >= locked_hole_bytes ? free_bytes - locked_hole_bytes : 0;
   auto release_acquired_hole = [&] {
-    if (hole_slot != row_max_) {
+    if (hole_slot != row_max) {
       txn.ReleaseWriteIntent(RowPosition(page_id, hole_slot));
-      hole_slot = row_max_;
+      hole_slot = row_max;
     }
   };
-  if (hole_slot != row_max_) {
-    // Reusing a hole costs the record bytes only -- no new RowPointer.
+  if (hole_slot != row_max) {
     if (available < record.size()) {
       release_acquired_hole();
       return Status::kNoSpace;
@@ -132,14 +80,9 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
     }
     txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()),
                              std::nullopt, record);
-    Status append =
+    const Status append =
         txn.InsertLog(page_id, inserted.Value(), record).GetStatus();
     if (append != Status::kSuccess) {
-      // The WAL append failed: no CLR will ever compensate this insert, and
-      // once AbortVersions clears the unstaged pending, the physical image
-      // would serve phantom rows through ReadVersion's fallback.  Roll the
-      // slot back to a hole now (DeleteRow keeps the high-water mark, which
-      // is harmless; the space stays reusable through the hole).
       DeleteRow(inserted.Value());
       (void)txn.CancelStagedVersion(RowPosition(page_id, inserted.Value()));
       txn.MarkFailed();
@@ -147,117 +90,76 @@ StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
     }
     return inserted.Value();
   }
-  // A fresh slot costs one RowPointer on top of the record (and extends the
-  // slot array when it grows past row_max_ -- InsertRowAt re-checks the
-  // contiguous bound). Without the hole-discount this is where the old
-  // early check used to under-charge by sizeof(RowPointer).
-  if (available < static_cast<size_t>(record.size()) + sizeof(RowPointer)) {
+  if (slots_.size() >= kMaxSlotsPerBlock ||
+      available < record.size() + kSlotEntryBytes) {
     return Status::kNoSpace;
   }
-  // Same latch discipline as the hole loop: try, never wait. A foreign
-  // pending on the boundary slot is a mid-abort window; failing fast (pre-
-  // mutation) lets the caller treat it like any other conflict instead of
-  // parking this page's latch under a multi-second intent wait.
-  if (!txn.TryAddWriteSet(RowPosition(page_id, row_max_))) {
+  const RowPosition pos(page_id, row_max);
+  if (!txn.TryAddWriteSet(pos)) {
     return Status::kConflicts;
   }
-  const StatusOr<slot_t> inserted = InsertRowAt(row_max_, record);
+  const StatusOr<slot_t> inserted = InsertRowAt(row_max, record);
   if (!inserted.HasValue()) {
+    txn.ReleaseWriteIntent(pos);
     return inserted.GetStatus();
   }
-  txn.RegisterVersionWrite(RowPosition(page_id, inserted.Value()), std::nullopt,
-                           record);
-  Status append = txn.InsertLog(page_id, inserted.Value(), record).GetStatus();
+  txn.RegisterVersionWrite(pos, std::nullopt, record);
+  const Status append =
+      txn.InsertLog(page_id, inserted.Value(), record).GetStatus();
   if (append != Status::kSuccess) {
-    // The WAL append failed: no CLR will ever compensate this insert, and
-    // once AbortVersions clears the unstaged pending, the physical image
-    // would serve phantom rows through ReadVersion's fallback.  Roll the
-    // slot back to a hole now (DeleteRow keeps the high-water mark, which is
-    // harmless; the space stays reusable through the hole).
     DeleteRow(inserted.Value());
-    (void)txn.CancelStagedVersion(RowPosition(page_id, inserted.Value()));
+    (void)txn.CancelStagedVersion(pos);
     txn.MarkFailed();
     return append;
   }
   return inserted.Value();
 }
 
-namespace {
-
-size_t SlotArrayBytes(slot_t row_max) {
-  return sizeof(RowPage) + (static_cast<size_t>(row_max) * sizeof(RowPointer));
-}
-
-}  // namespace
-
-bool RowPage::ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
-                                     slot_t prospective_row_max) {
-  auto fits = [&] {
-    return SlotArrayBytes(prospective_row_max) + bytes <= free_ptr_;
-  };
-  if (fits()) {
-    return true;
-  }
-  DeFragmentExcept(protected_slot);
-  // Live rows are never dropped here: only logged transaction deletes may
-  // remove them.  When even a full compaction cannot satisfy the request the
-  // caller must fail (and surface kNoSpace) instead of losing rows.
-  return fits();
-}
-
 StatusOr<slot_t> RowPage::InsertRow(std::string_view new_row) {
   slot_t slot = 0;
-  while (slot < row_max_ && rows_[slot].offset != 0) {
+  while (slot < slots_.size() && !slots_[slot].empty()) {
     ++slot;
   }
   return InsertRowAt(slot, new_row);
 }
 
 StatusOr<slot_t> RowPage::InsertRowAt(slot_t slot, std::string_view new_row) {
-  // Leaf/Branch pages reject oversized payloads with kTooBigData; RowPage
-  // must do the same. The assert alone vanishes in NDEBUG builds, where the
-  // narrowing below (rows_[slot].size, free_ptr_/free_size_) would silently
-  // truncate the record.
-  if (new_row.size() > std::numeric_limits<bin_size_t>::max()) {
-    return Status::kTooBigData;
-  }
-  if (slot < row_max_ && rows_[slot].offset != 0) {
-    return Status::kConflicts;
-  }
-
-  // row_count_ cannot describe the end of the slot array when deletions have
-  // left holes.  Reserve metadata through the highest live/prospective slot;
-  // otherwise tuple bytes can overwrite RowPointers that are still in use.
-  const slot_t prospective_row_max = std::max<slot_t>(row_max_, slot + 1);
-  if (!ReclaimUntilContiguous(new_row.size(), slot, prospective_row_max)) {
+  if (new_row.size() > kBlockBudgetBytes) {
     return Status::kNoSpace;
   }
-
-  const size_t slot_growth =
-      static_cast<size_t>(prospective_row_max - row_max_) * sizeof(RowPointer);
-  free_size_ -= static_cast<bin_size_t>(new_row.size() + slot_growth);
-  free_ptr_ -= static_cast<bin_size_t>(new_row.size());
-  rows_[slot].offset = free_ptr_;
-  rows_[slot].size = static_cast<bin_size_t>(new_row.size());
-  memcpy(Payload() + free_ptr_, new_row.data(), new_row.size());
-  row_count_++;
-  row_max_ = prospective_row_max;
+  if (slot < slots_.size() && !slots_[slot].empty()) {
+    return Status::kConflicts;
+  }
+  const size_t new_slots = slot >= slots_.size()
+                               ? (static_cast<size_t>(slot) + 1 - slots_.size())
+                               : 0;
+  if (UsedBytes() + new_slots * kSlotEntryBytes + new_row.size() >
+      kBlockBudgetBytes) {
+    return Status::kNoSpace;
+  }
+  if (slot >= slots_.size()) {
+    slots_.resize(static_cast<size_t>(slot) + 1);
+    hole_sizes_.resize(static_cast<size_t>(slot) + 1, 0);
+  }
+  slots_[slot].assign(new_row);
+  if (slot < hole_sizes_.size()) {
+    hole_sizes_[slot] = 0;
+  }
+  ++row_count_;
   return slot;
 }
 
 Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
                        std::string_view record) {
-  if (row_max_ <= slot || rows_[slot].offset == 0) {
+  if (slot >= slots_.size() || slots_[slot].empty()) {
     return Status::kNotExists;
   }
-  // Own a copy of the previous image: applying the update may defragment the
-  // page and move or release the bytes this view points into.
   const std::string prev_row(GetRow(slot));
   if (prev_row.size() < record.size() &&
-      free_size_ < record.size() - prev_row.size()) {
+      FreeSize() < record.size() - prev_row.size()) {
     return Status::kNoSpace;
   }
-  RowPosition pos(page_id, slot);
+  const RowPosition pos(page_id, slot);
   if (!txn.AddWriteSet(pos, prev_row)) {
     return Status::kConflicts;
   }
@@ -266,21 +168,12 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   if (!head.HasValue() || head.Value() != prev_row) {
     return Status::kConflicts;
   }
-  // Reserve contiguous space before any WAL write: a failed allocation must
-  // not leave a log record describing an update that never reached the page.
   RETURN_IF_FAIL(UpdateRow(pos.slot, record));
   txn.RegisterVersionWrite(pos, prev_row, record);
-  Status append = txn.UpdateLog(page_id, slot, record, prev_row).GetStatus();
+  const Status append =
+      txn.UpdateLog(page_id, slot, record, prev_row).GetStatus();
   if (append != Status::kSuccess) {
-    // WAL append failed: restore the previous image so the page never keeps
-    // an update no log record backs.  The committed base installed by
-    // AddWriteSet shields MVCC readers, but the physical fallback would not.
-    // The restore cannot fail here: its image is never larger than what the
-    // page already held before the applied update.
-    if (UpdateRow(pos.slot, prev_row) != Status::kSuccess) {
-      LOG(ERROR) << "Update rollback failed; unlogged image at " << page_id
-                 << "/" << pos.slot;
-    }
+    std::ignore = UpdateRow(pos.slot, prev_row);
     (void)txn.CancelStagedVersion(pos);
     txn.MarkFailed();
     return append;
@@ -291,66 +184,40 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
 StatusOr<lsn_t> RowPage::RestorePhysicalUpdate(page_id_t page_id,
                                                Transaction& txn, slot_t slot,
                                                std::string_view record) {
-  if (row_max_ <= slot || rows_[slot].offset == 0) {
+  if (slot >= slots_.size() || slots_[slot].empty()) {
     return Status::kNotExists;
   }
-  ASSIGN_OR_RETURN(lsn_t, compensation_end,
+  ASSIGN_OR_RETURN(lsn_t, lsn,
                    txn.AppendPhysicalUpdateCompensation(page_id, slot, record));
   RETURN_IF_FAIL(UpdateRow(slot, record));
-  return compensation_end;
+  return lsn;
 }
 
 Status RowPage::UpdateRow(slot_t slot, std::string_view record) {
-  if (record.size() > std::numeric_limits<bin_size_t>::max()) {
-    return Status::kTooBigData;
+  if (slot >= slots_.size()) {
+    slots_.resize(static_cast<size_t>(slot) + 1);
+    hole_sizes_.resize(static_cast<size_t>(slot) + 1, 0);
   }
-  const size_t previous_size = rows_[slot].size;
-  if (record.size() <= previous_size) {
-    // There is already enough space, just overwrite.
-    free_size_ += static_cast<bin_size_t>(previous_size - record.size());
-    rows_[slot].size = static_cast<bin_size_t>(record.size());
-    memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
-    return Status::kSuccess;
+  const size_t prev_size = slots_[slot].size();
+  if (record.size() > prev_size && FreeSize() < record.size() - prev_size) {
+    return Status::kNoSpace;
   }
-  // Allocate a new field and leave the old field as fragmented free space.
-  // Recovery undo may need to restore a larger image after another
-  // transaction reused the bytes an uncommitted shrink released. Compact,
-  // and drop later rows if needed, instead of writing below the slot array.
-  const bool already_contiguous =
-      SlotArrayBytes(row_max_) + record.size() <= free_ptr_;
-  if (!already_contiguous) {
-    // The compaction below releases the current image of |slot| back to the
-    // free area.  Verify up front that even that cannot leave the request
-    // unsatisfiable; otherwise fail before mutating anything so callers can
-    // stop without writing WAL records for an update that never applied.
-    size_t live_bytes = 0;
-    for (slot_t i = 0; i < row_max_; ++i) {
-      if (rows_[i].offset != 0 && static_cast<size_t>(i) != slot) {
-        live_bytes += rows_[i].size;
-      }
-    }
-    if (SlotArrayBytes(row_max_) + record.size() > kPageBodySize - live_bytes) {
-      return Status::kNoSpace;
-    }
-    DeFragmentExcept(slot);
+  if (slots_[slot].empty() && !record.empty()) {
+    ++row_count_;
   }
-  free_ptr_ -= static_cast<bin_size_t>(record.size());
-  rows_[slot].offset = free_ptr_;
-  if (already_contiguous) {
-    free_size_ += static_cast<bin_size_t>(previous_size);
+  slots_[slot].assign(record);
+  if (slot < hole_sizes_.size()) {
+    hole_sizes_[slot] = 0;
   }
-  free_size_ -= static_cast<bin_size_t>(record.size());
-  rows_[slot].size = static_cast<bin_size_t>(record.size());
-  memcpy(Payload() + rows_[slot].offset, record.data(), record.size());
   return Status::kSuccess;
 }
 
 Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
-  if (row_max_ <= slot || rows_[slot].offset == 0) {
+  if (slot >= slots_.size() || slots_[slot].empty()) {
     return Status::kNotExists;
   }
   const std::string previous(GetRow(slot));
-  RowPosition pos(page_id, slot);
+  const RowPosition pos(page_id, slot);
   if (!txn.AddWriteSet(pos, previous)) {
     return Status::kConflicts;
   }
@@ -360,7 +227,7 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
     return Status::kConflicts;
   }
   txn.RegisterVersionWrite(pos, previous, std::nullopt);
-  Status append = txn.DeleteLog(page_id, slot, previous).GetStatus();
+  const Status append = txn.DeleteLog(page_id, slot, previous).GetStatus();
   if (append != Status::kSuccess) {
     (void)txn.CancelStagedVersion(pos);
     txn.MarkFailed();
@@ -371,25 +238,14 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
 }
 
 void RowPage::DeleteRow(slot_t slot) {
-  // D2 (docs/design.md): row delete and its compensating undo may be applied
-  // more than once (loser undo rewinds page_lsn, so a second recovery pass
-  // redoes then re-undoes the same record).  A slot that is already empty
-  // (or beyond row_max_) is a successful no-op; decrementing row_count_ a
-  // second time underflowed the uint16_t to 65535 and inflated free_size_.
-  if (row_max_ <= slot || rows_[slot].offset == 0) {
-    return;
+  if (slot < slots_.size() && !slots_[slot].empty()) {
+    if (hole_sizes_.size() < slots_.size()) {
+      hole_sizes_.resize(slots_.size(), 0);
+    }
+    hole_sizes_[slot] = slots_[slot].size();
+    slots_[slot].clear();
+    --row_count_;
   }
-  row_count_--;
-  free_size_ += rows_[slot].size;
-  // Keep the row SIZE on the hole (only the offset clears): while the
-  // deleting transaction is unresolved, its write intent locks the slot and
-  // RowPage::Insert subtracts the hole's bytes from what a fresh-slot insert
-  // may consume -- the deleter's abort undo must always be able to put the
-  // row back. GetRow reports holes as empty regardless of the stored size.
-  rows_[slot].offset = 0;
-  // Keep the high-water mark: an older MV2PL snapshot may still need to ask
-  // the version store for a physically deleted tail slot. Vacant slots remain
-  // reusable by InsertRow.
 }
 
 Status RowPage::SetNextPage(page_id_t page_id, Transaction& txn,
@@ -414,76 +270,9 @@ Status RowPage::SetPrevPage(page_id_t page_id, Transaction& txn,
   return Status::kSuccess;
 }
 
-void RowPage::SetNextPageImpl(page_id_t next) { next_page_id_ = next; }
-
-void RowPage::SetPrevPageImpl(page_id_t prev) { prev_page_id_ = prev; }
-
-slot_t RowPage::RowCount() const { return row_count_; }
-
-void RowPage::DeFragmentExcept(slot_t excluded_slot) {
-  // FIXME: replace it with inplace one?
-  std::vector<std::string> tmp_buffer;
-  tmp_buffer.reserve(row_max_);
-  for (slot_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset == 0 || i == excluded_slot) {
-      tmp_buffer.emplace_back("");
-    } else {
-      tmp_buffer.emplace_back(GetRow(i));
-    }
-  }
-  free_ptr_ = kPageBodySize;
-  for (size_t i = 0; i < row_max_; ++i) {
-    if (rows_[i].offset == 0 || i == excluded_slot) {
-      if (i == excluded_slot) {
-        rows_[i].size = rows_[i].offset = 0;
-      }
-      continue;
-    }
-
-    free_ptr_ -= static_cast<bin_size_t>(tmp_buffer[i].size());
-    rows_[i].offset = free_ptr_;
-    memcpy(Payload() + free_ptr_, tmp_buffer[i].data(), tmp_buffer[i].size());
-  }
-  const auto slot_bytes = static_cast<size_t>(
-      reinterpret_cast<char*>(&rows_[row_max_]) - Payload());
-  assert(slot_bytes <= free_ptr_);
-  free_size_ = static_cast<bin_size_t>(free_ptr_ - slot_bytes);
-}
-
-void RowPage::DeFragment() {
-  DeFragmentExcept(std::numeric_limits<slot_t>::max());
-}
-
-void RowPage::Dump(std::ostream& o, int indent) const {
-  o << "Rows: " << row_count_ << " Prev: " << prev_page_id_
-    << " Next: " << next_page_id_ << " FreeSize: " << free_size_
-    << " FreePtr:" << free_ptr_;
-  for (slot_t i = 0; i < row_max_; ++i) {
-    o << "\n"
-      << Indent(static_cast<size_t>(indent)) << i << ": "
-      << OmittedString(GetRow(i), 40);
-  }
+void RowPage::Dump(std::ostream& o, int /*indent*/) const {
+  o << "[RowCount: " << row_count_ << " PrevPage: " << prev_page_id_
+    << " NextPage: " << next_page_id_ << "]";
 }
 
 }  // namespace tinylamb
-
-uint64_t std::hash<tinylamb::RowPage>::operator()(
-    const tinylamb::RowPage& r) const {
-  uint64_t ret = 0;
-  ret += std::hash<tinylamb::page_id_t>()(r.prev_page_id_);
-  ret += std::hash<tinylamb::page_id_t>()(r.next_page_id_);
-  ret += std::hash<tinylamb::slot_t>()(r.row_max_);
-  ret += std::hash<tinylamb::slot_t>()(r.row_count_);
-  ret += std::hash<tinylamb::bin_size_t>()(r.free_ptr_);
-  ret += std::hash<tinylamb::bin_size_t>()(r.free_size_);
-  // Slot numbers do not identify live rows once deletions leave holes: walk
-  // the whole slot array and hash only occupied slots (offset != 0).  The
-  // old loop hashed the first row_count_ slots, so two pages with identical
-  // contents but holes at different positions collided.
-  for (tinylamb::slot_t i = 0; i < r.row_max_; ++i) {
-    if (r.rows_[i].offset != 0) {
-      ret += std::hash<std::string_view>()(r.GetRow(i));
-    }
-  }
-  return ret;
-}

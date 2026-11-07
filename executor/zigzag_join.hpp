@@ -31,7 +31,6 @@ class ZigZagJoin final : public ExecutorBase {
   ZigZagJoin& operator=(ZigZagJoin&&) = delete;
   ~ZigZagJoin() override = default;
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
@@ -49,6 +48,7 @@ class ZigZagJoin final : public ExecutorBase {
     std::optional<int64_t> previous;
   };
 
+  bool NextRow(Row* destination, RowPosition* position);
   bool LoadLeft();
   bool LoadRight();
   void ClearLeft();

@@ -24,9 +24,13 @@
 // change, whether the page is served through the fast path or through the
 // ReadVersion fallback.
 
+#include <chrono>
 #include <cstdint>
+#include <future>
+#include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -93,6 +97,84 @@ class FullScanMvccFastPathTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> db_;
 };
+
+TEST_F(FullScanMvccFastPathTest, LockedScanWaitDoesNotHoldThePageLatch) {
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, position,
+      table.Insert(seed.txn_, Row({Value(0), Value("a"), Value(0.5)})));
+  ASSERT_SUCCESS(seed.PreCommit());
+  TransactionContext owner = db_->BeginContext();
+  ASSERT_TRUE(owner.txn_.AddWriteSet(position));
+  std::promise<void> started;
+  std::promise<StatusOr<Row>> scanned;
+  auto entered = started.get_future();
+  auto result = scanned.get_future();
+  std::thread waiter([&] {
+    auto context = db_->BeginContext();
+    TableScanOptions options;
+    options.lock_rows = true;
+    started.set_value();
+    auto scan = table.BeginFullScan(context.txn_, options);
+    if (scan.IsValid()) {
+      scanned.set_value(*scan);
+    } else {
+      scanned.set_value(scan.GetStatus());
+    }
+  });
+  entered.wait();
+  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  const auto begin = std::chrono::steady_clock::now();
+  const auto updated = table.Update(
+      owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
+  const Status committed = owner.PreCommit();
+  waiter.join();
+  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(1));
+  EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(committed, Status::kSuccess);
+  const auto row = result.get();
+  ASSERT_TRUE(row.HasValue()) << row.GetStatus();
+  EXPECT_EQ(row.Value(), Row({Value(0), Value("updated"), Value(1.0)}));
+}
+
+TEST_F(FullScanMvccFastPathTest, DirectUpdateWaitDoesNotHoldThePageLatch) {
+  TransactionContext seed = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "SampleTable"));
+  ASSIGN_OR_ASSERT_FAIL(
+      RowPosition, position,
+      table.Insert(seed.txn_, Row({Value(0), Value("a"), Value(0.5)})));
+  ASSERT_SUCCESS(seed.PreCommit());
+  TransactionContext owner = db_->BeginContext();
+  ASSERT_TRUE(owner.txn_.AddWriteSet(position));
+  std::promise<void> started;
+  std::promise<Status> completed;
+  auto entered = started.get_future();
+  auto result = completed.get_future();
+  std::thread waiter([&] {
+    auto context = db_->BeginContext();
+    started.set_value();
+    const auto update =
+        table.Update(context.txn_, position,
+                     Row({Value(0), Value("contender"), Value(2.0)}));
+    context.Abort();
+    completed.set_value(update.GetStatus());
+  });
+  entered.wait();
+  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  const auto begin = std::chrono::steady_clock::now();
+  const auto updated = table.Update(
+      owner.txn_, position, Row({Value(0), Value("updated"), Value(1.0)}));
+  const Status committed = owner.PreCommit();
+  waiter.join();
+  EXPECT_LT(std::chrono::steady_clock::now() - begin, std::chrono::seconds(1));
+  EXPECT_EQ(updated.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(committed, Status::kSuccess);
+  const Status status = result.get();
+  EXPECT_TRUE(status == Status::kSuccess || status == Status::kConflicts);
+}
 
 // Probe: txn B holds an uncommitted update on a row; txn A updating the
 // same row must lose the write-intent race.
@@ -502,6 +584,366 @@ TEST_F(FullScanMvccFastPathTest, AbortedDestroyRestoreSurvivesCrash) {
   ASSERT_NO_FATAL_FAILURE(
       ExpectScannedKeys(resurrected.Value(), check.txn_, {7}));
   ASSERT_SUCCESS(check.PreCommit());
+}
+
+TEST_F(FullScanMvccFastPathTest, CachedPageVerdictIsInvalidatedAfterLatchDrop) {
+  auto setup = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, "SampleTable"));
+  std::vector<RowPosition> positions;
+  for (int i = 0; i < 3; ++i) {
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, position,
+        table.Insert(setup.txn_,
+                     Row({Value(i), Value("payload"), Value(0.5)})));
+    positions.push_back(position);
+  }
+  ASSERT_SUCCESS(setup.PreCommit());
+  AdvanceCommitClock(64);
+  auto reader = db_->BeginReadOnlyContext();
+  Iterator iterator = table.BeginFullScan(reader.txn_);
+  ASSERT_TRUE(iterator.IsValid());
+  EXPECT_EQ((*iterator)[0], Value(0));
+  std::atomic<bool> writer_ok{false};
+  std::jthread writer([&] {
+    auto context = db_->BeginContext();
+    const auto updated = table.Update(
+        context.txn_, positions[2], Row({Value(99), Value("new"), Value(9.5)}));
+    writer_ok = updated.HasValue() && context.PreCommit().ok();
+  });
+  bool chain_registered = false;
+  for (int i = 0; i < 1000; ++i) {
+    if (reader.txn_.HasPageVersionChains(positions[2].page_id)) {
+      chain_registered = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // A registered writer is blocked by our shared latch. The unchanged
+  // physical image remains valid while that latch is held.
+  ++iterator;
+  const Value second = (*iterator)[0];
+  iterator.DropPageLatch();
+  writer.join();
+  ASSERT_TRUE(chain_registered);
+  ASSERT_TRUE(writer_ok.load());
+  EXPECT_EQ(second, Value(1));
+  ++iterator;  // re-pin must discard the cached physical-read verdict
+  ASSERT_TRUE(iterator.IsValid());
+  EXPECT_EQ((*iterator)[0], Value(2));
+  iterator.DropPageLatch();
+  TableScanOptions options;
+  options.projection = std::vector<slot_t>{0};
+  Iterator typed = table.BeginFullScan(reader.txn_, options);
+  TypedCellBatch batch;
+  batch.capture_positions = true;
+  ASSERT_EQ(typed.DecodeNextTypedBatch(&batch, 1), 1U);
+  typed.DropPageLatch();
+  {
+    auto update = db_->BeginContext();
+    ASSERT_SUCCESS(table
+                       .Update(update.txn_, positions[1],
+                               Row({Value(77), Value("newer"), Value(7.5)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(update.PreCommit());
+  }
+  ASSERT_EQ(typed.DecodeNextTypedBatch(&batch, 4), 2U);
+  EXPECT_EQ(batch.cells[0], 1);
+  EXPECT_EQ(batch.cells[1], 2);
+  EXPECT_EQ(batch.positions,
+            std::vector<RowPosition>({positions[1], positions[2]}));
+  EXPECT_TRUE(typed.GetStatus().ok());
+}
+
+TEST_F(FullScanMvccFastPathTest, TypedProjectionEndsBeforeUnneededSuffix) {
+  auto seed = db_->BeginContext();
+  ASSERT_SUCCESS(
+      db_->CreateTable(seed,
+                       Schema("Narrow", {Column("a", ValueType::kInt64),
+                                         Column("b", ValueType::kVarChar),
+                                         Column("c", ValueType::kInt64),
+                                         Column("d", ValueType::kVarChar),
+                                         Column("e", ValueType::kDouble)}))
+          .GetStatus());
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "Narrow"));
+  std::vector<Row> expected;
+  std::vector<RowPosition> positions;
+  for (int i = 0; i < 73; ++i) {
+    expected.emplace_back(
+        Row({i % 3 ? Value(i) : Value(), Value(std::string(i, 'b')),
+             i % 5 ? Value(100 + i) : Value(),
+             i % 2 ? Value(std::string(128, 'd')) : Value(), Value(i + 0.5)}));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
+                          table.Insert(seed.txn_, expected.back()));
+    positions.push_back(position);
+  }
+  ASSERT_SUCCESS(seed.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  for (int phase = 0; phase < 2; ++phase) {
+    if (phase == 1) {
+      auto writer = db_->BeginContext();
+      ASSERT_SUCCESS(table
+                         .Update(writer.txn_, positions[7],
+                                 Row({Value(999), Value("changed"), Value(999),
+                                      Value(), Value(9.5)}))
+                         .GetStatus());
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    for (const std::vector<slot_t>& projection :
+         {std::vector<slot_t>{0}, std::vector<slot_t>{2},
+          std::vector<slot_t>{0, 2}}) {
+      TableScanOptions options;
+      options.projection = projection;
+      Iterator iterator = table.BeginFullScan(reader.txn_, options);
+      TypedCellBatch batch;
+      batch.capture_positions = true;
+      size_t seen = 0;
+      while (size_t count = iterator.DecodeNextTypedBatch(&batch, 17)) {
+        ASSERT_EQ(batch.stride, projection.size());
+        ASSERT_LE(seen + count, expected.size());
+        for (size_t row = 0; row < count; ++row) {
+          EXPECT_EQ(batch.positions[row], positions[seen + row]);
+          for (size_t c = 0; c < projection.size(); ++c) {
+            const Value& value = expected[seen + row][projection[c]];
+            const size_t cell = row * batch.stride + c;
+            EXPECT_EQ(batch.nulls[cell] != 0, value.IsNull());
+            if (!value.IsNull()) {
+              EXPECT_EQ(batch.cells[cell], value.value.int_value);
+            }
+          }
+        }
+        seen += count;
+        iterator.DropPageLatch();
+      }
+      EXPECT_EQ(seen, expected.size());
+      EXPECT_TRUE(iterator.GetStatus().ok());
+      EXPECT_FALSE(iterator.IsValid());
+    }
+  }
+}
+
+TEST_F(FullScanMvccFastPathTest,
+       PlannedPeeksSkipFixedSpansAroundVariableCells) {
+  auto seed = db_->BeginContext();
+  ASSERT_SUCCESS(
+      db_->CreateTable(seed,
+                       Schema("MixedPeek", {Column("a", ValueType::kInt64),
+                                            Column("b", ValueType::kDouble),
+                                            Column("c", ValueType::kVarChar),
+                                            Column("d", ValueType::kInt64),
+                                            Column("e", ValueType::kVarChar),
+                                            Column("f", ValueType::kDate),
+                                            Column("g", ValueType::kInt64)}))
+          .GetStatus());
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(seed, "MixedPeek"));
+  std::vector<Row> rows;
+  std::vector<RowPosition> positions;
+  for (int i = 0; i < 97; ++i) {
+    rows.emplace_back(
+        Row({Value(i), i % 7 ? Value(i + .5) : Value(),
+             i % 9 ? Value(std::string(i, 'c')) : Value(),
+             i % 11 ? Value(i % 13) : Value(),
+             i % 8 ? Value(std::string(i % 19, 'e')) : Value(),
+             i % 6 ? Value::Date(i % 2 ? "1996-01-02" : "1996-01-03") : Value(),
+             i % 5 ? Value(i % 17) : Value()}));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
+                          table.Insert(seed.txn_, rows.back()));
+    positions.push_back(position);
+  }
+  ASSERT_SUCCESS(seed.PreCommit());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (db_->TransactionStats().version_chains != 0 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(db_->TransactionStats().version_chains, 0U);
+  auto reader = db_->BeginReadOnlyContext();
+  for (int phase = 0; phase < 2; ++phase) {
+    if (phase == 1) {
+      auto writer = db_->BeginContext();
+      Row changed = rows[13];
+      changed[2] = Value("new variable width");
+      changed[3] = Value(1000);
+      changed[5] = Value::Date("2000-01-01");
+      changed[6] = Value(1000);
+      ASSERT_SUCCESS(
+          table.Update(writer.txn_, positions[13], changed).GetStatus());
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    for (slot_t column : {slot_t{0}, slot_t{3}, slot_t{5}, slot_t{6}}) {
+      const int64_t low =
+          column == 5 ? Value::Date("1996-01-02").value.int_value : 3;
+      const int64_t high = column == 5 ? low : 9;
+      const std::vector<IntegerPeekCompare> peeks{
+          {column, BinaryOperation::kGreaterThanEquals, low},
+          {column, BinaryOperation::kLessThanEquals, high}};
+      const std::unordered_set<int64_t> keys{low, high};
+      for (bool use_key_filter : {false, true}) {
+        TableScanOptions options;
+        options.projection = std::vector<slot_t>{0};
+        options.peek_compares = &peeks;
+        if (use_key_filter) {
+          options.key_column = column;
+          options.key_filter = &keys;
+        }
+        std::vector<int64_t> expected;
+        for (const auto& row : rows) {
+          if (row[column].IsNull()) continue;
+          const int64_t value = row[column].value.int_value;
+          if (low <= value && value <= high &&
+              (!use_key_filter || keys.contains(value)))
+            expected.push_back(row[0].value.int_value);
+        }
+        std::vector<int64_t> actual;
+        for (auto it = table.BeginFullScan(reader.txn_, options); it.IsValid();
+             ++it)
+          actual.push_back((*it)[0].value.int_value);
+        EXPECT_EQ(actual, expected)
+            << "column=" << column << " phase=" << phase;
+      }
+    }
+  }
+}
+
+TEST_F(FullScanMvccFastPathTest,
+       IntegerKeyCountsValidatePagesAndRetainSnapshotFallback) {
+  auto setup = db_->BeginContext();
+  ASSERT_TRUE(
+      db_->CreateTable(
+             setup, Schema("CountedKeys", {Column("k", ValueType::kInt64),
+                                           Column("p", ValueType::kVarChar)}))
+          .HasValue());
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, "CountedKeys"));
+  std::vector<RowPosition> positions;
+  std::vector<uint64_t> expected(7);
+  for (int64_t i = 0; i < 1201; ++i) {
+    const Value key = i % 11 == 0 ? Value() : Value(i % 7 - 3);
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, pos,
+        table.Insert(setup.txn_, Row({key, Value(std::string(128, 'p'))})));
+    positions.push_back(pos);
+    if (!key.IsNull()) ++expected[static_cast<size_t>(i % 7)];
+  }
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto old = db_->BeginReadOnlyContext();
+  auto pages = table.BuildScanMorsels(old.txn_, 2);
+  ASSERT_GT(pages.size(), 1U);
+  const auto await_counts = [&](Transaction& txn) {
+    std::shared_ptr<const Table::IntegerKeyCounts> counts;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    do {
+      counts = table.TryReadIntegerKeyCounts(txn, pages, 0, -3, 7);
+      if (counts) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return counts;
+  };
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(old.txn_, 0, -3, 7), nullptr);
+  auto first = await_counts(old.txn_);
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first->rows, 1201U);
+  EXPECT_EQ(first->counts, expected);
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(old.txn_, 0, -3, 7), first);
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(old.txn_, 0, -2, 7), nullptr);
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, pages, 0, -3, 7), first);
+  Table copy = table;
+  EXPECT_EQ(copy.TryReadIntegerKeyCounts(old.txn_, pages, 0, -3, 7), first);
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, pages, 1, -3, 7), nullptr);
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, pages, 0, 0, 65537),
+            nullptr);
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(
+                old.txn_, pages, 0, std::numeric_limits<int64_t>::max(), 2),
+            nullptr);
+  auto shifted = table.TryReadIntegerKeyCounts(old.txn_, pages, 0, -1, 3);
+  ASSERT_NE(shifted, nullptr);
+  EXPECT_EQ(shifted->counts,
+            std::vector<uint64_t>({expected[2], expected[3], expected[4]}));
+  auto incomplete = pages;
+  incomplete.pop_back();
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, incomplete, 0, -3, 7),
+            nullptr);
+  auto writer = db_->BeginContext();
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(writer.txn_, pages, 0, -3, 7),
+            nullptr);
+  ASSERT_TRUE(table
+                  .Update(writer.txn_, positions[2],
+                          Row({Value(3), Value(std::string(128, 'p'))}))
+                  .HasValue());
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, pages, 0, -3, 7), nullptr);
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(old.txn_, 0, -3, 7), nullptr);
+  ASSERT_SUCCESS(writer.PreCommit());
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(old.txn_, pages, 0, -3, 7), nullptr);
+  // The canonical fallback still resolves the old image; a fresh snapshot
+  // must not reuse a count produced for that old image.
+  std::vector<uint64_t> old_counts(7);
+  for (auto it = table.BeginFullScan(old.txn_); it.IsValid(); ++it) {
+    const auto row = *it;
+    if (!row[0].IsNull())
+      ++old_counts[static_cast<size_t>(row[0].value.int_value + 3)];
+  }
+  EXPECT_EQ(old_counts, expected);
+  auto fresh = db_->BeginReadOnlyContext();
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(fresh.txn_, pages, 0, -3, 7),
+            nullptr);
+  old.Abort();
+  --expected[2];
+  ++expected[6];
+  auto changed = await_counts(fresh.txn_);
+  ASSERT_NE(changed, nullptr);
+  EXPECT_EQ(changed->counts, expected);
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(fresh.txn_, 0, -3, 7), changed);
+  EXPECT_NE(changed, first);
+  // Abort rewrites the physical page through CLR without another Table DML
+  // call. A previously cached histogram must be invalidated by page LSN.
+  auto aborted = db_->BeginContext();
+  ASSERT_TRUE(table
+                  .Update(aborted.txn_, positions[2],
+                          Row({Value(-3), Value(std::string(128, 'p'))}))
+                  .HasValue());
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(fresh.txn_, pages, 0, -3, 7),
+            nullptr);
+  aborted.Abort();
+  auto restored = await_counts(fresh.txn_);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->counts, expected);
+  fresh.Abort();
+  auto deleter = db_->BeginContext();
+  ASSERT_SUCCESS(table.Delete(deleter.txn_, positions[1]));
+  ASSERT_SUCCESS(deleter.PreCommit());
+  auto after_delete = db_->BeginReadOnlyContext();
+  --expected[1];
+  auto holes = await_counts(after_delete.txn_);
+  ASSERT_NE(holes, nullptr);
+  EXPECT_EQ(holes->rows, 1200U);
+  EXPECT_EQ(holes->counts, expected);
+  EXPECT_EQ(table.FindCachedIntegerKeyCounts(after_delete.txn_, 0, -3, 7),
+            holes);
+  after_delete.Abort();
+}
+
+TEST_F(FullScanMvccFastPathTest,
+       IntegerKeyCountsRejectAnUnpublishedTailOutsideSavedMorsels) {
+  auto setup = db_->BeginContext();
+  ASSERT_TRUE(
+      db_->CreateTable(
+             setup, Schema("CountedTail", {Column("k", ValueType::kInt64),
+                                           Column("p", ValueType::kVarChar)}))
+          .HasValue());
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, "CountedTail"));
+  ASSERT_TRUE(
+      table.Insert(setup.txn_, Row({Value(1), Value(std::string(30000, 'x'))}))
+          .HasValue());
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  const auto pages = table.BuildScanMorsels(reader.txn_);
+  auto writer = db_->BeginContext();
+  ASSERT_TRUE(
+      table.Insert(writer.txn_, Row({Value(1), Value(std::string(30000, 'y'))}))
+          .HasValue());
+  EXPECT_EQ(table.TryReadIntegerKeyCounts(reader.txn_, pages, 0, 1, 1),
+            nullptr);
+  writer.Abort();
+  reader.Abort();
 }
 
 }  // namespace tinylamb

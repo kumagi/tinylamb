@@ -13,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -24,12 +25,14 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/executor_base.hpp"
 #include "index/index_schema.hpp"
 #include "query/sql_engine.hpp"
 #include "table/table.hpp"
+#endif
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -68,6 +71,7 @@ std::string StringValue(const Value& value) {
   return {};
 }
 
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 Status ExecuteSql(Database& database, TransactionContext& context,
                   std::string_view sql, std::string* error) {
   SqlEngine engine(database);
@@ -95,6 +99,8 @@ Status CreateIndex(Database& database, TransactionContext& context,
   return database.CreateIndex(context, table,
                               IndexSchema(name, std::move(keys), {}, mode));
 }
+
+#endif
 
 constexpr std::array<std::string_view, 10> kLastNameSyllables = {
     "BAR", "OUGHT", "ABLE",  "PRI",   "PRES",
@@ -210,13 +216,29 @@ std::string_view ToString(TpccTransactionType type) {
   return "unknown";
 }
 
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
                            int terminal_id, TpccNurand nurand)
     : database_(&database),
-      sql_engine_(database),
+      sql_engine_(std::make_unique<SqlEngine>(database)),
       scale_(scale),
       random_(seed),
       nurand_(nurand.valid ? nurand : TpccNurand::FromSeed(seed)) {
+  InitializeTerminal(terminal_id);
+}
+
+#endif
+
+TpccWorkload::TpccWorkload(TpccSqlSession& session, TpccScale scale,
+                           uint64_t seed, int terminal_id, TpccNurand nurand)
+    : external_session_(&session),
+      scale_(scale),
+      random_(seed),
+      nurand_(nurand.valid ? nurand : TpccNurand::FromSeed(seed)) {
+  InitializeTerminal(terminal_id);
+}
+
+void TpccWorkload::InitializeTerminal(int terminal_id) {
   if (terminal_id >= 0) {
     const int terminals = std::max(1, scale_.Terminals());
     const int id = terminal_id % terminals;
@@ -228,6 +250,85 @@ TpccWorkload::TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
   }
 }
 
+#ifdef TINYLAMB_TPCC_EXTERNAL_ONLY
+class TpccWorkload::Transaction {
+ public:
+  Transaction(Database*, TpccSqlSession* session, bool read_only)
+      : session_(session), begin_status_(session->Begin(read_only)) {}
+  ~Transaction() { Abort(); }
+  Transaction(const Transaction&) = delete;
+  Transaction& operator=(const Transaction&) = delete;
+  Status PreCommit() {
+    if (!active_) return Status::kInvalidArgument;
+    if (begin_status_ != Status::kSuccess) return begin_status_;
+    const auto status = session_->Commit();
+    if (status == Status::kSuccess) active_ = false;
+    return status;
+  }
+  void Abort() {
+    if (active_) session_->Abort();
+    active_ = false;
+  }
+  Status BeginStatus() const { return begin_status_; }
+  bool IsFinished() const { return !active_; }
+
+ private:
+  TpccSqlSession* session_;
+  Status begin_status_;
+  bool active_{true};
+};
+
+#else
+class TpccWorkload::Transaction {
+ public:
+  Transaction(Database* database, TpccSqlSession* session, bool read_only)
+      : session_(session) {
+    if (session_) {
+      begin_status_ = session_->Begin(read_only);
+    } else {
+      native_.emplace(read_only ? database->BeginReadOnlyContext()
+                                : database->BeginContext());
+    }
+  }
+  ~Transaction() { Abort(); }
+  Transaction(const Transaction&) = delete;
+  Transaction& operator=(const Transaction&) = delete;
+
+  Status PreCommit() {
+    if (!active_) return Status::kInvalidArgument;
+    if (begin_status_ != Status::kSuccess) return begin_status_;
+    const Status status = session_ ? session_->Commit() : native_->PreCommit();
+    if (status == Status::kSuccess) active_ = false;
+    return status;
+  }
+  void Abort() {
+    if (!active_) return;
+    if (session_)
+      session_->Abort();
+    else
+      native_->Abort();
+    active_ = false;
+  }
+  Status BeginStatus() const { return begin_status_; }
+  bool IsFinished() const {
+    return !active_ || (native_ && native_->IsFinished());
+  }
+  TransactionContext& Native() { return *native_; }
+
+ private:
+  TpccSqlSession* session_;
+  std::optional<TransactionContext> native_;
+  Status begin_status_{Status::kSuccess};
+  bool active_{true};
+};
+
+#endif
+
+TpccWorkload::Transaction TpccWorkload::BeginTransaction(bool read_only) {
+  return Transaction(database_, external_session_, read_only);
+}
+
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
                                 std::string* error, uint64_t seed) {
   if (scale.warehouses < 1 || scale.districts_per_warehouse < 1 ||
@@ -499,6 +600,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
   return stats_context.PreCommit();
 }
 
+#endif
+
 int TpccWorkload::Random(int lower, int upper) {
   return std::uniform_int_distribution<int>(lower, upper)(random_);
 }
@@ -541,15 +644,29 @@ TpccTransactionType TpccWorkload::NextTransactionType() {
   return TpccTransactionType::kStockLevel;
 }
 
-Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
+Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
                             std::vector<Row>* rows,
                             TpccTransactionResult* result) {
-  StatusOr<QueryResult> query_result = sql_engine_.Execute(context, sql);
+  if (external_session_) {
+    ++result->sql_statements;
+    Status status = context.BeginStatus();
+    if (status == Status::kSuccess)
+      status = external_session_->Execute(sql, rows);
+    if (status != Status::kSuccess) {
+      result->error = std::string(ToString(result->type)) + ": " +
+                      std::string(external_session_->LastError()) + " [" +
+                      std::string(sql) + "]";
+    }
+    return status;
+  }
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
+  StatusOr<QueryResult> query_result =
+      sql_engine_->Execute(context.Native(), sql);
   if (!query_result.HasValue()) {
     result->error = std::string(ToString(result->type)) + ": " +
-                    (sql_engine_.LastError().empty()
+                    (sql_engine_->LastError().empty()
                          ? std::string(ToString(query_result.GetStatus()))
-                         : sql_engine_.LastError()) +
+                         : sql_engine_->LastError()) +
                     " [" + std::string(sql) + "]";
     return query_result.GetStatus();
   }
@@ -573,6 +690,9 @@ Status TpccWorkload::RunSql(TransactionContext& context, std::string_view sql,
     return stream_status;
   }
   return Status::kSuccess;
+#else
+  return Status::kInvalidArgument;
+#endif
 }
 
 bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
@@ -660,7 +780,7 @@ TpccTransactionResult TpccWorkload::NewOrder() {
     item_ids.back() = scale_.items + 1;
   }
 
-  TransactionContext context = database_->BeginContext();
+  auto context = BeginTransaction();
   auto fail = [&]() {
     context.Abort();
     return result;
@@ -873,7 +993,7 @@ TpccTransactionResult TpccWorkload::Payment() {
   }
   result.customer_id = PickCustomerId();
   result.amount = static_cast<double>(Random(100, 500000)) / 100.0;
-  TransactionContext context = database_->BeginContext();
+  auto context = BeginTransaction();
   auto fail = [&]() {
     context.Abort();
     return result;
@@ -1012,7 +1132,7 @@ TpccTransactionResult TpccWorkload::OrderStatus() {
   // terminal district specifically for Stock-Level.
   result.district_id = Random(1, scale_.districts_per_warehouse);
   result.customer_id = PickCustomerId();
-  TransactionContext context = database_->BeginReadOnlyContext();
+  auto context = BeginTransaction(true);
   auto fail = [&]() {
     context.Abort();
     return result;
@@ -1074,7 +1194,7 @@ TpccTransactionResult TpccWorkload::Delivery() {
   result.type = TpccTransactionType::kDelivery;
   result.warehouse_id = home_warehouse_;
   const int carrier_id = Random(1, 10);
-  TransactionContext context = database_->BeginContext();
+  auto context = BeginTransaction();
   auto fail = [&]() {
     context.Abort();
     return result;
@@ -1138,7 +1258,7 @@ TpccTransactionResult TpccWorkload::Delivery() {
       }
       rows.clear();
       sql.str("");
-      sql << "UPDATE order_line SET ol_delivery_d = CURRENT_TIMESTAMP() "
+      sql << "UPDATE order_line SET ol_delivery_d = CURRENT_TIMESTAMP "
           << "WHERE ol_w_id = " << result.warehouse_id
           << " AND ol_d_id = " << district_id << " AND ol_o_id = " << order_id
           << " AND ol_number >= 1 AND ol_number <= " << scale_.max_order_lines
@@ -1200,7 +1320,7 @@ TpccTransactionResult TpccWorkload::StockLevel() {
   result.warehouse_id = home_warehouse_;
   result.district_id = home_district_;
   const int threshold = Random(10, 20);
-  TransactionContext context = database_->BeginReadOnlyContext();
+  auto context = BeginTransaction(true);
   auto fail = [&]() {
     context.Abort();
     return result;

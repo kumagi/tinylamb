@@ -18,7 +18,6 @@
 
 #include <cstdint>
 #include <ostream>
-#include <stdexcept>
 #include <string>
 
 #include "common/decoder.hpp"
@@ -31,23 +30,8 @@ std::ostream& operator<<(std::ostream& o, const PageType& type) {
     case PageType::kUnknown:
       o << "UnknownPageType";
       break;
-    case PageType::kFreePage:
-      o << "FreePageType";
-      break;
-    case PageType::kMetaPage:
-      o << "MetaPageType";
-      break;
     case PageType::kRowPage:
       o << "RowPageType";
-      break;
-    case PageType::kLeafPage:
-      o << "LeafPageType";
-      break;
-    case PageType::kBranchPage:
-      o << "BranchPageType";
-      break;
-    case PageType::kPaxPage:
-      o << "PaxPageType";
       break;
     default:
       o << "(unknown)";
@@ -62,12 +46,10 @@ Encoder& operator<<(Encoder& e, const PageType& type) {
 }
 
 Decoder& operator>>(Decoder& d, PageType& type) {
-  constexpr auto kMaxValid = static_cast<uint64_t>(PageType::kPaxPage);
+  constexpr auto kMaxValid = static_cast<uint64_t>(PageType::kRowPage);
   uint64_t raw = 0;
   d >> raw;
   if (raw > kMaxValid) {
-    // Broken images must not leak out-of-range enum values into downstream
-    // switches; the sticky decoder failure propagates as kCorrupt.
     d.Fail();
     return d;
   }

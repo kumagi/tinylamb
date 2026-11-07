@@ -1,0 +1,11 @@
+-- tinylamb-join-test v1
+-- seed: 2573203521
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact SELECT n, CASE WHEN MOD(n, 11) = 0 THEN NULL ELSE MOD(n, 7) END, MOD(n, 5) - 2 FROM UNNEST(GENERATE_SERIES(0, 8999)) AS n;
+-- setup: INSERT INTO dim SELECT MOD(n, 6), CASE WHEN MOD(n, 2) = 0 THEN 'x' ELSE 'yy' END FROM UNNEST(GENERATE_SERIES(0, 99)) AS n;
+-- query: SELECT COUNT(*) FROM fact f WHERE NOT EXISTS (SELECT 1 FROM dim d WHERE d.k = f.k AND d.tag = 'yy');
+-- expect: |5494|,
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f CROSS JOIN dim d;
+-- expect: |900000|,|900000|,|7|,|0|,|-2|,|5|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

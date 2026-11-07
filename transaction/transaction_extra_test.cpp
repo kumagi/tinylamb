@@ -39,7 +39,6 @@
 #include "recovery/logger.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/column.hpp"
@@ -53,6 +52,72 @@ namespace {
 
 int64_t IntValue(const Value& v) {
   return v.type == ValueType::kInt64 ? v.value.int_value : 0;
+}
+
+TEST(IndexReservationTest, NoWaitPolicyDoesNotParkBehindAnotherSession) {
+  const std::string path = "reservation_nowait-" + RandomString();
+  auto database = Database::Create(path).MoveValue();
+  ASSERT_NE(database, nullptr);
+  {
+    database->SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kNoWait);
+    auto owner = database->BeginContext();
+    auto waiter = database->BeginContext();
+    // A reservation without a physical mutation isolates admission from WAL
+    // and row-intent waits. It must remain reserved after a failed drain.
+    constexpr page_id_t page = 42;
+    owner.txn_.ReserveIndexUndoBytes(page, 128);
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(
+        waiter.txn_.WaitAllIndexReservationsDrain(std::chrono::seconds(2)),
+        Status::kConflicts);
+    EXPECT_EQ(waiter.txn_.WaitIndexReservationsDrain(page), Status::kConflicts);
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::milliseconds(100));
+    EXPECT_EQ(waiter.txn_.IndexUndoReservedBytes(page), 128U);
+    EXPECT_EQ(owner.txn_.WaitAllIndexReservationsDrain(), Status::kSuccess);
+    ASSERT_EQ(owner.PreCommit(), Status::kSuccess);
+    EXPECT_EQ(waiter.txn_.WaitAllIndexReservationsDrain(), Status::kSuccess);
+    EXPECT_EQ(waiter.txn_.IndexUndoReservedBytes(page), 0U);
+  }
+  database->DeleteAll();
+}
+
+TEST(IndexReservationTest, ForeignOwnerSummaryTracksRepeatedAndSharedPages) {
+  const std::string path = "reservation_summary-" + RandomString();
+  auto database = Database::Create(path).MoveValue();
+  ASSERT_NE(database, nullptr);
+  {
+    auto owner = database->BeginContext();
+    auto other = database->BeginContext();
+    auto observer = database->BeginReadOnlyContext();
+    // Cover every shard and many entries belonging only to one owner.
+    for (page_id_t page = 1; page <= 4097; ++page) {
+      owner.txn_.ReserveIndexUndoBytes(page, 32);
+      owner.txn_.ReserveIndexUndoBytes(page, 64);
+    }
+    EXPECT_FALSE(owner.txn_.HasForeignIndexReservations());
+    EXPECT_TRUE(other.txn_.HasForeignIndexReservations());
+    EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
+    other.txn_.ReserveIndexUndoBytes(1, 128);
+    other.txn_.ReserveIndexUndoBytes(1, 256);
+    other.txn_.ReserveIndexUndoBytes(4098, 128);
+    EXPECT_TRUE(owner.txn_.HasForeignIndexReservations());
+    EXPECT_TRUE(other.txn_.HasForeignIndexReservations());
+    EXPECT_EQ(owner.txn_.IndexUndoReservedBytes(1), 384U);
+    other.Abort();
+    EXPECT_FALSE(owner.txn_.HasForeignIndexReservations());
+    EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
+    EXPECT_EQ(owner.txn_.IndexUndoReservedBytes(1), 0U);
+    ASSERT_EQ(owner.PreCommit(), Status::kSuccess);
+    EXPECT_FALSE(observer.txn_.HasForeignIndexReservations());
+    auto again = database->BeginContext();
+    again.txn_.ReserveIndexUndoBytes(1, 16);
+    EXPECT_FALSE(again.txn_.HasForeignIndexReservations());
+    EXPECT_TRUE(observer.txn_.HasForeignIndexReservations());
+    again.Abort();
+    EXPECT_FALSE(observer.txn_.HasForeignIndexReservations());
+  }
+  database->DeleteAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +134,6 @@ TEST(CommitPublicationTest, ReaderNeverSeesLaterCommitWithoutEarlierOne) {
   auto logger_holder = Logger::Create(log_name).MoveValue();
   CHECK(logger_holder != nullptr);
   Logger& logger = *logger_holder;
-  LockManager lm;
   TransactionManager tm(nullptr, &logger, nullptr);
   // Visibility is decided at version publication; durability waits would
   // only slow this test down.
@@ -172,7 +236,6 @@ TEST(CommitPublicationTest, SnapshotIsRepeatableAcrossConcurrentCommits) {
   auto logger_holder = Logger::Create(log_name).MoveValue();
   CHECK(logger_holder != nullptr);
   Logger& logger = *logger_holder;
-  LockManager lm;
   TransactionManager tm(nullptr, &logger, nullptr);
 
   const RowPosition rp(43, 1);
@@ -205,58 +268,6 @@ TEST(CommitPublicationTest, SnapshotIsRepeatableAcrossConcurrentCommits) {
   ASSERT_SUCCESS_AND_EQ(second, std::optional<std::string>("base"));
   ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
   ASSERT_EQ(std::remove(log_name.c_str()), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Lock wait semantics (Phase 0-3): a timeout is only trustworthy when the
-// lock table showed no release progress at all; otherwise the waiter is
-// extended instead of being turned into a spurious conflict.
-// ---------------------------------------------------------------------------
-
-TEST(LockWaitProgressTest, WaiterTimesOutWhenNobodyReleasesAnything) {
-  LockManager lm;
-  const RowPosition contested(52, 1);
-  // Hold exactly the row the waiter wants; no release happens anywhere.
-  ASSERT_TRUE(lm.GetExclusiveLock(contested, 1));
-
-  const auto before = lm.WaitTimeouts();
-  const auto start = std::chrono::steady_clock::now();
-  EXPECT_FALSE(
-      lm.GetExclusiveLock(contested, 2, std::chrono::milliseconds(80)));
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  EXPECT_GT(lm.WaitTimeouts(), before);
-  // Fails fast: no extension without progress.
-  EXPECT_LT(elapsed, std::chrono::milliseconds(500));
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(contested, 1));
-}
-
-TEST(LockWaitProgressTest, WaiterExtendsWhileSystemShowsReleaseProgress) {
-  LockManager lm;
-  const RowPosition held(53, 1);
-  const RowPosition unrelated(54, 1);
-  const RowPosition contested(55, 1);
-  ASSERT_TRUE(lm.GetExclusiveLock(held, 1));
-
-  std::atomic<bool> acquired{false};
-  std::thread contender([&] {
-    // Would previously fail after 80ms even though the system was live.
-    acquired.store(
-        lm.GetExclusiveLock(contested, 2, std::chrono::milliseconds(80)));
-  });
-
-  // Keep releasing/re-acquiring an unrelated row so the lock table shows
-  // progress; the holder releases the contested row after ~500ms.
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  while (std::chrono::steady_clock::now() < deadline) {
-    ASSERT_TRUE(lm.GetExclusiveLock(unrelated, 9));
-    ASSERT_TRUE(lm.ReleaseExclusiveLock(unrelated, 9));
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  ASSERT_TRUE(lm.ReleaseExclusiveLock(held, 1));
-  contender.join();
-  EXPECT_TRUE(acquired.load());
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(contested, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,13 +756,99 @@ TEST_F(QueueTableTest, DeleteCompletesWhenPhysicalImageWasDisplaced) {
 // of the synchronous_commit setting.
 // ---------------------------------------------------------------------------
 
+TEST(DurabilityBarrierTest, WriteCapableEmptyTransactionDoesNotAppendWal) {
+  auto logger =
+      Logger::Create("empty_commit-" + RandomString() + ".log").MoveValue();
+  ASSERT_NE(logger, nullptr);
+  TransactionManager tm(nullptr, logger.get(), nullptr);
+  const lsn_t before = logger->BufferedLSN();
+  auto blocking = tm.Begin(false);
+  EXPECT_FALSE(blocking.IsReadOnly());
+  EXPECT_EQ(blocking.PreCommit(), Status::kSuccess);
+  EXPECT_TRUE(blocking.IsFinished());
+  EXPECT_EQ(logger->BufferedLSN(), before);
+  auto prepared = tm.Begin(false);
+  ASSERT_SUCCESS_AND_EQ(prepared.PrepareCommitForDurableReply(), lsn_t{0});
+  EXPECT_TRUE(prepared.IsFinished());
+  EXPECT_EQ(logger->BufferedLSN(), before);
+}
+
+TEST(DurabilityBarrierTest, WriteCapableReaderKeepsDependencyWithoutOwnWal) {
+  auto logger =
+      Logger::Create("empty_reader-" + RandomString() + ".log").MoveValue();
+  ASSERT_NE(logger, nullptr);
+  TransactionManager tm(nullptr, logger.get(), nullptr);
+  tm.SetSynchronousCommit(false);
+  // Pin a pre-write snapshot so GC cannot remove this synthetic version;
+  // this test has no backing heap from which to reconstruct its value.
+  auto pin = tm.Begin(true);
+  const RowPosition row(19, 1);
+  auto writer = tm.Begin();
+  ASSERT_TRUE(writer.AddWriteSet(row));
+  writer.RegisterVersionWrite(row, std::nullopt,
+                              std::optional<std::string_view>("A"));
+  ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  const lsn_t commit_end = logger->BufferedLSN();
+  ASSERT_GT(commit_end, 0U);
+  auto reader = tm.Begin(false);
+  ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, row, std::nullopt),
+                        std::optional<std::string>("A"));
+  EXPECT_EQ(reader.DurabilityDependence(), commit_end);
+  ASSERT_EQ(reader.PreCommit(), Status::kSuccess);
+  EXPECT_GE(logger->DurableLSN(), commit_end);
+  EXPECT_EQ(logger->BufferedLSN(), commit_end);
+  tm.SetSynchronousCommit(true);
+  auto prepared = tm.Begin(false);
+  ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(prepared, row, std::nullopt),
+                        std::optional<std::string>("A"));
+  ASSERT_SUCCESS_AND_EQ(prepared.PrepareCommitForDurableReply(), commit_end);
+  EXPECT_EQ(logger->BufferedLSN(), commit_end);
+  EXPECT_EQ(tm.WaitForWALDurable(commit_end), Status::kSuccess);
+  EXPECT_EQ(pin.PreCommit(), Status::kSuccess);
+}
+
+TEST(DurabilityBarrierTest, DeferredReplyCarriesOwnAndObservedCommitTargets) {
+  const std::string name = "durability_deferred-" + RandomString() + ".log";
+  auto logger = Logger::Create(name).MoveValue();
+  ASSERT_NE(logger, nullptr);
+  TransactionManager tm(nullptr, logger.get(), nullptr);
+  const RowPosition a(11, 1), b(12, 1);
+  auto writer = tm.Begin();
+  ASSERT_TRUE(writer.AddWriteSet(a));
+  writer.RegisterVersionWrite(a, std::nullopt,
+                              std::optional<std::string_view>("A"));
+  auto own = writer.PrepareCommitForDurableReply();
+  ASSERT_TRUE(own.HasValue());
+  EXPECT_GT(own.Value(), writer.PrevLSN());
+  EXPECT_TRUE(writer.IsFinished());
+  tm.SetSynchronousCommit(false);
+  auto reader = tm.Begin(true);
+  ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(reader, a, std::nullopt),
+                        std::optional<std::string>("A"));
+  auto dependence = reader.PrepareCommitForDurableReply();
+  ASSERT_TRUE(dependence.HasValue());
+  EXPECT_EQ(dependence.Value(), own.Value());
+  auto chained = tm.Begin();
+  ASSERT_SUCCESS_AND_EQ(tm.ReadVersion(chained, a, std::nullopt),
+                        std::optional<std::string>("A"));
+  ASSERT_TRUE(chained.AddWriteSet(b));
+  chained.RegisterVersionWrite(b, std::nullopt,
+                               std::optional<std::string_view>("B"));
+  auto target = chained.PrepareCommitForDurableReply();
+  ASSERT_TRUE(target.HasValue());
+  EXPECT_EQ(target.Value(), own.Value());  // async own commit still keeps D4.
+  EXPECT_EQ(tm.WaitForWALDurable(target.Value()), Status::kSuccess);
+  EXPECT_GE(logger->DurableLSN(), own.Value());
+  auto empty = tm.Begin(true);
+  ASSERT_SUCCESS_AND_EQ(empty.PrepareCommitForDurableReply(), lsn_t{0});
+}
+
 TEST(DurabilityBarrierTest, ReadOnlyReaderWaitsForObservedCommitLSN) {
   const std::string log_name =
       "durability_barrier-test-" + RandomString() + ".log";
   auto logger_holder = Logger::Create(log_name).MoveValue();
   CHECK(logger_holder != nullptr);
   Logger& logger = *logger_holder;
-  LockManager lm;
   TransactionManager tm(nullptr, &logger, nullptr);
   // Own-commit waiting is OFF, so the only durability barrier a read-only
   // reader can hit is the dependency wait introduced by D4.
@@ -788,7 +885,6 @@ TEST(DurabilityBarrierTest, ReadOnlyReaderWithoutVersionReadHasNoBarrier) {
   auto logger_holder = Logger::Create(log_name).MoveValue();
   CHECK(logger_holder != nullptr);
   Logger& logger = *logger_holder;
-  LockManager lm;
   TransactionManager tm(nullptr, &logger, nullptr);
   tm.SetSynchronousCommit(false);
 
@@ -806,7 +902,6 @@ TEST(DurabilityBarrierTest, ChainedWriterDependsOnEarlierCommit) {
   auto logger_holder = Logger::Create(log_name).MoveValue();
   CHECK(logger_holder != nullptr);
   Logger& logger = *logger_holder;
-  LockManager lm;
   TransactionManager tm(nullptr, &logger, nullptr);
   tm.SetSynchronousCommit(false);
 

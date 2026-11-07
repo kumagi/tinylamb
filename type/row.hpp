@@ -95,6 +95,10 @@ struct Row {
     return ExcShimUnwrap(TryDeserializePlanned(src, plan),
                          "Row::DeserializePlanned");
   }
+  size_t DeserializeBounded(const char* src, size_t max_len, const Schema& sc);
+  [[nodiscard]] static size_t PeekSerializedSize(const char* src,
+                                                 size_t max_len,
+                                                 const Schema& sc);
   // Read a single INT64/DATE column without materializing other values.
   [[nodiscard]] static std::optional<int64_t> TryPeekInteger(const char* src,
                                                              const Schema& sc,
@@ -110,11 +114,17 @@ struct Row {
     return ExcShimUnwrap(TryEncodeMemcomparableFormat(),
                          "Row::EncodeMemcomparableFormat");
   }
+  [[nodiscard]] std::string EncodeKeyMemcomparableFormat(
+      const Schema& sc) const;
+  size_t EncodeKeyMemcomparableFormatTo(const Schema& sc, char* dst) const;
   void DecodeMemcomparableFormat(std::string_view src) {
     const Status status = TryDecodeMemcomparableFormat(src);
     if (status != Status::kSuccess) {
       detail::ExcShimThrow("Row::DecodeMemcomparableFormat", status);
     }
+  }
+  void DecodeMemcomparableFormatBounded(std::string_view src) {
+    DecodeMemcomparableFormat(src);
   }
   void Clear() { values_.clear(); }
   [[nodiscard]] bool IsValid() const { return !values_.empty(); }

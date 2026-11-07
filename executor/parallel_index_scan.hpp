@@ -49,7 +49,6 @@ class ParallelIndexScan final : public ExecutorBase {
                     TransactionManager::IndexReadGuard index_read_guard = {});
   ~ParallelIndexScan() override;
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& out, int indent) const override;
@@ -106,8 +105,6 @@ class ParallelIndexScan final : public ExecutorBase {
 
   std::optional<DataChunk> pending_;
   size_t pending_offset_{0};
-  DataChunk scalar_batch_;
-  size_t scalar_offset_{0};
 };
 
 }  // namespace tinylamb

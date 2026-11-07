@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <functional>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -26,13 +28,91 @@
 
 namespace tinylamb {
 
+namespace {
+// A bounded view of one peer group. The sort owns this view while consuming
+// the group, and one lookahead row is returned to the outer streaming cursor.
+class PrefixRun final : public ExecutorBase {
+ public:
+  PrefixRun(Executor source, Row first, RowPosition position,
+            std::optional<std::pair<Row, RowPosition>> second,
+            std::function<StatusOr<bool>(const Row&, const Row&)> peers,
+            std::function<void(Row, RowPosition)> next_group,
+            std::function<void()> exhausted)
+      : source_(std::move(source)),
+        first_(std::move(first)),
+        position_(position),
+        second_(std::move(second)),
+        peers_(std::move(peers)),
+        next_group_(std::move(next_group)),
+        exhausted_(std::move(exhausted)) {}
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
+    while (!done_ && destination->Size() < max_rows) {
+      if (first_pending_) {
+        first_pending_ = false;
+        destination->Append(first_, position_);
+        continue;
+      }
+      if (second_) {
+        destination->Append(std::move(second_->first), second_->second);
+        second_.reset();
+        continue;
+      }
+      DataChunk candidate_chunk;
+      if (source_->NextBatch(&candidate_chunk, 1) == 0) {
+        done_ = true;
+        exhausted_();
+        FailWithChildOf(*source_);
+        break;
+      }
+      Row candidate = candidate_chunk.RowAt(0);
+      const RowPosition candidate_position = candidate_chunk.PositionAt(0);
+      auto equal = peers_(first_, candidate);
+      if (!equal.HasValue()) {
+        done_ = true;
+        FailWith(equal.GetStatus());
+        return 0;
+      }
+      if (!equal.Value()) {
+        done_ = true;
+        next_group_(std::move(candidate), candidate_position);
+        break;
+      }
+      destination->Append(std::move(candidate), candidate_position);
+    }
+    return destination->Size();
+  }
+  void Dump(std::ostream& out, int) const override { out << "PrefixRun"; }
+
+ private:
+  Executor source_;
+  Row first_;
+  RowPosition position_;
+  std::optional<std::pair<Row, RowPosition>> second_;
+  std::function<StatusOr<bool>(const Row&, const Row&)> peers_;
+  std::function<void(Row, RowPosition)> next_group_;
+  std::function<void()> exhausted_;
+  bool first_pending_{true};
+  bool done_{false};
+};
+}  // namespace
+
 IncrementalSortExecutor::IncrementalSortExecutor(
     Executor source, Schema schema, std::vector<SortExecutor::Key> prefix_keys,
     std::vector<SortExecutor::Key> suffix_keys)
     : source_(std::move(source)),
       schema_(std::move(schema)),
       prefix_keys_(std::move(prefix_keys)),
-      suffix_keys_(std::move(suffix_keys)) {}
+      suffix_keys_(std::move(suffix_keys)) {
+  singleton_passthrough_ =
+      !suffix_keys_.empty() &&
+      std::ranges::all_of(suffix_keys_, [&](const auto& key) {
+        return key.expression &&
+               key.expression->Type() == TypeTag::kColumnValue &&
+               schema_.Offset(
+                   key.expression->AsColumnValue().GetColumnName()) >= 0;
+      });
+}
 
 bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
   return std::ranges::all_of(prefix_keys_, [&](const auto& key) {
@@ -52,86 +132,100 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
   });
 }
 
+bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
+  if (GetStatus() != Status::kSuccess) return false;
+  if (sort_error_ != Status::kSuccess) return FailWith(sort_error_);
+  for (;;) {
+    if (group_sort_) {
+      DataChunk group_chunk;
+      if (group_sort_->NextBatch(&group_chunk, 1) != 0) {
+        *dst = group_chunk.RowAt(0);
+        if (rp) *rp = group_chunk.PositionAt(0);
+        return true;
+      }
+      if (FailWithChildOf(*group_sort_)) return false;
+      group_sort_.reset();
+    }
+    if (!has_pending_) {
+      if (input_exhausted_ || !source_) return false;
+      DataChunk pending_chunk;
+      if (source_->NextBatch(&pending_chunk, 1) == 0) {
+        input_exhausted_ = true;
+        FailWithChildOf(*source_);
+        return false;
+      }
+      pending_row_ = pending_chunk.RowAt(0);
+      pending_position_ = pending_chunk.PositionAt(0);
+    }
+    has_pending_ = false;
+    std::optional<std::pair<Row, RowPosition>> second;
+    if (singleton_passthrough_ &&
+        pending_row_.Count() == schema_.ColumnCount()) {
+      Row first = std::move(pending_row_);
+      const RowPosition first_position = pending_position_;
+      DataChunk candidate_chunk;
+      if (source_->NextBatch(&candidate_chunk, 1) == 0) {
+        input_exhausted_ = true;
+        if (FailWithChildOf(*source_)) return false;
+        *dst = std::move(first);
+        if (rp) *rp = first_position;
+        ++singleton_runs_;
+        return true;
+      }
+      Row candidate = candidate_chunk.RowAt(0);
+      const RowPosition candidate_position = candidate_chunk.PositionAt(0);
+      const bool equal = ArePrefixEqual(first, candidate);
+      if (sort_error_ != Status::kSuccess) return FailWith(sort_error_);
+      if (!equal) {
+        pending_row_ = std::move(candidate);
+        pending_position_ = candidate_position;
+        has_pending_ = true;
+        *dst = std::move(first);
+        if (rp) *rp = first_position;
+        ++singleton_runs_;
+        return true;
+      }
+      pending_row_ = std::move(first);
+      pending_position_ = first_position;
+      second.emplace(std::move(candidate), candidate_position);
+    }
+    auto run = std::make_shared<PrefixRun>(
+        source_, std::move(pending_row_), pending_position_, std::move(second),
+        [this](const Row& a, const Row& b) -> StatusOr<bool> {
+          const bool equal = ArePrefixEqual(a, b);
+          if (sort_error_ != Status::kSuccess) return sort_error_;
+          return equal;
+        },
+        [this](Row next, RowPosition position) {
+          pending_row_ = std::move(next);
+          pending_position_ = position;
+          has_pending_ = true;
+        },
+        [this] { input_exhausted_ = true; });
+    // SortExecutor already enforces the memory budget and spills a large
+    // peer group. Only that group, rather than the entire child, is consumed.
+    group_sort_ = std::make_shared<SortExecutor>(run, schema_, suffix_keys_);
+  }
+}
+
 void IncrementalSortExecutor::ExecuteIncrementalSort() {
-  output_.clear();
-  output_offset_ = 0;
-  sort_error_ = Status::kSuccess;
-  Status* const error_ = &sort_error_;
-  (void)error_;
-
-  std::vector<std::pair<Row, RowPosition>> input_rows;
   Row row;
-  RowPosition rp;
-  size_t total_bytes = 0;
-
-  while (source_ && source_->Next(&row, &rp)) {
-    total_bytes += EstimateRowBytes(row) + sizeof(RowPosition);
-    input_rows.emplace_back(std::move(row), rp);
+  RowPosition position;
+  while (NextStreaming(&row, &position)) {
+    charge_.Add(EstimateRowBytes(row) + sizeof(RowPosition));
+    output_.emplace_back(std::move(row), position);
   }
-  if (source_ && source_->GetStatus() != Status::kSuccess &&
-      sort_error_ == Status::kSuccess) {
-    sort_error_ = source_->GetStatus();
-  }
-
-  if (input_rows.empty()) {
-    return;
-  }
-
-  size_t start = 0;
-  while (start < input_rows.size()) {
-    size_t end = start + 1;
-    while (end < input_rows.size() &&
-           ArePrefixEqual(input_rows[start].first, input_rows[end].first)) {
-      ++end;
-    }
-
-    // Sort sub-range [start, end) on suffix_keys_
-    std::vector<std::pair<Row, RowPosition>> group_rows(
-        std::make_move_iterator(input_rows.begin() +
-                                static_cast<std::ptrdiff_t>(start)),
-        std::make_move_iterator(input_rows.begin() +
-                                static_cast<std::ptrdiff_t>(end)));
-
-    if (!suffix_keys_.empty() && group_rows.size() > 1) {
-      PdqSort::Sort(group_rows, schema_, suffix_keys_, &sort_error_);
-    }
-
-    for (auto& item : group_rows) {
-      output_.push_back(std::move(item));
-    }
-
-    start = end;
-  }
-
-  charge_.Add(total_bytes);
 }
 
 void IncrementalSortExecutor::EnsureMaterialized() {
   if (materialized_) {
     return;
   }
-  materialized_ = true;
   ExecuteIncrementalSort();
+  materialized_ = true;
 }
 
 void IncrementalSortExecutor::MaterializePipeline() { EnsureMaterialized(); }
-
-bool IncrementalSortExecutor::Next(Row* dst, RowPosition* rp) {
-  assert(dst != nullptr);
-  EnsureMaterialized();
-  if (sort_error_ != Status::kSuccess) {
-    return FailWith(sort_error_);
-  }
-  if (output_offset_ >= output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
-  return true;
-}
 
 size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
                                           size_t max_rows) {
@@ -139,21 +233,30 @@ size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
     return 0;
   }
   destination->Reset();
-  EnsureMaterialized();
-  if (output_offset_ >= output_.size()) {
+  if (GetStatus() != Status::kSuccess) return 0;
+  if (!materialized_) {
+    Row row;
+    RowPosition position;
+    while (destination->Size() < max_rows && NextStreaming(&row, &position)) {
+      destination->Append(std::move(row), position);
+    }
+    return destination->Size();
+  }
+  if (sort_error_ != Status::kSuccess) {
+    FailWith(sort_error_);
     return 0;
   }
-  const size_t count = std::min(max_rows, output_.size() - output_offset_);
-  for (size_t i = 0; i < count; ++i) {
-    destination->Append(output_[output_offset_ + i].first,
-                        output_[output_offset_ + i].second);
+  while (destination->Size() < max_rows && output_offset_ < output_.size()) {
+    destination->Append(output_[output_offset_].first,
+                        output_[output_offset_].second);
+    ++output_offset_;
   }
-  output_offset_ += count;
-  return count;
+  return destination->Size();
 }
 
 void IncrementalSortExecutor::Dump(std::ostream& o, int indent) const {
   o << "IncrementalSort";
+  if (singleton_runs_ != 0) o << " singleton_runs=" << singleton_runs_;
   if (!prefix_keys_.empty() && prefix_keys_.front().expression) {
     const Expression& prefix = prefix_keys_.front().expression;
     if (prefix->Type() == TypeTag::kColumnValue) {

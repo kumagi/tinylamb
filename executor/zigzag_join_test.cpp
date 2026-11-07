@@ -81,16 +81,13 @@ class PositionedSource final : public ExecutorBase {
   PositionedSource(std::vector<Row> rows, std::vector<RowPosition> positions)
       : rows_(std::move(rows)), positions_(std::move(positions)) {}
 
-  bool Next(Row* row, RowPosition* position) override {
-    if (offset_ >= rows_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
+    while (offset_ < rows_.size() && dst->Size() < max_rows) {
+      dst->Append(std::move(rows_[offset_]), positions_[offset_]);
+      ++offset_;
     }
-    *row = std::move(rows_[offset_]);
-    if (position != nullptr) {
-      *position = positions_[offset_];
-    }
-    ++offset_;
-    return true;
+    return dst->Size();
   }
 
   void Dump(std::ostream& output, int /*indent*/) const override {
@@ -105,7 +102,10 @@ class PositionedSource final : public ExecutorBase {
 
 class FailingSource final : public ExecutorBase {
  public:
-  bool Next(Row* /*row*/, RowPosition* /*position*/) override { return false; }
+  size_t NextBatch(DataChunk* dst, size_t /*max_rows*/) override {
+    dst->Reset();
+    return 0;
+  }
   void Dump(std::ostream& output, int /*indent*/) const override {
     output << "FailingSource";
   }

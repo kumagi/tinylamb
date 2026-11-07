@@ -34,10 +34,13 @@ class UnnestExecutor final : public ExecutorBase {
   UnnestExecutor& operator=(UnnestExecutor&&) = delete;
   ~UnnestExecutor() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  bool NextRow(Row* dst, RowPosition* rp);
+
   TransactionContext& ctx_;
   Schema child_schema_;
   Executor child_;
@@ -50,6 +53,8 @@ class UnnestExecutor final : public ExecutorBase {
   bool left_outer_{false};
   Schema output_schema_;
 
+  DataChunk child_batch_;
+  size_t child_batch_idx_{0};
   Row current_child_row_;
   std::vector<Row> current_unnested_rows_;
   size_t current_row_index_{0};

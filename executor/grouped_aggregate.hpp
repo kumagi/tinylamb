@@ -118,7 +118,6 @@ class AggregateGroupTable {
 // shapes and a failure never yields a partial result.
 class GroupedAggregateBase : public ExecutorBase {
  public:
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
 

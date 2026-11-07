@@ -1015,14 +1015,7 @@ void GriffinFuzzTry(const uint8_t* data, size_t size, bool verbose) {
 
   const std::string path =
       "griffin_fuzz-repro-" + std::to_string(trace.seed) + ".test";
-  std::ofstream file(path);
-  file << text;
-  file.close();
-
-  std::cerr << "[griffin_fuzz] seed=" << trace.seed << "\n"
-            << report << "regression test written to " << path
-            << (verify.empty() ? "" : "\n" + verify) << "\n";
-  abort();
+  EmitFuzzFinding("griffin_fuzz", trace.seed, path, text, report, verify);
 }
 
 }  // namespace tinylamb

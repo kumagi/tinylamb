@@ -11,31 +11,31 @@
 
 namespace tinylamb {
 
-bool MinMaxIndexExecutor::Next(Row* destination, RowPosition* position) {
-  if (emitted_) {
-    return false;
+size_t MinMaxIndexExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0 || emitted_) {
+    return 0;
   }
   emitted_ = true;
 
-  Row input;
-  RowPosition input_position;
-  while (source_->Next(&input, &input_position)) {
-    if (value_slot_ < input.values_.size() && !input[value_slot_].IsNull()) {
-      *destination = Row({input[value_slot_]});
-      // Scalar aggregates do not expose a row position. Keep the argument
-      // accepted by ExecutorBase harmless for callers that pass one.
-      (void)position;
-      return true;
+  DataChunk batch;
+  while (source_->NextBatch(&batch, 1) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      const Row input = batch.RowAt(i);
+      if (value_slot_ < input.values_.size() && !input[value_slot_].IsNull()) {
+        destination->Append(Row({input[value_slot_]}));
+        return 1;
+      }
     }
   }
   if (source_->GetStatus() != Status::kSuccess) {
-    return FailWith(source_->GetStatus());
+    FailWith(source_->GetStatus());
+    return 0;
   }
 
   // MIN/MAX over an empty or all-NULL input is one row containing NULL.
-  *destination = Row({Value()});
-  (void)position;
-  return true;
+  destination->Append(Row({Value()}));
+  return 1;
 }
 
 void MinMaxIndexExecutor::Dump(std::ostream& output, int indent) const {

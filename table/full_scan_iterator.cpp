@@ -37,6 +37,7 @@
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "page/row_page.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 
@@ -151,6 +152,9 @@ FullScanIterator::FullScanIterator(
     return;
   }
   table_lease_ = lease.MoveValue();
+  if (TryInitLSTableScan()) {
+    return;
+  }
   // Scans only read: always take a shared page latch, even for writable
   // transactions, so concurrent scan workers never convoy on exclusive
   // latches.  Row-level unpinning below keeps same-thread mutations safe.
@@ -191,6 +195,9 @@ FullScanIterator::FullScanIterator(
   if (!pos_.IsValid()) {
     return;
   }
+  if (TryInitLSTableScan()) {
+    return;
+  }
   if (!PinPage(pos_.page_id)) {
     pos_.page_id = ~0ULL;
     return;
@@ -200,6 +207,11 @@ FullScanIterator::FullScanIterator(
 
 IteratorBase& FullScanIterator::operator++() {
   if (!pos_.IsValid()) {
+    return *this;
+  }
+  if (lstable_store_ != nullptr) {
+    ++lstable_row_cursor_;
+    SeekLSTableRow();
     return *this;
   }
   ++pos_.slot;
@@ -222,16 +234,21 @@ FullScanIterator::PlannedPeek FullScanIterator::BuildPeek(slot_t column) const {
   if (type != ValueType::kInt64 && type != ValueType::kDate) {
     return peek;
   }
-  // Constant offsets hold only while every earlier column serializes as a
-  // fixed 8-byte payload (i.e. the column sits in the leading prefix).
+  // Collapse adjacent fixed-width cells. Only variable-width cells need
+  // inspection per row; this also covers dates after VARCHAR columns.
   for (slot_t i = 0; i < column; ++i) {
-    if (FixedSerializedSize(schema.GetColumn(i).Type()) != sizeof(uint64_t)) {
-      return peek;
+    const ValueType previous = schema.GetColumn(i).Type();
+    const auto fixed = static_cast<uint32_t>(FixedSerializedSize(previous));
+    if (fixed == 0) {
+      peek.variable_skips.push_back({previous, 0});
+    } else if (peek.variable_skips.empty()) {
+      peek.offset += fixed;
+    } else {
+      peek.variable_skips.back().fixed_after += fixed;
     }
   }
   peek.valid = true;
   peek.stored_count = schema.ColumnCount();
-  peek.offset = static_cast<uint32_t>(sizeof(uint64_t)) * column;
   return peek;
 }
 
@@ -251,8 +268,19 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
     // every constant offset — take the walked path for those rows.
     return {.kind = PeekOutcome::Kind::kFallback, .value = 0};
   }
+  const char* payload = row + sizeof(slot_t) + peek.offset;
+  for (const auto& skip : peek.variable_skips) {
+    Status status = Status::kSuccess;
+    const size_t consumed =
+        Value::SkipSerializedInto(payload, skip.type, &status);
+    if (status != Status::kSuccess) [[unlikely]] {
+      // Preserve the canonical peek's corrupt-image failure behavior.
+      detail::ExcShimThrow("Value::SkipSerialized", status);
+    }
+    payload += consumed + skip.fixed_after;
+  }
   int64_t key = 0;
-  DeserializeInteger(row + sizeof(slot_t) + peek.offset, &key);
+  DeserializeInteger(payload, &key);
   return {.kind = PeekOutcome::Kind::kValue, .value = key};
 }
 
@@ -310,15 +338,16 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
   // Precondition: page_ is pinned (the constructors and operator++ re-pin it
   // after DropPageLatch or a per-row unpin before calling this method).
   while (pos_.IsValid()) {
-    // One verdict per pinned page: the shared latch freezes PageLSN for the
-    // whole pass, and a dropped latch (DropPageLatch / AdvancePage) re-enters
-    // here, re-pins, and re-evaluates against the possibly newer stamp.
-    const bool physical_read = PhysicalReadEligible(*txn_, **page_);
-    // The slot table is page-stable for the whole inner pass (page_ only
-    // changes across AdvancePage, i.e. after this loop exits), so hold the
-    // body reference instead of re-walking the PageRef chain per row.
-    const RowPage& body = (*page_)->body.row_page;
-    while (pos_.slot < body.RowMax()) {
+    // The shared latch freezes the page image. A writer may register a
+    // version chain meanwhile, but cannot change these bytes before we drop
+    // the latch. Re-pinning invalidates this verdict before any newer image
+    // is read. A cached false verdict only keeps the ordinary MVCC resolver.
+    if (!physical_read_eligible_.has_value())
+      physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
+    const bool physical_read = *physical_read_eligible_;
+    // A locking scan may release and re-pin this page while waiting for an
+    // intent, so no body reference may survive across that wait.
+    while (pos_.slot < (*page_)->body.row_page.RowMax()) {
       std::optional<std::string_view> row;
       const bool already_reserved = lock_rows_ && txn_->HasWriteSet(pos_);
       if (lock_rows_) {
@@ -328,10 +357,12 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
         // IndexScan's Position/AddWriteSet/ResolveRow sequence provides.
         // Vacant slots cannot carry a live head row, so they are skipped
         // without spending an intent.
-        const RowPage& body = (*page_)->body.row_page;
-        if (body.rows_[pos_.slot].offset == 0) {
+        if (!(*page_)->body.row_page.IsSlotOccupied(pos_.slot)) {
           ++pos_.slot;
           continue;
+        }
+        if (wait_for_write_intent_ && !already_reserved) {
+          page_.reset();
         }
         const bool locked = wait_for_write_intent_ ? txn_->AddWriteSet(pos_)
                                                    : txn_->TryAddWriteSet(pos_);
@@ -343,6 +374,17 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
           }
           scan_acquired_.clear();
           status_ = Status::kConflicts;
+          pos_.page_id = ~0ULL;
+          return std::nullopt;
+        }
+        if (page_ == nullptr && !PinPage(pos_.page_id)) {
+          if (!already_reserved) {
+            txn_->ReleaseWriteIntent(pos_);
+          }
+          for (const RowPosition& held : scan_acquired_) {
+            txn_->ReleaseWriteIntent(held);
+          }
+          scan_acquired_.clear();
           pos_.page_id = ~0ULL;
           return std::nullopt;
         }
@@ -365,24 +407,8 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
         }
         row = version.Value();
       } else if (physical_read) {
-        // Fast path: vacant slots (offset == 0, i.e. deleted or never
-        // filled) are invisible to every snapshot that qualifies above --
-        // any historical deletion would have stamped PageLSN above the
-        // threshold and routed the page to ReadVersion, which is what still
-        // resurrects rows for older snapshots.
-        // Sequential scans see dense pages: filled slots dominate.
-        if (body.rows_[pos_.slot].offset != 0) [[likely]] {
-          if (pos_.slot + 4 < body.RowMax()) {
-            __builtin_prefetch(&body.rows_[pos_.slot + 4], 0, 1);
-            // Warm the row IMAGE too: the descriptor prefetch above only
-            // covers 16 bytes of slot table, while the decode below walks
-            // 100-200 bytes of payload a few slots later in the page.
-            const RowPointer& ahead = body.rows_[pos_.slot + 4];
-            if (ahead.offset != 0) {
-              __builtin_prefetch(
-                  reinterpret_cast<const char*>(&body) + ahead.offset, 0, 1);
-            }
-          }
+        const RowPage& body = (*page_)->body.row_page;
+        if (body.IsSlotOccupied(pos_.slot)) [[likely]] {
           row = body.GetRow(pos_.slot);
         }
       } else {
@@ -460,17 +486,9 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
         if (lock_rows_ && !already_reserved) {
           scan_acquired_.push_back(pos_);
         }
-        // The returned image lives in the pinned page: typed-batch consumers
-        // decode it before dropping the latch, and the Row consumer below
-        // copies varchar bytes out (see DeserializeCurrent).  Morsel scans
-        // (pages_ set) are consumed by dedicated worker threads that drop
-        // their latch before blocking, so they can hold the shared page latch
-        // across rows.  Plain scans may feed a same-thread mutation (e.g. a
-        // caller updating while iterating), so they unpin per row to avoid
-        // self-deadlock on the page latch.
-        if (!txn_->IsReadOnly() && !pages_) {
-          page_.reset();
-        }
+        // Keep the image pinned until the caller has decoded/copied it.
+        // SeekVisibleRow and DecodeNextTypedBatch release writable plain
+        // scans after consuming the bytes, before returning to a mutator.
         // Iterator contract: pos_ stays ON the returned row; operator++ (or
         // DecodeNextTypedBatch) advances past it before the next seek.
         return row;
@@ -489,9 +507,13 @@ void FullScanIterator::SeekVisibleRow() {
   std::optional<std::string_view> row = NextVisibleImage();
   if (!row.has_value()) {
     current_row_.Clear();
+    page_.reset();
     return;
   }
   DeserializeCurrent(*row);
+  if (!txn_->IsReadOnly() && !pages_) {
+    page_.reset();
+  }
 }
 
 bool FullScanIterator::AdvancePage() {
@@ -538,6 +560,7 @@ bool FullScanIterator::AdvancePage() {
         return false;
       }
       page_ = std::make_unique<PageRef>(retry.MoveValue());
+      physical_read_eligible_.reset();
     }
   }
   if (next_page == 0) {
@@ -548,6 +571,7 @@ bool FullScanIterator::AdvancePage() {
 }
 
 bool FullScanIterator::PinPage(page_id_t page_id) {
+  physical_read_eligible_.reset();
   const Status visible = txn_->GetPageManager()->CheckTableTailPage(
       txn_->ID(), table_->first_pid_, page_id);
   if (visible != Status::kSuccess) {
@@ -745,11 +769,19 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
   if (!pos_.IsValid()) {
     return 0;
   }
+  if (lstable_store_ != nullptr) {
+    return DecodeNextTypedBatchFromLSTable(batch, max_rows);
+  }
   const Schema& schema = table_->schema_;
   size_t count = 0;
   while (count < max_rows) {
+    if (page_ == nullptr && pos_.IsValid() && !PinPage(pos_.page_id)) {
+      pos_.page_id = ~0ULL;
+      break;
+    }
     std::optional<std::string_view> row = NextVisibleImage();
     if (!row.has_value()) {
+      page_.reset();
       break;
     }
     const size_t index = count;
@@ -814,7 +846,12 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
       cursor = payload + typed_const_prefix_end_;
       i = typed_const_prefix_;
     }
-    for (; i < stored_count && i < schema.ColumnCount(); ++i) {
+    // Projection is ascending. Once its final cell is decoded, later stored
+    // columns cannot contribute to this batch (including variable-width
+    // suffixes); advancing the row cursor is independent of their payload.
+    for (; i < stored_count && i < schema.ColumnCount() &&
+           kept_cursor < typed_keep_slots_.size();
+         ++i) {
       const bool is_null =
           has_null && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0;
       const bool keep = kept_cursor < typed_keep_slots_.size() &&
@@ -893,12 +930,13 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
       }
       ++kept_cursor;
     }
+    if (batch->capture_positions) batch->positions.push_back(pos_);
     ++count;
     // Iterator contract: NextVisibleImage left pos_ on the decoded row;
     // advance past it (operator++'s movement without the Row decode).
     ++pos_.slot;
-    if (page_ == nullptr && pos_.IsValid() && !PinPage(pos_.page_id)) {
-      break;
+    if (!txn_->IsReadOnly() && !pages_) {
+      page_.reset();
     }
   }
   batch->rows = count;
@@ -913,7 +951,10 @@ IteratorBase& FullScanIterator::operator--() {
   return *this;
 }
 
-void FullScanIterator::DropPageLatch() { page_.reset(); }
+void FullScanIterator::DropPageLatch() {
+  page_.reset();
+  physical_read_eligible_.reset();
+}
 
 const RuntimeFilterGroup* FullScanIterator::AcceptsColumn(
     const RuntimeFilterGroup* group, std::optional<slot_t> column,
@@ -955,6 +996,10 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
   if (runtime_filter_ == nullptr || !pos_.IsValid()) {
     return;
   }
+  if (lstable_store_ != nullptr) {
+    SeekLSTableRow();
+    return;
+  }
   // The constructor already seeked to the first visible row, which is exactly
   // the row a filter installed later would have rejected. Re-seek from the
   // current position so the filter sees it too; the contract is that nothing
@@ -973,10 +1018,460 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
   SeekVisibleRow();
 }
 
+bool FullScanIterator::TryInitLSTableScan() {
+  if (table_ == nullptr || txn_ == nullptr || lock_rows_ || txn_->IsFailed() ||
+      table_->RowsRewrittenInPlace()) {
+    return false;
+  }
+  if (projection_.has_value() && RowPlan() == nullptr) {
+    return false;
+  }
+  std::shared_ptr<const LSTableStore> store =
+      GetOrBuildLSTableStore(*txn_, *table_, /*allow_lazy_build=*/false);
+  if (store == nullptr ||
+      store->layout_generation != table_->LayoutGeneration() ||
+      store->first_pid != table_->FirstPageId()) {
+    return false;
+  }
+  if (store->uncommitted_owner_txn != 0) {
+    if (store->uncommitted_owner_txn != txn_->ID()) {
+      return false;
+    }
+  } else if (!txn_->IsReadOnly() && !txn_->WriteSetEmpty()) {
+    return false;
+  }
+  const bool check_chains =
+      store->uncommitted_owner_txn == 0 && txn_->HasAnyPageVersionChains();
+  if (!pages_.has_value()) {
+    if (check_chains) {
+      for (const page_id_t pid : store->page_ids) {
+        if (txn_->HasPageVersionChains(pid)) {
+          return false;
+        }
+      }
+    }
+  } else {
+    for (const page_id_t pid : *pages_) {
+      if ((check_chains && txn_->HasPageVersionChains(pid)) ||
+          store->FindBlock(pid) == nullptr) {
+        return false;
+      }
+    }
+  }
+  lstable_store_ = std::move(store);
+  lstable_page_cursor_ = 0;
+  lstable_row_cursor_ = 0;
+  lstable_row_materialized_ = true;
+  SeekLSTableRow();
+  return true;
+}
+
+const LSTablePageBlock* FullScanIterator::CurrentLSTableBlock() const noexcept {
+  if (lstable_store_ == nullptr) {
+    return nullptr;
+  }
+  if (pages_.has_value()) {
+    if (lstable_page_cursor_ >= pages_->size()) {
+      return nullptr;
+    }
+    return lstable_store_->FindBlock((*pages_)[lstable_page_cursor_]);
+  }
+  if (lstable_page_cursor_ >= lstable_store_->blocks.size()) {
+    return nullptr;
+  }
+  return &lstable_store_->blocks[lstable_page_cursor_];
+}
+
+bool FullScanIterator::LSTableRowMatches(const LSTablePageBlock& blk,
+                                         uint32_t row) const noexcept {
+  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+      key_column_.has_value()) {
+    const slot_t col_idx = *key_column_;
+    if (col_idx >= blk.columns.size()) {
+      return false;
+    }
+    const LSTableColumnBlock& col = blk.columns[col_idx];
+    if (col.IsNull(row) ||
+        (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
+      return false;
+    }
+    const int64_t key = col.int_cells[row];
+    const bool rejected = runtime_filter_ != nullptr
+                              ? runtime_filter_->Reject(key)
+                              : !key_filter_->contains(key);
+    if (rejected) {
+      return false;
+    }
+  }
+  if (peek_compares_ != nullptr && !peek_compares_->empty()) {
+    for (const IntegerPeekCompare& pred : *peek_compares_) {
+      if (pred.column >= blk.columns.size()) {
+        return false;
+      }
+      const LSTableColumnBlock& col = blk.columns[pred.column];
+      if (col.IsNull(row) ||
+          (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
+        return false;
+      }
+      if (!MatchIntegerCompare(col.int_cells[row], pred.op, pred.constant)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool FullScanIterator::LSTableBlockAllRowsMatch(
+    const LSTablePageBlock& blk) const noexcept {
+  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+      key_column_.has_value()) {
+    return false;
+  }
+  if (peek_compares_ == nullptr || peek_compares_->empty()) {
+    return true;
+  }
+  for (const IntegerPeekCompare& cmp : *peek_compares_) {
+    if (cmp.column >= blk.columns.size()) {
+      return false;
+    }
+    const LSTableColumnBlock& col = blk.columns[cmp.column];
+    if (col.has_null || !col.has_min_max ||
+        (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
+      return false;
+    }
+    switch (cmp.op) {
+      case BinaryOperation::kEquals:
+        if (col.min_int != cmp.constant || col.max_int != cmp.constant) {
+          return false;
+        }
+        break;
+      case BinaryOperation::kNotEquals:
+        if (cmp.constant >= col.min_int && cmp.constant <= col.max_int) {
+          return false;
+        }
+        break;
+      case BinaryOperation::kLessThan:
+        if (col.max_int >= cmp.constant) {
+          return false;
+        }
+        break;
+      case BinaryOperation::kLessThanEquals:
+        if (col.max_int > cmp.constant) {
+          return false;
+        }
+        break;
+      case BinaryOperation::kGreaterThan:
+        if (col.min_int <= cmp.constant) {
+          return false;
+        }
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        if (col.min_int < cmp.constant) {
+          return false;
+        }
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+void FullScanIterator::SeekLSTableRow() {
+  if (lstable_store_ == nullptr) {
+    pos_.page_id = ~0ULL;
+    current_row_.Clear();
+    lstable_row_materialized_ = true;
+    return;
+  }
+  const size_t total_pages =
+      pages_.has_value() ? pages_->size() : lstable_store_->blocks.size();
+  while (lstable_page_cursor_ < total_pages) {
+    const LSTablePageBlock* blk = CurrentLSTableBlock();
+    if (blk == nullptr || blk->row_count == 0) {
+      ++lstable_page_cursor_;
+      lstable_row_cursor_ = 0;
+      continue;
+    }
+    if (lstable_row_cursor_ == 0 &&
+        !blk->MatchesZoneMaps(peek_compares_, runtime_filter_, key_column_)) {
+      ++lstable_page_cursor_;
+      continue;
+    }
+    for (; lstable_row_cursor_ < blk->row_count; ++lstable_row_cursor_) {
+      if (LSTableRowMatches(*blk, lstable_row_cursor_)) {
+        pos_ = RowPosition(blk->page_id, blk->slots[lstable_row_cursor_]);
+        lstable_row_materialized_ = false;
+        return;
+      }
+    }
+    ++lstable_page_cursor_;
+    lstable_row_cursor_ = 0;
+  }
+  pos_.page_id = ~0ULL;
+  current_row_.Clear();
+  lstable_row_materialized_ = true;
+}
+
+void FullScanIterator::EnsureLSTableRowMaterialized() const {
+  if (lstable_row_materialized_ || lstable_store_ == nullptr) {
+    return;
+  }
+  if (!pos_.IsValid()) {
+    current_row_.Clear();
+    lstable_row_materialized_ = true;
+    return;
+  }
+  const LSTablePageBlock* blk = CurrentLSTableBlock();
+  if (blk == nullptr || lstable_row_cursor_ >= blk->row_count) {
+    current_row_.Clear();
+    lstable_row_materialized_ = true;
+    return;
+  }
+  const uint32_t r = lstable_row_cursor_;
+  const size_t col_count =
+      projection_.has_value() ? projection_->size() : blk->columns.size();
+  current_row_.values_.resize(col_count);
+  for (size_t k = 0; k < col_count; ++k) {
+    const slot_t col_idx =
+        projection_.has_value() ? (*projection_)[k] : static_cast<slot_t>(k);
+    const LSTableColumnBlock& col = blk->columns[col_idx];
+    if (col.IsNull(r)) {
+      current_row_.values_[k] = Value();
+      continue;
+    }
+    switch (col.type) {
+      case ValueType::kInt64:
+        current_row_.values_[k] = Value(col.int_cells[r]);
+        if (col.is_unsigned) {
+          current_row_.values_[k].SetUnsigned();
+        }
+        break;
+      case ValueType::kDate:
+        current_row_.values_[k] = Value::DateFromDays(col.int_cells[r]);
+        break;
+      case ValueType::kDouble: {
+        double d = 0.0;
+        std::memcpy(&d, &col.int_cells[r], sizeof(d));
+        current_row_.values_[k] = Value(d);
+        break;
+      }
+      case ValueType::kVarChar:
+        current_row_.values_[k] = Value(std::string(col.VarcharAt(r)));
+        break;
+      default:
+        current_row_.values_[k] = Value();
+        break;
+    }
+  }
+  lstable_row_materialized_ = true;
+}
+
+size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
+                                                         size_t max_rows) {
+  const size_t total_pages =
+      pages_.has_value() ? pages_->size() : lstable_store_->blocks.size();
+  const size_t stride = batch->stride;
+  const size_t kept_count = typed_keep_slots_.size();
+  size_t count = 0;
+  while (count < max_rows && lstable_page_cursor_ < total_pages) {
+    const LSTablePageBlock* blk = CurrentLSTableBlock();
+    if (blk == nullptr || blk->row_count == 0) {
+      ++lstable_page_cursor_;
+      lstable_row_cursor_ = 0;
+      continue;
+    }
+    if (lstable_row_cursor_ == 0 &&
+        !blk->MatchesZoneMaps(peek_compares_, runtime_filter_, key_column_)) {
+      ++lstable_page_cursor_;
+      continue;
+    }
+    if (!blk->has_any_null && !batch->capture_positions &&
+        LSTableBlockAllRowsMatch(*blk)) {
+      const uint32_t r0 = lstable_row_cursor_;
+      const size_t take =
+          std::min<size_t>(blk->row_count - r0, max_rows - count);
+      std::memset(batch->nulls.data() + (count * stride), 0, take * stride);
+      for (size_t k = 0; k < kept_count; ++k) {
+        const slot_t col_idx = typed_keep_slots_[k];
+        const LSTableColumnBlock& col = blk->columns[col_idx];
+        const size_t vslot = typed_varchar_slot_[k];
+        if (vslot == SIZE_MAX) {
+          const int64_t* __restrict src = col.int_cells.data() + r0;
+          if (stride == 1) {
+            std::memcpy(batch->cells.data() + count, src,
+                        take * sizeof(int64_t));
+          } else {
+            int64_t* __restrict dst =
+                batch->cells.data() + (count * stride) + k;
+            for (size_t r = 0; r < take; ++r) {
+              dst[r * stride] = src[r];
+            }
+          }
+        } else if (col.all_single_byte_varchar) {
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          auto& dst_ends = batch->varchar_ends[vslot];
+          const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
+          const size_t old_ends = dst_ends.size();
+          dst_bytes.insert(dst_bytes.end(), col.varchar_bytes.data() + r0,
+                           col.varchar_bytes.data() + r0 + take);
+          dst_ends.resize(old_ends + take);
+          uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
+          for (size_t r = 0; r < take; ++r) {
+            out_ends[r] = dst_base + static_cast<uint32_t>(r + 1);
+          }
+        } else if (col.dict != nullptr && col.dict->active) {
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          auto& dst_ends = batch->varchar_ends[vslot];
+          for (size_t r = 0; r < take; ++r) {
+            const std::string_view sv = col.VarcharAt(r0 + r);
+            dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+            dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
+          }
+        } else {
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          auto& dst_ends = batch->varchar_ends[vslot];
+          const uint32_t src_byte_begin =
+              r0 == 0 ? 0U : col.varchar_ends[r0 - 1];
+          const uint32_t src_byte_end = col.varchar_ends[r0 + take - 1];
+          const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
+          dst_bytes.insert(dst_bytes.end(),
+                           col.varchar_bytes.data() + src_byte_begin,
+                           col.varchar_bytes.data() + src_byte_end);
+          const uint32_t offset_delta = dst_base - src_byte_begin;
+          const uint32_t* __restrict src_ends = col.varchar_ends.data() + r0;
+          const size_t old_ends = dst_ends.size();
+          dst_ends.resize(old_ends + take);
+          uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
+          for (size_t r = 0; r < take; ++r) {
+            out_ends[r] = src_ends[r] + offset_delta;
+          }
+        }
+      }
+      count += take;
+      lstable_row_cursor_ = static_cast<uint32_t>(r0 + take);
+      if (lstable_row_cursor_ >= blk->row_count) {
+        ++lstable_page_cursor_;
+        lstable_row_cursor_ = 0;
+      }
+      continue;
+    }
+
+    if (!blk->has_any_null && !batch->capture_positions) {
+      uint32_t match_rows[2048];
+      const size_t max_take = std::min<size_t>(max_rows - count, 2048);
+      size_t n_match = 0;
+      for (; lstable_row_cursor_ < blk->row_count && n_match < max_take;
+           ++lstable_row_cursor_) {
+        if (LSTableRowMatches(*blk, lstable_row_cursor_)) {
+          match_rows[n_match++] = lstable_row_cursor_;
+        }
+      }
+      if (n_match > 0) {
+        std::memset(batch->nulls.data() + (count * stride), 0,
+                    n_match * stride);
+        for (size_t k = 0; k < kept_count; ++k) {
+          const slot_t col_idx = typed_keep_slots_[k];
+          const LSTableColumnBlock& col = blk->columns[col_idx];
+          const size_t vslot = typed_varchar_slot_[k];
+          if (vslot == SIZE_MAX) {
+            const int64_t* __restrict src = col.int_cells.data();
+            int64_t* __restrict dst =
+                batch->cells.data() + (count * stride) + k;
+            for (size_t i = 0; i < n_match; ++i) {
+              dst[i * stride] = src[match_rows[i]];
+            }
+          } else if (col.all_single_byte_varchar) {
+            auto& dst_bytes = batch->varchar_bytes[vslot];
+            auto& dst_ends = batch->varchar_ends[vslot];
+            const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
+            const size_t old_ends = dst_ends.size();
+            dst_bytes.resize(dst_base + n_match);
+            dst_ends.resize(old_ends + n_match);
+            const uint8_t* __restrict src_bytes = col.varchar_bytes.data();
+            uint8_t* __restrict out_bytes = dst_bytes.data() + dst_base;
+            uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
+            for (size_t i = 0; i < n_match; ++i) {
+              out_bytes[i] = src_bytes[match_rows[i]];
+              out_ends[i] = dst_base + static_cast<uint32_t>(i + 1);
+            }
+          } else {
+            auto& dst_bytes = batch->varchar_bytes[vslot];
+            auto& dst_ends = batch->varchar_ends[vslot];
+            for (size_t i = 0; i < n_match; ++i) {
+              const std::string_view sv = col.VarcharAt(match_rows[i]);
+              dst_bytes.insert(dst_bytes.end(), sv.data(),
+                               sv.data() + sv.size());
+              dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
+            }
+          }
+        }
+        count += n_match;
+      }
+      if (lstable_row_cursor_ >= blk->row_count) {
+        ++lstable_page_cursor_;
+        lstable_row_cursor_ = 0;
+      }
+      continue;
+    }
+
+    for (; lstable_row_cursor_ < blk->row_count && count < max_rows;
+         ++lstable_row_cursor_) {
+      const uint32_t r = lstable_row_cursor_;
+      if (!LSTableRowMatches(*blk, r)) {
+        continue;
+      }
+      const size_t base = count * stride;
+      std::memset(batch->nulls.data() + base, 0, stride);
+      for (size_t k = 0; k < kept_count; ++k) {
+        const slot_t col_idx = typed_keep_slots_[k];
+        const LSTableColumnBlock& col = blk->columns[col_idx];
+        const size_t vslot = typed_varchar_slot_[k];
+        if (col.IsNull(r)) {
+          batch->nulls[base + k] = 1;
+          if (vslot != SIZE_MAX) {
+            batch->varchar_ends[vslot].push_back(
+                static_cast<uint32_t>(batch->varchar_bytes[vslot].size()));
+          } else {
+            batch->cells[base + k] = 0;
+          }
+          continue;
+        }
+        if (vslot == SIZE_MAX) {
+          batch->cells[base + k] = col.int_cells[r];
+        } else {
+          const std::string_view sv = col.VarcharAt(r);
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+          batch->varchar_ends[vslot].push_back(
+              static_cast<uint32_t>(dst_bytes.size()));
+        }
+      }
+      if (batch->capture_positions) {
+        batch->positions.emplace_back(blk->page_id, blk->slots[r]);
+      }
+      ++count;
+    }
+    if (lstable_row_cursor_ >= blk->row_count) {
+      ++lstable_page_cursor_;
+      lstable_row_cursor_ = 0;
+    }
+  }
+  SeekLSTableRow();
+  batch->rows = count;
+  return count;
+}
+
 bool FullScanIterator::IsValid() const { return pos_.IsValid(); }
 
-const Row& FullScanIterator::operator*() const { return current_row_; }
-Row& FullScanIterator::operator*() { return current_row_; }
+const Row& FullScanIterator::operator*() const {
+  EnsureLSTableRowMaterialized();
+  return current_row_;
+}
+Row& FullScanIterator::operator*() {
+  EnsureLSTableRowMaterialized();
+  return current_row_;
+}
 
 void FullScanIterator::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->schema_.Name();

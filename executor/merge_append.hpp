@@ -26,7 +26,8 @@ class MergeAppendExecutor final : public ExecutorBase {
         output_schema_(std::move(output_schema)),
         keys_(std::move(keys)) {}
 
-  bool Next(Row* destination, RowPosition* position) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
@@ -36,6 +37,7 @@ class MergeAppendExecutor final : public ExecutorBase {
     size_t source{0};
   };
 
+  bool PullNextFromSource(size_t source, Row* row, RowPosition* position);
   [[nodiscard]] StatusOr<Value> KeyValue(const Head& head,
                                          const SortExecutor::Key& key) const;
   [[nodiscard]] bool Before(const Head& left, const Head& right) const;
@@ -45,6 +47,8 @@ class MergeAppendExecutor final : public ExecutorBase {
   std::vector<Schema> schemas_;
   Schema output_schema_;
   std::vector<SortExecutor::Key> keys_;
+  std::vector<DataChunk> source_batches_;
+  std::vector<size_t> source_offsets_;
   std::vector<Head> heads_;
   bool initialized_{false};
 };

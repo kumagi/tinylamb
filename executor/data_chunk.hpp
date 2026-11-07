@@ -61,6 +61,14 @@ class ColumnVector {
 
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   void SetUnsigned(bool value) { unsigned_ = value; }
+  [[nodiscard]] bool IsHeterogeneous() const { return heterogeneous_; }
+  void SetAllowHeterogeneous(bool allow) { allow_heterogeneous_ = allow; }
+  void RebindEmptyType(ValueType type, bool is_unsigned) {
+    assert(size_ == 0);
+    type_ = type;
+    unsigned_ = is_unsigned;
+    heterogeneous_ = false;
+  }
   // VARCHAR only: the collator shared by every value in this column, so a
   // value that arrived tagged (COLLATE) leaves the batch carrying it and the
   // sort/group stages downstream keep folding the same way they would have
@@ -87,10 +95,14 @@ class ColumnVector {
   void AppendDefault();
   void EnsureNullBit(size_t index, bool is_null);
   void MaterializeInferredStorage();
+  void PromoteToHeterogeneous();
 
   ValueType type_;
   bool unsigned_{false};
+  bool allow_heterogeneous_{true};
+  bool heterogeneous_{false};
   Collation collation_{Collation::kNone};
+  bool observed_collation_{false};
   bool mixed_collation_{false};
   size_t size_{0};
   std::vector<uint64_t> null_bitmap_;
@@ -172,6 +184,8 @@ class DataChunk {
   std::vector<ZoneMap> zone_maps_;
   std::vector<RowPosition> positions_;
   size_t size_{0};
+  bool schema_fixed_{false};
+  bool rebind_on_first_row_{true};
 };
 
 }  // namespace tinylamb

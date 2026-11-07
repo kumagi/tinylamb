@@ -26,15 +26,6 @@
 
 namespace tinylamb {
 
-bool ConstantExecutor::Next(Row* row, RowPosition* /*rp*/) {
-  if (offset_ >= rows_.size()) {
-    return false;
-  }
-  // Each row is emitted once, so moving out is safe.
-  *row = std::move(rows_[offset_++]);
-  return true;
-}
-
 size_t ConstantExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   while (offset_ < rows_.size() && destination->Size() < max_rows) {

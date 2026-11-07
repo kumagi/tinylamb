@@ -674,6 +674,10 @@ bool LooksLikeIntervalText(std::string_view s) {
   // Interval text carries a single-hyphen month token ("2014-1 0 ..."); a
   // leading token shaped like an ISO date ("2014-01-01 ...") is a timestamp
   // string and must compare byte-exact instead.
+  if (s.size() < 3 || !((s[0] >= '0' && s[0] <= '9') || s[0] == '-' ||
+                        s[0] == '+' || s[0] == ' ')) {
+    return false;
+  }
   const size_t sp = s.find(' ');
   if (sp == std::string_view::npos) {
     return false;
@@ -948,6 +952,103 @@ StatusOr<std::string> Value::TryEncodeMemcomparableFormat() const {
   }
   CHECK_MSG(false, "undefined type");
   return std::string();
+}
+
+void Value::ThrowAsInt64() {
+  throw std::runtime_error("AsInt64 called on non-int64 value");
+}
+
+void Value::ThrowAsDouble() {
+  throw std::runtime_error("AsDouble called on non-double value");
+}
+
+void Value::ThrowAsStringView() {
+  throw std::runtime_error("AsStringView called on non-varchar value");
+}
+
+namespace {
+size_t EncodeMemcomparableFormatVarcharTo(char* dst, std::string_view in) {
+  if (in.empty()) {
+    dst[0] = '\x02';
+    std::memset(dst + 1, 0, 9);
+    return 10;
+  }
+  dst[0] = static_cast<char>(ValueType::kVarChar);
+  char* d = dst + 1;
+  const char* src = in.data();
+  const size_t size = in.size();
+  for (size_t i = 0;; i += 8) {
+    if (9 <= size - i) {
+      std::memcpy(d, src, 8);
+      d += 8;
+      src += 8;
+      *d++ = 9;
+    } else {
+      std::memcpy(d, src, size - i);
+      std::memset(d + (size - i), 0, 8 - (size - i));
+      d += 8;
+      *d++ = static_cast<char>((size % 8) + (size % 8 == 0 ? 8 : 0));
+      return static_cast<size_t>(d - dst);
+    }
+  }
+}
+
+size_t VarcharMemcomparableLength(const char* src, size_t avail) {
+  const char* p = src;
+  size_t left = avail;
+  for (;;) {
+    if (left < 9) throw std::runtime_error("truncated varchar group");
+    const auto cnt = static_cast<uint8_t>(p[8]);
+    if (cnt == 0 || cnt > 9) {
+      throw std::runtime_error("broken varchar group count");
+    }
+    left -= 9;
+    p += 9;
+    if (cnt != 9) break;
+  }
+  return static_cast<size_t>(p - src);
+}
+}  // namespace
+
+size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
+  switch (type) {
+    case ValueType::kNull:
+      throw std::runtime_error("Cannot encode unknown type.");
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return EncodeMemcomparableFormatIntegerTo(dst, value.int_value);
+    case ValueType::kVarChar:
+      return EncodeMemcomparableFormatVarcharTo(dst, value.varchar_value);
+    case ValueType::kDouble:
+      return EncodeMemcomparableFormatDoubleTo(dst, value.double_value);
+    default:
+      break;
+  }
+  throw std::runtime_error("undefined type");
+}
+
+size_t Value::DecodeMemcomparableFormatBounded(const char* src, size_t avail) {
+  if (avail < 1) throw std::runtime_error("truncated tag");
+  const auto tag = static_cast<ValueType>(static_cast<uint8_t>(src[0]));
+  switch (tag) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+    case ValueType::kDouble:
+      if (avail < 1 + 8) throw std::runtime_error("truncated numeric");
+      return 1 + 8;
+    case ValueType::kVarChar: {
+      const bool empty =
+          (avail >= 10) &&
+          std::all_of(src + 1, src + 10, [](char c) { return c == '\0'; });
+      if (empty) {
+        if (avail < 10) throw std::runtime_error("truncated varchar");
+        return 10;
+      }
+      return 1 + VarcharMemcomparableLength(src + 1, avail - 1);
+    }
+    default:
+      throw std::runtime_error("unknown memcomparable tag");
+  }
 }
 
 StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {

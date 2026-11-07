@@ -1,5 +1,390 @@
 # Benchmark history
 
+## 2026-11-06 — TPC-C-derived W=1: Tinylamb / PostgreSQL / MySQL
+
+- **Completed:** nine selected measurements, 10 clients, 5-second warmup plus
+  30 seconds, three trials per engine; all post-trial invariants pass.
+  Exact values/types of all nine initial tables match before every trial.
+  W=1 is the TPC-C warehouse count; TPC-H SF=1 is a separate scale.
+  DuckDB/Oracle are excluded from this explicitly three-engine profile.
+- **Common current C++ generator and executable:** 45/43/4/4/4 request mix,
+  no think/keying time, retries or stored procedures. Tiny/PG Simple Query,
+  MySQL official C API 8.4.11 COM_QUERY; binary collation for names.
+  The generator batches some SQL. Identity with older frozen clients was not
+  established, so older/current TPS differences are not attributed to DB fixes.
+- **Fixed profile:** previously validated Tinylamb C8, PostgreSQL 18.6,
+  MySQL 8.4.13; server CPUs0–15, data buffers512 MiB, synchronous commit.
+  Tiny query budget256 MiB, PG work_mem64 MiB; total memory scopes differ.
+  Restore the same W=1 snapshot before each trial, including its recorded
+  small prior preflight modifications.
+- **Median successful TPS [min–max]:** Tiny **1,712.30 [1,701.93–1,825.40]**,
+  PG **1,373.27 [1,343.87–1,454.60]**, MySQL **4,376.43 [4,347.30–4,650.57]**.
+  New-Order TPS: Tiny **993.43**, PG **617.23**, MySQL **1,981.73**.
+  MySQL total successful TPS is2.56x Tiny /3.19x PG in this profile.
+- **Unexpected abort rates:** Tiny **41.23%**, PG **.46%**, MySQL **1.21%**.
+  Intentional New-Order rollback: .34%/.42%/.45% of all measured requests.
+  Rates pool counts across selected trials; percentiles use successful work.
+  Aborts change the committed mix, so total TPS alone does not establish
+  equal-work capacity. Output engine_aborts includes client affected-row
+  checks. PG/MySQL aborts concentrate in Delivery; the representative cause
+  is a queue DELETE affecting zero rows. The shared driver does not add
+  FOR UPDATE/SKIP LOCKED to the queue SELECT/DELETE sequence.
+- **Successful p50 (Tiny/PG/MySQL ms):** Order-Status .604/.181/.177,
+  Delivery 8.820/3.248/3.996, Stock-Level 1.689/.727/.629.
+  All five types' TPS/p50/p95/p99 and all trial values are retained.
+  Not an audited tpmC score or completed PG1.5x optimization qualification.
+- **Monitoring and adoption:** first series and its two repeats remain
+  reference-only after discovering the monitor omitted other benchmark jobs.
+  Repeat the whole matrix with expanded process monitoring. Its Tiny trial3
+  and PG trial3 recorded another TPC client, so repeat only those conditions
+  with identical binary/fixture/profile hashes. The audited final selection
+  consists of seven original plus two replacement timings. One-second samples
+  detect no competing build/test/profiler/known benchmark in selected trials.
+  No selection by TPS/latency. Normal apps and unrelated idle DBs remain;
+  CPU/I/O exclusivity is not claimed.
+- **Validation/limits:** 60 Python comparison tests pass; C++ transport probes
+  pass against all three DBs (types, affected rows, commit/rollback and error
+  recovery); include lint exits0. Independent client target builds without
+  DB engine dependencies. Existing unrelated LStable/storage compilation
+  errors prevent claiming a full current-source engine build/regression;
+  this measures the validated C8 server. Balance/order-count checks are not
+  a complete TPC-C serial oracle. Both figures visually checked.
+- **Artifacts:** [report](docs/tpcc_three_comparison_2026-11-06.md),
+  [primary matrix, selection audit, CSV and plots](benchmark/comparison/results/2026-11-06-tpcc-three-quiet/),
+  [two final replacements](benchmark/comparison/results/2026-11-06-tpcc-three-quiet-repeat1/).
+  Earlier final/repeat1 directories are preserved as provisional records.
+  Owned containers/servers and scratch DBs removed after measurement.
+
+## 2026-11-05 — DuckDB 2.0.0 added: five-engine comparison
+
+- **Coverage:** 395 OLAP measurements (19 microqueries × 3 sales sizes × 5,
+  plus 22 TPC-H-derived queries × 5), 495 OLTP/HTAP trials
+  (11 workloads × 1/4/16 clients × 3 trials × 5). All result comparisons and
+  post-trial invariants pass. Independent audit checks complete conditions,
+  no duplicates, all 9 warm samples, fixtures, indexes and frozen harness hashes.
+- **Profile:** frozen Tinylamb C8, PostgreSQL 18.6, MySQL 8.4.13,
+  Oracle Free 23.26.3.0.0 and DuckDB 2.0.0. Fresh measurements for all five;
+  CPUs 0,1, common secondary keys, sales 10k/100k/1m, TPC-H-derived SF=.01.
+  OLTP .5-s warmup + 2-s window × 3: initial screening, not close-margin or
+  tail-target qualification. Existing PG 1.5x optimization goal remains open.
+- **DuckDB:** official Quack whole-session CONNECT over localhost HTTP,
+  persistent database, server threads=2 and one thread per client-side instance.
+  Pin Python package 2.0.0; capture engine and Quack/httpfs extension hashes.
+  Default WAL durability, snapshot isolation/OCC, no automatic retries.
+  ART/zone maps/compression differ from other engines' storage layouts.
+  Tiny/PG buffers 1,088 MiB; MySQL actual 1,536 MiB; DuckDB memory_limit
+  requested 1,088 MiB. These budgets do not cover identical memory categories.
+- **Observed:** DuckDB is faster than Tiny on 16/19 million-row microqueries
+  and PG on 17/19. Join: Tiny 20.353 ms / PG 22.454 / DuckDB 2.301.
+  Group-100: Tiny 19.012 / PG 20.370 / DuckDB 2.687 ms.
+  Top-100: Tiny .054 / PG .041 / DuckDB 2.184 ms.
+  TPC-H-derived sum of per-query medians: Tiny 75.008, PG 68.128,
+  MySQL 261.387, Oracle 60.083, DuckDB 52.174 ms; not a suite wall time or
+  audited TPC score. DuckDB wins 7/22 against Tiny and 8/22 against PG.
+- **Errors:** measured/warmup SQL failures Tiny 1,107/291, DuckDB 317/84,
+  PG/MySQL/Oracle zero. All trials remain valid; TPS includes successful work
+  only. SELECT-1 one-client p50: Tiny .0065 ms, PG .0092, DuckDB .5159;
+  Quack-path timings must not be presented as embedded DuckDB API timings.
+- **Finalization failure, preserved explicitly:** every measurement was saved
+  before an unsupported duckdb_database_size() metadata query failed.
+  Initial environment and raw records remain unchanged. A SHA-256 sidecar
+  plus the complete termination log supports recovery and independent audit.
+  End-of-run Oracle SGA/segments and DuckDB file-size fields are unavailable;
+  no substitute values were taken from another run. Offline summary generation
+  uses the frozen runtime summarizer. The current harness uses PRAGMA
+  database_size; a separate five-engine/100-row smoke passes finalization.
+- **Validation:** 51 comparison tests pass, include-layer lint exits 0;
+  four five-engine figures visually checked. No engine source changes.
+  DuckDB TPC-C, SF=1, embedded/direct and no-secondary profiles are unmeasured.
+  Owned servers/containers/data cleaned; official images/extensions cached.
+- **Artifacts:** [report](docs/duckdb_comparison_2026-11-05.md),
+  [raw records, plans, runtime scripts, audit and recovery](benchmark/comparison/results/2026-11-05-duckdb-5engine-indexed/).
+
+## 2026-10-31 — Oracle AI Database Free added: four-engine, two-core comparison
+
+- **Completed:** 316 OLAP measurements (19 queries × 3 sales sizes × 4 engines,
+  plus 22 TPC-H-derived queries × 4) and 396 OLTP/HTAP trials
+  (11 workloads × 3 connection counts × 3 trials × 4).
+  All OLAP result values/order match PostgreSQL; every OLTP trial passes the
+  account/churn/snapshot checks. Audit confirms no missing/duplicate conditions.
+- **Products:** frozen Tinylamb C4, PostgreSQL 18.6, MySQL 8.4.13,
+  Oracle AI Database 26ai Free **23.26.3.0.0 Full** from the official registry,
+  pinned digest `sha256:f988b0c04c4c386cd306a2a914c0d7a9702d83acc31b064a28ad8eb6278a8fba`.
+  Oracle Free Use distribution; 2-core / 2-GB DB RAM / 12-GB user-data limits.
+- **Separate profile:** every server on CPUs 0,1 (two physical cores), common
+  secondary keys; sales 10k/100k/1m, accounts capped at 10k, TPC-H-derived SF=.01.
+  This does not replace the existing 8-/16-core PG optimization baseline.
+  Tiny/PG data buffers 1,088 MiB; MySQL requested 1,088 but reports **1,536 MiB**;
+  Oracle actual buffer cache **1,088 → 1,008 MiB**, managed inside its SGA.
+  Memory budgets and driver/network paths are explicitly not identical.
+- **Sampling:** OLAP first execution separate, then 9 warm repetitions;
+  OLTP 1/4/16 connections, .5-s warmup + **2-s** window, 3 trials.
+  The short write windows have large min/max ranges and do not establish
+  close margins or tail-performance targets. No build/test/profiler overlaps
+  accepted measurements. Oracle runs WAIT/IMMEDIATE synchronous commit,
+  FORCE LOGGING YES, explicitly verified NOARCHIVELOG.
+- **TPC-H-derived sum of per-query medians:** Tiny **74.464 ms**, PG **68.407 ms**,
+  MySQL **262.573 ms**, Oracle **59.653 ms**. This is neither a measured suite
+  total nor an audited TPC score. Oracle is faster than Tiny on 12/22 queries;
+  Tiny is faster on 12/19 largest-scale microbenchmarks. No universal ranking.
+- **Errors:** PG/MySQL/Oracle zero SQL failures. Tiny has **2,304 measured +
+  528 warmup** write-intent conflicts, across 30 error-bearing trials;
+  all remain valid by post-trial invariants. Successful TPS excludes failures.
+  Zero result mismatches/validation failures across all products.
+- **Artifacts:** [report](docs/oracle_free_comparison_2026-10-31.md),
+  [all raw records, plans, frozen runtime scripts and audit](benchmark/comparison/results/2026-10-31-oracle-2core-indexed-final/).
+  Four-engine tables/plots generated and visually checked; harness **40 tests pass**.
+  Comparison-owned containers/data removed; the official image remains cached.
+  Earlier ARCHIVELOG/configuration preparation attempts are retained separately
+  and excluded, never combined into the accepted profile.
+- **Limits:** Oracle uses the official Python Thin driver and literal,
+  non-prepared SQL; array DML is used only for loading. Oracle TPC-C, SF=1,
+  no-secondary-index and prepared/bind profiles remain unmeasured.
+
+## 2026-10-31 — C8 fixes stale-tail relocation and speeds up Delivery (1.5x goal remains open)
+
+- A single-client Delivery repeatedly failed on order2370/district10. Error
+  propagation previously replaced every storage status with generic Conflicts.
+  Preserving the cause and adding phase context identifies **tail reservation**.
+  Relocation started from the updated row and did not heal a conservative
+  append hint lying before it; reaching the actual tail then failed its
+  expected-tail guard. It also repeatedly walked the table's remaining pages.
+- C8 starts relocation from the owner-visible append cursor, advances it only
+  through guarded links, and retries a plain concurrent-successor conflict as
+  INSERT already does. Reserve-before-delete, unpublished-tail ownership,
+  index maintenance, abort undo and synchronous visibility remain intact.
+  No page/WAL format changes. UPDATE now retains the lower status/message.
+- A self-contained **65-row** restart regression fails before the fix with
+  the same tail conflict, passes after it for commit and abort, validates
+  old-snapshot reads, hidden pending tail and all65 unique rows after reopen.
+  The old 64-row prototype did not force growth (preallocated empty tail)
+  and is explicitly excluded. The saved TPC-C failure also passes all5
+  preflights after C8; that working fixture has now advanced.
+- Same W1/10-terminal client, CPU0–15, buffers512 MiB, sync settings,
+  seed20260819, gold fixture, warmup5 s +30 s ×3; all **6/6 trials valid**.
+  No build/test/profiler/fuzzer overlaps. Delivery p50 **33.0719 →8.85851 ms**,
+  p95 **80.4137 →11.8984**, p99 **95.5595 →16.0609** (C7→C8 Tiny).
+  Delivery success TPS **23.4667 →65.3**, contemporaneous PG **45.2333**.
+  The latency goal still fails: **nine of20** transaction-type metrics ≥1.5x.
+
+| Transaction | p50 Tiny / PG ms (ratio) | p95 Tiny / PG ms (ratio) | p99 Tiny / PG ms (ratio) |
+| --- | ---: | ---: | ---: |
+| order_status | 0.586769 / 0.178130 (3.294x) | 1.592920 / 0.244246 (6.522x) | 2.114310 / 0.349587 (6.048x) |
+| stock_level | 1.699630 / 0.699015 (2.431x) | 3.955560 / 0.979610 (4.038x) | 5.681880 / 1.174960 (4.836x) |
+| delivery | 8.858510 / 3.228840 (2.744x) | 11.898400 / 4.671770 (2.547x) | 16.060900 / 6.913860 (2.323x) |
+
+- Total committed TPS trials: Tiny **1720.83 /1183.13 /1732.9**, PG
+  **1340.5 /810.133 /1327.2**. Keep every trial and the I/O-state variation.
+  Engine-abort rates Tiny **41.24–41.47%**, PG **.46–.51%** of attempts;
+  successful latencies/TPS must be read with this failed work.
+- Validation: all **4,194** CTest entries, failure0 /existing skips3;
+  SQL oracle **602 s /776 inputs /657 new units**, mismatch/crash0,
+  peak212 MiB; layering66 allowlisted, format/diff checks pass. Unchanged
+  Python harness had40 passing checks. Source hashes match the frozen C8
+  server `81f7650cf20e3a702a23eea10af4bc6a5e62a885d8c15b9ab9a9f72e711e83e1`.
+- [All trials/errors/invariants](benchmark/comparison/results/2026-10-31-pg15-tpcc-c8/),
+  [all20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c8-targets.json),
+  [validation and before/after regression logs](benchmark/comparison/results/2026-10-30-pg15/).
+- Next measured CPU lead: successful one-client Order-Status Callgrind
+  (21,705 traced type2 statements, no SQL errors) attributes53.35% inclusive
+  instructions to cache replay,25.39% to Projection construction.
+  Generic CSE/rewrite/bytecode setup for simple columns is the next candidate;
+  instruction counts and instrumented wall times are not benchmark scores.
+  Original34 conditions and final full-suite regression remain unfinished.
+
+## 2026-10-31 — PG 1.5x optimization, C7 TPC-C checkpoint (target not achieved)
+
+- Common frozen TCP client, W=1, 10 terminals, seed 20260819, omitted
+  think/keying time, synchronous commits, identical v2 fixture/CSV/indexes;
+  CPUs 0–15, 512-MiB data buffers, warmup 5 s + 30 s × 3 paired trials.
+  No builds/tests/profilers overlap accepted timings. Every trial passes
+  all five preflights and post-trial invariants. This is not certified tpmC.
+- C5 refines conservative index fallback with bounded, exact removed-key
+  history under existing gates; unknown/affected/old/budget-revoked ranges
+  retain full fallback. C6 avoids redundant point-range prefetch cursors.
+  C7 uses one owned page image instead of per-row allocation in compaction.
+  Existing visibility, durability, row-locking and on-disk formats are retained.
+- Order-Status p95 falls from C4 **38.3791 ms** to C7 **1.72515 ms**;
+  contemporaneous PG **.260948 ms**, still **6.611x**. p99 **7.457x**.
+  Delivery p50 **33.0719 / 3.36056 ms = 9.841x**, p95 **17.270x**;
+  Stock-Level p50 **1.78682 / .724392 ms = 2.467x**. Ten of twenty
+  transaction-type metrics still miss the 1.5x goal. Do not treat this as
+  completion of the optimization or a full-suite regression check.
+- Tiny committed TPS trials **1603.77 / 1608.67 / 1606.63**, PG
+  **1323.47 / 1333.97 / 1336.17**. Tiny engine-abort rates are
+  **42.92–43.12%**, PG **.48–.54%** of attempts; successful latency/TPS
+  must not conceal the different no-wait/locking behavior or failed work.
+- [All trials, errors and invariants](benchmark/comparison/results/2026-10-31-pg15-tpcc-c7/),
+  [all 20 median ratios](benchmark/comparison/results/2026-10-30-pg15/tpcc-c7-targets.json),
+  [ongoing plan](docs/postgresql_1_5_plan_2026-10-30.md).
+  Frozen C7 SHA256: `09e138998180774c7dd552d96b3df007eb2843a1090af09b33a5508c85d3ed9e`.
+  Targeted page/history tests 27 + 8 passed; full post-C7 QA: 4,192 CTest entries, failure 0, existing skips 3; SQL oracle 601 s / 788 runs / 676 new units, mismatch/crash 0; harness 40 pass, layering 66 allowlisted.
+
+## 2026-10-31 — C7 full TPC-H SF=1, matched TCP comparison
+
+- All 22 queries × 2 engines complete: **44/44 full-value/order-correct and
+  stable** records, first execution separate from 9 warm repetitions.
+  This completes the earlier interrupted C4 SF=1 run; it does not make the
+  historical pre-C3 wrong Q16 value result valid.
+- Frozen C7, CPUs 0–15, Tiny/PG buffers 4 GiB, Tiny query budget 2 GiB,
+  PG work_mem 64 MiB / max_parallel_workers_per_gather 4 / JIT on;
+  same DBGEN SF=1 input (6,001,215 lineitem rows), same bounded duplicate
+  secondary-key recipe, PG VACUUM (ANALYZE), synchronous settings retained.
+  Preparation waited at an explicit gate until all builds/tests/fuzzers/
+  diagnostics exited. No overlapping measurement load from this task.
+- Q02 **12.616 / PG 92.791 ms = .136x** (baseline Tiny 277.857 ms).
+  Q16 **85.357 / 83.004 ms = 1.028x**, all **18,331** grouped values correct.
+  **Six queries still take ≥1.5x PG time**. Sum of per-query medians:
+  Tiny **5,544.945 ms**, PG **5,784.351 ms**; not an actual suite duration
+  or certified TPC-H score, and not completion of the per-query target.
+
+| Query | Tinylamb median ms | PostgreSQL median ms | Tiny / PG |
+| --- | ---: | ---: | ---: |
+| Q09 | 973.301 | 355.545 | 2.737 |
+| Q11 | 79.353 | 35.325 | 2.246 |
+| Q10 | 274.494 | 123.764 | 2.218 |
+| Q04 | 126.329 | 57.665 | 2.191 |
+| Q20 | 94.814 | 60.071 | 1.578 |
+| Q19 | 28.754 | 19.124 | 1.504 |
+| Q05 | 182.236 | 133.219 | 1.368 |
+| Q13 | 444.206 | 367.044 | 1.210 |
+| Q08 | 96.362 | 80.015 | 1.204 |
+| Q03 | 122.584 | 111.589 | 1.099 |
+| Q16 | 85.357 | 83.004 | 1.028 |
+| Q14 | 59.389 | 60.016 | 0.990 |
+| Q18 | 902.419 | 929.252 | 0.971 |
+| Q01 | 167.873 | 200.785 | 0.836 |
+| Q07 | 122.160 | 179.723 | 0.680 |
+| Q21 | 1487.994 | 2321.780 | 0.641 |
+| Q06 | 77.530 | 125.182 | 0.619 |
+| Q22 | 61.185 | 110.325 | 0.555 |
+| Q17 | 55.923 | 114.738 | 0.487 |
+| Q15 | 38.982 | 85.475 | 0.456 |
+| Q12 | 51.084 | 137.922 | 0.370 |
+| Q02 | 12.616 | 92.791 | 0.136 |
+
+[All inputs/settings/SQL/plans/results](benchmark/comparison/results/2026-10-31-pg15-tpch-sf1-c7/),
+[sorted ratios](benchmark/comparison/results/2026-10-30-pg15/tpch-sf1-c7-targets.json).
+Oracle Free SF=1 is not measured here; its four-engine SF=.01 comparison
+uses a separate two-core profile above.
+
+## 2026-10-30 — TPC-C W=1/10 terminals and TPC-H SF=1: current native benchmark snapshot
+
+- **Scope:** current working-tree Tinylamb, the bundled C++ benchmarks calling
+  `SqlEngine` directly. PostgreSQL/MySQL were not rerun here. This is separate
+  from the TCP, SF=0.01 cross-engine results; neither audited `tpmC` nor a
+  certified TPC-H score is claimed. No engine optimization was added for this run.
+- **Environment:** AMD Ryzen 9 9950X3D, RelWithDebInfo, ext4/NVMe;
+  process and children pinned to logical CPUs 0–15. No build, test or profiler
+  ran concurrently with timings. Page pool/query budget: TPC-C 2 GiB/256 MiB,
+  TPC-H 4 GiB/2 GiB. Checkpoint and ANALYZE defaults remain enabled; no
+  optimization-disable, no-sync or skip-ANALYZE overrides. Host load and exact
+  environment are in the saved command records. Raw-input/OS caches were not evicted.
+- **Reproducibility:** both targets were rebuilt, then copied to frozen binaries;
+  all C++ source and frozen binary hashes matched before/after. Raw logs, plans,
+  commands, input hashes, source patch, build log and results are under
+  [`benchmark/comparison/results/2026-10-30-tpc-native/`](benchmark/comparison/results/2026-10-30-tpc-native/).
+
+### TPC-C W=1, 10 terminals
+
+- Standard 45/43/4/4/4 attempted mix, seed 20260819; warmup 5 s + measurement
+  30 s, three fresh-process trials. Synchronous commit enabled, WAL sync interval
+  1 ms, engine-default deadlock policy, think/keying time omitted.
+  Each trial restores an independent copy of the freshly initialized W=1 fixture;
+  all five transaction preflights and `sql_path_gate` passed.
+- **Median committed throughput:** **1,087.700 TPS**,
+  **9,398.433 SQL/s**,
+  **30,016 New-Order/min**.
+  TPS spans 891.233–1,352.067; retain this
+  spread rather than interpreting the median as a stable lower bound.
+
+| Trial | Committed TPS | SQL/s | New-Order/min | Engine aborts / attempts | User rollbacks | Delivery commits / attempts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 891.233 | 7,651.600 | 24,624 | 912 / 27,759 (3.285%) | 110 | 191 / 1,094 |
+| 2 | 1,087.700 | 9,398.433 | 30,016 | 1,058 / 33,823 (3.128%) | 134 | 265 / 1,316 |
+| 3 | 1,352.067 | 11,624.067 | 37,414 | 1,333 / 42,072 (3.168%) | 177 | 298 / 1,624 |
+
+| Transaction | Median committed txn/s | Median average latency ms (all attempts) | Engine aborts across 3 runs |
+| --- | ---: | ---: | ---: |
+| new_order | 500.267 | 12.711 | 23 |
+| payment | 486.400 | 3.727 | 0 |
+| order_status | 46.033 | 0.547 | 0 |
+| delivery | 8.833 | 21.882 | 3,280 |
+| stock_level | 46.167 | 1.494 | 0 |
+
+- Engine-abort rate is 3.128–3.285% overall, but
+  **Delivery alone aborts 79.86–82.54%**.
+  Almost all engine aborts are Delivery; New-Order also hits index-undo
+  reservation-drain timeouts (8/7/6 timeout-classified aborts in the three runs).
+  Logs retain slow index-undo-drain warnings. These contention costs are a
+  remaining problem, not a clean all-transactions-success result. Expected
+  unused-item user rollbacks are listed separately from engine aborts.
+- All measured native exits are **3**, the benchmark's engine-abort indicator;
+  SQL-path failure would be exit 4. The driver initially stopped on exit 3;
+  it then resumed from the saved first trial and ran only trials 2–3.
+  No recorded trial was discarded or rerun to select a better value.
+- Native latency above averages all attempts, including aborts. TPS counts
+  committed work divided by the configured 30 s; a transaction started before
+  the deadline may finish afterward and is still counted by this native client.
+  It does not use the stricter completion-window rule of the TCP comparison client.
+  `mix_clause_542=short_interval` in all three runs; these runs are not audited
+  TPC-C and the preflight/SQL-path checks are not a full consistency oracle.
+
+### TPC-H SF=1, all 22 queries
+
+**2026-10-31 correction:** the later full-value PostgreSQL oracle found that
+this pre-C3 engine returned 54 incorrect Q16 group counts at SF=1, despite
+matching all 18,331 group keys/row counts. The historical Q16 timing and
+8.24156 s suite total below are retained as raw observations, **not accepted
+as a correct 22-query performance score**. C3 fixes the parallel scan's
+omission of precompiled NOT IN filters; C4's paired Q16 check matches every
+value. The full post-fix SF=1 rerun remains pending in the
+[1.5× plan](docs/postgresql_1_5_plan_2026-10-30.md).
+
+- Fresh load from the pinned DBGEN commit
+  `32f1c1b92d1664dba542e927d23d86ffa57aa253`, 6,001,215 lineitem rows;
+  load **22.737 s**, initial ANALYZE **6.161 s**. The initial Q1–Q22 pass is
+  excluded. Each of three measured processes restores the same post-initial
+  fixture, runs ANALYZE and executes Q1–Q22 once in order.
+- **Query sum (Q1-Q22):** **8.24156 s** median
+  of the three suite totals (8.11185 / 8.24156 / 8.37876 s).
+  This includes planning and result draining, excludes database open, ANALYZE,
+  shutdown and input loading. It is the median of suite totals, not the sum
+  of per-query medians, and is not a cold-I/O measurement.
+- All 22 queries succeed in the initial and three measured passes (88 query
+  executions); row counts match both across passes and the recorded SF=1
+  2026-10-02 snapshot. This confirms row counts only; **no separate result-value
+  oracle** was run at SF=1. No paired speedup claim is made against historical
+  min-of-N measurements with different memory, CPU, statistics and code settings.
+- Slowest median queries remain Q21 (1,611.540 ms), Q9 (1,203.880 ms),
+  Q18 (1,010.580 ms), Q13 (555.001 ms) and Q10 (392.861 ms).
+
+| Query | Median ms (3 runs) | Min–max ms | Rows |
+| --- | ---: | ---: | ---: |
+| Q01 | 222.408 | 222.239–279.411 | 4 |
+| Q02 | 373.751 | 371.885–384.024 | 100 |
+| Q03 | 224.815 | 200.785–226.187 | 10 |
+| Q04 | 196.183 | 192.334–196.303 | 5 |
+| Q05 | 291.126 | 279.185–293.530 | 5 |
+| Q06 | 117.426 | 116.426–120.542 | 1 |
+| Q07 | 225.977 | 220.311–242.258 | 4 |
+| Q08 | 189.497 | 187.921–191.221 | 5 |
+| Q09 | 1203.880 | 1200.680–1226.420 | 175 |
+| Q10 | 392.861 | 391.751–398.341 | 20 |
+| Q11 | 184.366 | 181.970–187.490 | 741 |
+| Q12 | 151.973 | 149.779–154.550 | 2 |
+| Q13 | 555.001 | 550.961–565.446 | 42 |
+| Q14 | 158.937 | 157.595–159.746 | 1 |
+| Q15 | 142.465 | 140.046–143.594 | 1 |
+| Q16 | 186.020 | 180.175–198.030 | 18,331 |
+| Q17 | 157.091 | 153.489–181.274 | 1 |
+| Q18 | 1010.580 | 955.246–1062.610 | 100 |
+| Q19 | 159.825 | 157.181–165.126 | 1 |
+| Q20 | 230.901 | 226.849–296.565 | 164 |
+| Q21 | 1611.540 | 1606.280–1618.550 | 100 |
+| Q22 | 206.978 | 194.671–209.594 | 7 |
+
+
 ## 2026-10-10 — TPC-H SF=1: bulk raw-count fusion (one map probe replaces the join bucket walk, Q13), single-pread page reads (the 32 KiB body copy per page read removed, suite-wide scan floor), hoisted per-group maps in the fast grouped emit (Q11), morsel-parallel membership fills (Q22) — −5.3% (min-of-8) clean, all rows and all 19,689 value lines identical; the ~20% target was NOT reached — eleventh consecutive TPC-H session. TPC-C untouched (owned by the concurrent txn session, on round 15).
 
 - **Measurement headline:** interleaved paired passes, gold-restore per

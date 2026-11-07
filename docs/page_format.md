@@ -20,9 +20,8 @@ network byte order. Unknown magic/version values are rejected as corrupt.
 
 ## Page types
 
-- **RowPage** — slotted row store (default heap table).
+- **RowPage** — slotted row store.
 - **BranchPage / LeafPage** — B+ tree nodes.
-- **PaxPage** — persistent column-group page for `DataChunk` values.
 - **Meta / checkpoint** pages — catalog and recovery metadata.
 
 Row and index layouts are validated on read; a checksum mismatch logs an
@@ -30,11 +29,6 @@ error and fails the read with `Status::kCorrupt` from `PagePool::ReadFrom`
 (page/page_pool.cpp) — nothing throws (see `docs/page_checksum.md`). The
 process-level failure path is `CHECK_MSG` → `LOG(FATAL)` abort, per the
 project's no-throw policy.
-
-## PAX variant
-
-Columnar PAX blocks for analytics experiments are documented in
-`docs/pax_page_format.md`.
 
 ## Compatibility
 

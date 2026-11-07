@@ -143,10 +143,11 @@ bool WindowExecutor::EnsureComputed() {
   // exhausted and rows_ holds the partially extended input.
   if (appended_columns_ == 0) {
     std::vector<Row> input;
-    Row row;
-    RowPosition rp;
-    while (child_->Next(&row, &rp)) {
-      input.push_back(std::move(row));
+    DataChunk batch;
+    while (child_->NextBatch(&batch) != 0) {
+      for (size_t i = 0; i < batch.Size(); ++i) {
+        input.push_back(batch.RowAt(i));
+      }
     }
     if (child_->GetStatus() != Status::kSuccess) {
       FailWithChildOf(*child_);
@@ -173,29 +174,31 @@ bool WindowExecutor::DrainIntoSpills(
   spills_.resize(files);
   const Schema input_schema = InputSchema();
   const relational_detail::CteMap empty_ctes;
-  Row row;
-  RowPosition rp;
-  while (child_->Next(&row, &rp)) {
-    std::vector<Value> key;
-    key.reserve(partition_by.size());
-    relational_detail::Scope scope;
-    scope.row = &row;
-    scope.schema = &input_schema;
-    for (const Expression& term : partition_by) {
-      StatusOr<Value> value = relational_detail::TryEvaluate(
-          term, scope, nullptr, context_, empty_ctes);
-      if (!value.HasValue()) {
-        FailWith(value.GetStatus());
+  DataChunk batch;
+  while (child_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      const Row row = batch.RowAt(i);
+      std::vector<Value> key;
+      key.reserve(partition_by.size());
+      relational_detail::Scope scope;
+      scope.row = &row;
+      scope.schema = &input_schema;
+      for (const Expression& term : partition_by) {
+        StatusOr<Value> value = relational_detail::TryEvaluate(
+            term, scope, nullptr, context_, empty_ctes);
+        if (!value.HasValue()) {
+          FailWith(value.GetStatus());
+          return false;
+        }
+        key.push_back(value.MoveValue());
+      }
+      Status appended =
+          spills_[relational_detail::WindowPartitionKeyHash(key) % files]
+              .Append(row);
+      if (appended != Status::kSuccess) {
+        FailWith(appended);
         return false;
       }
-      key.push_back(value.MoveValue());
-    }
-    Status appended =
-        spills_[relational_detail::WindowPartitionKeyHash(key) % files].Append(
-            row);
-    if (appended != Status::kSuccess) {
-      FailWith(appended);
-      return false;
     }
   }
   if (child_->GetStatus() != Status::kSuccess) {
@@ -286,19 +289,6 @@ bool WindowExecutor::NextChunk() {
   }
   exhausted_ = true;
   return false;
-}
-
-bool WindowExecutor::Next(Row* dst, RowPosition* rp) {
-  assert(dst != nullptr);
-  if (read_offset_ >= rows_.size() && !NextChunk()) {
-    return false;
-  }
-  *dst = rows_[read_offset_];
-  if (rp != nullptr) {
-    *rp = RowPosition();
-  }
-  ++read_offset_;
-  return true;
 }
 
 size_t WindowExecutor::NextBatch(DataChunk* destination, size_t max_rows) {

@@ -152,14 +152,16 @@ Row MultiIndexCoveringScan::AssembleFromHeap(const Row& heap_row) const {
   return assembled;
 }
 
-bool MultiIndexCoveringScan::Next(Row* dst, RowPosition* rp) {
+size_t MultiIndexCoveringScan::NextBatch(DataChunk* destination,
+                                         size_t max_rows) {
+  destination->Reset(output_schema_, max_rows);
   if (!built_) {
     Build();
   }
   if (GetStatus() != Status::kSuccess) {
-    return false;
+    return 0;
   }
-  while (next_position_ < positions_.size()) {
+  while (destination->Size() < max_rows && next_position_ < positions_.size()) {
     const RowPosition pos = positions_[next_position_++];
     const auto found = candidates_.find(pos);
     if (found == candidates_.end()) {
@@ -178,7 +180,8 @@ bool MultiIndexCoveringScan::Next(Row* dst, RowPosition* rp) {
         continue;
       }
       if (row_or.GetStatus() != Status::kSuccess) {
-        return FailWith(row_or.GetStatus());
+        FailWith(row_or.GetStatus());
+        return destination->Size();
       }
       assembled = AssembleFromHeap(row_or.Value());
       if (!assembled.IsValid()) {
@@ -195,19 +198,16 @@ bool MultiIndexCoveringScan::Next(Row* dst, RowPosition* rp) {
             return conjunct->TryEvaluate(assembled, output_schema_);
           });
       if (!pass.HasValue()) {
-        return FailWith(pass.GetStatus());
+        FailWith(pass.GetStatus());
+        return destination->Size();
       }
       if (!pass.Value()) {
         continue;
       }
     }
-    *dst = std::move(assembled);
-    if (rp != nullptr) {
-      *rp = pos;
-    }
-    return true;
+    destination->Append(std::move(assembled), pos);
   }
-  return false;
+  return destination->Size();
 }
 
 void MultiIndexCoveringScan::Dump(std::ostream& o, int /*indent*/) const {

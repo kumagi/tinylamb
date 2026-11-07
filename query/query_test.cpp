@@ -6648,10 +6648,25 @@ TEST_F(QueryTest, ZigZagJoinSqlContracts) {
   EXPECT_EQ(residual[0], (Row({Value(3), Value(3)})));
   EXPECT_EQ(residual[1], (Row({Value(3), Value(3)})));
 
-  StatusOr<Executor> explained = engine.Prepare(
-      ctx,
-      "EXPLAIN SELECT zz_left.k, zz_right.k FROM zz_left JOIN zz_right "
-      "ON zz_left.k = zz_right.k ORDER BY zz_left.k, zz_right.k;");
+  // Costing now charges distinct-key navigation. Use duplicate-heavy
+  // indexes to pin the ordered-index join; the tiny semantic fixture above
+  // may legitimately choose a hash join.
+  for (const std::string name : {"zz_order_left", "zz_order_right"}) {
+    RunSql(ctx, *db_, "CREATE TABLE " + name + " (k INT64)");
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable(name));
+    for (int64_t i = 0; i < 100; ++i) {
+      ASSERT_SUCCESS(table->Insert(ctx.txn_, Row({Value(i % 10)})).GetStatus());
+    }
+    ASSERT_SUCCESS(db_->CreateIndex(
+        ctx, name, IndexSchema(name + "_k", {0}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(db_->RefreshStatistics(ctx, name));
+  }
+  StatusOr<Executor> explained =
+      engine.Prepare(ctx,
+                     "EXPLAIN SELECT zz_order_left.k, zz_order_right.k FROM "
+                     "zz_order_left JOIN zz_order_right "
+                     "ON zz_order_left.k = zz_order_right.k ORDER BY "
+                     "zz_order_left.k, zz_order_right.k;");
   ASSERT_TRUE(explained.HasValue()) << engine.LastError();
   std::string plan_text;
   Row plan_row;
@@ -7848,5 +7863,74 @@ TEST_F(QueryTest, FilterOverflowSurfacesThroughDrainStatus) {
   const auto [tolerant_status, tolerant_ok] =
       drained("SELECT k FROM t WHERE week - 10 = 0 AND k = 'nomatch';");
   EXPECT_TRUE(tolerant_ok) << tolerant_status;
+}
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(QueryTest, ProjectedIndexReadsRebindPredicatesAndPreserveNulls) {
+  {
+    auto seed = db_->BeginContext();
+    RunSql(seed, *db_,
+           "CREATE TABLE read_projection (id BIGINT PRIMARY KEY, bucket "
+           "BIGINT, balance BIGINT, padding STRING)");
+    RunSql(seed, *db_,
+           "INSERT INTO read_projection VALUES "
+           "(0,0,NULL,'zero'),(1,1,10,'one'),(2,NULL,20,'two'),(3,1,30,'three')"
+           ",(4,0,40,'four'),(5,1,NULL,'five')");
+    RunSql(seed, *db_, "ANALYZE");
+    RunSql(seed, *db_, "UPDATE read_projection SET balance = balance");
+    ASSERT_SUCCESS(seed.PreCommit());
+  }
+  SqlEngine engine(*db_);
+  const uint64_t before = PlanCacheStats().replays.load();
+  for (int repetition = 0; repetition < 3; ++repetition) {
+    for (int key = 0; key < 2; ++key) {
+      auto reader = db_->BeginReadOnlyContext();
+      const auto rows = RunPrepared(
+          &engine, &reader,
+          "SELECT id, balance FROM read_projection WHERE bucket = " +
+              std::to_string(key) + " ORDER BY id LIMIT 2");
+      const std::vector<Row> expected =
+          key == 0 ? std::vector<Row>{Row({Value(0), Value()}),
+                                      Row({Value(4), Value(40)})}
+                   : std::vector<Row>{Row({Value(1), Value(10)}),
+                                      Row({Value(3), Value(30)})};
+      EXPECT_EQ(rows, expected);
+      const auto sum = RunPrepared(
+          &engine, &reader,
+          "SELECT SUM(balance) FROM read_projection WHERE id BETWEEN " +
+              std::to_string(key) + " AND " + std::to_string(key + 2));
+      EXPECT_EQ(sum, std::vector<Row>{Row({Value(key == 0 ? 30 : 60)})});
+      // Reordered/duplicated outputs keep the general projection path.
+      EXPECT_EQ(RunPrepared(&engine, &reader,
+                            "SELECT padding, balance, id, id FROM "
+                            "read_projection WHERE id = 1"),
+                (std::vector<Row>{
+                    Row({Value("one"), Value(10), Value(1), Value(1)})}));
+      ASSERT_SUCCESS(reader.PreCommit());
+    }
+  }
+  EXPECT_GT(PlanCacheStats().replays.load(), before);
+}
+
+TEST_F(QueryTest,
+       ProjectedIndexReadsKeepNonIntegerResidualAndUnsignedConstant) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE read_residual (id BIGINT PRIMARY KEY, balance BIGINT, "
+         "text STRING)");
+  RunSql(ctx, *db_,
+         "INSERT INTO read_residual VALUES "
+         "(0,-1,'skip'),(1,20,'keep'),(2,NULL,'keep'),(3,30,'skip')");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT id, balance FROM read_residual WHERE id BETWEEN 0 AND 3 "
+             "AND text = 'keep' ORDER BY id"),
+      (std::vector<Row>{Row({Value(1), Value(20)}), Row({Value(2), Value()})}));
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT id FROM read_residual WHERE id BETWEEN 0 AND 3 AND "
+             "balance < CAST(18446744073709551615 AS UINT64) ORDER BY id"),
+      (std::vector<Row>{Row({Value(0)}), Row({Value(1)}), Row({Value(3)})}));
 }
 }  // namespace tinylamb

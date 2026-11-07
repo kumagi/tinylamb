@@ -25,6 +25,7 @@
 #include "page/page_manager.hpp"
 #include "recovery/checkpoint_manager.hpp"
 #include "recovery/logger.hpp"
+#include "recovery/recovery_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
@@ -36,8 +37,9 @@ class PageStorage {
  public:
   // Opens the WAL + page files and runs recovery. Construction failures that
   // previously escaped as exceptions surface as Status.
-  static StatusOr<std::unique_ptr<PageStorage>> Create(std::string_view dbname,
-                                                       size_t wal_sync_ms = 1);
+  static StatusOr<std::unique_ptr<PageStorage>> Create(
+      std::string_view dbname, size_t wal_sync_ms = 1,
+      bool preallocate_new_wal = false);
   PageStorage(const PageStorage&) = delete;
   PageStorage& operator=(const PageStorage&) = delete;
   PageStorage(PageStorage&&) = delete;

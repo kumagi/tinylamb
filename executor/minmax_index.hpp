@@ -13,7 +13,8 @@ class MinMaxIndexExecutor final : public ExecutorBase {
   MinMaxIndexExecutor(Executor source, size_t value_slot)
       : source_(std::move(source)), value_slot_(value_slot) {}
 
-  bool Next(Row* destination, RowPosition* position) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:

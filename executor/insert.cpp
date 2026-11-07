@@ -51,7 +51,7 @@ std::string KeyString(const Value& value) {
 
 }  // namespace
 
-bool Insert::Next(Row* dst, RowPosition* rp) {
+bool Insert::Execute(Row* dst, RowPosition* rp) {
   if (finished_) {
     return false;
   }
@@ -149,106 +149,110 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
     }
     return Status::kSuccess;
   };
-  while (src_->Next(&new_row, nullptr)) {
-    const bool has_key = enforce_primary_key_ && !new_row.values_.empty();
-    const std::string key = has_key ? KeyString(new_row[0]) : std::string();
-    const bool exists = has_key && existing_keys.contains(key);
-    // Rows arrive in full schema layout; listed columns keep their
-    // destination offsets.
-    const bool in_batch = has_key && batch_keys.contains(key);
-    if (exists) {
-      switch (mode_) {
-        case InsertExecutionMode::kIgnore:
-          continue;
-        case InsertExecutionMode::kUpsert: {
-          const RowPosition& pos = existing_positions[key];
-          Row updated = target_->Read(*txn_, pos).Value();
-          if (!upsert_offsets_.empty()) {
-            for (const size_t offset : upsert_offsets_) {
-              if (offset < updated.values_.size()) {
-                updated[offset] = new_row[offset];
+  DataChunk src_batch;
+  while (src_->NextBatch(&src_batch) != 0) {
+    for (size_t row_idx = 0; row_idx < src_batch.Size(); ++row_idx) {
+      new_row = src_batch.RowAt(row_idx);
+      const bool has_key = enforce_primary_key_ && !new_row.values_.empty();
+      const std::string key = has_key ? KeyString(new_row[0]) : std::string();
+      const bool exists = has_key && existing_keys.contains(key);
+      // Rows arrive in full schema layout; listed columns keep their
+      // destination offsets.
+      const bool in_batch = has_key && batch_keys.contains(key);
+      if (exists) {
+        switch (mode_) {
+          case InsertExecutionMode::kIgnore:
+            continue;
+          case InsertExecutionMode::kUpsert: {
+            const RowPosition& pos = existing_positions[key];
+            Row updated = target_->Read(*txn_, pos).Value();
+            if (!upsert_offsets_.empty()) {
+              for (const size_t offset : upsert_offsets_) {
+                if (offset < updated.values_.size()) {
+                  updated[offset] = new_row[offset];
+                }
               }
+            } else {
+              updated = new_row;
             }
-          } else {
-            updated = new_row;
+            if (const Status fk_status = check_child_row(updated);
+                fk_status != Status::kSuccess) {
+              return FailWith(fk_status);
+            }
+            if (target_->Update(*txn_, pos, updated).GetStatus() !=
+                Status::kSuccess) {
+              return FailWith(
+                  StatusError(StatusCode::kConflicts,
+
+                              "insert failed on table " +
+                                  std::string(target_->GetSchema().Name())));
+            }
+            if (const Status reseed_status = reseed_self_counts();
+                reseed_status != Status::kSuccess) {
+              return FailWith(reseed_status);
+            }
+            if (!in_batch) {
+              ++insertion_count;
+            }
+            continue;
           }
-          if (const Status fk_status = check_child_row(updated);
-              fk_status != Status::kSuccess) {
-            return FailWith(fk_status);
+          case InsertExecutionMode::kReplace: {
+            const RowPosition& pos = existing_positions[key];
+            if (const Status fk_status = check_child_row(new_row);
+                fk_status != Status::kSuccess) {
+              return FailWith(fk_status);
+            }
+            if (target_->Update(*txn_, pos, new_row).GetStatus() !=
+                Status::kSuccess) {
+              return FailWith(
+                  StatusError(StatusCode::kConflicts,
+
+                              "insert failed on table " +
+                                  std::string(target_->GetSchema().Name())));
+            }
+            if (const Status reseed_status = reseed_self_counts();
+                reseed_status != Status::kSuccess) {
+              return FailWith(reseed_status);
+            }
+            if (!in_batch) {
+              ++insertion_count;
+            }
+            continue;
           }
-          if (target_->Update(*txn_, pos, updated).GetStatus() !=
-              Status::kSuccess) {
+          case InsertExecutionMode::kDefault:
             return FailWith(
-                StatusError(StatusCode::kConflicts,
+                StatusError(StatusCode::kDuplicates,
 
-                            "insert failed on table " +
-                                std::string(target_->GetSchema().Name())));
-          }
-          if (const Status reseed_status = reseed_self_counts();
-              reseed_status != Status::kSuccess) {
-            return FailWith(reseed_status);
-          }
-          if (!in_batch) {
-            ++insertion_count;
-          }
-          continue;
+                            "Failed to insert row with primary key (" + key +
+                                ") due to previously existing row"));
         }
-        case InsertExecutionMode::kReplace: {
-          const RowPosition& pos = existing_positions[key];
-          if (const Status fk_status = check_child_row(new_row);
-              fk_status != Status::kSuccess) {
-            return FailWith(fk_status);
-          }
-          if (target_->Update(*txn_, pos, new_row).GetStatus() !=
-              Status::kSuccess) {
-            return FailWith(
-                StatusError(StatusCode::kConflicts,
-
-                            "insert failed on table " +
-                                std::string(target_->GetSchema().Name())));
-          }
-          if (const Status reseed_status = reseed_self_counts();
-              reseed_status != Status::kSuccess) {
-            return FailWith(reseed_status);
-          }
-          if (!in_batch) {
-            ++insertion_count;
-          }
-          continue;
+      }
+      if (const Status fk_status = check_child_row(new_row);
+          fk_status != Status::kSuccess) {
+        return FailWith(fk_status);
+      }
+      StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);
+      if (inserted.GetStatus() != Status::kSuccess) {
+        // A failed insert (e.g. UNIQUE violation) must not be counted as
+        // inserted; surface the failure instead of reporting success. The
+        // original message rides along when the failure carried one, so a
+        // table-tail timeout is not flattened into a bare "Conflicts".
+        const Status failure = inserted.GetStatus();
+        std::string message = "insert failed on table " +
+                              std::string(target_->GetSchema().Name());
+        if (!failure.GetMessage().empty()) {
+          message += ": " + failure.GetMessage();
         }
-        case InsertExecutionMode::kDefault:
-          return FailWith(
-              StatusError(StatusCode::kDuplicates,
-
-                          "Failed to insert row with primary key (" + key +
-                              ") due to previously existing row"));
+        return FailWith(StatusError(failure.GetCode(), std::move(message)));
       }
-    }
-    if (const Status fk_status = check_child_row(new_row);
-        fk_status != Status::kSuccess) {
-      return FailWith(fk_status);
-    }
-    StatusOr<RowPosition> inserted = target_->Insert(*txn_, new_row);
-    if (inserted.GetStatus() != Status::kSuccess) {
-      // A failed insert (e.g. UNIQUE violation) must not be counted as
-      // inserted; surface the failure instead of reporting success. The
-      // original message rides along when the failure carried one, so a
-      // table-tail timeout is not flattened into a bare "Conflicts".
-      const Status failure = inserted.GetStatus();
-      std::string message =
-          "insert failed on table " + std::string(target_->GetSchema().Name());
-      if (!failure.GetMessage().empty()) {
-        message += ": " + failure.GetMessage();
+      if (has_key) {
+        existing_keys.insert(key);
+        batch_keys.insert(key);
+        existing_positions.insert_or_assign(key, inserted.Value());
       }
-      return FailWith(StatusError(failure.GetCode(), std::move(message)));
+      note_inserted_row(new_row);
+      insertion_count++;
     }
-    if (has_key) {
-      existing_keys.insert(key);
-      batch_keys.insert(key);
-      existing_positions.insert_or_assign(key, inserted.Value());
-    }
-    note_inserted_row(new_row);
-    insertion_count++;
   }
   if (src_->GetStatus() != Status::kSuccess) {
     return FailWith(src_->GetStatus());
@@ -267,6 +271,20 @@ bool Insert::Next(Row* dst, RowPosition* rp) {
   }
   finished_ = true;
   return true;
+}
+
+size_t Insert::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  RowPosition rp;
+  if (!Execute(&row, &rp)) {
+    return 0;
+  }
+  destination->Append(std::move(row), rp);
+  return 1;
 }
 
 void Insert::Dump(std::ostream& o, int indent) const {

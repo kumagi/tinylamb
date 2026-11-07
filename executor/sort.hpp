@@ -69,7 +69,8 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
         keys_(std::move(keys)),
         options_(options),
         worker_count_(std::max<size_t>(1, worker_count)) {}
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
   [[nodiscard]] const Options& SortOptions() const { return options_; }

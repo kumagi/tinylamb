@@ -20,3 +20,8 @@ Not C++ layers; ignored by `check_layering.py` (`IGNORED_PREFIXES`).
 - `fetch_googlesql_compliance.py` — fetches
   `google/googlesql@2026.7.2` testdata (keep in sync with the
   `TINYLAMB_GOOGLESQL_VERSION` CMake variable).
+- `oci_fuzz.sh` + `remote_fuzz_supervisor.sh` + `fuzz_collector.py` —
+  continuous remote SQL fuzzing & failure collection pipeline on `ssh oci`
+  (`deploy`, `status`, `collect`, `logs`, `start`, `stop`, `restart`); keeps
+  active DB/WAL/corpus/logs on `tmpfs` (`/tmp/tinylamb-fuzz`) and connects
+  directly to `/tmp/googlesql_zygote.sock` (`TINYLAMB_GOOGLESQL_ZYGOTE_SOCK`).

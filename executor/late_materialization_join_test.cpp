@@ -39,7 +39,10 @@ namespace {
 
 class FailingSource final : public ExecutorBase {
  public:
-  bool Next(Row* /*row*/, RowPosition* /*position*/) override { return false; }
+  size_t NextBatch(DataChunk* dst, size_t /*max_rows*/) override {
+    dst->Reset();
+    return 0;
+  }
   void Dump(std::ostream& output, int /*indent*/) const override {
     output << "FailingSource";
   }

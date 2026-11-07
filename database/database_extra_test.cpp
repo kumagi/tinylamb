@@ -21,6 +21,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -38,6 +40,7 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "query/sql_engine.hpp"
+#include "recovery/logger.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -117,6 +120,53 @@ class DatabaseExtraTest : public ::testing::Test {
   std::string prefix_;
   std::unique_ptr<Database> db_;
 };
+
+TEST_F(DatabaseExtraTest, DurableWalFrontierWaitsForSuccessfulSync) {
+  SqlEngine engine(*db_);
+  auto setup = db_->BeginContext();
+  ASSERT_TRUE(
+      RunStatement(&engine, &setup, "CREATE TABLE durable_frontier (k INT64)"));
+  ASSERT_SUCCESS(setup.PreCommit());
+  const auto previous = db_->DurableWALLSN();
+  auto writer = db_->BeginContext();
+  ASSERT_TRUE(RunStatement(&engine, &writer,
+                           "INSERT INTO durable_frontier VALUES (1)"));
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+  };
+  auto gate = std::make_shared<Gate>();
+  struct ResetHook {
+    std::shared_ptr<Gate> gate;
+    ~ResetHook() {
+      Logger::SetBeforeSyncHookForTest({});
+      std::scoped_lock lock(gate->mutex);
+      gate->released = true;
+      gate->cv.notify_all();
+    }
+  } reset{gate};
+  Logger::SetBeforeSyncHookForTest([gate](int) {
+    std::unique_lock lock(gate->mutex);
+    gate->entered = true;
+    gate->cv.notify_all();
+    gate->cv.wait(lock, [&] { return gate->released; });
+    return 0;
+  });
+  ASSIGN_OR_ASSERT_FAIL(lsn_t, target, writer.PrepareCommitForDurableReply());
+  {
+    std::unique_lock lock(gate->mutex);
+    ASSERT_TRUE(gate->cv.wait_for(lock, std::chrono::seconds(5),
+                                  [&] { return gate->entered; }));
+    EXPECT_GE(db_->DurableWALLSN(), previous);
+    EXPECT_LT(db_->DurableWALLSN(), target);
+    gate->released = true;
+    gate->cv.notify_all();
+  }
+  ASSERT_SUCCESS(db_->WaitForCommitDurable(target));
+  EXPECT_GE(db_->DurableWALLSN(), target);
+}
 
 TEST_F(DatabaseExtraTest, SecondLiveDatabaseOpenFailsWithoutChangingFiles) {
   SqlEngine engine(*db_);

@@ -4214,4 +4214,152 @@ ExtractWindowCalls(const Expression& expression, size_t* counter,
   return std::make_pair(std::move(*rewritten), std::move(specs));
 }
 
+bool IsNullStrictWhere(
+    const Expression& expression,  // NOLINT(misc-no-recursion)
+    const std::function<bool(const ColumnName&)>& match_column,
+    bool in_exp_is_strict) {
+  if (!expression) {
+    return false;
+  }
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue:
+      return match_column(expression->AsColumnValue().GetColumnName());
+    case TypeTag::kBinaryExp: {
+      const auto& binary = expression->AsBinaryExpression();
+      switch (binary.Op()) {
+        case BinaryOperation::kAdd:
+        case BinaryOperation::kSubtract:
+        case BinaryOperation::kMultiply:
+        case BinaryOperation::kDivide:
+        case BinaryOperation::kModulo:
+        case BinaryOperation::kShiftLeft:
+        case BinaryOperation::kShiftRight:
+        case BinaryOperation::kXor:
+          return IsNullStrictWhere(binary.Left(), match_column,
+                                   in_exp_is_strict) ||
+                 IsNullStrictWhere(binary.Right(), match_column,
+                                   in_exp_is_strict);
+        default:
+          return false;
+      }
+    }
+    case TypeTag::kCastExp:
+      return IsNullStrictWhere(expression->AsCastExpression().Child(),
+                               match_column, in_exp_is_strict);
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expression->AsUnaryExpression();
+      if (unary.Op() == UnaryOperation::kNot ||
+          unary.Op() == UnaryOperation::kMinus ||
+          unary.Op() == UnaryOperation::kBitwiseNot) {
+        return IsNullStrictWhere(unary.Child(), match_column, in_exp_is_strict);
+      }
+      return false;
+    }
+    case TypeTag::kInExp:
+      return in_exp_is_strict &&
+             IsNullStrictWhere(expression->AsInExpression().child_,
+                               match_column, in_exp_is_strict);
+    case TypeTag::kFunctionCallExp: {
+      const auto& function = expression->AsFunctionCallExpression();
+      const std::string& name = function.FuncName();
+      if (name != "abs" && name != "lower" && name != "upper" &&
+          name != "length" && name != "trim") {
+        return false;
+      }
+      return std::ranges::any_of(function.Args(), [&](const Expression& arg) {
+        return IsNullStrictWhere(arg, match_column, in_exp_is_strict);
+      });
+    }
+    default:
+      return false;
+  }
+}
+
+bool ExpressionRejectsNullsWhere(
+    const Expression& expression,  // NOLINT(misc-no-recursion)
+    const std::function<bool(const ColumnName&)>& match_column,
+    bool bare_column_rejects_null) {
+  if (!expression) {
+    return false;
+  }
+  const bool in_exp_is_strict = bare_column_rejects_null;
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue:
+      return bare_column_rejects_null &&
+             match_column(expression->AsColumnValue().GetColumnName());
+    case TypeTag::kBinaryExp: {
+      const auto& binary = expression->AsBinaryExpression();
+      switch (binary.Op()) {
+        case BinaryOperation::kAnd:
+          return ExpressionRejectsNullsWhere(binary.Left(), match_column,
+                                             bare_column_rejects_null) ||
+                 ExpressionRejectsNullsWhere(binary.Right(), match_column,
+                                             bare_column_rejects_null);
+        case BinaryOperation::kOr:
+          return ExpressionRejectsNullsWhere(binary.Left(), match_column,
+                                             bare_column_rejects_null) &&
+                 ExpressionRejectsNullsWhere(binary.Right(), match_column,
+                                             bare_column_rejects_null);
+        case BinaryOperation::kXor:
+          if (bare_column_rejects_null) {
+            return ExpressionRejectsNullsWhere(binary.Left(), match_column,
+                                               bare_column_rejects_null) &&
+                   ExpressionRejectsNullsWhere(binary.Right(), match_column,
+                                               bare_column_rejects_null);
+          }
+          return IsNullStrictWhere(binary.Left(), match_column,
+                                   in_exp_is_strict) ||
+                 IsNullStrictWhere(binary.Right(), match_column,
+                                   in_exp_is_strict);
+        case BinaryOperation::kEquals:
+        case BinaryOperation::kNotEquals:
+        case BinaryOperation::kLessThan:
+        case BinaryOperation::kLessThanEquals:
+        case BinaryOperation::kGreaterThan:
+        case BinaryOperation::kGreaterThanEquals:
+        case BinaryOperation::kLike:
+        case BinaryOperation::kNotLike:
+        case BinaryOperation::kAdd:
+        case BinaryOperation::kSubtract:
+        case BinaryOperation::kMultiply:
+        case BinaryOperation::kDivide:
+        case BinaryOperation::kModulo:
+        case BinaryOperation::kShiftLeft:
+        case BinaryOperation::kShiftRight:
+          return IsNullStrictWhere(binary.Left(), match_column,
+                                   in_exp_is_strict) ||
+                 IsNullStrictWhere(binary.Right(), match_column,
+                                   in_exp_is_strict);
+        case BinaryOperation::kIsDistinctFrom:
+        case BinaryOperation::kIsNotDistinctFrom:
+          return false;
+      }
+      return false;
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expression->AsUnaryExpression();
+      switch (unary.Op()) {
+        case UnaryOperation::kIsNotNull:
+        case UnaryOperation::kIsTrue:
+        case UnaryOperation::kIsFalse:
+        case UnaryOperation::kMinus:
+        case UnaryOperation::kBitwiseNot:
+          return IsNullStrictWhere(unary.Child(), match_column,
+                                   in_exp_is_strict);
+        case UnaryOperation::kNot:
+        case UnaryOperation::kIsNull:
+        case UnaryOperation::kIsNotTrue:
+        case UnaryOperation::kIsNotFalse:
+          return false;
+      }
+      return false;
+    }
+    case TypeTag::kInExp:
+      return IsNullStrictWhere(expression->AsInExpression().child_,
+                               match_column, in_exp_is_strict);
+    default:
+      return false;
+  }
+}
+
 }  // namespace tinylamb

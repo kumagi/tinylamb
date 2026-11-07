@@ -66,13 +66,6 @@ size_t LogSegmentSizeFromEnv() {
   return static_cast<size_t>(bytes);
 }
 
-size_t MinimumLogSegmentSize() {
-  const std::string body(kPageBodySize, '\0');
-  return LogRecord::FullPageImageLogRecord(0, PageType::kRowPage, body)
-      .Serialize()
-      .size();
-}
-
 // Reads the checkpoint LSN from the master record written by
 // CheckpointManager. Missing/truncated files resolve to 0; callers
 // additionally verify the value against the WAL itself.
@@ -112,37 +105,22 @@ lsn_t ReadMasterRecordLsn(const std::filesystem::path& path) {
 }  // namespace
 
 StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
-    std::string_view dbname, size_t wal_sync_ms) {
+    std::string_view dbname, size_t wal_sync_ms, bool preallocate_new_wal) {
   const std::string dbname_str(dbname);
   const size_t requested_segment_size = LogSegmentSizeFromEnv();
-  const size_t minimum_segment_size = MinimumLogSegmentSize();
   ASSIGN_OR_RETURN(std::unique_ptr<PageManager>, pm,
                    PageManager::Create(dbname_str + ".db",
                                        PagePoolCapacityFromEnv(), false));
   ASSIGN_OR_RETURN(
       std::unique_ptr<Logger>, logger,
       Logger::Create(dbname_str + ".log", static_cast<size_t>(8 * 1024 * 1024),
-                     wal_sync_ms, requested_segment_size));
+                     wal_sync_ms, requested_segment_size, preallocate_new_wal,
+                     RecoveryManager::TornTailTruncationAllowed()));
   const size_t segment_size = logger->SegmentSize();
-  if (segment_size < minimum_segment_size) {
-    return StatusError(
-        StatusCode::kInvalidArgument,
-        "persisted WAL segment geometry is too small for a full-page image: " +
-            std::to_string(segment_size) + " < " +
-            std::to_string(minimum_segment_size));
-  }
   auto rm = std::make_unique<RecoveryManager>(dbname_str + ".log",
                                               pm->GetPool(), segment_size);
   auto tm =
       std::make_unique<TransactionManager>(pm.get(), logger.get(), rm.get());
-  // Periodic checkpointing keeps the WAL bounded: without it fdatasync cost
-  // scales with the file's dirty page cache footprint, which on a long TPC-C
-  // run makes every commit barrier approach 1 ms regardless of group size.
-  // TINYLAMB_CHECKPOINT_SECONDS tunes the period (0 disables); the default
-  // 10 s balances checkpoint overhead with WAL growth. The value must reach
-  // the CheckpointManager itself -- a stale draft read it only to decide
-  // whether to call Start(), leaving every database on the compiled-in
-  // default period.
   size_t checkpoint_interval = 10;
   const char* ckpt_env = std::getenv("TINYLAMB_CHECKPOINT_SECONDS");
   if (ckpt_env != nullptr && ckpt_env[0] != '\0') {
@@ -156,29 +134,6 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
   auto storage = std::unique_ptr<PageStorage>(
       new PageStorage(dbname, std::move(logger), std::move(pm), std::move(rm),
                       std::move(tm), std::move(cm)));
-  // WAL rule for evictions: a dirty page must never reach disk ahead of the
-  // log records its page_lsn covers. The gate fires outside the pool latch,
-  // so blocking on the group-commit flush here is deadlock-free. It MUST
-  // call the logger directly: the pool is destroyed AFTER the transaction
-  // manager (declared-member teardown order), so ~PagePool's final
-  // write-backs would touch a dead manager through this lambda.  Write-intent
-  // waits still see these stalls through the group-commit backlog signal in
-  // ExtendIntentDeadlineForDurabilityBarrier.
-  storage->pm_->GetPool()->SetDurabilityGate([s = storage.get()](lsn_t lsn) {
-    return s->logger_->WaitForDurable(lsn);
-  });
-  // Full-page-image (FPW) rule: a dirty page whose WAL snapshot is no longer
-  // retained gets its complete image logged before the data file is touched,
-  // keeping torn pages rebuildable across WAL recycling.
-  storage->pm_->GetPool()->SetWalSnapshotSink(
-      [s = storage.get()](page_id_t pid, PageType type,
-                          std::string_view body) -> StatusOr<lsn_t> {
-        const LogRecord record =
-            LogRecord::FullPageImageLogRecord(pid, type, body);
-        const std::string serialized = record.Serialize();
-        ASSIGN_OR_RETURN(lsn_t, start, s->logger_->AddLog(serialized));
-        return start + static_cast<lsn_t>(serialized.size());
-      });
   // Recycling may only cut at record boundaries: a record straddling a
   // segment boundary keeps its head in the older segment until it is gone
   // from the WAL entirely.
@@ -187,10 +142,6 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
         LogRecord probe;
         return rm_raw->ReadLog(lsn, &probe);
       });
-  // Runtime undo walks read their own WAL records back through the logger's
-  // ring buffer, which lets TransactionManager::Abort skip the pre-undo
-  // group-commit flush entirely (the ring serves records that are still
-  // volatile; losing them to a crash replays the same rollback at restart).
   storage->rm_->SetLogger(storage->logger_.get());
   std::error_code db_size_error;
   const auto db_size =
@@ -203,10 +154,6 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     return StatusError(StatusCode::kCorrupt,
                        "database file is nonempty but WAL is empty");
   }
-  // Resume from the last durable checkpoint when the master record points at
-  // a real one; otherwise fall back to replaying the whole log. The hint is
-  // only trusted when it lands on a decodable kBeginCheckpoint record -- a
-  // garbage or torn hint must widen the recovery window, never skip it.
   lsn_t checkpoint = ReadMasterRecordLsn(storage->MasterRecordName());
   if (checkpoint != 0) {
     LogRecord probe;
@@ -217,17 +164,9 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
       checkpoint = 0;
     }
   }
-  // Full-page images below the anchor may already have been recycled by a
-  // previous incarnation; the pool must not trust them.
-  storage->pm_->GetPool()->SetSnapshotRetentionFloor(checkpoint);
   const Status recovered =
       storage->rm_->RecoverFrom(checkpoint, storage->tm_.get());
   if (recovered != Status::kSuccess) {
-    // Recovery failed closed: whatever the replay managed to apply is
-    // untrustworthy, and ~PagePool writes back every page whose checksum does
-    // not match. Retire the buffer without writing anything so the data file
-    // stays exactly as the crash left it and the next boot retries from the
-    // same master record.
     storage->pm_->GetPool()->DropAllPages();
     return recovered;
   }

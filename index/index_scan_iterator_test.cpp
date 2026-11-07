@@ -41,7 +41,6 @@
 #include "recovery/recovery_manager.hpp"
 #include "table/iterator.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
 #include "type/row.hpp"
@@ -120,6 +119,32 @@ TEST_F(IndexScanIteratorTest, Construct) {
   // Arrange -- nothing to set up; default database created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
   // Assert -- nothing to verify; gtest green on pass, death on crash
+}
+
+TEST_F(IndexScanIteratorTest, ProjectedDecodeCanRebindWithoutChangingPosition) {
+  auto setup = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        setup.GetTable(kTableName));
+  ASSERT_TRUE(
+      table->Insert(setup.txn_, Row({Value(1), Value("text"), Value(2.5)}))
+          .HasValue());
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto read = db_->BeginReadOnlyContext();
+  IndexScanIterator iterator(*table, table->GetIndex(0), read.txn_, Value(1),
+                             Value(1));
+  ASSERT_TRUE(iterator.IsValid());
+  const auto position = iterator.Position();
+  EXPECT_EQ(*iterator, Row({Value(1), Value("text"), Value(2.5)}));
+  ASSERT_SUCCESS(iterator.SetProjection({0, 2}));
+  EXPECT_EQ(*iterator, Row({Value(1), Value(2.5)}));
+  ASSERT_SUCCESS(iterator.SetProjection({1}));
+  EXPECT_EQ(*iterator, Row({Value("text")}));
+  EXPECT_EQ(iterator.Position(), position);
+  EXPECT_NE(iterator.SetProjection({99}), Status::kSuccess);
+  EXPECT_EQ(*iterator, Row({Value("text")}));
+  ++iterator;
+  EXPECT_FALSE(iterator.IsValid());
+  ASSERT_SUCCESS(iterator.GetStatus());
 }
 
 TEST_F(IndexScanIteratorTest, ScanAscending) {
@@ -725,14 +750,17 @@ TEST_F(IndexScanIteratorTest, IndexOnlyVisibilityMapServesChainFreePages) {
   // Act -- NameIdx (kNonUnique key {1} include {2}) serves key + payload.
   IndexScanIterator scan(*table, table->GetIndex(1), reader.txn_);
   std::vector<Row> from_index;
+  Row row({Value("stale"), Value(99), Value(100)});
   while (scan.IsValid()) {
-    Row row;
     ASSERT_TRUE(scan.TryReadIndexOnly(&row));
     // The heap-resolved full row agrees with the entry image.
     const Row& heap = *scan;
     EXPECT_EQ(row[0], heap[1]);
     EXPECT_EQ(row[1], heap[2]);
-    from_index.push_back(std::move(row));
+    ASSERT_EQ(row.Count(), 2U);
+    from_index.push_back(row);
+    row[0] = Value("changed owned result");
+    EXPECT_EQ(scan.GetKey()[0], heap[1]);
     ++scan;
   }
 
@@ -982,4 +1010,292 @@ TEST_F(IndexScanIteratorTest, PartitionBoundariesTileTheLeafChain) {
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(IndexScanIteratorTest, SnapshotDecodesDuplicateListsOncePerKey) {
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    for (int i = 0; i < 600; ++i) {
+      const Value name =
+          i % 5 == 0 ? Value() : Value("g" + std::to_string(i % 5));
+      ASSERT_SUCCESS(
+          table->Insert(writer.txn_, Row{Value(i), name, Value(i + .5)})
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  auto reader = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  for (const bool ascending : {true, false}) {
+    IndexScanIterator scan(*table, table->GetIndex(1), reader.txn_, Value(),
+                           Value(), ascending);
+    for (int group = 0; group < 5; ++group) {
+      const int key = ascending ? group : 4 - group;
+      for (int offset = 0; offset < 120; ++offset) {
+        const int id = key + 5 * (ascending ? offset : 119 - offset);
+        ASSERT_TRUE(scan.IsValid());
+        EXPECT_EQ((*scan)[0], Value(id));
+        EXPECT_EQ(scan.Include()[0], Value(id + .5));
+        if (ascending || offset % 2 == 0) {
+          ++scan;
+        } else {
+          --scan;
+        }
+      }
+    }
+    EXPECT_FALSE(scan.IsValid());
+    EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    EXPECT_EQ(scan.ValueListsDecoded(), 5);
+    EXPECT_EQ(scan.ValueEntriesDecoded(), 600);
+  }
+}
+TEST_F(IndexScanIteratorTest,
+       SnapshotLeafCacheKeepsBoundsAcrossLeafTransitions) {
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    for (int64_t i = 0; i < 4000; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(writer.txn_,
+                       Row({Value(i), Value(std::to_string(i)), Value(i + .5)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  auto reader = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  for (const bool ascending : {true, false}) {
+    const auto before = db_->CacheHits();
+    IndexScanIterator scan(*table, table->GetIndex(0), reader.txn_, Value(17),
+                           Value(3988), ascending);
+    for (int64_t i = 0; i < 3972; ++i) {
+      ASSERT_TRUE(scan.IsValid());
+      EXPECT_EQ(scan.GetKey()[0], Value(ascending ? 17 + i : 3988 - i));
+      EXPECT_TRUE(scan.Position().IsValid());
+      ++scan;
+    }
+    EXPECT_FALSE(scan.IsValid());
+    EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    EXPECT_LT(db_->CacheHits() - before, 1986U);
+  }
+}
+TEST_F(IndexScanIteratorTest, SnapshotInvalidKeyReportsStickyError) {
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    ASSERT_SUCCESS(
+        table->Insert(writer.txn_, Row({Value(1), Value("one"), Value(1.5)}))
+            .GetStatus());
+    BPlusTree tree(table->GetIndex(0).Root());
+    ASSERT_SUCCESS(tree.Insert(writer.txn_, std::string(1, '\xff'), "invalid"));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  auto reader = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  IndexScanIterator scan(*table, table->GetIndex(0), reader.txn_);
+  ASSERT_TRUE(scan.IsValid());
+  EXPECT_EQ(scan.GetKey()[0], Value(1));
+  ++scan;
+  EXPECT_FALSE(scan.IsValid());
+  EXPECT_NE(scan.GetStatus(), Status::kSuccess);
+  const Status first = scan.GetStatus();
+  ++scan;
+  EXPECT_EQ(scan.GetStatus(), first);
+}
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(IndexScanIteratorTest, ReadOnlyHeapImagesKeepBoundsHolesAndDirections) {
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    for (int i = 0; i < 600; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(
+          RowPosition, position,
+          table->Insert(
+              writer.txn_,
+              Row({Value(i), Value(std::string(128, 'x')), Value(i + .5)})));
+      if (i % 11 == 0) {
+        ASSERT_SUCCESS(table->Delete(writer.txn_, position));
+      }
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  for (bool ascending : {true, false}) {
+    IndexScanIterator scan(*table, table->GetIndex(0), reader.txn_, Value(17),
+                           Value(588), ascending);
+    for (int step = 0; step <= 571; ++step) {
+      const int key = ascending ? 17 + step : 588 - step;
+      if (key % 11 == 0) continue;
+      ASSERT_TRUE(scan.IsValid());
+      EXPECT_EQ((*scan), Row({Value(key), Value(std::string(128, 'x')),
+                              Value(key + .5)}));
+      ++scan;
+    }
+    EXPECT_FALSE(scan.IsValid());
+    EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    EXPECT_GT(scan.HeapPageImagesCopied(), 0);
+    EXPECT_LT(scan.HeapPageImagesCopied(), scan.RowsDecoded() / 10);
+  }
+}
+
+TEST_F(IndexScanIteratorTest, HeapImagesNeverHideOlderSnapshotOrOwnUpdates) {
+  std::vector<RowPosition> positions;
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    for (int i = 0; i < 8; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(
+          RowPosition, position,
+          table->Insert(writer.txn_,
+                        Row({Value(i), Value("old"), Value(i + .5)})));
+      positions.push_back(position);
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto old = db_->BeginReadOnlyContext();
+  {
+    auto writer = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                writer.GetTable(kTableName));
+    ASSERT_SUCCESS(table
+                       ->Update(writer.txn_, positions[4],
+                                Row({Value(4), Value("new"), Value(99.5)}))
+                       .GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              old.GetTable(kTableName));
+  {
+    IndexScanIterator scan(*table, table->GetIndex(0), old.txn_, Value(0),
+                           Value(7));
+    for (int i = 0; i < 8; ++i) {
+      ASSERT_TRUE(scan.IsValid());
+      EXPECT_EQ((*scan)[1], Value("old"));
+      EXPECT_EQ((*scan)[2], Value(i + .5));
+      ++scan;
+    }
+    EXPECT_EQ(scan.HeapPageImagesCopied(), 0);
+  }
+  ASSERT_SUCCESS(old.PreCommit());
+  WaitForChainFreePages();
+  auto writer = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, writable,
+                              writer.GetTable(kTableName));
+  ASSERT_SUCCESS(writable
+                     ->Update(writer.txn_, positions[6],
+                              Row({Value(6), Value("own"), Value(100.5)}))
+                     .GetStatus());
+  IndexScanIterator scan(*writable, writable->GetIndex(0), writer.txn_,
+                         Value(0), Value(7));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_TRUE(scan.IsValid());
+    EXPECT_EQ((*scan)[1], Value(i == 4 ? "new" : i == 6 ? "own" : "old"));
+    ++scan;
+  }
+  EXPECT_EQ(scan.HeapPageImagesCopied(), 0);
+}
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(IndexScanIteratorTest, CompactLeafImagesKeepBinaryIncludesAcrossLeaves) {
+  auto payload = [](int key) {
+    std::string value = std::to_string(key) + std::string(120, 'x');
+    value[15] = '\0';
+    return value;
+  };
+  {
+    auto seed = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                                seed.GetTable(kTableName));
+    for (int i = 0; i < 800; ++i) {
+      ASSERT_SUCCESS(table
+                         ->Insert(seed.txn_, Row({Value(i), Value(payload(i)),
+                                                  Value(i + .5)}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(seed.PreCommit());
+  }
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, table,
+                              reader.GetTable(kTableName));
+  for (const bool ascending : {true, false}) {
+    IndexScanIterator scan(*table, table->GetIndex(2), reader.txn_,
+                           std::vector<Value>{Value(17)},
+                           std::vector<Value>{Value(782)}, ascending);
+    for (int step = 0; step < 766; ++step) {
+      int key = ascending ? 17 + step : 782 - step;
+      ASSERT_TRUE(scan.IsValid());
+      EXPECT_EQ(scan.GetKey(), Row({Value(key), Value(key + .5)}));
+      EXPECT_EQ(scan.Include(), Row({Value(payload(key))}));
+      ++scan;
+    }
+    EXPECT_FALSE(scan.IsValid());
+    EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+  }
+}
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(IndexScanIteratorTest, CompactPositionDecoderRejectsTruncatedPayloads) {
+  const size_t position_bytes = RowPosition::Size();
+  for (const bool nonunique : {false, true}) {
+    for (const size_t cut : {size_t{1}, position_bytes, position_bytes + 7}) {
+      const std::string table_name =
+          "broken_" + std::to_string(nonunique) + "_" + std::to_string(cut);
+      auto writer = db_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, table,
+          db_->CreateTable(
+              writer, Schema(table_name, {Column("id", ValueType::kInt64)})));
+      ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
+                            table.Insert(writer.txn_, Row({Value(7)})));
+      ASSERT_SUCCESS(db_->CreateIndex(
+          writer, table_name,
+          IndexSchema("broken_idx", {0}, {},
+                      nonunique ? IndexMode::kNonUnique : IndexMode::kUnique)));
+      ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, indexed,
+                                  writer.GetTable(table_name));
+      BPlusTree tree(indexed->GetIndex(0).Root());
+      std::string encoded;
+      if (nonunique) {
+        encoded.resize(sizeof(uint64_t));
+        SerializeU64(encoded.data(), 1);
+      }
+      encoded += position.Serialize();
+      const size_t prefix = encoded.size();
+      encoded.resize(prefix + sizeof(uint64_t));
+      SerializeU64(encoded.data() + prefix, 0);
+      encoded.resize((nonunique ? sizeof(uint64_t) : 0) + cut);
+      ASSERT_SUCCESS(tree.Update(
+          writer.txn_, Value(7).EncodeMemcomparableFormat(), encoded));
+      ASSERT_SUCCESS(writer.PreCommit());
+      auto reader = db_->BeginReadOnlyContext();
+      ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, current,
+                                  reader.GetTable(table_name));
+      IndexScanIterator scan(*current, current->GetIndex(0), reader.txn_,
+                             Value(7), Value(7));
+      EXPECT_FALSE(scan.IsValid());
+      EXPECT_EQ(scan.GetStatus(), Status::kCorrupt);
+      ++scan;
+      EXPECT_EQ(scan.GetStatus(), Status::kCorrupt);
+    }
+  }
+}
 }  // namespace tinylamb

@@ -114,13 +114,9 @@ DEFAULT_ALLOWLIST = (
     "index/index_scan_iterator.hpp -> table/*",
     # ゾーンマップ/統計が述語式を直接評価する。
     "table/* -> expression/*",
-    # bytecode と PAX が executor/data_chunk.hpp を要求 (S6/A1 で分離候補)。
+    # bytecode が executor/data_chunk.hpp を要求 (S6/A1 で分離候補)。
     "expression/bytecode.hpp -> executor/data_chunk.hpp",
     "expression/bytecode.cpp -> executor/data_chunk.hpp",
-    "page/pax_block.hpp -> executor/data_chunk.hpp",
-    "page/pax_block.cpp -> executor/data_chunk.hpp",
-    "page/pax_page.hpp -> executor/data_chunk.hpp",
-    "page/pax_page.cpp -> executor/data_chunk.hpp",
 
     # relational(executor/detail) から executor 本体への上向き。A5 で解消予定。
     "executor/detail/* -> executor/*",

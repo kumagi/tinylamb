@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,7 @@
 namespace tinylamb {
 
 class Transaction;
+struct LSTableStore;
 
 // Morsel-driven scan: workers dynamically claim small page groups rather than
 // statically owning a table partition, which balances uneven page occupancy.
@@ -42,13 +44,33 @@ class ParallelScan final : public ExecutorBase {
                bool ordered = false);
   ~ParallelScan() override;
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& out, int indent) const override;
 
   [[nodiscard]] size_t MorselCount() const { return morsels_.size(); }
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
+  [[nodiscard]] size_t OutputColumnCount() const {
+    return projection_ ? projection_->size()
+                       : table_->GetSchema().ColumnCount();
+  }
+  [[nodiscard]] slot_t TableColumnSlot(size_t output_column) const {
+    return projection_ ? (*projection_)[output_column]
+                       : static_cast<slot_t>(output_column);
+  }
+
+  // A scalar fold can consume disjoint morsels in the decode workers, without
+  // boxing rows or handing chunks through the ordered output queue. The
+  // callback owns one state per morsel; batches within a morsel stay ordered.
+  // Unsupported layouts and row predicates decline before consuming input.
+  StatusOr<bool> TryFoldTypedMorsels(
+      const std::function<Status(size_t, const TypedCellBatch&)>& consume,
+      bool capture_positions = false);
+  StatusOr<bool> TryFoldLSTableBlocks(
+      size_t worker_count,
+      const std::function<Status(size_t, const LSTablePageBlock&,
+                                 const uint32_t*, size_t)>& consume);
+  [[nodiscard]] bool WasTypedFolded() const { return typed_folded_; }
 
   // Attach a full row predicate to be decided inside the decode workers
   // (before chunk append), replacing the Selection executor that would
@@ -75,6 +97,10 @@ class ParallelScan final : public ExecutorBase {
   [[nodiscard]] bool IsOrdered() const { return ordered_; }
 
   [[nodiscard]] bool HasRowFilter() const { return row_filter_ != nullptr; }
+  [[nodiscard]] bool HasSignedIntegerColumn(size_t offset) const;
+  [[nodiscard]] const LSTableStore* GetLSTableStore() const {
+    return lstable_store_.get();
+  }
 
  private:
   void Start(size_t batch_size);
@@ -87,6 +113,7 @@ class ParallelScan final : public ExecutorBase {
   Transaction* txn_;
   const Table* table_;
   TableLease table_lease_;
+  std::shared_ptr<const LSTableStore> lstable_store_;
   std::optional<std::vector<slot_t>> projection_;
   std::vector<IntegerPeekCompare> peek_compares_;
   bool ordered_{false};
@@ -128,14 +155,13 @@ class ParallelScan final : public ExecutorBase {
   std::condition_variable space_cv_;
   size_t active_workers_{0};
   bool started_{false};
+  bool typed_folded_{false};
   std::atomic<bool> cancelled_{false};
   std::exception_ptr worker_error_;
   Status worker_status_{Status::kSuccess};
 
   std::optional<DataChunk> pending_;
   size_t pending_offset_{0};
-  DataChunk scalar_batch_;
-  size_t scalar_offset_{0};
 };
 
 }  // namespace tinylamb

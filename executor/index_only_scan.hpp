@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "executor_base.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "type/schema.hpp"
@@ -53,8 +54,12 @@ class IndexOnlyScan : public ExecutorBase {
   IndexOnlyScan& operator=(IndexOnlyScan&&) = delete;
   ~IndexOnlyScan() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
+  // Called before iteration by a scalar COUNT(DISTINCT key) consumer. Other
+  // aggregates still need the multiplicity of every visible index entry.
+  bool TryEnableKeyDeduplication();
 
  private:
   static Schema KeySchema(const Index& idx, const Schema& input_schema);
@@ -64,15 +69,22 @@ class IndexOnlyScan : public ExecutorBase {
   TransactionManager::IndexReadGuard index_read_guard_;
   IndexScanIterator iter_;
   Expression cond_;
+  bool constant_true_{false};
   // Top-level conjuncts of `cond_`; the filter follows commutative WHERE
   // semantics (executor/detail/scan_filter.hpp) so conjunct order is not
   // observable.
   std::vector<Expression> cond_conjuncts_;
+  std::vector<std::optional<BytecodeProgram>> cond_programs_;
+  bool key_only_condition_{false};
+  std::optional<size_t> condition_key_generation_;
+  bool condition_key_passed_{false};
   Schema key_schema_;
   Schema value_schema_;
   Schema output_schema_;
   std::vector<slot_t> include_offsets_;
   bool ascending_{true};
+  bool nonunique_keys_{false};
+  bool distinct_keys_{false};
 };
 
 }  // namespace tinylamb

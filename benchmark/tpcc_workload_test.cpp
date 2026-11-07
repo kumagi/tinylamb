@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,6 +55,77 @@ class TpccWorkloadTest : public ::testing::Test {
   std::string path_;
   std::unique_ptr<Database> database_;
 };
+
+class TestSqlSession final : public TpccSqlSession {
+ public:
+  explicit TestSqlSession(Database& database)
+      : database_(database), engine_(database) {}
+  Status Begin(bool read_only) override {
+    read_modes.push_back(read_only);
+    if (fail_begin) return Status::kIOError;
+    context_.emplace(read_only ? database_.BeginReadOnlyContext()
+                               : database_.BeginContext());
+    return Status::kSuccess;
+  }
+  Status Execute(std::string_view sql, std::vector<Row>* rows) override {
+    ++statements;
+    auto result = engine_.Execute(*context_, sql);
+    if (!result.HasValue()) return result.GetStatus();
+    *rows = result.Value().Collect();
+    return result.Value().GetStatus();
+  }
+  Status Commit() override {
+    ++commits;
+    return context_->PreCommit();
+  }
+  void Abort() override {
+    ++aborts;
+    if (context_) context_->Abort();
+  }
+  std::string_view LastError() const override { return "session failure"; }
+
+  bool fail_begin{false};
+  size_t statements{0}, commits{0}, aborts{0};
+  std::vector<bool> read_modes;
+
+ private:
+  Database& database_;
+  SqlEngine engine_;
+  std::optional<TransactionContext> context_;
+};
+
+TEST_F(TpccWorkloadTest, ExternalSessionRunsTheSameFiveTransactionShapes) {
+  const auto scale = TpccScale::ForTest();
+  std::string error;
+  ASSERT_EQ(TpccWorkload::Initialize(*database_, scale, &error, 42),
+            Status::kSuccess)
+      << error;
+  TestSqlSession session(*database_);
+  TpccWorkload workload(session, scale, 42, 0);
+  for (size_t i = 0; i < kTpccTransactionTypeCount; ++i) {
+    const auto result = workload.Execute(static_cast<TpccTransactionType>(i));
+    ASSERT_TRUE(result.committed || result.user_rollback) << result.error;
+    EXPECT_GT(result.sql_statements, 0U);
+  }
+  EXPECT_EQ(session.read_modes,
+            (std::vector<bool>{false, false, true, false, true}));
+  EXPECT_EQ(session.commits + session.aborts, 5U);
+  EXPECT_GT(session.statements, 20U);
+  EXPECT_EQ(Run("SELECT COUNT(*) FROM customer")[0][0], Value(10));
+  EXPECT_EQ(Run("SELECT COUNT(*) FROM history")[0][0], Value(11));
+}
+
+TEST_F(TpccWorkloadTest, ExternalBeginFailureDoesNotExecuteOrCommit) {
+  TestSqlSession session(*database_);
+  session.fail_begin = true;
+  TpccWorkload workload(session, TpccScale::ForTest(), 42, 0);
+  const auto result = workload.Execute(TpccTransactionType::kPayment);
+  EXPECT_FALSE(result.committed);
+  EXPECT_NE(result.error.find("session failure"), std::string::npos);
+  EXPECT_EQ(session.statements, 0U);
+  EXPECT_EQ(session.commits, 0U);
+  EXPECT_EQ(session.aborts, 1U);
+}
 
 namespace {
 // Deliberately out-of-range TpccTransactionType probe for fallback arms.

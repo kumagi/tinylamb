@@ -50,6 +50,33 @@ EXPLAIN ANALYZE SELECT l_returnflag, COUNT(*) FROM lineitem
   GROUP BY l_returnflag;
 ```
 
+Storage engine
+--------------
+
+Tables use the hybrid row + `LSTable` columnar PAX/zone-map storage engine
+(`table/lstable/`). Full and parallel table scans use per-page min/max zone maps
+and zero-allocation columnar batch decoding when the table's layout generation is
+clean (refreshed by `ANALYZE` or first read-only analytical scan), while OLTP
+point lookups and in-place mutations use the underlying MVCC row pages and
+secondary B+Tree indexes without rebuilding the columnar store on writes.
+
+Explicit `CREATE TABLE` engine clauses naming `lstable` (`lstable`/`lst`/`columnar`/`pax`,
+case-insensitive) are accepted:
+
+```sql
+CREATE TABLE lineitem_lst (l_orderkey INT64, l_returnflag STRING)
+  OPTIONS (engine = 'lstable');
+
+CREATE TABLE orders_lst (o_orderkey INT64, o_Orderstatus STRING)
+  USING lstable;
+
+CREATE TABLE part_lst (p_partkey INT64, p_name STRING)
+  ENGINE = lstable;
+
+CREATE TABLE supplier_lst (s_suppkey INT64, s_name STRING)
+  WITH (engine = 'lstable');
+```
+
 The TPC-H benchmark takes a scale factor, builds the pinned TPC-H DBGEN tool,
 generates all eight official-distribution `.tbl` files, validates their
 cardinalities, loads them with their SQL types, and executes all 22 queries. It
@@ -167,6 +194,66 @@ Think/keying time is omitted, so the number is not an audited TPC-C `tpmC`
 score. Scale factor 1 is a large load (on the order of 100k items and ~300k
 order lines). Unit tests use a reduced `TpccScale::ForTest()` population, not
 SF=1.
+
+Cross-engine OLAP and OLTP comparison
+======================================
+
+[`benchmark/comparison`](benchmark/comparison/README.md) runs portable OLAP,
+OLTP, HTAP, and all 22 TPC-H-derived queries against isolated tinylamb,
+PostgreSQL, and MySQL servers, with optional Oracle Free and DuckDB (official
+Quack) backends. It saves latency, throughput, transaction
+errors, result validation, query plans, and reproduction metadata.
+The [TPC-C three-engine comparison](docs/tpcc_three_comparison_2026-11-06.md)
+uses a shared C++ generator for Tinylamb C8, PostgreSQL and MySQL at W=1,
+10 clients, with three 30-second trials and aborts reported separately.
+The [five-engine comparison](docs/duckdb_comparison_2026-11-05.md) adds DuckDB
+2.0.0 and Oracle Free, with fresh measurements on a common two-core profile.
+See the [latest full three-engine comparison](docs/benchmark_full_comparison_2026-10-29.md)
+for all workloads with and without secondary indexes after the EXISTS and
+OLTP read improvements. Earlier runs are documented in the
+[second full rerun](docs/benchmark_full_rerun_2026-10-29.md),
+[first 2026-10-29 rerun](docs/olap_oltp_comparison_2026-10-29.md), and the
+[2026-10-28 report](docs/olap_oltp_comparison_2026-10-28.md).
+The [PostgreSQL twofold follow-up](docs/postgresql_twofold_results_2026-10-30.md)
+records the subsequent implementation work, a complete OLAP and Tiny/PG OLTP
+rerun, and matched-condition follow-ups. All original 161 targets and all 456
+comparisons are within 2x the contemporaneous PG reference after refinement;
+the report retains the 13 gaps from the short-window full run separately.
+These are engineering benchmarks,
+not audited TPC scores.
+The [EXISTS follow-up](docs/exists_performance_2026-10-29.md) records the
+million-row regression fix and three alternating before/after measurement pairs.
+The [OLTP read follow-up](docs/read_performance_2026-10-29.md) investigates
+non-key/range reads, fixes stranded MVCC garbage collection and index scan
+overhead, and compares all 12 targeted conditions with PostgreSQL.
+The [A–H implementation and follow-up report](docs/postgresql_gap_results_2026-10-29.md)
+records the changes, all 41 targeted comparisons, and the five remaining
+historical PostgreSQL gaps in durable write workloads.
+
+Remote SQL Fuzzing (`ssh oci`)
+==============================
+
+Continuous SQL pattern fuzzing (`sql_oracle`, `sql_session`, `sql_join`,
+`sql_aggregate`, `sql_plancache`, `griffin`, `expr_oracle`) runs on the remote
+server (`ssh oci`) via `scripts/oci_fuzz.sh` and `scripts/remote_fuzz_supervisor.sh`,
+using `tmpfs` (`/tmp/tinylamb-fuzz`) for DB/WAL/corpus/log I/O and collecting
+deduplicated failing queries and reproduction `.test` files.
+
+```bash
+# 稼働状況・各ワーカーの進捗・リモート上の失敗クエリサマリを表示
+./scripts/oci_fuzz.sh status
+
+# リモートで集まった失敗クエリ(.sql / .test / .report.txt / SUMMARY.md)をローカルの .fuzz_findings/ に回収
+./scripts/oci_fuzz.sh collect
+
+# ローカルのコード変更を oci に同期してリビルド＆Fuzzer再起動
+./scripts/oci_fuzz.sh deploy
+
+# ワーカーログの確認 / 停止 / 再起動
+./scripts/oci_fuzz.sh logs
+./scripts/oci_fuzz.sh stop
+./scripts/oci_fuzz.sh restart
+```
 
 License
 ==========

@@ -9,6 +9,7 @@
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
   tinylamb::SessionFuzzTry(data, size,
-                           std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr);
+                           std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr ||
+                               std::getenv("TINYLAMB_FUZZ_VERBOSE") != nullptr);
   return 0;
 }

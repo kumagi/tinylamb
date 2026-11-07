@@ -119,15 +119,18 @@ void MergeJoin::Materialize() {
     return;
   }
   materialized_ = true;
-  Row row;
-  RowPosition position;
-  while (left_->Next(&row, &position)) {
-    left_rows_.push_back(row);
-    left_positions_.push_back(position);
+  DataChunk batch;
+  while (left_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      left_rows_.push_back(batch.RowAt(i));
+      left_positions_.push_back(batch.PositionAt(i));
+    }
   }
   FailWithChildOf(*left_);
-  while (right_->Next(&row, nullptr)) {
-    right_rows_.push_back(row);
+  while (right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_rows_.push_back(batch.RowAt(i));
+    }
   }
   FailWithChildOf(*right_);
 
@@ -313,20 +316,24 @@ void MergeJoin::Materialize() {
   }
 }
 
-bool MergeJoin::Next(Row* dst, RowPosition* rp) {
+size_t MergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
   Materialize();
   if (residual_error_ != Status::kSuccess) {
-    return FailWith(residual_error_);
+    FailWith(residual_error_);
+    return 0;
   }
-  if (output_index_ >= output_.size()) {
-    return false;
+  const bool keep_pos = (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti);
+  while (destination->Size() < max_rows && output_index_ < output_.size()) {
+    const RowPosition rp =
+        keep_pos ? output_positions_[output_index_] : RowPosition();
+    destination->Append(output_[output_index_], rp);
+    ++output_index_;
   }
-  *dst = output_[output_index_];
-  if (rp != nullptr && (kind_ == JoinKind::kSemi || kind_ == JoinKind::kAnti)) {
-    *rp = output_positions_[output_index_];
-  }
-  ++output_index_;
-  return true;
+  return destination->Size();
 }
 
 void MergeJoin::Dump(std::ostream& o, int indent) const {

@@ -262,3 +262,18 @@ a mismatch is treated as the valid end of the log so nothing after a corrupted
 a version outside this range is treated as corrupt(or a torn tail). Re-encoding
 a decoded v1-v5 allocation preserves its original wire version because the
 missing undo payload cannot be synthesized safely.
+
+
+## Fixed-file prototype (metadata version 2)
+
+C14 introduces an opt-in fixed-file series; see
+[ADR 0001](adr/0001-fixed-wal-logical-end.md) for its format and adoption gates.
+Its S-byte LSN data area is followed by two 32-byte CRC32C logical-end slots.
+The physical S+64 bytes never mean S+64 bytes of WAL records. A successful
+fdatasync covers both data and the new logical end before DurableLSN advances.
+Both slots and physical length must validate; the older valid slot is never
+an automatic fallback after damage. A damaged frame requires explicit force,
+which scans the available data area for a CRC-valid prefix before truncating.
+Every byte below a framed logical end is data: zero tails there cannot use
+the legacy never-written-region exemption. Existing version-1 series retain
+their format, and older binaries reject version 2.

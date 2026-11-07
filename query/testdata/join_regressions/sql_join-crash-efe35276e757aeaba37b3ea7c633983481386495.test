@@ -1,0 +1,17 @@
+-- tinylamb-join-test v1
+-- seed: 474940709
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact VALUES (0, NULL, NULL);
+-- setup: INSERT INTO fact VALUES (1, 2, -2);
+-- setup: INSERT INTO fact VALUES (2, 1, 0);
+-- setup: INSERT INTO fact VALUES (3, 2, -1);
+-- setup: INSERT INTO fact VALUES (4, 1, 3);
+-- setup: INSERT INTO dim VALUES (1, 'yy');
+-- setup: INSERT INTO dim VALUES (3, 'x');
+-- setup: INSERT INTO dim VALUES (1, 'x');
+-- setup: INSERT INTO dim VALUES (NULL, 'x');
+-- setup: INSERT INTO dim VALUES (1, 'yy');
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f LEFT JOIN dim d ON f.k = d.k;
+-- expect: |9|,|6|,|2|,|6|,|-2|,|1|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "common/constants.hpp"
+#include "type/collation.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -19,6 +20,8 @@ void ZoneMap::Add(const Value& value) {
     return;
   }
   ++value_count_;
+  has_collated_values_ =
+      has_collated_values_ || CollationOf(value) == Collation::kCaseInsensitive;
   // Arrays carry no useful scalar ordering for pruning (element-wise
   // lexicographic comparison throws across NULL/non-NULL elements), so keep
   // them out of the min/max envelope.
@@ -31,6 +34,12 @@ void ZoneMap::Add(const Value& value) {
   if (value.type == ValueType::kDouble &&
       std::isnan(value.value.double_value)) {
     has_nan_ = true;
+    return;
+  }
+  if (minimum_ && minimum_->type != value.type) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
     return;
   }
   if (!minimum_ || value < *minimum_) {
@@ -108,6 +117,13 @@ void ZoneMap::Merge(const ZoneMap& other) {
   null_count_ += other.null_count_;
   value_count_ += other.value_count_;
   has_nan_ = has_nan_ || other.has_nan_;
+  has_collated_values_ = has_collated_values_ || other.has_collated_values_;
+  if (minimum_ && other.minimum_ && minimum_->type != other.minimum_->type) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
   if (other.minimum_ &&
       (!minimum_ || CompareForOrderBy(*other.minimum_, *minimum_) < 0)) {
     minimum_ = other.minimum_;
@@ -124,6 +140,8 @@ void ZoneMap::Reset() {
   null_count_ = 0;
   value_count_ = 0;
   initialized_ = false;
+  has_nan_ = false;
+  has_collated_values_ = false;
 }
 
 bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
@@ -153,6 +171,13 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   // Cross-type comparisons (e.g. int constant vs double zone) may match after
   // implicit conversion; pruning them would silently drop rows.
   if (minimum_->type != constant.type) {
+    return true;
+  }
+  // A collation can change the order of values inside a byte-order range:
+  // e.g. ["Z", "a"] contains a match for COLLATE("z", "und:ci"). Until
+  // the zone carries an envelope for each collation, retain such batches.
+  if (has_collated_values_ ||
+      CollationOf(constant) == Collation::kCaseInsensitive) {
     return true;
   }
   switch (operation) {

@@ -60,6 +60,9 @@ class TransactionContext {
       std::string_view table_name);
 
   Status PreCommit() { return txn_.PreCommit(); }
+  StatusOr<lsn_t> PrepareCommitForDurableReply() {
+    return txn_.PrepareCommitForDurableReply();
+  }
   void Abort() { txn_.Abort(); }
   // True once the underlying transaction committed or aborted.
   [[nodiscard]] bool IsFinished() const { return txn_.IsFinished(); }

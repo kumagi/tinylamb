@@ -7,11 +7,15 @@ class LimitExecutor : public ExecutorBase {
  public:
   LimitExecutor(Executor source, size_t limit, size_t offset)
       : source_(std::move(source)), limit_(limit), offset_(offset) {}
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
+  bool NextInput(Row* dst, RowPosition* position, size_t requested);
   Executor source_;
+  DataChunk input_batch_;
+  size_t input_offset_{0};
   size_t limit_;
   size_t offset_;
   size_t skipped_{0};

@@ -3073,4 +3073,45 @@ TEST(ExpressionRewriteTest, DoubleBitwiseNegation) {
   EXPECT_NE(str_rewritten->ToString(), "'str'");
 }
 
+TEST(ExpressionRewriteTest, IsNullStrictWhereAndExpressionRejectsNullsWhere) {
+  auto match_x = [](const ColumnName& col) { return col.name == "x"; };
+
+  Expression col_x = ColumnValueExp("x");
+  Expression col_y = ColumnValueExp("y");
+  Expression add_x = BinaryExpressionExp(col_x, BinaryOperation::kAdd,
+                                         ConstantValueExp(Value(int64_t{1})));
+  Expression add_y = BinaryExpressionExp(col_y, BinaryOperation::kAdd,
+                                         ConstantValueExp(Value(int64_t{1})));
+  Expression func_abs = FunctionCallExp("abs", {col_x});
+  Expression func_coalesce =
+      FunctionCallExp("coalesce", {col_x, ConstantValueExp(Value(int64_t{0}))});
+
+  EXPECT_TRUE(IsNullStrictWhere(col_x, match_x));
+  EXPECT_FALSE(IsNullStrictWhere(col_y, match_x));
+  EXPECT_TRUE(IsNullStrictWhere(add_x, match_x));
+  EXPECT_FALSE(IsNullStrictWhere(add_y, match_x));
+  EXPECT_TRUE(IsNullStrictWhere(func_abs, match_x));
+  EXPECT_FALSE(IsNullStrictWhere(func_coalesce, match_x));
+
+  Expression eq_x = BinaryExpressionExp(col_x, BinaryOperation::kEquals,
+                                        ConstantValueExp(Value(int64_t{5})));
+  Expression is_null_x = UnaryExpressionExp(col_x, UnaryOperation::kIsNull);
+  Expression is_not_null_x =
+      UnaryExpressionExp(col_x, UnaryOperation::kIsNotNull);
+  Expression or_both =
+      BinaryExpressionExp(eq_x, BinaryOperation::kOr, is_not_null_x);
+  Expression or_one = BinaryExpressionExp(
+      eq_x, BinaryOperation::kOr,
+      BinaryExpressionExp(col_y, BinaryOperation::kEquals,
+                          ConstantValueExp(Value(int64_t{1}))));
+
+  EXPECT_TRUE(ExpressionRejectsNullsWhere(eq_x, match_x));
+  EXPECT_FALSE(ExpressionRejectsNullsWhere(is_null_x, match_x));
+  EXPECT_TRUE(ExpressionRejectsNullsWhere(is_not_null_x, match_x));
+  EXPECT_TRUE(ExpressionRejectsNullsWhere(or_both, match_x));
+  EXPECT_FALSE(ExpressionRejectsNullsWhere(or_one, match_x));
+  EXPECT_FALSE(ExpressionRejectsNullsWhere(col_x, match_x, false));
+  EXPECT_TRUE(ExpressionRejectsNullsWhere(col_x, match_x, true));
+}
+
 }  // namespace tinylamb

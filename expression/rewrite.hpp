@@ -183,6 +183,22 @@ class ExpressionRewriter {
     const Expression& expression,
     const std::unordered_set<std::string>& relation_names);
 
+// True when evaluating `expression` is guaranteed to return NULL whenever
+// every column matching `match_column` is NULL (used for outer-join -> inner
+// reduction and IS NOT NULL inference).
+[[nodiscard]] bool IsNullStrictWhere(
+    const Expression& expression,
+    const std::function<bool(const ColumnName&)>& match_column,
+    bool in_exp_is_strict = true);
+
+// True when `expression` cannot evaluate to TRUE if every column matching
+// `match_column` is NULL. When `bare_column_rejects_null` is true, a bare
+// `kColumnValue` (as a boolean predicate) also rejects NULL.
+[[nodiscard]] bool ExpressionRejectsNullsWhere(
+    const Expression& expression,
+    const std::function<bool(const ColumnName&)>& match_column,
+    bool bare_column_rejects_null = false);
+
 // A window-function call extracted from a projection, with its assigned
 // hidden output column. Window calls need whole-partition context, so
 // planning hoists each call into a kWindow node emitting this column and

@@ -130,6 +130,15 @@ class TableIncarnation {
     rows_rewritten_in_place_.store(true, std::memory_order_release);
   }
 
+  [[nodiscard]] std::shared_ptr<const void> GetLSTableStoreRaw() const {
+    std::scoped_lock lock(lstable_mutex_);
+    return lstable_store_;
+  }
+  void SetLSTableStoreRaw(std::shared_ptr<const void> store) {
+    std::scoped_lock lock(lstable_mutex_);
+    lstable_store_ = std::move(store);
+  }
+
  private:
   static uint64_t NextLayoutGenerationSeed() noexcept {
     static std::atomic<uint64_t> seed{1};
@@ -137,12 +146,14 @@ class TableIncarnation {
   }
 
   mutable std::mutex mutex_;
+  mutable std::mutex lstable_mutex_;
   std::condition_variable quiescent_;
   State state_{State::kLive};
   size_t active_leases_{0};
   std::unordered_map<txn_id_t, size_t> owner_leases_;
   std::atomic<uint64_t> layout_generation_{NextLayoutGenerationSeed()};
   std::atomic<bool> rows_rewritten_in_place_{false};
+  std::shared_ptr<const void> lstable_store_;
 };
 
 class TableLease {

@@ -1,5 +1,5 @@
 /**
- * Copyright 2025 KUMAZAKI Hiroki
+ * Copyright 2026 KUMAZAKI Hiroki
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef ENV_ENDIAN_HPP
-#define ENV_ENDIAN_HPP
+#ifndef TINYLAMB_ENV_ENDIAN_HPP
+#define TINYLAMB_ENV_ENDIAN_HPP
 
-#ifdef __APPLE__
+#if defined(__APPLE__)
 
 #include <libkern/OSByteOrder.h>
 #define htobe16(x) OSSwapHostToBigInt16(x)
@@ -33,6 +33,60 @@
 #define be64toh(x) OSSwapBigToHostInt64(x)
 #define le64toh(x) OSSwapLittleToHostInt64(x)
 
+#elif defined(__linux__) || defined(__GLIBC__) || defined(__gnu_linux__)
+
+#include <endian.h>
+
+#elif !defined(htobe16)
+
+#include <cstdint>
+
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define TINYLAMB_HOST_IS_BIG_ENDIAN 1
+#else
+#define TINYLAMB_HOST_IS_BIG_ENDIAN 0
 #endif
 
-#endif  // ENV_ENDIAN_HPP
+inline uint16_t tinylamb_bswap16(uint16_t x) {
+  return static_cast<uint16_t>((x << 8) | (x >> 8));
+}
+inline uint32_t tinylamb_bswap32(uint32_t x) {
+  return ((x << 24) & 0xff000000u) | ((x << 8) & 0x00ff0000u) |
+         ((x >> 8) & 0x0000ff00u) | ((x >> 24) & 0x000000ffu);
+}
+inline uint64_t tinylamb_bswap64(uint64_t x) {
+  return ((x << 56) & 0xff00000000000000ULL) |
+         ((x << 40) & 0x00ff000000000000ULL) |
+         ((x << 24) & 0x0000ff0000000000ULL) |
+         ((x << 8) & 0x000000ff00000000ULL) |
+         ((x >> 8) & 0x00000000ff000000ULL) |
+         ((x >> 24) & 0x0000000000ff0000ULL) |
+         ((x >> 40) & 0x000000000000ff00ULL) |
+         ((x >> 56) & 0x00000000000000ffULL);
+}
+
+#if TINYLAMB_HOST_IS_BIG_ENDIAN
+inline uint16_t htobe16(uint16_t x) { return x; }
+inline uint16_t htole16(uint16_t x) { return tinylamb_bswap16(x); }
+inline uint32_t htobe32(uint32_t x) { return x; }
+inline uint32_t htole32(uint32_t x) { return tinylamb_bswap32(x); }
+inline uint64_t htobe64(uint64_t x) { return x; }
+inline uint64_t htole64(uint64_t x) { return tinylamb_bswap64(x); }
+#else
+inline uint16_t htobe16(uint16_t x) { return tinylamb_bswap16(x); }
+inline uint16_t htole16(uint16_t x) { return x; }
+inline uint32_t htobe32(uint32_t x) { return tinylamb_bswap32(x); }
+inline uint32_t htole32(uint32_t x) { return x; }
+inline uint64_t htobe64(uint64_t x) { return tinylamb_bswap64(x); }
+inline uint64_t htole64(uint64_t x) { return x; }
+#endif
+inline uint16_t be16toh(uint16_t x) { return htobe16(x); }
+inline uint16_t le16toh(uint16_t x) { return htole16(x); }
+inline uint32_t be32toh(uint32_t x) { return htobe32(x); }
+inline uint32_t le32toh(uint32_t x) { return htole32(x); }
+inline uint64_t be64toh(uint64_t x) { return htobe64(x); }
+inline uint64_t le64toh(uint64_t x) { return htole64(x); }
+
+#endif
+
+#endif  // TINYLAMB_ENV_ENDIAN_HPP

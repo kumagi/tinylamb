@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -37,6 +38,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
@@ -731,27 +733,10 @@ void StashBuildDomainFilter(
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
-    const Scope& outer, const CteMap& ctes, bool exists_only) {
-  if (context.execution_runtime() == nullptr || statement.Sources().empty() ||
-      std::ranges::any_of(
-          statement.Sources(),
-          [](const SelectSource& source) { return source.query != nullptr; }) ||
-      !statement.UnionAll().empty() ||
-      statement.GetSetOperationTree() != nullptr || statement.Qualify() ||
-      HasWindowFunctions(statement) ||
-      StatementContainsVolatileFunction(statement) ||
-      context.execution_runtime()->unindexable_queries.contains(&statement)) {
+    const Scope& outer, const CteMap& ctes, bool exists_only,
+    std::optional<bool>* exists_answer, std::optional<Value>* scalar_answer) {
+  if (context.execution_runtime() == nullptr) {
     return std::nullopt;
-  }
-  {
-    // CTE sources (inherited or declared by this statement's own WITH clause)
-    // have no base table; the correlated-index fast path cannot load them.
-    const SelectSource& from = statement.Sources()[0];
-    if ((!from.table.empty() &&
-         (ctes.contains(from.table) ||
-          statement.WithQueries().contains(from.table)))) {
-      return std::nullopt;
-    }
   }
 
   CorrelatedIndex* index = nullptr;
@@ -780,6 +765,26 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       DropCacheEntry(*context.execution_runtime(), &statement);
       context.execution_runtime()->correlated_indexes.erase(cached);
       context.execution_runtime()->unindexable_queries.erase(&statement);
+    }
+  }
+  if (index == nullptr) {
+    if (statement.Sources().empty() ||
+        std::ranges::any_of(statement.Sources(),
+                            [](const SelectSource& source) {
+                              return source.query != nullptr;
+                            }) ||
+        !statement.UnionAll().empty() ||
+        statement.GetSetOperationTree() != nullptr || statement.Qualify() ||
+        HasWindowFunctions(statement) ||
+        StatementContainsVolatileFunctionCached(context.execution_runtime(),
+                                                statement) ||
+        context.execution_runtime()->unindexable_queries.contains(&statement)) {
+      return std::nullopt;
+    }
+    const SelectSource& from = statement.Sources()[0];
+    if (!from.table.empty() && (ctes.contains(from.table) ||
+                                statement.WithQueries().contains(from.table))) {
+      return std::nullopt;
     }
   }
   if (index == nullptr &&
@@ -835,6 +840,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     // so a later probe from a different context rebuilds.
     const void* domain_relation = nullptr;
     uint64_t domain_serial = 0;
+    std::vector<Expression> applied_scan_predicates;
     if (statement.Sources().size() == 1) {
       std::vector<slot_t> projection;
       if (peek_schema.ColumnCount() > 0) {
@@ -858,7 +864,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // from THIS statement's own correlation equality and recorded on the
       // cache entry, so an unrelated or later outer context can never
       // narrow another scan.
-      std::optional<std::pair<slot_t, ColumnName>> correlation_equality;
+      std::vector<std::pair<slot_t, ColumnName>> correlation_equalities;
       for (const Expression& predicate :
            SplitConjuncts(statement.WhereClause())) {
         if (predicate->Type() != TypeTag::kBinaryExp) {
@@ -876,40 +882,57 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         const auto left_local = LocalColumnOffset(peek_schema, left);
         const auto right_local = LocalColumnOffset(peek_schema, right);
         if (left_local && !right_local) {
-          correlation_equality.emplace(static_cast<slot_t>(*left_local), right);
-          break;
-        }
-        if (right_local && !left_local) {
-          correlation_equality.emplace(static_cast<slot_t>(*right_local), left);
-          break;
+          correlation_equalities.emplace_back(static_cast<slot_t>(*left_local),
+                                              right);
+        } else if (right_local && !left_local) {
+          correlation_equalities.emplace_back(static_cast<slot_t>(*right_local),
+                                              left);
         }
       }
       ScanRuntimeFilter domain_filter;
       const ScanRuntimeFilter* domain_filter_ptr = nullptr;
-      if (correlation_equality &&
+      if (!correlation_equalities.empty() &&
           context.execution_runtime()->correlated_outer_relation != nullptr) {
-        std::optional<ScanRuntimeFilter> filter =
-            CorrelationDomainFilter(peek_schema, correlation_equality->first,
-                                    correlation_equality->second, projection,
-                                    *context.execution_runtime());
-        if (filter.has_value()) {
-          domain_filter = std::move(*filter);
-          domain_filter_ptr = &domain_filter;
-          domain_relation =
-              context.execution_runtime()->correlated_outer_relation;
-          domain_serial = context.execution_runtime()->correlated_outer_serial;
+        for (const auto& [local_slot, outer_col] : correlation_equalities) {
+          std::optional<ScanRuntimeFilter> filter =
+              CorrelationDomainFilter(peek_schema, local_slot, outer_col,
+                                      projection, *context.execution_runtime());
+          if (!filter.has_value()) {
+            continue;
+          }
+          if (domain_filter_ptr == nullptr) {
+            domain_filter = std::move(*filter);
+            domain_filter_ptr = &domain_filter;
+            domain_relation =
+                context.execution_runtime()->correlated_outer_relation;
+            domain_serial =
+                context.execution_runtime()->correlated_outer_serial;
+          } else {
+            domain_filter.extra.push_back(std::move(*filter));
+          }
           ++context.execution_runtime()->correlated_domain_filter_builds;
         }
       }
       // NOTE: table_key_filters are intentionally NOT applied here. The stash
       // is owned by the statement that derived it; applying it to correlated
       // subqueries silently narrowed unrelated scans.
+      std::vector<Expression> scan_predicates;
+      for (const Expression& predicate :
+           SplitConjuncts(statement.WhereClause())) {
+        if (IsNonThrowingScanComparison(predicate, peek_schema)) {
+          scan_predicates.push_back(predicate);
+        }
+      }
       StatusOr<Relation> loaded =
           LoadSource(context, from, &outer, ctes,
-                     projection.empty() ? nullptr : &projection, nullptr,
+                     projection.empty() ? nullptr : &projection,
+                     scan_predicates.empty() ? nullptr : &scan_predicates,
                      domain_filter_ptr);
       if (!loaded.HasValue()) {
         return std::nullopt;
+      }
+      if (peek_schema.ColumnCount() > 0) {
+        applied_scan_predicates = std::move(scan_predicates);
       }
       source = loaded.MoveValue();
     } else {
@@ -1029,11 +1052,42 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       if (indexed) {
         continue;
       }
+      if (std::ranges::find(applied_scan_predicates, predicate) !=
+          applied_scan_predicates.end()) {
+        continue;
+      }
       local_predicates.push_back(predicate);
     }
 
     const bool integer_key =
         SingleIntegerJoinKey(source.schema, created->local_columns);
+    const bool packed_two_int_key =
+        !integer_key && created->local_columns.size() == 2 &&
+        std::ranges::all_of(created->local_columns, [&](slot_t col_idx) {
+          if (col_idx >= source.schema.ColumnCount()) {
+            return false;
+          }
+          const ValueType t = source.schema.GetColumn(col_idx).Type();
+          return t == ValueType::kInt64 || t == ValueType::kDate;
+        });
+    const auto try_pack_two_int_key = [&](const Row& row,
+                                          int64_t* out_key) -> bool {
+      const int64_t k0 = IntegerJoinKey(row, created->local_columns[0]);
+      const int64_t k1 = IntegerJoinKey(row, created->local_columns[1]);
+      if (k0 < std::numeric_limits<int32_t>::min() ||
+          k0 > std::numeric_limits<int32_t>::max() ||
+          k1 < std::numeric_limits<int32_t>::min() ||
+          k1 > std::numeric_limits<int32_t>::max()) {
+        return false;
+      }
+      const uint64_t u = (static_cast<uint64_t>(
+                              static_cast<uint32_t>(static_cast<int32_t>(k0)))
+                          << 32) |
+                         static_cast<uint64_t>(
+                             static_cast<uint32_t>(static_cast<int32_t>(k1)));
+      *out_key = static_cast<int64_t>(u);
+      return true;
+    };
     const auto integer_key_value = [&](int64_t key) {
       const Column& column =
           source.schema.GetColumn(created->local_columns.front());
@@ -1043,6 +1097,25 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         value = value.WithUnsigned();
       }
       return value;
+    };
+    const auto packed_two_int_key_encoded = [&](int64_t key) {
+      const auto u = static_cast<uint64_t>(key);
+      const int64_t k0 = static_cast<int32_t>(static_cast<uint32_t>(u >> 32));
+      const int64_t k1 =
+          static_cast<int32_t>(static_cast<uint32_t>(u & 0xFFFFFFFFULL));
+      const Column& c0 = source.schema.GetColumn(created->local_columns[0]);
+      const Column& c1 = source.schema.GetColumn(created->local_columns[1]);
+      Value v0 =
+          c0.Type() == ValueType::kDate ? Value::DateFromDays(k0) : Value(k0);
+      if (c0.IsUnsigned()) {
+        v0 = v0.WithUnsigned();
+      }
+      Value v1 =
+          c1.Type() == ValueType::kDate ? Value::DateFromDays(k1) : Value(k1);
+      if (c1.IsUnsigned()) {
+        v1 = v1.WithUnsigned();
+      }
+      return Row({std::move(v0), std::move(v1)}).EncodeMemcomparableFormat();
     };
 
     std::vector<Expression> build_predicates;
@@ -1266,8 +1339,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // (AggregateAccumulator::Merge), which keeps Q21-style whole-table
       // COUNT(DISTINCT l_suppkey) builds parallel.  DISTINCT on SUM/AVG has
       // no exact set-union merge, so it stays serial.
-      bool build_parallel =
-          integer_key && !source.HasSpill() && source.TotalRows() >= 65536;
+      bool build_parallel = (integer_key || packed_two_int_key) &&
+                            !source.HasSpill() && source.TotalRows() >= 16384;
       std::vector<bool> worker_safe(aggregate_expressions.size(), false);
       for (size_t i = 0; build_parallel && i < aggregate_expressions.size();
            ++i) {
@@ -1328,6 +1401,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         int64_t int_key = 0;
         if (integer_key) {
           int_key = IntegerJoinKey(row, created->local_columns[0]);
+          group = int_groups.TryEmplace(int_key).first;
+        } else if (packed_two_int_key && try_pack_two_int_key(row, &int_key)) {
           group = int_groups.TryEmplace(int_key).first;
         } else {
           str_key = EncodeJoinKey(row, created->local_columns);
@@ -1434,7 +1509,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         const auto build_rows = source.TotalRows();
         const auto workers =
             std::min<size_t>({std::thread::hardware_concurrency(), 16UL,
-                              std::max<size_t>(1, build_rows / 32768)});
+                              std::max<size_t>(1, build_rows / 4096)});
         if (workers > 1) {
           std::vector<BuildWorker> build_workers(workers);
           for (BuildWorker& local : build_workers) {
@@ -1496,8 +1571,14 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                         if (matches && !decided) {
                           local.deferred.push_back(row);
                         } else if (matches) {
-                          int64_t key =
-                              IntegerJoinKey(row, created->local_columns[0]);
+                          int64_t key = 0;
+                          if (integer_key) {
+                            key =
+                                IntegerJoinKey(row, created->local_columns[0]);
+                          } else if (!try_pack_two_int_key(row, &key)) {
+                            local.deferred.push_back(row);
+                            continue;
+                          }
                           auto [group, inserted] =
                               local.int_groups.TryEmplace(key);
                           if (inserted) {
@@ -1607,6 +1688,143 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       for (size_t i = 0; i < statement.SelectList().size(); ++i) {
         emit_names[i] = ProjectionName(statement.SelectList()[i], i);
       }
+      const bool can_use_preagg_int_scalars =
+          scalar_answer != nullptr && !exists_only &&
+          statement.SelectList().size() == 1 && !statement.AsStruct() &&
+          !statement.HasLimit() && statement.Offset() == 0 &&
+          created->cache_outer_columns.size() ==
+              created->outer_columns.size() &&
+          (integer_key || (packed_two_int_key && str_groups.empty()));
+      const Expression& select0_expr =
+          !statement.SelectList().empty() ? statement.SelectList()[0].expression
+                                          : Expression{};
+      const bool fast_bare_agg = statement.Having() == nullptr &&
+                                 aggregate_expressions.size() == 1 &&
+                                 select0_expr != nullptr &&
+                                 select0_expr.get() == aggregate_expressions[0];
+      bool fast_const_op_agg = false;
+      bool fast_const_on_left = false;
+      BinaryOperation fast_agg_bin_op = BinaryOperation::kMultiply;
+      double fast_agg_const = 0.0;
+      if (!fast_bare_agg && statement.Having() == nullptr &&
+          aggregate_expressions.size() == 1 && select0_expr != nullptr &&
+          select0_expr->Type() == TypeTag::kBinaryExp) {
+        const BinaryExpression& bin = select0_expr->AsBinaryExpression();
+        if (bin.Op() == BinaryOperation::kMultiply ||
+            bin.Op() == BinaryOperation::kAdd ||
+            bin.Op() == BinaryOperation::kSubtract) {
+          const Expression& lhs = bin.Left();
+          const Expression& rhs = bin.Right();
+          const Value* cval = nullptr;
+          if (lhs && rhs && lhs->Type() == TypeTag::kConstantValue &&
+              rhs.get() == aggregate_expressions[0]) {
+            cval = &lhs->AsConstantValue().GetValue();
+            fast_const_on_left = true;
+          } else if (lhs && rhs && rhs->Type() == TypeTag::kConstantValue &&
+                     lhs.get() == aggregate_expressions[0]) {
+            cval = &rhs->AsConstantValue().GetValue();
+            fast_const_on_left = false;
+          }
+          if (cval != nullptr && !cval->IsNull() && !cval->IsUnsigned() &&
+              (cval->type == ValueType::kDouble ||
+               cval->type == ValueType::kInt64)) {
+            fast_agg_const = cval->type == ValueType::kDouble
+                                 ? cval->value.double_value
+                                 : static_cast<double>(cval->value.int_value);
+            if (std::isfinite(fast_agg_const)) {
+              fast_const_op_agg = true;
+              fast_agg_bin_op = bin.Op();
+            }
+          }
+        }
+      }
+      auto eval_group_scalar = [&](GroupAggs& group, bool* kept,
+                                   Value* out_val) {
+        *kept = false;
+        if (fast_bare_agg && group.accumulators.size() == 1) {
+          StatusOr<Value> finished = group.accumulators[0].TryFinish();
+          if (!finished.HasValue()) {
+            group_error = finished.GetStatus();
+            return;
+          }
+          *out_val = finished.MoveValue();
+          *kept = true;
+          return;
+        }
+        if (fast_const_op_agg && group.accumulators.size() == 1) {
+          StatusOr<Value> finished = group.accumulators[0].TryFinish();
+          if (!finished.HasValue()) {
+            group_error = finished.GetStatus();
+            return;
+          }
+          const Value& fv = finished.Value();
+          if (fv.IsNull()) {
+            *out_val = Value();
+            *kept = true;
+            return;
+          }
+          if (fv.type == ValueType::kDouble &&
+              std::isfinite(fv.value.double_value)) {
+            const double a =
+                fast_const_on_left ? fast_agg_const : fv.value.double_value;
+            const double b =
+                fast_const_on_left ? fv.value.double_value : fast_agg_const;
+            double res = 0.0;
+            if (fast_agg_bin_op == BinaryOperation::kMultiply) {
+              res = a * b;
+            } else if (fast_agg_bin_op == BinaryOperation::kAdd) {
+              res = a + b;
+            } else {
+              res = a - b;
+            }
+            if (std::isfinite(res)) {
+              *out_val = Value(res);
+              *kept = true;
+              return;
+            }
+          }
+        }
+        AggregateResultMap aggregate_results;
+        aggregate_results.reserve(group.accumulators.size());
+        for (const AggregateAccumulator& accumulator : group.accumulators) {
+          StatusOr<Value> finished = accumulator.TryFinish();
+          if (!finished.HasValue()) {
+            group_error = finished.GetStatus();
+            return;
+          }
+          aggregate_results.emplace(accumulator.expression,
+                                    finished.MoveValue());
+        }
+        Row representative;
+        Scope scope{
+            .row = &representative, .schema = &source.schema, .outer = nullptr};
+        if (statement.Having()) {
+          if (group_error != Status::kSuccess) {
+            return;
+          }
+          StatusOr<Value> keep = TryEvaluate(statement.Having(), scope,
+                                             &aggregate_results, context, ctes);
+          if (!keep.HasValue()) {
+            group_error = keep.GetStatus();
+            return;
+          }
+          if (!Truthy(keep.Value())) {
+            return;
+          }
+        }
+        if (group_error != Status::kSuccess) {
+          return;
+        }
+        StatusOr<Value> v =
+            TryEvaluate(statement.SelectList()[0].expression, scope,
+                        &aggregate_results, context, ctes);
+        if (!v.HasValue()) {
+          group_error = v.GetStatus();
+          return;
+        }
+        *out_val = v.MoveValue();
+        *kept = true;
+      };
       auto emit_group = [&](const std::string& key, GroupAggs& group) {
         AggregateResultMap aggregate_results;
         aggregate_results.reserve(group.accumulators.size());
@@ -1669,14 +1887,54 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         created->cached_results.emplace(
             key, std::make_shared<Relation>(std::move(finished)));
       };
-      if (integer_key) {
+      if (can_use_preagg_int_scalars) {
+        GroupAggs empty_group;
+        empty_group.accumulators.reserve(aggregate_expressions.size());
+        for (const AggregateExpression* aggregate : aggregate_expressions) {
+          empty_group.accumulators.emplace_back(aggregate, &source.schema);
+        }
+        bool empty_kept = false;
+        Value empty_val;
+        eval_group_scalar(empty_group, &empty_kept, &empty_val);
+        if (group_error == Status::kSuccess) {
+          created->has_preagg_int_scalars = true;
+          created->preagg_two_int_key = packed_two_int_key;
+          created->preagg_empty_has_row = empty_kept;
+          created->preagg_empty_scalar =
+              empty_kept ? std::move(empty_val) : Value();
+          size_t group_cnt = 0;
+          int_groups.ForEach([&](int64_t, GroupAggs&) { ++group_cnt; });
+          created->preagg_int_scalars.Reserve(group_cnt + 16);
+          int_groups.ForEach([&](int64_t key, GroupAggs& group) {
+            if (group_error != Status::kSuccess) {
+              return;
+            }
+            bool kept = false;
+            Value val;
+            eval_group_scalar(group, &kept, &val);
+            if (group_error == Status::kSuccess && kept) {
+              *created->preagg_int_scalars.TryEmplace(key) = std::move(val);
+            }
+          });
+        }
+      } else if (integer_key) {
         int_groups.ForEach([&](int64_t key, GroupAggs& group) {
           emit_group(integer_key_value(key).EncodeMemcomparableFormat(), group);
         });
+      } else if (packed_two_int_key) {
+        int_groups.ForEach([&](int64_t key, GroupAggs& group) {
+          emit_group(packed_two_int_key_encoded(key), group);
+        });
+        for (auto& [key, group] : str_groups) {
+          emit_group(key, group);
+        }
       } else {
         for (auto& [key, group] : str_groups) {
           emit_group(key, group);
         }
+      }
+      if (group_error != Status::kSuccess) {
+        return std::nullopt;
       }
     } else if (created->exists_residual_fast_path) {
       // Sibling build sharing (TPC-H Q21: an EXISTS/NOT EXISTS pair over the
@@ -1724,6 +1982,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         // residual conjunction (inner-local and outer-referencing alike)
         // evaluates per candidate row at probe time.
         created->exists_residual_predicates = local_predicates;
+        created->exists_residual_predicates.insert(
+            created->exists_residual_predicates.end(),
+            applied_scan_predicates.begin(), applied_scan_predicates.end());
         ++context.execution_runtime()->shared_exists_build_reuses;
       } else {
         const CompiledScanFilter local_filter =
@@ -1750,7 +2011,8 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
                   [](const auto& left, const auto& right) {
                     return left.first < right.first;
                   });
-        if (shareable && build_predicates.empty()) {
+        if (shareable && build_predicates.empty() &&
+            applied_scan_predicates.empty()) {
           // Only builds without build-time predicates may be published: a
           // consumer of this entry probes every loaded row under its own
           // residual conjunction.
@@ -1849,6 +2111,143 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
   if (index->local_columns.size() != index->outer_columns.size()) {
     return std::nullopt;
   }
+  if (index->has_preagg_int_scalars && scalar_answer != nullptr) {
+    const size_t nkeys = index->preagg_two_int_key ? 2U : 1U;
+    bool use_cached_slots = false;
+    if (outer.outer == nullptr && outer.row != nullptr &&
+        outer.schema != nullptr) {
+      if (index->cached_outer_schema != outer.schema) {
+        index->cached_outer_schema = outer.schema;
+        index->cached_outer_slots_valid = true;
+        for (size_t i = 0; i < nkeys; ++i) {
+          const auto off =
+              LocalColumnOffset(*outer.schema, index->outer_columns[i]);
+          if (!off.has_value() || *off >= outer.schema->ColumnCount()) {
+            index->cached_outer_slots_valid = false;
+            break;
+          }
+          const Column& oc = outer.schema->GetColumn(*off);
+          const Column& lc = index->schema.GetColumn(index->local_columns[i]);
+          if (oc.Type() != lc.Type() || oc.IsUnsigned() != lc.IsUnsigned()) {
+            index->cached_outer_slots_valid = false;
+            break;
+          }
+          index->cached_outer_slots[i] = static_cast<slot_t>(*off);
+        }
+      }
+      use_cached_slots = index->cached_outer_slots_valid;
+    }
+    if (!index->preagg_two_int_key) {
+      const Value* v0_ptr = nullptr;
+      StatusOr<Value> ov(Status::kSuccess);
+      if (use_cached_slots &&
+          index->cached_outer_slots[0] < outer.row->Count()) {
+        v0_ptr = &(*outer.row)[index->cached_outer_slots[0]];
+      } else {
+        ov = TryLookup(index->outer_columns[0], outer);
+        if (!ov.HasValue()) {
+          return std::nullopt;
+        }
+        v0_ptr = &ov.Value();
+      }
+      const Value& v0 = *v0_ptr;
+      if (v0.IsNull()) {
+        index->null_parameter_seen = true;
+        *scalar_answer = index->preagg_empty_scalar;
+        return Relation{};
+      }
+      if (!use_cached_slots) {
+        const Column& c0 = index->schema.GetColumn(index->local_columns[0]);
+        const bool ok0 =
+            (c0.Type() == ValueType::kDate && v0.type == ValueType::kDate) ||
+            (c0.Type() == ValueType::kInt64 && v0.type == ValueType::kInt64 &&
+             c0.IsUnsigned() == v0.IsUnsigned());
+        if (!ok0) {
+          return std::nullopt;
+        }
+      }
+      const int64_t k0 = v0.value.int_value;
+      bool first_probe = false;
+      index->preagg_seen_keys.TryEmplace(k0, &first_probe);
+      if (first_probe) {
+        ++index->preagg_distinct_keys;
+      }
+      if (const Value* hit = index->preagg_int_scalars.Find(k0);
+          hit != nullptr) {
+        ++context.execution_runtime()->correlated_result_cache_hits;
+        *scalar_answer = *hit;
+      } else {
+        *scalar_answer = index->preagg_empty_scalar;
+      }
+      return Relation{};
+    }
+    const Value* v0_ptr = nullptr;
+    const Value* v1_ptr = nullptr;
+    StatusOr<Value> ov0(Status::kSuccess);
+    StatusOr<Value> ov1(Status::kSuccess);
+    if (use_cached_slots && index->cached_outer_slots[0] < outer.row->Count() &&
+        index->cached_outer_slots[1] < outer.row->Count()) {
+      v0_ptr = &(*outer.row)[index->cached_outer_slots[0]];
+      v1_ptr = &(*outer.row)[index->cached_outer_slots[1]];
+    } else {
+      ov0 = TryLookup(index->outer_columns[0], outer);
+      ov1 = TryLookup(index->outer_columns[1], outer);
+      if (!ov0.HasValue() || !ov1.HasValue()) {
+        return std::nullopt;
+      }
+      v0_ptr = &ov0.Value();
+      v1_ptr = &ov1.Value();
+    }
+    const Value& v0 = *v0_ptr;
+    const Value& v1 = *v1_ptr;
+    if (!use_cached_slots) {
+      for (size_t i = 0; i < 2; ++i) {
+        const Value& vi = i == 0 ? v0 : v1;
+        if (vi.IsNull()) {
+          continue;
+        }
+        const Column& ci = index->schema.GetColumn(index->local_columns[i]);
+        const bool oki =
+            (ci.Type() == ValueType::kDate && vi.type == ValueType::kDate) ||
+            (ci.Type() == ValueType::kInt64 && vi.type == ValueType::kInt64 &&
+             ci.IsUnsigned() == vi.IsUnsigned());
+        if (!oki) {
+          return std::nullopt;
+        }
+      }
+    }
+    if (v0.IsNull() || v1.IsNull()) {
+      index->null_parameter_seen = true;
+      *scalar_answer = index->preagg_empty_scalar;
+      return Relation{};
+    }
+    const int64_t k0 = v0.value.int_value;
+    const int64_t k1 = v1.value.int_value;
+    if (k0 >= std::numeric_limits<int32_t>::min() &&
+        k0 <= std::numeric_limits<int32_t>::max() &&
+        k1 >= std::numeric_limits<int32_t>::min() &&
+        k1 <= std::numeric_limits<int32_t>::max()) {
+      const uint64_t u = (static_cast<uint64_t>(
+                              static_cast<uint32_t>(static_cast<int32_t>(k0)))
+                          << 32) |
+                         static_cast<uint64_t>(
+                             static_cast<uint32_t>(static_cast<int32_t>(k1)));
+      const auto packed = static_cast<int64_t>(u);
+      bool first_probe = false;
+      index->preagg_seen_keys.TryEmplace(packed, &first_probe);
+      if (first_probe) {
+        ++index->preagg_distinct_keys;
+      }
+      if (const Value* hit = index->preagg_int_scalars.Find(packed);
+          hit != nullptr) {
+        ++context.execution_runtime()->correlated_result_cache_hits;
+        *scalar_answer = *hit;
+      } else {
+        *scalar_answer = index->preagg_empty_scalar;
+      }
+      return Relation{};
+    }
+  }
   for (size_t i = 0; i < index->outer_columns.size(); ++i) {
     StatusOr<Value> indexed_outer_value =
         TryLookup(index->outer_columns[i], outer);
@@ -1870,6 +2269,47 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     if (!same_domain) {
       return std::nullopt;
     }
+  }
+
+  if (index->exists_key_set) {
+    // Key-set probes answer directly from the build; neither the per-key
+    // result cache nor FinishQuery runs.  A NULL correlation key matches
+    // nothing under `=` (empty relation), mirroring the generic NULL guard.
+    StatusOr<Value> outer_value = TryLookup(index->outer_columns[0], outer);
+    if (!outer_value.HasValue()) {
+      return std::nullopt;  // Fall back to the generic (diagnostic) path.
+    }
+    const Value& probe = outer_value.Value();
+    if (probe.IsNull()) {
+      index->null_parameter_seen = true;
+      if (exists_only && exists_answer) {
+        *exists_answer = false;
+        return Relation{};
+      }
+      Relation empty;
+      empty.schema = index->schema;
+      return empty;
+    }
+    if (probe.type != ValueType::kInt64 && probe.type != ValueType::kDate) {
+      // Type-promoted equality is the generic path's decision, not the
+      // bit-equality key set's.
+      return std::nullopt;
+    }
+    index->parameter_int_keys_seen.insert(probe.value.int_value);
+    const bool found = index->exists_keys.contains(probe.value.int_value);
+    if (exists_only && exists_answer) {
+      *exists_answer = found;
+      return Relation{};
+    }
+    if (!found) {
+      Relation empty;
+      empty.schema = index->schema;
+      return empty;
+    }
+    Relation one;
+    one.schema = index->schema;
+    one.AddRow(Row(std::vector<Value>(index->schema.ColumnCount())));
+    return one;
   }
 
   std::vector<Value> cache_values;
@@ -1980,36 +2420,6 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       index->cached_results.emplace(*cache_key, std::move(cached_relation));
     }
     return make_result(matched);
-  }
-
-  if (index->exists_key_set) {
-    // Key-set probes answer directly from the build; neither the per-key
-    // result cache nor FinishQuery runs.  A NULL correlation key matches
-    // nothing under `=` (empty relation), mirroring the generic NULL guard.
-    StatusOr<Value> outer_value = TryLookup(index->outer_columns[0], outer);
-    if (!outer_value.HasValue()) {
-      return std::nullopt;  // Fall back to the generic (diagnostic) path.
-    }
-    const Value& probe = outer_value.Value();
-    if (probe.IsNull()) {
-      Relation empty;
-      empty.schema = index->schema;
-      return empty;
-    }
-    if (probe.type != ValueType::kInt64 && probe.type != ValueType::kDate) {
-      // Type-promoted equality is the generic path's decision, not the
-      // bit-equality key set's.
-      return std::nullopt;
-    }
-    if (!index->exists_keys.contains(probe.value.int_value)) {
-      Relation empty;
-      empty.schema = index->schema;
-      return empty;
-    }
-    Relation one;
-    one.schema = index->schema;
-    one.AddRow(Row(std::vector<Value>(index->schema.ColumnCount())));
-    return one;
   }
 
   if (index->preaggregated) {
@@ -2199,18 +2609,6 @@ bool ExpressionsAreLocal(TransactionContext& context,
   for (const Expression& expression : expressions) {
     if (!ExpressionUsesOnlyScopes(context, expression, sources, ctes)) {
       return false;
-    }
-    for (const ColumnName& column : expression->TouchedColumns()) {
-      bool found = false;
-      for (const Relation& source : sources) {
-        if (LocalColumnOffset(source.schema, column)) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return false;
-      }
     }
   }
   return true;

@@ -42,7 +42,6 @@
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "table/table.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
 #include "type/row.hpp"

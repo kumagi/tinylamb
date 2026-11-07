@@ -2,6 +2,7 @@
 #include "common/runtime_filter.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <utility>
 
@@ -22,14 +23,20 @@ const char* RuntimeFilterKindName(RuntimeFilterKind kind) {
 }
 
 ExactSetRuntimeFilter::ExactSetRuntimeFilter(
-    std::vector<int64_t> sorted_distinct_keys)
+    std::vector<int64_t> sorted_distinct_keys, bool already_sorted_unique,
+    bool skip_hash_table)
     : keys_(std::move(sorted_distinct_keys)) {
-  // Sorts (and dedupes) rather than trusting the caller: a set that is not
-  // sorted turns binary_search into "reject everything", which would silently
-  // drop join matches.
-  std::ranges::sort(keys_);
-  const auto last = std::ranges::unique(keys_);
-  keys_.erase(last.begin(), last.end());
+  if (!already_sorted_unique) {
+    // Sorts (and dedupes) rather than trusting the caller: a set that is not
+    // sorted turns binary_search into "reject everything", which would silently
+    // drop join matches.
+    std::ranges::sort(keys_);
+    const auto last = std::ranges::unique(keys_);
+    keys_.erase(last.begin(), last.end());
+  }
+  if (skip_hash_table || keys_.empty()) {
+    return;
+  }
   // Membership table at <= 50% load keeps Reject() to ~1.1 probes/key.
   size_t slots = 16;
   while (slots < keys_.size() * 2) {
@@ -53,6 +60,9 @@ ExactSetRuntimeFilter::ExactSetRuntimeFilter(
 bool ExactSetRuntimeFilter::Reject(int64_t key) const {
   if (keys_.empty()) {
     return true;
+  }
+  if (table_.empty()) [[unlikely]] {
+    return !std::binary_search(keys_.begin(), keys_.end(), key);
   }
   // splitmix64 finalizer: probe keys arrive in data order, so the low bits
   // of the raw key must not decide the slot.
@@ -107,10 +117,12 @@ size_t BloomRuntimeFilter::BitsForKeys(size_t distinct_keys) {
 }
 
 BloomRuntimeFilter::BloomRuntimeFilter(std::vector<uint64_t> bits,
-                                       size_t bit_count, size_t distinct_keys)
+                                       size_t bit_count, size_t distinct_keys,
+                                       size_t nominal_bit_count)
     : bits_(std::move(bits)),
       bit_count_(bit_count),
       distinct_keys_(distinct_keys),
+      nominal_bit_count_(nominal_bit_count),
       mask_(bit_count - 1) {
   // A power-of-two bit count that the word vector actually covers is an
   // invariant of BitsForKeys. A non-conforming caller must not turn every
@@ -120,6 +132,7 @@ BloomRuntimeFilter::BloomRuntimeFilter(std::vector<uint64_t> bits,
       bits_.size() * 64 < bit_count_) {
     bits_.clear();
     bit_count_ = 0;
+    nominal_bit_count_ = 0;
     mask_ = 0;
     disabled_ = true;
   }
@@ -148,8 +161,112 @@ bool BloomRuntimeFilter::Reject(int64_t key) const {
 }
 
 RuntimeFilterGroup::RuntimeFilterGroup(
-    std::vector<std::unique_ptr<RuntimeFilter>> parts)
-    : parts_(std::move(parts)) {}
+    std::vector<std::unique_ptr<RuntimeFilter>> parts,
+    const std::vector<int64_t>* sorted_distinct_keys)
+    : parts_(std::move(parts)) {
+  for (const auto& part : parts_) {
+    if (!part) continue;
+    switch (part->Kind()) {
+      case RuntimeFilterKind::kRejectAll:
+        reject_all_ = true;
+        break;
+      case RuntimeFilterKind::kMinMax: {
+        const auto& mm = static_cast<const MinMaxRuntimeFilter&>(*part);
+        if (!has_bounds_) {
+          has_bounds_ = true;
+          lo_ = mm.Lo();
+          hi_ = mm.Hi();
+        } else {
+          lo_ = std::max(lo_, mm.Lo());
+          hi_ = std::min(hi_, mm.Hi());
+        }
+        break;
+      }
+      case RuntimeFilterKind::kExactSet: {
+        const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
+        const auto& keys = exact.Keys();
+        if (!exact_keys_ || keys.size() < exact_keys_->size()) {
+          exact_keys_ = &keys;
+        }
+        if (keys.empty()) {
+          reject_all_ = true;
+        } else if (!has_bounds_) {
+          has_bounds_ = true;
+          lo_ = keys.front();
+          hi_ = keys.back();
+        } else {
+          lo_ = std::max(lo_, keys.front());
+          hi_ = std::min(hi_, keys.back());
+        }
+        break;
+      }
+      case RuntimeFilterKind::kBloom:
+        break;
+    }
+  }
+  if (has_bounds_ && lo_ > hi_) {
+    reject_all_ = true;
+    return;
+  }
+  const std::vector<int64_t>* candidate_keys =
+      sorted_distinct_keys != nullptr ? sorted_distinct_keys : exact_keys_;
+  if (!reject_all_ && candidate_keys != nullptr && !candidate_keys->empty()) {
+    if (!has_bounds_) {
+      has_bounds_ = true;
+      lo_ = candidate_keys->front();
+      hi_ = candidate_keys->back();
+    }
+    if (lo_ <= hi_) {
+      const uint64_t span =
+          static_cast<uint64_t>(hi_) - static_cast<uint64_t>(lo_);
+      if (span <= kMaxDenseSpan) {
+        const size_t words = static_cast<size_t>((span >> 6) + 1);
+        dense_bits_.assign(words, 0);
+        const bool single_part =
+            (parts_.size() <= 1) ||
+            (sorted_distinct_keys != nullptr && parts_.size() == 2);
+        for (const int64_t k : *candidate_keys) {
+          if (k < lo_ || k > hi_) continue;
+          if (!single_part) {
+            bool keep = true;
+            for (const auto& part : parts_) {
+              if (part->Reject(k)) {
+                keep = false;
+                break;
+              }
+            }
+            if (!keep) continue;
+          }
+          const uint64_t off =
+              static_cast<uint64_t>(k) - static_cast<uint64_t>(lo_);
+          dense_bits_[off >> 6] |= uint64_t{1} << (off & 63);
+        }
+        has_dense_bits_ = true;
+      }
+    }
+  }
+}
+
+RuntimeFilterGroup::RuntimeFilterGroup(
+    std::vector<std::unique_ptr<RuntimeFilter>> parts,
+    std::vector<uint64_t> prebuilt_dense_bits, int64_t lo, int64_t hi)
+    : parts_(std::move(parts)),
+      dense_bits_(std::move(prebuilt_dense_bits)),
+      lo_(lo),
+      hi_(hi),
+      has_bounds_(true),
+      has_dense_bits_(!dense_bits_.empty()) {
+  for (const auto& part : parts_) {
+    if (!part) continue;
+    if (part->Kind() == RuntimeFilterKind::kExactSet) {
+      const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
+      const auto& keys = exact.Keys();
+      if (!exact_keys_ || keys.size() < exact_keys_->size()) {
+        exact_keys_ = &keys;
+      }
+    }
+  }
+}
 
 bool RuntimeFilterGroup::Has(RuntimeFilterKind kind) const {
   return std::ranges::any_of(
@@ -230,7 +347,7 @@ void RuntimeFilterBuilder::ObserveNull() {
 }
 
 std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::Build(
-    bool allow_reject_all) const {
+    bool allow_reject_all, size_t max_exact_keys) const {
   if (observations_ == 0 || !has_key_) {
     // Either nothing was observed at all, or every observed build key was
     // NULL: no probe row can match an equi-join.
@@ -247,6 +364,50 @@ std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::Build(
         std::make_unique<MinMaxRuntimeFilter>(lo_, hi_, keys_.size()));
     return std::make_shared<const RuntimeFilterGroup>(std::move(parts));
   }
+  if (lo_ <= hi_) {
+    const uint64_t span =
+        static_cast<uint64_t>(hi_) - static_cast<uint64_t>(lo_);
+    if (span <= RuntimeFilterGroup::kMaxDenseSpan && keys_.size() > 64) {
+      const size_t words = static_cast<size_t>((span >> 6) + 1);
+      std::vector<uint64_t> dense_bits(words, 0);
+      size_t distinct_count = 0;
+      const auto base_u = static_cast<uint64_t>(lo_);
+      for (const int64_t key : keys_) {
+        const uint64_t off = static_cast<uint64_t>(key) - base_u;
+        const uint64_t mask = uint64_t{1} << (off & 63);
+        uint64_t& word = dense_bits[off >> 6];
+        if ((word & mask) == 0) {
+          word |= mask;
+          ++distinct_count;
+        }
+      }
+      if (distinct_count <= max_exact_keys) {
+        std::vector<int64_t> distinct;
+        distinct.reserve(distinct_count);
+        for (size_t w = 0; w < words; ++w) {
+          uint64_t bits = dense_bits[w];
+          const uint64_t word_base = base_u + (static_cast<uint64_t>(w) << 6);
+          while (bits != 0) {
+            const auto bit = static_cast<uint64_t>(std::countr_zero(bits));
+            distinct.push_back(static_cast<int64_t>(word_base + bit));
+            bits &= bits - 1;
+          }
+        }
+        parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
+            std::move(distinct), /*already_sorted_unique=*/true,
+            /*skip_hash_table=*/true));
+        return std::make_shared<const RuntimeFilterGroup>(
+            std::move(parts), std::move(dense_bits), lo_, hi_);
+      }
+      parts.push_back(
+          std::make_unique<MinMaxRuntimeFilter>(lo_, hi_, distinct_count));
+      parts.push_back(std::make_unique<BloomRuntimeFilter>(
+          std::vector<uint64_t>(8, ~uint64_t{0}), 512, distinct_count,
+          BloomRuntimeFilter::BitsForKeys(distinct_count)));
+      return std::make_shared<const RuntimeFilterGroup>(
+          std::move(parts), std::move(dense_bits), lo_, hi_);
+    }
+  }
   std::vector<int64_t> distinct = keys_;
   std::ranges::sort(distinct);
   const auto last = std::ranges::unique(distinct);
@@ -255,36 +416,36 @@ std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::Build(
   const int64_t lo = distinct.front();
   const int64_t hi = distinct.back();
 
-  if (distinct.size() <= kMaxExactKeys) {
-    parts.push_back(
-        std::make_unique<ExactSetRuntimeFilter>(std::move(distinct)));
-  } else {
-    parts.push_back(
-        std::make_unique<MinMaxRuntimeFilter>(lo, hi, distinct.size()));
-    const size_t bits = BloomRuntimeFilter::BitsForKeys(distinct.size());
-    std::vector<uint64_t> words(bits / 64, 0);
-    for (const int64_t key : distinct) {
-      for (unsigned probe = 0; probe < BloomRuntimeFilter::kHashProbes;
-           ++probe) {
-        const size_t bit =
-            static_cast<size_t>(BloomRuntimeFilter::Hash(key, probe)) &
-            (bits - 1);
-        words[bit / 64] |= uint64_t{1} << (bit % 64);
-      }
-    }
-    parts.push_back(std::make_unique<BloomRuntimeFilter>(std::move(words), bits,
-                                                         distinct.size()));
+  if (distinct.size() <= max_exact_keys) {
+    parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
+        std::move(distinct), /*already_sorted_unique=*/true));
+    return std::make_shared<const RuntimeFilterGroup>(std::move(parts));
   }
-  return std::make_shared<const RuntimeFilterGroup>(std::move(parts));
+  parts.push_back(
+      std::make_unique<MinMaxRuntimeFilter>(lo, hi, distinct.size()));
+  const size_t bits = BloomRuntimeFilter::BitsForKeys(distinct.size());
+  std::vector<uint64_t> words(bits / 64, 0);
+  for (const int64_t key : distinct) {
+    for (unsigned probe = 0; probe < BloomRuntimeFilter::kHashProbes; ++probe) {
+      const size_t bit =
+          static_cast<size_t>(BloomRuntimeFilter::Hash(key, probe)) &
+          (bits - 1);
+      words[bit / 64] |= uint64_t{1} << (bit % 64);
+    }
+  }
+  parts.push_back(std::make_unique<BloomRuntimeFilter>(std::move(words), bits,
+                                                       distinct.size()));
+  return std::make_shared<const RuntimeFilterGroup>(std::move(parts),
+                                                    &distinct);
 }
 
 std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::FromKeys(
-    const std::vector<int64_t>& keys) {
+    const std::vector<int64_t>& keys, size_t max_exact_keys) {
   RuntimeFilterBuilder builder;
   for (const int64_t key : keys) {
     builder.Observe(key);
   }
-  return builder.Build();
+  return builder.Build(false, max_exact_keys);
 }
 
 }  // namespace tinylamb

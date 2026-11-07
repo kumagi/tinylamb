@@ -28,3 +28,8 @@ Facade over everything below: DDL/catalog, statistics persistence, and the
   database→expression direction stays closed).
 
 Test: `./build/catalog_test`, `database_extra_test`.
+
+`DurableWALLSN()` exposes only Logger's successfully synced frontier (acquire
+load) to the server's own/dependency reply gate. BufferedLSN and CommittedLSN
+are not durability proofs. A cached requested target may lag that actual
+frontier because a successful sync can cover additional bytes.

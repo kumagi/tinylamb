@@ -49,6 +49,8 @@ class ZoneMap {
   // Set when a DOUBLE NaN was added: NaN is excluded from the envelope but
   // must conservatively keep the zone eligible for every predicate.
   bool has_nan_{false};
+  // A byte-order envelope is not a proof under a folding comparison.
+  bool has_collated_values_{false};
 };
 
 }  // namespace tinylamb

@@ -34,16 +34,18 @@ std::string UpdateKeyString(const Value& value) {
 
 }  // namespace
 
-bool Update::Next(Row* dst, RowPosition* rp) {
+bool Update::Execute(Row* dst, RowPosition* rp) {
   if (finished_) {
     return false;
   }
   std::vector<std::pair<Row, RowPosition>> pending;
-  Row new_row;
-  RowPosition position;
-  while (src_->Next(&new_row, &position)) {
-    assert(position.IsValid());
-    pending.emplace_back(std::move(new_row), position);
+  DataChunk batch;
+  while (src_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      const RowPosition position = batch.PositionAt(i);
+      assert(position.IsValid());
+      pending.emplace_back(batch.RowAt(i), position);
+    }
   }
   if (src_->GetStatus() != Status::kSuccess) {
     return FailWith(src_->GetStatus());
@@ -161,12 +163,13 @@ bool Update::Next(Row* dst, RowPosition* rp) {
     auto& [row, row_position] = pending[i];
     StatusOr<RowPosition> p = target_->Update(*txn_, row_position, row);
     if (p.GetStatus() != Status::kSuccess) {
-      // Do not report a partial update as successful.
-      return FailWith(
-          StatusError(StatusCode::kConflicts,
-
-                      "update failed on table " +
-                          std::string(target_->GetSchema().Name())));
+      // Preserve the cause: constraint, storage and missing-row failures are
+      // not all retryable writer conflicts. Do not report a partial update
+      // as successful or discard the lower layer's diagnostic.
+      const Status failure = p.GetStatus();
+      return FailWith(StatusError(
+          failure.GetCode(),
+          "update failed on table " + target_name + ": " + ToString(failure)));
     }
     // Keep self-referencing parent multisets precise across the statement.
     if (!old_rows.empty()) {
@@ -210,6 +213,20 @@ bool Update::Next(Row* dst, RowPosition* rp) {
   }
   finished_ = true;
   return true;
+}
+
+size_t Update::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  RowPosition rp;
+  if (!Execute(&row, &rp)) {
+    return 0;
+  }
+  destination->Append(std::move(row), rp);
+  return 1;
 }
 
 void Update::Dump(std::ostream& o, int indent) const {

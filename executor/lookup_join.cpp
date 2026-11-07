@@ -272,14 +272,16 @@ bool LookupJoin::Load() {
   if (GetStatus() != Status::kSuccess) {
     return false;
   }
+  DataChunk left_batch;
   for (;;) {
-    if (!left_->Next(&hold_left_, nullptr)) {
+    if (left_->NextBatch(&left_batch, 1) == 0) {
       hold_left_.Clear();
       if (left_->GetStatus() != Status::kSuccess) {
         FailWith(left_->GetStatus());
       }
       return false;
     }
+    hold_left_ = left_batch.RowAt(0);
     const Row left_key = hold_left_.Extract(left_cols_);
     // SQL's `NULL = NULL` is UNKNOWN, so a NULL equality key can never match;
     // a NaN key has no stable position in the memcomparable order. Both are
@@ -312,7 +314,7 @@ bool LookupJoin::Load() {
   }
 }
 
-bool LookupJoin::Next(Row* dst, RowPosition* /* rp */) {
+bool LookupJoin::NextRow(Row* dst) {
   if (!hold_left_.IsValid() && !Load()) {
     return false;
   }
@@ -356,6 +358,18 @@ bool LookupJoin::Next(Row* dst, RowPosition* /* rp */) {
       return true;
     }
   }
+}
+
+size_t LookupJoin::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  while (destination->Size() < max_rows && NextRow(&row)) {
+    destination->Append(std::move(row));
+  }
+  return destination->Size();
 }
 
 void LookupJoin::Dump(std::ostream& o, int indent) const {

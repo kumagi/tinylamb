@@ -14,15 +14,16 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
-bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
+bool DeleteExecutor::Execute(Row* dst, RowPosition* rp) {
   if (finished_) {
     return false;
   }
   std::vector<RowPosition> pending;
-  Row row;
-  RowPosition position;
-  while (source_->Next(&row, &position)) {
-    pending.push_back(position);
+  DataChunk batch;
+  while (source_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      pending.push_back(batch.PositionAt(i));
+    }
   }
   if (source_->GetStatus() != Status::kSuccess) {
     return FailWith(source_->GetStatus());
@@ -82,6 +83,20 @@ bool DeleteExecutor::Next(Row* dst, RowPosition* rp) {
   }
   finished_ = true;
   return true;
+}
+
+size_t DeleteExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  RowPosition rp;
+  if (!Execute(&row, &rp)) {
+    return 0;
+  }
+  destination->Append(std::move(row), rp);
+  return 1;
 }
 
 void DeleteExecutor::Dump(std::ostream& output, int indent) const {

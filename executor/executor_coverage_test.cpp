@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +23,10 @@
 
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
-#include "executor/materialize.hpp"
+#include "executor/incremental_sort.hpp"
+#include "executor/limit.hpp"
+#include "executor/projection.hpp"
+#include "executor/selection.hpp"
 #include "executor/topn.hpp"
 #include "executor/values.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -65,6 +69,61 @@ TEST(TopNCoverageTest, LimitZeroFastPathReturnsNothing) {
       {TopNExecutor::Key{.expression = ColumnValueExp("x"), .ascending = true}},
       /*limit=*/0, /*offset=*/0);
   EXPECT_TRUE(ReadAll(&topn).empty());
+}
+
+TEST(TopNCoverageTest, BatchedHeapKeepsStableNullOrderPayloadAndPositions) {
+  class Source final : public ExecutorBase {
+   public:
+    std::vector<Row> rows;
+    size_t offset{0};
+    size_t batches{0};
+    size_t NextBatch(DataChunk* chunk, size_t limit) override {
+      ++batches;
+      chunk->Reset();
+      while (offset < rows.size() && chunk->Size() < limit) {
+        chunk->Append(rows[offset],
+                      RowPosition(7, static_cast<slot_t>(offset)));
+        ++offset;
+      }
+      return chunk->Size();
+    }
+    void Dump(std::ostream&, int) const override {}
+  };
+  auto source = std::make_shared<Source>();
+  for (int i = 0; i < 3000; ++i) {
+    source->rows.push_back(Row({i % 13 == 0 ? Value() : Value(i % 7), Value(i),
+                                Value(std::string(64, 'x'))}));
+  }
+  auto expected = source->rows;
+  std::stable_sort(expected.begin(), expected.end(),
+                   [](const Row& a, const Row& b) {
+                     if (a[0].IsNull() != b[0].IsNull()) {
+                       return !a[0].IsNull();
+                     }
+                     return !a[0].IsNull() && a[0] > b[0];
+                   });
+  Schema schema(
+      "t", {Column("x", ValueType::kInt64), Column("id", ValueType::kInt64),
+            Column("payload", ValueType::kVarChar)});
+  TopNExecutor top(source, schema,
+                   {{.expression = ColumnValueExp("x"),
+                     .ascending = false,
+                     .nulls_first = false}},
+                   25, 17);
+  Row row;
+  RowPosition position;
+  size_t count = 0;
+  while (top.Next(&row, &position)) {
+    ASSERT_LT(count, 25U);
+    EXPECT_EQ(row, expected[count + 17]);
+    EXPECT_EQ(position,
+              RowPosition(7, static_cast<slot_t>(
+                                 expected[count + 17][1].value.int_value)));
+    ++count;
+  }
+  EXPECT_EQ(count, 25U);
+  EXPECT_GE(source->batches, 3U);
+  EXPECT_EQ(top.GetStatus(), Status::kSuccess);
 }
 
 TEST(TopNCoverageTest, WithTiesExtendsBoundaryTies) {
@@ -206,7 +265,11 @@ TEST(TopNCoverageTest, KeyEvaluationFailurePropagates) {
   EXPECT_TRUE(ReadAll(&ties).empty());
   EXPECT_NE(ties.GetStatus(), Status::kSuccess);
 
-  TopNExecutor heap(src, schema,
+  auto src2 = std::make_shared<ValuesExecutor>(std::vector<Row>{
+      Row({Value(int64_t{1})}),
+      Row({Value(int64_t{2})}),
+  });
+  TopNExecutor heap(src2, schema,
                     {TopNExecutor::Key{.expression = ColumnValueExp("nope"),
                                        .ascending = true}},
                     /*limit=*/1, /*offset=*/0);
@@ -232,91 +295,171 @@ TEST(TopNCoverageTest, DumpRendersConfiguration) {
   EXPECT_NE(dumped.find("with ties"), std::string::npos);
 }
 
-// ---------------------------------------------------------------------------
-// MaterializeExecutor
-// ---------------------------------------------------------------------------
+}  // namespace tinylamb
 
-TEST(MaterializeExecutorTest, CachesRowsAndSupportsRewind) {
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1})}),
-      Row({Value(int64_t{2})}),
-      Row({Value(int64_t{3})}),
-  });
-  MaterializeExecutor materialize(src, schema);
-  EXPECT_FALSE(materialize.IsMaterialized());
-  EXPECT_EQ(materialize.MaterializedRowCount(), 0U);
-
-  const auto first_pass = ReadAll(&materialize);
-  ASSERT_EQ(first_pass.size(), 3U);
-  EXPECT_EQ(first_pass[0], Value(int64_t{1}));
-  EXPECT_EQ(first_pass[2], Value(int64_t{3}));
-  EXPECT_TRUE(materialize.IsMaterialized());
-  EXPECT_EQ(materialize.MaterializedRowCount(), 3U);
-  EXPECT_GT(materialize.MaterializedBytes(), 0U);
-
-  // The child stays readable: a rewind replays the cached rows.
-  materialize.Rewind();
-  const auto second_pass = ReadAll(&materialize);
-  EXPECT_EQ(second_pass.size(), first_pass.size());
-}
-
-TEST(MaterializeExecutorTest, MaterializePipelinePreloadsWithoutDraining) {
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{9})}),
-      Row({Value(int64_t{8})}),
-  });
-  MaterializeExecutor materialize(src, schema);
-  materialize.MaterializePipeline();
-  EXPECT_TRUE(materialize.IsMaterialized());
-  EXPECT_EQ(materialize.MaterializedRowCount(), 2U);
-}
-
-TEST(MaterializeExecutorTest, NextBatchStreamsChunks) {
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1})}),
-      Row({Value(int64_t{2})}),
-      Row({Value(int64_t{3})}),
-  });
-  MaterializeExecutor materialize(src, schema);
-
+namespace tinylamb {
+TEST(IncrementalSortCoverageTest, LimitConsumesOnlyFirstPeerGroupAndLookahead) {
+  class Source final : public ExecutorBase {
+   public:
+    size_t consumed{0};
+    size_t NextBatch(DataChunk* chunk, size_t max_rows) override {
+      chunk->Reset();
+      while (consumed < 10000 && chunk->Size() < max_rows) {
+        const auto group = static_cast<int64_t>(99 - consumed / 100);
+        const auto suffix = static_cast<int64_t>(99 - consumed % 100);
+        chunk->Append(Row{Value(group), Value(suffix)},
+                      RowPosition(1, static_cast<slot_t>(consumed)));
+        ++consumed;
+      }
+      return chunk->Size();
+    }
+    void Dump(std::ostream& out, int) const override {
+      out << "CountingSource";
+    }
+  };
+  const Schema schema("t", {Column("group", ValueType::kInt64),
+                            Column("suffix", ValueType::kInt64)});
+  auto source = std::make_shared<Source>();
+  auto sort = std::make_shared<IncrementalSortExecutor>(
+      source, schema,
+      std::vector<SortExecutor::Key>{{ColumnValueExp("group"), false}},
+      std::vector<SortExecutor::Key>{{ColumnValueExp("suffix"), true}});
+  LimitExecutor limit(sort, 100, 0);
   DataChunk chunk;
-  ASSERT_EQ(materialize.NextBatch(&chunk, /*max_rows=*/2), 2U);
-  EXPECT_EQ(chunk.Size(), 2U);
-  EXPECT_EQ(chunk.RowAt(0)[0], Value(int64_t{1}));
-  EXPECT_EQ(materialize.NextBatch(&chunk, /*max_rows=*/2), 1U);
-  EXPECT_EQ(materialize.NextBatch(&chunk, /*max_rows=*/2), 0U);
-  EXPECT_EQ(materialize.NextBatch(&chunk, /*max_rows=*/0), 0U);
-  EXPECT_EQ(materialize.NextBatch(nullptr, /*max_rows=*/4), 0U);
+  ASSERT_EQ(limit.NextBatch(&chunk, 100), 100);
+  for (size_t i = 0; i < 100; ++i) {
+    EXPECT_EQ(chunk.RowAt(i), Row({Value(99), Value(static_cast<int64_t>(i))}));
+    EXPECT_EQ(chunk.PositionAt(i), RowPosition(1, static_cast<slot_t>(99 - i)));
+  }
+  EXPECT_EQ(source->consumed, 101);
+  EXPECT_EQ(limit.NextBatch(&chunk, 100), 0);
+  EXPECT_EQ(source->consumed, 101);
+  EXPECT_EQ(limit.GetStatus(), Status::kSuccess);
+}
+TEST(IncrementalSortCoverageTest, SingletonPeersKeepPositionsAndLookahead) {
+  class Source final : public ExecutorBase {
+   public:
+    size_t consumed{0};
+    size_t NextBatch(DataChunk* chunk, size_t max_rows) override {
+      chunk->Reset();
+      while (consumed < 1000 && chunk->Size() < max_rows) {
+        chunk->Append(Row({Value(static_cast<int64_t>(consumed)), Value()}),
+                      RowPosition(7, static_cast<slot_t>(consumed)));
+        ++consumed;
+      }
+      return chunk->Size();
+    }
+    void Dump(std::ostream& out, int) const override { out << "Singletons"; }
+  };
+  const Schema schema(
+      "t", {Column("g", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  auto source = std::make_shared<Source>();
+  auto sort = std::make_shared<IncrementalSortExecutor>(
+      source, schema,
+      std::vector<SortExecutor::Key>{{ColumnValueExp("g"), true}},
+      std::vector<SortExecutor::Key>{{ColumnValueExp("v"), false}});
+  LimitExecutor limit(sort, 10, 0);
+  Row row;
+  RowPosition position;
+  for (int64_t i = 0; i < 10; ++i) {
+    ASSERT_TRUE(limit.Next(&row, &position));
+    EXPECT_EQ(row, Row({Value(i), Value()}));
+    EXPECT_EQ(position, RowPosition(7, static_cast<slot_t>(i)));
+  }
+  EXPECT_FALSE(limit.Next(&row, &position));
+  EXPECT_EQ(source->consumed, 11U);
+  EXPECT_EQ(limit.GetStatus(), Status::kSuccess);
+  std::ostringstream dump;
+  sort->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("singleton_runs=10"), std::string::npos);
 }
 
-TEST(MaterializeExecutorTest, EmptyChildYieldsNothing) {
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{});
-  MaterializeExecutor materialize(src, schema);
-  EXPECT_TRUE(ReadAll(&materialize).empty());
-  EXPECT_TRUE(materialize.IsMaterialized());
-  EXPECT_EQ(materialize.MaterializedRowCount(), 0U);
-
-  DataChunk chunk;
-  EXPECT_EQ(materialize.NextBatch(&chunk, 8), 0U);
+TEST(IncrementalSortCoverageTest, SingletonDoesNotElideSuffixErrors) {
+  const Schema schema("t", {Column("g", ValueType::kInt64)});
+  auto source =
+      std::make_shared<ValuesExecutor>(std::vector<Row>{Row({Value(1)})});
+  IncrementalSortExecutor sort(source, schema, {{ColumnValueExp("g"), true}},
+                               {{ColumnValueExp("missing"), true}});
+  Row row;
+  EXPECT_FALSE(sort.Next(&row, nullptr));
+  EXPECT_NE(sort.GetStatus(), Status::kSuccess);
 }
 
-TEST(MaterializeExecutorTest, DumpAndExplainRenderRowStats) {
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{1})}),
-  });
-  MaterializeExecutor materialize(src, schema);
-  std::ostringstream dumped;
-  materialize.Dump(dumped, 0);
-  EXPECT_NE(dumped.str().find("MaterializeExecutor(rows="), std::string::npos);
+TEST(IncrementalSortCoverageTest, SpilledNullPeerAndExplicitMaterialization) {
+  struct RestoreBudget {
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  QueryMemoryBudget::Global().ResetForTest(16384);
+  const Schema schema(
+      "t", {Column("g", ValueType::kInt64), Column("v", ValueType::kInt64)});
+  std::vector<Row> input;
+  for (int64_t i = 2000; i >= 0; --i) input.push_back(Row({Value(), Value(i)}));
+  input.push_back(Row({Value(1), Value(4)}));
+  auto source = std::make_shared<ValuesExecutor>(std::move(input));
+  IncrementalSortExecutor sort(
+      source, schema,
+      {SortExecutor::Key{.expression = ColumnValueExp("g"), .ascending = true}},
+      {SortExecutor::Key{.expression = ColumnValueExp("v"),
+                         .ascending = true}});
+  Row row;
+  ASSERT_TRUE(sort.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(), Value(0)}));
+  sort.MaterializePipeline();
+  EXPECT_TRUE(sort.IsMaterialized());
+  EXPECT_EQ(sort.MaterializedRowCount(), 2001U);
+  for (int64_t i = 1; i <= 2000; ++i) {
+    ASSERT_TRUE(sort.Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(), Value(i)}));
+  }
+  ASSERT_TRUE(sort.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1), Value(4)}));
+  EXPECT_FALSE(sort.Next(&row, nullptr));
+  EXPECT_EQ(sort.GetStatus(), Status::kSuccess);
+}
 
-  std::ostringstream explained;
-  materialize.Explain(explained, 0);
-  EXPECT_NE(explained.str().find("materialized=false"), std::string::npos);
+TEST(LimitCoverageTest, BoundedDemandCrossesProjectionAndFilterWithOffset) {
+  class CountingSource final : public ExecutorBase {
+   public:
+    size_t consumed{0};
+    size_t NextBatch(DataChunk* chunk, size_t max_rows) override {
+      chunk->Reset();
+      while (consumed < 10000 && chunk->Size() < max_rows) {
+        chunk->Append(Row({Value(static_cast<int64_t>(consumed)),
+                           Value(static_cast<int64_t>(consumed % 100))}),
+                      RowPosition(1, static_cast<slot_t>(consumed)));
+        ++consumed;
+      }
+      return chunk->Size();
+    }
+    void Dump(std::ostream& out, int) const override {
+      out << "CountingSource";
+    }
+  };
+  auto source = std::make_shared<CountingSource>();
+  const Schema schema("t", {Column("id", ValueType::kInt64),
+                            Column("bucket", ValueType::kInt64)});
+  auto filtered = std::make_shared<Selection>(
+      BinaryExpressionExp(ColumnValueExp("bucket"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(7))),
+      schema, source);
+  auto projected = std::make_shared<Projection>(
+      std::vector<NamedExpression>{NamedExpression("id")}, schema, filtered);
+  LimitExecutor limit(projected, 3, 2);
+  Row row;
+  RowPosition position;
+  ASSERT_TRUE(limit.Next(&row, &position));
+  EXPECT_EQ(row, Row({Value(207)}));
+  EXPECT_EQ(position, RowPosition(1, 207));
+  DataChunk batch;
+  ASSERT_EQ(limit.NextBatch(&batch, 1), 1U);
+  EXPECT_EQ(batch.RowAt(0), Row({Value(307)}));
+  ASSERT_TRUE(limit.Next(&row, &position));
+  EXPECT_EQ(row, Row({Value(407)}));
+  EXPECT_EQ(position, RowPosition(1, 407));
+  EXPECT_FALSE(limit.Next(&row, &position));
+  EXPECT_EQ(source->consumed, 408U);
+  EXPECT_EQ(limit.GetStatus(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

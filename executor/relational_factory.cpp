@@ -42,14 +42,10 @@
 #include "executor/late_materialization_join.hpp"
 #include "executor/limit.hpp"
 #include "executor/lookup_join.hpp"
-#include "executor/lsm_scan.hpp"
-#include "executor/materialize.hpp"
-#include "executor/max1_row.hpp"
 #include "executor/merge_append.hpp"
 #include "executor/merge_join.hpp"
 #include "executor/minmax_index.hpp"
 #include "executor/multi_index_covering_scan.hpp"
-#include "executor/nested_loop_join.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
 #include "executor/parallel_index_scan.hpp"
@@ -74,6 +70,7 @@
 #include "expression/parameter_slot.hpp"
 #include "expression/rewrite.hpp"
 #include "index/index.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "page/row_position.hpp"
 #include "plan/aggregation_plan.hpp"
 #include "plan/apply_plan.hpp"
@@ -89,9 +86,6 @@
 #include "plan/index_skip_scan_plan.hpp"
 #include "plan/late_materialization_join_plan.hpp"
 #include "plan/limit_plan.hpp"
-#include "plan/lsm_scan_plan.hpp"
-#include "plan/materialize_plan.hpp"
-#include "plan/max1_row_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/minmax_index_plan.hpp"
 #include "plan/multi_index_covering_scan_plan.hpp"
@@ -113,6 +107,7 @@
 #include "plan/values_plan.hpp"
 #include "plan/window_plan.hpp"
 #include "plan/zigzag_join_plan.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -177,13 +172,6 @@ class RelationRenameExecutor final : public ExecutorBase {
         relation_(std::move(relation)),
         physical_(std::move(physical)) {}
 
-  bool Next(Row* dst, RowPosition* rp) override {
-    if (!src_->Next(dst, rp)) {
-      FailWithChildOf(*src_);
-      return false;
-    }
-    return true;
-  }
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     const size_t count = src_->NextBatch(destination, max_rows);
     if (count == 0) {
@@ -246,6 +234,10 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
   Executor src = src_->EmitExecutor(ctx);
+  if (const auto* index_scan = dynamic_cast<IndexScan*>(src.get());
+      index_scan && index_scan->EnforcesIntegerPredicate(exp_)) {
+    return src;
+  }
   // A Selection directly above a morsel-parallel scan is the Cascades core's
   // big-table filter shape.  When the predicate lowers to context-free
   // bytecode, push it into the scan so the decode workers decide rows before
@@ -273,8 +265,13 @@ Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
 }
 
 Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
+  Executor src = src_->EmitExecutor(ctx);
+  if (auto* index_scan = dynamic_cast<IndexScan*>(src.get());
+      index_scan && index_scan->TrySetProjection(columns_, GetSchema())) {
+    return src;
+  }
   return std::make_shared<Projection>(columns_, src_->GetSchema(),
-                                      src_->EmitExecutor(ctx));
+                                      std::move(src));
 }
 
 Executor LimitPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -405,21 +402,346 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
             return IsStatisticalAggregate(agg.GetType());
         }
       });
-  if (parallel_safe &&
-      plan.Child()->EmitRowCount() >= kParallelAggregationMinRows) {
+  Plan input = plan.Child();
+  bool lstable_distinct_fold = false;
+  {
+    const auto* outer_proj = dynamic_cast<const ProjectionPlan*>(input.get());
+    const Plan& after_proj =
+        outer_proj != nullptr ? outer_proj->GetSource() : input;
+    const auto* outer_sel =
+        dynamic_cast<const SelectionPlan*>(after_proj.get());
+    const Plan& leaf = outer_sel != nullptr ? outer_sel->Src() : after_proj;
+    const auto* idx_only = dynamic_cast<const IndexOnlyScanPlan*>(leaf.get());
+    const bool is_equality_seek = idx_only != nullptr &&
+                                  !idx_only->BeginKey().empty() &&
+                                  idx_only->BeginKey() == idx_only->EndKey();
+    if (idx_only != nullptr && !is_equality_seek &&
+        idx_only->ScanSource() != nullptr &&
+        idx_only->EmitRowCount() >= kParallelScanMinRows &&
+        (ctx.txn_.IsReadOnly() || ctx.txn_.WriteSetEmpty()) &&
+        !ctx.txn_.HasAnyPageVersionChains()) {
+      const auto lstable = idx_only->ScanSource()->GetLSTableStore();
+      if (lstable != nullptr && !lstable->blocks.empty() &&
+          lstable->uncommitted_owner_txn == 0) {
+        const Table& tbl = *idx_only->ScanSource();
+        const Schema& tbl_schema = tbl.GetSchema();
+        bool is_distinct_fold = false;
+        const bool eligible_aggs =
+            parallel_safe &&
+            std::ranges::all_of(aggregates, [&](const NamedExpression& named) {
+              const auto& agg = named.expression->AsAggregateExpression();
+              if (agg.HasWhereFilter()) return false;
+              if (!agg.Distinct()) {
+                if (IsCountStar(agg)) return true;
+                if (!agg.Child() ||
+                    agg.Child()->Type() != TypeTag::kColumnValue) {
+                  return false;
+                }
+                const int off = tbl_schema.Offset(
+                    agg.Child()->AsColumnValue().GetColumnName());
+                return off >= 0 &&
+                       tbl_schema.GetColumn(static_cast<size_t>(off)).Type() ==
+                           ValueType::kInt64 &&
+                       !tbl_schema.GetColumn(static_cast<size_t>(off))
+                            .IsUnsigned() &&
+                       (agg.GetType() == AggregationType::kCount ||
+                        agg.GetType() == AggregationType::kSum ||
+                        agg.GetType() == AggregationType::kMin ||
+                        agg.GetType() == AggregationType::kMax);
+              }
+              if (aggregates.size() != 1 ||
+                  agg.GetType() != AggregationType::kCount || !agg.Child() ||
+                  agg.Child()->Type() != TypeTag::kColumnValue) {
+                return false;
+              }
+              const int off = tbl_schema.Offset(
+                  agg.Child()->AsColumnValue().GetColumnName());
+              if (off < 0) return false;
+              const auto& col_def =
+                  tbl_schema.GetColumn(static_cast<size_t>(off));
+              if ((col_def.Type() != ValueType::kInt64 &&
+                   col_def.Type() != ValueType::kDate) ||
+                  col_def.IsUnsigned()) {
+                return false;
+              }
+              int64_t g_min = std::numeric_limits<int64_t>::max();
+              int64_t g_max = std::numeric_limits<int64_t>::min();
+              for (const LSTablePageBlock& blk : lstable->blocks) {
+                if (blk.row_count == 0) continue;
+                if (static_cast<size_t>(off) >= blk.columns.size()) {
+                  return false;
+                }
+                const LSTableColumnBlock& c =
+                    blk.columns[static_cast<size_t>(off)];
+                if (!c.has_min_max) {
+                  return false;
+                }
+                g_min = std::min(g_min, c.min_int);
+                g_max = std::max(g_max, c.max_int);
+              }
+              if (g_max >= g_min) {
+                const __int128_t span128 = static_cast<__int128_t>(g_max) -
+                                           static_cast<__int128_t>(g_min) + 1;
+                if (span128 <= 0 || span128 > 1048576) {
+                  return false;
+                }
+              }
+              is_distinct_fold = true;
+              return true;
+            });
+        if (eligible_aggs) {
+          Plan rebuilt =
+              std::make_shared<FullScanPlan>(tbl, idx_only->GetStats());
+          Expression pred = outer_sel != nullptr ? outer_sel->Predicate()
+                                                 : idx_only->ScanPredicate();
+          const bool is_const_true =
+              pred && pred->Type() == TypeTag::kConstantValue &&
+              pred->AsConstantValue().GetValue().Truthy();
+          if (pred && !is_const_true) {
+            rebuilt = std::make_shared<SelectionPlan>(std::move(rebuilt), pred,
+                                                      idx_only->GetStats());
+          }
+          if (outer_proj != nullptr) {
+            rebuilt = std::make_shared<ProjectionPlan>(std::move(rebuilt),
+                                                       outer_proj->Columns());
+          }
+          input = std::move(rebuilt);
+          lstable_distinct_fold = is_distinct_fold;
+        }
+      }
+    }
+  }
+  const auto* projection = dynamic_cast<const ProjectionPlan*>(input.get());
+  if (projection != nullptr) {
+    const auto* source =
+        dynamic_cast<const FullScanPlan*>(projection->GetSource().get());
+    if (source != nullptr && source->CanNarrow() &&
+        source->GetStats().Columns() >= source->GetSchema().ColumnCount() &&
+        std::ranges::all_of(
+            projection->Columns(), [](const NamedExpression& item) {
+              return item.expression->Type() == TypeTag::kColumnValue;
+            })) {
+      std::vector<slot_t> slots;
+      for (const auto& item : projection->Columns()) {
+        const int offset = source->GetSchema().Offset(
+            item.expression->AsColumnValue().GetColumnName());
+        if (offset < 0) {
+          slots.clear();
+          break;
+        }
+        slots.push_back(static_cast<slot_t>(offset));
+      }
+      std::ranges::sort(slots);
+      slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+      if (!slots.empty() && slots.size() < source->GetSchema().ColumnCount()) {
+        input = std::make_shared<ProjectionPlan>(
+            std::make_shared<FullScanPlan>(*source, std::move(slots)),
+            projection->Columns());
+      }
+    }
+  }
+  const auto* scan = dynamic_cast<const FullScanPlan*>(input.get());
+  const bool simple_columns =
+      parallel_safe &&
+      std::ranges::all_of(aggregates, [](const NamedExpression& named) {
+        const auto& aggregate = named.expression->AsAggregateExpression();
+        return !aggregate.HasWhereFilter() &&
+               (IsCountStar(aggregate) ||
+                (aggregate.Child() &&
+                 aggregate.Child()->Type() == TypeTag::kColumnValue));
+      });
+  if (scan != nullptr && scan->CanNarrow() && simple_columns &&
+      scan->GetStats().Columns() >= scan->GetSchema().ColumnCount()) {
+    std::vector<slot_t> slots;
+    bool resolved = true;
+    for (const auto& named : aggregates) {
+      const auto& aggregate = named.expression->AsAggregateExpression();
+      if (!IsCountStar(aggregate)) {
+        const int offset = input->GetSchema().Offset(
+            aggregate.Child()->AsColumnValue().GetColumnName());
+        if (offset < 0) {
+          resolved = false;
+          break;
+        }
+        slots.push_back(static_cast<slot_t>(offset));
+      }
+    }
+    std::ranges::sort(slots);
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+    // COUNT(*) still scans MVCC-visible rows. One cheap column supplies the
+    // batch cardinality without decoding every unused payload column.
+    if (slots.empty() && input->GetSchema().ColumnCount() != 0) {
+      slot_t cheapest = 0;
+      for (size_t i = 0; i < input->GetSchema().ColumnCount(); ++i) {
+        if (input->GetSchema().GetColumn(i).Type() == ValueType::kInt64) {
+          cheapest = static_cast<slot_t>(i);
+          break;
+        }
+      }
+      slots.push_back(cheapest);
+    }
+    if (resolved && !slots.empty() &&
+        slots.size() < input->GetSchema().ColumnCount()) {
+      input = std::make_shared<FullScanPlan>(*scan, std::move(slots));
+    }
+  }
+  const bool counts_only =
+      parallel_safe &&
+      std::ranges::all_of(aggregates, [](const NamedExpression& named) {
+        const auto& aggregate = named.expression->AsAggregateExpression();
+        return IsCountStar(aggregate) && !aggregate.Distinct() &&
+               !aggregate.HasWhereFilter() && !aggregate.NeedsGroupContext();
+      });
+  if (counts_only) {
+    const auto* projected = dynamic_cast<const ProjectionPlan*>(input.get());
+    const auto* base =
+        projected == nullptr
+            ? nullptr
+            : dynamic_cast<const FullScanPlan*>(projected->GetSource().get());
+    if (base != nullptr && base->CanNarrow() &&
+        input->EmitRowCount() >= kParallelScanMinRows &&
+        base->GetSchema().ColumnCount() != 0 && !projected->Columns().empty() &&
+        std::ranges::all_of(projected->Columns(), [&](const auto& column) {
+          return column.expression &&
+                 column.expression->Type() == TypeTag::kColumnValue &&
+                 base->GetSchema().Offset(
+                     column.expression->AsColumnValue().GetColumnName()) >= 0;
+        })) {
+      // COUNT(*) needs visibility and multiplicity, not a zero-width Row
+      // projection. Retain the scan's limits/locking and read one cheap cell.
+      slot_t cheapest = 0;
+      for (size_t i = 0; i < base->GetSchema().ColumnCount(); ++i) {
+        if (base->GetSchema().GetColumn(i).Type() == ValueType::kInt64) {
+          cheapest = static_cast<slot_t>(i);
+          break;
+        }
+      }
+      input =
+          std::make_shared<FullScanPlan>(*base, std::vector<slot_t>{cheapest});
+    }
+  }
+  // Integer column folds are cheaper than handing every batch around a
+  // round-robin condition variable. The scan itself still decodes in parallel;
+  // the serial typed accumulator consumes its batches without 16-way wakeups.
+  const auto* input_projection =
+      dynamic_cast<const ProjectionPlan*>(input.get());
+  const Plan& unprojected_input =
+      input_projection != nullptr ? input_projection->GetSource() : input;
+  const auto* input_selection =
+      dynamic_cast<const SelectionPlan*>(unprojected_input.get());
+  const Plan& leaf_input =
+      input_selection != nullptr ? input_selection->Src() : unprojected_input;
+  const bool scan_input =
+      dynamic_cast<const FullScanPlan*>(leaf_input.get()) != nullptr ||
+      dynamic_cast<const IndexOnlyScanPlan*>(leaf_input.get()) != nullptr;
+  const bool integer_columns =
+      lstable_distinct_fold ||
+      (scan_input && simple_columns &&
+       std::ranges::all_of(aggregates, [&](const NamedExpression& named) {
+         const auto& aggregate = named.expression->AsAggregateExpression();
+         if (aggregate.Distinct()) {
+           return false;
+         }
+         if (IsCountStar(aggregate)) {
+           return true;
+         }
+         const int offset = input->GetSchema().Offset(
+             aggregate.Child()->AsColumnValue().GetColumnName());
+         return offset >= 0 &&
+                input->GetSchema()
+                        .GetColumn(static_cast<size_t>(offset))
+                        .Type() == ValueType::kInt64 &&
+                !input->GetSchema()
+                     .GetColumn(static_cast<size_t>(offset))
+                     .IsUnsigned() &&
+                (aggregate.GetType() == AggregationType::kCount ||
+                 aggregate.GetType() == AggregationType::kSum ||
+                 aggregate.GetType() == AggregationType::kMin ||
+                 aggregate.GetType() == AggregationType::kMax);
+       }));
+  Executor source;
+  const auto* projected = dynamic_cast<const ProjectionPlan*>(input.get());
+  bool positional_identity =
+      projected != nullptr &&
+      projected->Columns().size() ==
+          projected->GetSource()->GetSchema().ColumnCount();
+  if (positional_identity) {
+    for (size_t i = 0; i < projected->Columns().size(); ++i) {
+      const Expression& expression = projected->Columns()[i].expression;
+      if (expression->Type() != TypeTag::kColumnValue ||
+          projected->GetSource()->GetSchema().Offset(
+              expression->AsColumnValue().GetColumnName()) !=
+              static_cast<int>(i)) {
+        positional_identity = false;
+        break;
+      }
+    }
+  }
+  bool pure_column_subset =
+      !positional_identity && projected != nullptr &&
+      !projected->Columns().empty() &&
+      std::ranges::all_of(
+          projected->Columns(), [&](const NamedExpression& col) {
+            if (!col.expression ||
+                col.expression->Type() != TypeTag::kColumnValue) {
+              return false;
+            }
+            const ColumnName& cn =
+                col.expression->AsColumnValue().GetColumnName();
+            return (col.name.empty() || col.name == cn.name) &&
+                   projected->GetSource()->GetSchema().Offset(cn) >= 0;
+          });
+  // Keep the logical input schema (including aliases) below for positional
+  // identity, or use the source schema when eliding a pure column-subset
+  // projection above the scan/filter.
+  source = (positional_identity || pure_column_subset)
+               ? projected->GetSource()->EmitExecutor(ctx)
+               : input->EmitExecutor(ctx);
+  const Schema& source_schema = pure_column_subset
+                                    ? projected->GetSource()->GetSchema()
+                                    : input->GetSchema();
+  // The covering index owns the duplicate positions under each encoded key.
+  // A sole COUNT(DISTINCT key) only needs one snapshot-visible representative,
+  // so do not expand the list into rows and then hash every duplicate. The
+  // ordinary accumulator still handles NULL, equality and collation. A stale
+  // snapshot's EmitExecutor fallback is not an IndexOnlyScan and stays intact.
+  bool deduplicated_covering_keys = false;
+  if (simple_columns && aggregates.size() == 1 &&
+      source_schema.ColumnCount() == 1) {
+    const auto& aggregate = aggregates[0].expression->AsAggregateExpression();
+    if (aggregate.GetType() == AggregationType::kCount &&
+        aggregate.Distinct() && aggregate.Child() &&
+        aggregate.Child()->Type() == TypeTag::kColumnValue &&
+        source_schema.Offset(
+            aggregate.Child()->AsColumnValue().GetColumnName()) == 0) {
+      auto covering = std::dynamic_pointer_cast<IndexOnlyScan>(source);
+      if (covering) {
+        deduplicated_covering_keys = covering->TryEnableKeyDeduplication();
+      }
+    }
+  }
+  const auto* parallel_scan = dynamic_cast<const ParallelScan*>(source.get());
+  const size_t effective_rows =
+      parallel_scan != nullptr
+          ? std::max(input->EmitRowCount(),
+                     parallel_scan->MorselCount() * kParallelAggregationMinRows)
+          : input->EmitRowCount();
+  if (parallel_safe && !counts_only && !integer_columns &&
+      !deduplicated_covering_keys &&
+      effective_rows >= kParallelAggregationMinRows) {
     // Cap workers like the parallel table scan path; unbounded
     // hardware_concurrency() oversubscribes under nested or concurrent
     // aggregations.
     constexpr size_t kMaxParallelAggregationWorkers = 16;
-    const size_t workers =
-        std::min(kMaxParallelAggregationWorkers,
-                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    const size_t workers = std::max<size_t>(
+        1, std::min({kMaxParallelAggregationWorkers,
+                     static_cast<size_t>(std::thread::hardware_concurrency()),
+                     effective_rows / kParallelAggregationMinRows}));
     return std::make_shared<ParallelAggregationExecutor>(
-        plan.Child()->EmitExecutor(ctx), plan.Child()->GetSchema(), aggregates,
-        workers);
+        std::move(source), source_schema, aggregates, workers);
   }
-  return std::make_shared<AggregationExecutor>(
-      plan.Child()->EmitExecutor(ctx), plan.Child()->GetSchema(), aggregates);
+  return std::make_shared<AggregationExecutor>(std::move(source), source_schema,
+                                               aggregates);
 }
 }  // namespace
 
@@ -463,7 +785,37 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
                                      .nulls_first = key.nulls_first,
                                      .collation = key.collation});
   }
-  return std::make_shared<TopNExecutor>(Child()->EmitExecutor(ctx),
+  Plan input = Child();
+  if (const auto* projection =
+          dynamic_cast<const ProjectionPlan*>(input.get())) {
+    const auto* scan =
+        dynamic_cast<const FullScanPlan*>(projection->GetSource().get());
+    if (scan && scan->CanNarrow() &&
+        scan->GetStats().Columns() >= scan->GetSchema().ColumnCount()) {
+      std::vector<slot_t> slots;
+      bool valid = !projection->Columns().empty();
+      for (const auto& column : projection->Columns()) {
+        if (!column.expression ||
+            column.expression->Type() != TypeTag::kColumnValue) {
+          valid = false;
+          break;
+        }
+        const int offset = scan->GetSchema().Offset(
+            column.expression->AsColumnValue().GetColumnName());
+        if (offset < 0) {
+          valid = false;
+          break;
+        }
+        slots.push_back(static_cast<slot_t>(offset));
+      }
+      // Identity by position: aliases do not change the row image. Reordered
+      // or duplicate projections retain the ordinary projection executor.
+      if (valid && std::ranges::is_sorted(slots) &&
+          std::adjacent_find(slots.begin(), slots.end()) == slots.end())
+        input = std::make_shared<FullScanPlan>(*scan, std::move(slots));
+    }
+  }
+  return std::make_shared<TopNExecutor>(input->EmitExecutor(ctx),
                                         Child()->GetSchema(), std::move(keys),
                                         Limit(), Offset(), WithTies());
 }
@@ -481,12 +833,6 @@ Executor DummyScanPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
   return std::make_shared<ValuesExecutor>(std::vector<Row>{Row({})});
 }
 
-Executor LsmScanPlan::EmitExecutor(TransactionContext& /*ctx*/) const {
-  // The LSM scan needs no transaction context: the tree's own snapshot view
-  // is the consistency boundary (no MVCC/row locks).
-  return std::make_shared<LsmScan>(tree_);
-}
-
 Executor IndexSkipScanPlan::EmitExecutor(TransactionContext& txn) const {
   return std::make_shared<IndexSkipScanExecutor>(inner_->EmitExecutor(txn));
 }
@@ -501,15 +847,6 @@ Executor SkipScanDistinctPlan::EmitExecutor(TransactionContext& txn) const {
 
 Executor SortDistinctPlan::EmitExecutor(TransactionContext& ctx) const {
   return std::make_shared<SortDistinctExecutor>(Child()->EmitExecutor(ctx));
-}
-
-Executor Max1RowPlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<Max1RowExecutor>(child_->EmitExecutor(ctx));
-}
-
-Executor MaterializePlan::EmitExecutor(TransactionContext& ctx) const {
-  return std::make_shared<MaterializeExecutor>(child_->EmitExecutor(ctx),
-                                               child_->GetSchema());
 }
 
 Executor MinMaxIndexPlan::EmitExecutor(TransactionContext& ctx) const {
@@ -654,17 +991,52 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     return SortedByIndexKey(std::move(scan), table_.GetSchema(), table_, index_,
                             ascending_);
   };
-  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
-    return stale_fallback();
-  }
   auto index_read_guard = txn.txn_.AcquireIndexReadGuard(index_.Root());
-  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
-    return stale_fallback();
+  bool stale = txn.txn_.IndexKeysMayBeStale(index_.Root());
+  if (stale && !lock_rows_) {
+    const auto changes =
+        txn.txn_.IndexKeyChangesSinceSnapshot(index_.Root(), index_read_guard);
+    if (changes) {
+      stale = std::ranges::any_of(*changes, [&](const std::string& key) {
+        if (point_ranges.empty()) {
+          return IndexScanIterator::EncodedKeyMayOverlap(index_, key, begin_key,
+                                                         end_key);
+        }
+        return std::ranges::any_of(point_ranges, [&](const auto& range) {
+          return IndexScanIterator::EncodedKeyMayOverlap(
+              index_, key, range.first, range.second);
+        });
+      });
+    }
+  }
+  if (stale) {
+    bool owned_point = false;
+    if (lock_rows_ && point_ranges.empty() && index_.StoresSingleValue() &&
+        begin_key.size() == index_.sc_.key_.size() && begin_key == end_key &&
+        std::ranges::none_of(begin_key, &Value::IsNull)) {
+      // An exact unique key still present under the read gate, whose row
+      // intent we already own, cannot have been removed by a foreign writer.
+      // In particular INSERT+DELETE of our own row must not scan and lock
+      // other sessions' rows just because one of them deleted another key.
+      IndexScanIterator probe(table_, index_, txn.txn_, begin_key, end_key,
+                              ascending_, true, &index_read_guard);
+      owned_point = probe.IsValid() && txn.txn_.HasWriteSet(probe.Position());
+    }
+    if (!owned_point) {
+      index_read_guard = TransactionManager::IndexReadGuard();
+      return stale_fallback();
+    }
   }
   if (!point_ranges.empty()) {
-    return std::make_shared<IndexScan>(
-        txn.txn_, table_, index_, point_ranges, ascending_, where_, GetSchema(),
-        lock_rows_, wait_for_write_intent_, std::move(index_read_guard));
+    // Each short IN range used to build and seek a second look-ahead cursor
+    // even for one key. Apply the same per-range amortization as serial scans.
+    const bool prefetch =
+        LimitHint() == std::numeric_limits<size_t>::max() &&
+        EmitRowCount() / point_ranges.size() > kDefaultVectorSize;
+    return std::make_shared<IndexScan>(txn.txn_, table_, index_, point_ranges,
+                                       ascending_, where_, GetSchema(),
+                                       lock_rows_, wait_for_write_intent_,
+                                       std::move(index_read_guard), prefetch);
   }
   // RangePartitionedScan / ParallelIndexScan: a large ascending single-range
   // scan partitions at B+Tree leaf boundaries and scans the partitions in
@@ -675,6 +1047,7 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
   static const bool parallel_index_scan_disabled =
       std::getenv("TINYLAMB_DISABLE_PARALLEL_INDEX_SCAN") != nullptr;
   if (!parallel_index_scan_disabled && ascending_ && !lock_rows_ &&
+      LimitHint() == std::numeric_limits<size_t>::max() &&
       EmitRowCount() >= kParallelIndexScanMinRows) {
     constexpr size_t kMaxParallelIndexScanWorkers = 16;
     constexpr size_t kLeavesPerIndexMorsel = 8;
@@ -690,10 +1063,15 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
     }
     return scan;
   }
-  return std::make_shared<IndexScan>(txn.txn_, table_, index_, begin_key,
-                                     end_key, ascending_, where_, GetSchema(),
-                                     lock_rows_, wait_for_write_intent_,
-                                     std::move(index_read_guard));
+  return std::make_shared<IndexScan>(
+      txn.txn_, table_, index_, begin_key, end_key, ascending_, where_,
+      GetSchema(), lock_rows_, wait_for_write_intent_,
+      std::move(index_read_guard),
+      // A look-ahead cursor copies its own leaf snapshot. A short range fits
+      // in one execution vector; constructing and walking a second cursor
+      // costs more than the warming can save on that path.
+      LimitHint() == std::numeric_limits<size_t>::max() &&
+          EmitRowCount() > kDefaultVectorSize);
 }
 
 Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
@@ -1027,7 +1405,7 @@ Executor LateMaterializationJoinPlan::EmitExecutor(
       right = std::make_shared<Projection>(std::move(items), right_physical,
                                            std::move(right));
     }
-    return std::make_shared<NestedLoopJoin>(
+    return std::make_shared<BatchNestedLoopJoin>(
         Left()->EmitExecutor(ctx), Left()->GetSchema(), std::move(right),
         right_output, Predicate());
   };
@@ -1065,7 +1443,7 @@ Executor ZigZagJoinPlan::EmitExecutor(TransactionContext& ctx) const {
        ctx.txn_.IndexKeysMayBeStale(left_index->Root())) ||
       (right_index != nullptr &&
        ctx.txn_.IndexKeysMayBeStale(right_index->Root()))) {
-    return std::make_shared<NestedLoopJoin>(
+    return std::make_shared<BatchNestedLoopJoin>(
         Left()->EmitExecutor(ctx), Left()->GetSchema(),
         Right()->EmitExecutor(ctx), Right()->GetSchema(), Predicate());
   }
@@ -1076,7 +1454,7 @@ Executor ZigZagJoinPlan::EmitExecutor(TransactionContext& ctx) const {
        ctx.txn_.IndexKeysMayBeStale(left_index->Root())) ||
       (right_index != nullptr &&
        ctx.txn_.IndexKeysMayBeStale(right_index->Root()))) {
-    return std::make_shared<NestedLoopJoin>(
+    return std::make_shared<BatchNestedLoopJoin>(
         std::move(left_executor), Left()->GetSchema(),
         std::move(right_executor), Right()->GetSchema(), Predicate());
   }
@@ -1088,16 +1466,12 @@ Executor ZigZagJoinPlan::EmitExecutor(TransactionContext& ctx) const {
 Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (left_cols_.empty() && right_cols_.empty()) {
     // A cross product filtered by the full join predicate is a nested-loop
-    // join; lower it to the executor that evaluates the predicate per pair.
+    // join; lower it to the blocked BatchNestedLoopJoin executor.
     // LeftOuter carries the kind through so unmatched outer rows are
     // null-padded by the executor; RIGHT is normalized to LEFT by the
     // optimizer and FULL has hash/merge implementations.
     if (residual_note_ && !IsSemiJoinKind(kind_) && !IsAntiJoinKind(kind_)) {
       if (kind_ != JoinKind::kInner && !IsLeftOuterJoinKind(kind_)) {
-        // Full/right-outer residuals have no tuple nested-loop
-        // implementation; the blocked executor null-pads unmatched rows on
-        // either side. Only the batch_nested_loop rule constructs this
-        // shape, so any other kind here is still a planner bug.
         if (IsFullOuterJoinKind(kind_) || IsRightOuterJoinKind(kind_)) {
           return std::make_shared<BatchNestedLoopJoin>(
               left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
@@ -1112,16 +1486,7 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
                   "ProductPlan: residual predicate on unsupported "
                   "join kind (expected INNER/LEFT OUTER)");
       }
-      // The batch_nested_loop rule marks inner joins whose predicate has no
-      // equi pair for the blocked executor; the tuple executor stays the
-      // default so existing plans are unchanged.
-      if (batch_nested_loop_) {
-        return std::make_shared<BatchNestedLoopJoin>(
-            left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
-            right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
-            residual_note_, kind_);
-      }
-      return std::make_shared<NestedLoopJoin>(
+      return std::make_shared<BatchNestedLoopJoin>(
           left_src_->EmitExecutor(ctx), left_src_->GetSchema(),
           right_src_->EmitExecutor(ctx), right_src_->GetSchema(),
           residual_note_, kind_);
@@ -1294,10 +1659,11 @@ StatusOr<Relation> ApplyTableSample(TransactionContext& context,
       input.schema, *source.sample);
   Relation output(context.execution_runtime());
   output.schema = executor->OutputSchema();
-  Row row;
-  RowPosition position;
-  while (executor->Next(&row, &position)) {
-    output.AddRow(std::move(row));
+  DataChunk batch;
+  while (executor->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      output.AddRow(batch.RowAt(i));
+    }
   }
   if (executor->GetStatus() != Status::kSuccess) {
     return executor->GetStatus();

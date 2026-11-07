@@ -150,28 +150,27 @@ void ParallelIndexScan::RunWorker(size_t batch_size, size_t worker_index) {
                      ascending_, Expression(), schema_);
       DataChunk chunk;
       chunk.Initialize(table_->GetSchema(), batch_size);
-      Row row;
-      RowPosition position;
+      DataChunk batch;
       bool scan_failed = false;
-      while (scan.Next(&row, &position)) {
+      bool reached_boundary = false;
+      while (!reached_boundary && scan.NextBatch(&batch, batch_size) != 0) {
         if (cancelled_.load(std::memory_order_relaxed)) {
           return;
         }
-        if (morsel.exclusive_end && KeyEqualsBoundary(row, morsel.end_key)) {
-          // The next morsel owns this key (half-open partition): stop here
-          // instead of emitting a duplicate.
-          break;
-        }
-        chunk.Append(std::move(row), position);
-        row = Row();
-        if (chunk.Size() == batch_size) {
-          if (!Deposit(morsel_index, std::move(chunk))) {
-            return;
+        for (size_t i = 0; i < batch.Size(); ++i) {
+          Row row = batch.RowAt(i);
+          if (morsel.exclusive_end && KeyEqualsBoundary(row, morsel.end_key)) {
+            reached_boundary = true;
+            break;
           }
-          // The chunk above was handed off; start the refill from a
-          // well-defined state instead of re-initializing a moved-from one.
-          chunk = DataChunk{};
-          chunk.Initialize(table_->GetSchema(), batch_size);
+          chunk.Append(std::move(row), batch.PositionAt(i));
+          if (chunk.Size() == batch_size) {
+            if (!Deposit(morsel_index, std::move(chunk))) {
+              return;
+            }
+            chunk = DataChunk{};
+            chunk.Initialize(table_->GetSchema(), batch_size);
+          }
         }
       }
       if (scan.GetStatus() != Status::kSuccess) {
@@ -319,21 +318,6 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
     }
   }
   return destination->Size();
-}
-
-bool ParallelIndexScan::Next(Row* destination, RowPosition* position) {
-  if (scalar_offset_ == scalar_batch_.Size()) {
-    if (NextBatch(&scalar_batch_) == 0) {
-      return false;
-    }
-    scalar_offset_ = 0;
-  }
-  *destination = scalar_batch_.RowAt(scalar_offset_);
-  if (position != nullptr) {
-    *position = scalar_batch_.PositionAt(scalar_offset_);
-  }
-  ++scalar_offset_;
-  return true;
 }
 
 void ParallelIndexScan::Dump(std::ostream& out, int /*indent*/) const {

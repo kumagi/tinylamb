@@ -25,13 +25,16 @@ class DistinctExecutor : public ExecutorBase {
       : source_(std::move(source)),
         schema_(std::move(schema)),
         distinct_on_(std::move(distinct_on)) {}
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
   Executor source_;
   Schema schema_;
   std::vector<Expression> distinct_on_;
+  DataChunk input_batch_;
+  size_t input_offset_{0};
   DistinctRowSet seen_;
   DistinctRowSet seen_keys_;
 };
@@ -39,11 +42,14 @@ class DistinctExecutor : public ExecutorBase {
 class SortDistinctExecutor final : public ExecutorBase {
  public:
   explicit SortDistinctExecutor(Executor source) : source_(std::move(source)) {}
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
   Executor source_;
+  DataChunk input_batch_;
+  size_t input_offset_{0};
   Row previous_;
   bool have_previous_{false};
 };

@@ -23,7 +23,6 @@
 #include "benchmark/tpcc_workload.hpp"
 #include "common/constants.hpp"
 #include "database/database.hpp"
-#include "executor/query_scheduler.hpp"
 #include "query/plan_cache.hpp"
 #include "query/sql_engine.hpp"
 
@@ -41,6 +40,7 @@ struct Options {
   bool verify_only{false};
   bool reuse_existing{false};
   bool synchronous_commit{true};
+  bool fixed_wal{false};
   bool profile_waits{false};
   size_t wal_sync_ms{1};
   std::string transaction_only;
@@ -120,6 +120,8 @@ void Usage(std::ostream& out, std::string_view program) {
       << "  --seed N            random seed\n"
       << "  --verify-only       run each transaction once and stop\n"
       << "  --reuse-existing    reuse an already initialized fixture\n"
+      << "  --fixed-wal         use the new-server fixed WAL format for a new "
+         "fixture\n"
       << "  --no-sync-commit    diagnostic only: do not wait for WAL "
          "durability\n"
       << "  --profile-waits     collect WAL/MVCC/scheduler wait counters\n"
@@ -169,6 +171,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     }
     if (argument == "--no-sync-commit") {
       options->synchronous_commit = false;
+      continue;
+    }
+    if (argument == "--fixed-wal") {
+      options->fixed_wal = true;
       continue;
     }
     if (argument == "--profile-waits") {
@@ -333,14 +339,16 @@ int main(int argc, char** argv) {
     std::cout << "deadlock_policy=engine-default\n";
   }
 
-  auto database_or_status =
-      tinylamb::Database::Create(options.database_path, options.wal_sync_ms);
+  auto database_or_status = tinylamb::Database::Create(
+      options.database_path, options.wal_sync_ms, options.fixed_wal);
   if (!database_or_status.HasValue()) {
     std::cerr << "failed to open database " << options.database_path << ": "
               << database_or_status.GetStatus() << '\n';
     return 1;
   }
   tinylamb::Database& database = *database_or_status.Value();
+  std::cout << "fixed_size_wal=" << (database.FixedSizeWal() ? "true" : "false")
+            << '\n';
   if (pin_deadlock_policy) {
     database.SetDeadlockPolicy(parse_policy(policy_source));
   }
@@ -368,11 +376,8 @@ int main(int argc, char** argv) {
 
   database.SetSynchronousCommit(options.synchronous_commit);
   database.SetTransactionMetricsEnabled(options.profile_waits);
-  tinylamb::QueryScheduler::Global().SetMetricsEnabled(options.profile_waits);
   const tinylamb::TransactionRuntimeStats txn_stats_before =
       database.TransactionStats();
-  const tinylamb::QuerySchedulerStats scheduler_stats_before =
-      tinylamb::QueryScheduler::Global().Stats();
   const uint64_t plan_hits_before =
       tinylamb::PlanCacheStats().hits.load(std::memory_order_relaxed);
   const uint64_t plan_misses_before =
@@ -660,8 +665,6 @@ int main(int argc, char** argv) {
   if (options.profile_waits) {
     const tinylamb::TransactionRuntimeStats txn_after =
         database.TransactionStats();
-    const tinylamb::QuerySchedulerStats scheduler_after =
-        tinylamb::QueryScheduler::Global().Stats();
     const uint64_t wal_waits =
         txn_after.wal_wait_count - txn_stats_before.wal_wait_count;
     const uint64_t wal_wait_ns =
@@ -680,10 +683,6 @@ int main(int argc, char** argv) {
                                     txn_stats_before.write_intent_mutex_wait_ns;
     const uint64_t commit_wait_ns = txn_after.commit_shard_mutex_wait_ns -
                                     txn_stats_before.commit_shard_mutex_wait_ns;
-    const uint64_t scheduler_acquires =
-        scheduler_after.acquire_count - scheduler_stats_before.acquire_count;
-    const uint64_t scheduler_wait_ns = scheduler_after.acquire_wait_ns -
-                                       scheduler_stats_before.acquire_wait_ns;
     std::cout
         << "wait.wal.count=" << wal_waits << '\n'
         << "wait.wal.total_ms="
@@ -708,13 +707,6 @@ int main(int argc, char** argv) {
         << static_cast<double>(intent_wait_ns) / 1'000'000.0 << '\n'
         << "wait.mvcc_commit_shards.total_ms="
         << static_cast<double>(commit_wait_ns) / 1'000'000.0 << '\n'
-        << "wait.scheduler.acquires=" << scheduler_acquires << '\n'
-        << "wait.scheduler.total_ms="
-        << static_cast<double>(scheduler_wait_ns) / 1'000'000.0 << '\n'
-        << "wait.scheduler.contended="
-        << scheduler_after.contended_acquires -
-               scheduler_stats_before.contended_acquires
-        << '\n'
         << "tm.active_transactions=" << txn_after.active_transactions << '\n'
         << "tm.version_chains=" << txn_after.version_chains << '\n'
         << "tm.index_undo_reserved_pages="

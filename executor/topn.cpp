@@ -2,6 +2,7 @@
 #include "executor/topn.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <ostream>
 #include <queue>
@@ -10,7 +11,12 @@
 
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
+#include "executor/data_chunk.hpp"
+#include "executor/parallel_scan.hpp"
+#include "executor/query_memory.hpp"
+#include "expression/column_value.hpp"
 #include "page/row_position.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -49,27 +55,28 @@ Status TopNExecutor::Materialize() {
                                  const Candidate& right) {
     return precedes(left, right);
   };
-  Row row;
-  RowPosition position;
   size_t sequence = 0;
   if (with_ties_) {
-    while (source_->Next(&row, &position)) {
-      Candidate candidate{.row = std::move(row),
-                          .position = position,
-                          .keys = {},
-                          .sequence = sequence++};
-      candidate.keys.reserve(keys_.size());
-      for (const Key& key : keys_) {
-        StatusOr<Value> key_value =
-            key.expression->TryEvaluate(candidate.row, schema_);
-        if (!key_value.HasValue()) {
-          const Status key_error = key_value.GetStatus();
-          FailWith(key_error);
-          return key_error;
+    DataChunk chunk;
+    while (source_->NextBatch(&chunk) != 0) {
+      for (size_t i = 0; i < chunk.Size(); ++i) {
+        Candidate candidate{.row = chunk.RowAt(i),
+                            .position = chunk.PositionAt(i),
+                            .keys = {},
+                            .sequence = sequence++};
+        candidate.keys.reserve(keys_.size());
+        for (const Key& key : keys_) {
+          StatusOr<Value> key_value =
+              key.expression->TryEvaluate(candidate.row, schema_);
+          if (!key_value.HasValue()) {
+            const Status key_error = key_value.GetStatus();
+            FailWith(key_error);
+            return key_error;
+          }
+          candidate.keys.push_back(key_value.MoveValue());
         }
-        candidate.keys.push_back(key_value.MoveValue());
+        rows_.push_back(std::move(candidate));
       }
-      rows_.push_back(std::move(candidate));
     }
     FailWithChildOf(*source_);
     std::ranges::sort(rows_, precedes);
@@ -109,28 +116,168 @@ Status TopNExecutor::Materialize() {
   std::priority_queue<Candidate, std::vector<Candidate>, decltype(worse_first)>
       heap(worse_first);
 
-  while (source_->Next(&row, &position)) {
-    ++input_rows_;
-    Candidate candidate{.row = std::move(row),
-                        .position = position,
-                        .keys = {},
-                        .sequence = sequence++};
-    candidate.keys.reserve(keys_.size());
-    for (const Key& key : keys_) {
-      StatusOr<Value> key_value =
-          key.expression->TryEvaluate(candidate.row, schema_);
-      if (!key_value.HasValue()) {
-        const Status key_error = key_value.GetStatus();
-        FailWith(key_error);
-        return key_error;
-      }
-      candidate.keys.push_back(key_value.MoveValue());
+  std::vector<size_t> direct_columns;
+  for (const Key& key : keys_) {
+    if (key.expression->Type() != TypeTag::kColumnValue) {
+      break;
     }
-    if (heap.size() < capacity) {
-      heap.push(std::move(candidate));
-    } else if (capacity != 0 && precedes(candidate, heap.top())) {
-      heap.pop();
-      heap.push(std::move(candidate));
+    const int offset =
+        schema_.Offset(key.expression->AsColumnValue().GetColumnName());
+    if (offset < 0) {
+      break;
+    }
+    direct_columns.push_back(static_cast<size_t>(offset));
+  }
+  bool folded = false;
+  if (direct_columns.size() == keys_.size()) {
+    if (auto scan = std::dynamic_pointer_cast<ParallelScan>(source_)) {
+      // Each morsel keeps its best prefix. The union of these prefixes
+      // contains the global best prefix, including stable equal-key ties.
+      // Charge the geometric heap capacities and decoded position batches
+      // before consuming anything; a large LIMIT retains the regular path.
+      size_t candidate_bytes, heap_bytes, scan_bytes, bytes;
+      const size_t payload =
+          sizeof(Candidate) +
+          (schema_.ColumnCount() + keys_.size()) * sizeof(Value);
+      if (!__builtin_mul_overflow(capacity, payload * 2, &candidate_bytes) &&
+          !__builtin_mul_overflow(scan->MorselCount() + 1, candidate_bytes,
+                                  &heap_bytes) &&
+          !__builtin_mul_overflow(
+              scan->WorkerCount() * kDefaultVectorSize,
+              schema_.ColumnCount() * 9 + sizeof(RowPosition), &scan_bytes) &&
+          !__builtin_add_overflow(heap_bytes, scan_bytes, &bytes) &&
+          QueryMemoryBudget::Global().CanReserve(bytes)) {
+        QueryMemoryCharge charge(bytes);
+        using Heap = decltype(heap);
+        std::vector<Heap> partials;
+        partials.reserve(scan->MorselCount());
+        for (size_t m = 0; m < scan->MorselCount(); ++m)
+          partials.emplace_back(worse_first);
+        std::vector<size_t> counts(scan->MorselCount(), 0);
+        auto fold = scan->TryFoldTypedMorsels(
+            [&](size_t m, const TypedCellBatch& batch) -> Status {
+              if (batch.stride != schema_.ColumnCount() ||
+                  batch.positions.size() != batch.rows)
+                return StatusError(StatusCode::kRuntimeError,
+                                   "typed TopN layout mismatch");
+              const auto value_at = [&](size_t batch_row, size_t column) {
+                const size_t cell = batch_row * batch.stride + column;
+                if (batch.nulls[cell]) return Value();
+                Value value;
+                if (batch.slot_types[column] == ValueType::kDouble)
+                  value = Value(std::bit_cast<double>(batch.cells[cell]));
+                else {
+                  value = Value(batch.cells[cell]);
+                  value.type = batch.slot_types[column];
+                  if (batch.slot_unsigned[column]) value = value.WithUnsigned();
+                }
+                return value;
+              };
+              Candidate candidate;
+              candidate.keys.resize(keys_.size());
+              auto& local = partials[m];
+              for (size_t r = 0; r < batch.rows; ++r) {
+                candidate.sequence = counts[m]++;
+                candidate.keys.resize(keys_.size());
+                for (size_t k = 0; k < keys_.size(); ++k)
+                  candidate.keys[k] = value_at(r, direct_columns[k]);
+                if (local.size() < capacity ||
+                    precedes(candidate, local.top())) {
+                  candidate.row.values_.clear();
+                  candidate.row.values_.reserve(batch.stride);
+                  for (size_t c = 0; c < batch.stride; ++c)
+                    candidate.row.values_.push_back(value_at(r, c));
+                  candidate.position = batch.positions[r];
+                  if (local.size() == capacity) local.pop();
+                  local.push(std::move(candidate));
+                }
+              }
+              return Status::kSuccess;
+            },
+            true);
+        if (!fold.HasValue()) {
+          FailWith(fold.GetStatus());
+          return fold.GetStatus();
+        }
+        folded = fold.Value();
+        if (folded) {
+          size_t prefix = 0;
+          for (size_t m = 0; m < partials.size(); ++m) {
+            auto& local = partials[m];
+            while (!local.empty()) {
+              Candidate candidate =
+                  std::move(const_cast<Candidate&>(local.top()));
+              local.pop();
+              if (__builtin_add_overflow(candidate.sequence, prefix,
+                                         &candidate.sequence))
+                return StatusError(StatusCode::kTooBigData,
+                                   "TopN input row count overflow");
+              if (heap.size() < capacity || precedes(candidate, heap.top())) {
+                if (heap.size() == capacity) heap.pop();
+                heap.push(std::move(candidate));
+              }
+            }
+            if (__builtin_add_overflow(prefix, counts[m], &prefix))
+              return StatusError(StatusCode::kTooBigData,
+                                 "TopN input row count overflow");
+          }
+          input_rows_ = prefix;
+          fused_scan_ = true;
+        }
+      }
+    }
+  }
+
+  if (!folded && direct_columns.size() == keys_.size()) {
+    DataChunk chunk;
+    Candidate candidate;
+    while (source_->NextBatch(&chunk) != 0) {
+      for (size_t i = 0; i < chunk.Size(); ++i) {
+        ++input_rows_;
+        candidate.sequence = sequence++;
+        candidate.keys.resize(keys_.size());
+        for (size_t key = 0; key < keys_.size(); ++key) {
+          candidate.keys[key] = chunk.ColumnAt(direct_columns[key]).ValueAt(i);
+        }
+        // Most rows lose to the boundary. Materialize their payload only
+        // when admitted, and reuse key storage on every rejected row.
+        if (heap.size() < capacity || precedes(candidate, heap.top())) {
+          candidate.row = chunk.RowAt(i);
+          candidate.position = chunk.PositionAt(i);
+          if (heap.size() == capacity) {
+            heap.pop();
+          }
+          heap.push(std::move(candidate));
+        }
+      }
+    }
+  } else if (!folded) {
+    DataChunk chunk;
+    while (source_->NextBatch(&chunk) != 0) {
+      for (size_t i = 0; i < chunk.Size(); ++i) {
+        ++input_rows_;
+        Candidate candidate{.row = chunk.RowAt(i),
+                            .position = chunk.PositionAt(i),
+                            .keys = {},
+                            .sequence = sequence++};
+        candidate.keys.reserve(keys_.size());
+        for (const Key& key : keys_) {
+          StatusOr<Value> key_value =
+              key.expression->TryEvaluate(candidate.row, schema_);
+          if (!key_value.HasValue()) {
+            const Status key_error = key_value.GetStatus();
+            FailWith(key_error);
+            return key_error;
+          }
+          candidate.keys.push_back(key_value.MoveValue());
+        }
+        if (heap.size() < capacity) {
+          heap.push(std::move(candidate));
+        } else if (capacity != 0 && precedes(candidate, heap.top())) {
+          heap.pop();
+          heap.push(std::move(candidate));
+        }
+      }
     }
   }
   FailWithChildOf(*source_);
@@ -146,26 +293,26 @@ Status TopNExecutor::Materialize() {
   return GetStatus();
 }
 
-bool TopNExecutor::Next(Row* dst, RowPosition* position) {
+size_t TopNExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(schema_, max_rows);
   if (!materialized_) {
-    if (Materialize() != Status::kSuccess) {
-      return false;
+    if (const Status status = Materialize(); status != Status::kSuccess) {
+      FailWith(status);
+      return 0;
     }
   }
-  if (output_index_ >= output_end_) {
-    return false;
+  while (destination->Size() < max_rows && output_index_ < output_end_) {
+    destination->Append(std::move(rows_[output_index_].row),
+                        rows_[output_index_].position);
+    ++output_index_;
   }
-  *dst = std::move(rows_[output_index_].row);
-  if (position != nullptr) {
-    *position = rows_[output_index_].position;
-  }
-  ++output_index_;
-  return true;
+  return destination->Size();
 }
 
 void TopNExecutor::Dump(std::ostream& output, int indent) const {
   output << Indent(static_cast<size_t>(indent)) << "TopN (limit=" << limit_
-         << ", offset=" << offset_ << (with_ties_ ? ", with ties" : "") << ")\n"
+         << ", offset=" << offset_ << (with_ties_ ? ", with ties" : "")
+         << (fused_scan_ ? ", fused typed scan" : "") << ")\n"
          << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
   if (materialized_) {

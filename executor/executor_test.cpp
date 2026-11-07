@@ -66,6 +66,7 @@
 #include "executor/projection.hpp"
 #include "executor/selection.hpp"
 #include "executor/sort.hpp"
+#include "executor/topn.hpp"
 #include "executor/update.hpp"
 #include "executor/zone_map.hpp"
 #include "expression/expression.hpp"
@@ -91,18 +92,6 @@ static const char* const kTableName = "SampleTable";
 class SyntheticBatchExecutor final : public ExecutorBase {
  public:
   explicit SyntheticBatchExecutor(size_t row_count) : row_count_(row_count) {}
-
-  bool Next(Row* destination, RowPosition* position) override {
-    if (next_row_ == row_count_) {
-      return false;
-    }
-    *destination = Row({Value(static_cast<int64_t>(next_row_ % 100))});
-    if (position != nullptr) {
-      *position = RowPosition(1, static_cast<slot_t>(next_row_));
-    }
-    ++next_row_;
-    return true;
-  }
 
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
@@ -475,6 +464,173 @@ TEST_F(ExecutorTest, IndexOnlyScanAndBitmapScanMvccSnapshotVisibility) {
   EXPECT_EQ(fresh_bhs_rows[1][0], Value(3));
   EXPECT_EQ(fresh_bhs_rows[2][0], Value(4));
   ASSERT_SUCCESS(fresh_ctx.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, IndexOnlyDistinctKeysBatchesReverseAndResidualGate) {
+  {
+    TransactionContext writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            writer, Schema("DistinctScan", {Column("k", ValueType::kInt64),
+                                            Column("v", ValueType::kInt64)})));
+    for (int i = 0; i < 1000; ++i) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({i % 6 == 5 ? Value() : Value(i % 6), Value(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, "DistinctScan",
+                         IndexSchema("keys", {0}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(rs_->CreateIndex(
+        writer, "DistinctScan",
+        IndexSchema("included", {0}, {1}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  for (bool ascending : {true, false}) {
+    TransactionContext reader = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->GetTable(reader, "DistinctScan"));
+    {
+      IndexOnlyScan scan(reader.txn_, table, table.GetIndex(0), Value(),
+                         Value(), ascending, Expression(), table.GetSchema());
+      ASSERT_TRUE(scan.TryEnableKeyDeduplication());
+      std::vector<Row> actual;
+      DataChunk batch;
+      while (scan.NextBatch(&batch, 2) != 0) {
+        for (size_t i = 0; i < batch.Size(); ++i) {
+          actual.push_back(batch.RowAt(i));
+        }
+      }
+      std::vector<Row> expected{Row({Value()}),  Row({Value(0)}),
+                                Row({Value(1)}), Row({Value(2)}),
+                                Row({Value(3)}), Row({Value(4)})};
+      if (!ascending) {
+        std::ranges::reverse(expected);
+      }
+      EXPECT_EQ(actual, expected);
+      Row row;
+      EXPECT_FALSE(scan.Next(&row, nullptr));
+      ASSERT_SUCCESS(scan.GetStatus());
+    }
+    {
+      IndexOnlyScan included(reader.txn_, table, table.GetIndex(1), Value(),
+                             Value(), ascending, Expression(),
+                             table.GetSchema());
+      EXPECT_FALSE(included.TryEnableKeyDeduplication());
+    }
+    {
+      IndexOnlyScan residual(reader.txn_, table, table.GetIndex(0), Value(),
+                             Value(), ascending,
+                             BinaryExpressionExp(ColumnValueExp("k"),
+                                                 BinaryOperation::kGreaterThan,
+                                                 ConstantValueExp(Value(2))),
+                             table.GetSchema());
+      EXPECT_FALSE(residual.TryEnableKeyDeduplication());
+    }
+  }
+}
+
+TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
+  auto seed = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      rs_->CreateTable(
+          seed, Schema("PredicateKeys", {Column("k", ValueType::kInt64),
+                                         Column("v", ValueType::kInt64)})));
+  std::vector<Row> original;
+  RowPosition updated;
+  for (int i = 0; i < 100; ++i) {
+    original.emplace_back(Row({i % 10 ? Value(i % 4) : Value(), Value(i)}));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
+                          table.Insert(seed.txn_, original.back()));
+    if (i == 1) updated = position;
+  }
+  ASSERT_SUCCESS(
+      rs_->CreateIndex(seed, "PredicateKeys",
+                       IndexSchema("kv", {0}, {1}, IndexMode::kNonUnique)));
+  ASSERT_SUCCESS(seed.PreCommit());
+  auto old = rs_->BeginReadOnlyContext();
+  {
+    auto writer = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        table.Update(writer.txn_, updated, Row({Value(1), Value(998)}))
+            .GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  const auto compare = [](std::string name, BinaryOperation op, Value value) {
+    return BinaryExpressionExp(ColumnValueExp(std::move(name)), op,
+                               ConstantValueExp(std::move(value)));
+  };
+  const std::vector<Expression> predicates{
+      BinaryExpressionExp(
+          compare("k", BinaryOperation::kGreaterThanEquals, Value(1)),
+          BinaryOperation::kAnd,
+          compare("k", BinaryOperation::kLessThan, Value(3))),
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kModulo,
+                              ConstantValueExp(Value(2))),
+          BinaryOperation::kEquals, ConstantValueExp(Value(0))),
+      UnaryExpressionExp(ColumnValueExp("k"), UnaryOperation::kIsNull),
+      BinaryExpressionExp(FunctionCallExp("abs", {ColumnValueExp("v")}),
+                          BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(30)))};
+  for (int phase = 0; phase < 2; ++phase) {
+    auto fresh = rs_->BeginReadOnlyContext();
+    auto& context = phase == 0 ? old : fresh;
+    ASSIGN_OR_ASSERT_FAIL(Table, current,
+                          rs_->GetTable(context, "PredicateKeys"));
+    auto visible = original;
+    if (phase == 1) visible[1][1] = Value(998);
+    for (size_t predicate = 0; predicate < predicates.size(); ++predicate) {
+      for (bool ascending : {true, false}) {
+        std::vector<Row> expected;
+        for (const auto& row : visible) {
+          const auto value =
+              predicates[predicate]->TryEvaluate(row, current.GetSchema());
+          ASSERT_TRUE(value.HasValue());
+          if (!value.Value().IsNull() && value.Value().Truthy())
+            expected.push_back(row);
+        }
+        IndexOnlyScan scan(context.txn_, current, current.GetIndex(0), Value(),
+                           Value(), ascending, predicates[predicate],
+                           current.GetSchema());
+        std::vector<Row> actual;
+        DataChunk batch;
+        while (scan.NextBatch(&batch, 7))
+          for (size_t i = 0; i < batch.Size(); ++i)
+            actual.push_back(batch.RowAt(i));
+        ASSERT_SUCCESS(scan.GetStatus());
+        const auto by_payload = [](const Row& a, const Row& b) {
+          return a[1] < b[1];
+        };
+        std::sort(expected.begin(), expected.end(), by_payload);
+        std::sort(actual.begin(), actual.end(), by_payload);
+        EXPECT_EQ(actual, expected)
+            << "predicate=" << predicate << " phase=" << phase;
+      }
+    }
+    const auto raises = BinaryExpressionExp(
+        BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kDivide,
+                            ConstantValueExp(Value(0))),
+        BinaryOperation::kGreaterThan, ConstantValueExp(Value(0)));
+    const auto rejects = compare("k", BinaryOperation::kLessThan, Value(0));
+    for (const auto& predicate :
+         {BinaryExpressionExp(raises, BinaryOperation::kAnd, rejects),
+          BinaryExpressionExp(rejects, BinaryOperation::kAnd, raises)}) {
+      IndexOnlyScan scan(context.txn_, current, current.GetIndex(0), Value(),
+                         Value(), true, predicate, current.GetSchema());
+      Row row;
+      EXPECT_FALSE(scan.Next(&row, nullptr));
+      EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    }
+    IndexOnlyScan erroneous(context.txn_, current, current.GetIndex(0), Value(),
+                            Value(), true, raises, current.GetSchema());
+    Row row;
+    EXPECT_FALSE(erroneous.Next(&row, nullptr));
+    EXPECT_NE(erroneous.GetStatus(), Status::kSuccess);
+  }
 }
 
 TEST_F(ExecutorTest, IndexOnlyScanServesVisibilityMapWithoutHeapFetch) {
@@ -1707,6 +1863,32 @@ TEST_F(ExecutorTest, Update) {
   ASSERT_TRUE(rows.empty());
 }
 
+TEST_F(ExecutorTest, UpdatePreservesConstraintFailureStatusAndMessage) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable(kTableName));
+  // Deliberately provide an incomplete replacement image at valid positions.
+  auto source = std::make_shared<Projection>(
+      std::vector<NamedExpression>{
+          NamedExpression("key", ColumnValueExp("key"))},
+      table->GetSchema(), std::make_shared<FullScan>(ctx.txn_, *table));
+  Update update(ctx.txn_, table.get(), std::move(source));
+  Row result;
+  EXPECT_FALSE(update.Next(&result, nullptr));
+  EXPECT_EQ(update.GetStatus(), Status::kInvalidArgument);
+  EXPECT_NE(update.GetStatus().GetMessage().find("update failed on table"),
+            std::string::npos);
+  EXPECT_NE(update.GetStatus().GetMessage().find(
+                "row column count does not match table schema"),
+            std::string::npos);
+  size_t count = 0;
+  for (auto scan = table->BeginFullScan(ctx.txn_); scan.IsValid(); ++scan) {
+    EXPECT_EQ((*scan).values_.size(), 3);
+    ++count;
+  }
+  EXPECT_EQ(count, 4);
+}
+
 TEST_F(ExecutorTest, Aggregation) {
   // Arrange
   TransactionContext ctx = rs_->BeginContext();
@@ -1884,6 +2066,181 @@ TEST_F(ExecutorTest, MorselDrivenParallelScanReadsEveryPageOnce) {
   EXPECT_TRUE(keys.contains(0));
   EXPECT_TRUE(keys.contains(kRows - 1));
   ASSERT_SUCCESS(reader.txn_.PreCommit());
+}
+
+TEST_F(ExecutorTest, FusedTypedScanAggregatesNullableOldSnapshot) {
+  constexpr std::string_view name = "FoldSnapshot";
+  std::vector<RowPosition> positions;
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            writer, Schema(name, {Column("value", ValueType::kInt64),
+                                  Column("padding", ValueType::kVarChar)})));
+    for (int64_t i = 0; i < 2000; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(
+          RowPosition, position,
+          table.Insert(writer.txn_, Row({i % 5 == 0 ? Value() : Value(i),
+                                         Value(std::string(100, 'x'))})));
+      positions.push_back(position);
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  auto old = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, old.GetTable(name));
+  auto old_scan = std::make_shared<ParallelScan>(old.txn_, *table, 4, 1,
+                                                 std::vector<slot_t>{0});
+  ASSERT_GT(old_scan->MorselCount(), 4U);
+  {
+    auto writer = rs_->BeginContext();
+    ASSERT_SUCCESS(table
+                       ->Update(writer.txn_, positions[0],
+                                Row({Value(99), Value(std::string(100, 'x'))}))
+                       .GetStatus());
+    ASSERT_SUCCESS(table->Delete(writer.txn_, positions[1]));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  const Schema schema(name, {Column("value", ValueType::kInt64)});
+  const std::vector<NamedExpression> aggregates{
+      NamedExpression("rows",
+                      AggregateExpressionExp(AggregationType::kCount, nullptr)),
+      NamedExpression("count", AggregateExpressionExp(AggregationType::kCount,
+                                                      ColumnValueExp("value"))),
+      NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                    ColumnValueExp("value"))),
+      NamedExpression("min", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("value"))),
+      NamedExpression("max", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("value")))};
+  AggregationExecutor before(old_scan, schema, aggregates);
+  Row row;
+  ASSERT_TRUE(before.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(2000), Value(1600), Value(1600000), Value(1),
+                      Value(1999)}));
+  EXPECT_TRUE(old_scan->WasTypedFolded());
+  EXPECT_FALSE(before.Next(&row, nullptr));
+  DataChunk exhausted;
+  EXPECT_EQ(old_scan->NextBatch(&exhausted), 0U);
+  ASSERT_SUCCESS(before.GetStatus());
+  ASSERT_SUCCESS(old.PreCommit());
+  auto current = rs_->BeginReadOnlyContext();
+  auto current_scan = std::make_shared<ParallelScan>(current.txn_, *table, 4, 1,
+                                                     std::vector<slot_t>{0});
+  AggregationExecutor after(current_scan, schema, aggregates);
+  ASSERT_TRUE(after.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(1999), Value(1600), Value(1600098), Value(2),
+                      Value(1999)}));
+  EXPECT_TRUE(current_scan->WasTypedFolded());
+  ASSERT_SUCCESS(after.GetStatus());
+  ASSERT_SUCCESS(current.PreCommit());
+}
+
+TEST_F(ExecutorTest, FusedTypedScanPreservesIntermediateSumOverflow) {
+  const int64_t hi = std::numeric_limits<int64_t>::max();
+  const int64_t lo = std::numeric_limits<int64_t>::min();
+  const std::vector<std::vector<int64_t>> cases{
+      {hi, 0, 1, -1}, {lo, 0, -1, 1}, {-hi, 0, hi, hi}, {hi, 0, -hi, -hi}};
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const std::string name = "FoldOverflow" + std::to_string(i);
+    {
+      auto writer = rs_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, table,
+          rs_->CreateTable(
+              writer, Schema(name, {Column("value", ValueType::kInt64),
+                                    Column("padding", ValueType::kVarChar)})));
+      for (int64_t value : cases[i]) {
+        ASSERT_SUCCESS(
+            table
+                .Insert(writer.txn_,
+                        Row({Value(value), Value(std::string(12000, 'x'))}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    auto reader = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, reader.GetTable(name));
+    const std::vector<NamedExpression> aggregates{NamedExpression(
+        "sum", AggregateExpressionExp(AggregationType::kSum,
+                                      ColumnValueExp("value")))};
+    Row expected;
+    std::vector<Row> reference_rows;
+    for (int64_t value : cases[i])
+      reference_rows.emplace_back(std::vector<Value>{Value(value)});
+    AggregationExecutor serial(
+        std::make_shared<ConstantExecutor>(std::move(reference_rows)),
+        Schema(name, {Column("value", ValueType::kInt64)}), aggregates);
+    const bool serial_success = serial.Next(&expected, nullptr);
+    EXPECT_EQ(serial_success, i >= 2);
+    auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 4, 1,
+                                               std::vector<slot_t>{0});
+    ASSERT_GE(scan->MorselCount(), 2U);
+    AggregationExecutor fused(
+        scan, Schema(name, {Column("value", ValueType::kInt64)}), aggregates);
+    Row actual;
+    EXPECT_EQ(fused.Next(&actual, nullptr), serial_success);
+    EXPECT_TRUE(scan->WasTypedFolded());
+    if (serial_success) {
+      EXPECT_EQ(actual, expected);
+      ASSERT_SUCCESS(fused.GetStatus());
+    } else {
+      EXPECT_EQ(fused.GetStatus(), Status::kIsInfinity);
+      EXPECT_EQ(serial.GetStatus(), Status::kIsInfinity);
+    }
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+}
+
+TEST_F(ExecutorTest, FusedTypedScanEmptyAndAllNullAggregates) {
+  for (int count : {0, 20}) {
+    const std::string name = "FoldNull" + std::to_string(count);
+    {
+      auto writer = rs_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, table,
+          rs_->CreateTable(writer,
+                           Schema(name, {Column("value", ValueType::kInt64)})));
+      for (int i = 0; i < count; ++i) {
+        ASSERT_SUCCESS(table.Insert(writer.txn_, Row({Value()})).GetStatus());
+      }
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    auto reader = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, reader.GetTable(name));
+    auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 4, 1);
+    AggregationExecutor aggregate(
+        scan, table->GetSchema(),
+        {NamedExpression(
+             "rows", AggregateExpressionExp(AggregationType::kCount, nullptr)),
+         NamedExpression("count",
+                         AggregateExpressionExp(AggregationType::kCount,
+                                                ColumnValueExp("value"))),
+         NamedExpression("sum",
+                         AggregateExpressionExp(AggregationType::kSum,
+                                                ColumnValueExp("value")))});
+    Row row;
+    ASSERT_TRUE(aggregate.Next(&row, nullptr));
+    EXPECT_TRUE(scan->WasTypedFolded());
+    EXPECT_EQ(row, Row({Value(count), Value(0), Value()}));
+    ASSERT_SUCCESS(aggregate.GetStatus());
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+}
+
+TEST_F(ExecutorTest, FusedTypedScanSurfacesConsumerFailure) {
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTableName));
+  ParallelScan scan(reader.txn_, *table, 4, 1, std::vector<slot_t>{0});
+  StatusOr<bool> result = scan.TryFoldTypedMorsels(
+      [](size_t, const TypedCellBatch&) { return Status::kConflicts; });
+  EXPECT_FALSE(result.HasValue());
+  EXPECT_EQ(result.GetStatus(), Status::kConflicts);
+  EXPECT_EQ(scan.GetStatus(), Status::kConflicts);
+  DataChunk chunk;
+  EXPECT_EQ(scan.NextBatch(&chunk), 0U);
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 // The worker-side row filter must decide rows inside the decode workers and
@@ -2697,19 +3054,6 @@ class FailingBatchExecutor final : public ExecutorBase {
   explicit FailingBatchExecutor(size_t good_batches)
       : remaining_(good_batches) {}
 
-  bool Next(Row* dst, RowPosition* position) override {
-    if (remaining_ == 0 || failed_) {
-      return false;
-    }
-    *dst = Row({Value(static_cast<int64_t>(emitted_))});
-    if (position != nullptr) {
-      *position = RowPosition(1, static_cast<slot_t>(emitted_));
-    }
-    ++emitted_;
-    --remaining_;
-    return true;
-  }
-
   size_t NextBatch(DataChunk* destination, size_t max_rows) override {
     destination->Reset();
     for (size_t i = 0; i < max_rows && !failed_; ++i) {
@@ -2747,9 +3091,10 @@ class FailingBatchExecutor final : public ExecutorBase {
 TEST_F(ExecutorTest, DecoratorForwardsInnerFailure) {
   class FailsImmediately final : public ExecutorBase {
    public:
-    bool Next(Row* /*dst*/, RowPosition* /*rp*/) override {
-      return FailWith(
-          StatusError(StatusCode::kConflicts, "synthetic inner failure"));
+    size_t NextBatch(DataChunk* dst, size_t /*max_rows*/) override {
+      dst->Reset();
+      FailWith(StatusError(StatusCode::kConflicts, "synthetic inner failure"));
+      return 0;
     }
     void Dump(std::ostream& out, int /*indent*/) const override {
       out << "FailsImmediately";
@@ -4194,23 +4539,27 @@ TEST_F(ExecutorTest, RelationalHybridHashJoinSpillsUnderBudget) {
 TEST_F(ExecutorTest, RelationalHybridHashLeftJoinSpillsUnderBudget) {
   CreateWideTable(*rs_, "WideLeft", 200);
   ScopedQueryMemory memory(65536);
-  // No right row matches b.key = 999, so every left row is null-extended; the
-  // hybrid hash join must emit unmatched rows from both the resident bucket
+  // Arithmetic keeps this predicate out of the non-throwing bare-comparison
+  // scan pushdown, so this test still exercises a spilled right build.
+  // No right row matches (b.key + 0) = 999, so every left row is null-extended;
+  // the hybrid hash join must emit unmatched rows from both the resident bucket
   // and the replayed spilled partitions. The EXISTS marker forces the
   // relational engine (M6 routes plain LEFT joins to the cost-based
   // optimizer); it is semantically neutral.
   const auto rows = RelationalRun(
       *rs_,
       "SELECT a.key FROM WideLeft AS a LEFT JOIN WideLeft AS b ON "
-      "a.key = b.key AND b.key = 999 WHERE EXISTS (SELECT 1 FROM WideLeft);");
+      "a.key = b.key AND (b.key + 0) = 999 WHERE EXISTS (SELECT 1 FROM "
+      "WideLeft);");
   ASSERT_EQ(rows.size(), 200U);
-  const std::string plan = RelationalExplain(*rs_,
-                                             "SELECT a.key FROM WideLeft AS a "
-                                             "LEFT JOIN WideLeft AS b ON "
-                                             "a.key = b.key AND b.key = 999 "
-                                             "WHERE EXISTS (SELECT 1 FROM "
-                                             "WideLeft);",
-                                             /*analyze=*/true);
+  const std::string plan =
+      RelationalExplain(*rs_,
+                        "SELECT a.key FROM WideLeft AS a "
+                        "LEFT JOIN WideLeft AS b ON "
+                        "a.key = b.key AND (b.key + 0) = 999 "
+                        "WHERE EXISTS (SELECT 1 FROM "
+                        "WideLeft);",
+                        /*analyze=*/true);
   EXPECT_EQ(StatsValue(plan, "hybrid_hash_joins="), 1);
   EXPECT_GT(StatsValue(plan, "relation_spills="), 0);
 }
@@ -5091,16 +5440,14 @@ TEST_F(ExecutorTest, HashJoinReactiveSpillIntKeyUnderBudget) {
   class PositionedRows final : public ExecutorBase {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
-    bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) {
-        return false;
+    size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+      dst->Reset();
+      while (offset_ < rows_.size() && dst->Size() < max_rows) {
+        dst->Append(rows_[offset_],
+                    RowPosition(7, static_cast<slot_t>(offset_)));
+        ++offset_;
       }
-      *dst = rows_[offset_];
-      if (rp != nullptr) {
-        *rp = RowPosition(7, static_cast<slot_t>(offset_));
-      }
-      ++offset_;
-      return true;
+      return dst->Size();
     }
     void Dump(std::ostream& out, int /*indent*/) const override {
       out << "PositionedRows";
@@ -5499,16 +5846,14 @@ TEST_F(ExecutorTest, SortExternalSpillDescendingPreservesPositions) {
   class PositionedRows final : public ExecutorBase {
    public:
     explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
-    bool Next(Row* dst, RowPosition* rp) override {
-      if (offset_ >= rows_.size()) {
-        return false;
+    size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+      dst->Reset();
+      while (offset_ < rows_.size() && dst->Size() < max_rows) {
+        dst->Append(rows_[offset_],
+                    RowPosition(7, static_cast<slot_t>(offset_)));
+        ++offset_;
       }
-      *dst = rows_[offset_];
-      if (rp != nullptr) {
-        *rp = RowPosition(7, static_cast<slot_t>(offset_));
-      }
-      ++offset_;
-      return true;
+      return dst->Size();
     }
     void Dump(std::ostream& out, int /*indent*/) const override {
       out << "PositionedRows";
@@ -6042,6 +6387,134 @@ TEST_F(ExecutorTest, RelationalPrebuiltScalarCompareMatchesCorrelatedMin) {
   // pid1: 10 != MAX(5,7)=7.  pid2: 20 = 20.  pid3: scalar NULL.
   ASSERT_EQ(max_rows.size(), 1U);
   EXPECT_EQ(max_rows[0][0], Value(2));
+}
+
+TEST_F(ExecutorTest, TypedMorselTopNKeepsNullOrderStableTiesAndPositions) {
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            writer,
+            Schema("TypedTop", {Column("k", ValueType::kInt64),
+                                Column("id", ValueType::kInt64),
+                                Column("padding", ValueType::kVarChar)})));
+    for (int64_t i = 0; i < 100; ++i)
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({i % 9 == 0 ? Value() : Value(i % 5), Value(i),
+                           Value(std::string(12000, 'x'))}))
+              .GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("TypedTop"));
+  const std::vector<slot_t> projection{0, 1};
+  const Schema schema("TypedTop", {Column("k", ValueType::kInt64),
+                                   Column("id", ValueType::kInt64)});
+  for (const bool ascending : {true, false}) {
+    for (const bool nulls_first : {true, false}) {
+      const std::vector<TopNExecutor::Key> keys{
+          {ColumnValueExp(ColumnName("k")), ascending, nulls_first}};
+      auto parallel =
+          std::make_shared<ParallelScan>(reader.txn_, *table, 4, 1, projection);
+      auto serial = std::make_shared<FullScan>(
+          reader.txn_, *table, std::numeric_limits<size_t>::max(), false, true,
+          std::nullopt, projection);
+      TopNExecutor actual(parallel, schema, keys, 11, 3);
+      TopNExecutor expected(serial, schema, keys, 11, 3);
+      Row row, reference;
+      RowPosition position, reference_position;
+      while (expected.Next(&reference, &reference_position)) {
+        ASSERT_TRUE(actual.Next(&row, &position));
+        EXPECT_EQ(row, reference);
+        EXPECT_EQ(position, reference_position);
+      }
+      EXPECT_FALSE(actual.Next(&row, &position));
+      EXPECT_TRUE(actual.GetStatus().ok());
+      EXPECT_TRUE(parallel->WasTypedFolded());
+    }
+  }
+  struct RestoreBudget {
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  QueryMemoryBudget::Global().ResetForTest(128);
+  auto parallel =
+      std::make_shared<ParallelScan>(reader.txn_, *table, 4, 1, projection);
+  TopNExecutor fallback(
+      parallel, schema,
+      {{ColumnValueExp(ColumnName("id")), false, std::nullopt}}, 1, 0);
+  Row row;
+  ASSERT_TRUE(fallback.Next(&row, nullptr));
+  EXPECT_EQ(row[1], Value(99));
+  EXPECT_FALSE(parallel->WasTypedFolded());
+  EXPECT_EQ(QueryMemoryBudget::Global().Used(), 0U);
+}
+
+TEST_F(ExecutorTest, TypedSerialFoldHonorsLimitsAndDeclinesAfterConsumption) {
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTableName));
+  FullScan scan(reader.txn_, *table, 2, false, true, std::nullopt,
+                std::vector<slot_t>{0});
+  size_t count = 0;
+  auto folded =
+      scan.TryFoldTypedBatches([&](size_t, const TypedCellBatch& batch) {
+        count += batch.rows;
+        return Status::kSuccess;
+      });
+  ASSERT_TRUE(folded.HasValue());
+  EXPECT_TRUE(folded.Value());
+  EXPECT_EQ(count, 2U);
+  Row row;
+  EXPECT_FALSE(scan.Next(&row, nullptr));
+  FullScan consumed(reader.txn_, *table, 3, false, true, std::nullopt,
+                    std::vector<slot_t>{0});
+  ASSERT_TRUE(consumed.Next(&row, nullptr));
+  auto declined = consumed.TryFoldTypedBatches(
+      [](size_t, const TypedCellBatch&) { return Status::kSuccess; });
+  ASSERT_TRUE(declined.HasValue());
+  EXPECT_FALSE(declined.Value());
+  EXPECT_TRUE(consumed.Next(&row, nullptr));
+  FullScan unsupported(reader.txn_, *table);
+  auto no = unsupported.TryFoldTypedBatches(
+      [](size_t, const TypedCellBatch&) { return Status::kSuccess; });
+  ASSERT_TRUE(no.HasValue());
+  EXPECT_FALSE(no.Value());
+  EXPECT_TRUE(unsupported.Next(&row, nullptr));
+}
+
+TEST_F(ExecutorTest, FullScanExecutesLSTableFragmentOverPaxChunk) {
+  TransactionContext reader = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable(kTableName));
+  FullScan scan(reader.txn_, *table);
+
+  Fragment fragment;
+  fragment.access = AccessMode::kFilterScan;
+  Conjunct ge_one;
+  ge_one.kind = ConjunctKind::kCompare;
+  ge_one.col = 1;  // column 1 in lstable_schema is "key" (0 is "__rowid")
+  ge_one.op = CompareOp::kGe;
+  ge_one.literal_kind = LiteralKind::kInt64;
+  ge_one.int64_literal = 1;
+  fragment.conjuncts.push_back(ge_one);
+  Aggregate sum_key;
+  sum_key.kind = AggregateKind::kSum;
+  sum_key.col = 1;
+  fragment.aggregate = sum_key;
+
+  StatusOr<ExecResult> exec_or =
+      scan.ExecuteLSTableFragment(fragment, Runtime::kNative);
+  ASSERT_TRUE(exec_or.HasValue());
+  const ExecResult& res = exec_or.Value();
+  EXPECT_FALSE(res.rejected);
+  EXPECT_EQ(res.status, Status::kSuccess);
+  EXPECT_EQ(res.scalar_count, 3U);
+  EXPECT_EQ(res.scalar_value, 6);
 }
 
 }  // namespace tinylamb

@@ -38,7 +38,6 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
 
   ~IncrementalSortExecutor() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
@@ -51,12 +50,14 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
     return output_.size();
   }
   [[nodiscard]] size_t MaterializedBytes() const override {
-    return charge_.Bytes();
+    return charge_.Bytes() +
+           (group_sort_ ? group_sort_->MaterializedBytes() : 0);
   }
 
  private:
   void EnsureMaterialized();
   void ExecuteIncrementalSort();
+  bool NextStreaming(Row* dst, RowPosition* rp);
   [[nodiscard]] bool ArePrefixEqual(const Row& a, const Row& b);
 
   Executor source_;
@@ -69,6 +70,13 @@ class IncrementalSortExecutor : public ExecutorBase, public PipelineBreaker {
   Status sort_error_{Status::kSuccess};
   bool materialized_{false};
   QueryMemoryCharge charge_;
+  std::shared_ptr<SortExecutor> group_sort_;
+  Row pending_row_;
+  RowPosition pending_position_;
+  bool has_pending_{false};
+  bool input_exhausted_{false};
+  bool singleton_passthrough_{false};
+  size_t singleton_runs_{0};
 };
 
 }  // namespace tinylamb

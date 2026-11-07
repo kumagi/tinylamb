@@ -39,6 +39,7 @@
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
@@ -60,6 +61,7 @@
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
 #include "plan/projection_plan.hpp"
+#include "plan/relational_plan.hpp"
 #include "plan/values_plan.hpp"
 #include "query/query_data.hpp"
 #include "query/statement.hpp"
@@ -2439,23 +2441,19 @@ StatusOr<Plan> Optimizer::OptimizeRelational(
     std::shared_ptr<const SelectStatement> statement, Schema output_schema,
     TransactionContext& ctx) {
   (void)ctx;
-  cascades::Memo memo;
-  const cascades::GroupId root =
-      memo.EnsureDerivedGroup({}, "relational-ir-root");
-  cascades::LogicalExpression logical;
-  logical.operation = cascades::LogicalOperator::kRelational;
-  logical.relational_statement = std::move(statement);
-  logical.output_schema = std::move(output_schema);
-  memo.AddExpression(root, std::move(logical));
-
-  cascades::SearchEngine search(std::move(memo), cascades::RuleSet::Default());
-  const std::optional<cascades::BestPlan> best = search.Optimize(
-      root, cascades::PhysicalProperties{}, DefaultImplementationRules());
-  if (!best) {
+  if (!statement) {
     return Status::kNotImplemented;
   }
-  AttachAppliedRuleNames(best->plan, search);
-  return best->plan;
+  Plan plan = std::make_shared<RelationalPlan>(std::move(statement),
+                                               std::move(output_schema));
+  PlanExplainInfo info = plan->ExplainInfo();
+  info.rule_name = "relational_ir";
+  info.physical_operator = "Relational";
+  info.required_properties = "none";
+  info.provided_properties = "none";
+  info.applied_rules = "relational_ir";
+  plan->SetExplainInfo(std::move(info));
+  return plan;
 }
 
 namespace {
@@ -3007,29 +3005,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
   // Required-column computation (Phase 3): every touched column is needed on
   // each root-to-leaf path of a conjunctive query, so the per-relation
   // projection lists follow directly from the global touched set.
-  const auto same_identifier = [](std::string_view left,
-                                  std::string_view right) {
-    if (left.size() != right.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < left.size(); ++i) {
-      if (std::tolower(static_cast<unsigned char>(left[i])) !=
-          std::tolower(static_cast<unsigned char>(right[i]))) {
-        return false;
-      }
-    }
-    return true;
-  };
   for (const auto& [relation, table] : rule_context.tables) {
     const std::string physical_name{table->GetSchema().Name()};
     std::vector<NamedExpression> projection;
     for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i) {
       const ColumnName& table_column = table->GetSchema().GetColumn(i).Name();
       if (std::ranges::any_of(touched, [&](const ColumnName& column) {
-            return same_identifier(table_column.name, column.name) &&
+            return IdentifierEquals(table_column.name, column.name) &&
                    (column.schema.empty() ||
-                    same_identifier(column.schema, relation) ||
-                    same_identifier(column.schema, physical_name));
+                    IdentifierEquals(column.schema, relation) ||
+                    IdentifierEquals(column.schema, physical_name));
           })) {
         projection.emplace_back(table_column);
       }

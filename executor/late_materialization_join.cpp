@@ -323,8 +323,9 @@ bool LateMaterializationJoin::LoadNextIdentity() {
   if (initial_status_ != Status::kSuccess) {
     return FailWith(initial_status_);
   }
+  DataChunk left_batch;
   for (;;) {
-    if (!left_->Next(&hold_left_, &hold_left_position_)) {
+    if (left_->NextBatch(&left_batch, 1) == 0) {
       hold_left_.Clear();
       hold_left_position_ = RowPosition();
       have_left_ = false;
@@ -333,6 +334,8 @@ bool LateMaterializationJoin::LoadNextIdentity() {
       }
       return false;
     }
+    hold_left_ = left_batch.RowAt(0);
+    hold_left_position_ = left_batch.PositionAt(0);
     if (!IsLeftRowValid(hold_left_)) {
       return false;
     }
@@ -379,7 +382,7 @@ StatusOr<Row> LateMaterializationJoin::MaterializePayload(
   return full.Value().Extract(right_projection_);
 }
 
-bool LateMaterializationJoin::Next(Row* destination, RowPosition* position) {
+bool LateMaterializationJoin::NextRow(Row* destination, RowPosition* position) {
   if (GetStatus() != Status::kSuccess) {
     return false;
   }
@@ -444,7 +447,7 @@ size_t LateMaterializationJoin::NextBatch(DataChunk* destination,
   while (destination->Size() < max_rows) {
     Row row;
     RowPosition position;
-    if (!Next(&row, &position)) {
+    if (!NextRow(&row, &position)) {
       break;
     }
     destination->Append(std::move(row), position);

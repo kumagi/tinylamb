@@ -28,30 +28,40 @@ namespace tinylamb {
 CrossJoin::CrossJoin(Executor left, Executor right)
     : left_(std::move(left)), right_(std::move(right)) {}
 
-bool CrossJoin::Next(Row* dst, RowPosition* /*rp*/) {
+size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
   if (!table_constructed_) {
     TableConstruct();
   }
   // An empty right side produces zero rows; without this guard the iterator
   // below would dereference end().
   if (right_table_.empty()) {
-    return false;
+    return 0;
   }
-  if (right_iter_ == right_table_.end()) {
-    if (!left_->Next(&hold_left_, nullptr)) {
-      FailWithChildOf(*left_);
-      return false;
+  DataChunk left_batch;
+  while (destination->Size() < max_rows) {
+    if (right_iter_ == right_table_.end()) {
+      if (left_->NextBatch(&left_batch, 1) == 0) {
+        FailWithChildOf(*left_);
+        break;
+      }
+      hold_left_ = left_batch.RowAt(0);
+      right_iter_ = right_table_.begin();
     }
-    right_iter_ = right_table_.begin();
+    destination->Append(hold_left_ + *right_iter_++);
   }
-  *dst = hold_left_ + *right_iter_++;
-  return true;
+  return destination->Size();
 }
 
 void CrossJoin::TableConstruct() {
-  Row right_row;
-  while (right_->Next(&right_row, nullptr)) {
-    right_table_.push_back(std::move(right_row));
+  DataChunk batch;
+  while (right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_table_.push_back(batch.RowAt(i));
+    }
   }
   FailWithChildOf(*right_);
   right_iter_ = right_table_.end();

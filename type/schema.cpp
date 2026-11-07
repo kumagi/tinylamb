@@ -16,6 +16,8 @@
 
 #include "schema.hpp"
 
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <ostream>
 #include <string_view>
@@ -32,7 +34,7 @@ namespace tinylamb {
 
 namespace {
 std::atomic<std::uint64_t> next_lookup_identity{1};
-}
+}  // namespace
 
 std::uint64_t Schema::NextLookupIdentity() {
   return next_lookup_identity.fetch_add(1, std::memory_order_relaxed);
@@ -43,18 +45,27 @@ Schema::Schema() : identity_(NextLookupIdentity()) {}
 Schema::Schema(const Schema& other)
     : name_(other.name_),
       columns_(other.columns_),
-      identity_(NextLookupIdentity()) {}
+      identity_(NextLookupIdentity()),
+      key_column_index_(other.key_column_index_),
+      schema_version_(other.schema_version_),
+      all_fixed_cache_(other.all_fixed_cache_) {}
 
 Schema::Schema(Schema&& other) noexcept
     : name_(std::move(other.name_)),
       columns_(std::move(other.columns_)),
-      identity_(NextLookupIdentity()) {}
+      identity_(NextLookupIdentity()),
+      key_column_index_(other.key_column_index_),
+      schema_version_(other.schema_version_),
+      all_fixed_cache_(other.all_fixed_cache_) {}
 
 Schema& Schema::operator=(const Schema& other) {
   if (this != &other) {
     name_ = other.name_;
     columns_ = other.columns_;
     identity_ = NextLookupIdentity();
+    key_column_index_ = other.key_column_index_;
+    schema_version_ = other.schema_version_;
+    all_fixed_cache_ = other.all_fixed_cache_;
   }
   return *this;
 }
@@ -64,19 +75,42 @@ Schema& Schema::operator=(Schema&& other) noexcept {
     name_ = std::move(other.name_);
     columns_ = std::move(other.columns_);
     identity_ = NextLookupIdentity();
+    key_column_index_ = other.key_column_index_;
+    schema_version_ = other.schema_version_;
+    all_fixed_cache_ = other.all_fixed_cache_;
   }
   return *this;
 }
 
-Schema::Schema(std::string_view schema_name, std::vector<Column> columns)
+Schema::Schema(std::string_view schema_name, std::vector<Column> columns,
+               uint16_t key_column_index, uint64_t schema_version)
     : name_(schema_name),
       columns_(std::move(columns)),
-      identity_(NextLookupIdentity()) {
+      identity_(NextLookupIdentity()),
+      key_column_index_(key_column_index),
+      schema_version_(schema_version) {
+  if (key_column_index_ >= columns_.size()) {
+    key_column_index_ = 0;
+  }
   for (auto& c : columns_) {
     if (c.Name().schema.empty()) {
       c.Name().schema = Name();
     }
   }
+  RefreshDerived();
+}
+
+void Schema::RefreshDerived() {
+  bool all_fixed = true;
+  for (const Column& col : columns_) {
+    const ValueType t = col.Type();
+    if (t != ValueType::kInt64 && t != ValueType::kDate &&
+        t != ValueType::kDouble) {
+      all_fixed = false;
+      break;
+    }
+  }
+  all_fixed_cache_ = all_fixed ? 1 : 2;
 }
 
 bool Schema::operator==(const Schema& rhs) const {
@@ -185,6 +219,7 @@ Decoder& operator>>(Decoder& e, Schema& sc) {
   // keyed by the old identity must not survive even a partial decode.
   sc.identity_ = Schema::NextLookupIdentity();
   e >> sc.name_ >> sc.columns_;
+  sc.RefreshDerived();
   return e;
 }
 

@@ -17,6 +17,9 @@
 
 namespace tinylamb {
 
+class ParallelScan;
+struct LSTablePageBlock;
+
 // Global aggregation with one independent state per worker followed by a
 // deterministic merge.  DISTINCT sets are merged by value, not by combining
 // partial counts, so duplicates spanning morsels remain correct.
@@ -27,7 +30,6 @@ class ParallelAggregationExecutor final : public ExecutorBase {
       std::vector<NamedExpression> aggregates,
       size_t worker_count = std::thread::hardware_concurrency());
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& out, int indent) const override;
@@ -35,6 +37,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   [[nodiscard]] size_t WorkerCount() const { return worker_count_; }
 
  private:
+  bool Execute(Row* destination);
   // How each aggregate reads its input.  kInt64Column / kDoubleColumn
   // aggregates can run directly over the chunk's raw numeric storage;
   // everything else falls back to the per-row generic path.
@@ -42,14 +45,17 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     kRowCount,
     kInt64Column,
     kDoubleColumn,
+    kDoubleBinaryColumn,
     kStatColumn,  // statistical aggregate over raw numeric storage
     kGeneric
   };
   struct AggregateInput {
     AggregateInputKind kind{AggregateInputKind::kGeneric};
     size_t column{0};
-    // Second input of a two-argument statistical aggregate (COVAR_* / CORR).
+    // Second input of a two-argument statistical aggregate (COVAR_* / CORR)
+    // or RHS of a binary DOUBLE expression.
     size_t trailing_column{0};
+    BinaryOperation binary_op{BinaryOperation::kMultiply};
   };
 
   // Partial states are default-built, moved between shards, and merged by
@@ -90,6 +96,14 @@ class ParallelAggregationExecutor final : public ExecutorBase {
                                const ColumnVector& column) const;
   Status AccumulateDoubleColumn(PartialState* state, size_t aggregate_index,
                                 const ColumnVector& column) const;
+  Status AccumulateDoubleBinaryColumn(PartialState* state,
+                                      size_t aggregate_index,
+                                      const ColumnVector& lhs,
+                                      const ColumnVector& rhs,
+                                      BinaryOperation op) const;
+  Status AccumulateLSTableBlock(PartialState* state, const ParallelScan& scan,
+                                const LSTablePageBlock& blk,
+                                const uint32_t* rows, size_t count) const;
   // Fast-path statistical accumulation over raw numeric storage; `trailing`
   // is null for the single-input forms (VAR_* / STDDEV_*).
   static Status AccumulateStatColumns(PartialState* state,
@@ -119,6 +133,7 @@ class ParallelAggregationExecutor final : public ExecutorBase {
   std::vector<size_t> row_count_indices_;
   std::vector<size_t> int64_column_indices_;
   std::vector<size_t> double_column_indices_;
+  std::vector<size_t> double_binary_column_indices_;
   std::vector<size_t> stat_column_indices_;
   std::vector<size_t> generic_indices_;
   size_t worker_count_;

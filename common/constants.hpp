@@ -58,6 +58,17 @@ static constexpr size_t kDefaultPagePoolCapacity =
     if (tmp_status != Status::kSuccess) return tmp_status; \
   }
 
+#ifndef CRASH_IF_FAIL
+#define CRASH_IF_FAIL(expr)               \
+  {                                       \
+    Status tmp_status = expr;             \
+    if (tmp_status != Status::kSuccess) { \
+      assert(false && #expr);             \
+      abort();                            \
+    }                                     \
+  }
+#endif
+
 enum class StatusCode : uint8_t {
   kUnknown,
   kSuccess,
@@ -72,6 +83,7 @@ enum class StatusCode : uint8_t {
   kIsInfinity,
   kDeleted,
   kCorrupt,
+  kCorruption = kCorrupt,
   kIOError,
   kInvalidArgument,
   kRuntimeError,
@@ -103,6 +115,7 @@ class Status {
   static const inline StatusCode kIsInfinity{StatusCode::kIsInfinity};
   static const inline StatusCode kDeleted{StatusCode::kDeleted};
   static const inline StatusCode kCorrupt{StatusCode::kCorrupt};
+  static const inline StatusCode kCorruption{StatusCode::kCorrupt};
   static const inline StatusCode kIOError{StatusCode::kIOError};
   static const inline StatusCode kInvalidArgument{StatusCode::kInvalidArgument};
   static const inline StatusCode kRuntimeError{StatusCode::kRuntimeError};

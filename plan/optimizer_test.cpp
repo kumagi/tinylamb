@@ -43,6 +43,7 @@
 #include "executor/update.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "gtest/gtest.h"
 #include "index/index_schema.hpp"
@@ -50,9 +51,11 @@
 #include "plan/cascades.hpp"
 #include "plan/full_scan_plan.hpp"
 #include "plan/implementation_rules.hpp"
+#include "plan/index_scan_plan.hpp"
 #include "plan/merge_join_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/product_plan.hpp"
+#include "plan/selection_plan.hpp"
 #include "plan/sort_distinct_plan.hpp"
 #include "plan/sort_plan.hpp"
 #include "plan/zigzag_join_plan.hpp"
@@ -245,6 +248,49 @@ TEST_F(OptimizerTest, FilteredScanEstimateAppliesSelectivityOnce) {
   ASSERT_TRUE(plan.HasValue());
   EXPECT_GE(plan.Value()->EmitRowCount(), 55U);
   EXPECT_LE(plan.Value()->EmitRowCount(), 65U);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(OptimizerTest, FullScanPeeksCheckColumnTypeBeforeReadingIntegerBytes) {
+  TransactionContext context = rs_->BeginContext();
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, statistics,
+                        context.GetStats("Sc1"));
+  rule_context.tables.emplace("Sc1", table);
+  rule_context.statistics.emplace("Sc1", statistics);
+  const cascades::ImplementationRule* scan_rule = nullptr;
+  for (const auto& rule : DefaultImplementationRules().Rules()) {
+    if (rule.Name() == "full_scan") {
+      scan_rule = &rule;
+      break;
+    }
+  }
+  ASSERT_NE(scan_rule, nullptr);
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(25))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c3")),
+                          BinaryOperation::kLessThan,
+                          ConstantValueExp(Value(25))));
+  cascades::Memo memo;
+  const auto group = memo.Build({"Sc1"}, {{predicate, {"Sc1"}}});
+  const auto alternatives =
+      scan_rule->Apply(memo, group, memo.Get(group).expressions.front(), {},
+                       cascades::PhysicalProperties{}, rule_context);
+  ASSERT_EQ(alternatives.size(), 1);
+  const auto selection =
+      std::dynamic_pointer_cast<SelectionPlan>(alternatives.front().plan);
+  ASSERT_NE(selection, nullptr);
+  const auto scan = std::dynamic_pointer_cast<FullScanPlan>(selection->Src());
+  ASSERT_NE(scan, nullptr);
+  ASSERT_EQ(scan->PeekCompares().size(), 1);
+  EXPECT_EQ(scan->PeekCompares()[0].column, 0);
+  EXPECT_EQ(scan->PeekCompares()[0].constant, 25);
+  EXPECT_EQ(scan->PeekCompares()[0].op, BinaryOperation::kLessThan);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -677,7 +723,7 @@ TEST_F(OptimizerTest, AggregateLimitDoesNotCapInputScan) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, CountStarUsesUnboundedIndexOnlyScan) {
+TEST_F(OptimizerTest, CountStarPrefersFullScanForDistinctIndexKeys) {
   QueryData query{
       {"Sc1"},
       nullptr,
@@ -689,14 +735,14 @@ TEST_F(OptimizerTest, CountStarUsesUnboundedIndexOnlyScan) {
   ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
   std::ostringstream logical;
   plan->Dump(logical, 0);
-  EXPECT_NE(logical.str().find("IndexOnlyScan"), std::string::npos)
+  EXPECT_EQ(logical.str().find("IndexOnlyScan"), std::string::npos)
       << logical.str();
-  EXPECT_EQ(logical.str().find("FullScan"), std::string::npos) << logical.str();
+  EXPECT_NE(logical.str().find("FullScan"), std::string::npos) << logical.str();
 
   Executor executor = plan->EmitExecutor(context);
   std::ostringstream physical;
   executor->Dump(physical, 0);
-  EXPECT_NE(physical.str().find("IndexOnlyScan"), std::string::npos)
+  EXPECT_NE(physical.str().find("FullScan"), std::string::npos)
       << physical.str();
   Row row;
   ASSERT_TRUE(executor->Next(&row, nullptr));
@@ -3156,6 +3202,7 @@ TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
     ASSERT_SUCCESS(q.Rewrite(context));
     OptimizerOptions options = OptimizerOptions::Default();
     options.disabled_implementation_rules.insert("nested_loop_join");
+    options.disabled_implementation_rules.insert("band_join");
     const auto plan_or = Optimizer::Optimize(q, context, options);
     ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
     Executor executor = plan_or.Value()->EmitExecutor(context);
@@ -3173,7 +3220,7 @@ TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
     ASSERT_SUCCESS(context.PreCommit());
   }
   {
-    // Act: the blocked executor wins without disabling the tuple fallback.
+    // Act: selective index bounds make BandJoin cheaper by default.
     QueryData q = query();
     TransactionContext context = rs_->BeginContext();
     ASSERT_SUCCESS(q.Rewrite(context));
@@ -3181,13 +3228,12 @@ TEST_F(OptimizerTest, BatchNestedLoopExecutesNonEquiInnerJoin) {
     ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
     std::ostringstream plan_dump;
     plan_dump << plan_or.Value();
-    EXPECT_NE(plan_dump.str().find("Batch"), std::string::npos)
+    EXPECT_NE(plan_dump.str().find("BandJoin"), std::string::npos)
         << plan_dump.str();
     Executor executor = plan_or.Value()->EmitExecutor(context);
     std::ostringstream dump;
     executor->Dump(dump, 0);
-    EXPECT_NE(dump.str().find("BatchNestedLoopJoin"), std::string::npos)
-        << dump.str();
+    EXPECT_NE(dump.str().find("BandJoin"), std::string::npos) << dump.str();
 
     // Assert: same single row.
     Row row;
@@ -3979,13 +4025,34 @@ TEST_F(OptimizerTest, IndexJoinRuleKeepsUnprobedPredicatesResidual) {
 // residual re-check disagreed and the join lost rows. Whichever orientation
 // wins, the pairs must equal the nested-loop mirror below.
 TEST_F(OptimizerTest, ZigZagJoinChoosesTwoOrderedIndexesAndCanFallback) {
+  // Duplicate-heavy indexes amortize distinct-key cursor navigation. With
+  // unique keys the newly calibrated full scan + hash/index join is cheaper.
+  {
+    auto setup = rs_->BeginContext();
+    for (const std::string name : {"ZigLeft", "ZigRight"}) {
+      ASSIGN_OR_ASSERT_FAIL(
+          Table, table,
+          rs_->CreateTable(setup,
+                           Schema(name, {Column("k", ValueType::kInt64)})));
+      for (int64_t i = 0; i < 100; ++i) {
+        ASSERT_SUCCESS(
+            table.Insert(setup.txn_, Row({Value(i % 10)})).GetStatus());
+      }
+      ASSERT_SUCCESS(rs_->CreateIndex(
+          setup, name,
+          IndexSchema(name + "Idx", {0}, {}, IndexMode::kNonUnique)));
+      ASSERT_SUCCESS(rs_->RefreshStatistics(setup, name));
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
   QueryData query{
-      {"Sc1", "Sc2"},
-      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+      {"ZigLeft", "ZigRight"},
+      BinaryExpressionExp(ColumnValueExp(ColumnName("ZigLeft", "k")),
                           BinaryOperation::kEquals,
-                          ColumnValueExp(ColumnName("Sc2", "d1"))),
-      {NamedExpression("left_key", ColumnValueExp(ColumnName("Sc1", "c1"))),
-       NamedExpression("right_key", ColumnValueExp(ColumnName("Sc2", "d1")))}};
+                          ColumnValueExp(ColumnName("ZigRight", "k"))),
+      {NamedExpression("left_key", ColumnValueExp(ColumnName("ZigLeft", "k"))),
+       NamedExpression("right_key",
+                       ColumnValueExp(ColumnName("ZigRight", "k")))}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
 
@@ -4002,7 +4069,7 @@ TEST_F(OptimizerTest, ZigZagJoinChoosesTwoOrderedIndexesAndCanFallback) {
     row = Row();
   }
   EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
-  EXPECT_EQ(rows, 100U);
+  EXPECT_EQ(rows, 1000U);
 
   OptimizerOptions fallback = OptimizerOptions::Default();
   fallback.disabled_implementation_rules = {"zigzag_join"};
@@ -4019,7 +4086,7 @@ TEST_F(OptimizerTest, ZigZagJoinChoosesTwoOrderedIndexesAndCanFallback) {
     row = Row();
   }
   EXPECT_EQ(fallback_executor->GetStatus(), Status::kSuccess);
-  EXPECT_EQ(rows, 100U);
+  EXPECT_EQ(rows, 1000U);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -4600,7 +4667,7 @@ TEST_F(OptimizerTest, ParallelScanEmittedForLargeAnalyzedTable) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, ParallelAggregationEmittedForLargeChild) {
+TEST_F(OptimizerTest, IntegerAggregationFoldsLargeParallelScan) {
   // Arrange: aggregation over a child estimated above the parallel threshold.
   const std::string kTable = "BigParallelAgg";
   InsertAnalyzedBigTable(rs_.get(), kTable);
@@ -4621,13 +4688,12 @@ TEST_F(OptimizerTest, ParallelAggregationEmittedForLargeChild) {
   ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
   const Plan& plan = plan_or.Value();
 
-  // Act + Assert: the emitted executor is the parallel aggregation and both
-  // aggregates match the sequential semantics.
+  // Integer payloads fold in the parallel scan without a second worker
+  // pool. Keep the parallel scan and validate both aggregate results.
   Executor executor = plan->EmitExecutor(context);
   std::ostringstream physical;
   executor->Dump(physical, 0);
-  EXPECT_NE(physical.str().find("ParallelAggregationExecutor"),
-            std::string::npos)
+  EXPECT_NE(physical.str().find("ParallelScan"), std::string::npos)
       << physical.str();
   Row row;
   ASSERT_TRUE(executor->Next(&row, nullptr));
@@ -5221,11 +5287,11 @@ TEST_F(OptimizerTest, TopNPushSkippedWhenReferentialIntegrityFails) {
             expected);
 }
 
-TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
+TEST_F(OptimizerTest, ClusteringPenaltySteersSelectiveRangeScanChoice) {
   // Two 2000-row tables with an index on key: one in ascending order,
   // one permuted with adjacent comparisons balanced in both directions.
-  // A 60% range costs 1200 heap rows clustered (index wins over the 2000-row
-  // full scan) but 1200 x 3.0 = 3600 unclustered (full scan wins).
+  // A selective range still wins on clustered data after charging heap
+  // fetches, but its random-access penalty makes the unclustered scan lose.
   constexpr int64_t kRows = 2000;
   {
     TransactionContext writer = rs_->BeginContext();
@@ -5270,7 +5336,7 @@ TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
             BinaryOperation::kAnd,
             BinaryExpressionExp(ColumnValueExp("key"),
                                 BinaryOperation::kLessThan,
-                                ConstantValueExp(Value(int64_t{1400})))),
+                                ConstantValueExp(Value(int64_t{400})))),
         {NamedExpression("key"), NamedExpression("payload")}};
     TransactionContext context = rs_->BeginContext();
     EXPECT_EQ(query.Rewrite(context), Status::kSuccess);
@@ -5289,10 +5355,10 @@ TEST_F(OptimizerTest, ClusteringPenaltySteersWideRangeScanChoice) {
   };
   const auto [clust_dump, clust_rows] = plan_for("ClustKeys");
   EXPECT_NE(clust_dump.find("IndexScan"), std::string::npos) << clust_dump;
-  EXPECT_EQ(clust_rows, 1200U);
+  EXPECT_EQ(clust_rows, 200U);
   const auto [unclust_dump, unclust_rows] = plan_for("UnclustKeys");
   EXPECT_NE(unclust_dump.find("FullScan"), std::string::npos) << unclust_dump;
-  EXPECT_EQ(unclust_rows, 1200U);
+  EXPECT_EQ(unclust_rows, 200U);
 }
 
 TEST_F(OptimizerTest, CoveringIndexWinsOverNonCoveringIndexForTheSameRange) {
@@ -5414,7 +5480,7 @@ TEST_F(OptimizerTest, ParallelIndexScanEmittedForLargeIndexRange) {
         rs_->CreateTable(
             writer, Schema(kTable, {Column("key", ValueType::kInt64),
                                     Column("payload", ValueType::kInt64)})));
-    for (int64_t key = 0; key < kParallelTestRows; ++key) {
+    for (int64_t key = 0; key < 6 * kParallelTestRows; ++key) {
       ASSERT_SUCCESS(tbl.Insert(writer.txn_, Row({Value(key), Value(key * 3)}))
                          .GetStatus());
     }
@@ -5427,11 +5493,16 @@ TEST_F(OptimizerTest, ParallelIndexScanEmittedForLargeIndexRange) {
     ASSERT_SUCCESS(rs_->RefreshStatistics(stats_ctx, kTable));
     ASSERT_SUCCESS(stats_ctx.PreCommit());
   }
-  QueryData query{{kTable},
-                  BinaryExpressionExp(ColumnValueExp("key"),
-                                      BinaryOperation::kGreaterThanEquals,
-                                      ConstantValueExp(Value(int64_t{0}))),
-                  {NamedExpression("key"), NamedExpression("payload")}};
+  QueryData query{
+      {kTable},
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("key"),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(int64_t{0}))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(kParallelTestRows)))),
+      {NamedExpression("key"), NamedExpression("payload")}};
   TransactionContext context = rs_->BeginContext();
   ASSERT_SUCCESS(query.Rewrite(context));
   ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
@@ -5454,9 +5525,13 @@ TEST_F(OptimizerTest, ParallelIndexScanEmittedForLargeIndexRange) {
   // A small range (10 rows) keeps the serial IndexScan.
   QueryData small{
       {kTable},
-      BinaryExpressionExp(ColumnValueExp("key"),
-                          BinaryOperation::kGreaterThanEquals,
-                          ConstantValueExp(Value(kParallelTestRows - 10))),
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("key"),
+                              BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(kParallelTestRows - 10))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp("key"), BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(kParallelTestRows)))),
       {NamedExpression("key"), NamedExpression("payload")}};
   TransactionContext small_ctx = rs_->BeginContext();
   ASSERT_SUCCESS(small.Rewrite(small_ctx));
@@ -5684,6 +5759,149 @@ TEST_F(OptimizerTest, OrderedOuterDiscountsTheIndexProbeIntoAWin) {
   // offer, the same query loses to the hash join.
   EXPECT_NE(ordered_text.find("Index Join"), std::string::npos) << ordered_text;
   EXPECT_EQ(plain_text.find("Index Join"), std::string::npos) << plain_text;
+}
+
+TEST_F(OptimizerTest, UnboundedNonCoveringIndexPaysForHeapAccess) {
+  QueryData query{{"Sc1"},
+                  nullptr,
+                  {NamedExpression("key", ColumnValueExp("c1")),
+                   NamedExpression("payload", ColumnValueExp("c2")),
+                   NamedExpression("score", ColumnValueExp("c3"))}};
+  auto context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("FullScan"), std::string::npos) << dump.str();
+  auto executor = plan->EmitExecutor(context);
+  Row row;
+  size_t count = 0;
+  while (executor->Next(&row, nullptr)) {
+    EXPECT_EQ(row.values_.size(), 3);
+    ++count;
+  }
+  EXPECT_EQ(count, 100);
+  ASSERT_SUCCESS(executor->GetStatus());
+}
+
+TEST_F(OptimizerTest, MixedDirectionTopNUsesStreamingOrderedPrefix) {
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            writer, Schema("PrefixTopN", {Column("x", ValueType::kInt64),
+                                          Column("y", ValueType::kInt64)})));
+    for (int64_t i = 0; i < 1000; ++i) {
+      ASSERT_SUCCESS(
+          table.Insert(writer.txn_, Row{Value(i / 10), Value(i % 10)})
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, "PrefixTopN",
+                         IndexSchema("xy", {0, 1}, {}, IndexMode::kNonUnique)));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(writer, "PrefixTopN"));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  QueryData query{
+      {"PrefixTopN"}, nullptr, {NamedExpression("x"), NamedExpression("y")}};
+  query.order_expressions_ = {ColumnValueExp("x"), ColumnValueExp("y")};
+  query.order_ascending_ = {false, true};
+  query.limit_count_ = 5;
+  auto context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("IncrementalSort"), std::string::npos)
+      << dump.str();
+  auto executor = plan->EmitExecutor(context);
+  Row row;
+  for (int64_t y = 0; y < 5; ++y) {
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(99), Value(y)}));
+  }
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(executor->GetStatus());
+}
+
+TEST_F(OptimizerTest, FilteredOrderedLimitUsesIndexAfterLayoutRewrite) {
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            writer,
+            Schema("ResidualLimit", {Column("id", ValueType::kInt64),
+                                     Column("bucket", ValueType::kInt64),
+                                     Column("payload", ValueType::kInt64)})));
+    for (int64_t i = 0; i < 10000; ++i) {
+      ASSIGN_OR_ASSERT_FAIL(
+          RowPosition, position,
+          table.Insert(writer.txn_,
+                       Row({Value(i), Value(i % 100), Value(10)})));
+      if (i == 0) {
+        ASSERT_SUCCESS(table
+                           .Update(writer.txn_, position,
+                                   Row({Value(i), Value(i % 100), Value(11)}))
+                           .GetStatus());
+      }
+    }
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(writer, "ResidualLimit",
+                         IndexSchema("pk", {0}, {}, IndexMode::kUnique)));
+    ASSERT_SUCCESS(rs_->RefreshStatistics(writer, "ResidualLimit"));
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  QueryData query{
+      {"ResidualLimit"},
+      BinaryExpressionExp(ColumnValueExp("bucket"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value(7))),
+      {NamedExpression("id"), NamedExpression("payload")}};
+  query.order_expressions_ = {ColumnValueExp("id")};
+  query.order_ascending_ = {true};
+  query.limit_count_ = 3;
+  auto context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  ASSIGN_OR_ASSERT_FAIL(Plan, plan, Optimizer::Optimize(query, context));
+  std::ostringstream dump;
+  plan->Dump(dump, 0);
+  EXPECT_NE(dump.str().find("IndexScan"), std::string::npos) << dump.str();
+  const uint64_t hits_before = rs_->CacheHits();
+  auto executor = plan->EmitExecutor(context);
+  std::ostringstream physical;
+  executor->Dump(physical, 0);
+  EXPECT_EQ(physical.str().find("ParallelIndexScan"), std::string::npos)
+      << physical.str();
+  Row row;
+  for (int64_t i = 0; i < 3; ++i) {
+    ASSERT_TRUE(executor->Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(7 + i * 100), Value(10)}));
+  }
+  EXPECT_FALSE(executor->Next(&row, nullptr));
+  ASSERT_SUCCESS(executor->GetStatus());
+  EXPECT_LT(rs_->CacheHits() - hits_before, 5000U);
+}
+
+TEST_F(OptimizerTest, ReboundFirstKeyUpperRangeKeepsCurrentEndpoint) {
+  auto context = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, context.GetTable("Sc1"));
+  const Index* index = nullptr;
+  for (size_t i = 0; i < table->IndexCount(); ++i) {
+    if (table->GetIndex(i).sc_.key_ == std::vector<slot_t>{0})
+      index = &table->GetIndex(i);
+  }
+  ASSERT_NE(index, nullptr);
+  auto bound = std::make_shared<ParameterSlot>(0, Value(2));
+  const Expression predicate = BinaryExpressionExp(
+      ColumnValueExp("c1"), BinaryOperation::kLessThan, bound);
+  for (int64_t upper : {2, 7, -1}) {
+    bound->Bind(Value(upper));
+    const auto keys = ReboundIndexKeysFromPredicate(
+        predicate, table->GetSchema(), *index, false);
+    EXPECT_TRUE(keys.begin_key.empty());
+    EXPECT_EQ(keys.end_key, std::vector<Value>{Value(upper)});
+  }
 }
 
 }  // namespace tinylamb

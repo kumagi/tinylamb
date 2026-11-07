@@ -334,17 +334,6 @@ class FailingRows final : public ExecutorBase {
  public:
   FailingRows(std::vector<Row> rows, size_t fail_after)
       : rows_(std::move(rows)), fail_after_(fail_after) {}
-  bool Next(Row* dst, RowPosition* rp) override {
-    if (offset_ >= fail_after_) {
-      return FailWith(StatusError(StatusCode::kIOError, "source failed"));
-    }
-    *dst = rows_[offset_];
-    if (rp != nullptr) {
-      *rp = RowPosition();
-    }
-    ++offset_;
-    return true;
-  }
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override {
     destination->Reset();

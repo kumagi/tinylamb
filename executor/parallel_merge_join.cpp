@@ -443,13 +443,16 @@ void ParallelMergeJoin::EnsureMaterialized() {
   output_.clear();
   output_offset_ = 0;
 
-  Row row;
-  RowPosition rp;
-  while (left_ && left_->Next(&row, &rp)) {
-    left_rows_.emplace_back(std::move(row), rp);
+  DataChunk batch;
+  while (left_ && left_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
-  while (right_ && right_->Next(&row, &rp)) {
-    right_rows_.emplace_back(std::move(row), rp);
+  while (right_ && right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   // NULL-padding needs the full right row width; rows can only supply it
   // when the right side is non-empty, so constructors may pass it explicitly
@@ -475,23 +478,6 @@ void ParallelMergeJoin::EnsureMaterialized() {
 }
 
 void ParallelMergeJoin::MaterializePipeline() { EnsureMaterialized(); }
-
-bool ParallelMergeJoin::Next(Row* dst, RowPosition* rp) {
-  assert(dst != nullptr);
-  EnsureMaterialized();
-  if (residual_error_ != Status::kSuccess) {
-    return FailWith(residual_error_);
-  }
-  if (output_offset_ >= output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
-  return true;
-}
 
 size_t ParallelMergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {

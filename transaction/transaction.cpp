@@ -34,10 +34,8 @@
 #include "common/constants.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
-#include "page/foster_pair.hpp"
-#include "page/index_key.hpp"
+#include "page/page_manager.hpp"
 #include "page/page_type.hpp"
-#include "page/row_pointer.hpp"
 #include "page/row_position.hpp"
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
@@ -80,6 +78,15 @@ void Transaction::FinishRunningNoexcept() noexcept {
         if (manager->recovery_ == nullptr && HasLogRecord() &&
             manager->page_manager_ != nullptr) {
           manager->fail_stop_.store(true, std::memory_order_release);
+        }
+        if (manager->page_manager_ != nullptr && !staged_records_.empty()) {
+          try {
+            manager->page_manager_->ApplyTransactionAbort(txn_id_,
+                                                          staged_records_);
+            staged_records_.clear();
+          } catch (...) {
+            failed_.store(true, std::memory_order_release);
+          }
         }
         try {
           manager->AbortVersions(*this);
@@ -147,6 +154,7 @@ Transaction::Transaction(Transaction&& o) noexcept
       recycled_page_allocations_(std::move(o.recycled_page_allocations_)),
       mutated_index_roots_(std::move(o.mutated_index_roots_)),
       index_undo_reservations_(std::move(o.index_undo_reservations_)),
+      staged_records_(std::move(o.staged_records_)),
       shard_epoch_(o.shard_epoch_),
       write_epoch_(o.write_epoch_.load(std::memory_order_acquire)),
       version_read_caches_(std::move(o.version_read_caches_)),
@@ -181,7 +189,15 @@ Transaction::Transaction(Transaction&& o) noexcept
   o.finish_hooks_finalized_ = true;
 }
 
-Status Transaction::PreCommit() {
+Status Transaction::PreCommit() { return PreCommitImpl(nullptr); }
+
+StatusOr<lsn_t> Transaction::PrepareCommitForDurableReply() {
+  lsn_t target = 0;
+  RETURN_IF_FAIL(PreCommitImpl(&target));
+  return target;
+}
+
+Status Transaction::PreCommitImpl(lsn_t* external_durability_target) {
   if (IsFinished()) {
     return Status::kRuntimeError;
   }
@@ -197,7 +213,8 @@ Status Transaction::PreCommit() {
   if (transaction_manager_ == nullptr) {
     return Status::kRuntimeError;
   }
-  Status result = transaction_manager_->PreCommit(*this);
+  Status result =
+      transaction_manager_->PreCommit(*this, external_durability_target);
   // Adopt the manager-assigned status: the pre-publish AddLog-failure path
   // reports kAborted, while the post-publish durability-failure path keeps
   // kCommitted (published versions cannot be retracted).  Overwriting a
@@ -227,6 +244,12 @@ Status Transaction::Abort() {
   if (transaction_manager_->recovery_ == nullptr) {
     if (HasLogRecord() && transaction_manager_->page_manager_ != nullptr) {
       transaction_manager_->fail_stop_.store(true, std::memory_order_release);
+    }
+    if (transaction_manager_->page_manager_ != nullptr &&
+        !staged_records_.empty()) {
+      transaction_manager_->page_manager_->ApplyTransactionAbort(
+          txn_id_, staged_records_);
+      staged_records_.clear();
     }
     transaction_manager_->AbortVersions(*this);
     status_.store(TransactionStatus::kAborted, std::memory_order_release);
@@ -579,229 +602,72 @@ StatusOr<lsn_t> Transaction::AppendLog(const LogRecord& lr) {
     first_lsn_.store(start, std::memory_order_relaxed);
   }
   has_log_.store(true, std::memory_order_release);
-  // AddLog returns the record's START offset; the record occupies
-  // [start, start + data.size()).  Page stamps use the END so the write-back
-  // durability gate cannot pass while the modifying record is still volatile.
   const std::string& data = serialization_scratch_;
   prev_end_lsn_ = start + static_cast<lsn_t>(data.size());
+  record.record_lsn = start;
+  if (record.type != LogType::kBegin && record.type != LogType::kCommit &&
+      record.type != LogType::kAbort &&
+      record.type != LogType::kBeginCheckpoint &&
+      record.type != LogType::kEndCheckpoint) {
+    staged_records_.push_back(std::move(record));
+  }
   DebugSetPhase(nullptr);
   return start;
 }
 
 StatusOr<lsn_t> Transaction::InsertLog(page_id_t pid, slot_t slot,
                                        std::string_view redo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(
       LogRecord::InsertingLogRecord(prev_lsn_, txn_id_, pid, slot, redo));
-}
-StatusOr<lsn_t> Transaction::InsertLeafLog(page_id_t pid, std::string_view key,
-                                           std::string_view redo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  return AppendLog(
-      LogRecord::InsertingLeafLogRecord(prev_lsn_, txn_id_, pid, key, redo));
-}
-StatusOr<lsn_t> Transaction::InsertBranchLog(page_id_t pid,
-                                             std::string_view key,
-                                             page_id_t redo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  return AppendLog(
-      LogRecord::InsertingBranchLogRecord(prev_lsn_, txn_id_, pid, key, redo));
 }
 
 StatusOr<lsn_t> Transaction::UpdateLog(page_id_t pid, slot_t slot,
                                        std::string_view redo,
                                        std::string_view undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(
       LogRecord::UpdatingLogRecord(prev_lsn_, txn_id_, pid, slot, redo, undo));
 }
 
 StatusOr<lsn_t> Transaction::AppendPhysicalUpdateCompensation(
     page_id_t pid, slot_t slot, std::string_view redo) {
-  if (transaction_manager_ == nullptr || IsFinished() || read_only_) {
-    return Status::kRuntimeError;
-  }
-  std::scoped_lock chain_guard(chain_mu_);
-  if (IsWounded()) {
-    return Status::kConflicts;
-  }
-  return transaction_manager_->CompensateUpdateLog(
-      ID(), pid, slot, redo, prev_lsn_.load(std::memory_order_relaxed));
-}
-
-StatusOr<lsn_t> Transaction::UpdateLeafLog(page_id_t pid, std::string_view key,
-                                           std::string_view redo,
-                                           std::string_view undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(LogRecord::UpdatingLeafLogRecord(
-      prev_lsn_, txn_id_, pid, key, redo, undo));
-  if (appended.HasValue() && undo.size() > redo.size()) {
-    // The undo restores the larger old payload: reserve the growth it needs
-    // so a concurrent shrink-consumer cannot make the undo impossible.
-    ReserveIndexUndoBytes(pid, undo.size() - redo.size());
-  }
-  return appended;
-}
-
-StatusOr<lsn_t> Transaction::UpdateBranchLog(page_id_t pid,
-                                             std::string_view key,
-                                             page_id_t redo, page_id_t undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  // The undo overwrites a fixed-size child id in place -- no space to reserve.
-  return AppendLog(LogRecord::UpdatingBranchLogRecord(prev_lsn_, txn_id_, pid,
-                                                      key, redo, undo));
+  return AppendLog(LogRecord::CompensateUpdatingLogRecord(prev_lsn_, txn_id_,
+                                                          pid, slot, redo));
 }
 
 StatusOr<lsn_t> Transaction::DeleteLog(page_id_t pid, slot_t slot,
                                        std::string_view undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(
       LogRecord::DeletingLogRecord(prev_lsn_, txn_id_, pid, slot, undo));
 }
 
-StatusOr<lsn_t> Transaction::DeleteLeafLog(page_id_t pid, std::string_view key,
-                                           std::string_view undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(
-      LogRecord::DeletingLeafLogRecord(prev_lsn_, txn_id_, pid, key, undo));
-  if (appended.HasValue()) {
-    // The undo re-inserts exactly this entry: reserve the payload plus the
-    // RowPointer slot the re-insert charges, so a concurrent insert cannot
-    // consume the freed space inside the intent window (the Leaf twin of the
-    // RowPage hole reservation).
-    ReserveIndexUndoBytes(
-        pid, SerializeSize(key) + SerializeSize(undo) + sizeof(RowPointer));
-  }
-  return appended;
-}
-
-StatusOr<lsn_t> Transaction::DeleteBranchLog(page_id_t pid,
-                                             std::string_view key,
-                                             page_id_t undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(
-      LogRecord::DeletingBranchLogRecord(prev_lsn_, txn_id_, pid, key, undo));
-  if (appended.HasValue()) {
-    // Undo re-inserts {key -> child}: same accounting as the branch insert.
-    ReserveIndexUndoBytes(
-        pid, SerializeSize(key) + sizeof(page_id_t) + sizeof(RowPointer));
-  }
-  return appended;
-}
-
-StatusOr<lsn_t> Transaction::SetLowestLog(page_id_t pid, page_id_t redo,
-                                          page_id_t undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  return AppendLog(
-      LogRecord::SetLowestLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-}
-
 StatusOr<lsn_t> Transaction::SetRowPageNextLog(page_id_t pid, page_id_t redo,
                                                page_id_t undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(
       LogRecord::SetRowPageNextLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
 StatusOr<lsn_t> Transaction::SetRowPagePrevLog(page_id_t pid, page_id_t redo,
                                                page_id_t undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(
       LogRecord::SetRowPagePrevLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
 }
 
-namespace {
-
-size_t FosterPayloadSize(const FosterPair& foster) {
-  if (foster.IsEmpty()) {
-    return 0;
-  }
-  return SerializeSize(foster.key) + sizeof(foster.child_pid);
-}
-}  // namespace
-
-StatusOr<lsn_t> Transaction::SetLowFence(page_id_t pid, const IndexKey& redo,
-                                         const IndexKey& undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(
-      LogRecord::SetLowFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  if (appended.HasValue()) {
-    // A SHRUNKEN fence restores a LONGER old value when this transaction's
-    // abort replays its undo: reserve the growth so a concurrent consumer
-    // cannot make the restore impossible. Fences stay unreserved on GROWTH
-    // (the split/absorb admission contracts above the leaves are untouched);
-    // only the shrink side takes bytes out of the shared free pool, and it
-    // is exactly that bite the undo reservation exists to cover. Without it,
-    // every shrink-fence loser permanently erodes other transactions'
-    // reserved undo budgets -- measured as an 8-byte restart deficit on a
-    // leaf with 306 outstanding delete undos (the reopen then fails with
-    // kTooBigData inside LogUndo, wedging the database shut).
-    const size_t undo_size = SerializeSize(undo);
-    const size_t redo_size = SerializeSize(redo);
-    ReserveIndexUndoBytes(pid,
-                          undo_size > redo_size ? undo_size - redo_size : 0);
-  }
-  return appended;
+StatusOr<lsn_t> Transaction::LsmPutLog(page_id_t root, std::string_view key,
+                                       std::string_view value,
+                                       std::string_view prev_value,
+                                       bool had_prev) {
+  return AppendLog(LogRecord::LsmPutLogRecord(prev_lsn_, txn_id_, root, key,
+                                              value, prev_value, had_prev));
 }
 
-StatusOr<lsn_t> Transaction::SetHighFence(page_id_t pid, const IndexKey& redo,
-                                          const IndexKey& undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(
-      LogRecord::SetHighFenceLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  if (appended.HasValue()) {
-    // Shrink-side reservation only; see SetLowFence for the rationale and
-    // the measured restart wedge this closes.
-    const size_t undo_size = SerializeSize(undo);
-    const size_t redo_size = SerializeSize(redo);
-    ReserveIndexUndoBytes(pid,
-                          undo_size > redo_size ? undo_size - redo_size : 0);
-  }
-  return appended;
+StatusOr<lsn_t> Transaction::LsmDeleteLog(page_id_t root, std::string_view key,
+                                          std::string_view prev_value) {
+  return AppendLog(
+      LogRecord::LsmDeleteLogRecord(prev_lsn_, txn_id_, root, key, prev_value));
 }
 
-StatusOr<lsn_t> Transaction::SetFoster(page_id_t pid, const FosterPair& redo,
-                                       const FosterPair& undo) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  StatusOr<lsn_t> appended = AppendLog(
-      LogRecord::SetFosterLogRecord(prev_lsn_, txn_id_, pid, redo, undo));
-  if (appended.HasValue()) {
-    const size_t undo_size = FosterPayloadSize(undo);
-    const size_t redo_size = FosterPayloadSize(redo);
-    ReserveIndexUndoBytes(pid,
-                          undo_size > redo_size ? undo_size - redo_size : 0);
-  }
-  return appended;
+StatusOr<lsn_t> Transaction::LsmDestroyLog(page_id_t root) {
+  return AppendLog(LogRecord::LsmDestroyLogRecord(prev_lsn_, txn_id_, root));
 }
 
 void Transaction::ReserveIndexUndoBytes(page_id_t pid, size_t bytes) {
@@ -817,41 +683,18 @@ void Transaction::ReserveIndexUndoBytes(page_id_t pid, size_t bytes) {
 }
 
 StatusOr<lsn_t> Transaction::AllocatePageLog(page_id_t allocated_page_id,
-                                             PageType new_page_type,
-                                             PageAllocationKind allocation_kind,
-                                             PageType old_page_type,
-                                             std::string old_target_payload,
-                                             std::string old_meta_payload) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
-  return AppendLog(LogRecord::AllocatePageLogRecord(
-      prev_lsn_, txn_id_, allocated_page_id, new_page_type, allocation_kind,
-      old_page_type, std::move(old_target_payload),
-      std::move(old_meta_payload)));
-}
-
-StatusOr<lsn_t> Transaction::AllocatePageLog(page_id_t allocated_page_id,
                                              PageType new_page_type) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
   return AppendLog(LogRecord::AllocatePageLogRecord(
       prev_lsn_, txn_id_, allocated_page_id, new_page_type));
 }
 
 StatusOr<lsn_t> Transaction::DestroyPageLog(page_id_t destroyed_page_id,
-                                            PageType old_page_type,
-                                            std::string old_page_body) {
-  // AppendLog owns the finished/wounded/failed contract: it answers with a
-  // Status instead of asserting, so a transaction that finished concurrently
-  // (wound-wait victim, resolved abort) degrades to kRuntimeError/kConflicts.
+                                            PageType /*old_page_type*/,
+                                            std::string /*old_page_body*/) {
   return AppendLog(
-      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id,
-                                      old_page_type, std::move(old_page_body)));
+      LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
 }
 
-// Using this function is discouraged to get performance of flush pipelining.
 void Transaction::CommitWait() const {
   while (transaction_manager_->CommittedLSN() < prev_lsn_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

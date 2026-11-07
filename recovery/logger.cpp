@@ -46,6 +46,9 @@
 namespace tinylamb {
 namespace {
 
+std::mutex sync_hook_mutex;
+std::function<int(int)> before_sync_hook;
+
 StatusOr<int> CreateFile(const std::filesystem::path& path) {
   std::error_code ec;
   if (path.has_parent_path()) {
@@ -121,6 +124,169 @@ constexpr uint32_t kSegmentMetadataMagic = 0x57414c47U;
 constexpr uint32_t kSegmentMetadataVersion = 1U;
 constexpr size_t kSegmentMetadataSize = 20U;
 
+// Fixed files keep allocation and i_size out of the commit path. The two
+// end slots are outside LSN space; both must validate before trusting either.
+constexpr size_t kTailSlotBytes = 32;
+constexpr size_t kTailBytes = 2 * kTailSlotBytes;
+constexpr uint32_t kTailMagic = 0x544c4632U;
+
+struct FixedTail {
+  uint64_t generation{0};
+  size_t end{0};
+};
+
+std::array<char, kTailSlotBytes> EncodeTail(uint64_t index, uint64_t generation,
+                                            size_t end) {
+  std::array<char, kTailSlotBytes> bytes{};
+  SerializeU32(bytes.data(), kTailMagic);
+  SerializeU64(bytes.data() + 4, index);
+  SerializeU64(bytes.data() + 12, generation);
+  SerializeU64(bytes.data() + 20, end);
+  SerializeU32(bytes.data() + 28, Crc32C(bytes.data(), 28));
+  return bytes;
+}
+
+int PwriteAll(int fd, const char* bytes, size_t length, off_t offset) {
+  size_t done = 0;
+  while (done < length) {
+    const ssize_t written = ::pwrite(fd, bytes + done, length - done,
+                                     offset + static_cast<off_t>(done));
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      if (written == 0) {
+        errno = EIO;
+      }
+      return -1;
+    }
+    done += static_cast<size_t>(written);
+  }
+  return 0;
+}
+
+int ClearAppend(int fd) {
+  const int flags = ::fcntl(fd, F_GETFL);
+  return flags < 0 ? -1 : ::fcntl(fd, F_SETFL, flags & ~O_APPEND);
+}
+
+int InitializeFixedFile(int fd, uint64_t index, size_t size, size_t end,
+                        bool initialize_data = false) {
+  if (size >
+          static_cast<size_t>(std::numeric_limits<off_t>::max()) - kTailBytes ||
+      end > size) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  if (ClearAppend(fd) != 0) {
+    return -1;
+  }
+  const off_t physical_size = static_cast<off_t>(size + kTailBytes);
+#ifdef __linux__
+  int allocated = 0;
+  do {
+    allocated = ::posix_fallocate(fd, 0, physical_size);
+  } while (allocated == EINTR);
+  if (allocated != 0 && allocated != EOPNOTSUPP && allocated != ENOSYS &&
+      allocated != EINVAL) {
+    errno = allocated;
+    return -1;
+  }
+#endif
+  // ftruncate also repairs an explicitly forced overlong frame. It never
+  // alters the data prefix [0, size); logical truncation only changes slots.
+  if (::ftruncate(fd, physical_size) != 0) {
+    return -1;
+  }
+  if (initialize_data) {
+    // fallocate alone leaves unwritten extents: their first writes still
+    // need extent-conversion metadata at commit. Materialize new data blocks
+    // once, before any records/ACKs exist. Forced repair and truncation must
+    // preserve all existing data bytes and never take this branch.
+    const std::array<char, 64 * 1024> zeros{};
+    for (size_t offset = 0; offset < size; offset += zeros.size()) {
+      const size_t count = std::min(zeros.size(), size - offset);
+      if (PwriteAll(fd, zeros.data(), count, static_cast<off_t>(offset)) != 0) {
+        return -1;
+      }
+    }
+  }
+  const auto bytes = EncodeTail(index, 0, end);
+  if (PwriteAll(fd, bytes.data(), bytes.size(), static_cast<off_t>(size)) !=
+          0 ||
+      PwriteAll(fd, bytes.data(), bytes.size(),
+                static_cast<off_t>(size + kTailSlotBytes)) != 0) {
+    return -1;
+  }
+  return FdataSync(fd);
+}
+
+StatusOr<FixedTail> ReadFixedTail(int fd, uint64_t index, size_t size,
+                                  bool allow_torn) {
+  struct stat stat_buffer{};
+  if (::fstat(fd, &stat_buffer) != 0) {
+    return StatusError(StatusCode::kIOError, "Failed to stat fixed WAL frame");
+  }
+  bool valid = stat_buffer.st_size >= 0 &&
+               size <= static_cast<size_t>(std::numeric_limits<off_t>::max()) -
+                           kTailBytes &&
+               std::cmp_equal(stat_buffer.st_size, size + kTailBytes);
+  FixedTail latest;
+  std::array<FixedTail, 2> tails{};
+  for (size_t slot = 0; valid && slot < 2; ++slot) {
+    std::array<char, kTailSlotBytes> bytes{};
+    ssize_t count = 0;
+    do {
+      count = ::pread(fd, bytes.data(), bytes.size(),
+                      static_cast<off_t>(size + slot * kTailSlotBytes));
+    } while (count < 0 && errno == EINTR);
+    if (count < 0) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to read fixed WAL end slot");
+    }
+    uint32_t magic = 0;
+    uint32_t crc = 0;
+    uint64_t stored_index = 0;
+    uint64_t generation = 0;
+    uint64_t end = 0;
+    DeserializeU32(bytes.data(), &magic);
+    DeserializeU64(bytes.data() + 4, &stored_index);
+    DeserializeU64(bytes.data() + 12, &generation);
+    DeserializeU64(bytes.data() + 20, &end);
+    DeserializeU32(bytes.data() + 28, &crc);
+    valid = count == static_cast<ssize_t>(bytes.size()) &&
+            magic == kTailMagic && stored_index == index && end <= size &&
+            crc == Crc32C(bytes.data(), 28);
+    tails[slot] = {generation, static_cast<size_t>(end)};
+  }
+  if (valid) {
+    const auto& a = tails[0];
+    const auto& b = tails[1];
+    // A reset has two identical generation-zero slots. Normal publication
+    // alternates adjacent generations and never moves the end backwards.
+    valid = (a.generation == 0 && b.generation == 0 && a.end == b.end) ||
+            (a.generation > b.generation && a.generation - b.generation == 1 &&
+             a.end >= b.end && a.generation % 2 == 0) ||
+            (b.generation > a.generation && b.generation - a.generation == 1 &&
+             b.end >= a.end && b.generation % 2 == 1);
+    latest = a.generation >= b.generation ? a : b;
+  }
+  if (!valid) {
+    if (!allow_torn) {
+      return StatusError(StatusCode::kCorrupt,
+                         "Fixed WAL logical-end slots/length are corrupt");
+    }
+    // --force must inspect all available record bytes, not silently trust an
+    // older slot which might precede an acknowledged commit. Recovery finds
+    // the CRC-valid prefix and performs the actual logical truncation later.
+    latest = {0, stat_buffer.st_size <= 0
+                     ? 0
+                     : static_cast<size_t>(std::min<uint64_t>(
+                           static_cast<uint64_t>(stat_buffer.st_size), size))};
+  }
+  return latest;
+}
+
 // Cap for the flush worker's adaptive idle sleep. An idle worker (nothing
 // buffered, no durability waiters) otherwise re-arms a 1 ms timed wait a
 // thousand times per second for as long as the database sits quiet. The
@@ -139,7 +305,7 @@ std::filesystem::path Logger::SegmentMetadataPath(
 }
 
 StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
-                                             bool* exists) {
+                                             bool* exists, bool* fixed_size) {
   const std::filesystem::path path = SegmentMetadataPath(base);
   std::error_code ec;
   const bool present = std::filesystem::exists(path, ec);
@@ -149,6 +315,9 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
                            ": " + ec.message());
   }
   *exists = present;
+  if (fixed_size != nullptr) {
+    *fixed_size = false;
+  }
   if (!present) {
     return size_t{0};
   }
@@ -174,7 +343,8 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
                  &stored_crc);
   const uint32_t computed =
       Crc32C(encoded.data(), kSegmentMetadataSize - sizeof(uint32_t));
-  if (magic != kSegmentMetadataMagic || version != kSegmentMetadataVersion ||
+  if (magic != kSegmentMetadataMagic ||
+      (version != kSegmentMetadataVersion && version != 2U) ||
       segment_size == 0 || stored_crc != computed) {
     return StatusError(
         StatusCode::kCorrupt,
@@ -185,11 +355,14 @@ StatusOr<size_t> Logger::ReadSegmentMetadata(const std::filesystem::path& base,
         StatusCode::kCorrupt,
         "WAL segment size does not fit this platform: " + path.string());
   }
+  if (fixed_size != nullptr) {
+    *fixed_size = version == 2U;
+  }
   return static_cast<size_t>(segment_size);
 }
 
 Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
-                                    size_t segment_size) {
+                                    size_t segment_size, bool fixed_size) {
   if (segment_size == 0) {
     return StatusError(StatusCode::kIOError, "WAL segment size must be > 0");
   }
@@ -206,7 +379,8 @@ Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
   const std::filesystem::path tmp = path.string() + ".tmp";
   std::array<char, kSegmentMetadataSize> encoded{};
   SerializeU32(encoded.data(), kSegmentMetadataMagic);
-  SerializeU32(encoded.data() + sizeof(uint32_t), kSegmentMetadataVersion);
+  SerializeU32(encoded.data() + sizeof(uint32_t),
+               fixed_size ? 2U : kSegmentMetadataVersion);
   SerializeU64(encoded.data() + (sizeof(uint32_t) * 2), segment_size);
   const uint32_t crc =
       Crc32C(encoded.data(), kSegmentMetadataSize - sizeof(uint32_t));
@@ -257,6 +431,48 @@ Status Logger::WriteSegmentMetadata(const std::filesystem::path& base,
                            path.string() + ": " + ec.message());
   }
   return SyncDirectoryOf(path);
+}
+
+StatusOr<bool> Logger::FixedSizeSegmentFormat(
+    const std::filesystem::path& base) {
+  bool exists = false;
+  bool fixed = false;
+  ASSIGN_OR_RETURN(size_t, unused, ReadSegmentMetadata(base, &exists, &fixed));
+  (void)unused;
+  return fixed;
+}
+
+StatusOr<size_t> Logger::SegmentLogicalSize(const std::filesystem::path& base,
+                                            uint64_t index, size_t segment_size,
+                                            bool allow_torn_footer) {
+  bool exists = false;
+  bool fixed = false;
+  ASSIGN_OR_RETURN(size_t, persisted,
+                   ReadSegmentMetadata(base, &exists, &fixed));
+  if (fixed && persisted != segment_size) {
+    return StatusError(StatusCode::kCorrupt, "Fixed WAL geometry mismatch");
+  }
+  const auto path = SegmentPath(base, index);
+  if (!fixed) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size > std::numeric_limits<size_t>::max()) {
+      return StatusError(StatusCode::kIOError,
+                         "Failed to stat WAL " + path.string());
+    }
+    return static_cast<size_t>(size);
+  }
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return StatusError(StatusCode::kIOError,
+                       "Failed to read fixed WAL " + path.string());
+  }
+  auto tail = ReadFixedTail(fd, index, segment_size, allow_torn_footer);
+  ::close(fd);
+  if (!tail.HasValue()) {
+    return tail.GetStatus();
+  }
+  return tail.Value().end;
 }
 
 namespace {
@@ -485,7 +701,7 @@ Status Logger::MigrateLegacyLog(const std::filesystem::path& base,
 
 StatusOr<std::unique_ptr<Logger>> Logger::Create(
     const std::filesystem::path& logfile, size_t buffer_size, size_t every_ms,
-    size_t segment_size) {
+    size_t segment_size, bool preallocate_new_series, bool allow_torn_footer) {
   if (segment_size == 0) {
     return StatusError(StatusCode::kIOError, "WAL segment size must be > 0");
   }
@@ -509,9 +725,34 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
                    FindHighestSegment(logfile, &any_segment));
   const bool has_numbered_segments = initial_highest > 0;
   bool metadata_exists = false;
+  bool fixed_size = false;
   ASSIGN_OR_RETURN(size_t, persisted_segment_size,
-                   ReadSegmentMetadata(logfile, &metadata_exists));
-  if (metadata_exists && has_numbered_segments) {
+                   ReadSegmentMetadata(logfile, &metadata_exists, &fixed_size));
+  if (!metadata_exists && any_segment && !has_numbered_segments) {
+    // A lost sidecar must not turn a positively identified fixed frame into
+    // a legacy oversized log and migrate its footer as record bytes.
+    struct stat base_stat{};
+    const int base_fd = ::open(logfile.c_str(), O_RDONLY | O_CLOEXEC);
+    bool framed = false;
+    if (base_fd >= 0) {
+      if (::fstat(base_fd, &base_stat) == 0 &&
+          base_stat.st_size > static_cast<off_t>(kTailBytes)) {
+        const auto candidate_size =
+            static_cast<size_t>(base_stat.st_size) - kTailBytes;
+        framed = ReadFixedTail(base_fd, 0, candidate_size, false).HasValue();
+      }
+      ::close(base_fd);
+    }
+    if (framed) {
+      return StatusError(
+          StatusCode::kCorrupt,
+          "Fixed WAL has no geometry metadata: " + logfile.string());
+    }
+  }
+  if (!metadata_exists && !any_segment && preallocate_new_series) {
+    fixed_size = true;
+  }
+  if (metadata_exists && (has_numbered_segments || fixed_size)) {
     if (persisted_segment_size != segment_size) {
       LOG(WARN) << "Ignoring WAL segment size override " << segment_size
                 << "; persisted geometry is " << persisted_segment_size;
@@ -522,7 +763,7 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
         StatusCode::kIOError,
         "Segmented WAL has no geometry metadata: " + logfile.string());
   } else if (!metadata_exists || persisted_segment_size != segment_size) {
-    RETURN_IF_FAIL(WriteSegmentMetadata(logfile, segment_size));
+    RETURN_IF_FAIL(WriteSegmentMetadata(logfile, segment_size, fixed_size));
   }
   bool legacy_base_oversized = false;
   {
@@ -543,12 +784,45 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
       legacy_base_oversized = base_size > segment_size;
     }
   }
-  if (!has_numbered_segments || legacy_base_oversized) {
+  if (!fixed_size && (!has_numbered_segments || legacy_base_oversized)) {
     RETURN_IF_FAIL(MigrateLegacyLog(logfile, segment_size));
   }
   ASSIGN_OR_RETURN(uint64_t, start_segment,
                    FindHighestSegment(logfile, &any_segment));
-  ASSIGN_OR_RETURN(int, fd, CreateFile(SegmentPath(logfile, start_segment)));
+  const auto start_path = SegmentPath(logfile, start_segment);
+  std::error_code existed_ec;
+  const bool existed = std::filesystem::exists(start_path, existed_ec);
+  if (existed_ec) {
+    return StatusError(StatusCode::kIOError,
+                       "Failed to stat fixed WAL segment");
+  }
+  ASSIGN_OR_RETURN(int, fd, CreateFile(start_path));
+  FixedTail fixed_tail;
+  if (fixed_size) {
+    StatusOr<FixedTail> tail =
+        existed
+            ? ReadFixedTail(fd, start_segment, segment_size, allow_torn_footer)
+            : StatusOr<FixedTail>(FixedTail{});
+    if (!tail.HasValue()) {
+      ::close(fd);
+      return tail.GetStatus();
+    }
+    fixed_tail = tail.Value();
+    // Rewriting both slots is only needed for a new or explicitly repaired
+    // frame. A normal reopen keeps the alternating generation history.
+    const bool needs_init =
+        !existed ||
+        !ReadFixedTail(fd, start_segment, segment_size, false).HasValue();
+    if (ClearAppend(fd) != 0 ||
+        (needs_init && InitializeFixedFile(fd, start_segment, segment_size,
+                                           fixed_tail.end, !existed) != 0)) {
+      const int saved = errno;
+      ::close(fd);
+      return StatusError(StatusCode::kIOError,
+                         "Failed to initialize fixed WAL: " +
+                             std::string(std::strerror(saved)));
+    }
+  }
   Status directory_status =
       SyncDirectoryOf(SegmentPath(logfile, start_segment));
   if (directory_status != Status::kSuccess) {
@@ -579,7 +853,7 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   }
   const lsn_t file_size =
       (static_cast<lsn_t>(start_segment) * static_cast<lsn_t>(segment_size)) +
-      static_cast<lsn_t>(seg_size);
+      static_cast<lsn_t>(fixed_size ? fixed_tail.end : seg_size);
   if (FdataSync(fd) != 0) {
     const int saved = errno;
     close(fd);
@@ -605,6 +879,8 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
   // stored nowhere, and a spawn failure must not double-close.
   logger->dst_ = fd;
   logger->current_segment_ = start_segment;
+  logger->fixed_size_segments_ = fixed_size;
+  logger->footer_generation_ = fixed_tail.generation;
   logger->lowest_segment_ = lowest_segment;
   logger->flushed_lsn_.store(file_size, std::memory_order_relaxed);
   logger->durable_lsn_.store(file_size, std::memory_order_release);
@@ -704,6 +980,65 @@ void Logger::AdvanceDurable(lsn_t to) {
   durable_cv_.notify_all();
 }
 
+void Logger::SetBeforeSyncHookForTest(std::function<int(int)> hook) {
+  std::scoped_lock lock(sync_hook_mutex);
+  before_sync_hook = std::move(hook);
+}
+
+int Logger::WriteFixedTail(size_t logical_end) {
+  if (logical_end > segment_size_ ||
+      footer_generation_ == std::numeric_limits<uint64_t>::max()) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  const uint64_t generation = footer_generation_ + 1;
+  const auto bytes = EncodeTail(current_segment_, generation, logical_end);
+  if (PwriteAll(dst_, bytes.data(), bytes.size(),
+                static_cast<off_t>(segment_size_ +
+                                   (generation % 2) * kTailSlotBytes)) != 0) {
+    return -1;
+  }
+  footer_generation_ = generation;
+  return 0;
+}
+
+int Logger::SyncSegment(size_t logical_end) {
+  if (fixed_size_segments_) {
+    if (logical_end == static_cast<size_t>(-1)) {
+      const lsn_t start = current_segment_ * static_cast<lsn_t>(segment_size_);
+      const lsn_t written = flushed_lsn_.load(std::memory_order_relaxed);
+      logical_end = static_cast<size_t>(std::min<lsn_t>(
+          written >= start ? written - start : 0, segment_size_));
+    }
+    if (WriteFixedTail(logical_end) != 0) {
+      return -1;
+    }
+  }
+  std::function<int(int)> hook;
+  {
+    std::scoped_lock lock(sync_hook_mutex);
+    hook = before_sync_hook;
+  }
+  if (hook) {
+    const int error = hook(dst_);
+    if (error != 0) {
+      errno = error;
+      return -1;
+    }
+  }
+  const auto begin = std::chrono::steady_clock::now();
+  const int result = FdataSync(dst_);
+  const int saved = errno;
+  sync_count_.fetch_add(1, std::memory_order_relaxed);
+  sync_ns_.fetch_add(static_cast<uint64_t>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count()),
+                     std::memory_order_relaxed);
+  errno = saved;
+  return result;
+}
+
 Status Logger::WaitForDurable(lsn_t lsn) {
   pending_durable_waiters_.fetch_add(1, std::memory_order_acq_rel);
   const bool already_satisfied =
@@ -751,7 +1086,15 @@ Status Logger::RollToLocked(uint64_t index) {
       return StatusError(StatusCode::kIOError,
                          "WAL segment size is negative before roll");
     }
-    if (std::cmp_less(stat_buffer.st_size, segment_size_)) {
+    if (fixed_size_segments_ &&
+        std::cmp_not_equal(stat_buffer.st_size, segment_size_ + kTailBytes)) {
+      ::close(dst_);
+      dst_ = -1;
+      return StatusError(StatusCode::kCorrupt,
+                         "Fixed WAL frame length changed before roll");
+    }
+    if (!fixed_size_segments_ &&
+        std::cmp_less(stat_buffer.st_size, segment_size_)) {
       if (::ftruncate(dst_, static_cast<off_t>(segment_size_)) != 0) {
         const int saved = errno;
         ::close(dst_);
@@ -760,7 +1103,9 @@ Status Logger::RollToLocked(uint64_t index) {
                            "Failed to extend WAL segment before roll: " +
                                std::string(std::strerror(saved)));
       }
-    } else if (std::cmp_greater(stat_buffer.st_size, segment_size_)) {
+    } else if (std::cmp_greater(
+                   stat_buffer.st_size,
+                   segment_size_ + (fixed_size_segments_ ? kTailBytes : 0))) {
       ::close(dst_);
       dst_ = -1;
       return StatusError(StatusCode::kCorrupt,
@@ -769,7 +1114,10 @@ Status Logger::RollToLocked(uint64_t index) {
     // The old segment will never be fsynced through the new fd: flush it
     // here, or records already reported durable via the new segment's
     // barriers could sit unsynced in the closed file forever.
-    if (FdataSync(dst_) != 0) {
+    if (!(fixed_size_segments_ &&
+          durable_lsn_.load(std::memory_order_acquire) >=
+              flushed_lsn_.load(std::memory_order_relaxed)) &&
+        SyncSegment() != 0) {
       const int saved = errno;
       ::close(dst_);
       dst_ = -1;
@@ -780,7 +1128,26 @@ Status Logger::RollToLocked(uint64_t index) {
     ::close(dst_);
     dst_ = -1;
   }
+  if (fixed_size_segments_) {
+    std::error_code ec;
+    const bool present =
+        std::filesystem::exists(SegmentPath(base_path_, index), ec);
+    if (ec || present) {
+      return StatusError(
+          StatusCode::kCorrupt,
+          "Refusing to overwrite an existing future WAL segment");
+    }
+  }
   ASSIGN_OR_RETURN(int, fd, CreateFile(SegmentPath(base_path_, index)));
+  if (fixed_size_segments_ &&
+      InitializeFixedFile(fd, index, segment_size_, 0, true) != 0) {
+    const int saved = errno;
+    ::close(fd);
+    return StatusError(StatusCode::kIOError,
+                       "Failed to allocate next WAL segment: " +
+                           std::string(std::strerror(saved)));
+  }
+  footer_generation_ = 0;
   Status directory_status = SyncDirectoryOf(SegmentPath(base_path_, index));
   if (directory_status != Status::kSuccess) {
     ::close(fd);
@@ -861,8 +1228,11 @@ Status Logger::TruncateTo(lsn_t valid_end) {
     return opened_tail.GetStatus();
   }
   const int tail_fd = opened_tail.Value();
-  if (::ftruncate(tail_fd, static_cast<off_t>(valid_end % segment_size_)) !=
-      0) {
+  if ((fixed_size_segments_
+           ? InitializeFixedFile(tail_fd, tail_index, segment_size_,
+                                 static_cast<size_t>(valid_end % segment_size_))
+           : ::ftruncate(tail_fd,
+                         static_cast<off_t>(valid_end % segment_size_))) != 0) {
     const int saved = errno;
     ::close(tail_fd);
     SetFailed(saved);
@@ -887,6 +1257,7 @@ Status Logger::TruncateTo(lsn_t valid_end) {
 
   dst_ = tail_fd;
   current_segment_ = tail_index;
+  footer_generation_ = 0;
   flushed_lsn_.store(valid_end, std::memory_order_relaxed);
   durable_lsn_.store(valid_end, std::memory_order_release);
   buffered_lsn_.store(valid_end, std::memory_order_release);
@@ -1126,6 +1497,9 @@ StatusOr<lsn_t> Logger::AddLog(std::string_view payload) {
     return StatusError(StatusCode::kRuntimeError, "logger is finished");
   }
   lsn_t lsn = buffered_lsn_.load(std::memory_order_relaxed);
+  // Pre-roll keeps the next segment on a record boundary for recycling.
+  // A framed old segment keeps its actual data end in the CRC slots; recovery
+  // skips only the positively declared unused suffix, never arbitrary zeros.
   if (!payload.empty() &&
       payload.size() >
           segment_size_ - static_cast<size_t>(lsn % segment_size_)) {
@@ -1228,6 +1602,11 @@ void Logger::LoggerWork() {
   using Clock = std::chrono::steady_clock;
   auto last_sync = Clock::now();
   bool dirty = false;
+  const auto background_interval = [&] {
+    return commit_driven_sync_.load(std::memory_order_relaxed)
+               ? std::max(sync_interval_, std::chrono::milliseconds(200))
+               : sync_interval_;
+  };
   // Adaptive idle cadence for the empty-queue sleep below; see kIdleWaitCap.
   std::chrono::milliseconds idle_wait = sync_interval_;
   while (!failed_.load(std::memory_order_acquire) &&
@@ -1241,11 +1620,11 @@ void Logger::LoggerWork() {
     if (flushed_lsn == buffered_lsn) {
       if (dirty &&
           (finish_.load(std::memory_order_acquire) ||
-           Clock::now() - last_sync >= sync_interval_ ||
+           Clock::now() - last_sync >= background_interval() ||
            pending_durable_waiters_.load(std::memory_order_acquire) > 0)) {
         {
           std::scoped_lock segment_guard(segment_mu_);
-          if (dst_ < 0 || FdataSync(dst_) != 0) {
+          if (dst_ < 0 || SyncSegment() != 0) {
             const int saved = errno == 0 ? EIO : errno;
             SetFailed(saved);
             return;
@@ -1328,7 +1707,11 @@ void Logger::LoggerWork() {
         }
         ssize_t flushed_size = 0;
         do {
-          flushed_size = write(dst_, buffer_.data() + flushed_off, span);
+          flushed_size =
+              fixed_size_segments_
+                  ? ::pwrite(dst_, buffer_.data() + flushed_off, span,
+                             static_cast<off_t>(flushed % segment_size_))
+                  : ::write(dst_, buffer_.data() + flushed_off, span);
         } while (flushed_size < 0 && errno == EINTR);
         if (flushed_size < 0) {
           const int saved = errno;
@@ -1361,14 +1744,15 @@ void Logger::LoggerWork() {
     // the full sync_interval_ of latency. A bare timer would otherwise cap
     // throughput at floor(1 second / sync_interval_) * num_producers_per_fsync
     // barriers per second even when fsync itself is sub-millisecond.
-    const bool timer_elapsed = Clock::now() - last_sync >= sync_interval_;
+    const bool timer_elapsed =
+        Clock::now() - last_sync >= background_interval();
     const bool waiter_present =
         pending_durable_waiters_.load(std::memory_order_acquire) > 0;
     if (finish_.load(std::memory_order_acquire) || timer_elapsed ||
         waiter_present) {
       {
         std::scoped_lock segment_guard(segment_mu_);
-        if (dst_ < 0 || FdataSync(dst_) != 0) {
+        if (dst_ < 0 || SyncSegment() != 0) {
           const int saved = errno == 0 ? EIO : errno;
           SetFailed(saved);
           return;
@@ -1381,7 +1765,12 @@ void Logger::LoggerWork() {
   }
   {
     std::scoped_lock segment_guard(segment_mu_);
-    if (dst_ < 0 || ::fsync(dst_) != 0) {
+    if (dst_ < 0 ||
+        (fixed_size_segments_ &&
+         WriteFixedTail(static_cast<size_t>(
+             flushed_lsn_.load() -
+             current_segment_ * static_cast<lsn_t>(segment_size_))) != 0) ||
+        ::fsync(dst_) != 0) {
       const int saved = errno == 0 ? EIO : errno;
       SetFailed(saved);
       return;

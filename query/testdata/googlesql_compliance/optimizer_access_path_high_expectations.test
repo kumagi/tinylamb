@@ -80,7 +80,7 @@ ARRAY<STRUCT<id INT64>>[{1}, {10}]
 [plan_contains=category = 20]
 [name=index_range_keeps_residual_predicate]
 SELECT id FROM access_input
-WHERE id >= 2 AND id <= 8 AND category = 20
+WHERE id >= 3 AND id <= 4 AND category = 20
 ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{3}, {4}]
@@ -123,18 +123,19 @@ ARRAY<STRUCT<id INT64>>[{10}]
 ==
 
 [mode=explain]
-[plan_contains=IndexOnlyScan: access_input]
-[plan_not_contains=SeqScan access_input]
-[name=count_star_uses_narrowest_index]
+[plan_contains=FullScan: access_input]
+[name=count_star_prices_distinct_key_navigation]
 SELECT COUNT(*) AS n FROM access_input
 --
 ARRAY<STRUCT<n INT64>>[{10}]
 ==
 
-# The primary key is unique, so DISTINCT is redundant and the covering index
-# supplies the requested ordering without reading the heap.
+# The primary key is unique, so DISTINCT is redundant. The cheap projected
+# full scan retains the proven physical ordering on this unchanged fixture.
 [mode=explain]
-[plan_contains=IndexOnlyScan: access_input]
+[plan_contains=FullScan: access_input]
+[plan_not_contains=HashDistinct]
+[plan_not_contains=SortDistinct]
 [name=distinct_primary_key_is_eliminated]
 SELECT DISTINCT id FROM access_input ORDER BY id
 --

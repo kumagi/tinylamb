@@ -82,10 +82,11 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
 
   // Materialize right side rows
   std::vector<std::pair<Row, RowPosition>> right_rows;
-  Row r_row;
-  RowPosition r_pos;
-  while (right_ && right_->Next(&r_row, &r_pos)) {
-    right_rows.emplace_back(std::move(r_row), r_pos);
+  DataChunk batch;
+  while (right_ && right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_rows.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   if (right_->GetStatus() != Status::kSuccess) {
     predicate_error_ = right_->GetStatus();
@@ -98,14 +99,22 @@ void BatchNestedLoopJoin::ExecuteBlockJoin() {
 
   bool left_exhausted = false;
   size_t total_bytes = 0;
+  DataChunk left_batch;
+  size_t left_batch_idx = 0;
 
   while (!left_exhausted) {
     left_block.clear();
-    Row l_row;
-    RowPosition l_pos;
-    while (left_block.size() < block_size_ && left_ &&
-           left_->Next(&l_row, &l_pos)) {
-      left_block.emplace_back(std::move(l_row), l_pos);
+    while (left_block.size() < block_size_ && left_) {
+      if (left_batch_idx >= left_batch.Size()) {
+        left_batch_idx = 0;
+        if (left_->NextBatch(&left_batch, block_size_ - left_block.size()) ==
+            0) {
+          break;
+        }
+      }
+      left_block.emplace_back(left_batch.RowAt(left_batch_idx),
+                              left_batch.PositionAt(left_batch_idx));
+      ++left_batch_idx;
     }
     if (left_->GetStatus() != Status::kSuccess) {
       predicate_error_ = left_->GetStatus();
@@ -189,23 +198,6 @@ void BatchNestedLoopJoin::EnsureMaterialized() {
 }
 
 void BatchNestedLoopJoin::MaterializePipeline() { EnsureMaterialized(); }
-
-bool BatchNestedLoopJoin::Next(Row* dst, RowPosition* rp) {
-  if (!predicate_error_.ok()) {
-    return FailWith(predicate_error_);
-  }
-  assert(dst != nullptr);
-  EnsureMaterialized();
-  if (output_offset_ >= output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
-  return true;
-}
 
 size_t BatchNestedLoopJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (destination == nullptr || max_rows == 0) {

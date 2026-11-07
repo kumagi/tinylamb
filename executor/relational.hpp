@@ -34,7 +34,8 @@ class RelationalExecutor : public ExecutorBase {
   RelationalExecutor& operator=(const RelationalExecutor&) = delete;
   RelationalExecutor(RelationalExecutor&&) = delete;
   RelationalExecutor& operator=(RelationalExecutor&&) = delete;
-  bool Next(Row* destination, RowPosition* position) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
   void Explain(std::ostream& output, int indent) const override;
 
@@ -57,6 +58,9 @@ class RelationalExecutor : public ExecutorBase {
   size_t peak_intermediate_rows_{0};
   size_t relation_spills_{0};
   size_t correlated_index_builds_{0};
+  size_t prebuilt_exists_index_builds_{0};
+  size_t prebuilt_exists_index_rows_{0};
+  size_t prebuilt_exists_keys_{0};
   size_t correlated_index_probes_{0};
   size_t correlated_result_cache_hits_{0};
   size_t shared_exists_build_reuses_{0};
@@ -65,6 +69,9 @@ class RelationalExecutor : public ExecutorBase {
   size_t uncorrelated_hash_builds_{0};
   size_t uncorrelated_hash_probes_{0};
   size_t grouped_join_fusions_{0};
+  size_t streamed_grouped_joins_{0};
+  size_t selective_index_scans_{0};
+  size_t selective_index_rows_{0};
   double scan_ms_{0};
   double filter_ms_{0};
   double join_ms_{0};

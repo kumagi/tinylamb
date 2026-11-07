@@ -13,7 +13,6 @@
 #include "common/constants.hpp"
 #include "executor/selection_vector.hpp"
 #include "executor/simd_comparison.hpp"
-#include "executor/vectorized_expression.hpp"
 #include "executor/zone_map.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
@@ -25,6 +24,79 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(DataChunkTest, CollationSurvivesNullPrefixesAndNullOnlyTransfers) {
+  const Value folded = Value("A").WithCollation(2);
+  ColumnVector source(ValueType::kVarChar);
+  source.Append(folded);
+  ColumnVector nulls(ValueType::kVarChar);
+  nulls.Append(Value());
+  for (int path = 0; path < 4; ++path) {
+    SCOPED_TRACE(path);
+    ColumnVector column(ValueType::kVarChar);
+    // Exercise both a fresh column and reuse after Reset().
+    for (int run = 0; run < 2; ++run) {
+      column.Append(Value());
+      switch (path) {
+        case 0:
+          column.Append(folded);
+          break;
+        case 1:
+          column.Append(Value("A").WithCollation(2));
+          break;
+        case 2:
+          column.AppendFrom(source, 0);
+          break;
+        default:
+          column.AppendRange(source);
+          break;
+      }
+      column.AppendRange(nulls);
+      column.Append(folded);
+      EXPECT_EQ(column.ValueAt(1).Collation(), 2);
+      EXPECT_EQ(column.ValueAt(3).Collation(), 2);
+      EXPECT_TRUE(EqualUnderCollation(column.ValueAt(1), Value("a")));
+      column.Reset();
+    }
+  }
+}
+
+TEST(DataChunkTest, TransfersKeepZoneMapsSoundForUnsignedAndCollatedValues) {
+  Column key("key", ValueType::kInt64);
+  key.SetUnsigned(true);
+  const Schema schema("batch", {key, Column("name", ValueType::kVarChar)});
+  DataChunk source(schema, 2);
+  const Value high = Value(int64_t{-1}).WithUnsigned();
+  source.Append(Row({high, Value("Z").WithCollation(2)}));
+  source.Append(Row({Value(1).WithUnsigned(), Value("a").WithCollation(2)}));
+  for (int path = 0; path < 3; ++path) {
+    SCOPED_TRACE(path);
+    DataChunk output(schema, 2);
+    if (path == 0) {
+      output.Append(source, 0);
+      output.Append(source, 1);
+    } else if (path == 1) {
+      const std::array<uint32_t, 2> selected = {0, 1};
+      output.AppendGather(source, selected.data(), selected.size());
+    } else {
+      output.AppendRowFromColumns({&source.ColumnAt(0), &source.ColumnAt(1)},
+                                  0);
+      output.AppendRowFromColumns({&source.ColumnAt(0), &source.ColumnAt(1)},
+                                  1);
+    }
+    EXPECT_TRUE(output.ZoneMapAt(0).MayMatch(BinaryOperation::kEquals, high));
+    EXPECT_TRUE(
+        output.ZoneMapAt(1).MayMatch(BinaryOperation::kEquals, Value("z")));
+  }
+}
+
+TEST(DataChunkTest, BinaryZoneCannotPruneACaseInsensitivePredicate) {
+  ZoneMap zone;
+  zone.Add(Value("Z"));
+  zone.Add(Value("a"));
+  EXPECT_TRUE(
+      zone.MayMatch(BinaryOperation::kEquals, Value("z").WithCollation(2)));
+}
 
 TEST(DataChunkTest,
      Append_TypedColumnsAndNulls_StoresCorrectValuesAndPositions) {
@@ -480,43 +552,6 @@ TEST(SelectionVectorTest, FilterAndToSelectionVector) {
   EXPECT_EQ(sliced[3], 5);
 }
 
-TEST(VectorizedExpressionTest, EvaluateArithmeticAndComparison) {
-  const Schema schema(
-      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64),
-            Column("score", ValueType::kDouble)});
-  DataChunk chunk(schema, 4);
-  chunk.Append(Row({Value(int64_t{10}), Value(int64_t{2}), Value(1.5)}));
-  chunk.Append(Row({Value(int64_t{20}), Value(int64_t{5}), Value(2.5)}));
-  chunk.Append(Row({Value(int64_t{30}), Value(), Value(3.5)}));
-
-  // a + b
-  Expression add_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kAdd, ColumnValueExp("b"));
-  ColumnVector add_res =
-      VectorizedExpression::Evaluate(add_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(add_res.Size(), 3);
-  EXPECT_EQ(add_res.ValueAt(0), Value(int64_t{12}));
-  EXPECT_EQ(add_res.ValueAt(1), Value(int64_t{25}));
-  EXPECT_TRUE(add_res.IsNull(2));
-
-  // a > 15
-  Expression cmp_expr =
-      BinaryExpressionExp(ColumnValueExp("a"), BinaryOperation::kGreaterThan,
-                          ConstantValueExp(Value(int64_t{15})));
-  ValidityBitmap filter_mask =
-      VectorizedExpression::EvaluateFilter(cmp_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(filter_mask.Size(), 3);
-  EXPECT_FALSE(filter_mask.Get(0));
-  EXPECT_TRUE(filter_mask.Get(1));
-  EXPECT_TRUE(filter_mask.Get(2));
-
-  SelectionVector sel;
-  VectorizedExpression::FilterDataChunk(cmp_expr, schema, chunk, &sel);
-  ASSERT_EQ(sel.Size(), 2);
-  EXPECT_EQ(sel[0], 1);
-  EXPECT_EQ(sel[1], 2);
-}
-
 TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
   std::vector<int64_t> ints = {10, 20, 30, 40, 50};
   ValidityBitmap int_mask;
@@ -601,27 +636,12 @@ TEST(DataChunkBitwiseAggregateTest, BitAndOrXorSkipNullsAndHonorSelection) {
 
   // BIT_AND: 0b1111 & 0b0110 & 0b0011 = 0b0010 (2)
   EXPECT_EQ(chunk.AggregateBitAnd(0), Value(int64_t{0b0010}));
-  EXPECT_EQ(VectorizedExpression::AggregateBitAnd(chunk.ColumnAt(0)),
-            Value(int64_t{0b0010}));
-  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitAnd,
-                                            chunk.ColumnAt(0)),
-            Value(int64_t{0b0010}));
 
   // BIT_OR: 0b1111 | 0b0110 | 0b0011 = 0b1111 (15)
   EXPECT_EQ(chunk.AggregateBitOr(0), Value(int64_t{0b1111}));
-  EXPECT_EQ(VectorizedExpression::AggregateBitOr(chunk.ColumnAt(0)),
-            Value(int64_t{0b1111}));
-  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitOr,
-                                            chunk.ColumnAt(0)),
-            Value(int64_t{0b1111}));
 
   // BIT_XOR: 0b1111 ^ 0b0110 ^ 0b0011 = 0b1010 (10)
   EXPECT_EQ(chunk.AggregateBitXor(0), Value(int64_t{0b1010}));
-  EXPECT_EQ(VectorizedExpression::AggregateBitXor(chunk.ColumnAt(0)),
-            Value(int64_t{0b1010}));
-  EXPECT_EQ(VectorizedExpression::Aggregate(AggregationType::kBitXor,
-                                            chunk.ColumnAt(0)),
-            Value(int64_t{0b1010}));
 
   // With SelectionVector selecting row 0 and row 1:
   SelectionVector sel({0, 1});
@@ -650,82 +670,6 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   // Column "c" has all NULL: LOGICAL_AND = NULL, LOGICAL_OR = NULL
   EXPECT_TRUE(chunk.AggregateLogicalAnd(2).IsNull());
   EXPECT_TRUE(chunk.AggregateLogicalOr(2).IsNull());
-
-  // VectorizedExpression binary logical evaluation: a AND b
-  Expression and_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
-  ColumnVector and_res =
-      VectorizedExpression::Evaluate(and_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(and_res.Size(), 3);
-  EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
-  EXPECT_EQ(and_res.ValueAt(1), Value(int64_t{0}));
-  EXPECT_EQ(and_res.ValueAt(2), Value(int64_t{1}));
-
-  // a OR b
-  Expression or_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
-  ColumnVector or_res =
-      VectorizedExpression::Evaluate(or_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(or_res.Size(), 3);
-  EXPECT_EQ(or_res.ValueAt(0), Value(int64_t{1}));
-  EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
-  EXPECT_EQ(or_res.ValueAt(2), Value(int64_t{1}));
-
-  // a XOR b
-  Expression xor_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kXor, ColumnValueExp("b"));
-  ColumnVector xor_res =
-      VectorizedExpression::Evaluate(xor_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(xor_res.Size(), 3);
-  EXPECT_EQ(xor_res.ValueAt(0), Value(int64_t{1}));
-  EXPECT_EQ(xor_res.ValueAt(1), Value(int64_t{1}));
-  EXPECT_EQ(xor_res.ValueAt(2), Value(int64_t{0}));
-}
-
-TEST(VectorizedExpressionTest, AndOrFollowThreeValuedLogicWithNulls) {
-  const Schema schema(
-      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
-  DataChunk chunk(schema, 4);
-  // (FALSE, NULL), (TRUE, NULL), (NULL, NULL), (FALSE, FALSE)
-  chunk.Append(Row({Value(int64_t{0}), Value()}));
-  chunk.Append(Row({Value(int64_t{1}), Value()}));
-  chunk.Append(Row({Value(), Value()}));
-  chunk.Append(Row({Value(int64_t{0}), Value(int64_t{0})}));
-
-  const Expression and_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kAnd, ColumnValueExp("b"));
-  const ColumnVector and_res =
-      VectorizedExpression::Evaluate(and_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(and_res.Size(), 4);
-  // FALSE AND NULL -> FALSE (ground truth in binary_expression.cpp)
-  EXPECT_EQ(and_res.ValueAt(0), Value(int64_t{0}));
-  EXPECT_TRUE(and_res.ValueAt(1).IsNull());
-  EXPECT_TRUE(and_res.ValueAt(2).IsNull());
-  EXPECT_EQ(and_res.ValueAt(3), Value(int64_t{0}));
-  // Cross-check every row against scalar AST evaluation.
-  for (size_t i = 0; i < 4; ++i) {
-    const Value expected =
-        EvaluateBinary(BinaryOperation::kAnd, chunk.ColumnAt(0).ValueAt(i),
-                       chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(and_res.ValueAt(i), expected) << i;
-  }
-
-  const Expression or_expr = BinaryExpressionExp(
-      ColumnValueExp("a"), BinaryOperation::kOr, ColumnValueExp("b"));
-  const ColumnVector or_res =
-      VectorizedExpression::Evaluate(or_expr, schema, chunk).MoveValue();
-  ASSERT_EQ(or_res.Size(), 4);
-  // FALSE OR NULL -> NULL, TRUE OR NULL -> TRUE (ground truth).
-  EXPECT_TRUE(or_res.ValueAt(0).IsNull());
-  EXPECT_EQ(or_res.ValueAt(1), Value(int64_t{1}));
-  EXPECT_TRUE(or_res.ValueAt(2).IsNull());
-  EXPECT_EQ(or_res.ValueAt(3), Value(int64_t{0}));
-  for (size_t i = 0; i < 4; ++i) {
-    const Value expected =
-        EvaluateBinary(BinaryOperation::kOr, chunk.ColumnAt(0).ValueAt(i),
-                       chunk.ColumnAt(1).ValueAt(i));
-    EXPECT_EQ(or_res.ValueAt(i), expected) << i;
-  }
 }
 
 }  // namespace tinylamb

@@ -48,7 +48,7 @@
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "database/page_storage.hpp"
-#include "index/b_plus_tree_iterator.hpp"
+#include "index/lsm_index.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
@@ -103,12 +103,21 @@ bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
                     });
 }
 
+template <typename Cache>
+void EraseCaseVariants(Cache& cache, std::string_view name) {
+  std::erase_if(cache, [&](const auto& entry) {
+    return EqualsIgnoreCase(entry.first, name);
+  });
+}
+
 }  // namespace
 
 StatusOr<std::unique_ptr<Database>> Database::Create(std::string_view dbname,
-                                                     size_t wal_sync_ms) {
-  ASSIGN_OR_RETURN(std::unique_ptr<PageStorage>, storage,
-                   PageStorage::Create(dbname, wal_sync_ms));
+                                                     size_t wal_sync_ms,
+                                                     bool preallocate_new_wal) {
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<PageStorage>, storage,
+      PageStorage::Create(dbname, wal_sync_ms, preallocate_new_wal));
   {
     const std::scoped_lock lock(created_databases_mutex);
     created_databases.insert(std::string(dbname));
@@ -424,14 +433,7 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
       std::ignore = statistics_.Delete(ctx.txn_, schema.Name());
     }
     for (size_t i = 0; i < new_table.IndexCount(); ++i) {
-      for (const page_id_t idx_pid :
-           BPlusTree::CollectPageIds(ctx.txn_, new_table.GetIndex(i).Root())) {
-        auto page = storage_->pm_->GetPage(idx_pid);
-        if (page.HasValue()) {
-          storage_->pm_->DestroyPage(ctx.txn_, &*page.Value());
-          page.Value().PageUnlock();
-        }
-      }
+      std::ignore = LsmIndex(new_table.GetIndex(i).Root()).Destroy(ctx.txn_);
     }
     {
       auto page = storage_->pm_->GetPage(new_table.first_pid_);
@@ -581,21 +583,11 @@ Status Database::DropTable(TransactionContext& ctx,
     pid = next;
   }
   for (size_t i = 0; i < current.IndexCount(); ++i) {
-    for (const page_id_t idx_pid :
-         BPlusTree::CollectPageIds(ctx.txn_, current.GetIndex(i).Root())) {
-      ASSIGN_OR_RETURN(PageRef, page, storage_->pm_->GetPage(idx_pid));
-      if (!page.IsValid()) {
-        continue;
-      }
-      RETURN_IF_FAIL(storage_->pm_->DestroyPage(ctx.txn_, &*page));
-      page.PageUnlock();
-    }
+    RETURN_IF_FAIL(LsmIndex(current.GetIndex(i).Root()).Destroy(ctx.txn_));
   }
   storage_->pm_->ForgetTableTail(current.first_pid_);
-  ctx.tables_.erase(canonical);
-  ctx.stats_.erase(canonical);
-  ctx.tables_.erase(std::string(schema_name));
-  ctx.stats_.erase(std::string(schema_name));
+  EraseCaseVariants(ctx.tables_, canonical);
+  EraseCaseVariants(ctx.stats_, canonical);
   rollback->Dismiss();
   return Status::kSuccess;
 }
@@ -810,14 +802,11 @@ Status Database::RenameTable(TransactionContext& ctx,
                          "table " + target + " already exists");
     }
   }
-  // A FOREIGN KEY in any other table stores its parent table name as a
+  // A FOREIGN KEY stores its parent table name as a
   // string; renaming the parent would silently dangle it (DropTable refuses
   // for the same reason).
   for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
        ++iter) {
-    if (EqualsIgnoreCase(iter.Key(), canonical)) {
-      continue;
-    }
     Table other;
     if (!Deserialize(iter.Value(), &other)) {
       return Status::kCorrupt;
@@ -845,6 +834,10 @@ Status Database::RenameTable(TransactionContext& ctx,
   }
   Table renamed = tbl;
   renamed.schema_ = tbl.GetSchema().WithName(target);
+  // Resolve statistics while the old catalog name still exists. Looking
+  // them up after deleting it made migration depend on a warm thread cache.
+  ASSIGN_OR_RETURN(TableStatistics, renamed_stats,
+                   GetStatistics(ctx, canonical));
   {
     std::scoped_lock incarnation_lock(table_incarnations_mu_);
     auto state = table_incarnations_.find(canonical);
@@ -857,11 +850,10 @@ Status Database::RenameTable(TransactionContext& ctx,
   RETURN_IF_FAIL(catalog_.Delete(ctx.txn_, canonical));
   // Statistics entries are keyed by the canonical table name; carry them to
   // the new name so ANALYZE results survive a rename.
-  if (StatusOr<TableStatistics> stats = GetStatistics(ctx, canonical);
-      stats.HasValue()) {
+  {
     RETURN_IF_FAIL(
-        WriteSplitStatistics(statistics_, ctx.txn_, target, stats.Value()));
-    for (size_t column = 0; column < stats.Value().Columns(); ++column) {
+        WriteSplitStatistics(statistics_, ctx.txn_, target, renamed_stats));
+    for (size_t column = 0; column < renamed_stats.Columns(); ++column) {
       const Status deleted = statistics_.Delete(
           ctx.txn_,
           StatisticsColumnKey(canonical, static_cast<slot_t>(column)));
@@ -874,6 +866,10 @@ Status Database::RenameTable(TransactionContext& ctx,
       return deleted;
     }
   }
+  EraseCaseVariants(ctx.tables_, canonical);
+  EraseCaseVariants(ctx.stats_, canonical);
+  EraseCaseVariants(ctx.tables_, target);
+  EraseCaseVariants(ctx.stats_, target);
   BumpSchemaEpoch();
   return Status::kSuccess;
 }
@@ -903,10 +899,41 @@ Status Database::RenameColumn(TransactionContext& ctx,
                              " already exists in " + canonical);
     }
   }
+  // Reference payloads name parent columns. Match RenameTable's policy:
+  // reject a rename that would leave another constraint dangling.
+  for (BPlusTreeIterator iter = catalog_.Begin(ctx.txn_); iter.IsValid();
+       ++iter) {
+    Table other;
+    if (!Deserialize(iter.Value(), &other)) {
+      return Status::kCorrupt;
+    }
+    const Schema& other_schema = other.GetSchema();
+    for (size_t i = 0; i < other_schema.ColumnCount(); ++i) {
+      const Column& column = other_schema.GetColumn(i);
+      std::string parent_table;
+      std::vector<std::string> parent_columns;
+      if (!ParseForeignKeyReference(column.GetConstraint(), &parent_table,
+                                    &parent_columns) ||
+          !EqualsIgnoreCase(parent_table, canonical)) {
+        continue;
+      }
+      if (!EqualsIgnoreCase(old_column, new_column) &&
+          (parent_columns.empty() ||
+           std::ranges::any_of(parent_columns, [&](const std::string& name) {
+             return EqualsIgnoreCase(name, old_column);
+           }))) {
+        return StatusError(StatusCode::kConflicts,
+                           "cannot rename column " + std::string(old_column) +
+                               " because a FOREIGN KEY references it");
+      }
+    }
+  }
   Table renamed = tbl;
   renamed.schema_ = tbl.GetSchema().WithRenamedColumn(
       static_cast<size_t>(offset), new_column);
   RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(renamed)));
+  EraseCaseVariants(ctx.tables_, canonical);
+  EraseCaseVariants(ctx.stats_, canonical);
   BumpSchemaEpoch();
   return Status::kSuccess;
 }
@@ -923,7 +950,7 @@ Status Database::CreateIndex(TransactionContext& ctx,
   RETURN_IF_FAIL(tbl.CreateIndex(ctx.txn_, idx));
   RETURN_IF_FAIL(catalog_.Update(ctx.txn_, canonical, Serialize(tbl)));
   // Refresh the cached image so later inserts maintain the new index.
-  ctx.tables_.erase(std::string(schema_name));
+  EraseCaseVariants(ctx.tables_, canonical);
   ctx.tables_[canonical] = std::make_shared<Table>(std::move(tbl));
   // New access paths may change plan choices; invalidate compiled plans.
   BumpSchemaEpoch();
@@ -1176,6 +1203,8 @@ void Database::RemoveCreatedDatabaseFiles() {
     // are the norm (not every database reaches every stage) and simply
     // ignored.
     std::ignore = std::remove((name + ".db").c_str());
+    std::ignore = std::remove((name + ".db.ckpt").c_str());
+    std::ignore = std::remove((name + ".db.ckpt.tmp").c_str());
     std::ignore = std::remove((name + ".log").c_str());
     std::ignore = std::remove((name + ".log.meta").c_str());
     std::ignore = std::remove((name + ".log.meta.tmp").c_str());
@@ -1195,6 +1224,8 @@ void Database::DeleteAll() {
   const std::string master_record_name = storage_->MasterRecordName();
   storage_.reset();
   std::ignore = std::remove(database_name.c_str());
+  std::ignore = std::remove((database_name + ".ckpt").c_str());
+  std::ignore = std::remove((database_name + ".ckpt.tmp").c_str());
   std::ignore = std::remove(log_name.c_str());
   std::ignore = std::remove((log_name + ".meta").c_str());
   std::ignore = std::remove((log_name + ".meta.tmp").c_str());

@@ -11,12 +11,15 @@
 #include <exception>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/encoder.hpp"
 #include "common/exc_shim.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/binary_expression.hpp"
@@ -514,6 +517,141 @@ bool ProgramIsFastInterpretable(const BytecodeProgram& program) {
 
 }  // namespace
 
+namespace {
+bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
+                       size_t* nodes, size_t depth = 0) {
+  if (++*nodes > 2048 || depth > 128) return false;
+  *encoder << static_cast<bool>(expression);
+  if (!expression) return true;
+  *encoder << static_cast<uint32_t>(expression->Type());
+  const auto child = [&](const Expression& value) {
+    return EncodeCompileTree(value, encoder, nodes, depth + 1);
+  };
+  switch (expression->Type()) {
+    case TypeTag::kColumnValue:
+      *encoder << expression->AsColumnValue().GetColumnName();
+      return true;
+    case TypeTag::kConstantValue: {
+      const Value& value = expression->AsConstantValue().GetValue();
+      if (value.type == ValueType::kArray ||
+          (value.type == ValueType::kVarChar &&
+           value.value.varchar_value.size() > 16384))
+        return false;
+      if (typeid(*expression) != typeid(ConstantValue)) {
+        const auto evaluated = expression->TryEvaluate(Row(), Schema());
+        if (!evaluated.HasValue() ||
+            Encode(evaluated.Value()) != Encode(value) ||
+            evaluated.Value().Collation() != value.Collation())
+          return false;
+      }
+      *encoder << value << value.Collation();
+      return true;
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& binary = expression->AsBinaryExpression();
+      *encoder << static_cast<uint32_t>(binary.Op());
+      return child(binary.Left()) && child(binary.Right());
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& unary = expression->AsUnaryExpression();
+      *encoder << static_cast<uint32_t>(unary.Op());
+      return child(unary.Child());
+    }
+    case TypeTag::kInExp: {
+      const auto& in = expression->AsInExpression();
+      *encoder << static_cast<uint64_t>(in.list_.size());
+      if (!child(in.child_)) return false;
+      for (const auto& value : in.list_)
+        if (!child(value)) return false;
+      return true;
+    }
+    case TypeTag::kCaseExp: {
+      const auto& conditional = expression->AsCaseExpression();
+      *encoder << conditional.IsFromIf()
+               << static_cast<uint64_t>(conditional.when_clauses_.size());
+      for (const auto& clause : conditional.when_clauses_)
+        if (!child(clause.first) || !child(clause.second)) return false;
+      return child(conditional.else_clause_);
+    }
+    default:
+      // Functions, subqueries, aggregates and other context-bearing nodes
+      // keep the ordinary compiler; none enter the retained cache.
+      return false;
+  }
+}
+}  // namespace
+
+std::optional<std::string> ScalarExpressionCacheKey(
+    const std::vector<Expression>& expressions, const Schema& schema) {
+  std::string key;
+  key.reserve(512);
+  Encoder encoder(key);
+  encoder << schema << static_cast<uint64_t>(expressions.size());
+  size_t nodes = 0;
+  for (const auto& expression : expressions)
+    if (!EncodeCompileTree(expression, &encoder, &nodes)) return std::nullopt;
+  if (key.size() > 16384) return std::nullopt;
+  return key;
+}
+
+Expression FreezeScalarBindings(const Expression& expression) {
+  if (!expression) return nullptr;
+  if (expression->Type() == TypeTag::kConstantValue)
+    return ConstantValueExp(expression->AsConstantValue().GetValue());
+  auto children = ExpressionChildren(expression);
+  if (children.empty()) return expression;
+  for (auto& child : children) child = FreezeScalarBindings(child);
+  return WithExpressionChildren(expression, std::move(children));
+}
+
+std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
+    const Expression& expression, const Schema& schema, Context context) {
+  if (!expression) return std::nullopt;
+  std::string key;
+  key.reserve(512);
+  Encoder encoder(key);
+  encoder << static_cast<uint8_t>(context) << schema;
+  size_t nodes = 0;
+  if (!EncodeCompileTree(expression, &encoder, &nodes))
+    return Compile(expression, schema, context);
+  if (key.size() > 16384) return Compile(expression, schema, context);
+  struct Cache {
+    size_t bytes{0};
+    std::unordered_map<std::string, std::optional<BytecodeProgram>> entries;
+  };
+  static thread_local Cache cache;
+  if (auto found = cache.entries.find(key); found != cache.entries.end())
+    return found->second;
+  auto program = Compile(expression, schema, context);
+  if (!program && expression && expression->Type() == TypeTag::kCaseExp) {
+    // CompileNode emits the same branch dispatch as the AST without requiring
+    // one static output vector type. Keep each branch's returned Value intact.
+    BytecodeProgram dynamic;
+    if (CompileNode(expression, schema, &dynamic)) {
+      dynamic.SetResultType(ValueType::kNull);
+      dynamic.SetFastInterpretable(ProgramIsFastInterpretable(dynamic));
+      program = std::move(dynamic);
+    }
+  }
+  size_t bytes = key.capacity() + 128;
+  if (program) {
+    bytes += program->Instructions().capacity() * sizeof(BytecodeInstruction) +
+             program->Constants().capacity() * sizeof(Value);
+    for (const auto& value : program->Constants())
+      if (value.type == ValueType::kVarChar)
+        bytes += 2 * value.value.varchar_value.size() + 32;
+  }
+  constexpr size_t kLimit = 2 * 1024 * 1024;
+  if (bytes > kLimit) return program;
+  if (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes) {
+    cache.entries.clear();
+    cache.bytes = 0;
+  }
+  cache.bytes += bytes;
+  cache.entries.emplace(std::move(key), program);
+  return program;
+}
+
 std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     const Expression& expression, const Schema& schema, Context context) {
   try {
@@ -881,10 +1019,9 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
         // short-circuit replaces the operand with a normalized BOOLEAN
         // (INT64 0/1); an undecided jump leaves the operand in place.
         const FastSlot& top = stack.back();
-        const bool decides =
-            instruction.opcode == BytecodeOp::kJumpIfFalse
-                ? (!top.is_null && !FastTruthy(top))
-                : (!top.is_null && FastTruthy(top));
+        const bool decides = instruction.opcode == BytecodeOp::kJumpIfFalse
+                                 ? (!top.is_null && !FastTruthy(top))
+                                 : (!top.is_null && FastTruthy(top));
         if (decides) {
           stack.back() = FastSlot{
               .bits = instruction.opcode == BytecodeOp::kJumpIfTrue ? 1 : 0,
@@ -969,6 +1106,14 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
             bool equal = false;
             if (left.is_null || right.is_null) {
               equal = left.is_null && right.is_null;
+            } else if ((left.type != ValueType::kInt64 &&
+                        left.type != ValueType::kDouble) ||
+                       (right.type != ValueType::kInt64 &&
+                        right.type != ValueType::kDouble)) {
+              // Raw bits describe numeric equality only. Text lives in
+              // `text`, and DATE must retain its distinct comparison domain.
+              // Let the canonical VM handle these null-safe comparisons.
+              return FastEval::kUnsupported;
             } else if (left.type == ValueType::kDouble ||
                        right.type == ValueType::kDouble) {
               double l = 0.0;

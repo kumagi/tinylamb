@@ -273,3 +273,12 @@ Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_collation_test`,
 TPC-H/TPC-C suites (`sql_engine_tpch_test`, `sql_engine_tpcc_test`),
 `sql_extra_test`.
+
+CREATE INDEX SQL now routes through `CreateIndexStatement` to
+`Database::CreateIndex`: plain ascending column keys, UNIQUE, IF NOT EXISTS,
+and GoogleSQL STORING are supported. Names are checked within the target
+table. Expression/DESC/SEARCH/VECTOR/OPTIONS/OR REPLACE spellings are rejected
+explicitly. The pinned AST dump omits IF NOT EXISTS / OR REPLACE, so the
+visitor validates the source keyword prefix (including comments); source-less
+CREATE INDEX dumps are refused. DDL never enters the literal template cache.
+Regressions: `GoogleSqlAstTest.CreateIndex*`, `SqlEngineExtraTest.SqlCreateIndex*`.

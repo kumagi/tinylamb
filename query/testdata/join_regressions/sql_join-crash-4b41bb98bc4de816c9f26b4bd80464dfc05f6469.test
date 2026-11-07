@@ -1,0 +1,23 @@
+-- tinylamb-join-test v1
+-- seed: 3647704356
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact VALUES (0, 2, 3);
+-- setup: INSERT INTO fact VALUES (1, 3, 2);
+-- setup: INSERT INTO fact VALUES (2, 3, -3);
+-- setup: INSERT INTO fact VALUES (3, 3, -1);
+-- setup: INSERT INTO fact VALUES (4, 1, 2);
+-- setup: INSERT INTO fact VALUES (5, 1, -2);
+-- setup: INSERT INTO dim VALUES (0, 'x');
+-- setup: INSERT INTO dim VALUES (2, 'x');
+-- setup: INSERT INTO dim VALUES (NULL, 'x');
+-- setup: INSERT INTO dim VALUES (0, 'x');
+-- query: SELECT f.u, f.a FROM fact f JOIN dim d ON f.a <= d.k WHERE f.k = 1;
+-- expect: |4|,|2|,
+-- expect: |5|,|-2|,
+-- expect: |5|,|-2|,
+-- expect: |5|,|-2|,
+-- query: SELECT f.u FROM fact f WHERE f.k NOT IN (SELECT k FROM dim) ORDER BY f.u;
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f LEFT JOIN dim d ON f.k = d.k;
+-- expect: |6|,|1|,|3|,|1|,|-3|,|2|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

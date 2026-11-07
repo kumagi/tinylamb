@@ -71,12 +71,14 @@ BitmapHeapScan::BitmapHeapScan(Transaction& txn, const Table& table,
                    positions_.end());
 }
 
-bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
-  while (offset_ < positions_.size()) {
+size_t BitmapHeapScan::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(schema_, max_rows);
+  while (destination->Size() < max_rows && offset_ < positions_.size()) {
     const RowPosition pos = positions_[offset_++];
     StatusOr<Row> row_or = table_->Read(*txn_, pos);
     if (row_or.GetStatus() != Status::kSuccess) {
-      return FailWith(row_or.GetStatus());
+      FailWith(row_or.GetStatus());
+      return destination->Size();
     }
     if (where_) {
       StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
@@ -84,19 +86,16 @@ bool BitmapHeapScan::Next(Row* dst, RowPosition* rp) {
             return conjunct->TryEvaluate(row_or.Value(), schema_);
           });
       if (!pass.HasValue()) {
-        return FailWith(pass.GetStatus());
+        FailWith(pass.GetStatus());
+        return destination->Size();
       }
       if (!pass.Value()) {
         continue;
       }
     }
-    *dst = std::move(row_or.Value());
-    if (rp != nullptr) {
-      *rp = pos;
-    }
-    return true;
+    destination->Append(std::move(row_or.Value()), pos);
   }
-  return false;
+  return destination->Size();
 }
 
 void BitmapHeapScan::Dump(std::ostream& o, int /*indent*/) const {

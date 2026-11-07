@@ -144,3 +144,10 @@ documented SQL semantics; flipping one must not change results, only speed
 | `TINYLAMB_BPT_CONC_FUZZ_SEED` | B+Tree concurrency fuzzer seed. |
 | `TINYLAMB_CALLGRIND_MEASUREMENT` | Benchmark mode tuned for callgrind (skips wall-time assertions). |
 | `TINYLAMB_SKIP_ANALYZE` | `=1` skips the post-load ANALYZE pass in the TPC-H benchmark (profiling-only; statistics stay stale). |
+
+## Server diagnostics
+
+| Variable | Meaning |
+| --- | --- |
+| `TINYLAMB_DISABLE_IO_AFFINITY` | When present, leave the PostgreSQL server I/O thread unpinned. Normally Run pins that thread to the first CPU in its inherited allowed set. SQL workers and storage threads retain the full set; synchronous SQL on I/O temporarily restores it, and Run restores the caller mask on exit. Best effort on systems that allow affinity calls. |
+| `TINYLAMB_SERVER_METRICS` | When present, emit cumulative JSON counters to stderr at most once per second: monotonic timestamp, selected I/O CPU (`io_cpu`, -1 if unpinned), worker tasks/queue/execution/completion handoff ns, pending tasks, own-commit WAL waits, WAL sync calls/ns and buffered/durable bytes, active transactions and MVCC chain/snapshot gauges. Enables transaction timing. Blocking execution includes WAL wait; the deferred single-statement path reports separate durability_commands/wait_ns/batches after SQL execution. Compare deltas and subtract nested spans instead of adding them. Sync statistics count runtime segment syncs, including segment rolls, but exclude open-time sync and final shutdown fsync. |

@@ -21,8 +21,9 @@
 #include <vector>
 
 #include "common/incarnation.hpp"
-#include "index/b_plus_tree.hpp"
-#include "index/b_plus_tree_iterator.hpp"
+#include "index/index_schema.hpp"
+#include "index/lsm_index.hpp"
+#include "table/full_scan_iterator.hpp"
 #include "table/iterator_base.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
@@ -66,6 +67,16 @@ class IndexScanIterator : public IteratorBase {
   [[nodiscard]] const Row& Include() const { return include_; }
   [[nodiscard]] std::string GetValue() const;
   [[nodiscard]] RowPosition Position() const override;
+  [[nodiscard]] size_t ValueListsDecoded() const {
+    return value_lists_decoded_;
+  }
+  [[nodiscard]] size_t ValueEntriesDecoded() const {
+    return value_entries_decoded_;
+  }
+  [[nodiscard]] size_t HeapPageImagesCopied() const {
+    return heap_page_images_copied_;
+  }
+  [[nodiscard]] size_t RowsDecoded() const { return rows_decoded_; }
   // Index-only visibility fast path (the MVCC visibility-map equivalent of
   // full_scan_iterator.cpp's PhysicalReadEligible): when the index does not
   // retain deleted entries and the entry's row page carries no version
@@ -85,6 +96,15 @@ class IndexScanIterator : public IteratorBase {
   static StatusOr<std::vector<Row>> PartitionBoundaries(
       const Index& index, Transaction& txn, const std::vector<Value>& begin_key,
       const std::vector<Value>& end_key, size_t leaves_per_partition);
+  // Uses exactly the cursor's inclusive/prefix bound encoding. Unknown/null
+  // bounds deliberately overlap everything, keeping stale-key fallbacks safe.
+  static bool EncodedKeyMayOverlap(const Index& index,
+                                   std::string_view encoded_key,
+                                   const std::vector<Value>& begin_key,
+                                   const std::vector<Value>& end_key);
+  // Snapshot-only projected decoding. Retained indexes require full rows to
+  // revalidate their historical key images and deliberately decline this.
+  [[nodiscard]] Status SetProjection(const std::vector<slot_t>& columns);
   void Clear();
   IteratorBase& operator++() override;
   IteratorBase& operator--() override;
@@ -96,8 +116,15 @@ class IndexScanIterator : public IteratorBase {
  private:
   friend class Table;
   friend class IndexScan;
+  friend class IndexOnlyScan;
+  // Skip the remainder of this encoded key's value list. The covering scan
+  // calls this only after finding a visible representative for a key-only
+  // DISTINCT consumer; invisible candidates must still advance row by row.
+  void AdvanceToNextKey();
+  void SetDistinctKeysMode(bool enable) { distinct_keys_mode_ = enable; }
   void UpdateIteratorState();
   void ResolveRow() const;
+  void DecodeVisibleRow(std::string_view image) const;
   // kUnique entries normally hold a single position per key, but a key
   // carrying a NULL is stored (and must be decoded/navigated) as a
   // multi-value list: SQL says NULL != NULL, so several rows can share one
@@ -119,6 +146,13 @@ class IndexScanIterator : public IteratorBase {
   // -1 means "not positioned"; otherwise an index into the non-unique
   // value list of the current key. Signed so the sentinel cannot wrap.
   int64_t value_offset_{-1};
+  // Owned images, valid until the B+Tree cursor changes keys. Snapshot scans
+  // hold an index read gate; DML resolve-head scans reload before each step.
+  std::vector<IndexValueType> value_list_;
+  bool entry_loaded_{false};
+  bool distinct_keys_mode_{false};
+  size_t value_lists_decoded_{0};
+  size_t value_entries_decoded_{0};
   TableLease table_lease_;
   TransactionManager::IndexReadGuard index_read_lock_;
   BPlusTree bpt_;
@@ -128,6 +162,18 @@ class IndexScanIterator : public IteratorBase {
   Row include_;
   mutable Row current_row_;
   mutable bool current_row_resolved_{false};
+  // Snapshot range scans own one chain-free heap page's row images. No page
+  // latch or buffer-pool pointer survives a call. A later writer cannot change
+  // the image this fixed read-only snapshot must see.
+  bool cache_heap_images_{false};
+  mutable page_id_t last_heap_page_{~page_id_t{0}};
+  mutable page_id_t heap_image_page_{~page_id_t{0}};
+  mutable std::string heap_images_;
+  mutable std::vector<std::pair<size_t, size_t>> heap_image_slots_;
+  mutable size_t heap_page_images_copied_{0};
+  mutable size_t rows_decoded_{0};
+  std::vector<IntegerPeekCompare> integer_peeks_;
+  std::optional<std::vector<slot_t>> projection_;
   // One-slot memo for the chain probe in TryReadIndexOnly: consecutive
   // entries usually land on the same row page.  A cached verdict stays sound
   // for the scan's lifetime -- see the implementation.

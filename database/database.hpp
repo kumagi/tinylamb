@@ -31,7 +31,7 @@
 #include "database/catalog_reader.hpp"
 #include "database/page_storage.hpp"
 #include "database/transaction_context.hpp"
-#include "index/b_plus_tree.hpp"
+#include "index/lsm_index.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "transaction/transaction.hpp"
@@ -50,8 +50,9 @@ class Database final : public CatalogReader {
  public:
   // Opens (creating when needed) the database files and initializes the
   // system relations. Startup failures surface as Status.
-  static StatusOr<std::unique_ptr<Database>> Create(std::string_view dbname,
-                                                    size_t wal_sync_ms = 1);
+  static StatusOr<std::unique_ptr<Database>> Create(
+      std::string_view dbname, size_t wal_sync_ms = 1,
+      bool preallocate_new_wal = false);
 
   // Filesystem bookkeeping: every Create() records the database's base name
   // for this process; RemoveCreatedDatabaseFiles() unlinks the
@@ -76,6 +77,20 @@ class Database final : public CatalogReader {
   }
   void SetSynchronousCommit(bool enabled) {
     storage_->tm_->SetSynchronousCommit(enabled);
+  }
+  void SetCommitDrivenWalSync(bool enabled) {
+    storage_->logger_->SetCommitDrivenSync(enabled);
+  }
+  [[nodiscard]] bool FixedSizeWal() const {
+    return storage_->logger_->FixedSizeSegments();
+  }
+  Status WaitForCommitDurable(lsn_t target) {
+    return storage_->tm_->WaitForWALDurable(target);
+  }
+  // Successful fdatasync frontier, including bytes beyond a waiter's target.
+  // BufferedLSN / CommittedLSN are not durability proofs.
+  [[nodiscard]] lsn_t DurableWALLSN() const {
+    return storage_->logger_->DurableLSN();
   }
   void SetTransactionMetricsEnabled(bool enabled) {
     storage_->tm_->SetMetricsEnabled(enabled);

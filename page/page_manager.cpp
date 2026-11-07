@@ -14,111 +14,1463 @@
  * limitations under the License.
  */
 
-#include "page_manager.hpp"
+#include "page/page_manager.hpp"
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <mutex>
-#include <stdexcept>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "common/constants.hpp"
-#include "page/meta_page.hpp"
+#include "common/crc32c.hpp"
+#include "common/log_message.hpp"
+#include "common/serdes.hpp"
+#include "common/status_or.hpp"
+#include "page/page.hpp"
 #include "page/page_ref.hpp"
-#include "page_type.hpp"
+#include "page/page_type.hpp"
 #include "recovery/log_record.hpp"
-#include "recovery/recovery_manager.hpp"
 #include "transaction/transaction.hpp"
-#include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
 
-StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
-    std::string_view db_name, size_t capacity, bool initialize_meta) {
-  ASSIGN_OR_RETURN(std::unique_ptr<PagePool>, pool,
-                   PagePool::Create(db_name, capacity));
-  // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
-  auto manager = std::unique_ptr<PageManager>(
-      new PageManager(db_name, capacity, std::move(pool)));  // NOLINT
-  if (initialize_meta) {
-    RETURN_IF_FAIL(manager->GetMetaPage().GetStatus());
+namespace {
+constexpr char kFuzzyCheckpointMagic[8] = {'T', 'L', 'S', 'M',
+                                           'C', 'K', 'P', '1'};
+constexpr uint32_t kFuzzyCheckpointVersion = 1;
+constexpr auto kTableTailWaitTimeout = std::chrono::milliseconds(5000);
+constexpr auto kTableTailWaitSlice = std::chrono::milliseconds(5);
+
+void AppendU32(std::string* dst, uint32_t v) {
+  char buf[sizeof(uint32_t)];
+  std::memcpy(buf, &v, sizeof(uint32_t));
+  dst->append(buf, sizeof(uint32_t));
+}
+void AppendU64(std::string* dst, uint64_t v) {
+  char buf[sizeof(uint64_t)];
+  std::memcpy(buf, &v, sizeof(uint64_t));
+  dst->append(buf, sizeof(uint64_t));
+}
+void AppendString(std::string* dst, std::string_view sv) {
+  AppendU32(dst, static_cast<uint32_t>(sv.size()));
+  dst->append(sv.data(), sv.size());
+}
+bool ConsumeU32(const char* data, size_t size, size_t* off, uint32_t* out) {
+  if (*off + sizeof(uint32_t) > size) {
+    return false;
   }
-  return manager;
+  std::memcpy(out, data + *off, sizeof(uint32_t));
+  *off += sizeof(uint32_t);
+  return true;
+}
+bool ConsumeU64(const char* data, size_t size, size_t* off, uint64_t* out) {
+  if (*off + sizeof(uint64_t) > size) {
+    return false;
+  }
+  std::memcpy(out, data + *off, sizeof(uint64_t));
+  *off += sizeof(uint64_t);
+  return true;
+}
+bool ConsumeString(const char* data, size_t size, size_t* off,
+                   std::string* out) {
+  uint32_t len = 0;
+  if (!ConsumeU32(data, size, off, &len) || *off + len > size) {
+    return false;
+  }
+  out->assign(data + *off, len);
+  *off += len;
+  return true;
+}
+}  // namespace
+
+const LsmSortedRun::Entry* LsmSortedRun::Find(std::string_view key) const {
+  auto it = std::lower_bound(
+      entries.begin(), entries.end(), key,
+      [](const Entry& e, std::string_view k) { return e.key < k; });
+  if (it != entries.end() && it->key == key) {
+    return &*it;
+  }
+  return nullptr;
 }
 
-PageManager::PageManager(std::string_view /*db_name*/, size_t /*capacity*/,
-                         std::unique_ptr<PagePool> pool)
-    : pool_(std::move(pool)) {}
+bool LsmTreeState::LookupLiveLocked(std::string_view key,
+                                    std::string* value_out) const {
+  if (destroyed) {
+    return false;
+  }
+  auto mem_it = memtable.find(key);
+  if (mem_it != memtable.end()) {
+    if (mem_it->second.deleted) {
+      return false;
+    }
+    if (value_out != nullptr) {
+      *value_out = mem_it->second.value;
+    }
+    return true;
+  }
+  for (auto it = runs.rbegin(); it != runs.rend(); ++it) {
+    if (const auto* entry = it->Find(key)) {
+      if (entry->deleted) {
+        return false;
+      }
+      if (value_out != nullptr) {
+        *value_out = entry->value;
+      }
+      return true;
+    }
+  }
+  return false;
+}
 
-Status PageManager::InitializeMetaPage() {
-  RETURN_IF_FAIL(GetMetaPage().GetStatus());
+LsmSortedRun LsmTreeState::BuildCompactedCommittedRunLocked() const {
+  std::map<std::string, LsmSortedRun::Entry, std::less<>> merged;
+  for (const LsmSortedRun& run : runs) {
+    for (const LsmSortedRun::Entry& e : run.entries) {
+      merged[e.key] = e;
+    }
+  }
+  for (const auto& [k, c] : committed_mem) {
+    merged[k] = LsmSortedRun::Entry{
+        .key = k,
+        .value = c.value,
+        .deleted = c.deleted,
+        .committed_lsn = c.committed_lsn,
+    };
+  }
+  LsmSortedRun compacted;
+  compacted.generation = next_generation;
+  compacted.entries.reserve(merged.size());
+  for (auto& [k, e] : merged) {
+    if (!e.deleted) {
+      compacted.entries.push_back(std::move(e));
+    }
+  }
+  return compacted;
+}
+
+void LsmTreeState::FlushAndCompactIfIdleLocked() {
+  if (active_uncommitted_ops != 0 || committed_mem.size() < kFlushThreshold) {
+    return;
+  }
+  LsmSortedRun flushed;
+  flushed.generation = next_generation++;
+  flushed.entries.reserve(committed_mem.size());
+  for (auto& [k, c] : committed_mem) {
+    flushed.entries.push_back(LsmSortedRun::Entry{
+        .key = k,
+        .value = std::move(c.value),
+        .deleted = c.deleted,
+        .committed_lsn = c.committed_lsn,
+    });
+  }
+  committed_mem.clear();
+  memtable.clear();
+  runs.push_back(std::move(flushed));
+  if (runs.size() >= kCompactionThreshold) {
+    LsmSortedRun compacted = BuildCompactedCommittedRunLocked();
+    runs.clear();
+    if (!compacted.entries.empty()) {
+      runs.push_back(std::move(compacted));
+    }
+  }
+}
+
+StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
+    std::string_view db_name, size_t /*capacity*/, bool /*initialize_meta*/) {
+  const std::string path(db_name);
+  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return StatusError(
+        StatusCode::kIOError,
+        "failed to open database file " + path + ": " + std::strerror(errno));
+  }
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    const int err = errno;
+    ::close(fd);
+    if (err == EWOULDBLOCK || err == EAGAIN) {
+      return StatusError(StatusCode::kConflicts,
+                         "database file is already open: " + path);
+    }
+    return StatusError(
+        StatusCode::kIOError,
+        "failed to lock database file " + path + ": " + std::strerror(err));
+  }
+  return std::unique_ptr<PageManager>(new PageManager(path, fd));
+}
+
+PageManager::PageManager(std::string db_name, int lock_fd)
+    : db_name_(std::move(db_name)), lock_fd_(lock_fd) {}
+
+PageManager::~PageManager() { CloseDatabaseFile(); }
+
+void PageManager::CloseDatabaseFile() {
+  if (lock_fd_ >= 0) {
+    (void)::flock(lock_fd_, LOCK_UN);
+    ::close(lock_fd_);
+    lock_fd_ = -1;
+  }
+}
+
+void PageManager::DropAllState() {
+  {
+    std::scoped_lock lk(blocks_mu_);
+    blocks_.clear();
+    free_pages_.clear();
+    pending_destroyed_pages_.clear();
+  }
+  {
+    std::scoped_lock lk(trees_mu_);
+    lsm_trees_.clear();
+  }
+  {
+    std::scoped_lock lk(table_tails_mu_);
+    table_tails_.clear();
+    tail_reservations_.clear();
+    unpublished_tail_pages_.clear();
+  }
+}
+
+StatusOr<PageRef> PageManager::GetPage(page_id_t page_id, bool shared) {
+  if (page_id == 0) {
+    return Status::kNotExists;
+  }
+  Page* page = nullptr;
+  {
+    std::scoped_lock lk(blocks_mu_);
+    auto it = blocks_.find(page_id);
+    if (it == blocks_.end() || it->second == nullptr ||
+        it->second->Type() != PageType::kRowPage) {
+      cache_misses_.fetch_add(1, std::memory_order_relaxed);
+      return Status::kNotExists;
+    }
+    cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    page = it->second.get();
+  }
+  return PageRef(page, page->Latch(), shared);
+}
+
+StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
+                                               PageType new_page_type) {
+  Page* page = nullptr;
+  page_id_t pid = 0;
+  {
+    std::scoped_lock lk(blocks_mu_);
+    if (!free_pages_.empty()) {
+      pid = free_pages_.back();
+      free_pages_.pop_back();
+    } else {
+      pid = ++max_page_id_;
+    }
+    auto& slot = blocks_[pid];
+    if (slot == nullptr) {
+      slot = std::make_unique<Page>(pid, new_page_type);
+    } else {
+      slot->PageInit(pid, new_page_type);
+    }
+    page = slot.get();
+  }
+  txn.InvalidatePageVersions(pid);
+  ASSIGN_OR_RETURN(lsn_t, lsn, txn.AllocatePageLog(pid, new_page_type));
+  page->SetPageLSN(lsn);
+  return PageRef(page, page->Latch(), false);
+}
+
+Status PageManager::DestroyPage(Transaction& txn, Page* target) {
+  if (target == nullptr) {
+    return Status::kInvalidArgument;
+  }
+  const page_id_t pid = target->PageID();
+  ASSIGN_OR_RETURN(lsn_t, lsn, txn.DestroyPageLog(pid));
+  target->SetPageLSN(lsn);
+  target->type_ = PageType::kUnknown;
+  target->body.row_page.ClearLiveState();
+  {
+    std::scoped_lock lk(blocks_mu_);
+    pending_destroyed_pages_[txn.ID()].push_back(pid);
+  }
   return Status::kSuccess;
 }
 
-StatusOr<PageRef> PageManager::GetPage(uint64_t page_id, bool shared) {
-  bool cache_hit = false;
-  ASSIGN_OR_RETURN(PageRef, ref, pool_->GetPage(page_id, &cache_hit, shared));
-  if (!cache_hit && !ref->IsValid()) {
-    // Found a broken or new page: hand back the empty PageRef the existing
-    // callers (BPlusTree bootstrap) test with IsValid().
-    if (page_id > 3) {
-      LOG(WARN) << "PMDIAG empty ref pid=" << page_id
-                << " type=" << static_cast<int>(ref->Type())
-                << " file_bytes=" << pool_->DebugDataFileSizeForDiag();
-    }
-    return PageRef{};
+LsmTreeState* PageManager::GetOrCreateTreeLocked(page_id_t tree_id) const {
+  auto& ptr = lsm_trees_[tree_id];
+  if (ptr == nullptr) {
+    ptr = std::make_unique<LsmTreeState>();
   }
-  return ref;
+  return ptr.get();
+}
+
+LsmTreeState* PageManager::FindTreeLocked(page_id_t tree_id) const {
+  auto it = lsm_trees_.find(tree_id);
+  return it != lsm_trees_.end() ? it->second.get() : nullptr;
+}
+
+Status PageManager::LsmInsert(Transaction& txn, page_id_t tree_id,
+                              std::string_view key, std::string_view value) {
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = GetOrCreateTreeLocked(tree_id);
+  }
+  std::unique_lock tree_lk(tree->mutex);
+  if (tree->destroyed) {
+    tree->destroyed = false;
+  }
+  std::string existing;
+  if (tree->LookupLiveLocked(key, &existing)) {
+    return Status::kDuplicates;
+  }
+  ASSIGN_OR_RETURN(lsn_t, lsn,
+                   txn.LsmPutLog(tree_id, key, value, {}, /*had_prev=*/false));
+  (void)lsn;
+  tree->memtable[std::string(key)] = LsmTreeState::MemEntry{
+      .value = std::string(value),
+      .deleted = false,
+      .generation = tree->next_generation++,
+  };
+  ++tree->active_uncommitted_ops;
+  return Status::kSuccess;
+}
+
+Status PageManager::LsmUpdate(Transaction& txn, page_id_t tree_id,
+                              std::string_view key, std::string_view value) {
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = GetOrCreateTreeLocked(tree_id);
+  }
+  std::unique_lock tree_lk(tree->mutex);
+  std::string existing;
+  if (!tree->LookupLiveLocked(key, &existing)) {
+    return Status::kNotExists;
+  }
+  ASSIGN_OR_RETURN(
+      lsn_t, lsn,
+      txn.LsmPutLog(tree_id, key, value, existing, /*had_prev=*/true));
+  (void)lsn;
+  tree->memtable[std::string(key)] = LsmTreeState::MemEntry{
+      .value = std::string(value),
+      .deleted = false,
+      .generation = tree->next_generation++,
+  };
+  ++tree->active_uncommitted_ops;
+  return Status::kSuccess;
+}
+
+Status PageManager::LsmDelete(Transaction& txn, page_id_t tree_id,
+                              std::string_view key) {
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = GetOrCreateTreeLocked(tree_id);
+  }
+  std::unique_lock tree_lk(tree->mutex);
+  std::string existing;
+  if (!tree->LookupLiveLocked(key, &existing)) {
+    return Status::kNotExists;
+  }
+  ASSIGN_OR_RETURN(lsn_t, lsn, txn.LsmDeleteLog(tree_id, key, existing));
+  (void)lsn;
+  tree->memtable[std::string(key)] = LsmTreeState::MemEntry{
+      .value = {},
+      .deleted = true,
+      .generation = tree->next_generation++,
+  };
+  ++tree->active_uncommitted_ops;
+  return Status::kSuccess;
+}
+
+StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
+                                           std::string_view key) const {
+  cache_hits_.fetch_add(1, std::memory_order_relaxed);
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = FindTreeLocked(tree_id);
+  }
+  if (tree == nullptr) {
+    return Status::kNotExists;
+  }
+  std::shared_lock tree_lk(tree->mutex);
+  std::string value;
+  if (!tree->LookupLiveLocked(key, &value)) {
+    return Status::kNotExists;
+  }
+  return value;
+}
+
+std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
+    page_id_t tree_id, std::string_view begin, std::string_view end,
+    bool ascending) const {
+  cache_hits_.fetch_add(2, std::memory_order_relaxed);
+  if (!begin.empty() && !end.empty() && end < begin) {
+    return {};
+  }
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = FindTreeLocked(tree_id);
+  }
+  if (tree == nullptr) {
+    return {};
+  }
+  std::shared_lock tree_lk(tree->mutex);
+  if (tree->destroyed) {
+    return {};
+  }
+
+  auto in_bounds = [&](std::string_view k) -> bool {
+    if (!begin.empty() && k < begin) {
+      return false;
+    }
+    if (!end.empty()) {
+      if (ascending ? (end < k) : (end <= k)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::map<std::string, std::pair<std::string, bool>, std::less<>> merged;
+  for (const LsmSortedRun& run : tree->runs) {
+    auto it = begin.empty() ? run.entries.begin()
+                            : std::lower_bound(
+                                  run.entries.begin(), run.entries.end(), begin,
+                                  [](const LsmSortedRun::Entry& e,
+                                     std::string_view b) { return e.key < b; });
+    for (; it != run.entries.end(); ++it) {
+      if (!end.empty() && (ascending ? (end < it->key) : (end <= it->key))) {
+        break;
+      }
+      if (in_bounds(it->key)) {
+        merged[it->key] = {it->value, it->deleted};
+      }
+    }
+  }
+  auto mem_it = begin.empty() ? tree->memtable.begin()
+                              : tree->memtable.lower_bound(begin);
+  for (; mem_it != tree->memtable.end(); ++mem_it) {
+    if (!end.empty() &&
+        (ascending ? (end < mem_it->first) : (end <= mem_it->first))) {
+      break;
+    }
+    if (in_bounds(mem_it->first)) {
+      merged[mem_it->first] = {mem_it->second.value, mem_it->second.deleted};
+    }
+  }
+
+  std::vector<std::pair<std::string, std::string>> result;
+  result.reserve(merged.size());
+  if (ascending) {
+    for (auto& [k, val_del] : merged) {
+      if (!val_del.second) {
+        result.emplace_back(k, std::move(val_del.first));
+      }
+    }
+  } else {
+    for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
+      if (!it->second.second) {
+        result.emplace_back(it->first, std::move(it->second.first));
+      }
+    }
+  }
+  return result;
+}
+
+Status PageManager::LsmDestroy(Transaction& txn, page_id_t tree_id) {
+  LsmTreeState* tree = nullptr;
+  {
+    std::scoped_lock lk(trees_mu_);
+    tree = FindTreeLocked(tree_id);
+  }
+  if (tree == nullptr) {
+    return Status::kSuccess;
+  }
+  ASSIGN_OR_RETURN(lsn_t, lsn, txn.LsmDestroyLog(tree_id));
+  (void)lsn;
+  std::unique_lock tree_lk(tree->mutex);
+  tree->destroyed = true;
+  ++tree->active_uncommitted_ops;
+  return Status::kSuccess;
+}
+
+void PageManager::ApplyTransactionCommit(
+    txn_id_t txn_id, lsn_t commit_lsn, const std::vector<LogRecord>& records) {
+  for (const LogRecord& r : records) {
+    const lsn_t rec_lsn = r.record_lsn != 0 ? r.record_lsn : commit_lsn;
+    switch (r.type) {
+      case LogType::kSystemAllocPage: {
+        std::scoped_lock lk(blocks_mu_);
+        committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          it->second->body.row_page.committed_allocated_ = true;
+          it->second->SetPageLSN(std::max(it->second->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kSystemDestroyPage: {
+        std::scoped_lock lk(blocks_mu_);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          RowPage& rp = it->second->body.row_page;
+          rp.committed_allocated_ = false;
+          rp.committed_slots_.clear();
+          rp.committed_lsns_.clear();
+          rp.committed_prev_page_id_ = 0;
+          rp.committed_next_page_id_ = 0;
+          rp.committed_link_lsn_ = rec_lsn;
+          it->second->SetPageLSN(std::max(it->second->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kInsertRow:
+      case LogType::kUpdateRow:
+      case LogType::kCompensateUpdate: {
+        std::scoped_lock lk(blocks_mu_);
+        committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          Page* page = it->second.get();
+          RowPage& rp = page->body.row_page;
+          rp.committed_allocated_ = true;
+          if (r.slot >= rp.committed_slots_.size()) {
+            rp.committed_slots_.resize(static_cast<size_t>(r.slot) + 1);
+            rp.committed_lsns_.resize(static_cast<size_t>(r.slot) + 1, 0);
+          }
+          if (rec_lsn >= rp.committed_lsns_[r.slot]) {
+            rp.committed_slots_[r.slot] = r.redo_data;
+            rp.committed_lsns_[r.slot] = rec_lsn;
+          }
+          page->SetPageLSN(std::max(page->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kDeleteRow: {
+        std::scoped_lock lk(blocks_mu_);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          Page* page = it->second.get();
+          RowPage& rp = page->body.row_page;
+          if (r.slot >= rp.committed_slots_.size()) {
+            rp.committed_slots_.resize(static_cast<size_t>(r.slot) + 1);
+            rp.committed_lsns_.resize(static_cast<size_t>(r.slot) + 1, 0);
+          }
+          if (rec_lsn >= rp.committed_lsns_[r.slot]) {
+            rp.committed_slots_[r.slot].clear();
+            rp.committed_lsns_[r.slot] = rec_lsn;
+          }
+          page->SetPageLSN(std::max(page->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kSetRowPageNext: {
+        std::scoped_lock lk(blocks_mu_);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          Page* page = it->second.get();
+          if (rec_lsn >= page->body.row_page.committed_link_lsn_) {
+            page->body.row_page.committed_next_page_id_ = r.redo_pid;
+            page->body.row_page.committed_link_lsn_ = rec_lsn;
+          }
+          page->SetPageLSN(std::max(page->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kSetRowPagePrev: {
+        std::scoped_lock lk(blocks_mu_);
+        auto it = blocks_.find(r.pid);
+        if (it != blocks_.end() && it->second != nullptr) {
+          Page* page = it->second.get();
+          if (rec_lsn >= page->body.row_page.committed_link_lsn_) {
+            page->body.row_page.committed_prev_page_id_ = r.redo_pid;
+            page->body.row_page.committed_link_lsn_ = rec_lsn;
+          }
+          page->SetPageLSN(std::max(page->PageLSN(), rec_lsn));
+        }
+        break;
+      }
+      case LogType::kLsmPut: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = GetOrCreateTreeLocked(r.pid);
+        }
+        std::unique_lock tree_lk(tree->mutex);
+        tree->committed_destroyed = false;
+        lsn_t existing_lsn = 0;
+        if (auto cit = tree->committed_mem.find(r.key);
+            cit != tree->committed_mem.end()) {
+          existing_lsn = cit->second.committed_lsn;
+        } else {
+          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
+               ++rit) {
+            if (const auto* e = rit->Find(r.key); e != nullptr) {
+              existing_lsn = e->committed_lsn;
+              break;
+            }
+          }
+        }
+        if (rec_lsn >= existing_lsn) {
+          tree->committed_mem[r.key] = LsmTreeState::CommittedEntry{
+              .value = r.redo_data,
+              .deleted = false,
+              .committed_lsn = rec_lsn,
+          };
+        }
+        if (tree->active_uncommitted_ops > 0) {
+          --tree->active_uncommitted_ops;
+        }
+        tree->FlushAndCompactIfIdleLocked();
+        break;
+      }
+      case LogType::kLsmDelete: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = GetOrCreateTreeLocked(r.pid);
+        }
+        std::unique_lock tree_lk(tree->mutex);
+        lsn_t existing_lsn = 0;
+        if (auto cit = tree->committed_mem.find(r.key);
+            cit != tree->committed_mem.end()) {
+          existing_lsn = cit->second.committed_lsn;
+        } else {
+          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
+               ++rit) {
+            if (const auto* e = rit->Find(r.key); e != nullptr) {
+              existing_lsn = e->committed_lsn;
+              break;
+            }
+          }
+        }
+        if (rec_lsn >= existing_lsn) {
+          tree->committed_mem[r.key] = LsmTreeState::CommittedEntry{
+              .value = {},
+              .deleted = true,
+              .committed_lsn = rec_lsn,
+          };
+        }
+        if (tree->active_uncommitted_ops > 0) {
+          --tree->active_uncommitted_ops;
+        }
+        tree->FlushAndCompactIfIdleLocked();
+        break;
+      }
+      case LogType::kLsmDestroy: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = FindTreeLocked(r.pid);
+        }
+        if (tree != nullptr) {
+          std::unique_lock tree_lk(tree->mutex);
+          tree->committed_destroyed = true;
+          tree->committed_destroy_lsn = rec_lsn;
+          tree->memtable.clear();
+          tree->committed_mem.clear();
+          tree->runs.clear();
+          if (tree->active_uncommitted_ops > 0) {
+            --tree->active_uncommitted_ops;
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  {
+    std::scoped_lock lk(blocks_mu_);
+    auto it = pending_destroyed_pages_.find(txn_id);
+    if (it != pending_destroyed_pages_.end()) {
+      for (const page_id_t pid : it->second) {
+        free_pages_.push_back(pid);
+      }
+      pending_destroyed_pages_.erase(it);
+    }
+  }
+}
+
+void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
+                                        const std::vector<LogRecord>& records) {
+  for (auto it = records.rbegin(); it != records.rend(); ++it) {
+    const LogRecord& r = *it;
+    auto lock_page_if_needed = [](Page* p) {
+      return p->IsExclusivelyOwnedByCurrentThread()
+                 ? std::unique_lock<std::shared_mutex>()
+                 : std::unique_lock<std::shared_mutex>(*p->Latch());
+    };
+    switch (r.type) {
+      case LogType::kInsertRow: {
+        Page* page = nullptr;
+        {
+          std::scoped_lock lk(blocks_mu_);
+          auto bit = blocks_.find(r.pid);
+          if (bit != blocks_.end()) {
+            page = bit->second.get();
+          }
+        }
+        if (page != nullptr) {
+          auto page_lk = lock_page_if_needed(page);
+          page->body.row_page.DeleteRow(r.slot);
+        }
+        break;
+      }
+      case LogType::kUpdateRow: {
+        Page* page = nullptr;
+        {
+          std::scoped_lock lk(blocks_mu_);
+          auto bit = blocks_.find(r.pid);
+          if (bit != blocks_.end()) {
+            page = bit->second.get();
+          }
+        }
+        if (page != nullptr) {
+          auto page_lk = lock_page_if_needed(page);
+          (void)page->body.row_page.UpdateRow(r.slot, r.undo_data);
+        }
+        break;
+      }
+      case LogType::kDeleteRow: {
+        Page* page = nullptr;
+        {
+          std::scoped_lock lk(blocks_mu_);
+          auto bit = blocks_.find(r.pid);
+          if (bit != blocks_.end()) {
+            page = bit->second.get();
+          }
+        }
+        if (page != nullptr) {
+          auto page_lk = lock_page_if_needed(page);
+          (void)page->body.row_page.InsertRowAt(r.slot, r.undo_data);
+        }
+        break;
+      }
+      case LogType::kSetRowPageNext: {
+        Page* page = nullptr;
+        {
+          std::scoped_lock lk(blocks_mu_);
+          auto bit = blocks_.find(r.pid);
+          if (bit != blocks_.end()) {
+            page = bit->second.get();
+          }
+        }
+        if (page != nullptr) {
+          auto page_lk = lock_page_if_needed(page);
+          page->body.row_page.SetNextPageImpl(r.undo_pid);
+        }
+        break;
+      }
+      case LogType::kSetRowPagePrev: {
+        Page* page = nullptr;
+        {
+          std::scoped_lock lk(blocks_mu_);
+          auto bit = blocks_.find(r.pid);
+          if (bit != blocks_.end()) {
+            page = bit->second.get();
+          }
+        }
+        if (page != nullptr) {
+          auto page_lk = lock_page_if_needed(page);
+          page->body.row_page.SetPrevPageImpl(r.undo_pid);
+        }
+        break;
+      }
+      case LogType::kSystemAllocPage: {
+        std::scoped_lock lk(blocks_mu_);
+        auto bit = blocks_.find(r.pid);
+        if (bit != blocks_.end() && bit->second != nullptr) {
+          bit->second->type_ = PageType::kUnknown;
+          bit->second->body.row_page.Initialize();
+        }
+        free_pages_.push_back(r.pid);
+        break;
+      }
+      case LogType::kSystemDestroyPage: {
+        std::scoped_lock lk(blocks_mu_);
+        auto bit = blocks_.find(r.pid);
+        if (bit != blocks_.end() && bit->second != nullptr) {
+          Page* p = bit->second.get();
+          p->type_ = PageType::kRowPage;
+          RowPage& rp = p->body.row_page;
+          rp.prev_page_id_ = rp.committed_prev_page_id_;
+          rp.next_page_id_ = rp.committed_next_page_id_;
+          rp.slots_ = rp.committed_slots_;
+          rp.hole_sizes_.assign(rp.slots_.size(), 0);
+          rp.row_count_ = 0;
+          for (const std::string& s : rp.slots_) {
+            if (!s.empty()) {
+              ++rp.row_count_;
+            }
+          }
+        }
+        break;
+      }
+      case LogType::kLsmPut: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = FindTreeLocked(r.pid);
+        }
+        if (tree != nullptr) {
+          std::unique_lock tree_lk(tree->mutex);
+          const auto mit = tree->memtable.find(r.key);
+          if (mit == tree->memtable.end() ||
+              (!mit->second.deleted && mit->second.value == r.redo_data)) {
+            if (r.lsm_had_prev) {
+              tree->memtable[r.key] = LsmTreeState::MemEntry{
+                  .value = r.undo_data,
+                  .deleted = false,
+                  .generation = tree->next_generation++,
+              };
+            } else {
+              tree->memtable[r.key] = LsmTreeState::MemEntry{
+                  .value = {},
+                  .deleted = true,
+                  .generation = tree->next_generation++,
+              };
+            }
+          }
+          if (tree->active_uncommitted_ops > 0) {
+            --tree->active_uncommitted_ops;
+          }
+          tree->FlushAndCompactIfIdleLocked();
+        }
+        break;
+      }
+      case LogType::kLsmDelete: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = FindTreeLocked(r.pid);
+        }
+        if (tree != nullptr) {
+          std::unique_lock tree_lk(tree->mutex);
+          const auto mit = tree->memtable.find(r.key);
+          if (mit == tree->memtable.end() || mit->second.deleted) {
+            tree->memtable[r.key] = LsmTreeState::MemEntry{
+                .value = r.undo_data,
+                .deleted = false,
+                .generation = tree->next_generation++,
+            };
+          }
+          if (tree->active_uncommitted_ops > 0) {
+            --tree->active_uncommitted_ops;
+          }
+          tree->FlushAndCompactIfIdleLocked();
+        }
+        break;
+      }
+      case LogType::kLsmDestroy: {
+        LsmTreeState* tree = nullptr;
+        {
+          std::scoped_lock lk(trees_mu_);
+          tree = FindTreeLocked(r.pid);
+        }
+        if (tree != nullptr) {
+          std::unique_lock tree_lk(tree->mutex);
+          tree->destroyed = false;
+          if (tree->active_uncommitted_ops > 0) {
+            --tree->active_uncommitted_ops;
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  {
+    std::scoped_lock lk(blocks_mu_);
+    pending_destroyed_pages_.erase(txn_id);
+  }
+}
+
+Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
+  std::string buf;
+  buf.reserve(4096);
+  buf.append(kFuzzyCheckpointMagic, sizeof(kFuzzyCheckpointMagic));
+  AppendU32(&buf, kFuzzyCheckpointVersion);
+  AppendU64(&buf, replay_start_lsn);
+
+  struct BlockSnapshot {
+    page_id_t pid{0};
+    page_id_t prev_pid{0};
+    page_id_t next_pid{0};
+    lsn_t link_lsn{0};
+    std::vector<std::string> slots;
+    std::vector<lsn_t> lsns;
+  };
+  std::vector<BlockSnapshot> block_snaps;
+  std::vector<page_id_t> free_snap;
+  page_id_t max_pid_snap = 10;
+  {
+    std::scoped_lock lk(blocks_mu_);
+    max_pid_snap = std::max(max_page_id_, committed_max_page_id_);
+    free_snap = free_pages_;
+    block_snaps.reserve(blocks_.size());
+    for (const auto& [pid, p] : blocks_) {
+      if (p == nullptr) {
+        continue;
+      }
+      const RowPage& rp = p->body.row_page;
+      if (!rp.committed_allocated_) {
+        continue;
+      }
+      block_snaps.push_back(BlockSnapshot{
+          .pid = p->PageID(),
+          .prev_pid = rp.committed_prev_page_id_,
+          .next_pid = rp.committed_next_page_id_,
+          .link_lsn = rp.committed_link_lsn_,
+          .slots = rp.committed_slots_,
+          .lsns = rp.committed_lsns_,
+      });
+    }
+  }
+
+  AppendU64(&buf, max_pid_snap);
+  AppendU32(&buf, static_cast<uint32_t>(free_snap.size()));
+  for (page_id_t fpid : free_snap) {
+    AppendU64(&buf, fpid);
+  }
+  AppendU32(&buf, static_cast<uint32_t>(block_snaps.size()));
+  for (const BlockSnapshot& b : block_snaps) {
+    AppendU64(&buf, b.pid);
+    AppendU64(&buf, b.prev_pid);
+    AppendU64(&buf, b.next_pid);
+    AppendU64(&buf, b.link_lsn);
+    const auto nslots = static_cast<uint32_t>(b.slots.size());
+    AppendU32(&buf, nslots);
+    for (uint32_t i = 0; i < nslots; ++i) {
+      const lsn_t slsn = i < b.lsns.size() ? b.lsns[i] : 0;
+      AppendU64(&buf, slsn);
+      AppendString(&buf, b.slots[i]);
+    }
+  }
+
+  struct TreeSnapshot {
+    page_id_t tree_id{0};
+    LsmSortedRun compacted;
+  };
+  std::vector<TreeSnapshot> tree_snaps;
+  {
+    std::vector<std::pair<page_id_t, LsmTreeState*>> trees;
+    {
+      std::scoped_lock lk(trees_mu_);
+      trees.reserve(lsm_trees_.size());
+      for (const auto& [tid, t] : lsm_trees_) {
+        if (t != nullptr) {
+          trees.emplace_back(tid, t.get());
+        }
+      }
+    }
+    for (auto [tid, t] : trees) {
+      std::unique_lock tree_lk(t->mutex);
+      if (t->committed_destroyed && t->committed_mem.empty() &&
+          t->runs.empty()) {
+        continue;
+      }
+      LsmSortedRun compacted = t->BuildCompactedCommittedRunLocked();
+      if (t->active_uncommitted_ops == 0) {
+        t->committed_mem.clear();
+        t->memtable.clear();
+        t->runs.clear();
+        if (!compacted.entries.empty()) {
+          t->runs.push_back(compacted);
+        }
+      }
+      tree_snaps.push_back(TreeSnapshot{
+          .tree_id = tid,
+          .compacted = std::move(compacted),
+      });
+    }
+  }
+
+  AppendU32(&buf, static_cast<uint32_t>(tree_snaps.size()));
+  for (const TreeSnapshot& ts : tree_snaps) {
+    AppendU64(&buf, ts.tree_id);
+    AppendU32(&buf, static_cast<uint32_t>(ts.compacted.entries.size()));
+    for (const LsmSortedRun::Entry& e : ts.compacted.entries) {
+      AppendU64(&buf, e.committed_lsn);
+      AppendString(&buf, e.key);
+      AppendString(&buf, e.value);
+    }
+  }
+
+  const uint32_t crc = Crc32C(buf.data(), buf.size());
+  AppendU32(&buf, crc);
+
+  // Write in-place to lock_fd_ so the flock held on db_name_ stays attached to
+  // the exact inode on disk!
+  if (lock_fd_ < 0) {
+    return Status::kIOError;
+  }
+  if (::ftruncate(lock_fd_, 0) != 0) {
+    return StatusError(
+        StatusCode::kIOError,
+        "ftruncate failed on checkpoint: " + std::string(std::strerror(errno)));
+  }
+  size_t written = 0;
+  while (written < buf.size()) {
+    const ssize_t n =
+        ::pwrite(lock_fd_, buf.data() + written, buf.size() - written,
+                 static_cast<off_t>(written));
+    if (n <= 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return StatusError(
+          StatusCode::kIOError,
+          "pwrite failed on checkpoint: " + std::string(std::strerror(errno)));
+    }
+    written += static_cast<size_t>(n);
+  }
+  if (::fdatasync(lock_fd_) != 0) {
+    return StatusError(
+        StatusCode::kIOError,
+        "fdatasync failed on checkpoint: " + std::string(std::strerror(errno)));
+  }
+  return Status::kSuccess;
+}
+
+Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
+                                        bool* loaded_out) {
+  if (replay_start_lsn_out != nullptr) {
+    *replay_start_lsn_out = 0;
+  }
+  if (loaded_out != nullptr) {
+    *loaded_out = false;
+  }
+  std::error_code ec;
+  const auto fsize = std::filesystem::file_size(db_name_, ec);
+  if (ec || fsize == 0) {
+    return Status::kSuccess;
+  }
+  std::ifstream in(db_name_, std::ios::binary);
+  if (!in) {
+    return Status::kIOError;
+  }
+  std::string buf(static_cast<size_t>(fsize), '\0');
+  in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+  if (static_cast<size_t>(in.gcount()) != buf.size()) {
+    return Status::kCorrupt;
+  }
+  constexpr size_t kMinSize = sizeof(kFuzzyCheckpointMagic) +
+                              sizeof(uint32_t) * 4 + sizeof(uint64_t) * 2;
+  if (buf.size() < kMinSize ||
+      std::memcmp(buf.data(), kFuzzyCheckpointMagic,
+                  sizeof(kFuzzyCheckpointMagic)) != 0) {
+    return Status::kCorrupt;
+  }
+  const size_t payload_size = buf.size() - sizeof(uint32_t);
+  uint32_t stored_crc = 0;
+  std::memcpy(&stored_crc, buf.data() + payload_size, sizeof(uint32_t));
+  if (stored_crc != Crc32C(buf.data(), payload_size)) {
+    return Status::kCorrupt;
+  }
+
+  size_t off = sizeof(kFuzzyCheckpointMagic);
+  uint32_t version = 0;
+  lsn_t replay_lsn = 0;
+  page_id_t max_pid = 10;
+  uint32_t free_count = 0;
+  if (!ConsumeU32(buf.data(), payload_size, &off, &version) ||
+      version != kFuzzyCheckpointVersion ||
+      !ConsumeU64(buf.data(), payload_size, &off, &replay_lsn) ||
+      !ConsumeU64(buf.data(), payload_size, &off, &max_pid) ||
+      !ConsumeU32(buf.data(), payload_size, &off, &free_count)) {
+    return Status::kCorrupt;
+  }
+
+  std::scoped_lock lk(blocks_mu_, trees_mu_);
+  blocks_.clear();
+  lsm_trees_.clear();
+  free_pages_.clear();
+  max_page_id_ = std::max<page_id_t>(10, max_pid);
+  committed_max_page_id_ = max_page_id_;
+
+  for (uint32_t i = 0; i < free_count; ++i) {
+    page_id_t fpid = 0;
+    if (!ConsumeU64(buf.data(), payload_size, &off, &fpid)) {
+      return Status::kCorrupt;
+    }
+    free_pages_.push_back(fpid);
+  }
+
+  uint32_t num_blocks = 0;
+  if (!ConsumeU32(buf.data(), payload_size, &off, &num_blocks)) {
+    return Status::kCorrupt;
+  }
+  for (uint32_t i = 0; i < num_blocks; ++i) {
+    page_id_t pid = 0;
+    page_id_t prev_pid = 0;
+    page_id_t next_pid = 0;
+    lsn_t link_lsn = 0;
+    uint32_t nslots = 0;
+    if (!ConsumeU64(buf.data(), payload_size, &off, &pid) ||
+        !ConsumeU64(buf.data(), payload_size, &off, &prev_pid) ||
+        !ConsumeU64(buf.data(), payload_size, &off, &next_pid) ||
+        !ConsumeU64(buf.data(), payload_size, &off, &link_lsn) ||
+        !ConsumeU32(buf.data(), payload_size, &off, &nslots)) {
+      return Status::kCorrupt;
+    }
+    auto page = std::make_unique<Page>(pid, PageType::kRowPage);
+    RowPage& rp = page->body.row_page;
+    rp.committed_allocated_ = true;
+    rp.prev_page_id_ = prev_pid;
+    rp.next_page_id_ = next_pid;
+    rp.committed_prev_page_id_ = prev_pid;
+    rp.committed_next_page_id_ = next_pid;
+    rp.committed_link_lsn_ = link_lsn;
+    rp.slots_.resize(nslots);
+    rp.hole_sizes_.assign(nslots, 0);
+    rp.committed_slots_.resize(nslots);
+    rp.committed_lsns_.resize(nslots, 0);
+    lsn_t max_slot_lsn = link_lsn;
+    for (uint32_t s = 0; s < nslots; ++s) {
+      lsn_t slsn = 0;
+      std::string val;
+      if (!ConsumeU64(buf.data(), payload_size, &off, &slsn) ||
+          !ConsumeString(buf.data(), payload_size, &off, &val)) {
+        return Status::kCorrupt;
+      }
+      if (!val.empty()) {
+        ++rp.row_count_;
+      }
+      rp.slots_[s] = val;
+      rp.committed_slots_[s] = std::move(val);
+      rp.committed_lsns_[s] = slsn;
+      max_slot_lsn = std::max(max_slot_lsn, slsn);
+    }
+    page->SetPageLSN(max_slot_lsn);
+    max_page_id_ = std::max(max_page_id_, pid);
+    committed_max_page_id_ = max_page_id_;
+    blocks_[pid] = std::move(page);
+  }
+
+  uint32_t num_trees = 0;
+  if (!ConsumeU32(buf.data(), payload_size, &off, &num_trees)) {
+    return Status::kCorrupt;
+  }
+  for (uint32_t i = 0; i < num_trees; ++i) {
+    page_id_t tid = 0;
+    uint32_t nentries = 0;
+    if (!ConsumeU64(buf.data(), payload_size, &off, &tid) ||
+        !ConsumeU32(buf.data(), payload_size, &off, &nentries)) {
+      return Status::kCorrupt;
+    }
+    auto tree = std::make_unique<LsmTreeState>();
+    LsmSortedRun run;
+    run.generation = tree->next_generation++;
+    run.entries.reserve(nentries);
+    for (uint32_t e = 0; e < nentries; ++e) {
+      lsn_t elsn = 0;
+      std::string key;
+      std::string val;
+      if (!ConsumeU64(buf.data(), payload_size, &off, &elsn) ||
+          !ConsumeString(buf.data(), payload_size, &off, &key) ||
+          !ConsumeString(buf.data(), payload_size, &off, &val)) {
+        return Status::kCorrupt;
+      }
+      run.entries.push_back(LsmSortedRun::Entry{
+          .key = std::move(key),
+          .value = std::move(val),
+          .deleted = false,
+          .committed_lsn = elsn,
+      });
+    }
+    if (!run.entries.empty()) {
+      tree->runs.push_back(std::move(run));
+    }
+    lsm_trees_[tid] = std::move(tree);
+  }
+
+  if (off != payload_size) {
+    return Status::kCorrupt;
+  }
+  if (replay_start_lsn_out != nullptr) {
+    *replay_start_lsn_out = replay_lsn;
+  }
+  if (loaded_out != nullptr) {
+    *loaded_out = true;
+  }
+  return Status::kSuccess;
+}
+
+Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
+  switch (r.type) {
+    case LogType::kSystemAllocPage: {
+      std::scoped_lock lk(blocks_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+      std::erase(free_pages_, r.pid);
+      auto& slot = blocks_[r.pid];
+      if (slot == nullptr) {
+        slot = std::make_unique<Page>(r.pid, PageType::kRowPage);
+        slot->body.row_page.committed_allocated_ = true;
+        slot->SetPageLSN(lsn);
+      } else if (slot->Type() != PageType::kRowPage && lsn >= slot->PageLSN()) {
+        slot->PageInit(r.pid, PageType::kRowPage);
+        slot->body.row_page.committed_allocated_ = true;
+        slot->SetPageLSN(lsn);
+      } else {
+        slot->body.row_page.committed_allocated_ = true;
+      }
+      break;
+    }
+    case LogType::kSystemDestroyPage: {
+      std::scoped_lock lk(blocks_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+      auto it = blocks_.find(r.pid);
+      if (it != blocks_.end() && it->second != nullptr &&
+          lsn >= it->second->PageLSN()) {
+        it->second->type_ = PageType::kUnknown;
+        it->second->body.row_page.Initialize();
+        it->second->SetPageLSN(lsn);
+      }
+      if (std::ranges::find(free_pages_, r.pid) == free_pages_.end()) {
+        free_pages_.push_back(r.pid);
+      }
+      break;
+    }
+    case LogType::kInsertRow:
+    case LogType::kUpdateRow:
+    case LogType::kCompensateUpdate: {
+      std::scoped_lock lk(blocks_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+      std::erase(free_pages_, r.pid);
+      auto& page = blocks_[r.pid];
+      if (page == nullptr) {
+        page = std::make_unique<Page>(r.pid, PageType::kRowPage);
+      }
+      page->type_ = PageType::kRowPage;
+      RowPage& rp = page->body.row_page;
+      rp.committed_allocated_ = true;
+      if (r.slot >= rp.committed_slots_.size()) {
+        rp.slots_.resize(static_cast<size_t>(r.slot) + 1);
+        rp.hole_sizes_.resize(static_cast<size_t>(r.slot) + 1, 0);
+        rp.committed_slots_.resize(static_cast<size_t>(r.slot) + 1);
+        rp.committed_lsns_.resize(static_cast<size_t>(r.slot) + 1, 0);
+      }
+      if (lsn >= rp.committed_lsns_[r.slot]) {
+        if (rp.slots_[r.slot].empty() && !r.redo_data.empty()) {
+          ++rp.row_count_;
+        }
+        rp.slots_[r.slot] = r.redo_data;
+        rp.committed_slots_[r.slot] = r.redo_data;
+        rp.committed_lsns_[r.slot] = lsn;
+        page->SetPageLSN(std::max(page->PageLSN(), lsn));
+      }
+      break;
+    }
+    case LogType::kDeleteRow: {
+      std::scoped_lock lk(blocks_mu_);
+      auto it = blocks_.find(r.pid);
+      if (it == blocks_.end() || it->second == nullptr) {
+        break;
+      }
+      Page* page = it->second.get();
+      RowPage& rp = page->body.row_page;
+      if (r.slot >= rp.committed_slots_.size()) {
+        rp.slots_.resize(static_cast<size_t>(r.slot) + 1);
+        rp.committed_slots_.resize(static_cast<size_t>(r.slot) + 1);
+        rp.committed_lsns_.resize(static_cast<size_t>(r.slot) + 1, 0);
+      }
+      if (lsn >= rp.committed_lsns_[r.slot]) {
+        if (!rp.slots_[r.slot].empty()) {
+          --rp.row_count_;
+        }
+        rp.slots_[r.slot].clear();
+        rp.committed_slots_[r.slot].clear();
+        rp.committed_lsns_[r.slot] = lsn;
+        page->SetPageLSN(std::max(page->PageLSN(), lsn));
+      }
+      break;
+    }
+    case LogType::kSetRowPageNext: {
+      std::scoped_lock lk(blocks_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      auto& page = blocks_[r.pid];
+      if (page == nullptr) {
+        page = std::make_unique<Page>(r.pid, PageType::kRowPage);
+      }
+      RowPage& rp = page->body.row_page;
+      if (lsn >= rp.committed_link_lsn_) {
+        rp.next_page_id_ = r.redo_pid;
+        rp.committed_next_page_id_ = r.redo_pid;
+        rp.committed_link_lsn_ = lsn;
+        page->SetPageLSN(std::max(page->PageLSN(), lsn));
+      }
+      break;
+    }
+    case LogType::kSetRowPagePrev: {
+      std::scoped_lock lk(blocks_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      auto& page = blocks_[r.pid];
+      if (page == nullptr) {
+        page = std::make_unique<Page>(r.pid, PageType::kRowPage);
+      }
+      RowPage& rp = page->body.row_page;
+      if (lsn >= rp.committed_link_lsn_) {
+        rp.prev_page_id_ = r.redo_pid;
+        rp.committed_prev_page_id_ = r.redo_pid;
+        rp.committed_link_lsn_ = lsn;
+        page->SetPageLSN(std::max(page->PageLSN(), lsn));
+      }
+      break;
+    }
+    case LogType::kLsmPut: {
+      std::scoped_lock lk(trees_mu_);
+      max_page_id_ = std::max(max_page_id_, r.pid);
+      committed_max_page_id_ = std::max(committed_max_page_id_, r.pid);
+      LsmTreeState* tree = GetOrCreateTreeLocked(r.pid);
+      if (lsn >= tree->committed_destroy_lsn) {
+        tree->destroyed = false;
+        tree->committed_destroyed = false;
+        lsn_t existing_lsn = 0;
+        if (auto cit = tree->committed_mem.find(r.key);
+            cit != tree->committed_mem.end()) {
+          existing_lsn = cit->second.committed_lsn;
+        } else {
+          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
+               ++rit) {
+            if (const auto* e = rit->Find(r.key); e != nullptr) {
+              existing_lsn = e->committed_lsn;
+              break;
+            }
+          }
+        }
+        if (lsn >= existing_lsn) {
+          tree->memtable[r.key] = LsmTreeState::MemEntry{
+              .value = r.redo_data,
+              .deleted = false,
+              .generation = tree->next_generation++,
+          };
+          tree->committed_mem[r.key] = LsmTreeState::CommittedEntry{
+              .value = r.redo_data,
+              .deleted = false,
+              .committed_lsn = lsn,
+          };
+        }
+      }
+      break;
+    }
+    case LogType::kLsmDelete: {
+      std::scoped_lock lk(trees_mu_);
+      LsmTreeState* tree = GetOrCreateTreeLocked(r.pid);
+      if (lsn >= tree->committed_destroy_lsn) {
+        lsn_t existing_lsn = 0;
+        if (auto cit = tree->committed_mem.find(r.key);
+            cit != tree->committed_mem.end()) {
+          existing_lsn = cit->second.committed_lsn;
+        } else {
+          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
+               ++rit) {
+            if (const auto* e = rit->Find(r.key); e != nullptr) {
+              existing_lsn = e->committed_lsn;
+              break;
+            }
+          }
+        }
+        if (lsn >= existing_lsn) {
+          tree->memtable[r.key] = LsmTreeState::MemEntry{
+              .value = {},
+              .deleted = true,
+              .generation = tree->next_generation++,
+          };
+          tree->committed_mem[r.key] = LsmTreeState::CommittedEntry{
+              .value = {},
+              .deleted = true,
+              .committed_lsn = lsn,
+          };
+        }
+      }
+      break;
+    }
+    case LogType::kLsmDestroy: {
+      std::scoped_lock lk(trees_mu_);
+      LsmTreeState* tree = GetOrCreateTreeLocked(r.pid);
+      if (lsn >= tree->committed_destroy_lsn) {
+        tree->destroyed = true;
+        tree->committed_destroyed = true;
+        tree->committed_destroy_lsn = lsn;
+        tree->memtable.clear();
+        tree->committed_mem.clear();
+        tree->runs.clear();
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return Status::kSuccess;
 }
 
 page_id_t PageManager::GetTableTail(page_id_t first_page,
                                     page_id_t catalog_hint) {
   std::scoped_lock lock(table_tails_mu_);
-  return table_tails_.try_emplace(first_page, TableTailState{catalog_hint})
-      .first->second.published_tail;
+  auto [it, inserted] = table_tails_.try_emplace(
+      first_page, catalog_hint != 0 ? catalog_hint : first_page);
+  if (!inserted && it->second == 0) {
+    it->second = catalog_hint != 0 ? catalog_hint : first_page;
+  }
+  return it->second;
 }
 
 page_id_t PageManager::GetTableTailFor(txn_id_t viewer, page_id_t first_page,
                                        page_id_t catalog_hint) {
   std::scoped_lock lock(table_tails_mu_);
-  auto& state =
-      table_tails_.try_emplace(first_page, TableTailState{catalog_hint})
-          .first->second;
-  if (state.pending.has_value() && state.pending->owner == viewer) {
-    return state.pending->owner_tail;
+  const auto res = tail_reservations_.find(first_page);
+  if (res != tail_reservations_.end() && res->second.owner == viewer &&
+      res->second.new_tail != 0) {
+    return res->second.new_tail;
   }
-  return state.published_tail;
+  auto [it, inserted] = table_tails_.try_emplace(
+      first_page, catalog_hint != 0 ? catalog_hint : first_page);
+  if (!inserted && it->second == 0) {
+    it->second = catalog_hint != 0 ? catalog_hint : first_page;
+  }
+  return it->second;
 }
 
 Status PageManager::TryReserveTableTail(txn_id_t owner, page_id_t first_page,
                                         page_id_t expected) {
   std::scoped_lock lock(table_tails_mu_);
-  auto& state = table_tails_.try_emplace(first_page, TableTailState{expected})
-                    .first->second;
-  if (state.poisoned) {
-    return StatusError(StatusCode::kIOError,
-                       "table tail is poisoned by a failed transaction");
-  }
-  if (state.pending.has_value()) {
-    if (state.pending->owner != owner ||
-        state.pending->owner_tail != expected) {
-      return Status::kConflicts;
+  const auto res = tail_reservations_.find(first_page);
+  if (res != tail_reservations_.end()) {
+    if (res->second.owner == owner) {
+      const page_id_t visible_tail = res->second.new_tail != 0
+                                         ? res->second.new_tail
+                                         : res->second.predecessor;
+      return visible_tail == expected ? Status::kSuccess : Status::kConflicts;
     }
-    return Status::kSuccess;
-  }
-  if (state.published_tail != expected) {
     return Status::kConflicts;
   }
-  table_tail_reservations_[owner].insert(first_page);
-  PendingTableTail pending;
-  pending.owner = owner;
-  pending.owner_tail = expected;
-  state.pending = std::move(pending);
+  const auto tail = table_tails_.find(first_page);
+  if (tail != table_tails_.end() && tail->second != expected) {
+    return Status::kConflicts;
+  }
+  table_tails_[first_page] = expected;
+  tail_reservations_[first_page] =
+      TailReservation{.owner = owner, .predecessor = expected, .new_tail = 0};
   return Status::kSuccess;
 }
 
@@ -132,6 +1484,102 @@ Status PageManager::ReserveTableTail(Transaction& txn, page_id_t first_page,
   return ReserveTableTailImpl(txn.ID(), first_page, expected, &txn);
 }
 
+Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
+                                         page_id_t expected,
+                                         const Transaction* watcher) {
+  std::unique_lock lock(table_tails_mu_);
+  for (const auto& [reserved_table, reservation] : tail_reservations_) {
+    if (reservation.owner == owner && reserved_table != first_page) {
+      return StatusError(StatusCode::kConflicts,
+                         "transaction already holds a table tail reservation");
+    }
+  }
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + kTableTailWaitTimeout;
+  bool waited = false;
+  for (;;) {
+    if (watcher != nullptr && watcher->IsWounded()) {
+      return StatusError(StatusCode::kConflicts,
+                         "wounded while waiting for table tail reservation");
+    }
+    const auto res = tail_reservations_.find(first_page);
+    if (res == tail_reservations_.end()) {
+      break;
+    }
+    if (res->second.owner == owner) {
+      const page_id_t visible_tail = res->second.new_tail != 0
+                                         ? res->second.new_tail
+                                         : res->second.predecessor;
+      return visible_tail == expected ? Status::kSuccess : Status::kConflicts;
+    }
+    waited = true;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return StatusError(StatusCode::kConflicts,
+                         "table tail reservation wait timed out");
+    }
+    table_tails_cv_.wait_for(
+        lock, std::min(kTableTailWaitSlice,
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - now)));
+  }
+  if (waited) {
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    if (ns >= 1'000'000) {
+      tail_wait_count_.fetch_add(1, std::memory_order_relaxed);
+      tail_wait_ns_.fetch_add(static_cast<uint64_t>(ns),
+                              std::memory_order_relaxed);
+    }
+  }
+  const auto tail = table_tails_.find(first_page);
+  if (tail != table_tails_.end() && tail->second != expected) {
+    return Status::kConflicts;
+  }
+  table_tails_[first_page] = expected;
+  tail_reservations_[first_page] =
+      TailReservation{.owner = owner, .predecessor = expected, .new_tail = 0};
+  return Status::kSuccess;
+}
+
+Status PageManager::LinkReservedTableTail(txn_id_t owner, page_id_t first_page,
+                                          page_id_t predecessor,
+                                          page_id_t successor) {
+  std::scoped_lock lock(table_tails_mu_);
+  const auto res = tail_reservations_.find(first_page);
+  if (res == tail_reservations_.end() || res->second.owner != owner) {
+    return Status::kConflicts;
+  }
+  const page_id_t current_tail = res->second.new_tail != 0
+                                     ? res->second.new_tail
+                                     : res->second.predecessor;
+  if (current_tail != predecessor) {
+    return Status::kConflicts;
+  }
+  res->second.new_tail = successor;
+  unpublished_tail_pages_[successor] = PendingTailLink{
+      .owner = owner,
+      .first_page = first_page,
+      .predecessor = predecessor,
+      .poisoned = false,
+  };
+  return Status::kSuccess;
+}
+
+Status PageManager::CheckTableTailPage(txn_id_t viewer, page_id_t first_page,
+                                       page_id_t page_id) {
+  std::scoped_lock lock(table_tails_mu_);
+  const auto it = unpublished_tail_pages_.find(page_id);
+  if (it == unpublished_tail_pages_.end()) {
+    return Status::kSuccess;
+  }
+  if (it->second.first_page != first_page || it->second.poisoned) {
+    return Status::kCorrupt;
+  }
+  return it->second.owner == viewer ? Status::kSuccess : Status::kConflicts;
+}
+
 Status PageManager::WaitForTableTailPage(txn_id_t viewer, page_id_t first_page,
                                          page_id_t page_id) {
   return WaitForTableTailPageImpl(viewer, first_page, page_id, nullptr);
@@ -142,678 +1590,129 @@ Status PageManager::WaitForTableTailPage(Transaction& txn, page_id_t first_page,
   return WaitForTableTailPageImpl(txn.ID(), first_page, page_id, &txn);
 }
 
-bool PageManager::OwnerHoldsForeignTailReservation(txn_id_t owner,
-                                                   page_id_t first_page) const {
-  const auto reservations_it = table_tail_reservations_.find(owner);
-  if (reservations_it == table_tail_reservations_.end()) {
-    return false;
-  }
-  return std::ranges::any_of(
-      reservations_it->second,
-      [first_page](page_id_t held) { return held != first_page; });
-}
-
-Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
-                                         page_id_t expected,
-                                         Transaction* watcher) {
-  constexpr auto kWaitLimit = std::chrono::seconds(5);
-  const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
-  // Sampled accounting, same discipline as WaitForTableTailPageImpl.
-  const auto wait_started = std::chrono::steady_clock::now();
-  const auto record_wait = [&] {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - wait_started)
-                        .count();
-    if (ns > 1'000'000) {
-      tail_wait_count_.fetch_add(1, std::memory_order_relaxed);
-      tail_wait_ns_.fetch_add(static_cast<uint64_t>(ns),
-                              std::memory_order_relaxed);
-    }
-  };
-  std::unique_lock lock(table_tails_mu_);
-  for (;;) {
-    const auto state_it = table_tails_.find(first_page);
-    if (state_it == table_tails_.end()) {
-      record_wait();
-      return Status::kNotExists;
-    }
-    TableTailState& state = state_it->second;
-    if (state.poisoned) {
-      record_wait();
-      return StatusError(StatusCode::kIOError,
-                         "table tail is poisoned by a failed transaction");
-    }
-    if (state.pending.has_value() && state.pending->owner == owner) {
-      if (state.pending->owner_tail == expected) {
-        lock.unlock();
-        const Status reserved =
-            TryReserveTableTail(owner, first_page, expected);
-        record_wait();
-        return reserved;
-      }
-      // A stale self-reservation from an earlier walk of the same insert
-      // (this owner has since followed the chain to a different
-      // predecessor) can never be consumed by a link: retire it, as
-      // CancelTableTailReservation would, so the fresh claim below proceeds
-      // and waiters are not wedged behind a reservation nobody will link.
-      state.pending.reset();
-      const auto reservations_it = table_tail_reservations_.find(owner);
-      if (reservations_it != table_tail_reservations_.end()) {
-        reservations_it->second.erase(first_page);
-        if (reservations_it->second.empty()) {
-          table_tail_reservations_.erase(reservations_it);
-        }
-      }
-      table_tails_cv_.notify_all();
-    }
-    if (!state.pending.has_value()) {
-      if (state.published_tail != expected) {
-        record_wait();
-        return Status::kConflicts;
-      }
-      lock.unlock();
-      const Status claimed = TryReserveTableTail(owner, first_page, expected);
-      if (claimed != Status::kConflicts) {
-        record_wait();
-        return claimed;
-      }
-      lock.lock();
-      continue;
-    }
-    // Reservation-cycle prevention: this caller already grows another
-    // table. Waiting here risks the two-grower cycle (each holds the table
-    // the other waits for); the wait-for graph cannot see it, so it would
-    // burn the full wait limit on BOTH sides and then fail. Fail this
-    // growth attempt immediately instead -- the statement unwinds, the
-    // transaction releases its reservations, and the other grower proceeds.
-    if (watcher != nullptr &&
-        OwnerHoldsForeignTailReservation(owner, first_page)) {
-      record_wait();
-      return StatusError(
-          StatusCode::kConflicts,
-          "table tail reservation would cycle with a held reservation");
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      record_wait();
-      return StatusError(StatusCode::kConflicts,
-                         "timed out waiting for table tail reservation");
-    }
-    // Sliced wait: a wounded transaction (deadlock-detector victim) must
-    // abandon the growth wait so its abort -- and every row intent it
-    // holds -- proceeds without riding the full limit.
-    if (watcher != nullptr) {
-      watcher->DebugSetPhase("tail-reserve-wait");
-    }
-    const auto wake_by = std::min(deadline, std::chrono::steady_clock::now() +
-                                                std::chrono::milliseconds(25));
-    table_tails_cv_.wait_until(lock, wake_by, [&] {
-      const auto it = table_tails_.find(first_page);
-      return it == table_tails_.end() || it->second.poisoned ||
-             !it->second.pending.has_value() ||
-             it->second.pending->owner == owner;
-    });
-    if (watcher != nullptr) {
-      watcher->DebugSetPhase(nullptr);
-      if (watcher->IsWounded()) {
-        record_wait();
-        return StatusError(StatusCode::kConflicts,
-                           "transaction wounded while waiting for table tail");
-      }
-    }
-  }
-}
-
-Status PageManager::LinkReservedTableTail(txn_id_t owner, page_id_t first_page,
-                                          page_id_t predecessor,
-                                          page_id_t successor) {
-  std::scoped_lock lock(table_tails_mu_);
-  const auto state_it = table_tails_.find(first_page);
-  if (state_it == table_tails_.end()) {
-    return Status::kNotExists;
-  }
-  auto& state = state_it->second;
-  if (state.poisoned || !state.pending.has_value() ||
-      state.pending->owner != owner ||
-      state.pending->owner_tail != predecessor) {
-    return Status::kConflicts;
-  }
-  state.pending->unpublished_pages.insert(successor);
-  state.pending->owner_tail = successor;
-  return Status::kSuccess;
-}
-
-Status PageManager::CheckTableTailPage(txn_id_t viewer, page_id_t first_page,
-                                       page_id_t page_id) {
-  std::scoped_lock lock(table_tails_mu_);
-  const auto state_it = table_tails_.find(first_page);
-  if (state_it == table_tails_.end()) {
-    return Status::kSuccess;
-  }
-  const auto& state = state_it->second;
-  if (state.poisoned) {
-    return StatusError(StatusCode::kIOError,
-                       "table tail is poisoned by a failed transaction");
-  }
-  if (!state.pending.has_value() || state.pending->owner == viewer) {
-    return Status::kSuccess;
-  }
-  if (state.pending->unpublished_pages.contains(page_id)) {
-    return Status::kConflicts;
-  }
-  return Status::kSuccess;
-}
-
 Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
                                              page_id_t first_page,
                                              page_id_t page_id,
-                                             Transaction* watcher) {
-  constexpr auto kWaitLimit = std::chrono::seconds(5);
-  const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
-  // Sampled accounting: waits under 1ms are the uncontended majority and
-  // record nothing (same discipline as the index gate).
-  const auto wait_started = std::chrono::steady_clock::now();
-  const auto record_wait = [&] {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - wait_started)
-                        .count();
-    if (ns > 1'000'000) {
-      tail_wait_count_.fetch_add(1, std::memory_order_relaxed);
-      tail_wait_ns_.fetch_add(static_cast<uint64_t>(ns),
-                              std::memory_order_relaxed);
-    }
-  };
+                                             const Transaction* watcher) {
   std::unique_lock lock(table_tails_mu_);
+  const auto deadline =
+      std::chrono::steady_clock::now() + kTableTailWaitTimeout;
   for (;;) {
-    const auto state_it = table_tails_.find(first_page);
-    if (state_it == table_tails_.end()) {
-      record_wait();
-      return Status::kNotExists;
-    }
-    const auto& state = state_it->second;
-    if (state.poisoned) {
-      record_wait();
-      return StatusError(StatusCode::kIOError,
-                         "table tail is poisoned by a failed transaction");
-    }
-    if (!state.pending.has_value() || state.pending->owner == viewer ||
-        !state.pending->unpublished_pages.contains(page_id)) {
-      record_wait();
+    const auto it = unpublished_tail_pages_.find(page_id);
+    if (it == unpublished_tail_pages_.end()) {
       return Status::kSuccess;
     }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      record_wait();
+    if (it->second.first_page != first_page || it->second.poisoned) {
+      return Status::kCorrupt;
+    }
+    if (it->second.owner == viewer) {
+      return Status::kSuccess;
+    }
+    if (watcher != nullptr && watcher->IsWounded()) {
       return StatusError(StatusCode::kConflicts,
-                         "timed out waiting for unpublished table tail");
+                         "wounded while waiting for unpublished table tail");
     }
-    // Sliced wait so a wounded transaction abandons promptly (see
-    // ReserveTableTailImpl).
-    if (watcher != nullptr) {
-      watcher->DebugSetPhase("tail-publish-wait");
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return StatusError(StatusCode::kConflicts,
+                         "unpublished table tail wait timed out");
     }
-    const auto wake_by = std::min(deadline, std::chrono::steady_clock::now() +
-                                                std::chrono::milliseconds(25));
-    table_tails_cv_.wait_until(lock, wake_by, [&] {
-      const auto it = table_tails_.find(first_page);
-      return it == table_tails_.end() || it->second.poisoned ||
-             !it->second.pending.has_value() ||
-             it->second.pending->owner == viewer ||
-             !it->second.pending->unpublished_pages.contains(page_id);
-    });
-    if (watcher != nullptr) {
-      watcher->DebugSetPhase(nullptr);
-      if (watcher->IsWounded()) {
-        record_wait();
-        return StatusError(StatusCode::kConflicts,
-                           "transaction wounded while waiting for table tail");
-      }
-    }
+    table_tails_cv_.wait_for(
+        lock, std::min(kTableTailWaitSlice,
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - now)));
   }
 }
 
 Status PageManager::WaitForTableTailQuiescence(page_id_t first_page,
                                                txn_id_t requester) {
-  constexpr auto kWaitLimit = std::chrono::seconds(5);
-  const auto deadline = std::chrono::steady_clock::now() + kWaitLimit;
   std::unique_lock lock(table_tails_mu_);
-  for (;;) {
-    const auto state_it = table_tails_.find(first_page);
-    if (state_it == table_tails_.end()) {
-      return Status::kSuccess;
+  const auto has_foreign_tail_work = [&] {
+    const auto res = tail_reservations_.find(first_page);
+    if (res != tail_reservations_.end() && res->second.owner != requester) {
+      return true;
     }
-    const auto& state = state_it->second;
-    if (state.poisoned) {
-      return StatusError(StatusCode::kIOError,
-                         "table tail is poisoned by a failed transaction");
+    for (const auto& [page_id, pending] : unpublished_tail_pages_) {
+      (void)page_id;
+      if (pending.first_page == first_page && pending.owner != requester) {
+        return true;
+      }
     }
-    if (!state.pending.has_value()) {
-      return Status::kSuccess;
-    }
-    if (state.pending->owner == requester) {
-      return Status::kConflicts;
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      return StatusError(StatusCode::kConflicts,
-                         "timed out waiting for table tail owner");
-    }
-    table_tails_cv_.wait_until(lock, deadline, [&] {
-      const auto it = table_tails_.find(first_page);
-      return it == table_tails_.end() || it->second.poisoned ||
-             !it->second.pending.has_value() ||
-             it->second.pending->owner == requester;
-    });
+    return false;
+  };
+  if (!table_tails_cv_.wait_for(lock, kTableTailWaitTimeout,
+                                [&] { return !has_foreign_tail_work(); })) {
+    return StatusError(StatusCode::kConflicts,
+                       "table tail quiescence wait timed out");
   }
+  return Status::kSuccess;
 }
 
 void PageManager::ResolveTableTailReservations(txn_id_t owner,
                                                TableTailResolution resolution) {
   std::scoped_lock lock(table_tails_mu_);
-  const auto reservations_it = table_tail_reservations_.find(owner);
-  if (reservations_it == table_tail_reservations_.end()) {
-    return;
-  }
-  for (page_id_t first_page : reservations_it->second) {
-    const auto state_it = table_tails_.find(first_page);
-    if (state_it == table_tails_.end()) {
+  for (auto it = tail_reservations_.begin(); it != tail_reservations_.end();) {
+    if (it->second.owner != owner) {
+      ++it;
       continue;
     }
-    auto& state = state_it->second;
-    if (!state.pending.has_value() || state.pending->owner != owner) {
-      continue;
-    }
-    if (resolution == TableTailResolution::kPublish) {
-      state.published_tail = state.pending->owner_tail;
-      state.pending.reset();
+    if (resolution == TableTailResolution::kPublish &&
+        it->second.new_tail != 0) {
+      table_tails_[it->first] = it->second.new_tail;
     } else if (resolution == TableTailResolution::kDiscard) {
-      state.pending.reset();
-    } else {
-      state.pending.reset();
-      state.poisoned = true;
+      table_tails_[it->first] = it->second.predecessor;
     }
+    it = tail_reservations_.erase(it);
   }
-  table_tail_reservations_.erase(reservations_it);
+  for (auto it = unpublished_tail_pages_.begin();
+       it != unpublished_tail_pages_.end();) {
+    if (it->second.owner != owner) {
+      ++it;
+      continue;
+    }
+    if (resolution == TableTailResolution::kPoison) {
+      it->second.poisoned = true;
+      ++it;
+      continue;
+    }
+    it = unpublished_tail_pages_.erase(it);
+  }
   table_tails_cv_.notify_all();
 }
 
 void PageManager::CancelTableTailReservation(txn_id_t owner,
                                              page_id_t first_page) {
   std::scoped_lock lock(table_tails_mu_);
-  const auto state_it = table_tails_.find(first_page);
-  if (state_it == table_tails_.end() || !state_it->second.pending.has_value() ||
-      state_it->second.pending->owner != owner ||
-      !state_it->second.pending->unpublished_pages.empty()) {
-    return;
+  const auto res = tail_reservations_.find(first_page);
+  if (res != tail_reservations_.end() && res->second.owner == owner &&
+      res->second.new_tail == 0) {
+    tail_reservations_.erase(res);
+    table_tails_cv_.notify_all();
   }
-  state_it->second.pending.reset();
-  const auto reservations_it = table_tail_reservations_.find(owner);
-  if (reservations_it != table_tail_reservations_.end()) {
-    reservations_it->second.erase(first_page);
-    if (reservations_it->second.empty()) {
-      table_tail_reservations_.erase(reservations_it);
-    }
-  }
-  table_tails_cv_.notify_all();
 }
 
 void PageManager::AdvanceTableTail(page_id_t first_page, page_id_t expected,
                                    page_id_t next) {
   std::scoped_lock lock(table_tails_mu_);
-  auto [it, inserted] =
-      table_tails_.try_emplace(first_page, TableTailState{next});
-  if (!inserted && !it->second.pending.has_value() &&
-      it->second.published_tail == expected) {
-    it->second.published_tail = next;
+  auto [it, inserted] = table_tails_.try_emplace(first_page, next);
+  if (!inserted && (it->second == 0 || it->second == expected)) {
+    it->second = next;
   }
 }
 
 void PageManager::ForgetTableTail(page_id_t first_page) {
   std::scoped_lock lock(table_tails_mu_);
-  const auto it = table_tails_.find(first_page);
-  if (it != table_tails_.end() && !it->second.pending.has_value()) {
-    table_tails_.erase(it);
-    table_tails_cv_.notify_all();
-  }
-}
-
-// Logically delete the page.
-Status PageManager::DestroyPage(Transaction& system_txn, Page* target) {
-  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-  return meta->DestroyPage(system_txn, target);
-}
-
-// D3 (docs/design.md): undo restored the destroyed page; drop it from the
-// allocator free stack so the next AllocateNewPage cannot re-issue it.
-// Reports the meta-page failure instead of aborting: callers run on the
-// recovery/abort path, where MoveValue()'s LOG(FATAL)+abort would turn a
-// distressed meta page into a whole-process crash.
-//
-// The destroyed page is usually the free-list head (destroys push on top of
-// the chain and undo unwinds in reverse LSN order), but a destroy that is
-// still uncommitted can sit above it in the chain.  In that case walk the
-// chain and relink the predecessor instead of the head.  Hops latch one page
-// at a time and never hold the meta latch across GetPage (the allocator's
-// candidate latch is held while it waits for the meta latch -- see
-// AllocateNewPage), so a page that an allocator consumed and re-initialized
-// mid-walk simply ends the walk; AllocateNewPage's stale-head escape hatch
-// then keeps the allocator live and the startup free-list rebuild heals the
-// leftover link.
-Status PageManager::PopFreePageHead(page_id_t pid, page_id_t next) {
-  page_id_t head = 0;
-  page_id_t max_page = 0;
-  {
-    ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-    if (meta->body.meta_page.FirstFreePage() == pid) {
-      meta->body.meta_page.PopFreePageHead(pid, next);
-      return Status::kSuccess;
-    }
-    head = meta->body.meta_page.FirstFreePage();
-    max_page = meta->body.meta_page.MaxPageCount();
-  }
-  // A corrupt chain must not spin: bound the walk by the page high-water
-  // mark, and retry from a freshly read head in case the list moved under
-  // us (an allocator consuming pages above pid makes pid the new head).
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    page_id_t cursor = head;
-    for (page_id_t hops = 0; cursor != 0 && hops <= max_page; ++hops) {
-      ASSIGN_OR_RETURN(PageRef, page, pool_->GetPage(cursor, nullptr));
-      if (page->Type() != PageType::kFreePage) {
-        break;
-      }
-      if (page->body.free_page.NextFreePage() == pid) {
-        page->body.free_page.SetNextFreePage(next);
-        return Status::kSuccess;
-      }
-      cursor = page->body.free_page.NextFreePage();
-    }
-    if (attempt == 2) {
-      break;
-    }
-    ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-    if (meta->body.meta_page.FirstFreePage() == pid) {
-      meta->body.meta_page.PopFreePageHead(pid, next);
-      return Status::kSuccess;
-    }
-    head = meta->body.meta_page.FirstFreePage();
-  }
-  return Status::kSuccess;
-}
-
-StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& system_txn,
-                                               PageType new_page_type) {
-  // Two-phase allocation: pick the candidate under the meta latch, but
-  // release that latch before blocking on the candidate page's latch.  The
-  // runtime undo of an aborted destroy latches the candidate page first and
-  // takes the meta latch second (LogUndoWithPage -> PopFreePageHead), so
-  // holding meta across GetPage here would give the two paths opposite
-  // orders and let an allocator deadlock against an aborting destructor.
-  // Re-validation under the re-taken latch keeps the pop correct when
-  // another allocator moved the head in between; the loser just retries.
-  // |force_fresh| skips the free list entirely: set when the free-list
-  // head's destroy is still owned by an active transaction, in which
-  // case the id cannot be safely reissued (the destroyer's abort would
-  // resurrect the old page image and catalog entry over the new owner's
-  // content).  The skipped entry becomes allocatable once its destroyer
-  // finishes -- a commit leaves the page free with a settled destroyer,
-  // while an abort restores it to a non-free type the candidate check
-  // rejects (and PopFreePageHead unlinks).
-  bool force_fresh = false;
-  for (;;) {
-    page_id_t candidate = 0;
-    {
-      ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-      candidate = force_fresh ? meta->body.meta_page.MaxPageCount() + 1
-                              : meta->body.meta_page.PeekAllocationCandidate();
-    }
-    ASSIGN_OR_RETURN(PageRef, page, pool_->GetPage(candidate, nullptr));
-    ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-    // Snapshot the allocator before mutating it: the WAL append below can
-    // fail (dead logger), and without a rollback the id leaks (max-path ids
-    // are skipped forever, free-path ids orphan a free-list entry).  This
-    // mirrors MetaPage::DestroyPage's rollback on log-append failure.
-    const page_id_t saved_first_free_page =
-        meta->body.meta_page.FirstFreePage();
-    const page_id_t saved_max_page_count = meta->body.meta_page.MaxPageCount();
-    const bool recycled = !force_fresh && saved_first_free_page == candidate;
-    if (recycled && page->Type() == PageType::kFreePage) {
-      const txn_id_t destroyer = page->body.free_page.Destroyer();
-      // A page whose destroyer is still active must not be reissued — not
-      // even to the destroying transaction itself.  An abort restores the
-      // pre-destroy page image, and the restored rows stay visible only
-      // because their version chains survive; reusing the id first would
-      // have erased them (see InvalidatePageVersions) and let the restore
-      // resurrect invisible rows / clobber the interim owner's content.
-      // Once the destroyer settles, reuse is safe: a commit makes the
-      // destroy permanent, and an abort unlinks the entry entirely.
-      if (destroyer != 0 && system_txn.IsTransactionActive(destroyer)) {
-        force_fresh = true;
-        continue;
-      }
-    }
-    const PageAllocationKind allocation_kind =
-        recycled ? PageAllocationKind::kRecycled : PageAllocationKind::kFresh;
-    const PageType old_target_type =
-        recycled ? page->Type() : PageType::kFreePage;
-    std::string old_target_payload;
-    if (recycled && old_target_type == PageType::kFreePage) {
-      old_target_payload =
-          EncodeAllocationFreePayload(page->body.free_page.NextFreePage(),
-                                      page->body.free_page.Destroyer());
-    }
-    const std::string old_meta_payload = EncodeAllocationMetaPayload(
-        saved_first_free_page, saved_max_page_count);
-    const bool allocated =
-        force_fresh
-            ? meta->body.meta_page.AllocateFreshId(candidate)
-            : meta->body.meta_page.AllocateCandidate(candidate, page.get());
-    if (!allocated) {
-      // The candidate moved while the meta latch was released; the pinned
-      // page was never mutated, so dropping it and recomputing is safe.
-      // A head that still names this candidate while the page is no longer
-      // free is a stale link that PopFreePageHead could not relink (its
-      // comment covers when that happens); retrying would re-peek the same
-      // dead head forever.  Abandon the chain -- the ids return at the
-      // startup free-list rebuild -- instead of hanging every allocation.
-      if (!force_fresh && meta->body.meta_page.FirstFreePage() == candidate &&
-          page->Type() != PageType::kFreePage) {
-        meta->body.meta_page.ResetFreeList();
-      }
-      continue;
-    }
-    const Status allocate_log =
-        system_txn
-            .AllocatePageLog(candidate, new_page_type, allocation_kind,
-                             old_target_type, old_target_payload,
-                             old_meta_payload)
-            .GetStatus();
-    if (allocate_log != Status::kSuccess) {
-      meta->body.meta_page.RollbackAllocation(saved_first_free_page,
-                                              saved_max_page_count);
-      return allocate_log;
-    }
-    meta->SetPageLSN(system_txn.PrevRecordEndLSN());
-    meta->SetRecLSN(system_txn.PrevLSN());
-    page->PageInit(candidate, new_page_type);
-    page->SetPageLSN(system_txn.PrevRecordEndLSN());
-    page->SetRecLSN(system_txn.PrevLSN());
-    if (recycled) {
-      system_txn.RecordRecycledPageAllocation(candidate);
-    }
-    return page;
-  }
-}
-
-Status PageManager::ApplyAllocationState(PageRef& target, lsn_t rec_lsn,
-                                         lsn_t page_lsn, const LogRecord& log,
-                                         bool redo_target) {
-  if (log.wire_version < kAllocationPayloadWalVersion ||
-      (log.type != LogType::kSystemAllocPage &&
-       log.type != LogType::kCompensateAllocPage) ||
-      log.pid == 0 || log.redo_data.size() != kAllocationMetaPayloadSize ||
-      static_cast<uint8_t>(log.allocation_kind) >
-          static_cast<uint8_t>(PageAllocationKind::kInPlace) ||
-      log.allocated_page_type == PageType::kUnknown ||
-      log.allocated_page_type == PageType::kMetaPage) {
-    return StatusError(StatusCode::kCorrupt,
-                       "invalid allocation compensation header");
-  }
-
-  page_id_t old_first_free = 0;
-  page_id_t old_max_page_count = 0;
-  if (!DecodeAllocationMetaPayload(log.redo_data, &old_first_free,
-                                   &old_max_page_count)) {
-    return StatusError(StatusCode::kCorrupt, "invalid allocation meta payload");
-  }
-
-  const PageAllocationKind kind = log.allocation_kind;
-  page_id_t recycled_next = 0;
-  txn_id_t recycled_destroyer = 0;
-  if (kind == PageAllocationKind::kFresh) {
-    if (log.previous_page_type != PageType::kFreePage ||
-        !log.undo_data.empty() ||
-        old_max_page_count == std::numeric_limits<page_id_t>::max() ||
-        old_max_page_count + 1 != log.pid) {
-      return StatusError(StatusCode::kCorrupt,
-                         "invalid fresh allocation payload");
-    }
-  } else if (kind == PageAllocationKind::kRecycled) {
-    if (log.previous_page_type != PageType::kFreePage ||
-        !DecodeAllocationFreePayload(log.undo_data, &recycled_next,
-                                     &recycled_destroyer) ||
-        old_first_free != log.pid ||
-        (recycled_next != 0 &&
-         (recycled_next == log.pid || (old_first_free <= old_max_page_count &&
-                                       recycled_next > old_max_page_count)))) {
-      // Name every decoded field: this validation is the authority on
-      // allocation-record self-consistency, and a bare "invalid" forced
-      // postmortems to re-derive the payload by hand.
-      return StatusError(
-          StatusCode::kCorrupt,
-          "invalid recycled allocation payload (pid=" +
-              std::to_string(log.pid) +
-              ", old_first_free=" + std::to_string(old_first_free) +
-              ", old_max_page_count=" + std::to_string(old_max_page_count) +
-              ", recycled_next=" + std::to_string(recycled_next) +
-              ", recycled_destroyer=" + std::to_string(recycled_destroyer) +
-              ", undo_bytes=" + std::to_string(log.undo_data.size()) + ")");
-    }
-  } else {
-    if (log.previous_page_type == PageType::kMetaPage ||
-        old_first_free > old_max_page_count ||
-        log.undo_data.size() != kPageBodySize) {
-      return StatusError(StatusCode::kCorrupt,
-                         "invalid in-place allocation payload");
-    }
-  }
-
-  if (kind == PageAllocationKind::kInPlace) {
-    if (redo_target) {
-      if (log.type == LogType::kSystemAllocPage) {
-        target->PageInit(log.pid, log.allocated_page_type);
-      } else {
-        target->PageInit(log.pid, log.previous_page_type);
-        std::memcpy(&target->body, log.undo_data.data(), kPageBodySize);
-      }
-      target->SetRecLSN(rec_lsn);
-      target->SetPageLSN(page_lsn);
-    }
-    return Status::kSuccess;
-  }
-
-  const bool fresh_allocation = kind == PageAllocationKind::kFresh;
-  const page_id_t expected_first_free =
-      fresh_allocation ? old_first_free : recycled_next;
-  const page_id_t expected_max_page_count =
-      fresh_allocation ? log.pid : std::max(old_max_page_count, log.pid);
-
-  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-  const bool redo_meta = meta->PageLSN() < page_lsn;
-  const bool restore_old = log.type == LogType::kCompensateAllocPage;
-  const bool exact_old_meta =
-      restore_old &&
-      meta->body.meta_page.FirstFreePage() == expected_first_free &&
-      meta->body.meta_page.MaxPageCount() == expected_max_page_count;
-  const page_id_t merge_next = meta->body.meta_page.FirstFreePage();
-
-  if (redo_target) {
-    if (!restore_old) {
-      target->PageInit(log.pid, log.allocated_page_type);
+  table_tails_.erase(first_page);
+  tail_reservations_.erase(first_page);
+  for (auto it = unpublished_tail_pages_.begin();
+       it != unpublished_tail_pages_.end();) {
+    if (it->second.first_page == first_page) {
+      it = unpublished_tail_pages_.erase(it);
     } else {
-      target->PageInit(log.pid, PageType::kFreePage);
-      if (kind == PageAllocationKind::kRecycled) {
-        target->body.free_page.SetNextFreePage(recycled_next);
-        target->body.free_page.SetDestroyer(recycled_destroyer);
-      }
+      ++it;
     }
-    if (restore_old && redo_meta && !exact_old_meta) {
-      target->body.free_page.SetNextFreePage(merge_next);
-    }
-    target->SetRecLSN(rec_lsn);
-    target->SetPageLSN(page_lsn);
   }
-
-  if (!redo_meta) {
-    return Status::kSuccess;
-  }
-
-  page_id_t restored_first_free = old_first_free;
-  page_id_t restored_max_page_count = old_max_page_count;
-  if (!restore_old) {
-    restored_first_free = expected_first_free;
-    restored_max_page_count = expected_max_page_count;
-  } else if (!exact_old_meta) {
-    restored_first_free = log.pid;
-    restored_max_page_count = std::max(
-        {meta->body.meta_page.MaxPageCount(), old_max_page_count, log.pid});
-  }
-  meta->PageInit(kMetaPageId, PageType::kMetaPage);
-  meta->body.meta_page.RollbackAllocation(restored_first_free,
-                                          restored_max_page_count);
-  meta->SetRecLSN(rec_lsn);
-  meta->SetPageLSN(page_lsn);
-  return Status::kSuccess;
-}
-
-Status PageManager::ReplayAllocation(PageRef& target, lsn_t lsn,
-                                     const LogRecord& log, bool redo_target) {
-  return ApplyAllocationState(target, lsn, lsn + log.Size(), log, redo_target);
-}
-
-StatusOr<lsn_t> PageManager::CompensateAllocation(PageRef& target, lsn_t lsn,
-                                                  const LogRecord& log,
-                                                  TransactionManager* tm) {
-  if (log.wire_version < kAllocationPayloadWalVersion) {
-    return lsn_t{0};
-  }
-  if (tm == nullptr) {
-    return StatusError(StatusCode::kRuntimeError,
-                       "allocation compensation has no transaction manager");
-  }
-  ASSIGN_OR_RETURN(lsn_t, clr_end,
-                   tm->CompensateAllocatePageLog(log, log.prev_lsn));
-  const LogRecord clr =
-      LogRecord::CompensateAllocatePageLogRecord(log, log.prev_lsn);
-  RETURN_IF_FAIL(ApplyAllocationState(target, lsn, clr_end, clr, true));
-  return clr_end;
-}
-
-StatusOr<std::string> PageManager::GetAllocationMetaPayload() {
-  ASSIGN_OR_RETURN(PageRef, meta, GetMetaPage());
-  return EncodeAllocationMetaPayload(meta->body.meta_page.FirstFreePage(),
-                                     meta->body.meta_page.MaxPageCount());
-}
-
-StatusOr<PageRef> PageManager::GetMetaPage() {
-  ASSIGN_OR_RETURN(PageRef, meta_page, pool_->GetPage(kMetaPageId, nullptr));
-  if (meta_page.IsNull()) {
-    return StatusError(StatusCode::kIOError, "failed to get meta page");
-  }
-  if (meta_page->Type() != PageType::kMetaPage) {
-    if (meta_page->Type() != PageType::kFreePage || meta_page->IsValid() ||
-        meta_page->checksum != 0) {
-      return StatusError(StatusCode::kCorrupt, "page 0 is not a meta page");
-    }
-    meta_page->PageInit(kMetaPageId, PageType::kMetaPage);
-  }
-  return meta_page;
+  table_tails_cv_.notify_all();
 }
 
 }  // namespace tinylamb

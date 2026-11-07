@@ -14,8 +14,10 @@ inline constexpr size_t kParallelScanMinRows = 8192;
 
 // Aggregation runs as ParallelAggregationExecutor only when its child is
 // estimated to emit at least this many rows; smaller inputs keep the
-// sequential executor (which additionally has the JIT sum fast path).
-inline constexpr size_t kParallelAggregationMinRows = 8192;
+// sequential executor (which additionally has typed scan folds and JIT SUM).
+// Simple integer/count payloads fold inside a parallel scan without creating
+// a second aggregation worker pool.
+inline constexpr size_t kParallelAggregationMinRows = 32768;
 
 // An inner hash join switches to the shared-build parallel executor when the
 // combined build+probe input reaches this size (TODO.md item 5). Semi/anti,

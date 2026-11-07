@@ -38,9 +38,9 @@ class ExecutorBase {
   ExecutorBase& operator=(const ExecutorBase&) = delete;
   ExecutorBase& operator=(ExecutorBase&&) = delete;
   virtual ~ExecutorBase() = default;
-  virtual bool Next(Row* dst, RowPosition* rp) = 0;
   virtual size_t NextBatch(DataChunk* destination,
-                           size_t max_rows = kDefaultVectorSize);
+                           size_t max_rows = kDefaultVectorSize) = 0;
+  bool Next(Row* dst, RowPosition* rp = nullptr);
   virtual void Dump(std::ostream& o, int indent) const = 0;
   virtual void Explain(std::ostream& o, int indent) const { Dump(o, indent); }
   friend std::ostream& operator<<(std::ostream& o, const ExecutorBase& e) {

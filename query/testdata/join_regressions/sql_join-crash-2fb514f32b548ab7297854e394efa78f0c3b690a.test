@@ -1,0 +1,29 @@
+-- tinylamb-join-test v1
+-- seed: 1196126520
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact VALUES (0, 3, NULL);
+-- setup: INSERT INTO fact VALUES (1, 3, NULL);
+-- setup: INSERT INTO fact VALUES (2, 0, -2);
+-- setup: INSERT INTO fact VALUES (3, 0, -3);
+-- setup: INSERT INTO fact VALUES (4, 1, NULL);
+-- setup: INSERT INTO fact VALUES (5, 2, 3);
+-- setup: INSERT INTO fact VALUES (6, NULL, -2);
+-- setup: INSERT INTO fact VALUES (7, 3, NULL);
+-- setup: INSERT INTO dim VALUES (2, 'yy');
+-- setup: INSERT INTO dim VALUES (0, 'x');
+-- setup: INSERT INTO dim VALUES (3, 'x');
+-- setup: INSERT INTO dim VALUES (3, 'yy');
+-- setup: INSERT INTO dim VALUES (2, 'x');
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f RIGHT JOIN dim d ON f.k = d.k AND d.tag = 'x';
+-- expect: |8|,|8|,|3|,|-2|,|-3|,|3|,
+-- query: SELECT f.u FROM fact f WHERE EXISTS (SELECT 1 FROM dim d WHERE d.k = f.k AND d.tag = 'yy') ORDER BY f.u;
+-- expect: |0|,
+-- expect: |1|,
+-- expect: |5|,
+-- expect: |7|,
+-- query: SELECT f.u FROM fact f WHERE f.k NOT IN (SELECT k FROM dim) ORDER BY f.u;
+-- expect: |4|,
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f LEFT JOIN dim d ON f.k = d.k;
+-- expect: |12|,|10|,|4|,|-1|,|-3|,|3|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

@@ -35,6 +35,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/table_sample_spec.hpp"
 #include "type/column.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
@@ -114,6 +115,7 @@ enum class StatementType : uint8_t {
   kDropMaterializedView,
   kCreateView,
   kDropView,
+  kCreateIndex,
 };
 
 // ALTER TABLE action.  v1 carries the catalog-level actions (table rename,
@@ -159,6 +161,8 @@ inline std::string StatementTypeName(StatementType t) {
       return "CreateView";
     case StatementType::kDropView:
       return "DropView";
+    case StatementType::kCreateIndex:
+      return "CreateIndex";
   }
   return "Unknown";
 }
@@ -213,6 +217,35 @@ class AlterTableStatement : public Statement {
  private:
   std::string table_name_;
   AlterTableAction action_;
+};
+
+class CreateIndexStatement : public Statement {
+ public:
+  CreateIndexStatement(std::string name, std::string table,
+                       std::vector<std::string> keys,
+                       std::vector<std::string> storing, bool unique,
+                       bool if_not_exists)
+      : Statement(StatementType::kCreateIndex),
+        name_(std::move(name)),
+        table_(std::move(table)),
+        keys_(std::move(keys)),
+        storing_(std::move(storing)),
+        unique_(unique),
+        if_not_exists_(if_not_exists) {}
+  const std::string& Name() const { return name_; }
+  const std::string& TableName() const { return table_; }
+  const std::vector<std::string>& Keys() const { return keys_; }
+  const std::vector<std::string>& Storing() const { return storing_; }
+  bool Unique() const { return unique_; }
+  bool IfNotExists() const { return if_not_exists_; }
+  void Dump(std::ostream& o) const override {
+    o << "name=" << name_ << " table=" << table_ << " unique=" << unique_;
+  }
+
+ private:
+  std::string name_, table_;
+  std::vector<std::string> keys_, storing_;
+  bool unique_, if_not_exists_;
 };
 
 class CreateTableStatement : public Statement {

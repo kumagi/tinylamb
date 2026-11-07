@@ -43,53 +43,53 @@ Encoder& Encoder::operator<<(std::string_view sv) {
   const auto sz = static_cast<bin_size_t>(sv.size());
   std::array<char, sizeof(bin_size_t)> prefix{};
   SerializeU16(prefix.data(), sz);
-  os_->write(prefix.data(), prefix.size());
-  os_->write(sv.data(), static_cast<std::streamsize>(sv.size()));
+  Write(prefix.data(), prefix.size());
+  Write(sv.data(), sv.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(uint8_t u8) {
-  os_->write(reinterpret_cast<const char*>(&u8), sizeof(u8));
+  Write(reinterpret_cast<const char*>(&u8), sizeof(u8));
   return *this;
 }
 
 Encoder& Encoder::operator<<(uint32_t u32) {
   std::array<char, sizeof(u32)> bytes{};
   SerializeU32(bytes.data(), u32);
-  os_->write(bytes.data(), bytes.size());
+  Write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(slot_t slot) {
   std::array<char, sizeof(slot)> bytes{};
   SerializeSlot(bytes.data(), slot);
-  os_->write(bytes.data(), bytes.size());
+  Write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(int64_t i64) {
   std::array<char, sizeof(i64)> bytes{};
   SerializeInteger(bytes.data(), i64);
-  os_->write(bytes.data(), bytes.size());
+  Write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(uint64_t u64) {
   std::array<char, sizeof(u64)> bytes{};
   SerializeU64(bytes.data(), u64);
-  os_->write(bytes.data(), bytes.size());
+  Write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(double d) {
   std::array<char, sizeof(d)> bytes{};
   SerializeDouble(bytes.data(), d);
-  os_->write(bytes.data(), bytes.size());
+  Write(bytes.data(), bytes.size());
   return *this;
 }
 
 Encoder& Encoder::operator<<(ValueType v) {
-  os_->write(reinterpret_cast<const char*>(&v), sizeof(v));
+  Write(reinterpret_cast<const char*>(&v), sizeof(v));
   return *this;
 }
 
@@ -97,7 +97,7 @@ Encoder& Encoder::operator<<(bool v) {
   // Normalize to 0/1 instead of writing the implementation-defined bool
   // representation; keeps the on-disk format stable.
   const uint8_t normalized = v ? 1 : 0;
-  os_->write(reinterpret_cast<const char*>(&normalized), sizeof(normalized));
+  Write(reinterpret_cast<const char*>(&normalized), sizeof(normalized));
   return *this;
 }
 

@@ -14,6 +14,13 @@
 
 namespace tinylamb::relational_detail {
 
+std::shared_ptr<QueryMemoryCharge> TryReserveQueryMemory(size_t bytes) {
+  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
+    return nullptr;
+  }
+  return std::make_shared<QueryMemoryCharge>(bytes);
+}
+
 Relation::Relation(Relation&& other) noexcept
     : schema(std::move(other.schema)),
       rows(std::move(other.rows)),
@@ -85,6 +92,10 @@ size_t Relation::ChargeFlushGranularity() {
     return size_t{4} << 20;
   }
   return std::clamp(limit / 64, size_t{4096}, size_t{262144});
+}
+
+bool Relation::HasAmpleMemoryBudget() {
+  return QueryMemoryBudget::Global().Remaining() >= (size_t{512} << 20);
 }
 
 void Relation::FlushPendingCharge() {
@@ -178,6 +189,41 @@ void Relation::AddRow(Row row) {
   }
   rows.push_back(std::move(row));
   peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+}
+
+void Relation::MergeInMemoryShard(Relation&& shard) {
+  if (shard.rows.empty() && !shard.HasSpill()) {
+    shard.ReleaseCharge();
+    return;
+  }
+  if (!HasSpill() && !shard.HasSpill() &&
+      QueryMemoryBudget::Global().CanReserve(shard.pending_charge_ +
+                                             pending_charge_)) {
+    charged_bytes_ += shard.charged_bytes_;
+    pending_charge_ += shard.pending_charge_;
+    shard.charged_bytes_ = 0;
+    shard.pending_charge_ = 0;
+    if (pending_charge_ >= ChargeFlushGranularity()) {
+      FlushPendingCharge();
+    }
+    if (rows.empty() && rows.capacity() <= shard.rows.capacity()) {
+      rows = std::move(shard.rows);
+    } else {
+      rows.insert(rows.end(), std::make_move_iterator(shard.rows.begin()),
+                  std::make_move_iterator(shard.rows.end()));
+      shard.rows.clear();
+    }
+    peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+    return;
+  }
+  for (Row& row : shard.rows) {
+    AddRow(std::move(row));
+  }
+  shard.rows.clear();
+  if (shard.HasSpill()) {
+    shard.ForEachRow([this](const Row& row) { AddRow(row); });
+  }
+  shard.ReleaseCharge();
 }
 
 Status Relation::FinishSpill() {

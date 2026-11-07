@@ -1310,6 +1310,9 @@ StatusOr<std::unique_ptr<Statement>> BindStatementLiterals(
       break;
     }
     case StatementType::kCreateTable:
+    case StatementType::kCreateIndex:
+    case StatementType::kCreateView:
+    case StatementType::kDropView:
     case StatementType::kDropTable:
     case StatementType::kAlterTable:
     case StatementType::kAnalyze:

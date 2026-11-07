@@ -1,44 +1,19 @@
-# `index/` — Layer 4 Foster B+Tree + WiscKey LSM
+# `index/` — Layer 4 LSM-Tree Index
 
-Persistent `{string => string}` structures over `page/`. Depends only on
-storage and below. Note the cycle-avoidance split: `index_scan_iterator.*`
-lives here but compiles into `tinylamb_table` (see `table/AGENTS.md`).
+Persistent unbounded `{string => string}` LSM-Tree index structures over
+`page/`. Depends only on storage and below. Note the cycle-avoidance split:
+`index_scan_iterator.*` lives here but compiles into `tinylamb_table`.
 
 ## Key files
 
-- `b_plus_tree.{hpp,cpp}` — Foster B+Tree. Splits link the new child as a
-  foster chain instead of updating the parent avalanche-style; readers follow
-  the chain, only writers absorb it. `hint_leaf` skips the root-to-leaf walk
-  when the previous landing leaf still routes the key (verified against root
-  + fences). Reclaim via `ReclaimIfOrphaned` (row-less + foster-less only).
-  `ScanPartitionBoundaries` walks the leaf chain for RangePartitionedScan:
-  the first key of every K-th non-empty leaf within the range, strictly
-  ascending and strictly greater than the scan's begin, which
-  `IndexScanIterator::PartitionBoundaries` decodes into key images for
-  `ParallelIndexScan`'s half-open morsels.
-- `b_plus_tree_iterator.{hpp,cpp}` — range scan cursor (asc/desc) built on
-  `BPlusTree::PositionAtOrAbove`/`BPlusTree::PositionBelow`.
+- `lsm_index.{hpp,cpp}` — `LsmIndex` and `LsmIndexIterator` (with `BPlusTree` /
+  `BPlusTreeIterator` aliases). Backed by `PageManager`'s LSM-Tree store
+  (`MemTable` + immutable `LsmSortedRun`s + k-way merge compaction), supporting
+  arbitrary key and value sizes without page-size or key-size limits.
 - `index_schema.{hpp,cpp}` (`IndexMode{kNonUnique/kUnique/kVersionedUnique}`),
-  `index.{hpp,cpp}` (`Index{schema, root pid}` only — no row data).
-  `IndexValueType{RowPosition | Row include}` lives here; `Table::IndexValueType`
-  is a compat alias, disk encoding unchanged.
+  `index.{hpp,cpp}` (`Index{schema, root pid}`).
 - `index_scan_iterator.{hpp,cpp}` — unified scan bound to `Table+Index+Txn`:
   fwd/rev, composite `vector<Value>` keys, non-unique offsets, `IndexOnly`
-  key/include access. `TryReadIndexOnly` is the index-only visibility fast
-  path (the MVCC visibility-map equivalent of full scans'
-  `PhysicalReadEligible`): a non-retained entry (`kUnique`/`kNonUnique`)
-  whose row page carries no version chains is served from the B+Tree image
-  (key + INCLUDE payload) without the heap fetch; retained entries, chain-
-  bearing pages and old snapshots keep the heap resolution. A/B hatch:
-  `TINYLAMB_DISABLE_INDEX_ONLY_VISIBILITY_MAP`. **CMake builds it into
-  `tinylamb_table`** to keep the `table → index` edge one-directional.
-- `lsm_tree.{hpp,cpp}` + `lsm_detail/` — WiscKey-style LSM (see
-  `lsm_detail/AGENTS.md`).  The plan/executor half lives above this layer:
-  `plan/lsm_scan_plan.*` + `executor/lsm_scan.*` behind the `lsm_scan`
-  implementation rule (`LogicalOperator::kLsmScan`, built by plan-level
-  callers; SQL not wired).  `LSMView` covers the registered runs only, so
-  fresh writes become visible after `Sync` (or the flusher's periodic flush).
+  key/include access (`TryReadIndexOnly`).
 
-Test: `./build/b_plus_tree_test`, `b_plus_tree_iterator_test`,
-`lsm_tree_test`, `index_scan_iterator_test`, `b_plus_tree_concurrent_test`.
-Fuzz: `index/*_fuzzer.cpp` (+ `_replay`, needs `TINYLAMB_ENABLE_FUZZ`).
+Test: `./build/lsm_index_test`, `index_scan_iterator_test`.

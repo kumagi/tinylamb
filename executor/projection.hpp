@@ -42,7 +42,6 @@ class Projection : public ExecutorBase {
   Projection& operator=(Projection&&) = delete;
   ~Projection() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
@@ -65,8 +64,6 @@ class Projection : public ExecutorBase {
   Executor src_;
   DataChunk input_batch_;
   DataChunk cse_input_batch_;
-  DataChunk output_batch_;
-  size_t output_offset_{0};
   std::vector<std::optional<BytecodeProgram>> cse_bytecodes_;
   std::vector<std::optional<BytecodeProgram>> bytecodes_;
   struct JitProjectionState {

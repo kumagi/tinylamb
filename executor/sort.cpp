@@ -547,22 +547,25 @@ Status SortExecutor::Materialize() {
   const bool always_spill = options_.spill_mode == SpillMode::kExternalMerge;
   QueryMemoryCharge charge;
   Status encode_error{Status::kSuccess};
-  Row row;
-  RowPosition position;
-  while (source_->Next(&row, &position)) {
-    const size_t bytes = EstimateRowBytes(row) + sizeof(RowPosition);
-    const bool spill_now =
-        !can_hold(bytes) || (run_rows != 0 && rows_.size() >= run_rows);
-    if (spill_now && !rows_.empty()) {
-      RETURN_IF_FAIL(write_sorted_run());
-      charge.ReleaseAll();
-      buffered_bytes = 0;
+  DataChunk batch;
+  while (source_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      Row row = batch.RowAt(i);
+      const RowPosition position = batch.PositionAt(i);
+      const size_t bytes = EstimateRowBytes(row) + sizeof(RowPosition);
+      const bool spill_now =
+          !can_hold(bytes) || (run_rows != 0 && rows_.size() >= run_rows);
+      if (spill_now && !rows_.empty()) {
+        RETURN_IF_FAIL(write_sorted_run());
+        charge.ReleaseAll();
+        buffered_bytes = 0;
+      }
+      charge.Add(bytes);
+      buffered_bytes += bytes;
+      ordering.AppendRow(row, &encode_error);
+      RETURN_IF_FAIL(encode_error);
+      rows_.emplace_back(std::move(row), position);
     }
-    charge.Add(bytes);
-    buffered_bytes += bytes;
-    ordering.AppendRow(row, &encode_error);
-    RETURN_IF_FAIL(encode_error);
-    rows_.emplace_back(std::move(row), position);
   }
   RETURN_IF_FAIL(encode_error);
   if (auto st = source_->GetStatus(); st != Status::kSuccess) {
@@ -697,22 +700,20 @@ Status SortExecutor::Materialize() {
   return Status::kSuccess;
 }
 
-bool SortExecutor::Next(Row* dst, RowPosition* rp) {
+size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(schema_, max_rows);
   if (!materialized_) {
     Status st = Materialize();
     if (st != Status::kSuccess) {
-      return FailWith(st);
+      FailWith(st);
+      return 0;
     }
   }
-  if (offset_ >= rows_.size()) {
-    return false;
+  while (destination->Size() < max_rows && offset_ < rows_.size()) {
+    destination->Append(std::move(rows_[offset_].first), rows_[offset_].second);
+    ++offset_;
   }
-  *dst = std::move(rows_[offset_].first);
-  if (rp != nullptr) {
-    *rp = rows_[offset_].second;
-  }
-  ++offset_;
-  return true;
+  return destination->Size();
 }
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {

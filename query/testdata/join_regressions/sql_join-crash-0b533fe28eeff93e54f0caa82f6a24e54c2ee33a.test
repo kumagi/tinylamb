@@ -1,0 +1,32 @@
+-- tinylamb-join-test v1
+-- seed: 1611007369
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact VALUES (0, 0, -3);
+-- setup: INSERT INTO fact VALUES (1, 0, -2);
+-- setup: INSERT INTO fact VALUES (2, 0, NULL);
+-- setup: INSERT INTO fact VALUES (3, NULL, 0);
+-- setup: INSERT INTO fact VALUES (4, NULL, -1);
+-- setup: INSERT INTO fact VALUES (5, 3, -2);
+-- setup: INSERT INTO fact VALUES (6, 0, 1);
+-- setup: INSERT INTO fact VALUES (7, 3, 3);
+-- setup: INSERT INTO dim VALUES (NULL, 'x');
+-- setup: INSERT INTO dim VALUES (0, 'x');
+-- setup: INSERT INTO dim VALUES (0, 'yy');
+-- query: SELECT f.u FROM fact f WHERE f.k IN (SELECT k FROM dim) ORDER BY f.u;
+-- expect: |0|,
+-- expect: |1|,
+-- expect: |2|,
+-- expect: |6|,
+-- query: SELECT d.tag, COUNT(*) FROM fact f RIGHT JOIN dim d ON f.k = d.k AND d.tag = 'x' GROUP BY d.tag HAVING COUNT(*) >= 1;
+-- expect: |"x"|,|5|,
+-- expect: |"yy"|,|1|,
+-- query: SELECT a FROM fact EXCEPT DISTINCT SELECT k FROM dim;
+-- expect: |-1|,
+-- expect: |-2|,
+-- expect: |-3|,
+-- expect: |1|,
+-- expect: |3|,
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f JOIN dim d ON f.a <= d.k;
+-- expect: |10|,|10|,|2|,|-16|,|-3|,|0|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

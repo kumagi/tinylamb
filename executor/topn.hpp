@@ -37,7 +37,8 @@ class TopNExecutor final : public ExecutorBase {
         offset_(offset),
         with_ties_(with_ties) {}
 
-  bool Next(Row* dst, RowPosition* position) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
 
  private:
@@ -62,6 +63,7 @@ class TopNExecutor final : public ExecutorBase {
   size_t input_rows_{0};
   size_t heap_capacity_{0};
   bool materialized_{false};
+  bool fused_scan_{false};
 };
 
 }  // namespace tinylamb

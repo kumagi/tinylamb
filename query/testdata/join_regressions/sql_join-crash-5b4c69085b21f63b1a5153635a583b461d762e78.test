@@ -1,0 +1,11 @@
+-- tinylamb-join-test v1
+-- seed: 36934874
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact SELECT n, CASE WHEN MOD(n, 11) = 0 THEN NULL ELSE MOD(n, 7) END, MOD(n, 5) - 2 FROM UNNEST(GENERATE_SERIES(0, 8999)) AS n;
+-- setup: INSERT INTO dim SELECT MOD(n, 6), CASE WHEN MOD(n, 2) = 0 THEN 'x' ELSE 'yy' END FROM UNNEST(GENERATE_SERIES(0, 99)) AS n;
+-- query: SELECT COUNT(*), SUM(f.a) FROM fact f JOIN dim d ON f.k = d.k AND d.tag = 'yy' WHERE f.k = 1;
+-- expect: |19873|,|-51|,
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f CROSS JOIN dim d;
+-- expect: |900000|,|900000|,|7|,|0|,|-2|,|5|,
+-- failure: TIMEOUT (unknown_crash_site)

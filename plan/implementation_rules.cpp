@@ -51,7 +51,6 @@
 #include "index_skip_scan_plan.hpp"
 #include "late_materialization_join_plan.hpp"
 #include "limit_plan.hpp"
-#include "lsm_scan_plan.hpp"
 #include "merge_join_plan.hpp"
 #include "minmax_index_plan.hpp"
 #include "multi_index_covering_scan_plan.hpp"
@@ -470,7 +469,8 @@ Plan BuildIndexScan(const Table& table, const Index& index,
                     bool ascending, const Expression& predicate,
                     const std::vector<NamedExpression>& select,
                     bool require_row_position, bool wait_for_write_intent,
-                    std::vector<ColumnName> provided_order) {
+                    std::vector<ColumnName> provided_order,
+                    size_t limit_hint = std::numeric_limits<size_t>::max()) {
   std::unordered_set<ColumnName> touched = predicate->TouchedColumns();
   for (const NamedExpression& item : select) {
     touched.merge(item.expression->TouchedColumns());
@@ -491,7 +491,7 @@ Plan BuildIndexScan(const Table& table, const Index& index,
   Plan scan = std::make_shared<IndexScanPlan>(
       table, index, statistics, std::move(begin_key), std::move(end_key),
       ascending, predicate, std::move(provided_order), require_row_position,
-      wait_for_write_intent);
+      wait_for_write_intent, limit_hint);
   // A range over a secondary index belongs to the skip-scan access family:
   // the executor seeks range boundaries in the index instead of reading the
   // table.  Covering (index-only) scans keep their dedicated node because
@@ -543,6 +543,9 @@ inline constexpr double kIndexRangeClusteringPenalty = 2.0;
 // touch so they win against a non-covering alternative of the same range and
 // stay competitive with the sequential full scan.
 inline constexpr double kCoveringIndexCostFactor = 0.5;
+// A non-covering index row also pays a heap lookup, visibility resolution and
+// row reconstruction. PAX full scans amortize those costs over whole batches.
+inline constexpr double kIndexHeapFetchCost = 4.0;
 
 double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
   double correlation = 1.0;
@@ -798,11 +801,15 @@ std::vector<PlanAlternative> ScanAlternatives(
   // ordering actually asks for it so unordered queries keep a stable
   // candidate set (the forward twin is always emitted first).
   const bool wants_descending = [&] {
-    if (required.ordering.empty() || context.query == nullptr) {
+    if (required.ordering.empty()) {
       return false;
     }
+    if (!required.sort_ascending.empty()) {
+      return !required.sort_ascending.front();
+    }
+    if (context.query == nullptr) return false;
     const std::vector<bool>& ascending = context.query->order_ascending_;
-    if (ascending.empty() || ascending.size() != required.ordering.size()) {
+    if (ascending.empty() || ascending.size() < required.ordering.size()) {
       return false;
     }
     return !ascending.front();
@@ -950,9 +957,12 @@ std::vector<PlanAlternative> ScanAlternatives(
       // is especially important for COUNT(*) and for ORDER BY/LIMIT shapes:
       // the index can provide the required order and the lazy executor can
       // stop after the requested prefix without touching the heap.  Do not
-      // offer this fallback for filtered scans; without a selective bound it
-      // would only create a tie that could displace the normal full scan.
-      if (no_filter) {
+      // A filtered ordered LIMIT can also stop early after checking residual
+      // predicates. Its cost must account for rejected heap rows.
+      const bool ordered_limit =
+          !required.ordering.empty() &&
+          required.limit_hint != std::numeric_limits<size_t>::max();
+      if (no_filter || ordered_limit) {
         std::vector<ColumnName> full_index_order;
         full_index_order.reserve(index.sc_.key_.size());
         for (const slot_t slot : index.sc_.key_) {
@@ -968,19 +978,31 @@ std::vector<PlanAlternative> ScanAlternatives(
           Plan unconstrained = BuildIndexScan(
               table, index, statistics, {}, {}, scan_ascending, scan_predicate,
               fallback_select, required.require_row_position,
-              required.wait_for_write_intent, full_index_order);
+              required.wait_for_write_intent, full_index_order,
+              required.limit_hint);
           // Detect covering before finalize wraps the node (aliased
           // relations get a rename node that hides the scan type).
           const bool covering = std::dynamic_pointer_cast<IndexOnlyScanPlan>(
                                     unconstrained) != nullptr;
           unconstrained = finalize(unconstrained);
-          const double unconstrained_cost =
+          double unconstrained_cost =
               static_cast<double>(statistics.Rows()) *
-              (covering ? kCoveringIndexCostFactor : 1.0);
-          candidates.push_back(PlanAlternative{
-              .plan = std::move(unconstrained),
-              .local_cost = unconstrained_cost,
-              .estimated_rows = static_cast<double>(statistics.Rows())});
+              (covering ? kCoveringIndexCostFactor : kIndexHeapFetchCost);
+          if (covering && !index.sc_.key_.empty()) {
+            const std::vector<size_t> key_slots(index.sc_.key_.begin(),
+                                                index.sc_.key_.end());
+            // Key transitions pay for cursor navigation and list decoding;
+            // duplicate entries amortize that work until the next key.
+            unconstrained_cost +=
+                4.0 * statistics.EstimateDistinctRows(key_slots);
+          }
+          double output_rows =
+              static_cast<double>(statistics.Rows()) * filter_selectivity;
+          ApplyLimitHint(unconstrained, required, context, filter_selectivity,
+                         &unconstrained_cost, &output_rows);
+          candidates.push_back(PlanAlternative{.plan = std::move(unconstrained),
+                                               .local_cost = unconstrained_cost,
+                                               .estimated_rows = output_rows});
         }
       }
 
@@ -1259,16 +1281,18 @@ std::vector<PlanAlternative> ScanAlternatives(
           if (range->second.max) {
             end_key.push_back(*range->second.max);
           }
+        } else if (range->second.max) {
+          // An empty begin is the index's unbounded lower endpoint. A
+          // first-column upper bound is useful too; the residual preserves
+          // strictness and rejects NULL keys in both scan directions.
+          end_key.push_back(*range->second.max);
         } else {
-          // A one-sided bound on the first key position with no equality
-          // prefix gives no usable seek start; skip this index explicitly
-          // and let the full-scan alternative handle it.
           break;
         }
         consumed.insert(slot);
         break;
       }
-      if (begin_key.empty()) {
+      if (begin_key.empty() && end_key.empty()) {
         continue;
       }
 
@@ -1289,7 +1313,8 @@ std::vector<PlanAlternative> ScanAlternatives(
         Plan candidate = BuildIndexScan(
             table, index, statistics, begin_key, end_key, scan_ascending,
             scan_predicate, fallback_select, required.require_row_position,
-            required.wait_for_write_intent, provided_order);
+            required.wait_for_write_intent, provided_order,
+            required.limit_hint);
         // Covering-ness is a property of the scan BuildIndexScan picked; the
         // Selection/Projection/Rename wrappers below hide the node type, so
         // capture it before wrapping.
@@ -1347,7 +1372,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
         if (has_range_slot && candidate->AccessRowCount() > 0) {
           local_cost = static_cast<double>(candidate->AccessRowCount()) *
-                       (covering ? 1.0 : range_penalty);
+                       (covering ? 1.0 : range_penalty * kIndexHeapFetchCost);
         }
         if (covering) {
           local_cost *= kCoveringIndexCostFactor;
@@ -1529,7 +1554,7 @@ std::vector<PlanAlternative> ScanAlternatives(
             : std::numeric_limits<size_t>::max();
     // Extract PeekCompare predicates from the filter so the scan iterator
     // can reject rows at the raw-byte level before full deserialization.
-    std::vector<IntegerPeekCompare> scan_peeks;
+    relational_detail::CompiledScanFilter peek_filter;
     if (filter) {
       const std::vector<Expression> conjuncts = SplitConjuncts(filter);
       for (const Expression& conjunct : conjuncts) {
@@ -1540,16 +1565,16 @@ std::vector<PlanAlternative> ScanAlternatives(
         }
         if (auto simple =
                 relational_detail::TryCompileSimpleCompare(conjunct, schema)) {
-          if (simple->int_payload) {
-            IntegerPeekCompare peek;
-            peek.column = simple->column;
-            peek.op = simple->op;
-            peek.constant = simple->int_constant;
-            scan_peeks.push_back(peek);
-          }
+          peek_filter.simple.push_back(std::move(*simple));
         }
       }
     }
+    // An integer constant does not prove the stored column is signed INT64
+    // (Q6 compares a DOUBLE quantity with 25). Reuse the schema-aware gate:
+    // interpreting DOUBLE bits or unsigned payloads as signed integers can
+    // reject rows before the exact residual gets a chance to evaluate them.
+    std::vector<IntegerPeekCompare> scan_peeks =
+        relational_detail::BuildIntegerPeeks(peek_filter, nullptr, schema);
     // Required-column narrowing (Phase 3, decode floor): when the required
     // list is a strict subset of plain table columns, emit only those
     // columns from the scan itself (the iterator skips the others before
@@ -1608,7 +1633,18 @@ std::vector<PlanAlternative> ScanAlternatives(
       full_scan = std::make_shared<ProjectionPlan>(full_scan, fallback_select);
     }
     full_scan = finalize(full_scan);
-    auto local_cost = static_cast<double>(full_scan->AccessRowCount());
+    // A table scan initializes its page cursor and filter/batch machinery.
+    // Keep that fixed startup separate from per-row work: tiny selective
+    // index walks should not lose merely because heap accesses cost more.
+    auto local_cost = 16.0 + static_cast<double>(full_scan->AccessRowCount());
+    if (required.require_row_position) {
+      // DML locks every visited head before checking the residual predicate.
+      // Charge for that admission, including a startup cost when statistics
+      // still say an initially empty table has zero rows. A zero-cost cached
+      // full scan otherwise beats a unique point seek forever and conflicts
+      // with unrelated, newly inserted keys in other open transactions.
+      local_cost = 2.0 * std::max(1.0, local_cost);
+    }
     // access_method hint (Phase 5): a soft preference against full scans.
     if (required.access_method == cascades::AccessMethod::kPreferIndex &&
         table.IndexCount() > 0) {
@@ -3541,35 +3577,6 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               .estimated_rows = static_cast<double>(logical.values.size())}};
         },
         c::LogicalOperator::kValues));
-    // LSM / WiscKey scan: the kLsmScan node carries a caller-owned tree and
-    // its row-count estimate; SQL does not produce the node (plan-level
-    // callers and tests build the memo directly).
-    built.Add(c::ImplementationRule(
-        "lsm_scan", c::dsl::LsmScan(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
-           const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext& context) {
-          if (!children.empty() || logical.lsm_tree == nullptr) {
-            return std::vector<PlanAlternative>{};
-          }
-          Plan plan = std::make_shared<LsmScanPlan>(*logical.lsm_tree,
-                                                    logical.lsm_estimated_rows);
-          const auto rows = static_cast<double>(logical.lsm_estimated_rows);
-          // The view streams keys in structural order, so a Top-N caller
-          // reading the required ordering gets the lazy prefix read like any
-          // other ordered scan (the hint helper gates on the plan actually
-          // delivering the query's order expressions).
-          double local_cost = rows;
-          double estimated_rows = rows;
-          ApplyLimitHint(plan, required, context, 1.0, &local_cost,
-                         &estimated_rows);
-          return std::vector<PlanAlternative>{
-              PlanAlternative{.plan = std::move(plan),
-                              .local_cost = local_cost,
-                              .estimated_rows = estimated_rows}};
-        },
-        c::LogicalOperator::kLsmScan));
     built.Add(c::ImplementationRule(
         "unnest", c::dsl::Unnest(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
@@ -3884,7 +3891,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
-           const PhysicalProperties& required, const c::RuleContext&) {
+           const PhysicalProperties& required, const c::RuleContext& context) {
           // Aggregated output carries no row positions.
           if (children.size() != 1 || required.require_row_position) {
             return std::vector<PlanAlternative>{};
@@ -3980,12 +3987,80 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             }
           }
 
+          Plan aggregate_input = children[0].plan;
+          // An unbounded COUNT(*) can fold the heap's typed visible batches
+          // directly. Walking a covering index still expands every duplicate
+          // row position; retain that access path for bounded predicates,
+          // ordered/grouped consumers and explicit index preferences.
+          if (grouping_keys.empty() && rows >= kParallelScanMinRows &&
+              required.access_method == c::AccessMethod::kAny &&
+              std::ranges::all_of(payload.aggregates, [](const auto& item) {
+                if (!item.expression ||
+                    item.expression->Type() != TypeTag::kAggregateExp)
+                  return false;
+                const auto& aggregate =
+                    item.expression->AsAggregateExpression();
+                return aggregate.GetType() == AggregationType::kCount &&
+                       !aggregate.Distinct() && !aggregate.HasWhereFilter() &&
+                       !aggregate.NeedsGroupContext() &&
+                       (!aggregate.Child() ||
+                        (aggregate.Child()->Type() == TypeTag::kColumnValue &&
+                         aggregate.Child()
+                                 ->AsColumnValue()
+                                 .GetColumnName()
+                                 .name == "*"));
+              })) {
+            Plan scan_input = aggregate_input;
+            if (const auto* projection =
+                    dynamic_cast<const ProjectionPlan*>(scan_input.get())) {
+              if (std::ranges::all_of(
+                      projection->Columns(), [&](const auto& item) {
+                        return item.expression &&
+                               item.expression->Type() ==
+                                   TypeTag::kColumnValue &&
+                               projection->GetSource()->GetSchema().Offset(
+                                   item.expression->AsColumnValue()
+                                       .GetColumnName()) >= 0;
+                      }))
+                scan_input = projection->GetSource();
+            }
+            if (const auto* covering =
+                    dynamic_cast<const IndexOnlyScanPlan*>(scan_input.get());
+                covering && covering->BeginKey().empty() &&
+                covering->EndKey().empty() && covering->ScanPredicate() &&
+                covering->ScanPredicate()->Type() == TypeTag::kConstantValue &&
+                covering->ScanPredicate()
+                    ->AsConstantValue()
+                    .GetValue()
+                    .Truthy()) {
+              for (const auto& [relation, table] : context.tables) {
+                if (table.get() != covering->ScanSource()) continue;
+                const auto found = context.statistics.find(relation);
+                if (found == context.statistics.end() || !found->second ||
+                    table->GetSchema().ColumnCount() == 0 ||
+                    found->second->Columns() < table->GetSchema().ColumnCount())
+                  break;
+                slot_t cheapest = 0;
+                for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i)
+                  if (table->GetSchema().GetColumn(i).Type() ==
+                      ValueType::kInt64) {
+                    cheapest = static_cast<slot_t>(i);
+                    break;
+                  }
+                FullScanPlan heap(*table, *found->second);
+                aggregate_input = std::make_shared<FullScanPlan>(
+                    heap, std::vector<slot_t>{cheapest});
+                break;
+              }
+            }
+          }
+
           // HashAgg: one hash table over the group keys, valid over any input
           // order and the cheapest single pass. Above the group capacity the
           // table partitions its input and re-groups it per partition, so the
           // cost carries that spill exactly where the estimate says it happens.
           Plan hash =
-              std::make_shared<HashAggregatePlan>(children[0].plan, payload);
+              std::make_shared<HashAggregatePlan>(aggregate_input, payload);
           const double hash_cost =
               rows + cascades::EstimateMemorySpillCost(
                          cascades::OperatorCostKind::kSort, output_rows,
@@ -3995,7 +4070,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // it is priced as a sort plus the accumulator pass and stays
           // selectable by rule disabling or a hint.
           Plan sort =
-              std::make_shared<SortAggregatePlan>(children[0].plan, payload);
+              std::make_shared<SortAggregatePlan>(aggregate_input, payload);
           const double sort_cost =
               (rows * std::log2(std::max(2.0, rows))) + rows;
           std::vector<PlanAlternative> agg_alternatives{
@@ -4012,8 +4087,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           // which makes the shape valid over any input order.
           if (grouping_keys.empty() ||
               ChildDeliversGroupKeyOrder(children[0], grouping_keys)) {
-            Plan stream = std::make_shared<StreamAggregatePlan>(
-                children[0].plan, payload);
+            Plan stream =
+                std::make_shared<StreamAggregatePlan>(aggregate_input, payload);
             agg_alternatives.push_back(PlanAlternative{
                 .plan = std::move(stream),
                 .local_cost = (rows * 0.8) + count_argument_cost,
@@ -4112,8 +4187,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         "topn", cascades::dsl::TopN(),
         [](c::GroupId, const c::Memo&, const c::Bindings&,
            const c::LogicalExpression& logical,
-           const std::vector<BestPlan>& children, const PhysicalProperties&,
-           const c::RuleContext&) {
+           const std::vector<BestPlan>& children,
+           const PhysicalProperties& required, const c::RuleContext&) {
           if (children.size() != 1 ||
               logical.target_list.size() != logical.sort_ascending.size() ||
               logical.limit_count == 0) {
@@ -4147,6 +4222,47 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                 .estimated_rows = LimitOutputRows(children[0].estimated_rows,
                                                   logical.limit_count,
                                                   logical.limit_offset)}};
+          }
+          if (!logical.with_ties &&
+              c::SatisfiesOrderingCollation(children[0].plan, required)) {
+            for (size_t count = keys.size(); count > 1;) {
+              --count;
+              std::vector<Expression> prefix_expressions(
+                  ordering.begin(), ordering.begin() + count);
+              std::vector<bool> directions(
+                  logical.sort_ascending.begin(),
+                  logical.sort_ascending.begin() + count);
+              std::vector<std::optional<bool>> nulls;
+              for (size_t i = 0; i < count; ++i)
+                nulls.push_back(keys[i].nulls_first);
+              if (!children[0].plan->IsOrderedBy(prefix_expressions, directions,
+                                                 nulls))
+                continue;
+              std::vector<SortKey> prefix, suffix;
+              for (size_t i = 0; i < keys.size(); ++i) {
+                SortKey key{keys[i].expression, keys[i].ascending,
+                            keys[i].nulls_first, keys[i].collation};
+                (i < count ? prefix : suffix).push_back(std::move(key));
+              }
+              const double rows = children[0].estimated_rows;
+              const double groups = std::max(
+                  1.0,
+                  EstimateDistinctRows(children[0].plan, prefix_expressions));
+              const double group_rows = std::max(1.0, rows / groups);
+              const double wanted = static_cast<double>(logical.limit_count) +
+                                    static_cast<double>(logical.limit_offset);
+              const double read_rows = std::min(rows, wanted + group_rows);
+              Plan sorted = std::make_shared<IncrementalSortPlan>(
+                  children[0].plan, std::move(prefix), std::move(suffix));
+              Plan limit = std::make_shared<LimitPlan>(
+                  std::move(sorted), logical.limit_count, logical.limit_offset);
+              return std::vector<PlanAlternative>{PlanAlternative{
+                  .plan = std::move(limit),
+                  .local_cost =
+                      read_rows * std::log2(std::max(2.0, group_rows)),
+                  .estimated_rows = LimitOutputRows(rows, logical.limit_count,
+                                                    logical.limit_offset)}};
+            }
           }
           Plan topn = std::make_shared<TopNPlan>(
               children[0].plan, std::move(keys), logical.limit_count,

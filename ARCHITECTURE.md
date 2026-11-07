@@ -61,7 +61,7 @@ server                server/          (postgres wire protocol)
 | common | `common/` | `status_or.hpp`, `log_message.hpp`, `vm_cache.hpp` | エラー型, ログ, 符号化, 仮想メモリキャッシュ |
 | type | `type/` | `value.hpp`, `row.hpp`, `schema.hpp`, `date.hpp` | 値・行・スキーマの表現 |
 | storage | `page/` `recovery/` `transaction/` | `page_pool.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | バッファ管理, 先書きログ, 分離レベル |
-| index | `index/` | `b_plus_tree.hpp`, `lsm_tree.hpp`, `index_schema.hpp` | 順次/LSM インデックス |
+| index | `index/` | `b_plus_tree.hpp`, `index.hpp`, `index_schema.hpp` | B+Tree インデックス |
 | table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp` | 行データアクセスと統計 |
 | database | `database/` | `database.hpp`, `catalog_reader.hpp`, `transaction_context.hpp` | カタログ, DDL, トランザクション文脈 |
 | expression | `expression/` | `expression.hpp`, `bytecode.hpp`, `jit.hpp` | 式評価 (AST 正本・bytecode はバッチ実行用 IR・JIT はその compiler, docs/expression_evaluation.md) |
@@ -123,5 +123,5 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
 
 無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (6),
 type→storage/row_position (1), index→table (3), table→expression (7),
-expression→executor (bytecode/pax_block→data_chunk, 2), storage→executor (4),
+expression→executor (bytecode→data_chunk, 2),
 relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 13)。

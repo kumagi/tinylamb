@@ -32,7 +32,6 @@ class TableSampleExecutor final : public ExecutorBase {
   TableSampleExecutor& operator=(TableSampleExecutor&&) = delete;
   ~TableSampleExecutor() override = default;
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   [[nodiscard]] const Schema& OutputSchema() const { return output_schema_; }
@@ -93,7 +92,6 @@ class TableSampleExecutor final : public ExecutorBase {
   std::unordered_map<uint64_t, bool> page_decisions_;
   std::vector<Candidate> output_rows_;
   size_t output_offset_{0};
-  DataChunk output_batch_;
 };
 
 #endif

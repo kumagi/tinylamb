@@ -75,7 +75,6 @@ class WindowExecutor : public ExecutorBase {
                  std::vector<NamedExpression> outputs, Options options);
   ~WindowExecutor() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;

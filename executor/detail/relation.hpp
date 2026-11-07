@@ -11,7 +11,15 @@
 #include "type/row.hpp"
 #include "type/schema.hpp"
 
+namespace tinylamb {
+class QueryMemoryCharge;
+}
+
 namespace tinylamb::relational_detail {
+
+// A shared lifetime for auxiliary relational state which cannot spill. A
+// failed reservation leaves the caller on its ordinary spill-capable route.
+std::shared_ptr<QueryMemoryCharge> TryReserveQueryMemory(size_t bytes);
 
 constexpr size_t kSpillPartitions = 32;
 struct ExecutionRuntime;
@@ -41,8 +49,10 @@ struct Relation {
   ~Relation();
 
   void ReleaseCharge();
+  [[nodiscard]] static bool HasAmpleMemoryBudget();
   void EnsureSpill();
   void AddRow(Row row);
+  void MergeInMemoryShard(Relation&& shard);
   Status FinishSpill();
   // Drop every buffered or spilled row (and its memory charge). Callers must
   // have copied the contents out beforehand (e.g. via ForEachRow); re-adding

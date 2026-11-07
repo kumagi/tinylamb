@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_FULL_SCAN_HPP
 #define TINYLAMB_FULL_SCAN_HPP
 
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -24,12 +25,14 @@
 
 #include "common/constants.hpp"
 #include "executor/executor_base.hpp"
+#include "table/fragment/fragment.hpp"
 #include "table/iterator.hpp"
 #include "type/column_name.hpp"
 
 namespace tinylamb {
 class Table;
 class Transaction;
+struct TypedCellBatch;
 struct Row;
 struct RowPosition;
 
@@ -53,10 +56,15 @@ class FullScan : public ExecutorBase {
            std::optional<ColumnName> clustered_order = std::nullopt,
            std::optional<std::vector<slot_t>> projection = std::nullopt);
   ~FullScan() override = default;
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
+  StatusOr<bool> TryFoldTypedBatches(
+      const std::function<Status(size_t, const TypedCellBatch&)>& consume);
+  [[nodiscard]] StatusOr<ExecResult> ExecuteLSTableFragment(
+      const Fragment& fragment, Runtime runtime = Runtime::kNative) const;
+  [[nodiscard]] const Schema& OutputSchema() const { return output_schema_; }
+  [[nodiscard]] bool WasTypedFolded() const { return typed_folded_; }
   // Accepts a dynamic join filter published by the hash join this scan probes
   // for. FullScan yields whole table rows, so `column` is a table-schema slot
   // and the rejection happens inside the iterator before row decode.
@@ -69,6 +77,7 @@ class FullScan : public ExecutorBase {
   }
 
  private:
+  Transaction* txn_;
   // Not owned; the executor must not outlive the Table.
   const Table* table_;
   Iterator iter_;
@@ -77,6 +86,7 @@ class FullScan : public ExecutorBase {
   // Set by the first Next/NextBatch: past that point the iterator has already
   // consumed rows, and installing a filter could only prune them retroactively.
   bool started_{false};
+  bool typed_folded_{false};
   // Owns the group so the iterator's raw pointer stays valid for its lifetime.
   std::shared_ptr<const RuntimeFilterGroup> runtime_filter_;
   slot_t runtime_filter_column_{0};

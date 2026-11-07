@@ -10,21 +10,18 @@
 
 namespace tinylamb {
 
-size_t ExecutorBase::NextBatch(DataChunk* destination, size_t max_rows) {
-  destination->Reset();
-  // Reset() keeps a default capacity; grow once for larger batches.
-  if (max_rows > kDefaultVectorSize) {
-    destination->Reserve(max_rows);
+bool ExecutorBase::Next(Row* dst, RowPosition* rp) {
+  DataChunk chunk;
+  if (NextBatch(&chunk, 1) == 0) {
+    return false;
   }
-  Row row;
-  while (destination->Size() < max_rows) {
-    RowPosition position;
-    if (!Next(&row, &position)) {
-      break;
-    }
-    destination->Append(std::move(row), position);
+  if (dst != nullptr) {
+    *dst = chunk.RowAt(0);
   }
-  return destination->Size();
+  if (rp != nullptr) {
+    *rp = chunk.PositionAt(0);
+  }
+  return true;
 }
 
 }  // namespace tinylamb

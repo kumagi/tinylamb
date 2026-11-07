@@ -22,18 +22,12 @@ namespace {
 class FakeSource : public ExecutorBase {
  public:
   explicit FakeSource(std::vector<Row> rows) : rows_(std::move(rows)) {}
-  bool Next(Row* row, RowPosition* rp) override {
-    if (idx_ >= rows_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
+    while (idx_ < rows_.size() && destination->Size() < max_rows) {
+      destination->Append(rows_[idx_++]);
     }
-    *row = rows_[idx_++];
-    if (rp != nullptr) {
-      *rp = RowPosition{};
-    }
-    return true;
-  }
-  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
-    return 0;
+    return destination->Size();
   }
   void Dump(std::ostream& o, int /*indent*/) const override { o << "fake"; }
 

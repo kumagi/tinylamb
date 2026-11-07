@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/runtime_filter.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
@@ -71,7 +72,16 @@ struct CorrelatedIndex {
   // Keeping this separate from cached_results lets EXPLAIN ANALYZE report the
   // actual distinct-key cardinality without pretending NULL is cacheable.
   std::unordered_set<std::string> parameter_keys_seen;
+  std::unordered_set<int64_t> parameter_int_keys_seen;
+  bool null_parameter_seen{false};
   bool preaggregated{false};
+  bool has_preagg_int_scalars{false};
+  bool preagg_two_int_key{false};
+  bool preagg_empty_has_row{false};
+  FlatIntKeyMap<Value> preagg_int_scalars{};
+  FlatIntKeyMap<uint8_t> preagg_seen_keys{};
+  size_t preagg_distinct_keys{0};
+  Value preagg_empty_scalar{};
   // EXISTS-only fast path: when the subquery result is consumed purely as
   // row-existence (single INT64/DATE correlation key, no outer-referencing
   // expressions, no HAVING/GROUP BY/LIMIT/OFFSET/DISTINCT), the build keeps
@@ -100,6 +110,9 @@ struct CorrelatedIndex {
   // would miss keys the filtered build never loaded.
   const void* outer_filter_relation{nullptr};
   uint64_t outer_filter_serial{0};
+  const Schema* cached_outer_schema{nullptr};
+  std::array<slot_t, 2> cached_outer_slots{};
+  bool cached_outer_slots_valid{false};
 };
 
 // Dynamic ("shared information passing") semi-join keys stashed by BuildInput
@@ -128,6 +141,8 @@ struct TableKeyFilter {
   size_t key_count{0};
   slot_t column{0};
   const SelectStatement* owner{nullptr};
+  const ExpressionBase* source_expr{nullptr};
+  bool exact_in{false};
 
   [[nodiscard]] bool empty() const {
     return filter == nullptr || filter->empty();
@@ -226,11 +241,10 @@ struct BaseRelationArena {
       VarcharRun& dst = varchars[v];
       const VarcharRun& src = run.varchars[v];
       const auto dst_bytes = static_cast<uint32_t>(dst.bytes.size());
-      const auto src_bytes = static_cast<uint32_t>(src.bytes.size());
       dst.bytes.insert(dst.bytes.end(), src.bytes.begin(), src.bytes.end());
       dst.ends.reserve(dst.ends.size() + src.ends.size());
       for (const uint32_t end : src.ends) {
-        dst.ends.push_back(dst_bytes + (end - src_bytes));
+        dst.ends.push_back(dst_bytes + end);
       }
     }
     rows += run.rows;
@@ -333,6 +347,9 @@ struct ExecutionRuntime {
   std::unordered_map<const SelectStatement*, std::string> fingerprint_memo;
   std::unordered_map<const SelectStatement*, std::string> uncorrelated_key_memo;
   size_t correlated_index_builds{0};
+  size_t prebuilt_exists_index_builds{0};
+  size_t prebuilt_exists_index_rows{0};
+  size_t prebuilt_exists_keys{0};
   size_t correlated_index_probes{0};
   size_t correlated_result_cache_hits{0};
   size_t uncorrelated_cache_hits{0};
@@ -359,11 +376,21 @@ struct ExecutionRuntime {
   // Statements whose final join step fused with their GROUP BY (the joined
   // relation was never materialized).
   size_t grouped_join_fusions{0};
+  // Probe table scanned directly into groups without a materialized input.
+  size_t streamed_grouped_joins{0};
+  size_t selective_index_scans{0};
+  size_t selective_index_rows{0};
   size_t scan_rows{0};
   size_t scan_output_rows{0};
   size_t scan_values_decoded{0};
   size_t scan_values_available{0};
   size_t relation_spills{0};
+  // Relational inner hash joins that keep a resident build and may stream a
+  // spilled probe. Counts aggregate across the statement's join steps.
+  size_t inner_hash_build_rows{0};
+  size_t inner_hash_index_estimate_bytes{0};
+  size_t inner_hash_left_builds{0};
+  size_t inner_hash_spilled_probe_rows{0};
   size_t key_filter_scans{0};
   size_t key_filter_keys{0};
   size_t key_filter_rejected{0};
@@ -551,7 +578,9 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct,
 
 std::optional<Relation> ExecuteCorrelatedSingleSource(
     TransactionContext& context, const SelectStatement& statement,
-    const Scope& outer, const CteMap& ctes, bool exists_only = false);
+    const Scope& outer, const CteMap& ctes, bool exists_only = false,
+    std::optional<bool>* exists_answer = nullptr,
+    std::optional<Value>* scalar_answer = nullptr);
 
 const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
                                           const SelectStatement& statement,

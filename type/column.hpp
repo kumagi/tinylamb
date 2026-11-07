@@ -30,14 +30,22 @@ namespace tinylamb {
 class Encoder;
 class Decoder;
 
+enum class AccessHint : uint8_t {
+  kUnknown = 0,
+  kFilter,
+  kAggregate,
+  kPointLookup,
+  kSortKey,
+};
+
 class Column {
  public:
   Column() = default;
   explicit Column(ColumnName name, ValueType type = ValueType::kNull,
-                  Constraint cst = Constraint());
+                  Constraint cst = Constraint(), uint8_t scale = 0);
 
   explicit Column(std::string_view name, ValueType type = ValueType::kNull,
-                  Constraint cst = Constraint());
+                  Constraint cst = Constraint(), uint8_t scale = 0);
 
   [[nodiscard]] const ColumnName& Name() const { return col_name_; }
   ColumnName& Name() { return col_name_; }
@@ -46,6 +54,10 @@ class Column {
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
+  [[nodiscard]] AccessHint GetHint() const { return hint_; }
+  void SetHint(AccessHint h) { hint_ = h; }
+  [[nodiscard]] uint8_t Scale() const { return scale_; }
+  void SetScale(uint8_t s) { scale_ = s; }
 
   bool operator==(const Column& rhs) const = default;
   friend std::ostream& operator<<(std::ostream& o, const Column& c);
@@ -57,6 +69,8 @@ class Column {
   ValueType type_{};
   bool unsigned_{false};
   Constraint constraint_{Constraint::kNothing};
+  AccessHint hint_{AccessHint::kUnknown};
+  uint8_t scale_{0};
 };
 
 }  // namespace tinylamb

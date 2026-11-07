@@ -11,14 +11,6 @@
 
 namespace tinylamb {
 
-bool ValuesExecutor::Next(Row* row, RowPosition* /*rp*/) {
-  if (offset_ >= rows_.size()) {
-    return false;
-  }
-  *row = std::move(rows_[offset_++]);
-  return true;
-}
-
 size_t ValuesExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
   while (offset_ < rows_.size() && destination->Size() < max_rows) {

@@ -1185,6 +1185,9 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   row_count_ = scanned_rows;
   stats_ = std::move(rebuilt);
   layout_generation_ = stable ? generation : 0;
+  if (stable && !target.RowsRewrittenInPlace()) {
+    std::ignore = target.RebuildLSTableStore(txn);
+  }
   return Status::kSuccess;
 }
 

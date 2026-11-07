@@ -25,5 +25,8 @@ ironlamb-compliance-*
 *.last_checkpoint
 *.last_checkpoint.tmp
 .fuzzscratch/
+.fuzz_campaign/
+.fuzz_findings/
 __pycache__/
 .freebuff/
+benchmark/comparison/results/

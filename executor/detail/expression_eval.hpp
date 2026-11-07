@@ -19,6 +19,7 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -32,6 +33,7 @@ class TransactionContext;
 namespace tinylamb::relational_detail {
 
 bool Truthy(const Value& value);
+int ThreeValuedEquals(const Value& left, const Value& right);
 StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope);
 
 // EXC-SHIM: remove with the boundary catch (see
@@ -322,8 +324,22 @@ struct AggregateAccumulator {
   Value FinishApproxTop(const std::vector<BufferedRow>& rows) const;
 };
 
+bool DecodeSketch(std::string_view bytes, int* typecode, int64_t* precision,
+                  std::vector<std::string>* out);
+
+std::string SketchBytesOf(const Value& sketch);
+
+StatusOr<Value> TryExtractSketchQuantilesStatic(const Value& sketch,
+                                                int64_t number);
+
 using AggregateResultMap =
     std::unordered_map<const AggregateExpression*, Value>;
+
+StatusOr<Value> TryEvaluateFunction(const FunctionCallExpression& function,
+                                    const Scope& scope,
+                                    const AggregateResultMap* aggregates,
+                                    TransactionContext& context,
+                                    const CteMap& ctes);
 
 StatusOr<Value> TryEvaluate(const Expression& expression, const Scope& scope,
                             const AggregateResultMap* aggregates,

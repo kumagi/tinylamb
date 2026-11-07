@@ -35,6 +35,7 @@
 
 #include "page/page.hpp"
 #include "page/row_position.hpp"
+#include "recovery/log_record.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
@@ -43,9 +44,6 @@ class TransactionManager;
 class CheckpointManager;
 class PageManager;
 class Logger;
-class LockManager;
-struct FosterPair;
-struct LogRecord;
 struct Row;
 
 class TransactionWriteSet final {
@@ -287,6 +285,7 @@ class Transaction final {
     recycled_page_allocations_ = std::move(o.recycled_page_allocations_);
     mutated_index_roots_ = std::move(o.mutated_index_roots_);
     index_undo_reservations_ = std::move(o.index_undo_reservations_);
+    staged_records_ = std::move(o.staged_records_);
     shard_epoch_ = o.shard_epoch_;
     write_epoch_.store(o.write_epoch_.load(std::memory_order_acquire),
                        std::memory_order_release);
@@ -457,6 +456,18 @@ class Transaction final {
     return transaction_manager_ != nullptr &&
            transaction_manager_->HasPageVersionChains(page_id);
   }
+  [[nodiscard]] bool HasAnyPageVersionChains() const noexcept {
+    return transaction_manager_ != nullptr &&
+           transaction_manager_->HasAnyPageVersionChains();
+  }
+  void SweepCommittedVersionChains() const {
+    if (transaction_manager_ != nullptr) {
+      transaction_manager_->SweepCommittedVersionChains();
+    }
+  }
+  [[nodiscard]] bool WriteSetEmpty() const noexcept {
+    return write_set_.empty();
+  }
   // Counts one row served by the index-only visibility-map fast path (see
   // IndexScanIterator::TryReadIndexOnly).
   void RecordIndexOnlyVisibleServe() const {
@@ -539,18 +550,34 @@ class Transaction final {
   // Index insertions need no stale-key fallback: MVCC hides rows newer than
   // the snapshot. Deletion/replacement can remove a key an old snapshot still
   // needs, so Table records those roots here and commit publishes their epoch.
-  void MarkIndexKeysChanged(page_id_t index_root) {
+  void MarkIndexKeysChanged(
+      page_id_t index_root,
+      std::optional<std::string_view> encoded_key = std::nullopt) {
+    if (transaction_manager_ != nullptr && !encoded_key) {
+      transaction_manager_->DisableIndexKeyTracking();
+    }
     // Transactions touch a handful of index roots at most; a linear scan
     // avoids building a hashtable per transaction (a measurable share of the
     // TPC-C malloc/rehash profile).
     if (std::find(mutated_index_roots_.begin(), mutated_index_roots_.end(),
-                  index_root) != mutated_index_roots_.end()) {
-      return;
+                  index_root) == mutated_index_roots_.end()) {
+      mutated_index_roots_.push_back(index_root);
+      if (transaction_manager_ != nullptr) {
+        transaction_manager_->MarkPendingIndexMutation(index_root);
+      }
     }
-    mutated_index_roots_.push_back(index_root);
-    if (transaction_manager_ != nullptr) {
-      transaction_manager_->MarkPendingIndexMutation(index_root);
+    if (transaction_manager_ != nullptr && encoded_key) {
+      transaction_manager_->TrackIndexKeyMutation(ID(), index_root,
+                                                  *encoded_key);
     }
+  }
+  [[nodiscard]] std::optional<std::vector<std::string>>
+  IndexKeyChangesSinceSnapshot(
+      page_id_t root, const TransactionManager::IndexReadGuard& guard) const {
+    return transaction_manager_ != nullptr
+               ? transaction_manager_->IndexKeyChangesSinceSnapshot(*this, root,
+                                                                    guard)
+               : std::optional<std::vector<std::string>>(std::in_place);
   }
   [[nodiscard]] bool IsReadOnly() const { return read_only_; }
 
@@ -608,6 +635,10 @@ class Transaction final {
   }
 
   Status PreCommit();
+  // Commit publication without blocking this execution thread. The caller
+  // must pass the returned own/dependency target to WaitForWALDurable and
+  // surface any failure BEFORE delivering results or a commit acknowledgement.
+  StatusOr<lsn_t> PrepareCommitForDurableReply();
   Status Abort();
 
   // Appends `lr` to the WAL, links it into this transaction's prev_lsn
@@ -617,56 +648,28 @@ class Transaction final {
 
   // Log the action. Returns LSN.
   StatusOr<lsn_t> InsertLog(page_id_t pid, slot_t slot, std::string_view redo);
-  StatusOr<lsn_t> InsertLeafLog(page_id_t pid, std::string_view key,
-                                std::string_view redo);
-  StatusOr<lsn_t> InsertBranchLog(page_id_t pid, std::string_view key,
-                                  page_id_t redo);
-
   StatusOr<lsn_t> UpdateLog(page_id_t pid, slot_t slot, std::string_view redo,
                             std::string_view undo);
   StatusOr<lsn_t> AppendPhysicalUpdateCompensation(page_id_t pid, slot_t slot,
                                                    std::string_view redo);
-  StatusOr<lsn_t> UpdateLeafLog(page_id_t pid, std::string_view key,
-                                std::string_view redo, std::string_view undo);
-  StatusOr<lsn_t> UpdateBranchLog(page_id_t pid, std::string_view key,
-                                  page_id_t redo, page_id_t undo);
-
   StatusOr<lsn_t> DeleteLog(page_id_t pid, slot_t slot, std::string_view undo);
-  StatusOr<lsn_t> DeleteLeafLog(page_id_t pid, std::string_view key,
-                                std::string_view undo);
-  StatusOr<lsn_t> DeleteBranchLog(page_id_t pid, std::string_view key,
-                                  page_id_t undo);
 
-  StatusOr<lsn_t> SetLowestLog(page_id_t pid, page_id_t redo, page_id_t undo);
   StatusOr<lsn_t> SetRowPageNextLog(page_id_t pid, page_id_t redo,
                                     page_id_t undo);
   StatusOr<lsn_t> SetRowPagePrevLog(page_id_t pid, page_id_t redo,
                                     page_id_t undo);
 
-  StatusOr<lsn_t> SetLowFence(page_id_t pid, const IndexKey& redo,
-                              const IndexKey& undo);
-  StatusOr<lsn_t> SetHighFence(page_id_t pid, const IndexKey& redo,
-                               const IndexKey& undo);
-  StatusOr<lsn_t> SetFoster(page_id_t pid, const FosterPair& redo,
-                            const FosterPair& undo);
+  StatusOr<lsn_t> LsmPutLog(page_id_t root, std::string_view key,
+                            std::string_view value,
+                            std::string_view prev_value = {},
+                            bool had_prev = false);
+  StatusOr<lsn_t> LsmDeleteLog(page_id_t root, std::string_view key,
+                               std::string_view prev_value = {});
+  StatusOr<lsn_t> LsmDestroyLog(page_id_t root);
 
-  // Registers the bytes this transaction's UNDO will re-consume on |pid| once
-  // a logged mutation frees them (delete re-insert, shrink update, fence or
-  // foster restore). Called by the log emitters right after the record's
-  // append succeeded; the reservation is released when the transaction leaves
-  // the active table. See TransactionManager::ReserveIndexUndoBytes.
   void ReserveIndexUndoBytes(page_id_t pid, size_t bytes);
 
-  StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type,
-                                  PageAllocationKind allocation_kind,
-                                  PageType old_page_type,
-                                  std::string old_target_payload,
-                                  std::string old_meta_payload);
   StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type);
-
-  // D3 (docs/design.md): destroy records carry the old page type and, when
-  // the page held rows, a full body image so undo restores an aborted
-  // destroy exactly.
   StatusOr<lsn_t> DestroyPageLog(page_id_t page_id,
                                  PageType old_page_type = PageType::kUnknown,
                                  std::string old_page_body = {});
@@ -724,6 +727,7 @@ class Transaction final {
   friend class TransactionManager;
   friend class CheckpointManager;
 
+  Status PreCommitImpl(lsn_t* external_durability_target);
   void FinishRunningNoexcept() noexcept;
 
   // Version cache sharded per reading thread, each with its own lock.  Scan
@@ -793,6 +797,7 @@ class Transaction final {
   // of index pages at most. Cleared by the manager when the reservation is
   // released (ForgetTransaction), so a repeated finish cannot double-release.
   std::vector<std::pair<page_id_t, uint64_t>> index_undo_reservations_{};
+  std::vector<LogRecord> staged_records_{};
   // Process-wide generation, unique across every Transaction ever created.
   // Thread-local shard caches key on it so a destroyed transaction whose
   // address (or even id, across Database instances) is reused can never be

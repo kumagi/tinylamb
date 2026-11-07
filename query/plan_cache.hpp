@@ -278,6 +278,12 @@ struct CompiledPlan {
   // First successful SELECT replay's elapsed time. Later replays that are
   // both above the floor and several times this baseline drop the entry.
   mutable std::atomic<uint64_t> reuse_baseline_ns{0};
+  // An immutable SELECT artifact can be shared across workers. Retiring the
+  // artifact itself also prevents another worker from reviving a slow plan.
+  mutable std::atomic<bool> retired{false};
+  // Audited slot-free bounded column read or scalar aggregate. Replay by exact
+  // SQL even when there are no expression literals for the template binder.
+  bool immutable_exact_read{false};
 
   // Specialized tiers: the compiled physical plan.
   std::shared_ptr<PlanBase> plan;
@@ -335,14 +341,45 @@ struct CompiledPlan {
 
 using CompiledPlanPtr = std::shared_ptr<const CompiledPlan>;
 
-// SELECT/UPDATE/DELETE plans are thread-local: Bind() mutates the slots in
-// the cached tree, so two workers must not share one artifact. INSERT stays
-// in the process-global cache because each execution clones its slots.
+// Bindable SELECT/UPDATE/DELETE plans are thread-local: Bind() mutates their
+// slots. INSERT clones its slots per execution. A slot-free bounded ordered
+// column read may also use the global cache; replay requires exact parameters.
 inline thread_local std::unordered_map<std::string, CompiledPlanPtr>
     thread_compiled_plans;
 inline thread_local std::unordered_set<std::string>
     thread_volatile_specialized_plans;
 inline constexpr size_t kThreadCompiledPlanCapacity = 256;
+
+// A migrating SQL session exclusively owns its mutable parameter slots.
+// The scheduler must allow at most one active scope per session; unrelated
+// sessions never share these entries, even when their worker changes.
+struct PreparedPlanSessionCache {
+  std::unordered_map<std::string, CompiledPlanPtr> plans;
+  std::unordered_set<std::string> volatile_fingerprints;
+};
+inline thread_local PreparedPlanSessionCache* active_plan_session = nullptr;
+class ScopedPreparedPlanSession {
+ public:
+  explicit ScopedPreparedPlanSession(PreparedPlanSessionCache* session)
+      : previous_(active_plan_session) {
+    active_plan_session = session;
+  }
+  ~ScopedPreparedPlanSession() { active_plan_session = previous_; }
+  ScopedPreparedPlanSession(const ScopedPreparedPlanSession&) = delete;
+  ScopedPreparedPlanSession& operator=(const ScopedPreparedPlanSession&) =
+      delete;
+
+ private:
+  PreparedPlanSessionCache* previous_;
+};
+inline auto& CurrentCompiledPlans() {
+  return active_plan_session ? active_plan_session->plans
+                             : thread_compiled_plans;
+}
+inline auto& CurrentVolatileFingerprints() {
+  return active_plan_session ? active_plan_session->volatile_fingerprints
+                             : thread_volatile_specialized_plans;
+}
 
 // A reused SELECT is planned again when a later execution is slower than
 // 50ms and at least 8x the first replay. Point lookups stay cached. A plan
@@ -359,32 +396,32 @@ inline bool SelectReuseExceededThreshold(uint64_t elapsed_ns,
 }
 
 inline bool IsVolatileSpecializedPlan(const std::string& fingerprint) {
-  return thread_volatile_specialized_plans.contains(fingerprint);
+  return CurrentVolatileFingerprints().contains(fingerprint);
 }
 
 // Prepends a fingerprint to the volatile set for the duration of one
 // statement compile (used by the DML subquery fold path), returning true
 // when the entry was freshly added so the caller can demote it later.
 inline bool MarkFingerprintVolatile(const std::string& fingerprint) {
-  return thread_volatile_specialized_plans.insert(fingerprint).second;
+  return CurrentVolatileFingerprints().insert(fingerprint).second;
 }
 
 inline void DemoteVolatileFingerprint(const std::string& fingerprint,
                                       bool was_fresh) {
   if (was_fresh) {
-    thread_volatile_specialized_plans.erase(fingerprint);
+    CurrentVolatileFingerprints().erase(fingerprint);
   }
 }
 
 inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
                                               const Database* database,
                                               uint64_t epoch) {
-  const auto found = thread_compiled_plans.find(fingerprint);
-  if (found == thread_compiled_plans.end()) {
+  const auto found = CurrentCompiledPlans().find(fingerprint);
+  if (found == CurrentCompiledPlans().end()) {
     return nullptr;
   }
   if (found->second->database != database || found->second->epoch != epoch) {
-    thread_compiled_plans.erase(found);
+    CurrentCompiledPlans().erase(found);
     PlanCacheStats().epoch_invalidations.fetch_add(1,
                                                    std::memory_order_relaxed);
     return nullptr;
@@ -395,11 +432,12 @@ inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
 
 inline void RememberThreadCompiledPlan(const std::string& fingerprint,
                                        CompiledPlanPtr plan) {
-  if (thread_compiled_plans.size() >= kThreadCompiledPlanCapacity &&
-      !thread_compiled_plans.contains(fingerprint)) {
-    thread_compiled_plans.clear();
+  if (CurrentCompiledPlans().size() >=
+          (active_plan_session ? 64 : kThreadCompiledPlanCapacity) &&
+      !CurrentCompiledPlans().contains(fingerprint)) {
+    CurrentCompiledPlans().clear();
   }
-  thread_compiled_plans.insert_or_assign(fingerprint, std::move(plan));
+  CurrentCompiledPlans().insert_or_assign(fingerprint, std::move(plan));
 }
 
 inline void StoreThreadCompiledPlan(const std::string& fingerprint,
@@ -409,7 +447,7 @@ inline void StoreThreadCompiledPlan(const std::string& fingerprint,
 }
 
 inline void ForgetThreadCompiledPlan(const std::string& fingerprint) {
-  thread_compiled_plans.erase(fingerprint);
+  CurrentCompiledPlans().erase(fingerprint);
 }
 
 // ---------------------------------------------------------------------------

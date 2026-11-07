@@ -12,11 +12,132 @@
 #include "executor/data_chunk.hpp"
 #include "expression/expression.hpp"
 #include "expression/jit.hpp"
+#include "expression/parameter_slot.hpp"
 #include "gtest/gtest.h"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(BytecodeTest, FastNullSafeComparisonKeepsTextAndDateDomains) {
+  for (const auto op : {BinaryOperation::kIsDistinctFrom,
+                        BinaryOperation::kIsNotDistinctFrom}) {
+    for (const ValueType type : {ValueType::kVarChar, ValueType::kDate}) {
+      const Schema schema("domains", {Column("a", type), Column("b", type)});
+      const auto expression =
+          BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b"));
+      const auto program =
+          BytecodeCompiler::CompileRowCached(expression, schema);
+      ASSERT_TRUE(program);
+      const Value first =
+          type == ValueType::kVarChar ? Value("alpha") : Value::DateFromDays(1);
+      const Value second =
+          type == ValueType::kVarChar ? Value("beta") : Value::DateFromDays(2);
+      for (const Row& row :
+           {Row({first, first}), Row({first, second}), Row({Value(), first}),
+            Row({first, Value()}), Row({Value(), Value()})}) {
+        const auto expected = expression->TryEvaluate(row, schema);
+        const auto actual = TryEvaluateRowAuto(*program, row);
+        ASSERT_TRUE(expected.HasValue());
+        ASSERT_TRUE(actual.HasValue());
+        EXPECT_EQ(actual.Value(), expected.Value());
+      }
+    }
+    const Schema schema("mixed", {Column("a", ValueType::kDate),
+                                  Column("b", ValueType::kInt64)});
+    const auto expression =
+        BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b"));
+    const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
+    ASSERT_TRUE(program);
+    const Row row({Value::DateFromDays(5), Value(5)});
+    const auto expected = expression->TryEvaluate(row, schema);
+    const auto actual = TryEvaluateRowAuto(*program, row);
+    ASSERT_EQ(actual.HasValue(), expected.HasValue());
+    if (expected.HasValue()) {
+      EXPECT_EQ(actual.Value(), expected.Value());
+    } else {
+      EXPECT_EQ(actual.GetStatus(), expected.GetStatus());
+    }
+  }
+}
+
+TEST(BytecodeTest, ScalarCacheKeySnapshotsCurrentBindingsAndDeclinesFunctions) {
+  const Schema schema("snapshot", {Column("k", ValueType::kInt64)});
+  auto slot = std::make_shared<ParameterSlot>(0, Value(1));
+  auto expression =
+      BinaryExpressionExp(ColumnValueExp("k"), BinaryOperation::kEquals, slot);
+  const auto first = ScalarExpressionCacheKey({expression}, schema);
+  ASSERT_TRUE(first);
+  const auto frozen = FreezeScalarBindings(expression);
+  slot->Bind(Value(2));
+  const auto second = ScalarExpressionCacheKey({expression}, schema);
+  ASSERT_TRUE(second);
+  EXPECT_NE(*first, *second);
+  EXPECT_EQ(frozen->Evaluate(Row({Value(1)}), schema), Value(true));
+  EXPECT_EQ(expression->Evaluate(Row({Value(1)}), schema), Value(false));
+  EXPECT_FALSE(ScalarExpressionCacheKey({FunctionCallExp("rand", {})}, schema));
+  const auto prepared =
+      std::make_shared<const PreparedValues>(std::vector<Value>{Value(9)});
+  const Expression deferred =
+      std::make_shared<ParameterSlot>(0, ValueType::kInt64, prepared);
+  EXPECT_FALSE(ScalarExpressionCacheKey({deferred}, schema));
+}
+
+TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
+  const Schema schema("cache", {Column("i", ValueType::kInt64),
+                                Column("d", ValueType::kDouble)});
+  auto slot = std::make_shared<ParameterSlot>(0, Value(1));
+  const auto predicate = BinaryExpressionExp(
+      ColumnValueExp("i"), BinaryOperation::kGreaterThan, slot);
+  for (int64_t bound : {1, 10, -3, 1}) {
+    slot->Bind(Value(bound));
+    for (auto context : {BytecodeCompiler::Context::kValue,
+                         BytecodeCompiler::Context::kFilter}) {
+      auto program =
+          BytecodeCompiler::CompileRowCached(predicate, schema, context);
+      ASSERT_TRUE(program);
+      auto value = program->TryEvaluateRow(Row({Value(5), Value(2.5)}));
+      ASSERT_TRUE(value.HasValue());
+      EXPECT_EQ(value.Value(), Value(5 > bound));
+    }
+  }
+  slot->Bind(Value(1));
+  const auto conditional = CaseExpressionExp({{predicate, ColumnValueExp("d")}},
+                                             ConstantValueExp(Value(0)));
+  EXPECT_FALSE(BytecodeCompiler::Compile(conditional, schema));
+  for (int repetition = 0; repetition < 2; ++repetition) {
+    auto program = BytecodeCompiler::CompileRowCached(conditional, schema);
+    ASSERT_TRUE(program);
+    EXPECT_EQ(program->ResultType(), ValueType::kNull);
+    for (const Row& row :
+         {Row({Value(5), Value(2.5)}), Row({Value(0), Value(7.5)}),
+          Row({Value(), Value()})}) {
+      auto expected = conditional->TryEvaluate(row, schema);
+      auto actual = program->TryEvaluateRow(row);
+      ASSERT_TRUE(expected.HasValue());
+      ASSERT_TRUE(actual.HasValue());
+      EXPECT_EQ(actual.Value().type, expected.Value().type);
+      EXPECT_EQ(actual.Value(), expected.Value());
+    }
+  }
+  const Schema reordered("cache", {Column("d", ValueType::kDouble),
+                                   Column("i", ValueType::kInt64)});
+  auto reordered_program =
+      BytecodeCompiler::CompileRowCached(predicate, reordered);
+  ASSERT_TRUE(reordered_program);
+  EXPECT_EQ(reordered_program->EvaluateRow(Row({Value(50.0), Value(0)})),
+            Value(false));
+  Value signed_value(int64_t{-1});
+  for (const Value& constant :
+       {signed_value, signed_value.WithUnsigned(), signed_value}) {
+    auto program =
+        BytecodeCompiler::CompileRowCached(ConstantValueExp(constant), schema);
+    ASSERT_TRUE(program);
+    const auto actual = program->EvaluateRow(Row());
+    EXPECT_EQ(actual.IsUnsigned(), constant.IsUnsigned());
+    EXPECT_EQ(actual, constant);
+  }
+}
 
 TEST(
     BytecodeTest,

@@ -661,33 +661,38 @@ struct HashJoin::JoinState {
                       Side* side,
                       const RuntimeFilterGroup* runtime_filter = nullptr,
                       std::optional<slot_t> filter_column = std::nullopt) {
-    Row row;
-    RowPosition position;
+    DataChunk batch;
     std::atomic<size_t> filtered{0};
     std::atomic<size_t> filtered_null{0};
     const bool apply_filter =
         runtime_filter != nullptr && filter_column.has_value();
-    while (child->Next(&row, &position)) {
-      ++side->seen_rows;
-      for (const slot_t col : cols) {
-        side->has_null_key = side->has_null_key || row[col].IsNull();
-      }
-      if (apply_filter) {
-        const Value& value = row[*filter_column];
-        // A NULL join key never matches an equi-join, and a value outside the
-        // filter's comparison domain is never rejected.
-        if (value.IsNull() || side->filter_rejects_all ||
-            (value.type == side->filter_type &&
-             runtime_filter->Reject(value.value.int_value))) {
-          ++filtered;
-          if (value.IsNull()) {
-            ++filtered_null;
-          }
-          continue;
+    bool stopped = false;
+    while (!stopped && child->NextBatch(&batch) != 0) {
+      for (size_t i = 0; i < batch.Size(); ++i) {
+        Row row = batch.RowAt(i);
+        const RowPosition position = batch.PositionAt(i);
+        ++side->seen_rows;
+        for (const slot_t col : cols) {
+          side->has_null_key = side->has_null_key || row[col].IsNull();
         }
-      }
-      if (!side->Accumulate(std::move(row), position, cols)) {
-        break;
+        if (apply_filter) {
+          const Value& value = row[*filter_column];
+          // A NULL join key never matches an equi-join, and a value outside the
+          // filter's comparison domain is never rejected.
+          if (value.IsNull() || side->filter_rejects_all ||
+              (value.type == side->filter_type &&
+               runtime_filter->Reject(value.value.int_value))) {
+            ++filtered;
+            if (value.IsNull()) {
+              ++filtered_null;
+            }
+            continue;
+          }
+        }
+        if (!side->Accumulate(std::move(row), position, cols)) {
+          stopped = true;
+          break;
+        }
       }
     }
     if (side->child_status == Status::kSuccess) {
@@ -743,29 +748,6 @@ bool HashJoin::MaterializeOrThrow() {
     materialize_error_ = st;
     return FailWith(st);
   }
-  return true;
-}
-
-bool HashJoin::Next(Row* dst, RowPosition* rp) {
-  if (!materialized_) {
-    if (!MaterializeOrThrow()) {
-      return false;
-    }
-  }
-  if (state_ && state_->spill_error != Status::kSuccess) {
-    return FailWith(state_->spill_error);
-  }
-  if (pipelined_) {
-    return EmitNextMatch(dst, rp);
-  }
-  if (output_offset_ == output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
   return true;
 }
 
@@ -1313,48 +1295,54 @@ Status HashJoin::MaterializeSemiAntiReduced() {
   size_t seen_keys = 0;
   bool raw_build_null_key = false;
   std::string build_key;
-  Row build_row;
-  RowPosition build_position;
-  while (right_->Next(&build_row, &build_position)) {
-    ++semi_reduction_build_rows_;
-    // Mirrors JoinState::Consume's own accounting: `NOT IN` is UNKNOWN for
-    // every non-match as soon as the build side carries a NULL key, and an
-    // empty build side makes `x NOT IN S` true for every x. Both read the RAW
-    // build side, not the reduced one.
-    for (const slot_t col : right_cols_) {
-      raw_build_null_key = raw_build_null_key || build_row[col].IsNull();
-    }
-    if (!EncodeJoinKeyInto(build_row, right_cols_, &build_key, NullSafeArg())) {
-      // No encodable key: the row can never join anything.
-      continue;
-    }
-    const uint64_t hash = HashBytesKey(build_key);
-    if (domain != nullptr) {
-      const size_t entry = domain->Find(hash, 0, build_key);
-      if (entry == JoinHashIndex::kNil) {
-        // No probe row carries this key, so this build row joins nothing.
+  DataChunk build_batch;
+  bool build_stopped = false;
+  while (!build_stopped && right_->NextBatch(&build_batch) != 0) {
+    for (size_t i = 0; i < build_batch.Size(); ++i) {
+      Row build_row = build_batch.RowAt(i);
+      const RowPosition build_position = build_batch.PositionAt(i);
+      ++semi_reduction_build_rows_;
+      // Mirrors JoinState::Consume's own accounting: `NOT IN` is UNKNOWN for
+      // every non-match as soon as the build side carries a NULL key, and an
+      // empty build side makes `x NOT IN S` true for every x. Both read the RAW
+      // build side, not the reduced one.
+      for (const slot_t col : right_cols_) {
+        raw_build_null_key = raw_build_null_key || build_row[col].IsNull();
+      }
+      if (!EncodeJoinKeyInto(build_row, right_cols_, &build_key,
+                             NullSafeArg())) {
+        // No encodable key: the row can never join anything.
         continue;
       }
-      const size_t ordinal = domain->RowIndex(entry);
-      if (kept[ordinal]) {
-        ++semi_reduction_duplicate_keys_;
-        continue;
+      const uint64_t hash = HashBytesKey(build_key);
+      if (domain != nullptr) {
+        const size_t entry = domain->Find(hash, 0, build_key);
+        if (entry == JoinHashIndex::kNil) {
+          // No probe row carries this key, so this build row joins nothing.
+          continue;
+        }
+        const size_t ordinal = domain->RowIndex(entry);
+        if (kept[ordinal]) {
+          ++semi_reduction_duplicate_keys_;
+          continue;
+        }
+        kept[ordinal] = true;
+      } else {
+        const size_t entry = seen->Find(hash, 0, build_key);
+        if (entry != JoinHashIndex::kNil) {
+          ++semi_reduction_duplicate_keys_;
+          continue;
+        }
+        seen->Insert(hash, 0, build_key, seen_keys);
+        ++seen_keys;
       }
-      kept[ordinal] = true;
-    } else {
-      const size_t entry = seen->Find(hash, 0, build_key);
-      if (entry != JoinHashIndex::kNil) {
-        ++semi_reduction_duplicate_keys_;
-        continue;
+      if (!s.right.Accumulate(std::move(build_row), build_position,
+                              right_cols_)) {
+        build_stopped = true;
+        break;
       }
-      seen->Insert(hash, 0, build_key, seen_keys);
-      ++seen_keys;
+      ++semi_reduction_build_rows_kept_;
     }
-    if (!s.right.Accumulate(std::move(build_row), build_position,
-                            right_cols_)) {
-      break;
-    }
-    ++semi_reduction_build_rows_kept_;
   }
   if (s.right.spill_error != Status::kSuccess) {
     return s.right.spill_error;
@@ -2280,21 +2268,23 @@ Status HashJoin::MaterializeHybrid() {
   std::vector<SpillFile> left_spill(kHybridPartitions);
   std::string key;
 
-  Row row;
-  RowPosition position;
-  while (right_->Next(&row, nullptr)) {
-    if (!EncodeJoinKeyInto(row, right_cols_, &key, NullSafeArg())) {
-      continue;
-    }
-    const size_t part = partition_of(key);
-    const size_t bytes = EstimateRowBytes(row);
-    if (part == 0 && budget.CanReserve(bytes)) {
-      resident_charge.Add(bytes);
-      resident_right.push_back(std::move(row));
-    } else {
-      if (Status st_sp = right_spill[part].Append(row);
-          st_sp != Status::kSuccess) {
-        return st_sp;
+  DataChunk batch;
+  while (right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      Row row = batch.RowAt(i);
+      if (!EncodeJoinKeyInto(row, right_cols_, &key, NullSafeArg())) {
+        continue;
+      }
+      const size_t part = partition_of(key);
+      const size_t bytes = EstimateRowBytes(row);
+      if (part == 0 && budget.CanReserve(bytes)) {
+        resident_charge.Add(bytes);
+        resident_right.push_back(std::move(row));
+      } else {
+        if (Status st_sp = right_spill[part].Append(row);
+            st_sp != Status::kSuccess) {
+          return st_sp;
+        }
       }
     }
   }
@@ -2304,25 +2294,30 @@ Status HashJoin::MaterializeHybrid() {
       BuildSideIndex(resident_right, right_cols_, std::nullopt, NullSafeArg());
   std::string probe_scratch;
 
-  while (left_->Next(&row, &position)) {
-    if (!EncodeJoinKeyInto(row, left_cols_, &key, NullSafeArg())) {
-      continue;
-    }
-    const size_t part = partition_of(key);
-    if (part == 0 && right_spill[0].Empty()) {
-      const KeyRef k = KeyOf(row, left_cols_, resident.mode, resident.int_type,
-                             &probe_scratch, NullSafeArg());
-      if (k.valid) {
-        for (size_t e = resident.index.Find(k.hash, k.int_key, k.byte_key);
-             e != JoinHashIndex::kNil; e = resident.index.ChainNext(e)) {
-          output_.emplace_back(row + resident_right[resident.index.RowIndex(e)],
-                               position);
-        }
+  while (left_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      const Row row = batch.RowAt(i);
+      const RowPosition position = batch.PositionAt(i);
+      if (!EncodeJoinKeyInto(row, left_cols_, &key, NullSafeArg())) {
+        continue;
       }
-    } else {
-      if (Status st_sp = left_spill[part].Append(row, position);
-          st_sp != Status::kSuccess) {
-        return st_sp;
+      const size_t part = partition_of(key);
+      if (part == 0 && right_spill[0].Empty()) {
+        const KeyRef k =
+            KeyOf(row, left_cols_, resident.mode, resident.int_type,
+                  &probe_scratch, NullSafeArg());
+        if (k.valid) {
+          for (size_t e = resident.index.Find(k.hash, k.int_key, k.byte_key);
+               e != JoinHashIndex::kNil; e = resident.index.ChainNext(e)) {
+            output_.emplace_back(
+                row + resident_right[resident.index.RowIndex(e)], position);
+          }
+        }
+      } else {
+        if (Status st_sp = left_spill[part].Append(row, position);
+            st_sp != Status::kSuccess) {
+          return st_sp;
+        }
       }
     }
   }

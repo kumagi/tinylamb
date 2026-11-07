@@ -235,16 +235,19 @@ uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
 Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   std::vector<std::pair<Row, RowPosition>> left_tuples;
   std::vector<std::pair<Row, RowPosition>> right_tuples;
-  Row row;
-  RowPosition rp;
-  while (left_ && left_->Next(&row, &rp)) {
-    left_tuples.emplace_back(std::move(row), rp);
+  DataChunk batch;
+  while (left_ && left_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      left_tuples.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   if (left_ && left_->GetStatus() != Status::kSuccess) {
     return left_->GetStatus();
   }
-  while (right_ && right_->Next(&row, &rp)) {
-    right_tuples.emplace_back(std::move(row), rp);
+  while (right_ && right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_tuples.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   if (right_ && right_->GetStatus() != Status::kSuccess) {
     return right_->GetStatus();
@@ -679,22 +682,6 @@ size_t SharedBuildParallelHashJoin::MaterializedRowCount() const {
 
 size_t SharedBuildParallelHashJoin::MaterializedBytes() const {
   return charge_.Bytes();
-}
-
-bool SharedBuildParallelHashJoin::Next(Row* dst, RowPosition* rp) {
-  assert(dst != nullptr);
-  if (Status status = EnsureMaterialized(); status != Status::kSuccess) {
-    return FailWith(status);
-  }
-  if (output_offset_ >= output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
-  return true;
 }
 
 size_t SharedBuildParallelHashJoin::NextBatch(DataChunk* destination,

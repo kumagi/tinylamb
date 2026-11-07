@@ -26,18 +26,12 @@ class FakeSortedSource : public ExecutorBase {
  public:
   explicit FakeSortedSource(std::vector<int64_t> keys)
       : keys_(std::move(keys)) {}
-  bool Next(Row* row, RowPosition* rp) override {
-    if (idx_ >= keys_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
+    while (idx_ < keys_.size() && destination->Size() < max_rows) {
+      destination->Append(Row(std::vector<Value>{Value(keys_[idx_++])}));
     }
-    *row = Row(std::vector<Value>{Value(keys_[idx_++])});
-    if (rp != nullptr) {
-      *rp = RowPosition{};
-    }
-    return true;
-  }
-  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
-    return 0;
+    return destination->Size();
   }
   void Dump(std::ostream& o, int /*indent*/) const override { o << "fake"; }
 
@@ -105,18 +99,17 @@ class FailingSortedSource : public ExecutorBase {
  public:
   FailingSortedSource(std::vector<int64_t> keys, size_t fail_after)
       : keys_(std::move(keys)), fail_after_(fail_after) {}
-  bool Next(Row* row, RowPosition* rp) override {
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
     if (idx_ >= fail_after_) {
-      return FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      return 0;
     }
-    *row = Row(std::vector<Value>{Value(keys_[idx_++])});
-    if (rp != nullptr) {
-      *rp = RowPosition{};
+    if (max_rows == 0 || idx_ >= keys_.size()) {
+      return 0;
     }
-    return true;
-  }
-  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
-    return 0;
+    destination->Append(Row(std::vector<Value>{Value(keys_[idx_++])}));
+    return destination->Size();
   }
   void Dump(std::ostream& o, int /*indent*/) const override { o << "failing"; }
 
@@ -181,18 +174,12 @@ namespace {
 class FakeRowSource : public ExecutorBase {
  public:
   explicit FakeRowSource(std::vector<Row> rows) : rows_(std::move(rows)) {}
-  bool Next(Row* row, RowPosition* rp) override {
-    if (idx_ >= rows_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset();
+    while (idx_ < rows_.size() && destination->Size() < max_rows) {
+      destination->Append(rows_[idx_++]);
     }
-    *row = rows_[idx_++];
-    if (rp != nullptr) {
-      *rp = RowPosition{};
-    }
-    return true;
-  }
-  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override {
-    return 0;
+    return destination->Size();
   }
   void Dump(std::ostream& o, int /*indent*/) const override {
     o << "fake rows";

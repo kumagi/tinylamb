@@ -54,10 +54,12 @@ class Update : public ExecutorBase {
         fk_checks_(std::move(fk_checks)),
         ref_checks_(std::move(ref_checks)) {}
 
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:
+  bool Execute(Row* dst, RowPosition* rp);
   Transaction* txn_;
   Table* target_;
   Executor src_;

@@ -49,14 +49,15 @@ class AggregationExecutor : public ExecutorBase {
   AggregationExecutor(std::shared_ptr<ExecutorBase> child, Schema input_schema,
                       std::vector<NamedExpression> aggregates,
                       size_t jit_threshold_rows = 20'000'000);
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
 
  private:
+  bool Execute(Row* dst);
   bool NextGeneric(Row* dst);
+  StatusOr<bool> TryFoldScan(Row* dst);
 
   // How each aggregate reads its input for the vectorized accumulator path.
   // kGeneric falls back to the per-row Evaluate loop below.

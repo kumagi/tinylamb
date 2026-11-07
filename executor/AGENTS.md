@@ -1,24 +1,26 @@
 # `executor/` — Layer 10 (with `plan/`) physical operators
 
-Volcano `Next(Row*, RowPosition*)` + batched `NextBatch(DataChunk*,
-max_rows = kDefaultVectorSize = 1024)` (`executor_base.hpp`;
-`Executor = shared_ptr<ExecutorBase>`). Morsel-driven parallel scans/joins/
-aggregations with disk spilling. CMake target `tinylamb_executor` also covers
-`plan/`, `executor/detail/`, and `query/query_data.cpp` — cross-include
-inside that set is build-free, but `check_layering.py` still ranks them.
+Pure batch-driven execution via `virtual size_t NextBatch(DataChunk*,
+max_rows = kDefaultVectorSize = 1024) = 0` (`executor_base.hpp`;
+`Executor = shared_ptr<ExecutorBase>`), with `lstable::Fragment` WASM/native
+pushdown over `lstable::PaxChunk` (`FullScan::ExecuteLSTableFragment` /
+`LSTableStore::ExecuteFragment`). A non-virtual `bool Next(Row*, RowPosition*)`
+sink adapter on `ExecutorBase` delegates to `NextBatch(&chunk, 1)` for outermost
+row-consumer boundaries only; internal operators pull batches exclusively via
+`NextBatch`. Morsel-driven parallel scans/joins/aggregations with disk spilling.
+CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
+`query/query_data.cpp` — cross-include inside that set is build-free, but
+`check_layering.py` still ranks them.
 
 ## Key files
 
 - `relational_factory.cpp` + `relational.{hpp,cpp}` — **the only place that
   implements `Plan::EmitExecutor` bodies** (V4 split). New physical operator
   = new `Plan` node + implementation rule + factory wiring here.
-- Scans: `full_scan`, `chunked_scan`, `parallel_scan`, `index_scan`,
+- Scans: `full_scan`, `parallel_scan`, `index_scan`,
   `index_only_scan`, `parallel_index_scan` (morsel-driven parallel index
-  scan over B+Tree-leaf-partitioned key ranges, morsel-ordered handoff),
-  `bitmap_scan`, `tid_scan`, `minmax_index`, `zone_map`, `remote_scan`,
-  `analyze_scan`, `cardinality_probe`, `constant_executor`, `lsm_scan`
-  (streams an LSM/WiscKey tree's live key/value pairs; `LSMTree::GetView()`
-  snapshot taken at construction).
+  scan over partitioned key ranges, morsel-ordered handoff),
+  `bitmap_scan`, `minmax_index`, `zone_map`, `constant_executor`.
   The serial `IndexScan` prefetches its upcoming heap pages with a look-ahead
   cursor (`TINYLAMB_DISABLE_INDEX_SCAN_PREFETCH`); the index-only visibility
   map is `IndexScanIterator::TryReadIndexOnly`.
@@ -40,9 +42,9 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   distinct key inside it — semi/anti/null-aware-anti only, with a domain-cap
   fallback to the unrestricted intake),
   `parallel_hash_join`,
-  `merge_join`, `parallel_merge_join`, `nested_loop_join`,
+  `merge_join`, `parallel_merge_join`,
   `batch_nested_loop_join`, `cross_join`, `lookup_join`,
-  `late_materialization_join`, `interval_join`, `as_of_join`, `apply`
+  `late_materialization_join`, `band_join`, `zigzag_join`, `apply`
   (correlated), `join_kind.hpp`. `lookup_join` short-circuits a **point probe
   on a complete single-value unique key** (`!range_position_`,
   `Index::StoresSingleValue()`, `left_cols.size() == key.size()`): a matching
@@ -53,7 +55,7 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   `BuildSeekRange` may widen and `Matches` is the authority. A non-unique or
   entry-retaining (`kVersionedUnique`) index and any prefix/range probe keep
   the per-candidate walk.
-- Sort/agg: `sort`, `topn`, `partial_sort`, `incremental_sort`, `pdqsort`,
+- Sort/agg: `sort`, `topn`, `incremental_sort`, `pdqsort`,
   (every sort-shaped operator resolves its keys through
   `type/collation.hpp`'s `SortKeyOrder` / `EqualUnderCollation`; `sort.cpp`
   folds a collated key *before* the memcomparable encoding so the in-memory
@@ -61,9 +63,7 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   encoding, and `ColumnVector` keeps a VARCHAR column's collator so a
   collated value survives the batch path),
   `spill_file`, `aggregation`, `grouped_aggregate`, `parallel_aggregation`,
-  `partial_aggregate`,
-  `grouping_sets`, `two_phase_distinct_agg`, `distributed_agg_finalize`,
-  `dictionary_batch_aggregation`, `distinct`, `skip_scan_distinct`.
+  `distinct`, `skip_scan_distinct`.
   `grouped_aggregate.{hpp,cpp}` is the physical half of the three GROUP BY
   shapes (`plan/aggregation_plan.hpp`): `HashAggregateExecutor` (one hash table
   over the group keys; when the table outgrows `GroupedAggregateOptions::
@@ -131,10 +131,10 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   operator must never rewind onto its resident chunk. Tests:
   `./build/window_spill_test` (operator) and `./build/window_shape_test` (plan,
   in `plan/`).
-- DML/other: `insert`, `update`, `delete`, `truncate`, `merge`, `returning`,
-  `values`, `generate_series`, `unnest`, `recursive_cte`, `set_operation`,
-  `merge_append`, `limit`, `max1_row`, `minmax_index`, `materialize`,
-  `exchange`, `pipeline_breaker.hpp`.
+- DML/other: `insert`, `update`, `delete`,
+  `values`, `unnest`, `recursive_cte`, `set_operation`,
+  `merge_append`, `limit`, `minmax_index`,
+  `pipeline_breaker.hpp`.
   `ExecuteRecursiveCte` (relational.cpp) is the work-table loop: it evaluates
   the anchor once, then re-binds the CTE name to the previous round's delta.
   **The anchor fixes the CTE's shape** — every round must produce those
@@ -154,15 +154,14 @@ inside that set is build-free, but `check_layering.py` still ranks them.
   relational route. Regressions: `QueryTest.SqlEngineRecursiveCteNameMatching*`,
   `SqlEngineRecursiveCteJoinUsingFeedsNameMatching`,
   `SqlEngineRecursiveCteReadsSiblingCteInDependencyOrder`.
-- Infra: `data_chunk` (+ `selection_vector`), `query_scheduler`,
-  `query_memory` (+ `operator_memory`, `numa_arena`), `vectorized_expression`,
+- Infra: `data_chunk` (+ `selection_vector`), `query_memory`,
   `simd_comparison`.
 
 ## Rules for new operators
 
 1. Add the `Plan` node in `plan/` (logical info only) + implementation rule.
 2. Implement the executor + wire `EmitExecutor` in `relational_factory.cpp`.
-3. Batch-first: implement `NextBatch`; keep row-at-a-time `Next` consistent.
+3. Pure batch execution: implement `NextBatch(DataChunk*, size_t)` only (`Next` is a non-virtual sink adapter on `ExecutorBase` and must not be overridden or called between operators).
 4. `executor/{apply,recursive_cte,unnest}.cpp + relational.cpp ->
    query/statement.hpp` is V3' debt — read-only, do not widen.
 
@@ -171,5 +170,5 @@ Test: `./build/executor_test`, `relational_regression_test`,
 `sort_shape_executor_test`, `grouped_aggregate_test`,
 `late_materialization_join_test`, `hash_semi_reduction_test`,
 `multi_index_covering_scan_test`,
-`query_scheduler_test`, `query_memory_test`, `spill_file_test`,
+`query_memory_test`, `spill_file_test`,
 `window_spill_test`, `executor_extra_test`.

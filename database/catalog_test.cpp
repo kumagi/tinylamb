@@ -647,6 +647,83 @@ TEST_F(CatalogTest, CreateIndexRefreshesContextCache) {
   }
 }
 
+TEST_F(CatalogTest, DdlInvalidatesEveryCaseVariantInTheContextCache) {
+  const Schema schema("Mixed", {Column("id", ValueType::kInt64)});
+  {
+    TransactionContext setup = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->CreateTable(setup, schema).GetStatus());
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  TransactionContext context = rs_->BeginContext();
+  const std::vector<std::string> names = {"Mixed", "mixed", "MIXED"};
+  for (const auto& name : names) {
+    ASSERT_TRUE(context.GetTable(name).HasValue());
+    ASSERT_TRUE(context.GetStats(name).HasValue());
+  }
+  ASSERT_SUCCESS(rs_->CreateIndex(context, "mixed", IndexSchema("idx", {0})));
+  for (const auto& name : names) {
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable(name));
+    EXPECT_EQ(table->IndexCount(), 1U) << name;
+  }
+  ASSERT_SUCCESS(rs_->RenameColumn(context, "mixed", "id", "renamed_id"));
+  for (const auto& name : names) {
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable(name));
+    EXPECT_EQ(table->GetSchema().Offset(ColumnName("renamed_id")), 0) << name;
+    EXPECT_LT(table->GetSchema().Offset(ColumnName("id")), 0) << name;
+  }
+  ASSERT_SUCCESS(rs_->RenameTable(context, "mixed", "Renamed"));
+  for (const auto& name : names) {
+    EXPECT_EQ(context.GetTable(name).GetStatus(), Status::kNotExists) << name;
+  }
+  const std::vector<std::string> renamed_names = {"Renamed", "renamed",
+                                                  "RENAMED"};
+  for (const auto& name : renamed_names) {
+    ASSERT_TRUE(context.GetTable(name).HasValue());
+    ASSERT_TRUE(context.GetStats(name).HasValue());
+  }
+  ASSERT_SUCCESS(rs_->DropTable(context, "renamed"));
+  for (const auto& name : renamed_names) {
+    EXPECT_EQ(context.GetTable(name).GetStatus(), Status::kNotExists) << name;
+    EXPECT_EQ(context.GetStats(name).GetStatus(), Status::kNotExists) << name;
+  }
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(CatalogTest, RenamingAReferencedColumnCannotDangleForeignKeys) {
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(
+      rs_->CreateTable(context,
+                       Schema("Parent", {Column("id", ValueType::kInt64),
+                                         Column("other", ValueType::kInt64)}))
+          .GetStatus());
+  ASSERT_SUCCESS(
+      rs_->CreateTable(
+             context,
+             Schema("Child", {Column("pid", ValueType::kInt64,
+                                     Constraint(Constraint::kForeign,
+                                                Value("Parent(id)")))}))
+          .GetStatus());
+  EXPECT_EQ(rs_->RenameColumn(context, "parent", "id", "new_id"),
+            Status::kConflicts);
+  ASSERT_SUCCESS(rs_->RenameColumn(context, "parent", "other", "new_other"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, parent,
+                        context.GetTable("Parent"));
+  EXPECT_EQ(parent->GetSchema().Offset(ColumnName("id")), 0);
+  EXPECT_EQ(parent->GetSchema().Offset(ColumnName("new_other")), 1);
+  ASSERT_SUCCESS(
+      rs_->CreateTable(context,
+                       Schema("Self", {Column("id", ValueType::kInt64),
+                                       Column("pid", ValueType::kInt64,
+                                              Constraint(Constraint::kForeign,
+                                                         Value("Self(id)")))}))
+          .GetStatus());
+  EXPECT_EQ(rs_->RenameTable(context, "Self", "NewSelf"), Status::kConflicts);
+  EXPECT_TRUE(context.GetTable("Self").HasValue());
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(CatalogTest, DropTableInvalidatesContextCache) {
   // Arrange -- create and commit a table.
   Schema schema("cache_drop", {Column("c", ValueType::kInt64)});
@@ -822,14 +899,15 @@ TEST_F(CatalogTest, TwoCleanRecoveryCyclesKeepTable) {
 }
 
 TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
-  // D3 (docs/design.md) acceptance 1: CREATE, insert, DROP, crash, recover,
-  // reopen -- the dropped table's pages come back as free pages linked into
-  // the rebuilt free list and are reused by the next allocation.
+  // CREATE, insert, DROP, crash, recover, reopen -- the dropped table's pages
+  // return to the free list and are reused by the next allocation.
   Schema schema("drop_reclaim", {Column("id", ValueType::kInt64),
                                  Column("name", ValueType::kVarChar)});
+  page_id_t dropped_first_pid = 0;
   {
     TransactionContext ctx = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(Table, tbl, rs_->CreateTable(ctx, schema));
+    dropped_first_pid = tbl.FirstPageId();
     for (int i = 0; i < 100; ++i) {
       ASSERT_SUCCESS(
           tbl.Insert(ctx.txn_, Row({Value(static_cast<int64_t>(i)),
@@ -849,18 +927,11 @@ TEST_F(CatalogTest, DropTableCrashRecoveryReclaimsPages) {
   TransactionContext ctx = rs_->BeginContext();
   EXPECT_FALSE(ctx.GetTable("drop_reclaim").HasValue());
   PageManager* pm = ctx.txn_.GetPageManager();
-  {
-    PageRef meta = pm->GetPage(kMetaPageId).MoveValue();
-    const page_id_t head = meta->body.meta_page.FirstFreePage();
-    EXPECT_NE(head, 0U);
-    PageRef freed = pm->GetPage(head).MoveValue();
-    ASSERT_FALSE(freed.IsNull());
-    EXPECT_EQ(freed->Type(), PageType::kFreePage);
-  }
   // The dropped pages are reusable by the very next allocation.
   PageRef reused =
       pm->AllocateNewPage(ctx.txn_, PageType::kRowPage).MoveValue();
   ASSERT_FALSE(reused.IsNull());
+  EXPECT_EQ(reused->PageID(), dropped_first_pid);
   ASSERT_TRUE(reused->Insert(ctx.txn_, "reused-row").HasValue());
   reused.PageUnlock();
   ASSERT_SUCCESS(ctx.txn_.PreCommit());

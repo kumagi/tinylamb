@@ -44,6 +44,7 @@ class Decoder;
 class Encoder;
 struct Row;
 struct RowPosition;
+struct LSTableStore;
 
 class Table {
  public:
@@ -134,6 +135,20 @@ class Table {
       ValueType runtime_filter_type = ValueType::kNull) const;
   [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
       Transaction& txn, size_t pages_per_morsel = 8) const;
+  struct IntegerKeyCounts {
+    std::vector<uint64_t> counts;
+    uint64_t rows{0};
+  };
+  // Exact bounded integer-domain counts over unfiltered row pages. Returns
+  // null when MVCC/page freshness cannot be proved; callers then scan normally.
+  [[nodiscard]] std::shared_ptr<const IntegerKeyCounts> TryReadIntegerKeyCounts(
+      Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
+      int64_t minimum, size_t span) const;
+  // Revalidate an existing histogram using its saved complete page chain;
+  // never builds a new one and never skips the page/MVCC freshness checks.
+  [[nodiscard]] std::shared_ptr<const IntegerKeyCounts>
+  FindCachedIntegerKeyCounts(Transaction& txn, slot_t column, int64_t minimum,
+                             size_t span) const;
   Iterator BeginIndexScan(Transaction& txn, const Index& index,
                           const Value& begin = Value(),
                           const Value& end = Value(),
@@ -146,6 +161,10 @@ class Table {
   [[nodiscard]] std::unordered_map<slot_t, size_t> AvailableKeyIndex() const;
 
   [[nodiscard]] const Schema& GetSchema() const { return schema_; }
+  [[nodiscard]] std::shared_ptr<const LSTableStore> GetLSTableStore() const;
+  void SetLSTableStore(std::shared_ptr<const LSTableStore> store) const;
+  std::shared_ptr<const LSTableStore> RebuildLSTableStore(
+      Transaction& txn) const;
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }
   // Diagnostics: the row-page chain head/tail (for corruption reports).
   [[nodiscard]] page_id_t FirstPageId() const { return first_pid_; }
@@ -175,6 +194,9 @@ class Table {
   }
 
  private:
+  [[nodiscard]] std::shared_ptr<const IntegerKeyCounts> ReadIntegerKeyCounts(
+      Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
+      int64_t minimum, size_t span, bool cached_pages_only) const;
   // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
   // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
   // skip the root-to-leaf walk when the remembered leaf still covers the

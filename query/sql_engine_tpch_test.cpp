@@ -20,6 +20,8 @@
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
 #include "query/sql_engine.hpp"
+#include "table/lstable_bridge.hpp"
+#include "table/table.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 
@@ -378,6 +380,72 @@ TEST_F(SqlEngineTpchTest, ExecutesAllTwentyTwoQueries) {
     }
   }
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(SqlEngineTpchTest, Q6KeepsDoubleQuantityWithIntegerBoundInParallelScan) {
+  {
+    TransactionContext context = database_->BeginContext();
+    Run(*database_, context,
+        "CREATE TABLE lineitem (l_orderkey INT64, l_partkey INT64, "
+        "l_suppkey INT64, l_linenumber INT64, l_quantity FLOAT64, "
+        "l_extendedprice FLOAT64, l_discount FLOAT64, l_tax FLOAT64, "
+        "l_returnflag STRING, l_linestatus STRING, l_shipdate DATE, "
+        "l_commitdate DATE, l_receiptdate DATE, l_shipinstruct STRING, "
+        "l_shipmode STRING, l_comment STRING)");
+    Run(*database_, context,
+        "INSERT INTO lineitem VALUES "
+        "(1,1,1,1,10.0,100.0,0.08,0.02,'R','O',DATE '1994-03-15',"
+        "DATE '1994-03-20',DATE '1994-03-25',"
+        "'DELIVER IN PERSON','AIR','')");
+    // ANALYZE enables the parallel scan above 8192 rows. Half the appended
+    // rows pass Q6 and half fail its integer-literal quantity bound, even
+    // though the stored quantity is DOUBLE. A raw integer peek over its
+    // IEEE payload rejects every matching positive quantity.
+    constexpr size_t kRows = 8192;
+    constexpr size_t kBatchRows = 256;
+    for (size_t begin = 0; begin < kRows; begin += kBatchRows) {
+      std::string sql = "INSERT INTO lineitem VALUES ";
+      for (size_t i = begin; i < begin + kBatchRows; ++i) {
+        if (i != begin) {
+          sql += ',';
+        }
+        sql += "(3,1,1,1,";
+        sql += i % 2 == 0 ? "10.0" : "30.0";
+        sql +=
+            ",100.0,0.08,0.02,'R','O',DATE '1994-03-15',"
+            "DATE '1994-03-20',DATE '1994-03-25',"
+            "'DELIVER IN PERSON','AIR','')";
+      }
+      Run(*database_, context, sql);
+    }
+    Run(*database_, context, "ANALYZE");
+    ASSERT_EQ(context.PreCommit(), Status::kSuccess);
+  }
+  // Exercise first execution and the SQL plan/template cache in independent
+  // read-only transactions, matching the public server's SELECT path.
+  // The cross-engine runner folds the literal date_add to the same DATE;
+  // keeping a function call here would select the relational fallback and
+  // miss the Cascades scan-peek regression.
+  constexpr std::string_view kQuery =
+      "SELECT SUM(l_extendedprice * l_discount) AS revenue FROM lineitem "
+      "WHERE l_shipdate >= DATE '1994-01-01' "
+      "AND l_shipdate < DATE '1995-01-01' "
+      "AND l_discount BETWEEN 0.08 - 0.01 AND 0.08 + 0.01 "
+      "AND l_quantity < 25";
+  for (size_t iteration = 0; iteration < 3; ++iteration) {
+    SCOPED_TRACE(iteration);
+    TransactionContext context = database_->BeginReadOnlyContext();
+    SqlEngine engine(*database_);
+    auto result = engine.Execute(context, kQuery);
+    ASSERT_TRUE(result.HasValue()) << engine.LastError();
+    std::vector<Row> rows = result.Value().Collect();
+    ASSERT_EQ(rows.size(), 1);
+    EXPECT_EQ(rows[0][0], Value(32776.0));
+    std::ostringstream plan;
+    result.Value().Dump(plan);
+    EXPECT_NE(plan.str().find("ParallelScan"), std::string::npos) << plan.str();
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  }
 }
 
 TEST_F(SqlEngineTpchTest, ExplainReturnsPlanAndAnalyzeReturnsRuntimeProfile) {
@@ -888,6 +956,62 @@ TEST_F(SqlEngineTpchTest, Q21WaitingSupplierShapeCountsOnlyTrueWaiters) {
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value("Supplier#1"));
   EXPECT_EQ(rows[0][1], Value(static_cast<int64_t>(1)));
+  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(SqlEngineTpchTest,
+       CreateTableSupportsLSTableStorageEngineAndColumnarScans) {
+  TransactionContext context = database_->BeginContext();
+  Run(*database_, context,
+      "CREATE TABLE t_opt (id INT64, flag STRING, price DOUBLE, d DATE) "
+      "OPTIONS (engine = 'lstable');");
+  Run(*database_, context,
+      "CREATE TABLE t_using (id INT64, name STRING) USING lstable;");
+  Run(*database_, context,
+      "CREATE TABLE t_eq (id INT64, name STRING) ENGINE = lstable;");
+  Run(*database_, context,
+      "CREATE TABLE t_with (id INT64, name STRING) WITH (engine = 'lstable');");
+
+  for (std::string_view name : {"t_opt", "t_using", "t_eq", "t_with"}) {
+    auto tbl = database_->GetTable(context, name);
+    ASSERT_TRUE(tbl.HasValue());
+  }
+  {
+    SqlEngine engine(*database_);
+    auto bad_heap = engine.Execute(context,
+                                   "CREATE TABLE t_heap (id INT64, name "
+                                   "STRING) OPTIONS (engine = 'heap');");
+    EXPECT_FALSE(bad_heap.HasValue());
+  }
+
+  Run(*database_, context,
+      "INSERT INTO t_opt VALUES "
+      "(1, 'A', 10.5, DATE '1995-01-01'), "
+      "(2, 'N', 20.0, DATE '1996-06-15'), "
+      "(3, 'A', 30.5, DATE '1997-12-31'), "
+      "(4, NULL, NULL, DATE '1998-03-01');");
+  Run(*database_, context, "ANALYZE;");
+  {
+    auto tbl = database_->GetTable(context, "t_opt");
+    ASSERT_TRUE(tbl.HasValue());
+    auto store = tbl.Value().GetLSTableStore();
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->total_rows, 4U);
+    EXPECT_NE(store->pax_chunk, nullptr);
+  }
+
+  std::vector<Row> rows =
+      Run(*database_, context,
+          "SELECT flag, COUNT(*), SUM(price * (1 - 0.1)) "
+          "FROM t_opt WHERE d >= DATE '1995-01-01' AND flag IS NOT NULL "
+          "GROUP BY flag ORDER BY flag;");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value("A"));
+  EXPECT_EQ(rows[0][1], Value(static_cast<int64_t>(2)));
+  EXPECT_NEAR(rows[0][2].value.double_value, 36.9, 1e-9);
+  EXPECT_EQ(rows[1][0], Value("N"));
+  EXPECT_EQ(rows[1][1], Value(static_cast<int64_t>(1)));
+  EXPECT_NEAR(rows[1][2].value.double_value, 18.0, 1e-9);
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
 }
 

@@ -13,9 +13,8 @@
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "expression/expression.hpp"
-#include "index/b_plus_tree.hpp"
-#include "index/b_plus_tree_iterator.hpp"
 #include "index/index.hpp"
+#include "index/lsm_index.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_ref.hpp"
 #include "table/table.hpp"
@@ -138,8 +137,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       Row next_key;
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
-      for (size_t col = 0;
-           col < prefix_cols_ && col < prev_key.Count() && col < next_key.Count();
+      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count() &&
+                           col < next_key.Count();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;
@@ -152,7 +151,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       // Same prefix, seek past this prefix using BPlusTree seek with prefix
       // upper bound!
       std::vector<Value> prefix_values;
-      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count(); ++col) {
+      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count();
+           ++col) {
         prefix_values.push_back(prev_key[col]);
       }
       std::string seek_after = EncodeParts(prefix_values);
@@ -166,8 +166,8 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
       Row next_key;
       next_key.DecodeMemcomparableFormat(iter_.Key());
       bool prefix_equal = true;
-      for (size_t col = 0;
-           col < prefix_cols_ && col < prev_key.Count() && col < next_key.Count();
+      for (size_t col = 0; col < prefix_cols_ && col < prev_key.Count() &&
+                           col < next_key.Count();
            ++col) {
         if (prev_key[col] != next_key[col]) {
           prefix_equal = false;
@@ -182,9 +182,16 @@ void SkipScanDistinct::SeekNextDistinct(const std::string& /*prev_encoded_key*/,
   }
 }
 
-bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
-  assert(dst != nullptr);
-  while (!finished_ && iter_.IsValid()) {
+size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
+  if (destination == nullptr || max_rows == 0) {
+    return 0;
+  }
+  // ExecutorBase::NextBatch contract: the destination is reset per batch.
+  // Without it, consumers that reuse an input chunk (Projection) append on
+  // top of the previous batch and re-emit every stale row once the DISTINCT
+  // result exceeds one batch.
+  destination->Reset();
+  while (destination->Size() < max_rows && !finished_ && iter_.IsValid()) {
     current_index_key_.Clear();
     current_index_key_.DecodeMemcomparableFormat(iter_.Key());
 
@@ -194,7 +201,8 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
       if (!val.HasValue()) {
         status_ = val.GetStatus();
         finished_ = true;
-        return false;
+        FailWith(status_);
+        return destination->Size();
       }
       current_pos_ = val.Value().pos;
     } else {
@@ -203,7 +211,8 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
       if (!val.HasValue()) {
         status_ = val.GetStatus();
         finished_ = true;
-        return false;
+        FailWith(status_);
+        return destination->Size();
       }
       if (val.Value().empty()) {
         if (ascending_) {
@@ -223,7 +232,9 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
     if (where_) {
       StatusOr<Value> res = where_->TryEvaluate(current_row_, schema_);
       if (!res.HasValue()) {
-        return FailWith(res.GetStatus());
+        status_ = res.GetStatus();
+        FailWith(status_);
+        return destination->Size();
       }
       matched = res.Value().Truthy();
     }
@@ -234,37 +245,16 @@ bool SkipScanDistinct::Next(Row* dst, RowPosition* rp) {
     SeekNextDistinct(prev_encoded_key, prev_key);
 
     if (matched && current_row_.IsValid()) {
-      *dst = current_row_;
-      if (rp != nullptr) {
-        *rp = current_pos_;
-      }
-      return true;
+      destination->Append(current_row_, current_pos_);
     }
   }
-  finished_ = true;
+  if (!iter_.IsValid()) {
+    finished_ = true;
+  }
   if (status_ != Status::kSuccess) {
-    return FailWith(status_);
+    FailWith(status_);
   }
-  return false;
-}
-
-size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
-  if (destination == nullptr || max_rows == 0) {
-    return 0;
-  }
-  // ExecutorBase::NextBatch contract: the destination is reset per batch.
-  // Without it, consumers that reuse an input chunk (Projection) append on
-  // top of the previous batch and re-emit every stale row once the DISTINCT
-  // result exceeds one batch.
-  destination->Reset();
-  size_t count = 0;
-  Row row;
-  RowPosition rp;
-  while (count < max_rows && Next(&row, &rp)) {
-    destination->Append(std::move(row), rp);
-    ++count;
-  }
-  return count;
+  return destination->Size();
 }
 
 void SkipScanDistinct::Dump(std::ostream& o, int /*indent*/) const {

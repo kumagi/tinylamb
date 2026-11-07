@@ -23,6 +23,7 @@
 #include <memory>
 #include <vector>
 
+#include "common/env_endian.hpp"
 #include "common/exc_shim.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
@@ -32,6 +33,30 @@ namespace tinylamb {
 class Encoder;
 class Decoder;
 struct ArrayPayload;
+
+inline size_t EncodeMemcomparableFormatIntegerTo(char* dst, int64_t in) {
+  dst[0] = static_cast<char>(ValueType::kInt64);
+  const uint64_t be = htobe64(static_cast<uint64_t>(in));
+  std::memcpy(dst + 1, &be, 8);
+  dst[1] ^= static_cast<char>(0x80);
+  return 9;
+}
+
+inline size_t EncodeMemcomparableFormatDoubleTo(char* dst, double in) {
+  dst[0] = static_cast<char>(ValueType::kDouble);
+  uint64_t bits;
+  std::memcpy(&bits, &in, sizeof(bits));
+  uint64_t code;
+  if (std::isnan(in)) {
+    code = ~0ULL;
+  } else {
+    if (bits == (1ULL << 63)) bits = 0;
+    code = (bits >> 63) != 0 ? ~bits : (bits | (1ULL << 63));
+  }
+  const uint64_t be = htobe64(code);
+  std::memcpy(dst + 1, &be, 8);
+  return 9;
+}
 
 enum class UnaryOperation : uint8_t {
   kIsNull,
@@ -283,6 +308,8 @@ class Value {
     return ExcShimUnwrap(TryEncodeMemcomparableFormat(),
                          "Value::EncodeMemcomparableFormat");
   }
+  size_t EncodeMemcomparableFormatTo(char* dst) const;
+  static size_t DecodeMemcomparableFormatBounded(const char* src, size_t avail);
   // Decodes one self-delimiting chunk from the (possibly NUL-containing)
   // buffer and returns the number of bytes consumed.  Errors on truncation.
   [[nodiscard]] StatusOr<size_t> TryDecodeMemcomparableFormat(
@@ -329,7 +356,13 @@ class Value {
         if (l == r) [[likely]] {
           return true;
         }
-        if (!ViewContainsSpace(l) || !ViewContainsSpace(r)) [[likely]] {
+        const auto may_be_interval = [](std::string_view s) noexcept {
+          return s.size() >= 3 &&
+                 ((s[0] >= '0' && s[0] <= '9') || s[0] == '-' || s[0] == '+' ||
+                  s[0] == ' ') &&
+                 ViewContainsSpace(s);
+        };
+        if (!may_be_interval(l) || !may_be_interval(r)) [[likely]] {
           return false;
         }
         break;
@@ -437,6 +470,21 @@ class Value {
   }
 
   [[nodiscard]] std::string AsString() const;
+  [[nodiscard]] int64_t AsInt64() const {
+    if (type != ValueType::kInt64 && type != ValueType::kDate) ThrowAsInt64();
+    return value.int_value;
+  }
+  [[nodiscard]] double AsDouble() const {
+    if (type != ValueType::kDouble) ThrowAsDouble();
+    return value.double_value;
+  }
+  [[nodiscard]] std::string_view AsStringView() const {
+    if (type != ValueType::kVarChar) ThrowAsStringView();
+    return value.varchar_value;
+  }
+  [[noreturn]] static void ThrowAsInt64();
+  [[noreturn]] static void ThrowAsDouble();
+  [[noreturn]] static void ThrowAsStringView();
   friend std::ostream& operator<<(std::ostream& o, const Value& v);
 
   // Three-way comparison with SQL ORDER BY semantics among non-NULL values:
@@ -452,6 +500,34 @@ class Value {
   friend Decoder& operator>>(Decoder& e, Value& v);
 
   [[nodiscard]] bool IsNull() const { return type == ValueType::kNull; }
+
+  void SetNull() {
+    type = ValueType::kNull;
+    collation_ = 0;
+  }
+  void SetInt64(int64_t v) {
+    type = ValueType::kInt64;
+    value.int_value = v;
+    collation_ = 0;
+  }
+  void SetDouble(double d) {
+    type = ValueType::kDouble;
+    value.double_value = d;
+    collation_ = 0;
+  }
+  void SetString(std::string&& s) {
+    owned_data = std::move(s);
+    type = ValueType::kVarChar;
+    value.varchar_value = owned_data;
+    collation_ = 0;
+  }
+  void SetStringView(std::string_view s) {
+    owned_data.assign(s);
+    type = ValueType::kVarChar;
+    value.varchar_value = owned_data;
+    collation_ = 0;
+  }
+  [[nodiscard]] std::string MoveString() { return std::move(owned_data); }
 
   // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
   // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when

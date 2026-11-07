@@ -17,6 +17,8 @@
 #ifndef TINYLAMB_INDEX_SCAN_PLAN_HPP
 #define TINYLAMB_INDEX_SCAN_PLAN_HPP
 
+#include <cstddef>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -35,7 +37,8 @@ class IndexScanPlan final : public PlanBase {
                 const TableStatistics& ts, std::vector<Value> begin_key,
                 std::vector<Value> end_key, bool ascending, Expression where,
                 std::vector<ColumnName> provided_order = {},
-                bool lock_rows = false, bool wait_for_write_intent = true);
+                bool lock_rows = false, bool wait_for_write_intent = true,
+                size_t limit_hint = std::numeric_limits<size_t>::max());
   // Point-union access for constant IN lists: one [begin,end] pair per
   // distinct value. Ordering credit only survives a single range.
   IndexScanPlan(
@@ -54,6 +57,9 @@ class IndexScanPlan final : public PlanBase {
 
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
   [[nodiscard]] const Index& GetIndex() const { return index_; }
+  // A downstream LIMIT expects a short prefix. This is a scheduling hint,
+  // never a cap on visited rows: residual predicates can reject any prefix.
+  [[nodiscard]] size_t LimitHint() const { return limit_hint_; }
   [[nodiscard]] const Schema& GetSchema() const override;
   [[nodiscard]] const TableStatistics& GetStats() const override {
     return stats_;
@@ -85,6 +91,7 @@ class IndexScanPlan final : public PlanBase {
   bool ascending_;
   bool lock_rows_;
   bool wait_for_write_intent_;
+  size_t limit_hint_{std::numeric_limits<size_t>::max()};
   Expression where_;
   std::vector<ColumnName> provided_order_;
 };

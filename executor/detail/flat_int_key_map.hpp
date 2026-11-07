@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_FLAT_INT_KEY_MAP_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_FLAT_INT_KEY_MAP_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -38,14 +39,16 @@ namespace tinylamb::relational_detail {
 template <typename T>
 class FlatIntKeyMap {
  public:
-  T* TryEmplace(int64_t key, bool* inserted) {
+  T* TryEmplace(int64_t key, bool* inserted = nullptr) {
     if ((size_ + 1) * 10 > Capacity() * 7) {
       Grow();
     }
     size_t slot = SlotOf(key);
     while (Occupied(slots_[slot])) {
       if (slots_[slot].key == key) {
-        *inserted = false;
+        if (inserted != nullptr) {
+          *inserted = false;
+        }
         return &slots_[slot].value;
       }
       slot = (slot + 1) & mask_;
@@ -53,9 +56,14 @@ class FlatIntKeyMap {
     slots_[slot].key = key;
     MarkOccupied(slots_[slot]);
     ++size_;
-    *inserted = true;
+    if (inserted != nullptr) {
+      *inserted = true;
+    }
     return &slots_[slot].value;
   }
+
+  [[nodiscard]] size_t Size() const noexcept { return size_; }
+  [[nodiscard]] bool Empty() const noexcept { return size_ == 0; }
 
   // Warms the slot for a key whose TryEmplace happens a few rows later (the
   // caller's filter work covers most of the line-fill latency).
@@ -93,13 +101,23 @@ class FlatIntKeyMap {
     }
   }
 
+  void Reserve(size_t expected) {
+    if (expected == 0) {
+      return;
+    }
+    const size_t min_cap = (expected * 10 + 6) / 7;
+    size_t next = Capacity() < 16 ? 16 : Capacity();
+    while (next < min_cap) {
+      next *= 2;
+    }
+    if (next > Capacity()) {
+      GrowTo(next);
+    }
+  }
+
  private:
   static constexpr bool kCompact =
       std::is_integral_v<T> && std::is_unsigned_v<T>;
-  // Compact-layout vacancy marker; callers never store this value (it would
-  // need 2^64 - 1 groups).  Non-compact layouts keep the explicit used byte.
-  static constexpr T kEmptyValue =
-      kCompact ? std::numeric_limits<T>::max() : T{};
 
   struct EmptyTag {};
   struct Slot {
@@ -110,7 +128,7 @@ class FlatIntKeyMap {
 
   [[nodiscard]] static bool Occupied(const Slot& slot) {
     if constexpr (kCompact) {
-      return slot.value != kEmptyValue;
+      return slot.value != std::numeric_limits<T>::max();
     } else {
       return slot.used != 0;
     }
@@ -125,7 +143,7 @@ class FlatIntKeyMap {
   [[nodiscard]] static Slot EmptySlot() {
     Slot slot{};
     if constexpr (kCompact) {
-      slot.value = kEmptyValue;
+      slot.value = std::numeric_limits<T>::max();
     }
     return slot;
   }
@@ -144,6 +162,9 @@ class FlatIntKeyMap {
     // instead of ~2x — callgrind put the rehash passes at a visible slice of
     // the multi-million-group folds' TryEmplace cost.
     const size_t next = Capacity() < 16 ? 16 : Capacity() * 4;
+    GrowTo(next);
+  }
+  void GrowTo(size_t next) {
     std::vector<Slot> old_slots = std::move(slots_);
     mask_ = next - 1;
     slots_.clear();
@@ -186,16 +207,102 @@ class FlatIntKeyMap {
 // Duplicate keys re-probe to an occupied equal slot and are dropped.
 class FlatIntSet {
  public:
+  static constexpr uint64_t kMaxDenseSpan = 33'554'432ULL;
+
+  [[nodiscard]] static size_t ReservationBytes(size_t members) {
+    return sizeof(FlatIntSet) + CapacityFor(members) * sizeof(Slot);
+  }
+
   void Reserve(size_t members) {
-    size_t capacity = 16;
-    while ((members + 1) * 10 > capacity * 7) {
-      capacity *= 4;
+    dense_mode_ = false;
+    dense_bits_.clear();
+    slots_.assign(CapacityFor(members), Slot{});
+    mask_ = slots_.size() - 1;
+    size_ = 0;
+    has_bounds_ = false;
+  }
+
+  bool TryReserveDense(int64_t min_key, int64_t max_key) {
+    if (min_key > max_key) {
+      return false;
     }
-    slots_.assign(capacity, Slot{});
-    mask_ = capacity - 1;
+    const uint64_t span =
+        static_cast<uint64_t>(max_key) - static_cast<uint64_t>(min_key);
+    if (span > kMaxDenseSpan) {
+      return false;
+    }
+    slots_.clear();
+    mask_ = 0;
+    dense_bits_.assign(static_cast<size_t>((span >> 6) + 1), 0ULL);
+    dense_mode_ = true;
+    dense_min_ = min_key;
+    dense_max_ = max_key;
+    size_ = 0;
+    has_bounds_ = false;
+    return true;
+  }
+
+  [[nodiscard]] bool IsDenseMode() const noexcept { return dense_mode_; }
+
+  void InsertDenseAtomic(int64_t key) noexcept {
+    const uint64_t off =
+        static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min_);
+    const uint64_t bit_mask = uint64_t{1} << (off & 63);
+    uint64_t& word = dense_bits_[off >> 6];
+    if ((std::atomic_ref<uint64_t>(word).load(std::memory_order_relaxed) &
+         bit_mask) == 0) {
+      std::atomic_ref<uint64_t>(word).fetch_or(bit_mask,
+                                               std::memory_order_relaxed);
+    }
+  }
+
+  void FinalizeDenseBounds() noexcept {
+    size_ = 0;
+    has_bounds_ = false;
+    for (size_t w = 0; w < dense_bits_.size(); ++w) {
+      const uint64_t word = dense_bits_[w];
+      if (word == 0) {
+        continue;
+      }
+      size_ += static_cast<size_t>(__builtin_popcountll(word));
+      const int64_t lo_k =
+          dense_min_ +
+          static_cast<int64_t>((static_cast<uint64_t>(w) << 6) +
+                               static_cast<uint64_t>(__builtin_ctzll(word)));
+      const int64_t hi_k =
+          dense_min_ + static_cast<int64_t>(
+                           (static_cast<uint64_t>(w) << 6) +
+                           static_cast<uint64_t>(63 - __builtin_clzll(word)));
+      if (!has_bounds_) {
+        has_bounds_ = true;
+        min_key_ = lo_k;
+        max_key_ = hi_k;
+      } else {
+        max_key_ = hi_k;
+      }
+    }
   }
 
   void Insert(int64_t key) {
+    if (!has_bounds_) {
+      has_bounds_ = true;
+      min_key_ = key;
+      max_key_ = key;
+    } else {
+      if (key < min_key_) min_key_ = key;
+      if (key > max_key_) max_key_ = key;
+    }
+    if (dense_mode_) {
+      const uint64_t off =
+          static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min_);
+      const uint64_t bit_mask = uint64_t{1} << (off & 63);
+      uint64_t& word = dense_bits_[off >> 6];
+      if ((word & bit_mask) == 0) {
+        word |= bit_mask;
+        ++size_;
+      }
+      return;
+    }
     size_t slot = SlotOf(key);
     while (slots_[slot].used != 0) {
       if (slots_[slot].key == key) {
@@ -208,7 +315,15 @@ class FlatIntSet {
     ++size_;
   }
 
-  [[nodiscard]] bool Contains(int64_t key) const {
+  [[nodiscard]] bool Contains(int64_t key) const noexcept {
+    if (!has_bounds_ || key < min_key_ || key > max_key_) {
+      return false;
+    }
+    if (dense_mode_) {
+      const uint64_t off =
+          static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min_);
+      return (dense_bits_[off >> 6] & (uint64_t{1} << (off & 63))) != 0;
+    }
     size_t slot = SlotOf(key);
     while (slots_[slot].used != 0) {
       if (slots_[slot].key == key) {
@@ -219,13 +334,66 @@ class FlatIntSet {
     return false;
   }
 
-  [[nodiscard]] bool Empty() const { return size_ == 0; }
-  [[nodiscard]] size_t Size() const { return size_; }
+  [[nodiscard]] bool ContainsAnyInRange(int64_t lo, int64_t hi) const noexcept {
+    if (!has_bounds_ || lo > hi || hi < min_key_ || lo > max_key_) {
+      return false;
+    }
+    if (dense_mode_) {
+      const int64_t clamped_lo = lo > min_key_ ? lo : min_key_;
+      const int64_t clamped_hi = hi < max_key_ ? hi : max_key_;
+      if (clamped_lo > clamped_hi) {
+        return false;
+      }
+      const uint64_t off_lo =
+          static_cast<uint64_t>(clamped_lo) - static_cast<uint64_t>(dense_min_);
+      const uint64_t off_hi =
+          static_cast<uint64_t>(clamped_hi) - static_cast<uint64_t>(dense_min_);
+      const size_t word_lo = static_cast<size_t>(off_lo >> 6);
+      const size_t word_hi = static_cast<size_t>(off_hi >> 6);
+      if (word_hi - word_lo <= 8) {
+        const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
+        const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));
+        if (word_lo == word_hi) {
+          return (dense_bits_[word_lo] & low_mask & high_mask) != 0;
+        }
+        if ((dense_bits_[word_lo] & low_mask) != 0) {
+          return true;
+        }
+        for (size_t w = word_lo + 1; w < word_hi; ++w) {
+          if (dense_bits_[w] != 0) {
+            return true;
+          }
+        }
+        return (dense_bits_[word_hi] & high_mask) != 0;
+      }
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool Empty() const noexcept { return size_ == 0; }
+  [[nodiscard]] size_t Size() const noexcept { return size_; }
+  [[nodiscard]] bool HasBounds() const noexcept { return has_bounds_; }
+  [[nodiscard]] int64_t MinKey() const noexcept { return min_key_; }
+  [[nodiscard]] int64_t MaxKey() const noexcept { return max_key_; }
 
   // Visits every distinct member.  Build-once contract: the set is frozen
   // while this runs.
   template <typename Fn>
   void ForEach(Fn&& fn) const {
+    if (dense_mode_) {
+      for (size_t w = 0; w < dense_bits_.size(); ++w) {
+        uint64_t word = dense_bits_[w];
+        while (word != 0) {
+          const auto bit = static_cast<unsigned>(__builtin_ctzll(word));
+          const int64_t key =
+              dense_min_ +
+              static_cast<int64_t>((static_cast<uint64_t>(w) << 6) + bit);
+          fn(key);
+          word &= word - 1;
+        }
+      }
+      return;
+    }
     for (const Slot& slot : slots_) {
       if (slot.used != 0) {
         fn(slot.key);
@@ -239,6 +407,14 @@ class FlatIntSet {
     uint8_t used;
   };
 
+  static size_t CapacityFor(size_t members) {
+    size_t capacity = 16;
+    while ((members + 1) * 10 > capacity * 7) {
+      capacity *= 4;
+    }
+    return capacity;
+  }
+
   [[nodiscard]] size_t SlotOf(int64_t key) const {
     auto x = static_cast<uint64_t>(key);
     x += 0x9e3779b97f4a7c15ULL;
@@ -248,8 +424,15 @@ class FlatIntSet {
   }
 
   std::vector<Slot> slots_;
+  std::vector<uint64_t> dense_bits_;
+  int64_t min_key_ = 0;
+  int64_t max_key_ = 0;
+  int64_t dense_min_ = 0;
+  int64_t dense_max_ = 0;
   size_t size_ = 0;
   size_t mask_ = 0;
+  bool dense_mode_ = false;
+  bool has_bounds_ = false;
 };
 
 }  // namespace tinylamb::relational_detail

@@ -32,7 +32,8 @@ class MergeJoin final : public ExecutorBase {
             Expression residual = Expression(),
             Schema residual_schema = Schema());
 
-  bool Next(Row* dst, RowPosition* rp) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
  private:

@@ -82,6 +82,12 @@ class SqlEngine {
   static void SetThreadRuntimeProfiling(bool enabled);
   [[nodiscard]] static SqlRuntimeStats ThreadRuntimeStats();
   [[nodiscard]] const std::string& LastError() const { return last_error_; }
+  // Conservative certification of a parsed, table-free literal arithmetic
+  // SELECT. Consumers may reuse a successful complete result under exact SQL.
+  // Functions, variables, subqueries and statement modifiers never qualify.
+  [[nodiscard]] bool LastQueryIsLiteralConstant() const {
+    return last_query_is_literal_constant_;
+  }
   [[nodiscard]] const std::optional<StatementType>& LastStatementType() const {
     return last_statement_type_;
   }
@@ -198,11 +204,13 @@ class SqlEngine {
   // (nullopt = miss or any doubt; callers fall back to the legacy path).
   std::optional<Executor> ServeFromPlanCache(
       TransactionContext& ctx, const std::string& fingerprint,
-      const std::vector<Value>& parameters);
+      const std::vector<Value>& parameters,
+      bool require_immutable_exact_read = false);
 
   // Fingerprint/parameters of the statement currently being prepared; fill
   // sites inside PrepareStatement consult these. An empty fingerprint
-  // disables caching (EXPLAIN, non-templatable SQL).
+  // disables fills (for example EXPLAIN). Replay eligibility is checked
+  // separately so unsupported template shapes cannot use the binder.
   void set_plan_cache_candidate(std::string fingerprint,
                                 std::vector<Value> parameters) {
     plan_cache_fingerprint_ = std::move(fingerprint);
@@ -244,6 +252,7 @@ class SqlEngine {
   Database* database_;
   std::string last_error_;
   std::optional<StatementType> last_statement_type_;
+  bool last_query_is_literal_constant_{false};
   std::string last_dml_table_;
   std::vector<std::string> result_column_names_;
   std::string plan_cache_fingerprint_;

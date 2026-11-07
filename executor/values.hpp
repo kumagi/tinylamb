@@ -17,7 +17,6 @@ class ValuesExecutor final : public ExecutorBase {
  public:
   explicit ValuesExecutor(std::vector<Row> rows) : rows_(std::move(rows)) {}
 
-  bool Next(Row* row, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;

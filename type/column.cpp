@@ -30,10 +30,17 @@
 
 namespace tinylamb {
 
-Column::Column(ColumnName name, ValueType type, Constraint cst)
-    : col_name_(std::move(name)), type_(type), constraint_(std::move(cst)) {}
-Column::Column(std::string_view name, ValueType type, Constraint cst)
-    : col_name_(ColumnName(name)), type_(type), constraint_(std::move(cst)) {}
+Column::Column(ColumnName name, ValueType type, Constraint cst, uint8_t scale)
+    : col_name_(std::move(name)),
+      type_(type),
+      constraint_(std::move(cst)),
+      scale_(scale) {}
+Column::Column(std::string_view name, ValueType type, Constraint cst,
+               uint8_t scale)
+    : col_name_(ColumnName(name)),
+      type_(type),
+      constraint_(std::move(cst)),
+      scale_(scale) {}
 
 std::ostream& operator<<(std::ostream& o, const Column& c) {
   o << c.col_name_;

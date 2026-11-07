@@ -17,20 +17,13 @@
 #include "common/join_kind.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/batch_nested_loop_join.hpp"
-#include "executor/cardinality_probe.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
-#include "executor/grouping_sets.hpp"
-#include "executor/max1_row.hpp"
 #include "executor/minmax_index.hpp"
-#include "executor/numa_arena.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
-#include "executor/partial_aggregate.hpp"
-#include "executor/partial_sort.hpp"
 #include "executor/pdqsort.hpp"
-#include "executor/returning.hpp"
 #include "executor/sort.hpp"
 #include "executor/topn.hpp"
 #include "executor/values.hpp"
@@ -65,116 +58,6 @@ TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
   ASSERT_EQ(result.values_.size(), 1U);
   EXPECT_TRUE(result[0].IsNull());
   EXPECT_FALSE(empty.Next(&result, nullptr));
-}
-
-TEST(PartialSortTest, TopKWithoutSortingEntireRun) {
-  const Schema schema("scores", {Column("player", ValueType::kVarChar),
-                                 Column("score", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value("P1"), Value(int64_t{50})}),
-      Row({Value("P2"), Value(int64_t{20})}),
-      Row({Value("P3"), Value(int64_t{90})}),
-      Row({Value("P4"), Value(int64_t{10})}),
-      Row({Value("P5"), Value(int64_t{70})}),
-      Row({Value("P6"), Value(int64_t{40})}),
-  });
-
-  std::vector<SortExecutor::Key> keys = {
-      {ColumnValueExp("score"), true, std::nullopt}};
-
-  PartialSortExecutor partial_sort(src, schema, keys, /*top_k=*/3,
-                                   /*offset=*/0);
-  EXPECT_FALSE(partial_sort.IsMaterialized());
-  partial_sort.MaterializePipeline();
-  EXPECT_TRUE(partial_sort.IsMaterialized());
-  EXPECT_EQ(partial_sort.MaterializedRowCount(), 3);
-
-  std::vector<Row> out_rows;
-  Row row;
-  RowPosition rp;
-  while (partial_sort.Next(&row, &rp)) {
-    out_rows.push_back(std::move(row));
-  }
-
-  ASSERT_EQ(out_rows.size(), 3);
-  EXPECT_EQ(out_rows[0][1], Value(int64_t{10}));
-  EXPECT_EQ(out_rows[1][1], Value(int64_t{20}));
-  EXPECT_EQ(out_rows[2][1], Value(int64_t{40}));
-}
-
-TEST(PartialSortTest, NullsFirstDefaultMatchesSortExecutor) {
-  // PRODUCTION BUG (fixed): PartialSort/PdqSort defaulted ASC to NULLS LAST
-  // while SortExecutor/TopN used NULLS FIRST for ascending keys, so the same
-  // ORDER BY produced different row order depending on the plan shape.
-  const Schema schema("vals", {Column("v", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{2})}),
-      Row({Value()}),
-      Row({Value(int64_t{1})}),
-  });
-
-  std::vector<SortExecutor::Key> keys = {
-      {ColumnValueExp("v"), true, std::nullopt}};
-
-  // SortExecutor (reference).
-  SortExecutor full_sort(src, schema, keys);
-  full_sort.MaterializePipeline();
-  std::vector<Value> reference;
-  Row row;
-  RowPosition rp;
-  while (full_sort.Next(&row, &rp)) {
-    reference.push_back(row[0]);
-  }
-  ASSERT_EQ(reference.size(), 3U);
-  EXPECT_TRUE(reference[0].IsNull());
-
-  // PartialSortExecutor with top_k large enough to see every row.
-  auto src2 = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{2})}),
-      Row({Value()}),
-      Row({Value(int64_t{1})}),
-  });
-  PartialSortExecutor partial_sort(src2, schema, keys, /*top_k=*/3, 0);
-  partial_sort.MaterializePipeline();
-  std::vector<Value> partial;
-  while (partial_sort.Next(&row, &rp)) {
-    partial.push_back(row[0]);
-  }
-  ASSERT_EQ(partial.size(), 3U);
-  EXPECT_TRUE(partial[0].IsNull());
-  EXPECT_EQ(partial[1], Value(int64_t{1}));
-  EXPECT_EQ(partial[2], Value(int64_t{2}));
-  EXPECT_TRUE(reference[0].IsNull() == partial[0].IsNull());
-  EXPECT_EQ(reference[1], partial[1]);
-  EXPECT_EQ(reference[2], partial[2]);
-}
-
-TEST(PartialSortTest, PartitionedBlockSorting) {
-  const Schema schema("numbers", {Column("val", ValueType::kInt64)});
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value(int64_t{30})}),
-      Row({Value(int64_t{10})}),
-      Row({Value(int64_t{20})}),
-      Row({Value(int64_t{90})}),
-      Row({Value(int64_t{80})}),
-      Row({Value(int64_t{70})}),
-  });
-
-  std::vector<SortExecutor::Key> keys = {
-      {ColumnValueExp("val"), true, std::nullopt}};
-
-  PartialSortExecutor partial_sort(src, schema, keys, /*top_k=*/0, /*offset=*/0,
-                                   /*block_size=*/3);
-
-  DataChunk destination(schema, 10);
-  size_t count = partial_sort.NextBatch(&destination);
-  ASSERT_EQ(count, 6);
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(0), Value(int64_t{10}));
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(1), Value(int64_t{20}));
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(2), Value(int64_t{30}));
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(3), Value(int64_t{70}));
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(4), Value(int64_t{80}));
-  EXPECT_EQ(destination.ColumnAt(0).ValueAt(5), Value(int64_t{90}));
 }
 
 TEST(PercentileContTest, OrderedSetAggregationLinearInterpolation) {
@@ -591,21 +474,6 @@ TEST(TopNExecutorTest, UnsignedInt64TopNMatchesSort) {
   EXPECT_EQ(results[1], u10);
 }
 
-TEST(GroupingSetsTest, OutputSchemaMatchesAggregateResultTypes) {
-  // Fixed: SUM(int) was declared Double and BIT_AND/MIN(int) VarChar while
-  // the executor emits child-typed values.
-  const Schema input("t", {Column("x", ValueType::kInt64)});
-  const Expression sum = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("x"));
-  const NamedExpression sum_named("s", sum);
-  Executor child = std::make_shared<ValuesExecutor>(
-      std::vector<Row>{Row({Value(int64_t{1})})});
-  GroupingSetsExecutor gs(std::move(child), input, {}, {{}}, {sum_named});
-  const Schema& out = gs.OutputSchema();
-  ASSERT_EQ(out.ColumnCount(), 1U);
-  EXPECT_EQ(out.GetColumn(0).Type(), ValueType::kInt64);
-}
-
 TEST(BatchNestedLoopJoinTest, PredicateErrorPropagatesForAntiJoin) {
   const Schema left_schema("l", {Column("a", ValueType::kInt64)});
   const Schema right_schema("r", {Column("b", ValueType::kInt64)});
@@ -1001,26 +869,6 @@ TEST(StatAggregateTest, ParallelPathLargeMixedInputMatchesSerial) {
 // partitioned bump arena, and the cardinality probe wrapper.
 // ---------------------------------------------------------------------------
 
-TEST(Max1RowExecutorTest, PassThroughEmptyAndMultiRow) {
-  Row row;
-  Max1RowExecutor single(std::make_shared<ValuesExecutor>(
-      std::vector<Row>{Row({Value(int64_t{7})})}));
-  ASSERT_TRUE(single.Next(&row, nullptr));
-  EXPECT_EQ(row[0], Value(int64_t{7}));
-  EXPECT_FALSE(single.Next(&row, nullptr));
-
-  Max1RowExecutor empty(std::make_shared<ValuesExecutor>(std::vector<Row>{}));
-  EXPECT_FALSE(empty.Next(&row, nullptr));
-
-  Max1RowExecutor two(std::make_shared<ValuesExecutor>(
-      std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})}));
-  EXPECT_TRUE(two.Next(&row, nullptr));
-  // The scalar-subquery contract: a second source row is a query error
-  // surfaced as a sticky status (Next returns false).
-  EXPECT_FALSE(two.Next(&row, nullptr));
-  EXPECT_NE(two.GetStatus(), Status::kSuccess);
-}
-
 TEST(PdqSortTest, MatchesOrderingContractAcrossShapes) {
   const Schema schema(
       "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
@@ -1083,308 +931,27 @@ TEST(PdqSortTest, TiebreakAndNullPlacement) {
   EXPECT_TRUE(none.empty());
 }
 
-TEST(NumaArenaPartitionTest, AlignmentAccountingResetAndMove) {
-  NumaArenaPartition arena(4096);
-  void* a = arena.Allocate(64);
-  ASSERT_NE(a, nullptr);
-  EXPECT_EQ(reinterpret_cast<uintptr_t>(a) % alignof(std::max_align_t), 0U);
-  void* b = arena.Allocate(100, 64);
-  ASSERT_NE(b, nullptr);
-  EXPECT_EQ(reinterpret_cast<uintptr_t>(b) % 64, 0U);
-  EXPECT_GE(arena.AllocatedBytes(), 164U);
-  EXPECT_GE(arena.CapacityBytes(), arena.AllocatedBytes());
-
-  // Requests larger than one block grow the capacity without failing.
-  void* big = arena.Allocate(size_t{10} * 4096U);
-  ASSERT_NE(big, nullptr);
-  EXPECT_GE(arena.CapacityBytes(), (size_t{10} * 4096U));
-  EXPECT_GE(arena.AllocatedBytes(), ((size_t{10} * 4096U) + 164U));
-
-  // Reset clears the accounting but keeps capacity usable.
-  arena.Reset();
-  EXPECT_EQ(arena.AllocatedBytes(), 0U);
-  void* again = arena.Allocate(128);
-  ASSERT_NE(again, nullptr);
-
-  // Moving hands the buffers over; the target keeps serving allocations.
-  NumaArenaPartition moved(std::move(arena));
-  void* post_move = moved.Allocate(32);
-  ASSERT_NE(post_move, nullptr);
-  EXPECT_GE(moved.AllocatedBytes(), 160U);
-}
-
-TEST(CardinalityProbeTest, PassesRowsThroughAndCountsBothPullStyles) {
-  CardinalityProbe probe(std::make_shared<ValuesExecutor>(std::vector<Row>{
-                             Row({Value(int64_t{1})}), Row({Value(int64_t{2})}),
-                             Row({Value(int64_t{3})})}),
-                         "scan", 6.0);
-  Row row;
-  size_t pulled = 0;
-  while (probe.Next(&row, nullptr)) {
-    ++pulled;
-  }
-  EXPECT_EQ(pulled, 3U);
-  EXPECT_EQ(probe.ActualRowCount(), 3U);
-  // Estimate was double the actual cardinality: ratio 2x.
-  EXPECT_DOUBLE_EQ(probe.CardinalityError(), 2.0);
-
-  // The batch path counts through the same counter.
-  const Schema schema("t", {Column("x", ValueType::kInt64)});
-  CardinalityProbe batch_probe(
-      std::make_shared<ValuesExecutor>(
-          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})}),
-      "batch", 0.0);
-  DataChunk chunk(schema, 8);
-  EXPECT_EQ(batch_probe.NextBatch(&chunk, 8), 2U);
-  EXPECT_EQ(batch_probe.ActualRowCount(), 2U);
-  // Without an estimate the error metric reports the raw row count.
-  EXPECT_DOUBLE_EQ(batch_probe.CardinalityError(), 2.0);
-}
-
-// ---------------------------------------------------------------------------
-// GroupingSetsExecutor: explicit sets / ROLLUP / CUBE expansion, empty-input
-// semantics, DISTINCT aggregates, and per-aggregate WHERE filters.
-// ---------------------------------------------------------------------------
-
-namespace {
-
-Schema GroupingSetsInputSchema() {
-  return Schema(
-      "gs", {Column("a", ValueType::kVarChar), Column("b", ValueType::kInt64)});
-}
-
-std::shared_ptr<ValuesExecutor> GroupingSetsSource() {
-  return std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value("x"), Value(int64_t{1})}),
-      Row({Value("x"), Value(int64_t{2})}),
-      Row({Value("y"), Value(int64_t{1})}),
-  });
-}
-
-std::vector<NamedExpression> GroupingSetsKeys() {
-  return {NamedExpression("a", ColumnValueExp("a")),
-          NamedExpression("b", ColumnValueExp("b"))};
-}
-
-}  // namespace
-
-TEST(GroupingSetsExecutorTest, ExplicitSetsNullOutInactiveKeys) {
-  // {{0,1},{1},{} } -> per (a,b), per b, grand total.
-  GroupingSetsExecutor gs(
-      GroupingSetsSource(), GroupingSetsInputSchema(), GroupingSetsKeys(),
-      {{0, 1}, {1}, {}},
-      {NamedExpression(
-           "cnt", std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                        ColumnValueExp("*"))),
-       NamedExpression("s", std::make_shared<AggregateExpression>(
-                                AggregationType::kSum, ColumnValueExp("b")))});
-
-  std::vector<Row> out;
-  Row row;
-  while (gs.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  ASSERT_EQ(out.size(), 6U);
-  // (a,b) groups, first-seen order.
-  EXPECT_EQ(out[0], (Row({Value("x"), Value(int64_t{1}), Value(int64_t{1}),
-                          Value(int64_t{1})})));
-  EXPECT_EQ(out[1], (Row({Value("x"), Value(int64_t{2}), Value(int64_t{1}),
-                          Value(int64_t{2})})));
-  EXPECT_EQ(out[2], (Row({Value("y"), Value(int64_t{1}), Value(int64_t{1}),
-                          Value(int64_t{1})})));
-  // b-only groups: key 0 is NULLed.
-  EXPECT_EQ(out[3], (Row({Value(), Value(int64_t{1}), Value(int64_t{2}),
-                          Value(int64_t{2})})));
-  EXPECT_EQ(out[4], (Row({Value(), Value(int64_t{2}), Value(int64_t{1}),
-                          Value(int64_t{2})})));
-  // Grand total.
-  EXPECT_EQ(out[5],
-            (Row({Value(), Value(), Value(int64_t{3}), Value(int64_t{4})})));
-}
-
-TEST(GroupingSetsExecutorTest, RollupEmitsHierarchyThenTotal) {
-  GroupingSetsExecutor gs = GroupingSetsExecutor::Rollup(
-      GroupingSetsSource(), GroupingSetsInputSchema(), GroupingSetsKeys(),
-      {NamedExpression(
-          "cnt", std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                       ColumnValueExp("*")))});
-
-  std::vector<Row> out;
-  Row row;
-  while (gs.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  // (a,b) x3, (a) x2, () x1.
-  ASSERT_EQ(out.size(), 6U);
-  EXPECT_EQ(out[0].values_.size(), 3U);
-  EXPECT_FALSE(out[0][1].IsNull());
-  EXPECT_TRUE(out[3][1].IsNull());  // (a) level drops b
-  EXPECT_FALSE(out[3][0].IsNull());
-  EXPECT_TRUE(out[5][0].IsNull());  // grand total drops both
-  EXPECT_TRUE(out[5][1].IsNull());
-  EXPECT_EQ(out[5][2], Value(int64_t{3}));
-}
-
-TEST(GroupingSetsExecutorTest, CubeEmitsAllSubsetsLargestFirst) {
-  GroupingSetsExecutor gs = GroupingSetsExecutor::Cube(
-      GroupingSetsSource(), GroupingSetsInputSchema(), GroupingSetsKeys(),
-      {NamedExpression(
-          "cnt", std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                       ColumnValueExp("*")))});
-
-  std::vector<Row> out;
-  Row row;
-  while (gs.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  // Set order: {0,1}, {1}, {0}, {} (popcount desc, mask desc).
-  // Sizes: 3 groups + 2 b-only + 2 a-only + 1 total = 8 rows.
-  ASSERT_EQ(out.size(), 8U);
-  EXPECT_FALSE(out[0][0].IsNull());
-  EXPECT_FALSE(out[0][1].IsNull());
-  // {1} block: a NULL, b set.
-  EXPECT_TRUE(out[3][0].IsNull());
-  EXPECT_FALSE(out[3][1].IsNull());
-  // {0} block: a set, b NULL.
-  EXPECT_FALSE(out[5][0].IsNull());
-  EXPECT_TRUE(out[5][1].IsNull());
-  // {} grand total.
-  EXPECT_TRUE(out[7][0].IsNull());
-  EXPECT_TRUE(out[7][1].IsNull());
-  EXPECT_EQ(out[7][2], Value(int64_t{3}));
-}
-
-TEST(GroupingSetsExecutorTest, EmptyInputOnlyGrandTotalSetEmits) {
-  GroupingSetsExecutor gs(
-      std::make_shared<ValuesExecutor>(std::vector<Row>{}),
-      GroupingSetsInputSchema(), GroupingSetsKeys(), {{0}, {}},
-      {NamedExpression(
-           "cnt", std::make_shared<AggregateExpression>(AggregationType::kCount,
-                                                        ColumnValueExp("*"))),
-       NamedExpression("s", std::make_shared<AggregateExpression>(
-                                AggregationType::kSum, ColumnValueExp("b")))});
-
-  std::vector<Row> out;
-  Row row;
-  while (gs.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  // Non-empty grouping sets produce nothing over zero rows; the grand
-  // total emits COUNT=0 / SUM=NULL.
-  ASSERT_EQ(out.size(), 1U);
-  EXPECT_EQ(out[0], (Row({Value(), Value(), Value(int64_t{0}), Value()})));
-}
-
-TEST(GroupingSetsExecutorTest, DistinctAggregatesDeduplicatePerGroup) {
-  auto src = std::make_shared<ValuesExecutor>(std::vector<Row>{
-      Row({Value("x"), Value(int64_t{10})}),
-      Row({Value("x"), Value(int64_t{10})}),
-      Row({Value("x"), Value(int64_t{20})}),
-      Row({Value("y"), Value()}),
-      Row({Value("y"), Value()}),
-  });
-  const Schema schema(
-      "d", {Column("a", ValueType::kVarChar), Column("b", ValueType::kInt64)});
-
-  auto count_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kCount, ColumnValueExp("b"), /*distinct=*/true);
-  auto sum_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("b"), true);
-  auto avg_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kAvg, ColumnValueExp("b"), true);
-  auto min_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kMin, ColumnValueExp("b"), true);
-  auto max_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kMax, ColumnValueExp("b"), true);
-  auto any_dist = std::make_shared<AggregateExpression>(
-      AggregationType::kAnyValue, ColumnValueExp("b"), true);
-
-  GroupingSetsExecutor gs(
-      src, schema, {NamedExpression("a", ColumnValueExp("a"))}, {{0}},
-      {NamedExpression("cnt", count_dist), NamedExpression("s", sum_dist),
-       NamedExpression("avg", avg_dist), NamedExpression("min", min_dist),
-       NamedExpression("max", max_dist), NamedExpression("any", any_dist)});
-
-  std::vector<Row> out;
-  Row row;
-  while (gs.Next(&row, nullptr)) {
-    out.push_back(std::move(row));
-  }
-  ASSERT_EQ(out.size(), 2U);
-  // x: distinct {10, 20}.
-  EXPECT_EQ(out[0][1], Value(int64_t{2}));
-  EXPECT_EQ(out[0][2], Value(int64_t{30}));
-  EXPECT_EQ(out[0][3], Value(15.0));
-  EXPECT_EQ(out[0][4], Value(int64_t{10}));
-  EXPECT_EQ(out[0][5], Value(int64_t{20}));
-  // ANY_VALUE over an unordered distinct set is any one of the members.
-  EXPECT_TRUE(out[0][6] == Value(int64_t{10}) ||
-              out[0][6] == Value(int64_t{20}));
-  // y: only NULLs -> every distinct aggregate sees an empty set.
-  EXPECT_EQ(out[1][1], Value(int64_t{0}));
-  EXPECT_TRUE(out[1][2].IsNull());
-  EXPECT_TRUE(out[1][3].IsNull());
-  EXPECT_TRUE(out[1][4].IsNull());
-  EXPECT_TRUE(out[1][5].IsNull());
-  EXPECT_TRUE(out[1][6].IsNull());
-}
-
-TEST(GroupingSetsExecutorTest, WhereFilterSkipsRowsAndBatchDumpWork) {
-  auto filter =
-      BinaryExpressionExp(ColumnValueExp("b"), BinaryOperation::kGreaterThan,
-                          ConstantValueExp(Value(int64_t{1})));
-  auto filtered_sum = std::make_shared<AggregateExpression>(
-      AggregationType::kSum, ColumnValueExp("b"));
-  filtered_sum->SetWhereFilter(filter);
-  // The unfiltered AVG still sees every row of the group.
-  auto avg = std::make_shared<AggregateExpression>(AggregationType::kAvg,
-                                                   ColumnValueExp("b"));
-
-  GroupingSetsExecutor gs(
-      GroupingSetsSource(), GroupingSetsInputSchema(),
-      {NamedExpression("a", ColumnValueExp("a"))}, {{0}},
-      {NamedExpression("fs", filtered_sum), NamedExpression("avg", avg)});
-
-  DataChunk chunk(gs.OutputSchema(), 8);
-  EXPECT_EQ(gs.NextBatch(&chunk, 8), 2U);
-  EXPECT_EQ(gs.NextBatch(&chunk, 8), 0U);
-  // Materialization happened inside the batch pull; drain via Next too.
-  Row row;
-  GroupingSetsExecutor gs2(
-      GroupingSetsSource(), GroupingSetsInputSchema(),
-      {NamedExpression("a", ColumnValueExp("a"))}, {{0}},
-      {NamedExpression("fs", filtered_sum), NamedExpression("avg", avg)});
-  ASSERT_TRUE(gs2.Next(&row, nullptr));
-  // Group "x": only b=2 passes the filter (fs=2), AVG still sees {1, 2}.
-  EXPECT_EQ(row[0], Value("x"));
-  EXPECT_EQ(row[1], Value(int64_t{2}));
-  EXPECT_EQ(row[2], Value(1.5));
-  ASSERT_TRUE(gs2.Next(&row, nullptr));
-  // Group "y": nothing passes the filter -> SUM is NULL, AVG sees {1}.
-  EXPECT_EQ(row[0], Value("y"));
-  EXPECT_TRUE(row[1].IsNull());
-  EXPECT_EQ(row[2], Value(1.0));
-  std::ostringstream oss;
-  gs2.Dump(oss, 0);
-  EXPECT_NE(oss.str().find("GroupingSetsExecutor"), std::string::npos);
-}
-
 // A child executor that fails the drain after a bounded number of rows, so
 // drain-error propagation can be exercised without a real I/O fault.
 class DrainFailingRows final : public ExecutorBase {
  public:
   DrainFailingRows(std::vector<Row> rows, size_t fail_after)
       : rows_(std::move(rows)), fail_after_(fail_after) {}
-  bool Next(Row* dst, RowPosition* rp) override {
+  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
+    destination->Reset(Schema("t", {Column("v", ValueType::kInt64)}),
+                       std::min(max_rows, rows_.size()));
     if (emitted_ >= fail_after_) {
-      return FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      (void)FailWith(StatusError(StatusCode::kIOError, "source failed"));
+      return 0;
     }
-    *dst = rows_[emitted_];
-    if (rp != nullptr) {
-      *rp = RowPosition(0, static_cast<slot_t>(emitted_));
+    const size_t limit =
+        std::min({max_rows, fail_after_ - emitted_, rows_.size() - emitted_});
+    for (size_t i = 0; i < limit; ++i) {
+      destination->Append(rows_[emitted_],
+                          RowPosition(0, static_cast<slot_t>(emitted_)));
+      ++emitted_;
     }
-    ++emitted_;
-    return true;
+    return limit;
   }
   void Dump(std::ostream& out, int /*indent*/) const override {
     out << "DrainFailingRows";
@@ -1415,55 +982,6 @@ TEST(DrainErrorPropagationTest, AggregationJitSumForwardsChildError) {
   EXPECT_NE(agg.GetStatus(), Status::kSuccess);
 }
 
-TEST(DrainErrorPropagationTest, GroupingSetsForwardsChildError) {
-  const Schema schema("t", {Column("k", ValueType::kInt64)});
-  GroupingSetsExecutor gs(
-      std::make_shared<DrainFailingRows>(
-          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})},
-          1),
-      schema, {NamedExpression("k", ColumnValueExp("k"))}, {{0}},
-      {NamedExpression("total",
-                       std::make_shared<AggregateExpression>(
-                           AggregationType::kCount, ColumnValueExp("k")))});
-
-  Row row;
-  EXPECT_FALSE(gs.Next(&row, nullptr));
-  EXPECT_NE(gs.GetStatus(), Status::kSuccess);
-}
-
-TEST(DrainErrorPropagationTest, PartialAggregateForwardsChildError) {
-  const Schema schema("t", {Column("v", ValueType::kInt64)});
-  PartialAggregate partial(
-      std::make_shared<DrainFailingRows>(
-          std::vector<Row>{Row({Value(int64_t{7})})}, 1),
-      schema,
-      {NamedExpression("total",
-                       std::make_shared<AggregateExpression>(
-                           AggregationType::kSum, ColumnValueExp("v")))});
-
-  Row row;
-  EXPECT_FALSE(partial.Next(&row, nullptr));
-  EXPECT_NE(partial.GetStatus(), Status::kSuccess);
-}
-
-TEST(DrainErrorPropagationTest, FinalizeAggregateForwardsChildError) {
-  // FinalizeAggregate consumes partial states through the same void
-  // Materialize path; the child's sticky error must latch into the
-  // finalize executor's own status instead of reading as clean EOF.
-  const Schema partial_schema("p", {Column("sum_v", ValueType::kInt64)});
-  FinalizeAggregate finalize(
-      std::make_shared<DrainFailingRows>(
-          std::vector<Row>{Row({Value(int64_t{7})})}, 1),
-      partial_schema,
-      {NamedExpression("total",
-                       std::make_shared<AggregateExpression>(
-                           AggregationType::kSum, ColumnValueExp("sum_v")))});
-
-  Row row;
-  EXPECT_FALSE(finalize.Next(&row, nullptr));
-  EXPECT_NE(finalize.GetStatus(), Status::kSuccess);
-}
-
 TEST(DrainErrorPropagationTest, CrossJoinForwardsLeftError) {
   const Schema left_schema("l", {Column("v", ValueType::kInt64)});
   const Schema right_schema("r", {Column("w", ValueType::kInt64)});
@@ -1481,21 +999,6 @@ TEST(DrainErrorPropagationTest, CrossJoinForwardsLeftError) {
   // instead of ending as a clean EOF with a truncated right pairing.
   EXPECT_FALSE(join.Next(&row, nullptr));
   EXPECT_NE(join.GetStatus(), Status::kSuccess);
-}
-
-TEST(DrainErrorPropagationTest, ReturningForwardsSourceError) {
-  const Schema schema("t", {Column("v", ValueType::kInt64)});
-  ReturningExecutor returning(
-      std::make_shared<DrainFailingRows>(
-          std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})},
-          1),
-      schema, {NamedExpression("v", ColumnValueExp("v"))});
-
-  Row row;
-  ASSERT_TRUE(returning.Next(&row, nullptr));
-  EXPECT_EQ(row[0], Value(int64_t{1}));
-  EXPECT_FALSE(returning.Next(&row, nullptr));
-  EXPECT_NE(returning.GetStatus(), Status::kSuccess);
 }
 
 }  // namespace tinylamb

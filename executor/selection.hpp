@@ -43,7 +43,6 @@ class Selection : public ExecutorBase {
   Selection& operator=(Selection&&) = delete;
   ~Selection() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
 
@@ -60,8 +59,6 @@ class Selection : public ExecutorBase {
   Schema schema_;
   Executor src_;
   DataChunk input_batch_;
-  DataChunk output_batch_;
-  size_t output_offset_{0};
   size_t skipped_batches_{0};
   std::optional<BytecodeProgram> bytecode_;
   std::optional<JitInt64Kernels> jit_filter_;

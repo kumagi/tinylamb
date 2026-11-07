@@ -47,21 +47,23 @@ Status RecursiveCteExecutor::Initialize() {
   return rel.ForEachRow([&](const Row& r) { rows_.push_back(r); });
 }
 
-bool RecursiveCteExecutor::Next(Row* dst, RowPosition* rp) {
+size_t RecursiveCteExecutor::NextBatch(DataChunk* destination,
+                                       size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
   if (!initialized_) {
     const Status st = Initialize();
     if (st != Status::kSuccess) {
-      return FailWith(st);
+      FailWith(st);
+      return 0;
     }
   }
-  if (row_idx_ >= rows_.size()) {
-    return false;
+  while (destination->Size() < max_rows && row_idx_ < rows_.size()) {
+    destination->Append(rows_[row_idx_++]);
   }
-  *dst = rows_[row_idx_++];
-  if (rp != nullptr) {
-    *rp = RowPosition();
-  }
-  return true;
+  return destination->Size();
 }
 
 void RecursiveCteExecutor::Dump(std::ostream& o, int indent) const {

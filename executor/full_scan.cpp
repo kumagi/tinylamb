@@ -26,6 +26,8 @@
 #include <utility>
 
 #include "executor/data_chunk.hpp"
+#include "table/full_scan_iterator.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 
 namespace tinylamb {
@@ -33,7 +35,8 @@ FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows,
                    bool lock_rows, bool wait_for_write_intent,
                    std::optional<ColumnName> clustered_order,
                    std::optional<std::vector<slot_t>> projection)
-    : table_(&table),
+    : txn_(&txn),
+      table_(&table),
       iter_([&]() {
         TableScanOptions options;
         options.lock_rows = lock_rows;
@@ -84,31 +87,11 @@ bool FullScan::AttachRuntimeFilter(
   return true;
 }
 
-bool FullScan::Next(Row* dst, RowPosition* rp) {
-  started_ = true;
-  if (emitted_ >= max_rows_) {
-    return false;
-  }
-  if (!iter_.IsValid()) {
-    // Iterator contract (table/iterator_base.hpp): a scan that stops early
-    // latches the failure in GetStatus(). Treating it as plain exhaustion
-    // would serve a truncated result set as a success.
-    const Status status = iter_.GetStatus();
-    if (status != Status::kSuccess) {
-      return FailWith(status);
-    }
-    return false;
-  }
-  *dst = *iter_;
-  if (rp != nullptr) {
-    *rp = iter_.Position();
-  }
-  ++iter_;
-  ++emitted_;
-  return true;
-}
-
 size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
+  if (typed_folded_) {
+    destination->Reset();
+    return 0;
+  }
   started_ = true;
   const size_t remaining = max_rows_ - std::min(emitted_, max_rows_);
   const size_t batch_limit = std::min(max_rows, remaining);
@@ -121,7 +104,9 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
     ++emitted_;
   }
   if (!iter_.IsValid() && destination->Size() < batch_limit) {
-    // See FullScan::Next: a mid-scan iterator failure is not EOF.
+    // Iterator contract (table/iterator_base.hpp): a scan that stops early
+    // latches the failure in GetStatus(). Treating it as plain exhaustion
+    // would serve a truncated result set as a success.
     const Status status = iter_.GetStatus();
     if (status != Status::kSuccess) {
       FailWith(status);
@@ -131,8 +116,74 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
   return destination->Size();
 }
 
+StatusOr<bool> FullScan::TryFoldTypedBatches(
+    const std::function<Status(size_t, const TypedCellBatch&)>& consume) {
+  if (started_) return false;
+  for (size_t i = 0; i < output_schema_.ColumnCount(); ++i) {
+    const ValueType type = output_schema_.GetColumn(i).Type();
+    if (type != ValueType::kInt64 && type != ValueType::kDate &&
+        type != ValueType::kDouble)
+      return false;
+  }
+  if (output_schema_.ColumnCount() == 0) return false;
+  started_ = true;
+  typed_folded_ = true;
+  TypedCellBatch batch;
+  while (emitted_ < max_rows_) {
+    const size_t limit = std::min(kDefaultVectorSize, max_rows_ - emitted_);
+    const size_t count = iter_.DecodeNextTypedBatch(&batch, limit);
+    iter_.DropPageLatch();
+    if (iter_.GetStatus() != Status::kSuccess) {
+      FailWith(iter_.GetStatus());
+      return iter_.GetStatus();
+    }
+    if (count == 0) {
+      if (iter_.GetStatus() != Status::kSuccess) {
+        FailWith(iter_.GetStatus());
+        return iter_.GetStatus();
+      }
+      if (iter_.IsValid()) {
+        const auto error = StatusError(StatusCode::kRuntimeError,
+                                       "typed scan stopped before exhaustion");
+        FailWith(error);
+        return error;
+      }
+      break;
+    }
+    emitted_ += count;
+    const Status status = consume(0, batch);
+    if (status != Status::kSuccess) {
+      FailWith(status);
+      return status;
+    }
+  }
+  return true;
+}
+
+StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
+                                                      Runtime runtime) const {
+  if (txn_ == nullptr || table_ == nullptr) {
+    ExecResult rejected;
+    rejected.status = Status::kNotImplemented;
+    rejected.rejected = true;
+    rejected.coverage = Coverage::kNone;
+    return rejected;
+  }
+  std::shared_ptr<const LSTableStore> store =
+      GetOrBuildLSTableStore(*txn_, *table_, /*allow_lazy_build=*/true);
+  if (store == nullptr) {
+    ExecResult rejected;
+    rejected.status = Status::kNotImplemented;
+    rejected.rejected = true;
+    rejected.coverage = Coverage::kNone;
+    return rejected;
+  }
+  return store->ExecuteFragment(fragment, runtime);
+}
+
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
+  if (typed_folded_) o << " fused-typed-fold";
   if (max_rows_ != std::numeric_limits<size_t>::max()) {
     o << " (max rows: " << max_rows_ << ")";
   }

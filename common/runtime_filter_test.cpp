@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/query_parallelism.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -48,6 +49,64 @@ std::shared_ptr<const RuntimeFilterGroup> ExactOf(
     builder.Observe(key);
   }
   return builder.Build();
+}
+
+TEST(QueryParallelismBudgetTest, AdmissionSharesCpuAndRestoresNestedScopes) {
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 8U);
+  std::atomic<size_t> active{4};
+  {
+    ScopedQueryParallelismBudget outer(&active, 8);
+    EXPECT_EQ(QueryParallelWorkerLimit(8), 2U);
+    active.store(16);
+    EXPECT_EQ(QueryParallelWorkerLimit(8), 1U);
+    {
+      ScopedQueryParallelismBudget nested(nullptr, 1);
+      EXPECT_EQ(QueryParallelWorkerLimit(8), 8U);
+    }
+    EXPECT_EQ(QueryParallelWorkerLimit(8), 1U);
+    active.store(1);
+    EXPECT_EQ(QueryParallelWorkerLimit(8), 8U);
+    std::thread independent([] { EXPECT_EQ(QueryParallelWorkerLimit(8), 8U); });
+    independent.join();
+  }
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 8U);
+}
+
+TEST(QueryParallelismBudgetTest,
+     MixedWorkUsesRequestParallelismBeforeAnalyticTeams) {
+  std::atomic<size_t> pending{4}, reads{1};
+  ScopedQueryParallelismBudget budget(&pending, 8, &reads);
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 1U);
+  pending.store(16);
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 1U);
+  pending.store(1);
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 8U);
+  pending.store(2);
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 1U);
+  reads.store(2);
+  EXPECT_EQ(QueryParallelWorkerLimit(8), 4U);
+  EXPECT_EQ(QueryParallelWorkerLimit(2), 2U);
+}
+
+TEST(RuntimeFilterTest, ExactKeyEnclosureKeepsConjunctiveMembership) {
+  std::vector<std::unique_ptr<RuntimeFilter>> parts;
+  parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
+      std::vector<int64_t>{1, 3, 5, 7}));
+  parts.push_back(
+      std::make_unique<ExactSetRuntimeFilter>(std::vector<int64_t>{3, 5, 9}));
+  parts.push_back(std::make_unique<MinMaxRuntimeFilter>(4, 10, 3));
+  const RuntimeFilterGroup group(std::move(parts));
+  ASSERT_NE(group.ExactKeys(), nullptr);
+  EXPECT_EQ(*group.ExactKeys(), std::vector<int64_t>({3, 5, 9}));
+  for (int64_t key = 0; key < 12; ++key) {
+    if (!group.Reject(key)) {
+      EXPECT_TRUE(std::binary_search(group.ExactKeys()->begin(),
+                                     group.ExactKeys()->end(), key));
+    }
+  }
+  EXPECT_EQ(Oracle(group, *group.ExactKeys()), std::set<int64_t>({5}));
+  const RuntimeFilterGroup empty;
+  EXPECT_EQ(empty.ExactKeys(), nullptr);
 }
 
 TEST(RuntimeFilterTest, EmptyBuildPublishesNothingUnlessRejectAllAllowed) {

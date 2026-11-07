@@ -123,9 +123,7 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   NL/LookupJoin/LateMaterializationJoin, outer NL, StreamAgg,
   `sort` / `sort_external_merge` (the buffered vs external-merge halves of one
   ORDER BY, see `sort_plan.hpp`),
-  `sort_incremental`, `lsm_scan` (LSM/WiscKey scan: `plan/lsm_scan_plan.*`
-  over a caller-owned `LSMTree`; the `kLsmScan` node is built by plan-level
-  callers and tests — SQL is not wired),
+  `sort_incremental`,
   multi-index covering scan candidates (see
   `multi_index_covering_scan_plan.hpp`); normal single-table queries use
   Memo, with only `OptimizeMinMaxIndex` retaining exact endpoint lookup).
@@ -183,8 +181,13 @@ alias; without that merge the filter runs twice per row.  Revisit (a fused
 `CalcPlan`) only if profiling shows the Selection→Projection batch copy
 dominating.
 
-Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 46 physical
+Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 45 physical
 registrations. Exploration retries dependent parents after a child changes.
 `OptimizeGrouping` lowers the supported single-table grouped SQL slice into the
 same scan/aggregate memo; `QueryData::grouping_keys_` carries resolved keys.
 Do not treat a rule tested only with an invented payload as SQL integration.
+
+`IndexScanPlan::LimitHint()` carries downstream prefix demand as scheduling
+metadata. It never limits visited rows (residuals may reject them). The factory
+keeps such scans serial and omits the synchronous look-ahead cursor; the
+`LimitExecutor` passes a bounded NextBatch request through projections/filters.

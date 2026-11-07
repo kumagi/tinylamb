@@ -16,60 +16,41 @@
 
 #include "page/page_ref.hpp"
 
-#include <atomic>
-#include <cassert>
-#include <cstdint>
 #include <ostream>
+#include <thread>
 
-#include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "page/page.hpp"
-#include "page/page_pool.hpp"
+#include "page/row_page.hpp"
 
 namespace tinylamb {
-namespace {
-void ReleasePin(std::atomic<uint32_t>* pin_count, page_id_t page_id) {
-  if (pin_count == nullptr) {
-    return;
-  }
-  uint32_t pins = pin_count->load(std::memory_order_relaxed);
-  while (pins != 0) {
-    if (pin_count->compare_exchange_weak(pins, pins - 1,
-                                         std::memory_order_release,
-                                         std::memory_order_relaxed)) {
-      return;
+
+PageRef::PageRef(Page* page, std::shared_mutex* page_lock, bool shared)
+    : page_(page) {
+  if (page_lock != nullptr) {
+    if (shared) {
+      shared_page_lock_ = std::shared_lock<std::shared_mutex>(*page_lock);
+    } else {
+      exclusive_page_lock_ = std::unique_lock<std::shared_mutex>(*page_lock);
+      if (page_ != nullptr) {
+        page_->SetExclusiveOwner(std::this_thread::get_id());
+      }
     }
   }
-  LOG(ERROR) << "unpin underflow on page " << page_id;
 }
-}  // namespace
+
+RowPage& PageRef::GetRowPage() { return page_->body.row_page; }
 
 void PageRef::PageUnlock() {
-  assert(page_);
-  assert(pool_);
   if (exclusive_page_lock_.owns_lock()) {
-    // Read the page id while the latch is still held: Page::PageInit rewrites
-    // page_id under an exclusive latch, so reading it after unlock races a
-    // concurrent re-init of the same page (TSAN-observed in parallel recovery
-    // replay: PageInit write vs PageUnlock's unlocked PageID read).
-    const page_id_t id = page_->PageID();
+    if (page_ != nullptr) {
+      page_->ClearExclusiveOwner();
+    }
     exclusive_page_lock_.unlock();
-    ReleasePin(pin_count_, id);
-  } else if (shared_page_lock_.owns_lock()) {
-    const page_id_t id = page_->PageID();
-    shared_page_lock_.unlock();
-    ReleasePin(pin_count_, id);
   }
-}
-
-RowPage& PageRef::GetRowPage() {
-  assert(page_->type == PageType::kRowPage);
-  return page_->body.row_page;
-}
-
-FreePage& PageRef::GetFreePage() {
-  assert(page_->type == PageType::kFreePage);
-  return page_->body.free_page;
+  if (shared_page_lock_.owns_lock()) {
+    shared_page_lock_.unlock();
+  }
+  page_ = nullptr;
 }
 
 PageRef::~PageRef() {
@@ -79,10 +60,10 @@ PageRef::~PageRef() {
 }
 
 std::ostream& operator<<(std::ostream& o, const PageRef& p) {
-  if (p.page_ == nullptr) {
-    o << "{Ref: null}";
+  if (p.IsNull()) {
+    o << "PageRef(NULL)";
   } else {
-    o << "{Ref: " << p.page_->PageID() << "}";
+    o << *p.page_;
   }
   return o;
 }

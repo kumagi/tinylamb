@@ -32,6 +32,7 @@ class JitInt64Kernels {
   static std::optional<JitInt64Kernels> CompileSum();
   static std::optional<JitInt64Kernels> CompileProjectionChecked();
   static std::optional<JitInt64Kernels> CompileSumChecked();
+  static void WarmUpAll();
 
   JitInt64Kernels(JitInt64Kernels&&) noexcept;
   JitInt64Kernels& operator=(JitInt64Kernels&&) noexcept;

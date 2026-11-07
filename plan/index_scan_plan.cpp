@@ -215,13 +215,11 @@ TableStatistics PointUnionStats(
 
 }  // namespace
 
-IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
-                             const TableStatistics& ts,
-                             std::vector<Value> begin_key,
-                             std::vector<Value> end_key, bool ascending,
-                             Expression where,
-                             std::vector<ColumnName> provided_order,
-                             bool lock_rows, bool wait_for_write_intent)
+IndexScanPlan::IndexScanPlan(
+    const Table& table, const Index& index, const TableStatistics& ts,
+    std::vector<Value> begin_key, std::vector<Value> end_key, bool ascending,
+    Expression where, std::vector<ColumnName> provided_order, bool lock_rows,
+    bool wait_for_write_intent, size_t limit_hint)
     : table_(table),
       index_(index),
       stats_(begin_key.empty() && end_key.empty()
@@ -232,6 +230,7 @@ IndexScanPlan::IndexScanPlan(const Table& table, const Index& index,
       ascending_(ascending),
       lock_rows_(lock_rows),
       wait_for_write_intent_(wait_for_write_intent),
+      limit_hint_(limit_hint),
       where_(std::move(where)),
       provided_order_(std::move(provided_order)) {}
 
@@ -525,7 +524,10 @@ ReboundIndexKeys ReboundIndexKeysFromPredicate(const Expression& predicate,
       if (range->second.max) {
         keys.end_key.push_back(*range->second.max);
       }
-    } else if (!keys.begin_key.empty() && range->second.max) {
+    } else if (range->second.max) {
+      // Empty begin is the unbounded lower endpoint, matching the optimizer's
+      // first-key upper-only range. Rebinding must not widen it to a full
+      // index walk on every cache hit.
       keys.end_key.push_back(*range->second.max);
     }
     break;

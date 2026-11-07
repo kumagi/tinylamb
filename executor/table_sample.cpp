@@ -282,21 +282,6 @@ Status TableSampleExecutor::MaterializeReservoir() {
   return reservoir_status_;
 }
 
-bool TableSampleExecutor::Next(Row* destination, RowPosition* position) {
-  if (output_offset_ >= output_batch_.Size()) {
-    if (NextBatch(&output_batch_) == 0) {
-      return false;
-    }
-    output_offset_ = 0;
-  }
-  *destination = output_batch_.RowAt(output_offset_);
-  if (position != nullptr) {
-    *position = output_batch_.PositionAt(output_offset_);
-  }
-  ++output_offset_;
-  return true;
-}
-
 size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   if (max_rows == 0) {
     return 0;

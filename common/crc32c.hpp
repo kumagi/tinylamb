@@ -27,6 +27,8 @@
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_acle.h>
 #endif
 
 namespace tinylamb {
@@ -48,7 +50,6 @@ namespace detail {
 #if defined(__x86_64__) || defined(__i386__)
 [[gnu::target("sse4.2")]] [[nodiscard]] uint32_t Crc32CRawHardware(
     uint32_t crc, std::span<const uint8_t> data);
-#endif
 
 // The crc32 register is GF(2)-linear in its input bits, so a register advanced
 // by k zero bytes is a linear image: adv(r, k) = XOR over set bits j of r of
@@ -271,7 +272,6 @@ struct AdvanceByteTable {
 // far cheaper than the 32k+ cycle bit loop for a 4 KiB page.
 [[gnu::target("sse4.2")]] [[nodiscard]] inline uint32_t Crc32CRawHardware(
     uint32_t crc, std::span<const uint8_t> data) {
-#if defined(__x86_64__) || defined(__i386__)
   // A/B hatch: TINYLAMB_DISABLE_CRC_LANES=1 restores the plain chained loop.
   static const bool lanes_disabled =
       std::getenv("TINYLAMB_DISABLE_CRC_LANES") != nullptr;
@@ -302,10 +302,38 @@ struct AdvanceByteTable {
     ++p;
   }
   return crc;
-#else
-  return Crc32CRawSoftware(crc, data);
-#endif
 }
+#elif defined(__aarch64__)
+[[gnu::target("+crc")]] [[nodiscard]] inline uint32_t Crc32CRawHardware(
+    uint32_t crc, std::span<const uint8_t> data) {
+  const uint8_t* p = data.data();
+  const uint8_t* const end = data.data() + data.size();
+  while (reinterpret_cast<uintptr_t>(p) + 8 <=
+         reinterpret_cast<uintptr_t>(end)) {
+    uint64_t chunk = 0;
+    __builtin_memcpy(&chunk, p, sizeof(chunk));
+    crc = __crc32cd(crc, chunk);
+    p += 8;
+  }
+  while (reinterpret_cast<uintptr_t>(p) + 4 <=
+         reinterpret_cast<uintptr_t>(end)) {
+    uint32_t chunk = 0;
+    __builtin_memcpy(&chunk, p, sizeof(chunk));
+    crc = __crc32cw(crc, chunk);
+    p += 4;
+  }
+  while (p < end) {
+    crc = __crc32cb(crc, *p);
+    ++p;
+  }
+  return crc;
+}
+#else
+[[nodiscard]] inline uint32_t Crc32CRawHardware(uint32_t crc,
+                                                std::span<const uint8_t> data) {
+  return Crc32CRawSoftware(crc, data);
+}
+#endif
 
 }  // namespace detail
 
@@ -328,6 +356,29 @@ struct AdvanceByteTable {
                                            size_t length) {
   return detail::Crc32CRawHardware(
       raw, std::span<const uint8_t>(static_cast<const uint8_t*>(data), length));
+}
+
+class Crc32c final {
+ public:
+  Crc32c() = default;
+
+  void Update(const void* data, size_t len) {
+    value_ = Crc32CExtend(value_, data, len);
+  }
+  [[nodiscard]] uint32_t Finalize() const { return value_; }
+
+ private:
+  uint32_t value_{0xFFFFFFFFu};
+};
+
+[[nodiscard]] inline uint32_t Crc32cOf(const void* data, size_t len) {
+  Crc32c c;
+  c.Update(data, len);
+  return c.Finalize();
+}
+
+[[nodiscard]] inline uint32_t Crc32cOf(const std::vector<char>& v) {
+  return Crc32cOf(v.data(), v.size());
 }
 
 }  // namespace tinylamb

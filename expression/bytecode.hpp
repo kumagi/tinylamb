@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "common/status_or.hpp"
@@ -124,6 +125,13 @@ class BytecodeProgram {
   bool fast_interpretable_{false};
 };
 
+// Exact schema/operator/current-literal identity for bounded, context-free
+// scalar caches. Unsupported/context-bearing trees decline. A retained AST
+// must snapshot its literals with FreezeScalarBindings first.
+[[nodiscard]] std::optional<std::string> ScalarExpressionCacheKey(
+    const std::vector<Expression>& expressions, const Schema& schema);
+[[nodiscard]] Expression FreezeScalarBindings(const Expression& expression);
+
 class BytecodeCompiler {
  public:
   // kValue: select items / sort keys — a rewrite that turns a NULL result
@@ -132,6 +140,14 @@ class BytecodeCompiler {
   // rewrite is sound and kept enabled.
   enum class Context { kValue, kFilter };
   [[nodiscard]] static std::optional<BytecodeProgram> Compile(
+      const Expression& expression, const Schema& schema,
+      Context context = Context::kValue);
+  // Bounded thread-local reuse for context-free scalar trees. The key owns
+  // schema metadata, operators and exact current literal payloads (including
+  // collation/unsigned tags), so rebinding never reuses old constants.
+  // Row consumers also accept a CASE with dynamically differing branch
+  // types. Such a program has ResultType()==kNull and cannot feed a batch.
+  [[nodiscard]] static std::optional<BytecodeProgram> CompileRowCached(
       const Expression& expression, const Schema& schema,
       Context context = Context::kValue);
 };

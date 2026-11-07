@@ -16,6 +16,7 @@
 
 #include "index_scan_iterator.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -27,8 +28,8 @@
 
 #include "common/decoder.hpp"
 #include "common/status_or.hpp"
-#include "index/b_plus_tree.hpp"
 #include "index/index.hpp"
+#include "index/lsm_index.hpp"
 #include "index_schema.hpp"
 #include "page/page_manager.hpp"
 #include "table/iterator_base.hpp"
@@ -85,6 +86,49 @@ TransactionManager::IndexReadGuard AcquireIteratorIndexReadGuard(
   return txn.AcquireIndexReadGuard(index.Root());
 }
 
+// The common no-INCLUDE entry is a fixed-width RowPosition followed by the
+// empty Row's uint64 element count. Preserve the general decoder for payloads
+// with INCLUDE values (and malformed/truncated records).
+bool DecodePositionOnly(std::string_view encoded, IndexValueType* value) {
+  constexpr size_t kSize = RowPosition::Size() + sizeof(uint64_t);
+  if (encoded.size() != kSize) return false;
+  uint64_t columns = 0;
+  DeserializeU64(encoded.data() + RowPosition::Size(), &columns);
+  if (columns != 0) return false;
+  value->pos.Deserialize(encoded.data());
+  value->include.Clear();
+  return true;
+}
+
+StatusOr<IndexValueType> DecodeIndexValue(std::string_view encoded) {
+  IndexValueType value;
+  if (DecodePositionOnly(encoded, &value)) return value;
+  return Decode<IndexValueType>(encoded);
+}
+
+StatusOr<std::vector<IndexValueType>> DecodeIndexValues(
+    std::string_view encoded) {
+  constexpr size_t kSize = RowPosition::Size() + sizeof(uint64_t);
+  if (encoded.size() >= sizeof(uint64_t)) {
+    uint64_t count = 0;
+    DeserializeU64(encoded.data(), &count);
+    const std::string_view entries = encoded.substr(sizeof(uint64_t));
+    if (count <= (1 << 20) && count == entries.size() / kSize &&
+        entries.size() % kSize == 0) {
+      std::vector<IndexValueType> values(static_cast<size_t>(count));
+      bool positions_only = true;
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (!DecodePositionOnly(entries.substr(i * kSize, kSize), &values[i])) {
+          positions_only = false;
+          break;
+        }
+      }
+      if (positions_only) return values;
+    }
+  }
+  return Decode<std::vector<IndexValueType>>(encoded);
+}
+
 }  // namespace
 
 bool IndexScanIterator::StoredAsSingleValue() const {
@@ -129,36 +173,17 @@ IndexScanIterator::IndexScanIterator(
     status_ = iter_.GetStatus();
     return;
   }
-  keys_.DecodeMemcomparableFormat(iter_.Key());
-  if (StoredAsSingleValue()) {
-    StatusOr<Table::IndexValueType> val =
-        Decode<Table::IndexValueType>(iter_.Value());
-    if (!val.HasValue()) {
-      status_ = val.GetStatus();
-      Clear();
-      return;
-    }
-    pos_ = val.Value().pos;
-    include_ = val.Value().include;
-  } else {
-    StatusOr<std::vector<Table::IndexValueType>> val =
-        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
-    if (!val.HasValue()) {
-      status_ = val.GetStatus();
-      Clear();
-      return;
-    }
-    if (val.Value().empty()) {
-      // A corrupted (or future empty) value list must not underflow the
-      // offset below; leave the row state cleared.
-      Clear();
-      return;
-    }
-    value_offset_ =
-        ascending_ ? 0 : static_cast<int64_t>(val.Value().size()) - 1;
-    pos_ = val.Value()[static_cast<size_t>(value_offset_)].pos;
-    include_ = val.Value()[static_cast<size_t>(value_offset_)].include;
+  // A complete equality seek reads one key: copying its neighbours would
+  // add work to every OLTP lookup. Prefix/range walks amortize the snapshot.
+  const bool exact_point =
+      begin_key.size() == index.sc_.key_.size() && begin_key == end_key;
+  if (!resolve_head_ && !exact_point &&
+      (index_read_lock_.HoldsLock() ||
+       (index_read_guard && index_read_guard->HoldsLock()))) {
+    iter_.EnableStableLeafCache();
+    cache_heap_images_ = txn_.IsReadOnly();
   }
+  UpdateIteratorState();
 }
 
 bool IndexScanIterator::IsValid() const {
@@ -192,6 +217,32 @@ StatusOr<std::vector<Row>> IndexScanIterator::PartitionBoundaries(
   return boundaries;
 }
 
+bool IndexScanIterator::EncodedKeyMayOverlap(
+    const Index& index, std::string_view key,
+    const std::vector<Value>& begin_key, const std::vector<Value>& end_key) {
+  if (key.empty() || begin_key.size() > index.sc_.key_.size() ||
+      end_key.size() > index.sc_.key_.size() ||
+      std::ranges::any_of(begin_key, &Value::IsNull) ||
+      std::ranges::any_of(end_key, &Value::IsNull)) {
+    return true;
+  }
+  const std::string begin = EncodeParts(begin_key);
+  const std::string end = EncodeEndParts(index, end_key);
+  return (begin.empty() || key >= begin) && (end.empty() || key <= end);
+}
+
+Status IndexScanIterator::SetProjection(const std::vector<slot_t>& columns) {
+  if (resolve_head_ || index_.RetainsDeletedEntries())
+    return Status::kInvalidArgument;
+  for (slot_t column : columns)
+    if (column >= table_.GetSchema().ColumnCount())
+      return Status::kInvalidArgument;
+  projection_ = columns;
+  current_row_resolved_ = false;
+  current_row_.Clear();
+  return Status::kSuccess;
+}
+
 void IndexScanIterator::Clear() {
   // A cleared iterator must behave as exhausted: Position()/operator++ on it
   // used to leak a valid-looking {0,0} row position to IndexScan::Next.
@@ -200,57 +251,117 @@ void IndexScanIterator::Clear() {
   keys_.Clear();
   include_.Clear();
   current_row_.Clear();
+  value_list_.clear();
+  entry_loaded_ = false;
 }
 
 void IndexScanIterator::UpdateIteratorState() {
   if (!iter_.IsValid()) {
+    if (iter_.GetStatus() != Status::kSuccess) status_ = iter_.GetStatus();
     Clear();
     return;
   }
-  keys_.DecodeMemcomparableFormat(iter_.Key());
-  if (StoredAsSingleValue()) {
-    StatusOr<Table::IndexValueType> rp =
-        Decode<Table::IndexValueType>(GetValue());
-    if (!rp.HasValue()) {
-      status_ = rp.GetStatus();
+  if (!entry_loaded_ || resolve_head_) {
+    std::string key_copy;
+    const std::string_view encoded_key =
+        iter_.stable_leaf_cache_
+            ? (iter_.EnsureLeafCache() ? iter_.CachedKey(iter_.idx_)
+                                       : std::string_view{})
+            : std::string_view(key_copy = iter_.Key());
+    if (iter_.GetStatus() != Status::kSuccess) {
+      status_ = iter_.GetStatus();
       Clear();
       return;
     }
-    // Single-value entries never index into a list; the sentinel also
-    // marks "next multi-value entry is entered fresh" for the branch
-    // below (a kUnique scan alternates between the two encodings at NULL
-    // keys, and the step operators do not touch the offset on single
-    // entries).
-    value_offset_ = -1;
-    pos_ = rp.Value().pos;
-    include_ = rp.Value().include;
-  } else {
-    StatusOr<std::vector<Table::IndexValueType>> val =
-        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
-    if (!val.HasValue()) {
-      status_ = val.GetStatus();
+    const Status decoded = keys_.TryDecodeMemcomparableFormat(encoded_key);
+    if (decoded != Status::kSuccess) {
+      status_ = decoded;
       Clear();
       return;
     }
-    if (value_offset_ < 0) {
-      // Entering this list at its first (ascending) or last (descending)
-      // element; see the sentinel reset in the single-value branch.
-      value_offset_ =
-          ascending_ ? 0 : static_cast<int64_t>(val.Value().size()) - 1;
-    }
-    if (val.Value().empty() || value_offset_ < 0 ||
-        static_cast<size_t>(value_offset_) >= val.Value().size()) {
+    std::string value_copy;
+    const std::string_view encoded_value =
+        iter_.stable_leaf_cache_
+            ? (iter_.EnsureLeafCache() ? iter_.CachedValue(iter_.idx_)
+                                       : std::string_view{})
+            : std::string_view(value_copy = iter_.Value());
+    if (iter_.GetStatus() != Status::kSuccess) {
+      status_ = iter_.GetStatus();
       Clear();
       return;
     }
-    const Table::IndexValueType& row_value =
-        val.Value()[static_cast<size_t>(value_offset_)];
-    pos_ = row_value.pos;
-    include_ = row_value.include;
+    if (StoredAsSingleValue()) {
+      auto value = DecodeIndexValue(encoded_value);
+      if (!value.HasValue()) {
+        status_ = value.GetStatus();
+        Clear();
+        return;
+      }
+      value_offset_ = -1;
+      value_list_.clear();
+      pos_ = value.Value().pos;
+      include_ = value.Value().include;
+    } else {
+      constexpr size_t kSize = RowPosition::Size() + sizeof(uint64_t);
+      if (distinct_keys_mode_ && ascending_ && !resolve_head_ &&
+          !index_.RetainsDeletedEntries() &&
+          encoded_value.size() >= sizeof(uint64_t) + kSize) {
+        uint64_t count = 0;
+        DeserializeU64(encoded_value.data(), &count);
+        const std::string_view entries = encoded_value.substr(sizeof(uint64_t));
+        if (count > 0 && count <= (1 << 20) &&
+            count == entries.size() / kSize && entries.size() % kSize == 0) {
+          IndexValueType first_val;
+          if (DecodePositionOnly(entries.substr(0, kSize), &first_val) &&
+              !txn_.HasPageVersionChains(first_val.pos.page_id)) {
+            value_list_.resize(1);
+            value_list_[0] = first_val;
+            value_offset_ = 0;
+            pos_ = first_val.pos;
+            include_.Clear();
+            ++value_lists_decoded_;
+            value_entries_decoded_ += static_cast<size_t>(count);
+            entry_loaded_ = true;
+            return;
+          }
+        }
+      }
+      auto values = DecodeIndexValues(encoded_value);
+      if (!values.HasValue()) {
+        status_ = values.GetStatus();
+        Clear();
+        return;
+      }
+      value_list_ = values.MoveValue();
+      ++value_lists_decoded_;
+      value_entries_decoded_ += value_list_.size();
+    }
+    entry_loaded_ = true;
   }
+  if (StoredAsSingleValue()) {
+    return;
+  }
+  if (value_offset_ < 0) {
+    value_offset_ =
+        ascending_ ? 0 : static_cast<int64_t>(value_list_.size()) - 1;
+  }
+  if (value_list_.empty() || value_offset_ < 0 ||
+      static_cast<size_t>(value_offset_) >= value_list_.size()) {
+    Clear();
+    return;
+  }
+  const auto& value = value_list_[static_cast<size_t>(value_offset_)];
+  pos_ = value.pos;
+  include_ = value.include;
 }
 
 void IndexScanIterator::ResolveRow() const {
+  if (cache_heap_images_ && heap_image_page_ == pos_.page_id &&
+      pos_.slot < heap_image_slots_.size()) {
+    const auto [offset, size] = heap_image_slots_[pos_.slot];
+    DecodeVisibleRow(std::string_view(heap_images_).substr(offset, size));
+    return;
+  }
   StatusOr<PageRef> ref = txn_.GetPageManager()->GetPage(pos_.page_id, true);
   if (!ref.HasValue()) {
     // const method: record the failure through the mutable sticky status.
@@ -270,6 +381,31 @@ void IndexScanIterator::ResolveRow() const {
     current_row_resolved_ = true;
     return;
   }
+  const bool repeated_page = last_heap_page_ == pos_.page_id;
+  last_heap_page_ = pos_.page_id;
+  if (cache_heap_images_ && repeated_page &&
+      !txn_.HasPageVersionChains(pos_.page_id)) {
+    // Check under the shared page latch, just like PhysicalReadEligible in
+    // FullScanIterator. Chain-free physical images are visible to every live
+    // snapshot; copy them while the latch excludes an arriving writer. Own
+    // writes and head-resolution scans never enable this cache.
+    const RowPage& page = ref.Value()->body.row_page;
+    heap_images_.clear();
+    heap_images_.reserve(kPageBodySize);
+    heap_image_slots_.resize(page.RowMax());
+    for (slot_t slot = 0; slot < page.RowMax(); ++slot) {
+      const std::string_view image = page.GetRow(slot);
+      heap_image_slots_[slot] = {heap_images_.size(), image.size()};
+      heap_images_.append(image);
+    }
+    heap_image_page_ = pos_.page_id;
+    ++heap_page_images_copied_;
+    if (pos_.slot < heap_image_slots_.size()) {
+      const auto [offset, size] = heap_image_slots_[pos_.slot];
+      DecodeVisibleRow(std::string_view(heap_images_).substr(offset, size));
+      return;
+    }
+  }
   StatusOr<std::string_view> row =
       ref.Value()->Read(txn_, pos_.slot, resolve_head_);
   if (!row.HasValue()) {
@@ -281,12 +417,50 @@ void IndexScanIterator::ResolveRow() const {
     current_row_resolved_ = true;
     return;
   }
+  DecodeVisibleRow(row.Value());
+}
+
+void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
+  current_row_resolved_ = true;
+  if (image.empty()) {
+    current_row_.Clear();
+    return;
+  }
+  // Keep fail-stop/error propagation even when the bytes came from our owned
+  // page image. ReadVersion's idle-shard fast path is just atomic loads; on a
+  // page changed since the copy it still resolves this fixed snapshot.
+  if (cache_heap_images_ && heap_image_page_ == pos_.page_id) {
+    auto visible = txn_.ReadVersion(pos_, image, false);
+    if (!visible.HasValue()) {
+      if (visible.GetStatus() != Status::kNotExists) {
+        const_cast<IndexScanIterator*>(this)->status_ = visible.GetStatus();
+        const_cast<IndexScanIterator*>(this)->Clear();
+      }
+      current_row_.Clear();
+      return;
+    }
+    image = visible.Value();
+  }
+  for (const IntegerPeekCompare& peek : integer_peeks_) {
+    const auto value =
+        Row::TryPeekInteger(image.data(), table_.schema_, peek.column);
+    if (!value || !MatchIntegerCompare(*value, peek.op, peek.constant)) {
+      current_row_.Clear();
+      return;
+    }
+  }
   // Only register rows that actually exist so the read set stays clean.
   txn_.AddReadSet(pos_);
   // Length-prefixed page images: decoded by offsets, never as C strings.
-  current_row_.Deserialize(
-      row.Value().data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-      table_.schema_);
+  if (projection_) {
+    current_row_.DeserializeProjected(image.data(), table_.schema_,
+                                      *projection_);
+  } else {
+    current_row_.Deserialize(
+        image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+        table_.schema_);
+  }
+  ++rows_decoded_;
   if (index_.RetainsDeletedEntries() &&
       index_.GenerateKey(current_row_) != iter_.Key()) {
     // A retained entry may point at a row whose indexed key was changed by a
@@ -306,35 +480,50 @@ IteratorBase& IndexScanIterator::operator++() {
     return *this;
   }
   if (!ascending_) {
-    if (StoredAsSingleValue()) {
-      --iter_;
-    } else if (0 < value_offset_) {
-      --value_offset_;
-    } else {
-      --iter_;
-      value_offset_ = -1;
-    }
-    UpdateIteratorState();
-    return *this;
+    return operator--();
   }
   if (StoredAsSingleValue()) {
     ++iter_;
+    entry_loaded_ = false;
   } else {
-    StatusOr<std::vector<Table::IndexValueType>> val =
-        Decode<std::vector<Table::IndexValueType>>(iter_.Value());
-    if (!val.HasValue()) {
-      status_ = val.GetStatus();
-      Clear();
-      return *this;
+    if (resolve_head_) {
+      // A streaming DML consumer may have removed the current entry. Read
+      // its new length before stepping, without rejecting the old offset:
+      // an emptied list must advance to the next key rather than end the scan.
+      auto values = DecodeIndexValues(iter_.Value());
+      if (!values.HasValue()) {
+        status_ = values.GetStatus();
+        Clear();
+        return *this;
+      }
+      value_list_ = values.MoveValue();
+      ++value_lists_decoded_;
+      value_entries_decoded_ += value_list_.size();
     }
     ++value_offset_;
-    if (std::cmp_less_equal(val.Value().size(), value_offset_)) {
+    if (std::cmp_less_equal(value_list_.size(), value_offset_)) {
       ++iter_;
-      value_offset_ = 0;
+      entry_loaded_ = false;
+      value_offset_ = -1;
     }
   }
   UpdateIteratorState();
   return *this;
+}
+
+void IndexScanIterator::AdvanceToNextKey() {
+  if (!IsValid()) {
+    return;
+  }
+  current_row_resolved_ = false;
+  if (ascending_) {
+    ++iter_;
+  } else {
+    --iter_;
+  }
+  entry_loaded_ = false;
+  value_offset_ = -1;
+  UpdateIteratorState();
 }
 
 IteratorBase& IndexScanIterator::operator--() {
@@ -352,11 +541,13 @@ IteratorBase& IndexScanIterator::operator--() {
   // updating those tests and every caller that relies on it.
   if (StoredAsSingleValue()) {
     --iter_;
+    entry_loaded_ = false;
   } else {
     if (0 < value_offset_) {
       --value_offset_;
     } else {
       --iter_;
+      entry_loaded_ = false;
       value_offset_ = -1;
     }
   }
@@ -410,7 +601,13 @@ bool IndexScanIterator::TryReadIndexOnly(Row* dst) const {
   if (!chain_checked_free_) {
     return false;
   }
-  *dst = keys_ + include_;
+  // Batch consumers keep the Row and move only its cells. Reuse that
+  // vector's capacity instead of allocating a concatenation for every
+  // visible index entry; the returned Values remain owned copies.
+  dst->values_.resize(keys_.Count() + include_.Count());
+  std::copy(keys_.values_.begin(), keys_.values_.end(), dst->values_.begin());
+  std::copy(include_.values_.begin(), include_.values_.end(),
+            dst->values_.begin() + static_cast<ptrdiff_t>(keys_.Count()));
   if (!dst->IsValid()) {
     return false;
   }

@@ -21,16 +21,16 @@ jobs:
             -DTINYLAMB_ENABLE_GOOGLESQL=OFF
           cmake --build build-fuzz -j"$(nproc)" --target \
             table_fuzzer value_fuzzer date_interval_fuzzer cast_fuzzer \
-            function_fuzzer data_chunk_fuzzer pax_page_fuzzer \
+            function_fuzzer data_chunk_fuzzer \
             expression_fuzzer row_page_fuzzer leaf_page_fuzzer \
-            b_plus_tree_fuzzer lsm_tree_fuzzer
+            b_plus_tree_fuzzer
 
       - name: short fuzz run
         run: |
           for f in table_fuzzer value_fuzzer date_interval_fuzzer \
                    cast_fuzzer function_fuzzer data_chunk_fuzzer \
-                   pax_page_fuzzer expression_fuzzer row_page_fuzzer \
-                   leaf_page_fuzzer b_plus_tree_fuzzer lsm_tree_fuzzer; do
+                   expression_fuzzer row_page_fuzzer \
+                   leaf_page_fuzzer b_plus_tree_fuzzer; do
             ./build-fuzz/$f -runs=1000 -max_total_time=60 || true
           done
 

@@ -135,14 +135,15 @@ class StopGuard {
 
 class LateFailureExecutor final : public ExecutorBase {
  public:
-  bool Next(Row* row, RowPosition* /*position*/) override {
+  size_t NextBatch(DataChunk* dst, size_t /*max_rows*/) override {
+    dst->Reset();
     ++next_calls;
     if (next_calls == 1) {
-      *row = Row({Value("Insert Rows"), Value(int64_t{7})});
-      return true;
+      dst->Append(Row({Value("Insert Rows"), Value(int64_t{7})}));
+      return 1;
     }
-    return FailWith(
-        StatusError(StatusCode::kRuntimeError, "late executor failure"));
+    FailWith(StatusError(StatusCode::kRuntimeError, "late executor failure"));
+    return 0;
   }
 
   void Dump(std::ostream& output, int /*indent*/) const override {
@@ -1884,7 +1885,7 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
         SendAll(client, QueryMessage("INSERT INTO with_rows VALUES (1);")));
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
-    // Act -- a read-only WITH query runs through a read worker.
+    // Act -- the frontend accepts a read-only WITH query.
     ASSERT_TRUE(
         SendAll(client, QueryMessage("WITH x AS (SELECT 1) SELECT * FROM x;")));
     const std::string with_select = ReadUntilReady(client);
@@ -1898,9 +1899,8 @@ TEST(PostgresServerTest, ReadWorkerRejectsDataModifyingWith) {
     EXPECT_NE(analyzed.find("ANALYZE"), std::string::npos);
     EXPECT_NE(analyzed.find('Z'), std::string::npos);
 
-    // Act -- a data-modifying WITH statement is parsed as a syntax error and
-    // reported through the read worker (leading keyword is WITH, so the
-    // statement is treated as read-only for scheduling).
+    // Act -- a different WITH spelling has no SELECT classification proof.
+    // The normal frontend rejects this data-modifying form.
     ASSERT_TRUE(SendAll(
         client, QueryMessage("WITH x AS (SELECT 1) DELETE FROM with_rows;")));
     const std::string response = ReadUntilReady(client);

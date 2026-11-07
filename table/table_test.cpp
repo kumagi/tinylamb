@@ -338,6 +338,78 @@ TEST_F(TableTest, Update_CommittedRelocationSurvivesCrashReplay) {
   ASSERT_SUCCESS(read.txn_.PreCommit());
 }
 
+TEST_F(TableTest, UpdateRelocationHealsStaleTailHintAndKeepsOwnership) {
+  for (bool commit : {false, true}) {
+    const std::string name =
+        commit ? "tail_update_commit" : "tail_update_abort";
+    RowPosition original_position;
+    const Row original({Value(16), Value(std::string(16000, 'a'))});
+    const Row expanded({Value(16), Value(std::string(32000, 'b'))});
+    {
+      auto setup = rs_->BeginContext();
+      ASSERT_SUCCESS(
+          rs_->CreateTable(setup,
+                           Schema(name, {Column("k", ValueType::kInt64),
+                                         Column("v", ValueType::kVarChar)}))
+              .GetStatus());
+      // Persist the index/catalog before loading, leaving a conservative hint.
+      ASSERT_SUCCESS(rs_->CreateIndex(
+          setup, name,
+          IndexSchema(name + "_pk", {0}, {}, IndexMode::kVersionedUnique)));
+      ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                            setup.GetTable(name));
+      for (int64_t i = 0; i < 65; ++i) {
+        ASSIGN_OR_ASSERT_FAIL(
+            RowPosition, inserted,
+            table->Insert(setup.txn_,
+                          Row({Value(i), Value(std::string(16000, 'a'))})));
+        if (i == 16) original_position = inserted;
+      }
+      ASSERT_SUCCESS(setup.PreCommit());
+    }
+    Recover();
+    {
+      auto reader = rs_->BeginContext();
+      auto writer = rs_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                            writer.GetTable(name));
+      const page_id_t first = table->FirstPageId();
+      ASSERT_NE(original_position.page_id, first);
+      PageManager* pm = writer.txn_.GetPageManager();
+      ASSERT_EQ(pm->GetTableTailFor(writer.txn_.ID(), first, first), first);
+      ASSIGN_OR_ASSERT_FAIL(
+          RowPosition, moved,
+          table->Update(writer.txn_, original_position, expanded));
+      ASSERT_NE(moved.page_id, original_position.page_id);
+      EXPECT_EQ(pm->CheckTableTailPage(reader.txn_.ID(), first, moved.page_id),
+                Status::kConflicts);
+      ASSERT_SUCCESS_AND_EQ(table->Read(reader.txn_, original_position),
+                            original);
+      ASSERT_SUCCESS_AND_EQ(table->Read(writer.txn_, moved), expanded);
+      if (commit) {
+        ASSERT_SUCCESS(writer.PreCommit());
+        ASSERT_SUCCESS_AND_EQ(table->Read(reader.txn_, original_position),
+                              original);
+      } else {
+        ASSERT_SUCCESS(writer.txn_.Abort());
+      }
+      ASSERT_SUCCESS(reader.PreCommit());
+    }
+    Recover();
+    auto fresh = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, fresh.GetTable(name));
+    std::unordered_set<int64_t> keys;
+    for (auto scan = table->BeginFullScan(fresh.txn_); scan.IsValid(); ++scan) {
+      const Row& row = *scan;
+      EXPECT_TRUE(keys.insert(row[0].value.int_value).second);
+      EXPECT_EQ(row[1],
+                row[0] == Value(16) && commit ? expanded[1] : original[1]);
+    }
+    EXPECT_EQ(keys.size(), 65);
+    ASSERT_SUCCESS(fresh.PreCommit());
+  }
+}
+
 TEST_F(TableTest, Update_SingleRow_UpdatesRowSuccessfully) {
   TransactionContext ctx = rs_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,

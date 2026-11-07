@@ -22,7 +22,10 @@ struct PostgresServerOptions {
   uint16_t port{54321};
   int backlog{128};
   size_t max_message_bytes{static_cast<size_t>(16U * 1024U * 1024U)};
-  // Zero selects std::thread::hardware_concurrency().
+  // Shared pool for snapshot reads and ordinary DML/transaction messages.
+  // One message per session is in flight. TEMP/UDF sessions and DDL retain
+  // the frontend's thread-local affinity on the event loop.
+  // Zero selects std::thread::hardware_concurrency() (capped at 16).
   size_t read_worker_threads{0};
   // Connections beyond this limit are shed immediately (client sees EOF).
   size_t max_connections{1024};
@@ -51,6 +54,8 @@ class PostgresServer {
   [[nodiscard]] uint16_t BoundPort() const;
   [[nodiscard]] size_t ReadWorkerCount() const;
   [[nodiscard]] size_t PeakConcurrentReadQueries() const;
+  [[nodiscard]] uint64_t CachedLiteralReplyCount() const;
+  [[nodiscard]] uint64_t DirectReplyCount() const;
 
  private:
   class Impl;

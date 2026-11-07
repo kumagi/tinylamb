@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "query/sql_join_fuzzer.hpp"
 
 extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
                                                        size_t size) {
-  tinylamb::JoinFuzzTry(data, size, false);
+  tinylamb::JoinFuzzTry(data, size,
+                        std::getenv("TINYLAMB_FUZZ_VERBOSE") != nullptr);
   return 0;
 }

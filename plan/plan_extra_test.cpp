@@ -22,7 +22,6 @@
 #include "plan/distinct_plan.hpp"
 #include "plan/group_by_plan.hpp"
 #include "plan/incremental_sort_plan.hpp"
-#include "plan/max1_row_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
@@ -99,21 +98,6 @@ TEST(SortDistinctPlanExtraTest, DumpToStringAndDelegation) {
   EXPECT_EQ(plan.EmitRowCount(), 2U);
   EXPECT_EQ(plan.GetSchema().ColumnCount(), 2U);
   EXPECT_EQ(plan.Child().get(), child.get());
-}
-
-TEST(Max1RowPlanExtraTest, EmitRowCountIsCappedAndDumpNests) {
-  Plan child = MakeValuesChild(/*rows=*/5);
-  Max1RowPlan plan(child);
-  EXPECT_EQ(plan.ToString(), "Max1Row");
-  EXPECT_EQ(plan.EmitRowCount(), 1U);
-  EXPECT_EQ(plan.AccessRowCount(), 5U);
-  std::string dump = DumpToString(plan);
-  EXPECT_NE(dump.find("Max1Row"), std::string::npos);
-  EXPECT_NE(dump.find("Values (rows=5)"), std::string::npos);
-
-  // An empty child stays empty (min(0, 1)).
-  Max1RowPlan empty(MakeValuesChild(/*rows=*/0));
-  EXPECT_EQ(empty.EmitRowCount(), 0U);
 }
 
 TEST(SetOperationPlanExtraTest, SchemaCoercionAndErrors) {

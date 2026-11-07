@@ -4,7 +4,7 @@
 // under test is the shared one in type/collation.hpp: NULL placement,
 // direction and the resolved collation, so SortExecutor's memcomparable
 // encoding, its external merge runs, TopNExecutor's heap, PdqSort,
-// IncrementalSort, PartialSort and MergeAppend cannot drift apart.
+// IncrementalSort and MergeAppend cannot drift apart.
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -22,7 +22,6 @@
 #include "executor/executor_base.hpp"
 #include "executor/incremental_sort.hpp"
 #include "executor/merge_append.hpp"
-#include "executor/partial_sort.hpp"
 #include "executor/pdqsort.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/sort.hpp"
@@ -202,16 +201,14 @@ class ScopedQueryMemory {
 class PositionedRows final : public ExecutorBase {
  public:
   explicit PositionedRows(std::vector<Row> rows) : rows_(std::move(rows)) {}
-  bool Next(Row* dst, RowPosition* rp) override {
-    if (offset_ >= rows_.size()) {
-      return false;
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
+    while (offset_ < rows_.size() && dst->Size() < max_rows) {
+      dst->Append(rows_[offset_],
+                  RowPosition(11, static_cast<slot_t>(offset_)));
+      ++offset_;
     }
-    *dst = rows_[offset_];
-    if (rp != nullptr) {
-      *rp = RowPosition(11, static_cast<slot_t>(offset_));
-    }
-    ++offset_;
-    return true;
+    return dst->Size();
   }
   void Dump(std::ostream& out, int /*indent*/) const override {
     out << "PositionedRows";
@@ -661,18 +658,6 @@ TEST(SortCollationTest, IncrementalSortTreatsFoldedPeersAsOneRun) {
       std::make_shared<ConstantExecutor>(rows), TextSchema(), SortKeys(Name()),
       CiSortKeys(Key()));
   EXPECT_EQ(DrainKeys(binary_prefix), (std::vector<int64_t>{3, 1, 2, 4}));
-}
-
-TEST(SortCollationTest, PartialSortFoldsACollatedKey) {
-  // PartialSort's block sort is not stable, so the rows are chosen with
-  // distinct folded keys: the collated top-K is apple, then Banana.
-  const std::vector<Row> rows{
-      Row({Value(1), Value("Banana")}), Row({Value(2), Value("apple")}),
-      Row({Value(3), Value("cherry")}), Row({Value(4), Value("date")})};
-  auto sort = std::make_shared<PartialSortExecutor>(
-      std::make_shared<ConstantExecutor>(rows), TextSchema(),
-      CiSortKeys(CiName()), 2, 0, 0);
-  EXPECT_EQ(DrainKeys(sort), (std::vector<int64_t>{2, 1}));
 }
 
 TEST(SortCollationTest, MergeAppendFoldsACollatedKey) {

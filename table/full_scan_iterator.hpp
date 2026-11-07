@@ -33,6 +33,8 @@
 namespace tinylamb {
 class Table;
 class Transaction;
+struct LSTablePageBlock;
+struct LSTableStore;
 
 // Pre-decode reject for INT64/DATE `column <cmp> constant` (full schema index).
 struct IntegerPeekCompare {
@@ -77,6 +79,10 @@ struct TypedCellBatch {
   std::vector<std::vector<uint8_t>> varchar_bytes;  // per VARCHAR slot
   std::vector<std::vector<uint32_t>> varchar_ends;  // per VARCHAR slot, rows+1
   size_t rows{0};
+  // Opt-in tuple identity for consumers such as TopN; plain folds pay no
+  // position-buffer allocation or writes.
+  bool capture_positions{false};
+  std::vector<RowPosition> positions;
 
   void Configure(size_t stride_in, std::vector<ValueType> types,
                  std::vector<bool> unsigned_flags) {
@@ -99,6 +105,7 @@ struct TypedCellBatch {
   // so stale payloads beyond `rows` are never observable.
   void Reset() {
     rows = 0;
+    positions.clear();
     for (auto& ends : varchar_ends) {
       ends.clear();
     }
@@ -144,6 +151,8 @@ class FullScanIterator : public IteratorBase {
   FullScanIterator& operator=(FullScanIterator&&) = delete;
   ~FullScanIterator() override = default;
   bool operator==(const FullScanIterator& rhs) const {
+    EnsureLSTableRowMaterialized();
+    rhs.EnsureLSTableRowMaterialized();
     return table_ == rhs.table_ && txn_ == rhs.txn_ &&
            current_row_ == rhs.current_row_;
   }
@@ -197,14 +206,19 @@ class FullScanIterator : public IteratorBase {
   // Lazily builds (and caches) the row-path decode plan for this scan's
   // projection; nullptr when the projection is malformed.
   [[nodiscard]] const RowDecodePlan* RowPlan();
-  // Pre-decode integer peeks: a column inside the leading fixed-width prefix
-  // reads at a payload-constant offset on rows without a null bitmap; rows
-  // with a bitmap (or columns past the prefix) keep the column walk.
+  // Pre-decode integer peeks: combine fixed-width spans once per schema,
+  // walking only variable-width cells for rows without a null bitmap.
+  // Bitmap rows keep the canonical column walk.
   struct PlannedPeek {
+    struct VariableSkip {
+      ValueType type;
+      uint32_t fixed_after{0};
+    };
     bool valid{false};
     slot_t column{0};
     slot_t stored_count{0};
     uint32_t offset{0};  // payload-relative
+    std::vector<VariableSkip> variable_skips;
   };
   [[nodiscard]] PlannedPeek BuildPeek(slot_t column) const;
   // Direct planned peek; nullopt = NULL or corrupt count (same contract as
@@ -223,6 +237,16 @@ class FullScanIterator : public IteratorBase {
   // advances pos_ past it; nullopt at exhaustion or on a latched failure.
   [[nodiscard]] std::optional<std::string_view> NextVisibleImage();
   void SeekVisibleRow();
+  [[nodiscard]] bool TryInitLSTableScan();
+  [[nodiscard]] const LSTablePageBlock* CurrentLSTableBlock() const noexcept;
+  [[nodiscard]] bool LSTableRowMatches(const LSTablePageBlock& blk,
+                                       uint32_t row) const noexcept;
+  [[nodiscard]] bool LSTableBlockAllRowsMatch(
+      const LSTablePageBlock& blk) const noexcept;
+  void SeekLSTableRow();
+  void EnsureLSTableRowMaterialized() const;
+  size_t DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
+                                         size_t max_rows);
   // Builds the projected-schema decode plan used by DecodeNextTypedBatch;
   // empty (typed decoding refused) for schemas carrying unsupported types.
   void BuildTypedDecodePlan();
@@ -234,9 +258,15 @@ class FullScanIterator : public IteratorBase {
   const Table* table_;
   Transaction* txn_;
   RowPosition pos_;
-  Row current_row_;
+  mutable Row current_row_;
   TableLease table_lease_;
   std::unique_ptr<PageRef> page_;
+  std::shared_ptr<const LSTableStore> lstable_store_;
+  size_t lstable_page_cursor_{0};
+  uint32_t lstable_row_cursor_{0};
+  mutable bool lstable_row_materialized_{true};
+  // Valid only while this shared page latch remains held.
+  std::optional<bool> physical_read_eligible_;
   std::optional<std::vector<slot_t>> projection_;
   std::optional<std::vector<page_id_t>> pages_;
   size_t page_index_{0};

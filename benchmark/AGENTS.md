@@ -19,6 +19,5 @@ not fetched for normal builds).
   `tinylamb_expression_jit_benchmark` (**`EXCLUDE_FROM_ALL`**): scalar-vs-JIT
   on INT64 filters, reports compile ms + break-even row count (LLVM
   availability probe).
-- `lsm_tree_bench.cpp` lives in `index/lsm_detail/` (same explicit-target rule).
 
 Gate: `scripts/bench_gate.py` compares against `BenchmarkHistory.md`.

@@ -6,13 +6,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/constants.hpp"
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 #include "query/sql_engine.hpp"
+#endif
 
 namespace tinylamb {
 
@@ -83,6 +86,18 @@ struct TpccTransactionResult {
 
 std::string TpccLastName(int n);
 
+// Benchmark-only transport seam: keep the transaction generator and SQL
+// identical when comparing servers through the same generator.
+class TpccSqlSession {
+ public:
+  virtual ~TpccSqlSession() = default;
+  virtual Status Begin(bool read_only) = 0;
+  virtual Status Execute(std::string_view sql, std::vector<Row>* rows) = 0;
+  virtual Status Commit() = 0;
+  virtual void Abort() = 0;
+  virtual std::string_view LastError() const = 0;
+};
+
 // TPC-C transaction mix and data access (Clause 2 and 5.2). Not an audited
 // tpmC run: think/keying time is omitted unless the benchmark driver adds it.
 class TpccWorkload {
@@ -90,6 +105,8 @@ class TpccWorkload {
   // terminal_id < 0 picks a random home warehouse/district (tests).
   // Otherwise the terminal is bound like TPC-C: warehouse-major, 10 districts.
   TpccWorkload(Database& database, TpccScale scale, uint64_t seed,
+               int terminal_id = -1, TpccNurand nurand = {});
+  TpccWorkload(TpccSqlSession& session, TpccScale scale, uint64_t seed,
                int terminal_id = -1, TpccNurand nurand = {});
 
   static Status Initialize(Database& database, const TpccScale& scale,
@@ -99,7 +116,10 @@ class TpccWorkload {
   TpccTransactionResult Execute(TpccTransactionType type);
 
  private:
-  Status RunSql(TransactionContext& context, std::string_view sql,
+  class Transaction;
+  Transaction BeginTransaction(bool read_only = false);
+  void InitializeTerminal(int terminal_id);
+  Status RunSql(Transaction& context, std::string_view sql,
                 std::vector<Row>* rows, TpccTransactionResult* result);
   static bool RequireRows(const std::vector<Row>& rows,
                           std::string_view operation,
@@ -121,12 +141,15 @@ class TpccWorkload {
   int PickLastNameNumber();
   std::string PickCustomerLastName();
 
-  Database* database_;
+  Database* database_{nullptr};
   // One workload is owned by one terminal thread.  Reusing the facade avoids
   // reconstructing its scratch strings/vectors for every one of the tens of
   // thousands of SQL statements issued per second; every statement still
   // enters SqlEngine::Execute and therefore remains covered by the SQL gate.
-  SqlEngine sql_engine_;
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
+  std::unique_ptr<SqlEngine> sql_engine_;
+#endif
+  TpccSqlSession* external_session_{nullptr};
   TpccScale scale_;
   std::mt19937_64 random_;
   int home_warehouse_{1};

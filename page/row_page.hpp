@@ -17,51 +17,68 @@
 #ifndef TINYLAMB_ROW_PAGE_HPP
 #define TINYLAMB_ROW_PAGE_HPP
 
-#include <cassert>
+#include <cstddef>
+#include <ostream>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/constants.hpp"
-#include "common/log_message.hpp"
 #include "common/status_or.hpp"
-#include "page/row_pointer.hpp"
 
 namespace tinylamb {
 
-class RecoveryManager;
 class Transaction;
 
-/*  Page Layout
- * +----------------------------------------------------+
- * | Page Header | Row Page Header | data_[] | (Tuples) |
- * +----------------------------------------------------+
- * | (cont. Tuples)                                     |
- * +----------------------------------------------------+
- * | (cont. Tuples)                             | Tuple |
- * +----------------------------------------------------+
- *                                     free_ptr_^
- */
-
+// Unbounded in-memory/LSM row block.
+// Each block holds up to kMaxSlotsPerBlock logical row slots before rolling
+// over to a new block (for parallel morsel scan partitioning), while each slot
+// stores a dynamically sized std::string with no page-size cap.
 class RowPage {
- private:
-  char* Payload() { return reinterpret_cast<char*>(this); }
-  [[nodiscard]] const char* Payload() const {
-    return reinterpret_cast<const char*>(this);
-  }
-  void DeFragmentExcept(slot_t excluded_slot);
-
  public:
+  static constexpr slot_t kMaxSlotsPerBlock = 4096;
+  static constexpr size_t kSlotEntryBytes = 4;
+  static constexpr size_t kBlockBudgetBytes = kPageBodySize - 24;
+
   void Initialize() {
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;
-    free_ptr_ = kPageBodySize;
-    free_size_ = kPageBodySize - sizeof(RowPage);
-    // memset(data_, 0, kBodySize);
+    slots_.clear();
+    hole_sizes_.clear();
+    committed_allocated_ = false;
+    committed_prev_page_id_ = 0;
+    committed_next_page_id_ = 0;
+    committed_link_lsn_ = 0;
+    committed_slots_.clear();
+    committed_lsns_.clear();
   }
 
-  // resolve_head is forwarded to Transaction::ReadVersion: false gives a
-  // pure snapshot read that ignores the head-upgrade effect of an own
-  // unstaged write intent.
+  void ClearLiveState() {
+    prev_page_id_ = 0;
+    next_page_id_ = 0;
+    row_count_ = 0;
+    slots_.clear();
+    hole_sizes_.clear();
+  }
+
+  [[nodiscard]] size_t UsedBytes() const {
+    size_t used = slots_.size() * kSlotEntryBytes;
+    for (const std::string& s : slots_) {
+      used += s.size();
+    }
+    return used;
+  }
+
+  [[nodiscard]] bin_size_t FreeSize() const {
+    const size_t used = UsedBytes();
+    return used < kBlockBudgetBytes
+               ? static_cast<bin_size_t>(kBlockBudgetBytes - used)
+               : 0;
+  }
+
+  [[nodiscard]] bin_size_t FreeSizeForTest() const { return FreeSize(); }
+
   StatusOr<std::string_view> Read(page_id_t page_id, Transaction& txn,
                                   slot_t slot, bool resolve_head = true) const;
 
@@ -78,82 +95,54 @@ class RowPage {
 
   Status SetNextPage(page_id_t page_id, Transaction& txn, page_id_t next);
   Status SetPrevPage(page_id_t page_id, Transaction& txn, page_id_t prev);
-  void SetNextPageImpl(page_id_t next);
-  void SetPrevPageImpl(page_id_t prev);
+  void SetNextPageImpl(page_id_t next) { next_page_id_ = next; }
+  void SetPrevPageImpl(page_id_t prev) { prev_page_id_ = prev; }
 
-  [[nodiscard]] slot_t RowCount() const;
-  [[nodiscard]] slot_t RowMax() const { return row_max_; }
-
-  [[nodiscard]] bin_size_t FreePtrForTest() const { return free_ptr_; }
-  [[nodiscard]] bin_size_t FreeSizeForTest() const { return free_size_; }
-
-  void DeFragment();
-
-  friend class Page;
-  friend class std::hash<RowPage>;
+  [[nodiscard]] slot_t RowCount() const { return row_count_; }
+  [[nodiscard]] slot_t RowMax() const {
+    return static_cast<slot_t>(slots_.size());
+  }
+  [[nodiscard]] bool IsSlotOccupied(slot_t slot) const {
+    return slot < slots_.size() && !slots_[slot].empty();
+  }
+  [[nodiscard]] bool ShouldPreallocateNextBlock() const {
+    return (FreeSize() < 1024 || slots_.size() + 8 >= kMaxSlotsPerBlock) &&
+           next_page_id_ == 0;
+  }
 
   [[nodiscard]] std::string_view GetRow(slot_t slot) const {
-    // Holes read as empty even though DeleteRow keeps the row size on the
-    // slot for the reservation accounting (see RowPage::Insert): the bytes
-    // behind offset 0 are dead until the slot is reused.
-    if (rows_[slot].offset == 0) {
+    if (slot >= slots_.size() || slots_[slot].empty()) {
       return {};
     }
-    return {Payload() + rows_[slot].offset,
-            static_cast<size_t>(rows_[slot].size)};
+    return slots_[slot];
   }
 
   StatusOr<slot_t> InsertRow(std::string_view new_row);
   StatusOr<slot_t> InsertRowAt(slot_t slot, std::string_view new_row);
-
   Status UpdateRow(slot_t slot, std::string_view record);
-
   void DeleteRow(slot_t slot);
 
-  bool ReclaimUntilContiguous(size_t bytes, slot_t protected_slot,
-                              slot_t prospective_row_max);
-
-  page_id_t prev_page_id_ = 0;
-  page_id_t next_page_id_ = 0;
-  slot_t row_max_ = 0;
-  slot_t row_count_ = 0;
-  // Defaults mirror Initialize() (page-body based); PageInit always runs
-  // Initialize before use, so these only guard against misuse of a bare
-  // RowPage.
-  bin_size_t free_ptr_ = kPageBodySize;
-  bin_size_t free_size_ = kPageBodySize - sizeof(RowPage);
-  // This zero-sized tail keeps the on-disk page header at the exact offset
-  // where the variable-sized slot array begins.  Changing it to [1] would
-  // alter sizeof(RowPage) and corrupt the fixed-size page layout.
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-  // NOLINTNEXTLINE(modernize-avoid-c-arrays): flexible trailing member
-  RowPointer rows_[0];
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
   void Dump(std::ostream& o, int indent) const;
   friend std::ostream& operator<<(std::ostream& o, const RowPage& r) {
     r.Dump(o, 0);
     return o;
   }
-};
 
-static_assert(std::is_trivially_destructible<RowPage>::value,
-              "RowPage must be trivially destructible");
+  page_id_t prev_page_id_ = 0;
+  page_id_t next_page_id_ = 0;
+  slot_t row_count_ = 0;
+  std::vector<std::string> slots_;
+  std::vector<size_t> hole_sizes_;
+
+  // Committed baseline state used by fuzzy checkpoint and fuzzy recovery.
+  bool committed_allocated_ = false;
+  page_id_t committed_prev_page_id_ = 0;
+  page_id_t committed_next_page_id_ = 0;
+  lsn_t committed_link_lsn_ = 0;
+  std::vector<std::string> committed_slots_;
+  std::vector<lsn_t> committed_lsns_;
+};
 
 }  // namespace tinylamb
-
-namespace std {
-
-template <>
-class hash<tinylamb::RowPage> {
- public:
-  uint64_t operator()(const tinylamb::RowPage& r) const;
-};
-
-}  // namespace std
 
 #endif  // TINYLAMB_ROW_PAGE_HPP

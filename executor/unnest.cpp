@@ -123,7 +123,7 @@ std::vector<Row> AlignRowsToSchema(const Schema& plan_schema,
 
 }  // namespace
 
-bool UnnestExecutor::Next(Row* dst, RowPosition* rp) {
+bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
   while (true) {
     if (current_row_index_ < current_unnested_rows_.size()) {
       const Row& unnested_row = current_unnested_rows_[current_row_index_++];
@@ -142,13 +142,15 @@ bool UnnestExecutor::Next(Row* dst, RowPosition* rp) {
       return false;
     }
 
-    current_child_row_ = Row();
-    RowPosition child_rp;
-    if (!child_->Next(&current_child_row_, &child_rp)) {
-      FailWithChildOf(*child_);
-      child_exhausted_ = true;
-      return false;
+    if (child_batch_idx_ >= child_batch_.Size()) {
+      child_batch_idx_ = 0;
+      if (child_->NextBatch(&child_batch_) == 0) {
+        FailWithChildOf(*child_);
+        child_exhausted_ = true;
+        return false;
+      }
     }
+    current_child_row_ = child_batch_.RowAt(child_batch_idx_++);
 
     current_unnested_rows_.clear();
     current_row_index_ = 0;
@@ -188,6 +190,19 @@ bool UnnestExecutor::Next(Row* dst, RowPosition* rp) {
       current_unnested_rows_.emplace_back(std::move(nulls));
     }
   }
+}
+
+size_t UnnestExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  RowPosition rp;
+  while (destination->Size() < max_rows && NextRow(&row, &rp)) {
+    destination->Append(std::move(row), rp);
+  }
+  return destination->Size();
 }
 
 void UnnestExecutor::Dump(std::ostream& o, int indent) const {

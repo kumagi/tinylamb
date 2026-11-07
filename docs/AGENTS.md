@@ -5,8 +5,7 @@ Read before designing, cite when changing behavior. Most binding first:
 - `lock_order.md` — normative lock ordering (storage + txn work must obey).
 - `recovery_invariants.md`, `wal_format.md` — ARIES invariants + on-disk WAL
   layout   (`kWalRecordVersion = 6`).
-- `page_format.md`, `page_checksum.md`, `pax_page_format.md`,
-  `value_storage.md` — on-disk formats.
+- `page_format.md`, `page_checksum.md`, `value_storage.md` — on-disk formats.
 - `expression_evaluation.md` — AST/Bytecode/JIT equivalence contract.
 - `cascades_optimizer.md` (+ `optimizer_todo.md`,
   `optimizer_improvements.md`) — optimizer design + open work.

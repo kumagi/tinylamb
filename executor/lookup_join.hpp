@@ -79,7 +79,8 @@ class LookupJoin : public ExecutorBase {
   LookupJoin& operator=(LookupJoin&&) = delete;
   ~LookupJoin() override = default;
 
-  bool Next(Row* dst, RowPosition* /* rp */) override;
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
 
   // Shape guard for the single-row short-circuit: the seek is a point probe on
@@ -90,6 +91,7 @@ class LookupJoin : public ExecutorBase {
   [[nodiscard]] bool AtMostOneProbe() const { return at_most_one_; }
 
  private:
+  bool NextRow(Row* dst);
   // Positions the next left row into a new index probe. Returns false at
   // end-of-input or on failure (with the sticky status recorded).
   bool Load();

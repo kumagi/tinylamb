@@ -42,7 +42,8 @@ class Schema {
   Schema& operator=(Schema&& other) noexcept;
   ~Schema() = default;
 
-  Schema(std::string_view schema_name, std::vector<Column> columns);
+  Schema(std::string_view schema_name, std::vector<Column> columns,
+         uint16_t key_column_index = 0, uint64_t schema_version = 0);
   [[nodiscard]] slot_t ColumnCount() const {
     return static_cast<slot_t>(columns_.size());
   }
@@ -53,6 +54,16 @@ class Schema {
   }
   [[nodiscard]] std::unordered_set<ColumnName> ColumnSet() const;
   [[nodiscard]] int Offset(const ColumnName& name) const;
+  void SetColumnHint(size_t idx, AccessHint h) {
+    assert(idx < columns_.size());
+    columns_[idx].SetHint(h);
+  }
+  [[nodiscard]] uint16_t KeyColumnIndex() const { return key_column_index_; }
+  [[nodiscard]] uint64_t SchemaVersion() const { return schema_version_; }
+  void SetSchemaVersion(uint64_t v) { schema_version_ = v; }
+  [[nodiscard]] bool AllFixedWidthCells() const {
+    return all_fixed_cache_ == 1;
+  }
 
   // A copy with the relation name (and every column's qualifier) replaced.
   // ALTER TABLE ... RENAME TO uses this to keep the catalog-serialized
@@ -72,10 +83,14 @@ class Schema {
 
  private:
   static std::uint64_t NextLookupIdentity();
+  void RefreshDerived();
 
   std::string name_;
   std::vector<Column> columns_;
   std::uint64_t identity_;
+  uint16_t key_column_index_{0};
+  uint64_t schema_version_{0};
+  uint8_t all_fixed_cache_{1};
 };
 
 }  // namespace tinylamb

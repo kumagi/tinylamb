@@ -42,7 +42,6 @@
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
@@ -53,7 +52,6 @@ class TransactionTest : public ::testing::Test {
 
   virtual void Reset() {
     tm_.reset();
-    lm_.reset();
     pm_.reset();
     l_.reset();
     if (!log_name_.empty()) {
@@ -63,7 +61,6 @@ class TransactionTest : public ::testing::Test {
     // Unique log file per run: parallel test suites must not share a WAL.
     log_name_ = "transaction_test-" + RandomString() + ".log";
     l_ = Logger::Create(log_name_).MoveValue();
-    lm_ = std::make_unique<LockManager>();
     // Fixture premise: pm_/recovery_ stay null on purpose.  The tests below
     // only exercise lock/version bookkeeping; any page-accessing method would
     // crash on the null PageManager.
@@ -72,7 +69,6 @@ class TransactionTest : public ::testing::Test {
 
   void TearDown() override {
     tm_.reset();
-    lm_.reset();
     pm_.reset();
     l_.reset();
     if (!log_name_.empty()) {
@@ -83,7 +79,6 @@ class TransactionTest : public ::testing::Test {
 
  protected:
   std::string log_name_;
-  std::unique_ptr<LockManager> lm_;
   std::unique_ptr<PageManager> pm_;
   std::unique_ptr<Logger> l_;
   std::unique_ptr<TransactionManager> tm_;
@@ -166,36 +161,6 @@ TEST_F(TransactionTest, FinishHooksRunOnCommitAbortAndMove) {
   ASSERT_EQ(moved.PreCommit(), Status::kSuccess);
   EXPECT_EQ(moved_hook->calls_, 1U);
   EXPECT_EQ(moved_hook->status_, TransactionStatus::kCommitted);
-}
-
-TEST_F(TransactionTest, UpgradePreservesUnrelatedSharedLocks) {
-  const RowPosition upgraded(10, 1);
-  const RowPosition preserved(10, 2);
-  ASSERT_TRUE(lm_->GetSharedLock(upgraded, 1));
-  ASSERT_TRUE(lm_->GetSharedLock(preserved, 2));
-
-  ASSERT_TRUE(lm_->TryUpgradeLock(upgraded, 1));
-
-  // Assert -- a foreign owner can neither release nor re-release the locks
-  EXPECT_FALSE(lm_->ReleaseExclusiveLock(upgraded, 3));
-  EXPECT_FALSE(lm_->ReleaseSharedLock(preserved, 3));
-
-  EXPECT_TRUE(lm_->ReleaseExclusiveLock(upgraded, 1));
-  EXPECT_TRUE(lm_->ReleaseSharedLock(preserved, 2));
-}
-
-TEST_F(TransactionTest, UpgradeRequiresSoleSharedOwner) {
-  const RowPosition row(10, 1);
-  ASSERT_TRUE(lm_->GetSharedLock(row, 1));
-  ASSERT_TRUE(lm_->GetSharedLock(row, 2));
-
-  EXPECT_FALSE(lm_->TryUpgradeLock(row, 1));
-  EXPECT_FALSE(lm_->TryUpgradeLock(row, 3));
-
-  EXPECT_TRUE(lm_->ReleaseSharedLock(row, 1));
-  // Releasing someone else's shared lock is rejected.
-  EXPECT_FALSE(lm_->ReleaseSharedLock(row, 1));
-  EXPECT_TRUE(lm_->ReleaseSharedLock(row, 2));
 }
 
 TEST_F(TransactionTest, TransactionIdsIncrement) {
@@ -451,23 +416,7 @@ TEST_F(TransactionTest, MvccWriteIntentCanFollowACommittedWriter) {
 }
 
 TEST_F(TransactionTest, CompensateLogsThroughManager) {
-  // Arrange -- nothing more than fixture setup
-  // Act -- append every flavor of compensating log record via the manager
-  tm_->CompensateInsertLog(1, 3, 4);
-  tm_->CompensateInsertLog(1, 3, "leaf-key");
-  tm_->CompensateInsertBranchLog(1, 3, "branch-key");
-  tm_->CompensateUpdateLog(1, 3, 4, "redo");
-  tm_->CompensateUpdateLog(1, 3, "leaf-key", "redo");
-  tm_->CompensateUpdateBranchLog(1, 3, "branch-key", 5);
-  tm_->CompensateDeleteLog(1, 3, 4, "redo");
-  tm_->CompensateDeleteLog(1, 3, "leaf-key", "redo");
-  tm_->CompensateDeleteBranchLog(1, 3, "branch-key", 5);
-  tm_->CompensateSetLowestValueLog(1, 3, 6);
-  tm_->CompensateSetLowFenceLog(1, 3, IndexKey("low"));
-  tm_->CompensateSetHighFenceLog(1, 3, IndexKey("high"));
-  tm_->CompensateSetFosterLog(1, 3, FosterPair("fk", 7));
-
-  // Assert -- implicit; every compensating record was appended without crash
+  ASSERT_TRUE(tm_->CompensateUpdateLog(1, 3, 4, "redo").HasValue());
 }
 
 TEST_F(TransactionTest, TransactionStatusStreaming) {
@@ -630,7 +579,6 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
     auto logger_holder = Logger::Create(log_name).MoveValue();
     CHECK(logger_holder != nullptr);
     Logger& logger = *logger_holder;
-    LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);
 
@@ -646,7 +594,7 @@ TEST(TransactionManagerTest, AbortedWriteIsNotVisibleToLaterReaders) {
               Status::kNotExists);
   }
   std::ignore = std::remove(db_name.c_str());
-  std::ignore = std::remove(log_name.c_str());
+  RemoveLogAndSegments(log_name);
 }
 
 TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
@@ -664,7 +612,6 @@ TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
     auto logger_holder = Logger::Create(log_name).MoveValue();
     CHECK(logger_holder != nullptr);
     Logger& logger = *logger_holder;
-    LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);
 
@@ -686,7 +633,7 @@ TEST(TransactionManagerTest, ReaderSeesRowWhileWriterHoldsUnstagedIntent) {
     writer.Abort();
   }
   std::ignore = std::remove(db_name.c_str());
-  std::ignore = std::remove(log_name.c_str());
+  RemoveLogAndSegments(log_name);
 }
 
 TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
@@ -704,7 +651,6 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
     auto logger_holder = Logger::Create(log_name).MoveValue();
     CHECK(logger_holder != nullptr);
     Logger& logger = *logger_holder;
-    LockManager lm;
     RecoveryManager rm(log_name, pm.GetPool());
     TransactionManager tm(&pm, &logger, &rm);
 
@@ -724,7 +670,7 @@ TEST(TransactionManagerTest, AbortAfterPreCommitIsNoOp) {
                           "committed-value");
   }
   std::ignore = std::remove(db_name.c_str());
-  std::ignore = std::remove(log_name.c_str());
+  RemoveLogAndSegments(log_name);
 }
 
 TEST_F(TransactionTest, WoundFlagSurvivesMove) {
@@ -738,6 +684,84 @@ TEST_F(TransactionTest, WoundFlagSurvivesMove) {
   Transaction moved = std::move(victim);
   EXPECT_TRUE(moved.IsWounded());
   moved.Abort();
+}
+
+}  // namespace tinylamb
+
+namespace tinylamb {
+TEST_F(TransactionTest, GcFinishesRotatingSweepWithoutAnotherWrite) {
+  constexpr uint64_t kRows = 10000;  // exceeds the adaptive full-scan limit
+  {
+    auto writer = tm_->Begin();
+    for (uint64_t i = 0; i < kRows; ++i) {
+      const RowPosition position(i + 100, 0);
+      ASSERT_TRUE(writer.AddWriteSet(position, "before"));
+      writer.RegisterVersionWrite(position, "before", "after");
+    }
+    ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (tm_->RuntimeStats().version_chains != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(tm_->RuntimeStats().version_chains, 0);
+}
+
+TEST_F(TransactionTest,
+       GcRetriesAfterLastOldSnapshotFinishesWithoutAWritableCommit) {
+  const RowPosition position(321, 0);
+  auto old = tm_->Begin(true);
+  {
+    auto writer = tm_->Begin();
+    ASSERT_TRUE(writer.AddWriteSet(position, "before"));
+    writer.RegisterVersionWrite(position, "before", "after");
+    ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
+  }
+  // Let the first GC pass observe the pin and drain its writable-commit
+  // counter. Finishing this read-only transaction must suffice to reclaim.
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  EXPECT_TRUE(tm_->HasVersionChain(position));
+  ASSERT_SUCCESS_AND_EQ(
+      tm_->ReadVersion(old, position, std::string_view("after")),
+      std::optional<std::string>("before"));
+  ASSERT_EQ(old.PreCommit(), Status::kSuccess);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (tm_->HasVersionChain(position) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_FALSE(tm_->HasVersionChain(position));
+}
+TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
+  for (int burst = 0; burst < 2; ++burst) {
+    auto old = tm_->Begin(true);
+    std::vector<RowPosition> rows;
+    for (int i = 0; i < 3; ++i) {
+      const RowPosition position(1000 + burst * 10 + i, 0);
+      rows.push_back(position);
+      auto writer = tm_->Begin();
+      ASSERT_TRUE(writer.AddWriteSet(position, "before"));
+      writer.RegisterVersionWrite(position, "before", "after");
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    for (const auto& position : rows) {
+      ASSERT_SUCCESS_AND_EQ(
+          tm_->ReadVersion(old, position, std::string_view("after")),
+          std::optional<std::string>("before"));
+    }
+    ASSERT_SUCCESS(old.PreCommit());
+    // No more writable work: both sub-threshold bursts must be reclaimed
+    // through the timed wake, including after the first counter reset.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (tm_->RuntimeStats().version_chains != 0 &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_EQ(tm_->RuntimeStats().version_chains, 0U);
+  }
 }
 
 }  // namespace tinylamb

@@ -75,7 +75,10 @@ std::vector<std::pair<int64_t, int64_t>> IntPairs(
 
 class FailingSource final : public ExecutorBase {
  public:
-  bool Next(Row* /*row*/, RowPosition* /*position*/) override { return false; }
+  size_t NextBatch(DataChunk* dst, size_t /*max_rows*/) override {
+    dst->Reset();
+    return 0;
+  }
   void Dump(std::ostream& o, int /*indent*/) const override {
     o << "FailingSource";
   }

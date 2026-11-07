@@ -12,8 +12,7 @@
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
-#include "index/b_plus_tree.hpp"
-#include "index/b_plus_tree_iterator.hpp"
+#include "index/lsm_index.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -44,7 +43,6 @@ class SkipScanDistinct : public ExecutorBase {
   SkipScanDistinct& operator=(SkipScanDistinct&&) = delete;
   ~SkipScanDistinct() override = default;
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   [[nodiscard]] Status GetStatus() const override { return status_; }

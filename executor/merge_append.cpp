@@ -101,6 +101,22 @@ bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
   return left.source < right.source;
 }
 
+bool MergeAppendExecutor::PullNextFromSource(size_t source, Row* row,
+                                             RowPosition* position) {
+  DataChunk& batch = source_batches_[source];
+  size_t& offset = source_offsets_[source];
+  if (offset >= batch.Size()) {
+    offset = 0;
+    if (sources_[source]->NextBatch(&batch) == 0) {
+      return false;
+    }
+  }
+  *row = batch.RowAt(offset);
+  *position = batch.PositionAt(offset);
+  ++offset;
+  return true;
+}
+
 Status MergeAppendExecutor::Initialize() {
   if (initialized_) {
     return Status::kSuccess;
@@ -109,10 +125,12 @@ Status MergeAppendExecutor::Initialize() {
     return StatusError(StatusCode::kInvalidArgument,
                        "merge append source/schema count mismatch");
   }
+  source_batches_.resize(sources_.size());
+  source_offsets_.assign(sources_.size(), 0);
   for (size_t source = 0; source < sources_.size(); ++source) {
     Head head;
     head.source = source;
-    if (sources_[source]->Next(&head.row, &head.position)) {
+    if (PullNextFromSource(source, &head.row, &head.position)) {
       heads_.push_back(std::move(head));
     } else if (sources_[source]->GetStatus() != Status::kSuccess) {
       return sources_[source]->GetStatus();
@@ -122,53 +140,55 @@ Status MergeAppendExecutor::Initialize() {
   return Status::kSuccess;
 }
 
-bool MergeAppendExecutor::Next(Row* destination, RowPosition* position) {
+size_t MergeAppendExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset(output_schema_, max_rows);
   if (Status st = Initialize(); st != Status::kSuccess) {
-    return FailWith(st);
+    FailWith(st);
+    return 0;
   }
   if (heads_.empty()) {
     if (!sources_.empty()) {
       FailWithChildOf(*sources_.front());
     }
-    return false;
+    return 0;
   }
-  size_t best = 0;
-  for (size_t index = 1; index < heads_.size(); ++index) {
-    if (Before(heads_[index], heads_[best])) {
-      best = index;
+  while (destination->Size() < max_rows && !heads_.empty()) {
+    size_t best = 0;
+    for (size_t index = 1; index < heads_.size(); ++index) {
+      if (Before(heads_[index], heads_[best])) {
+        best = index;
+      }
     }
-  }
-  if (!ok()) {
-    return false;
-  }
-  Head emitted = std::move(heads_[best]);
-  if (sources_[emitted.source]->Next(&heads_[best].row,
-                                     &heads_[best].position)) {
-    heads_[best].source = emitted.source;
-  } else {
-    if (FailWithChildOf(*sources_[emitted.source])) {
-      return false;
+    if (!ok()) {
+      return destination->Size();
     }
-    heads_.erase(heads_.begin() + static_cast<std::ptrdiff_t>(best));
-  }
-  if (emitted.row.values_.size() != output_schema_.ColumnCount()) {
-    return FailWith(StatusError(StatusCode::kInvalidArgument,
-
-                                "merge append row/schema width mismatch"));
-  }
-  for (size_t column = 0; column < emitted.row.values_.size(); ++column) {
-    StatusOr<Value> coerced = CoerceTo(emitted.row.values_[column],
-                                       output_schema_.GetColumn(column).Type());
-    if (!coerced.HasValue()) {
-      return FailWith(coerced.GetStatus());
+    Head emitted = std::move(heads_[best]);
+    if (PullNextFromSource(emitted.source, &heads_[best].row,
+                           &heads_[best].position)) {
+      heads_[best].source = emitted.source;
+    } else {
+      if (FailWithChildOf(*sources_[emitted.source])) {
+        return destination->Size();
+      }
+      heads_.erase(heads_.begin() + static_cast<std::ptrdiff_t>(best));
     }
-    emitted.row.values_[column] = coerced.MoveValue();
+    if (emitted.row.values_.size() != output_schema_.ColumnCount()) {
+      FailWith(StatusError(StatusCode::kInvalidArgument,
+                           "merge append row/schema width mismatch"));
+      return destination->Size();
+    }
+    for (size_t column = 0; column < emitted.row.values_.size(); ++column) {
+      StatusOr<Value> coerced = CoerceTo(
+          emitted.row.values_[column], output_schema_.GetColumn(column).Type());
+      if (!coerced.HasValue()) {
+        FailWith(coerced.GetStatus());
+        return destination->Size();
+      }
+      emitted.row.values_[column] = coerced.MoveValue();
+    }
+    destination->Append(std::move(emitted.row), emitted.position);
   }
-  *destination = std::move(emitted.row);
-  if (position != nullptr) {
-    *position = emitted.position;
-  }
-  return true;
+  return destination->Size();
 }
 
 void MergeAppendExecutor::Dump(std::ostream& output, int indent) const {

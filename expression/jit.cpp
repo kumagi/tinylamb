@@ -191,6 +191,8 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileFilter(
       false);
   auto* function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                           "tinylamb_filter", *module);
+  function->addParamAttr(0, llvm::Attribute::NoAlias);
+  function->addParamAttr(1, llvm::Attribute::NoAlias);
   auto* argument = function->arg_begin();
   llvm::Value* input = argument++;
   llvm::Value* output = argument++;
@@ -256,6 +258,8 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjection() {
       false);
   auto* function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                           "tinylamb_project", *module);
+  function->addParamAttr(0, llvm::Attribute::NoAlias);
+  function->addParamAttr(1, llvm::Attribute::NoAlias);
   auto* argument = function->arg_begin();
   llvm::Value* input = argument++;
   llvm::Value* output = argument++;
@@ -320,6 +324,7 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSum() {
       i64, {llvm::PointerType::getUnqual(*context), i64}, false);
   auto* function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                           "tinylamb_sum", *module);
+  function->addParamAttr(0, llvm::Attribute::NoAlias);
   auto* argument = function->arg_begin();
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
@@ -388,6 +393,10 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileProjectionChecked() {
       false);
   auto* function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                           "tinylamb_project_checked", *module);
+  function->addParamAttr(0, llvm::Attribute::NoAlias);
+  function->addParamAttr(1, llvm::Attribute::NoAlias);
+  function->addParamAttr(5, llvm::Attribute::NoAlias);
+  function->addParamAttr(6, llvm::Attribute::NoAlias);
   auto* argument = function->arg_begin();
   llvm::Value* input = argument++;
   llvm::Value* output = argument++;
@@ -478,6 +487,8 @@ std::optional<JitInt64Kernels> JitInt64Kernels::CompileSumChecked() {
                               false);
   auto* function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                           "tinylamb_sum_checked", *module);
+  function->addParamAttr(0, llvm::Attribute::NoAlias);
+  function->addParamAttr(2, llvm::Attribute::NoAlias);
   auto* argument = function->arg_begin();
   llvm::Value* input = argument++;
   llvm::Value* count = argument++;
@@ -587,6 +598,22 @@ int64_t JitInt64Kernels::SumChecked(const int64_t* input, size_t count,
 }
 double JitInt64Kernels::CompileMilliseconds() const {
   return impl_ ? impl_->compile_ms : 0.0;
+}
+
+void JitInt64Kernels::WarmUpAll() {
+#ifdef TINYLAMB_HAS_LLVM
+  static std::once_flag warmed;
+  std::call_once(warmed, [] {
+    (void)CompileFilter(BinaryOperation::kEquals);
+    (void)CompileFilter(BinaryOperation::kNotEquals);
+    (void)CompileFilter(BinaryOperation::kLessThan);
+    (void)CompileFilter(BinaryOperation::kLessThanEquals);
+    (void)CompileFilter(BinaryOperation::kGreaterThan);
+    (void)CompileFilter(BinaryOperation::kGreaterThanEquals);
+    (void)CompileSum();
+    (void)CompileProjection();
+  });
+#endif
 }
 
 }  // namespace tinylamb

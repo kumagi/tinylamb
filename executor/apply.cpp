@@ -40,13 +40,16 @@ ApplyExecutor::ApplyExecutor(TransactionContext& context, Schema outer_schema,
       kind_(kind),
       output_schema_(std::move(output_schema)) {}
 
-bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
+bool ApplyExecutor::NextRow(Row* dst, RowPosition* rp) {
+  DataChunk outer_batch;
   while (true) {
     if (!has_outer_row_) {
-      if (!outer_exec_->Next(&current_outer_row_, &current_outer_rp_)) {
+      if (outer_exec_->NextBatch(&outer_batch, 1) == 0) {
         FailWithChildOf(*outer_exec_);
         return false;
       }
+      current_outer_row_ = outer_batch.RowAt(0);
+      current_outer_rp_ = outer_batch.PositionAt(0);
       has_outer_row_ = true;
       matched_any_ = false;
       inner_rows_.clear();
@@ -80,10 +83,11 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
         }
       } else if (inner_exec_ != nullptr) {
         if (!static_inner_cached_) {
-          Row r;
-          RowPosition p;
-          while (inner_exec_->Next(&r, &p)) {
-            static_inner_rows_.push_back(std::move(r));
+          DataChunk inner_batch;
+          while (inner_exec_->NextBatch(&inner_batch) != 0) {
+            for (size_t i = 0; i < inner_batch.Size(); ++i) {
+              static_inner_rows_.push_back(inner_batch.RowAt(i));
+            }
           }
           if (inner_exec_->GetStatus() != Status::kSuccess) {
             return FailWith(inner_exec_->GetStatus());
@@ -155,6 +159,19 @@ bool ApplyExecutor::Next(Row* dst, RowPosition* rp) {
       }
     }
   }
+}
+
+size_t ApplyExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
+  Row row;
+  RowPosition rp;
+  while (destination->Size() < max_rows && NextRow(&row, &rp)) {
+    destination->Append(std::move(row), rp);
+  }
+  return destination->Size();
 }
 
 void ApplyExecutor::Dump(std::ostream& o, int indent) const {

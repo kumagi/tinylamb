@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_SCAN_FILTER_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -73,7 +74,13 @@ struct PrebuiltMembershipPredicate {
   // keeps multi-hundred-thousand-member builds allocation-free.
   // NULL members are recorded in contains_null and never stored.
   std::shared_ptr<const FlatIntSet> values;
+  // Optional dynamic runtime filter group (used for secondary join-key filters
+  // pushed into the scan alongside the primary ScanRuntimeFilter).
+  std::shared_ptr<const RuntimeFilterGroup> runtime_filter;
   bool contains_null{false};
+  // An equality-correlated EXISTS is two-valued: NULL probes do not match
+  // (NOT EXISTS keeps them), and NULL build keys do not poison misses.
+  bool existence{false};
 };
 
 // `col op (correlated scalar aggregate subquery)` with exactly one
@@ -102,6 +109,10 @@ struct FilterCompileEnv {
   TransactionContext* context{nullptr};
   const Scope* outer{nullptr};
   const CteMap* ctes{nullptr};
+  size_t input_rows{0};
+  // FinishQuery historically compiled without a context. Enable only the
+  // selective EXISTS peel there, preserving its other execution strategies.
+  bool prebuild_only_exists{false};
 };
 
 struct CompiledScanFilter {
@@ -137,7 +148,16 @@ struct CompiledScanFilter {
   std::optional<BytecodeProgram> residual_bytecode;
 };
 
+bool FastLikeMatch(std::string_view value, std::string_view pattern);
+
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);
+
+bool MatchPrefixIn(const Row& row, const PrefixInPredicate& pred);
+
+std::optional<PrefixInPredicate> TryCompilePrefixIn(const Expression& predicate,
+                                                    const Schema& schema);
+
+std::optional<Value> TryDecideConstantConjunct(const Expression& predicate);
 
 // Exact SQL three-valued membership verdict for a prebuilt IN/NOT IN set.
 // Empty member set is decisive (`x IN ()` is FALSE, `x NOT IN ()` is TRUE,
@@ -152,6 +172,9 @@ bool MatchPrebuiltMembership(const Row& row,
 // UNKNOWN and the row is rejected.
 bool MatchPrebuiltScalarCompare(const Row& row,
                                 const PrebuiltScalarComparePredicate& pred);
+
+bool IsNonThrowingScanComparison(const Expression& predicate,
+                                 const Schema& schema);
 
 std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
     const Expression& predicate, const Schema& schema);

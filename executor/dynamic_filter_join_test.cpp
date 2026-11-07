@@ -474,8 +474,8 @@ TEST_F(DynamicFilterJoinTest, LargeBuildDomainFallsBackToRangeAndBloom) {
 class ProbeScan : public ExecutorBase {
  public:
   explicit ProbeScan(Executor inner) : inner_(std::move(inner)) {}
-  bool Next(Row* dst, RowPosition* rp) override {
-    return inner_->Next(dst, rp);
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    return inner_->NextBatch(dst, max_rows);
   }
   void Dump(std::ostream& o, int indent) const override {
     o << "ProbeScan\n" << Indent(static_cast<size_t>(indent) + 2);

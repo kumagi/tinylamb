@@ -43,18 +43,23 @@ bool DistinctRowEqual::operator()(const Row& left, const Row& right) const {
   return DistinctEquals(left, right);
 }
 
-bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
-  Row row;
-  RowPosition position;
-  while (source_->Next(&row, &position)) {
+size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+  destination->Reset();
+  while (destination->Size() < max_rows) {
+    if (input_offset_ >= input_batch_.Size()) {
+      input_offset_ = 0;
+      if (source_->NextBatch(&input_batch_) == 0) {
+        FailWithChildOf(*source_);
+        break;
+      }
+    }
+    Row row = input_batch_.RowAt(input_offset_);
+    const RowPosition position = input_batch_.PositionAt(input_offset_);
+    ++input_offset_;
     if (distinct_on_.empty()) {
       const auto [it, inserted] = seen_.insert(std::move(row));
       if (inserted) {
-        *dst = *it;
-        if (rp != nullptr) {
-          *rp = position;
-        }
-        return true;
+        destination->Append(*it, position);
       }
     } else {
       Row current_keys;
@@ -62,44 +67,46 @@ bool DistinctExecutor::Next(Row* dst, RowPosition* rp) {
       for (const auto& expr : distinct_on_) {
         StatusOr<Value> key = expr->TryEvaluate(row, schema_);
         if (!key.HasValue()) {
-          return FailWith(key.GetStatus());
+          FailWith(key.GetStatus());
+          return destination->Size();
         }
         current_keys.values_.push_back(key.MoveValue());
       }
       if (seen_keys_.insert(std::move(current_keys)).second) {
-        *dst = std::move(row);
-        if (rp != nullptr) {
-          *rp = position;
-        }
-        return true;
+        destination->Append(std::move(row), position);
       }
     }
   }
-  FailWithChildOf(*source_);
-  return false;
+  return destination->Size();
 }
+
 void DistinctExecutor::Dump(std::ostream& output, int indent) const {
   output << "HashDistinct\n" << Indent(static_cast<size_t>(indent) + 2);
   source_->Dump(output, indent + 2);
 }
 
-bool SortDistinctExecutor::Next(Row* dst, RowPosition* rp) {
-  Row row;
-  RowPosition position;
-  while (source_->Next(&row, &position)) {
+size_t SortDistinctExecutor::NextBatch(DataChunk* destination,
+                                       size_t max_rows) {
+  destination->Reset();
+  while (destination->Size() < max_rows) {
+    if (input_offset_ >= input_batch_.Size()) {
+      input_offset_ = 0;
+      if (source_->NextBatch(&input_batch_) == 0) {
+        FailWithChildOf(*source_);
+        break;
+      }
+    }
+    Row row = input_batch_.RowAt(input_offset_);
+    const RowPosition position = input_batch_.PositionAt(input_offset_);
+    ++input_offset_;
     if (have_previous_ && DistinctEquals(previous_, row)) {
       continue;
     }
     previous_ = row;
     have_previous_ = true;
-    *dst = std::move(row);
-    if (rp != nullptr) {
-      *rp = position;
-    }
-    return true;
+    destination->Append(std::move(row), position);
   }
-  FailWithChildOf(*source_);
-  return false;
+  return destination->Size();
 }
 
 void SortDistinctExecutor::Dump(std::ostream& output, int indent) const {

@@ -21,12 +21,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <ostream>
 #include <set>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +42,10 @@
 namespace tinylamb {
 
 struct TransactionRuntimeStats {
+  uint64_t wal_sync_count{0};
+  uint64_t wal_sync_ns{0};
+  uint64_t wal_buffered_bytes{0};
+  uint64_t wal_durable_bytes{0};
   uint64_t wal_wait_count{0};
   uint64_t wal_wait_ns{0};
   uint64_t write_intent_attempts{0};
@@ -98,13 +105,11 @@ struct TransactionRuntimeStats {
   uint64_t index_scan_prefetch_pages{0};
 };
 
-class IndexKey;
 class Logger;
 class PageManager;
 class Transaction;
 class RecoveryManager;
 enum class TransactionStatus : uint_fast8_t;
-struct FosterPair;
 struct LogRecord;
 struct RowPosition;
 
@@ -143,7 +148,11 @@ class TransactionManager {
     }
   }
 
-  Status PreCommit(Transaction& txn);
+  // With a target pointer, publish/finish the transaction and return the
+  // explicit own+dependency barrier to the caller instead of waiting here.
+  // No externally visible reply may precede WaitForWALDurable(*target).
+  Status PreCommit(Transaction& txn,
+                   lsn_t* external_durability_target = nullptr);
 
   // When true (default), PreCommit waits until the commit LSN is fsynced.
   // See docs/commit_durability.md.
@@ -268,67 +277,9 @@ class TransactionManager {
 
   Status Abort(Transaction& txn);
 
-  // Append a compensating (CLR) record and return its END LSN (start +
-  // on-disk size).  Callers that revert a page in the same critical section
-  // use it to keep page_lsn at or above the record whose effect the page
-  // now reflects (see RecoveryManager::LogUndoWithPage).
-  StatusOr<lsn_t> CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                      slot_t slot, lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateInsertLog(txn_id_t txn_id, page_id_t pid,
-                                      std::string_view key,
-                                      lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateInsertBranchLog(txn_id_t txn_id, page_id_t pid,
-                                            std::string_view key,
-                                            lsn_t undo_next_lsn = 0);
   StatusOr<lsn_t> CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
                                       slot_t slot, std::string_view redo,
                                       lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateUpdateLog(txn_id_t txn_id, page_id_t pid,
-                                      std::string_view key,
-                                      std::string_view redo,
-                                      lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateUpdateBranchLog(txn_id_t txn_id, page_id_t pid,
-                                            std::string_view key,
-                                            page_id_t redo,
-                                            lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                      slot_t slot, std::string_view redo,
-                                      lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateDeleteLog(txn_id_t txn_id, page_id_t pid,
-                                      std::string_view key,
-                                      std::string_view redo,
-                                      lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateDeleteBranchLog(txn_id_t txn_id, page_id_t pid,
-                                            std::string_view key,
-                                            page_id_t redo,
-                                            lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetLowestValueLog(txn_id_t txn_id, page_id_t pid,
-                                              page_id_t redo,
-                                              lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetRowPageNextLog(txn_id_t txn_id, page_id_t pid,
-                                              page_id_t redo,
-                                              lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetRowPagePrevLog(txn_id_t txn_id, page_id_t pid,
-                                              page_id_t redo,
-                                              lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetLowFenceLog(txn_id_t txn_id, page_id_t pid,
-                                           const IndexKey& redo,
-                                           lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetHighFenceLog(txn_id_t txn_id, page_id_t pid,
-                                            const IndexKey& redo,
-                                            lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateSetFosterLog(txn_id_t txn_id, page_id_t pid,
-                                         const FosterPair& foster,
-                                         lsn_t undo_next_lsn = 0);
-  // CLR for a destroy undo: the record carries the restored page type and
-  // body image, so a later REDO replays the restore rather than leaving the
-  // destroyed (free) image that the original destroy record would recreate.
-  StatusOr<lsn_t> CompensateDestroyPageLog(txn_id_t txn_id, page_id_t pid,
-                                           PageType restored_type,
-                                           std::string_view restored_body,
-                                           lsn_t undo_next_lsn = 0);
-  StatusOr<lsn_t> CompensateAllocatePageLog(const LogRecord& allocation,
-                                            lsn_t undo_next_lsn);
   // Non-waiting first-updater-wins reservation stored in the same shard as
   // the row's MVCC chain. A stale snapshot or another pending writer loses.
   // When `before` is supplied (update/delete of an existing row), the chain's
@@ -370,6 +321,22 @@ class TransactionManager {
   // Reports whether any row on |pid| has a version chain. Exact per page:
   // only pages whose rows actually carry a chain answer true.
   [[nodiscard]] bool HasPageVersionChains(page_id_t pid) const;
+  // Reports whether any page in any shard currently has a version chain.
+  // Allows full-table scans on read-mostly / freshly-loaded tables to skip
+  // per-page version-chain probes in O(shards) instead of O(pages).
+  [[nodiscard]] bool HasAnyPageVersionChains() const noexcept {
+    for (const auto& count : page_chain_counts_) {
+      if (count.load(std::memory_order_acquire) != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+  void SweepCommittedVersionChains() {
+    for (size_t i = 0; i < kGcPassDivisor; ++i) {
+      GarbageCollectVersions();
+    }
+  }
   // Counts one row served by the index-only visibility-map fast path (see
   // TransactionRuntimeStats::index_only_visible_serves).
   void RecordIndexOnlyVisibleServe() const {
@@ -495,8 +462,22 @@ class TransactionManager {
     [[nodiscard]] bool HoldsLock() const noexcept { return lock_.owns_lock(); }
 
    private:
+    friend class TransactionManager;
     std::shared_lock<std::shared_mutex> lock_;
   };
+  // Opaque encoded keys only: the index layer owns range semantics. The
+  // caller must hold this root's read gate. nullopt keeps the coarse fallback.
+  [[nodiscard]] std::optional<std::vector<std::string>>
+  IndexKeyChangesSinceSnapshot(const Transaction& txn, page_id_t index_root,
+                               const IndexReadGuard& guard) const;
+  // Requires the root's write gate, like the physical key removal it records.
+  void TrackIndexKeyMutation(txn_id_t owner, page_id_t index_root,
+                             std::string_view key);
+  // Compatibility callers that cannot supply the exact key revoke precision.
+  // This is deliberately sticky for this manager; coarse epochs stay sound.
+  void DisableIndexKeyTracking() {
+    index_key_tracking_complete_.store(false, std::memory_order_release);
+  }
   [[nodiscard]] IndexReadGuard AcquireIndexReadGuard(
       page_id_t index_root) const;
   [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireIndexWriteGuard(
@@ -632,6 +613,9 @@ class TransactionManager {
     // wait (WaitForIndexReservationDrain) sleeps on it.
     mutable std::condition_variable released;
     std::unordered_map<page_id_t, std::unordered_map<txn_id_t, uint64_t>> bytes;
+    // Page entries per owner, protected by mutex. The coarse foreign-owner
+    // test must not walk every page reserved by a large index build.
+    std::unordered_map<txn_id_t, size_t> owner_pages;
   };
   [[nodiscard]] static size_t IndexReservationShardIndex(page_id_t pid) {
     return static_cast<size_t>((pid * 131ULL) % kIndexReservationShardCount);
@@ -651,6 +635,8 @@ class TransactionManager {
   void CommitIndexMutations(Transaction& txn, uint64_t commit_ts);
   void ClearPendingIndexMutations(Transaction& txn);
   void ReleasePendingIndexMutation(size_t shard);
+  void FinishIndexKeyChanges(txn_id_t owner, page_id_t index_root,
+                             std::optional<uint64_t> commit_ts);
 
   // Per-page chain bookkeeping (page_chain_shards_). Called exactly when a
   // chain enters/leaves shard.versions, mirroring page_chain_counts_.
@@ -673,6 +659,33 @@ class TransactionManager {
   std::atomic<uint64_t> pending_index_mutation_count_{0};
   mutable std::array<std::shared_mutex, kIndexMutationShardCount>
       index_gates_{};
+  struct PendingIndexKeys {
+    txn_id_t owner;
+    page_id_t root;
+    std::vector<std::string> keys;
+  };
+  struct CommittedIndexKey {
+    page_id_t root;
+    uint64_t commit_ts;
+    std::string key;
+  };
+  // Protected by the corresponding EXISTING index gate, never a new latch.
+  // Bounded history + an eviction timestamp: older snapshots simply fall back.
+  struct IndexKeyHistory {
+    bool precise{true};
+    size_t pending_bytes{0}, pending_keys{0}, history_bytes{0};
+    uint64_t forgotten_through_ts{0};
+    std::vector<PendingIndexKeys> pending;
+    std::deque<CommittedIndexKey> committed;
+    void Disable() noexcept {
+      precise = false;
+      pending.clear();
+      committed.clear();
+      pending_bytes = pending_keys = history_bytes = 0;
+    }
+  };
+  std::array<IndexKeyHistory, kIndexMutationShardCount> index_key_history_{};
+  std::atomic<bool> index_key_tracking_complete_{true};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
   std::array<std::atomic<int64_t>, kPageChainShardCount> page_chain_counts_{};
   // Exact per-page version-chain presence, sharded by page id (the same

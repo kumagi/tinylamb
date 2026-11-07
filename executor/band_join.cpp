@@ -151,16 +151,19 @@ Status BandJoin::Materialize() {
   output_.clear();
   output_offset_ = 0;
 
-  Row row;
-  RowPosition position;
-  while (left_->Next(&row, &position)) {
-    left_rows_.emplace_back(std::move(row), position);
+  DataChunk batch;
+  while (left_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      left_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   if (left_->GetStatus() != Status::kSuccess) {
     return left_->GetStatus();
   }
-  while (right_->Next(&row, &position)) {
-    right_rows_.emplace_back(std::move(row), position);
+  while (right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      right_rows_.emplace_back(batch.RowAt(i), batch.PositionAt(i));
+    }
   }
   if (right_->GetStatus() != Status::kSuccess) {
     return right_->GetStatus();
@@ -318,22 +321,6 @@ void BandJoin::EnsureMaterialized() {
   }
   materialized_ = true;
   materialize_error_ = Materialize();
-}
-
-bool BandJoin::Next(Row* dst, RowPosition* rp) {
-  EnsureMaterialized();
-  if (materialize_error_ != Status::kSuccess) {
-    return FailWith(materialize_error_);
-  }
-  if (output_offset_ >= output_.size()) {
-    return false;
-  }
-  *dst = output_[output_offset_].first;
-  if (rp != nullptr) {
-    *rp = output_[output_offset_].second;
-  }
-  ++output_offset_;
-  return true;
 }
 
 size_t BandJoin::NextBatch(DataChunk* destination, size_t max_rows) {

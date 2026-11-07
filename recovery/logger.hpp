@@ -38,6 +38,19 @@ namespace tinylamb {
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class Logger final {
  public:
+  // A nonzero errno from the hook injects a sync failure without closing fd.
+  // The hook is copied under a mutex, then invoked without that mutex.
+  static void SetBeforeSyncHookForTest(std::function<int(int)> hook);
+
+  struct SyncStats {
+    uint64_t count;
+    uint64_t nanoseconds;
+  };
+  [[nodiscard]] SyncStats GetSyncStats() const {
+    return {sync_count_.load(std::memory_order_relaxed),
+            sync_ns_.load(std::memory_order_relaxed)};
+  }
+
   // D1: a WAL record must stay within the bound the recovery reader accepts
   // (RecoveryManager parses records from a 16 MiB window, and the serialized
   // record carries magic/version/header/CRC overhead on top of the payload).
@@ -80,7 +93,18 @@ class Logger final {
   static StatusOr<std::unique_ptr<Logger>> Create(
       const std::filesystem::path& logfile,
       size_t buffer_size = size_t{1024} * 1024 * 8, size_t every_ms = 1,
-      size_t segment_size = kDefaultLogSegmentSize);
+      size_t segment_size = kDefaultLogSegmentSize,
+      bool preallocate_new_series = false, bool allow_torn_footer = false);
+  // New series may use fixed-size files with two CRC-protected logical-end
+  // slots. Existing series keep their persisted format. LSN geometry and
+  // record bytes are unchanged; the slots live outside the LSN address space.
+  [[nodiscard]] bool FixedSizeSegments() const { return fixed_size_segments_; }
+  static StatusOr<bool> FixedSizeSegmentFormat(
+      const std::filesystem::path& base);
+  static StatusOr<size_t> SegmentLogicalSize(const std::filesystem::path& base,
+                                             uint64_t index,
+                                             size_t segment_size,
+                                             bool allow_torn_footer = false);
   Logger(const Logger&) = delete;
   Logger(Logger&&) = delete;
   Logger& operator=(const Logger&) = delete;
@@ -89,6 +113,15 @@ class Logger final {
 
   // Drains the worker and reports a write failure, if one occurred.
   Status Finish();
+
+  // A synchronous commit coordinator explicitly requests every acknowledged
+  // barrier. Avoid syncing an unfinished transaction on the short background
+  // timer just before its COMMIT arrives. Requested barriers, roll and Finish
+  // remain immediate; unrequested dirty bytes retain a 200 ms backstop.
+  // Raw/embedded logger users retain the configured cadence by default.
+  void SetCommitDrivenSync(bool enabled) {
+    commit_driven_sync_.store(enabled, std::memory_order_relaxed);
+  }
 
   // Bytes written to the log files (may not be fsynced yet).
   [[nodiscard]] lsn_t CommittedLSN() const { return flushed_lsn_; }
@@ -118,7 +151,8 @@ class Logger final {
   Status WaitForDurable(lsn_t lsn);
 
   // Resynchronize after recovery truncated the log to `valid_end`
-  // (torn-tail --force path). Truncates the tail segment to `valid_end`,
+  // (torn-tail --force path). Truncates the tail segment to `valid_end`
+  // (logical end slots for fixed files, physical EOF for legacy files),
   // deletes every segment above it, and reopens the append fd there. The
   // constructor latched the three LSNs to the pre-truncation file size;
   // without this reset every later AddLog reports an LSN past the real
@@ -200,6 +234,10 @@ class Logger final {
   }
 
  private:
+  int SyncSegment(size_t logical_end = static_cast<size_t>(-1));
+  int WriteFixedTail(size_t logical_end);
+  std::atomic<uint64_t> sync_count_{0};
+  std::atomic<uint64_t> sync_ns_{0};
   // Only Create() may construct; use it so open/stat/thread-start failures
   // surface as Status.
   explicit Logger(std::filesystem::path logfile, size_t buffer_size,
@@ -210,9 +248,11 @@ class Logger final {
   static Status MigrateLegacyLog(const std::filesystem::path& base,
                                  size_t segment_size);
   static StatusOr<size_t> ReadSegmentMetadata(const std::filesystem::path& base,
-                                              bool* exists);
+                                              bool* exists,
+                                              bool* fixed_size = nullptr);
   static Status WriteSegmentMetadata(const std::filesystem::path& base,
-                                     size_t segment_size);
+                                     size_t segment_size,
+                                     bool fixed_size = false);
 
   void LoggerWork();
   // Closes dst_ and opens the append fd for `index` (O_CREAT | O_APPEND).
@@ -231,6 +271,9 @@ class Logger final {
   mutable std::mutex segment_mu_;
   // Index of the segment dst_ currently appends to.
   uint64_t current_segment_ = 0;
+  // Format is immutable after Create; generation is guarded by segment_mu_.
+  bool fixed_size_segments_{false};
+  uint64_t footer_generation_{0};
   // Lowest segment index that may still exist on disk. RecycleUpTo removes
   // the files and advances this under segment_mu_, so RecycleUpTo /
   // LowestRetainedLSN never re-scan the (ever growing) removed prefix: a
@@ -269,6 +312,7 @@ class Logger final {
   int full_buffer_waiters_{0};
   std::string buffer_;
   std::chrono::milliseconds sync_interval_{1};
+  std::atomic<bool> commit_driven_sync_{false};
   int dst_ = -1;
   // See SetRecycleBoundaryValidator. Read without extra locking; installed
   // before the checkpoint worker starts recycling.

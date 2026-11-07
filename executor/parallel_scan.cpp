@@ -13,12 +13,14 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "page/row_position.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 #include "type/value_type.hpp"
@@ -55,9 +57,31 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
     return;
   }
   table_lease_ = lease.MoveValue();
-  morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel);
+  if ((txn_->IsReadOnly() || txn_->WriteSetEmpty()) &&
+      !txn_->HasAnyPageVersionChains()) {
+    lstable_store_ = GetOrBuildLSTableStore(*txn_, *table_, true);
+    if (lstable_store_ != nullptr &&
+        (lstable_store_->uncommitted_owner_txn != 0 ||
+         lstable_store_->layout_generation != table_->LayoutGeneration() ||
+         lstable_store_->first_pid != table_->FirstPageId())) {
+      lstable_store_.reset();
+    }
+  }
+  if (lstable_store_ != nullptr) {
+    const size_t step = std::max<size_t>(1, pages_per_morsel);
+    morsels_.reserve((lstable_store_->page_ids.size() + step - 1) / step);
+    for (size_t i = 0; i < lstable_store_->page_ids.size(); i += step) {
+      const size_t end = std::min(lstable_store_->page_ids.size(), i + step);
+      Table::ScanMorsel morsel(
+          lstable_store_->page_ids.begin() + static_cast<ptrdiff_t>(i),
+          lstable_store_->page_ids.begin() + static_cast<ptrdiff_t>(end));
+      morsels_.push_back(std::move(morsel));
+    }
+  } else {
+    morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel);
+  }
   morsels_done_.assign(morsels_.size(), false);
-  worker_count_ = std::min(std::max<size_t>(1, worker_count),
+  worker_count_ = std::min(QueryParallelWorkerLimit(worker_count),
                            std::max<size_t>(1, morsels_.size()));
   max_ready_chunks_ = std::max<size_t>(2, worker_count_ * 2);
 }
@@ -72,6 +96,539 @@ ParallelScan::~ParallelScan() {
   // jthread joins in its destructor.  Join while the mutexes and condition
   // variables used by workers are still alive.
   workers_.clear();
+}
+
+StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
+    const std::function<Status(size_t, const TypedCellBatch&)>& consume,
+    bool capture_positions) {
+  if (started_ || row_filter_ != nullptr) {
+    return false;
+  }
+  const auto supported = [](ValueType type) {
+    return type == ValueType::kInt64 || type == ValueType::kDate ||
+           type == ValueType::kDouble;
+  };
+  if (projection_) {
+    if (projection_->empty()) return false;
+    for (slot_t slot : *projection_) {
+      if (slot >= table_->GetSchema().ColumnCount() ||
+          !supported(table_->GetSchema().GetColumn(slot).Type()))
+        return false;
+    }
+  } else {
+    for (size_t slot = 0; slot < table_->GetSchema().ColumnCount(); ++slot) {
+      if (!supported(table_->GetSchema().GetColumn(slot).Type())) return false;
+    }
+  }
+  if (worker_status_ != Status::kSuccess) return worker_status_;
+  started_ = true;
+  typed_folded_ = true;
+  std::atomic<size_t> next{0};
+  std::atomic<bool> failed{false};
+  Status error = Status::kSuccess;
+  std::mutex error_mutex;
+  const auto fail = [&](Status status) {
+    std::scoped_lock lock(error_mutex);
+    if (!failed.load(std::memory_order_relaxed)) {
+      error = std::move(status);
+      failed.store(true, std::memory_order_release);
+    }
+  };
+  const auto run = [&] {
+    try {
+      TypedCellBatch batch;
+      batch.capture_positions = capture_positions;
+      while (!failed.load(std::memory_order_acquire)) {
+        const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= morsels_.size()) break;
+        Iterator iterator = table_->BeginMorselScan(
+            *txn_, morsels_[index], projection_, nullptr, std::nullopt,
+            peek_compares_.empty() ? nullptr : &peek_compares_);
+        while (!failed.load(std::memory_order_acquire) &&
+               iterator.DecodeNextTypedBatch(&batch, kDefaultVectorSize) != 0) {
+          // Batches own all decoded bytes; do not hold a page latch across a
+          // consumer callback, which may need other pages or shared state.
+          iterator.DropPageLatch();
+          if (iterator.GetStatus() != Status::kSuccess) {
+            fail(iterator.GetStatus());
+            break;
+          }
+          const Status status = consume(index, batch);
+          if (status != Status::kSuccess) {
+            fail(status);
+            break;
+          }
+        }
+        if (iterator.GetStatus() != Status::kSuccess) {
+          fail(iterator.GetStatus());
+        } else if (iterator.IsValid() &&
+                   !failed.load(std::memory_order_acquire)) {
+          fail(StatusError(StatusCode::kRuntimeError,
+                           "typed scan stopped before exhaustion"));
+        }
+      }
+    } catch (const std::exception& exception) {
+      fail(StatusError(StatusCode::kRuntimeError, exception.what()));
+    } catch (...) {
+      fail(StatusError(StatusCode::kRuntimeError, "typed scan worker failed"));
+    }
+  };
+  std::vector<std::jthread> workers;
+  try {
+    // A few thousand fixed-width rows cost less than starting helper threads.
+    // The SQL worker already supplies parallelism across concurrent queries.
+    const size_t fold_workers = morsels_.size() <= 4 ? 1 : worker_count_;
+    workers.reserve(fold_workers - 1);
+    for (size_t i = 1; i < fold_workers; ++i) workers.emplace_back(run);
+    run();
+  } catch (const std::exception& exception) {
+    fail(StatusError(StatusCode::kRuntimeError, exception.what()));
+  }
+  workers.clear();
+  if (failed.load(std::memory_order_acquire)) {
+    FailWith(error);
+    return error;
+  }
+  return true;
+}
+
+StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
+    size_t worker_count,
+    const std::function<Status(size_t, const LSTablePageBlock&, const uint32_t*,
+                               size_t)>& consume) {
+  if (started_ || lstable_store_ == nullptr ||
+      txn_->HasAnyPageVersionChains()) {
+    return false;
+  }
+  if (worker_status_ != Status::kSuccess) {
+    return worker_status_;
+  }
+  if (projection_) {
+    for (slot_t slot : *projection_) {
+      if (slot >= table_->GetSchema().ColumnCount()) {
+        return false;
+      }
+    }
+  }
+  const bool can_inline_simple =
+      row_filter_ != nullptr && !row_filter_->compile_decided_reject &&
+      row_filter_->disjunctive_branches.empty() && !projection_;
+  if (row_filter_ != nullptr && !row_filter_->compile_decided_reject) {
+    if (!can_inline_simple || !row_filter_->prefix_in.empty() ||
+        !row_filter_->prebuilt_membership.empty() ||
+        !row_filter_->prebuilt_scalar_compare.empty() ||
+        !row_filter_->residual.empty()) {
+      return false;
+    }
+    for (const auto& pred : row_filter_->simple) {
+      if (pred.column_payload ||
+          pred.column >= table_->GetSchema().ColumnCount()) {
+        return false;
+      }
+      const auto& col_def = table_->GetSchema().GetColumn(pred.column);
+      const bool ok_double =
+          col_def.Type() == ValueType::kDouble &&
+          (pred.double_payload ||
+           (pred.int_payload && !pred.constant.IsUnsigned() &&
+            pred.int_constant >= -(int64_t{1} << 53) &&
+            pred.int_constant <= (int64_t{1} << 53)));
+      const bool ok_int = (col_def.Type() == ValueType::kInt64 ||
+                           col_def.Type() == ValueType::kDate) &&
+                          !col_def.IsUnsigned() && pred.int_payload &&
+                          !pred.constant.IsUnsigned();
+      if (!ok_double && !ok_int) {
+        return false;
+      }
+    }
+  }
+  started_ = true;
+  typed_folded_ = true;
+  if (row_filter_ != nullptr && row_filter_->compile_decided_reject) {
+    return true;
+  }
+  const size_t total_blocks = lstable_store_->blocks.size();
+  if (total_blocks == 0) {
+    return true;
+  }
+  const size_t fold_workers = std::min<size_t>(
+      std::max<size_t>(1, worker_count),
+      total_blocks <= 4 ? 1 : std::min(worker_count_, total_blocks));
+  const std::vector<IntegerPeekCompare>* peek_ptr =
+      peek_compares_.empty() ? nullptr : &peek_compares_;
+  std::atomic<bool> failed{false};
+  Status error = Status::kSuccess;
+  std::mutex error_mutex;
+  const auto fail = [&](Status status) {
+    std::scoped_lock lock(error_mutex);
+    if (!failed.load(std::memory_order_relaxed)) {
+      error = std::move(status);
+      failed.store(true, std::memory_order_release);
+    }
+  };
+  const auto run_worker = [&](size_t w) {
+    try {
+      const size_t b_begin = (total_blocks * w) / fold_workers;
+      const size_t b_end = (total_blocks * (w + 1)) / fold_workers;
+      std::vector<uint32_t> matched_rows;
+      matched_rows.reserve(256);
+      for (size_t b = b_begin; b < b_end; ++b) {
+        if (failed.load(std::memory_order_acquire)) {
+          return;
+        }
+        const LSTablePageBlock& blk = lstable_store_->blocks[b];
+        if (blk.row_count == 0) {
+          continue;
+        }
+        if (!blk.MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
+          continue;
+        }
+        bool all_rows_pass = true;
+        if (peek_ptr != nullptr) {
+          for (const IntegerPeekCompare& pred : *peek_ptr) {
+            if (pred.column >= blk.columns.size()) {
+              all_rows_pass = false;
+              break;
+            }
+            const LSTableColumnBlock& pcol = blk.columns[pred.column];
+            if (pcol.has_null || !pcol.has_min_max ||
+                !MatchIntegerCompare(pcol.min_int, pred.op, pred.constant) ||
+                !MatchIntegerCompare(pcol.max_int, pred.op, pred.constant) ||
+                (pred.op == BinaryOperation::kNotEquals &&
+                 pcol.min_int <= pred.constant &&
+                 pred.constant <= pcol.max_int)) {
+              all_rows_pass = false;
+              break;
+            }
+          }
+        }
+        if (can_inline_simple) {
+          bool zone_rejected = false;
+          for (const auto& pred : row_filter_->simple) {
+            const LSTableColumnBlock& col = blk.columns[pred.column];
+            const bool is_double_cmp = col.type == ValueType::kDouble;
+            if (is_double_cmp) {
+              if (!col.has_double_min_max) {
+                zone_rejected = true;
+                break;
+              }
+              const double c = pred.double_payload
+                                   ? pred.double_constant
+                                   : static_cast<double>(pred.int_constant);
+              switch (pred.op) {
+                case BinaryOperation::kEquals:
+                  if (c < col.min_double || c > col.max_double) {
+                    zone_rejected = true;
+                  } else if (col.has_null || col.min_double != c ||
+                             col.max_double != c) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kNotEquals:
+                  if (col.min_double == c && col.max_double == c) {
+                    zone_rejected = true;
+                  } else if (col.has_null ||
+                             (col.min_double <= c && c <= col.max_double)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kLessThan:
+                  if (col.min_double >= c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.max_double < c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kLessThanEquals:
+                  if (col.min_double > c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.max_double <= c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kGreaterThan:
+                  if (col.max_double <= c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.min_double > c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kGreaterThanEquals:
+                  if (col.max_double < c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.min_double >= c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                default:
+                  all_rows_pass = false;
+                  break;
+              }
+            } else {
+              if (!col.has_min_max) {
+                zone_rejected = true;
+                break;
+              }
+              const int64_t c = pred.int_constant;
+              switch (pred.op) {
+                case BinaryOperation::kEquals:
+                  if (c < col.min_int || c > col.max_int) {
+                    zone_rejected = true;
+                  } else if (col.has_null || col.min_int != c ||
+                             col.max_int != c) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kNotEquals:
+                  if (col.min_int == c && col.max_int == c) {
+                    zone_rejected = true;
+                  } else if (col.has_null ||
+                             (col.min_int <= c && c <= col.max_int)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kLessThan:
+                  if (col.min_int >= c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.max_int < c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kLessThanEquals:
+                  if (col.min_int > c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.max_int <= c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kGreaterThan:
+                  if (col.max_int <= c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.min_int > c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                case BinaryOperation::kGreaterThanEquals:
+                  if (col.max_int < c) {
+                    zone_rejected = true;
+                  } else if (col.has_null || !(col.min_int >= c)) {
+                    all_rows_pass = false;
+                  }
+                  break;
+                default:
+                  all_rows_pass = false;
+                  break;
+              }
+            }
+            if (zone_rejected) {
+              break;
+            }
+          }
+          if (zone_rejected) {
+            continue;
+          }
+        }
+        if (all_rows_pass) {
+          if (Status st = consume(w, blk, nullptr, blk.row_count);
+              st != Status::kSuccess) {
+            fail(st);
+            return;
+          }
+          continue;
+        }
+        matched_rows.clear();
+        if (peek_ptr == nullptr && can_inline_simple &&
+            row_filter_->simple.size() == 1) {
+          const auto& pred = row_filter_->simple[0];
+          const LSTableColumnBlock& col = blk.columns[pred.column];
+          if (!col.has_null && col.type != ValueType::kDouble) {
+            matched_rows.resize(blk.row_count);
+            uint32_t* __restrict out = matched_rows.data();
+            const int64_t* __restrict vals = col.int_cells.data();
+            const int64_t c = pred.int_constant;
+            const uint32_t n = blk.row_count;
+            size_t out_idx = 0;
+            switch (pred.op) {
+              case BinaryOperation::kEquals:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] == c);
+                }
+                break;
+              case BinaryOperation::kNotEquals:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] != c);
+                }
+                break;
+              case BinaryOperation::kLessThan:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] < c);
+                }
+                break;
+              case BinaryOperation::kLessThanEquals:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] <= c);
+                }
+                break;
+              case BinaryOperation::kGreaterThan:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] > c);
+                }
+                break;
+              case BinaryOperation::kGreaterThanEquals:
+                for (uint32_t r = 0; r < n; ++r) {
+                  out[out_idx] = r;
+                  out_idx += static_cast<size_t>(vals[r] >= c);
+                }
+                break;
+              default:
+                for (uint32_t r = 0; r < n; ++r) {
+                  if (MatchIntegerCompare(vals[r], pred.op, c)) {
+                    out[out_idx++] = r;
+                  }
+                }
+                break;
+            }
+            matched_rows.resize(out_idx);
+            if (matched_rows.size() == blk.row_count) {
+              if (Status st = consume(w, blk, nullptr, blk.row_count);
+                  st != Status::kSuccess) {
+                fail(st);
+                return;
+              }
+            } else if (!matched_rows.empty()) {
+              if (Status st =
+                      consume(w, blk, matched_rows.data(), matched_rows.size());
+                  st != Status::kSuccess) {
+                fail(st);
+                return;
+              }
+            }
+            continue;
+          }
+        }
+        for (uint32_t r = 0; r < blk.row_count; ++r) {
+          if (peek_ptr != nullptr) {
+            bool peek_ok = true;
+            for (const IntegerPeekCompare& pred : *peek_ptr) {
+              const LSTableColumnBlock& pcol = blk.columns[pred.column];
+              if (pcol.IsNull(r) ||
+                  !MatchIntegerCompare(pcol.int_cells[r], pred.op,
+                                       pred.constant)) {
+                peek_ok = false;
+                break;
+              }
+            }
+            if (!peek_ok) {
+              continue;
+            }
+          }
+          if (can_inline_simple) {
+            bool simple_ok = true;
+            for (const auto& pred : row_filter_->simple) {
+              const LSTableColumnBlock& col = blk.columns[pred.column];
+              if (col.IsNull(r)) {
+                simple_ok = false;
+                break;
+              }
+              if (col.type == ValueType::kDouble) {
+                const auto v = std::bit_cast<double>(col.int_cells[r]);
+                const double c = pred.double_payload
+                                     ? pred.double_constant
+                                     : static_cast<double>(pred.int_constant);
+                bool ok = false;
+                switch (pred.op) {
+                  case BinaryOperation::kEquals:
+                    ok = (v == c);
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    ok = (v != c);
+                    break;
+                  case BinaryOperation::kLessThan:
+                    ok = (v < c);
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    ok = (v <= c);
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    ok = (v > c);
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    ok = (v >= c);
+                    break;
+                  default:
+                    ok = true;
+                    break;
+                }
+                if (!ok) {
+                  simple_ok = false;
+                  break;
+                }
+              } else {
+                if (!MatchIntegerCompare(col.int_cells[r], pred.op,
+                                         pred.int_constant)) {
+                  simple_ok = false;
+                  break;
+                }
+              }
+            }
+            if (!simple_ok) {
+              continue;
+            }
+          }
+          matched_rows.push_back(r);
+        }
+        if (matched_rows.size() == blk.row_count) {
+          if (Status st = consume(w, blk, nullptr, blk.row_count);
+              st != Status::kSuccess) {
+            fail(st);
+            return;
+          }
+        } else if (!matched_rows.empty()) {
+          if (Status st =
+                  consume(w, blk, matched_rows.data(), matched_rows.size());
+              st != Status::kSuccess) {
+            fail(st);
+            return;
+          }
+        }
+      }
+    } catch (const std::exception& ex) {
+      fail(StatusError(StatusCode::kRuntimeError, ex.what()));
+    } catch (...) {
+      fail(StatusError(StatusCode::kRuntimeError,
+                       "lstable fold scan worker failed"));
+    }
+  };
+  std::vector<std::jthread> workers;
+  try {
+    workers.reserve(fold_workers - 1);
+    for (size_t w = 1; w < fold_workers; ++w) {
+      workers.emplace_back([&, w] { run_worker(w); });
+    }
+    run_worker(0);
+  } catch (const std::exception& ex) {
+    fail(StatusError(StatusCode::kRuntimeError, ex.what()));
+  }
+  workers.clear();
+  if (failed.load(std::memory_order_acquire)) {
+    FailWith(error);
+    return error;
+  }
+  return true;
+}
+
+bool ParallelScan::HasSignedIntegerColumn(size_t offset) const {
+  if (projection_) {
+    if (offset >= projection_->size()) return false;
+    offset = (*projection_)[offset];
+  }
+  return offset < table_->GetSchema().ColumnCount() &&
+         table_->GetSchema().GetColumn(offset).Type() == ValueType::kInt64 &&
+         !table_->GetSchema().GetColumn(offset).IsUnsigned();
 }
 
 void ParallelScan::Start(size_t batch_size) {
@@ -150,6 +707,331 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
       }
       const std::vector<IntegerPeekCompare>* peek_ptr =
           peek_compares_.empty() ? nullptr : &peek_compares_;
+      if (lstable_store_ != nullptr && !txn_->HasAnyPageVersionChains()) {
+        DataChunk chunk;
+        if (projection_) {
+          chunk.Initialize(projection_types, batch_size);
+        } else {
+          chunk.Initialize(table_->GetSchema(), batch_size);
+        }
+        const size_t out_cols = projection_types.size();
+        Row row_scratch{std::vector<Value>(out_cols)};
+        const bool can_inline_simple =
+            row_filter_ != nullptr && !row_filter_->compile_decided_reject &&
+            row_filter_->disjunctive_branches.empty() && !projection_;
+        bool all_simple_inline = can_inline_simple;
+        if (can_inline_simple) {
+          for (const auto& pred : row_filter_->simple) {
+            if (pred.column_payload ||
+                pred.column >= table_->GetSchema().ColumnCount()) {
+              all_simple_inline = false;
+              break;
+            }
+            const auto& col_def = table_->GetSchema().GetColumn(pred.column);
+            const bool ok_double =
+                col_def.Type() == ValueType::kDouble &&
+                (pred.double_payload ||
+                 (pred.int_payload && !pred.constant.IsUnsigned() &&
+                  pred.int_constant >= -(int64_t{1} << 53) &&
+                  pred.int_constant <= (int64_t{1} << 53)));
+            const bool ok_int = (col_def.Type() == ValueType::kInt64 ||
+                                 col_def.Type() == ValueType::kDate) &&
+                                !col_def.IsUnsigned() && pred.int_payload &&
+                                !pred.constant.IsUnsigned();
+            if (!ok_double && !ok_int) {
+              all_simple_inline = false;
+              break;
+            }
+          }
+        }
+        const bool skip_worker_filter =
+            all_simple_inline && row_filter_->prefix_in.empty() &&
+            row_filter_->prebuilt_membership.empty() &&
+            row_filter_->prebuilt_scalar_compare.empty() &&
+            row_filter_->residual.empty();
+
+        for (const page_id_t pid : morsels_[morsel_index]) {
+          if (cancelled_.load(std::memory_order_relaxed)) {
+            return;
+          }
+          if (row_filter_ != nullptr && row_filter_->compile_decided_reject) {
+            continue;
+          }
+          const LSTablePageBlock* blk = lstable_store_->FindBlock(pid);
+          if (blk == nullptr || blk->row_count == 0) {
+            continue;
+          }
+          if (!blk->MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
+            continue;
+          }
+          if (can_inline_simple) {
+            bool zone_rejected = false;
+            for (const auto& pred : row_filter_->simple) {
+              if (pred.column_payload || pred.column >= blk->columns.size()) {
+                continue;
+              }
+              const LSTableColumnBlock& col = blk->columns[pred.column];
+              const bool is_double_cmp =
+                  col.type == ValueType::kDouble &&
+                  (pred.double_payload ||
+                   (pred.int_payload && !pred.constant.IsUnsigned() &&
+                    pred.int_constant >= -(int64_t{1} << 53) &&
+                    pred.int_constant <= (int64_t{1} << 53)));
+              const bool is_int_cmp = (col.type == ValueType::kInt64 ||
+                                       col.type == ValueType::kDate) &&
+                                      !col.is_unsigned && pred.int_payload &&
+                                      !pred.constant.IsUnsigned();
+              if (is_double_cmp) {
+                if (!col.has_double_min_max) {
+                  zone_rejected = true;
+                  break;
+                }
+                const double c = pred.double_payload
+                                     ? pred.double_constant
+                                     : static_cast<double>(pred.int_constant);
+                switch (pred.op) {
+                  case BinaryOperation::kEquals:
+                    if (c < col.min_double || c > col.max_double) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    if (col.min_double == c && col.max_double == c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kLessThan:
+                    if (col.min_double >= c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    if (col.min_double > c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    if (col.max_double <= c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    if (col.max_double < c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  default:
+                    break;
+                }
+              } else if (is_int_cmp) {
+                if (!col.has_min_max) {
+                  zone_rejected = true;
+                  break;
+                }
+                const int64_t c = pred.int_constant;
+                switch (pred.op) {
+                  case BinaryOperation::kEquals:
+                    if (c < col.min_int || c > col.max_int) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    if (col.min_int == c && col.max_int == c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kLessThan:
+                    if (col.min_int >= c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    if (col.min_int > c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    if (col.max_int <= c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    if (col.max_int < c) {
+                      zone_rejected = true;
+                    }
+                    break;
+                  default:
+                    break;
+                }
+              }
+              if (zone_rejected) {
+                break;
+              }
+            }
+            if (zone_rejected) {
+              continue;
+            }
+          }
+
+          for (uint32_t r = 0; r < blk->row_count; ++r) {
+            if (peek_ptr != nullptr) {
+              bool peek_ok = true;
+              for (const IntegerPeekCompare& pred : *peek_ptr) {
+                const LSTableColumnBlock& pcol = blk->columns[pred.column];
+                if (pcol.IsNull(r) ||
+                    !MatchIntegerCompare(pcol.int_cells[r], pred.op,
+                                         pred.constant)) {
+                  peek_ok = false;
+                  break;
+                }
+              }
+              if (!peek_ok) {
+                continue;
+              }
+            }
+            if (can_inline_simple) {
+              bool simple_ok = true;
+              for (const auto& pred : row_filter_->simple) {
+                if (pred.column_payload || pred.column >= blk->columns.size()) {
+                  continue;
+                }
+                const LSTableColumnBlock& col = blk->columns[pred.column];
+                const bool is_double_cmp =
+                    col.type == ValueType::kDouble &&
+                    (pred.double_payload ||
+                     (pred.int_payload && !pred.constant.IsUnsigned() &&
+                      pred.int_constant >= -(int64_t{1} << 53) &&
+                      pred.int_constant <= (int64_t{1} << 53)));
+                const bool is_int_cmp = (col.type == ValueType::kInt64 ||
+                                         col.type == ValueType::kDate) &&
+                                        !col.is_unsigned && pred.int_payload &&
+                                        !pred.constant.IsUnsigned();
+                if (!is_double_cmp && !is_int_cmp) {
+                  continue;
+                }
+                if (col.IsNull(r)) {
+                  simple_ok = false;
+                  break;
+                }
+                if (is_double_cmp) {
+                  const auto v = std::bit_cast<double>(col.int_cells[r]);
+                  const double c = pred.double_payload
+                                       ? pred.double_constant
+                                       : static_cast<double>(pred.int_constant);
+                  bool ok = false;
+                  switch (pred.op) {
+                    case BinaryOperation::kEquals:
+                      ok = (v == c);
+                      break;
+                    case BinaryOperation::kNotEquals:
+                      ok = (v != c);
+                      break;
+                    case BinaryOperation::kLessThan:
+                      ok = (v < c);
+                      break;
+                    case BinaryOperation::kLessThanEquals:
+                      ok = (v <= c);
+                      break;
+                    case BinaryOperation::kGreaterThan:
+                      ok = (v > c);
+                      break;
+                    case BinaryOperation::kGreaterThanEquals:
+                      ok = (v >= c);
+                      break;
+                    default:
+                      ok = true;
+                      break;
+                  }
+                  if (!ok) {
+                    simple_ok = false;
+                    break;
+                  }
+                } else {
+                  if (!MatchIntegerCompare(col.int_cells[r], pred.op,
+                                           pred.int_constant)) {
+                    simple_ok = false;
+                    break;
+                  }
+                }
+              }
+              if (!simple_ok) {
+                continue;
+              }
+            }
+            for (size_t i = 0; i < out_cols; ++i) {
+              const slot_t full_col =
+                  projection_ ? (*projection_)[i] : static_cast<slot_t>(i);
+              const LSTableColumnBlock& col = blk->columns[full_col];
+              Value& cell = row_scratch[i];
+              if (col.IsNull(r)) {
+                cell = Value();
+                continue;
+              }
+              switch (col.type) {
+                case ValueType::kInt64:
+                  cell = Value(col.int_cells[r]);
+                  if (col.is_unsigned) {
+                    cell.SetUnsigned();
+                  }
+                  break;
+                case ValueType::kDate:
+                  cell.type = ValueType::kDate;
+                  cell.value.int_value = col.int_cells[r];
+                  break;
+                case ValueType::kDouble:
+                  cell = Value(std::bit_cast<double>(col.int_cells[r]));
+                  break;
+                case ValueType::kVarChar:
+                  cell = Value(std::string(col.VarcharAt(r)));
+                  break;
+                default:
+                  cell = Value();
+                  break;
+              }
+            }
+            const RowPosition position(pid, r < blk->slots.size()
+                                                ? blk->slots[r]
+                                                : static_cast<slot_t>(r));
+            if (row_filter_ != nullptr && !skip_worker_filter) {
+              const int decision = relational_detail::MatchScanFilterWorker(
+                  row_scratch, table_->GetSchema(), *row_filter_,
+                  *row_filter_programs_);
+              if (decision == 0) {
+                continue;
+              }
+              if (decision == 2) {
+                std::scoped_lock deferred_lock(deferred_mutex_);
+                deferred_.emplace_back(row_scratch, position);
+                continue;
+              }
+            }
+            chunk.Append(static_cast<const Row&>(row_scratch), position);
+            if (chunk.Size() == batch_size) {
+              if (!Enqueue(morsel_index, std::move(chunk))) {
+                return;
+              }
+              chunk = DataChunk{};
+              if (projection_) {
+                chunk.Initialize(projection_types, batch_size);
+              } else {
+                chunk.Initialize(table_->GetSchema(), batch_size);
+              }
+            }
+          }
+        }
+        if (!chunk.Empty()) {
+          if (!Enqueue(morsel_index, std::move(chunk))) {
+            return;
+          }
+          chunk = DataChunk{};
+        }
+        {
+          std::scoped_lock lock(mutex_);
+          morsels_done_[morsel_index] = true;
+        }
+        ready_cv_.notify_all();
+        continue;
+      }
       Iterator iterator =
           table_->BeginMorselScan(*txn_, morsels_[morsel_index], projection_,
                                   nullptr, std::nullopt, peek_ptr);
@@ -278,6 +1160,10 @@ bool ParallelScan::Enqueue(size_t morsel_index, DataChunk chunk) {
 }
 
 size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
+  if (typed_folded_) {
+    destination->Reset();
+    return 0;
+  }
   max_rows = std::max<size_t>(1, max_rows);
   destination->Reset();
 
@@ -382,21 +1268,6 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
   return destination->Size();
 }
 
-bool ParallelScan::Next(Row* destination, RowPosition* position) {
-  if (scalar_offset_ == scalar_batch_.Size()) {
-    if (NextBatch(&scalar_batch_) == 0) {
-      return false;
-    }
-    scalar_offset_ = 0;
-  }
-  *destination = scalar_batch_.RowAt(scalar_offset_);
-  if (position != nullptr) {
-    *position = scalar_batch_.PositionAt(scalar_offset_);
-  }
-  ++scalar_offset_;
-  return true;
-}
-
 size_t ParallelScan::DrainDeferred(DataChunk* destination, size_t max_rows) {
   if (row_filter_ == nullptr || deferred_drained_) {
     return 0;
@@ -452,6 +1323,7 @@ void ParallelScan::Dump(std::ostream& out, int /*indent*/) const {
   if (row_filter_ != nullptr) {
     out << " worker-filter";
   }
+  if (typed_folded_) out << " fused-typed-fold";
 }
 
 }  // namespace tinylamb

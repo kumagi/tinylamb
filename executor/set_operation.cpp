@@ -406,22 +406,25 @@ Status SetOperationExecutor::Materialize() {
     return Status::kSuccess;
   };
   for (size_t source = 0; source < sources_.size(); ++source) {
-    Row row;
-    RowPosition position;
-    while (sources_[source]->Next(&row, &position)) {
-      RETURN_IF_FAIL(observe_types(row));
-      if (!spilling && operation_ != SetOperationKind::kUnionAll &&
-          !QueryMemoryBudget::Global().CanReserve(EstimateRowBytes(row))) {
-        RETURN_IF_FAIL(begin_spill());
-      }
-      if (spilling) {
-        RETURN_IF_FAIL(spill_sources_[source][std::hash<Row>{}(row) %
-                                              kSetOperationPartitions]
-                           .Append(row));
-      } else {
-        charge.Add(EstimateRowBytes(row));
-        rows[source].push_back(
-            Positioned{.row = std::move(row), .position = position});
+    DataChunk batch;
+    while (sources_[source]->NextBatch(&batch) != 0) {
+      for (size_t i = 0; i < batch.Size(); ++i) {
+        Row row = batch.RowAt(i);
+        RowPosition position = batch.PositionAt(i);
+        RETURN_IF_FAIL(observe_types(row));
+        if (!spilling && operation_ != SetOperationKind::kUnionAll &&
+            !QueryMemoryBudget::Global().CanReserve(EstimateRowBytes(row))) {
+          RETURN_IF_FAIL(begin_spill());
+        }
+        if (spilling) {
+          RETURN_IF_FAIL(spill_sources_[source][std::hash<Row>{}(row) %
+                                                kSetOperationPartitions]
+                             .Append(row));
+        } else {
+          charge.Add(EstimateRowBytes(row));
+          rows[source].push_back(
+              Positioned{.row = std::move(row), .position = position});
+        }
       }
     }
     if (auto st = sources_[source]->GetStatus(); st != Status::kSuccess) {
@@ -437,22 +440,24 @@ Status SetOperationExecutor::Materialize() {
   return Status::kSuccess;
 }
 
-bool SetOperationExecutor::Next(Row* destination, RowPosition* position) {
+size_t SetOperationExecutor::NextBatch(DataChunk* destination,
+                                       size_t max_rows) {
+  destination->Reset();
+  if (max_rows == 0) {
+    return 0;
+  }
   if (!materialized_) {
     Status st = Materialize();
     if (st != Status::kSuccess) {
-      return FailWith(st);
+      FailWith(st);
+      return 0;
     }
   }
-  if (output_offset_ == output_.size()) {
-    return false;
+  while (destination->Size() < max_rows && output_offset_ < output_.size()) {
+    const Positioned& item = output_[output_offset_++];
+    destination->Append(item.row, item.position);
   }
-  const Positioned& item = output_[output_offset_++];
-  *destination = item.row;
-  if (position != nullptr) {
-    *position = item.position;
-  }
-  return true;
+  return destination->Size();
 }
 
 void SetOperationExecutor::Dump(std::ostream& output, int indent) const {

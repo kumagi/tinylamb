@@ -37,7 +37,6 @@
 #include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
-#include "transaction/lock_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
@@ -1700,110 +1699,6 @@ TEST_F(TransactionCoverageRecoveryTest, AbortStopsUndoWhenCompensationFails) {
   ForceWalFailure(l_.get());
   EXPECT_NE(txn.Abort(), Status::kSuccess);
   EXPECT_TRUE(txn.IsFinished());
-}
-
-// ---------------------------------------------------------------------------
-// Row lock manager gaps.
-// ---------------------------------------------------------------------------
-
-TEST(LockManagerCoverageTest, SharedLockRefusedWhileExclusiveHeld) {
-  LockManager lm;
-  const RowPosition row(90, 1);
-  ASSERT_TRUE(lm.GetExclusiveLock(row, 1, false));
-  // Any exclusive holder, even for a different owner, blocks shared users.
-  EXPECT_FALSE(lm.GetSharedLock(row, 2));
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(row, 1));
-  EXPECT_TRUE(lm.GetSharedLock(row, 2));
-  EXPECT_TRUE(lm.ReleaseSharedLock(row, 2));
-}
-
-TEST(LockManagerCoverageTest, NonWaitingExclusiveRefusedWhileHeld) {
-  LockManager lm;
-  const RowPosition row(91, 1);
-  ASSERT_TRUE(lm.GetExclusiveLock(row, 1, false));
-  EXPECT_FALSE(lm.GetExclusiveLock(row, 2, false));
-  EXPECT_FALSE(lm.GetSharedLock(row, 2));
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(row, 1));
-}
-
-TEST(LockManagerCoverageTest, TryUpgradeIdempotentForHolderOnly) {
-  LockManager lm;
-  const RowPosition row(92, 1);
-  ASSERT_TRUE(lm.GetExclusiveLock(row, 2, false));
-  // Already exclusively held: the holder's re-upgrade succeeds, a foreign
-  // owner's is refused.
-  EXPECT_FALSE(lm.TryUpgradeLock(row, 1));
-  EXPECT_TRUE(lm.TryUpgradeLock(row, 2));
-  EXPECT_TRUE(lm.TryUpgradeLock(row, 2));
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(row, 2));
-  EXPECT_FALSE(lm.ReleaseExclusiveLock(row, 2));
-
-  // A sole shared owner can promote; a second shared holder cannot.
-  ASSERT_TRUE(lm.GetSharedLock(row, 1));
-  ASSERT_TRUE(lm.GetSharedLock(row, 3));
-  EXPECT_FALSE(lm.TryUpgradeLock(row, 1));
-  EXPECT_TRUE(lm.ReleaseSharedLock(row, 3));
-  EXPECT_TRUE(lm.TryUpgradeLock(row, 1));
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(row, 1));
-}
-
-TEST(LockManagerCoverageTest, LockManagerStreamsCounts) {
-  LockManager lm;
-  const RowPosition shared_row(93, 1);
-  const RowPosition exclusive_row(94, 1);
-  ASSERT_TRUE(lm.GetSharedLock(shared_row, 1));
-  ASSERT_TRUE(lm.GetSharedLock(shared_row, 2));
-  ASSERT_TRUE(lm.GetExclusiveLock(exclusive_row, 3, false));
-  std::ostringstream oss;
-  oss << lm;
-  EXPECT_EQ(oss.str(), "LockManager(shared=1, exclusive=1)");
-  EXPECT_TRUE(lm.ReleaseExclusiveLock(exclusive_row, 3));
-  EXPECT_TRUE(lm.ReleaseSharedLock(shared_row, 1));
-  EXPECT_TRUE(lm.ReleaseSharedLock(shared_row, 2));
-}
-
-TEST(LockManagerCoverageTest, ExclusiveWaitExtendsWhileReleasesProgress) {
-  LockManager lm;
-  const RowPosition held(95, 1);
-  const RowPosition unrelated(96, 1);
-  ASSERT_TRUE(lm.GetExclusiveLock(held, 1));
-
-  std::atomic<bool> contender_parked{false};
-  std::atomic<bool> acquired{false};
-  std::thread contender([&] {
-    // Retry until granted: with release progress elsewhere the wait is
-    // extended instead of reported as a timeout.  A short patience with a
-    // much faster release cadence elsewhere makes every timed-out window
-    // observe progress, exercising the extension branch.
-    while (!acquired.load()) {
-      contender_parked.store(true);
-      acquired = lm.GetExclusiveLock(held, 2, std::chrono::milliseconds(20));
-    }
-  });
-  // The churn runs on its own thread so the release activity continues
-  // even if this thread is descheduled: the contender's 20ms windows then
-  // always observe a release somewhere in the table and keep extending.
-  std::atomic<bool> stop_churn{false};
-  std::thread churn([&] {
-    while (!stop_churn.load(std::memory_order_relaxed)) {
-      if (lm.GetExclusiveLock(unrelated, 9, false)) {
-        std::ignore = lm.ReleaseExclusiveLock(unrelated, 9);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(4));
-    }
-  });
-  // Hold the row through a timed churn window that starts only once the
-  // contender is (about to be) parked, so its first wait overlaps the
-  // release activity, then grant the lock.
-  while (!contender_parked.load()) {
-    std::this_thread::yield();
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  ASSERT_TRUE(lm.ReleaseExclusiveLock(held, 1));
-  contender.join();
-  stop_churn.store(true);
-  churn.join();
-  EXPECT_TRUE(acquired.load());
 }
 
 }  // namespace tinylamb

@@ -15,10 +15,7 @@ enum header `type/value_type.hpp`, allowlisted).
   primitives, big-endian fixed. Persistence base for WAL, pages, index keys.
 - `log_message.hpp` — `LOG(INFO/WARN/FATAL)` with file:line:func.
 - `crc32c.hpp` — WAL/page checksums.
-- `vm_cache*.{hpp,cpp}` — mmap-backed VM cache; convergence target for the
-  S3-FIFO migration (`s3-fifo.md`). Do not confuse with `page/PagePool`.
-- `ring_buffer.hpp` — SPSC lock-free queue. `join_kind.hpp`,
-  `set_operation.hpp`, `byte_stream.hpp`, `converter.hpp`, `debug.*`.
+- `join_kind.hpp`, `set_operation.hpp`, `byte_stream.hpp`.
 - `runtime_filter.{hpp,cpp}` — sound runtime ("dynamic") join filters over one
   INT64/DATE key domain: `ExactSetRuntimeFilter` (information passing),
   `MinMaxRuntimeFilter` (SIP range half), `BloomRuntimeFilter` (SIP membership
@@ -35,5 +32,5 @@ enum header `type/value_type.hpp`, allowlisted).
 kTooBigData/kDeleted/kCorrupt…`) and the macro forms above are the vocabulary
 of every layer — learn them first and the rest reads faster.
 
-Test: `./build/vm_cache_test`, `log_message_test`, `crc32c_test`, `debug_test`,
+Test: `./build/log_message_test`, `crc32c_test`, `serdes_test`,
 `runtime_filter_test`.

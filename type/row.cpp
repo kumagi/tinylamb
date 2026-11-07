@@ -606,6 +606,90 @@ StatusOr<std::string> Row::TryEncodeMemcomparableFormat() const {
   return encoded;
 }
 
+std::string Row::EncodeKeyMemcomparableFormat(const Schema& sc) const {
+  if (values_.empty()) {
+    throw std::runtime_error("cannot encode key of empty row");
+  }
+  const auto idx = sc.KeyColumnIndex();
+  if (idx >= values_.size()) {
+    throw std::runtime_error("key column index out of range");
+  }
+  return values_[idx].EncodeMemcomparableFormat();
+}
+
+size_t Row::EncodeKeyMemcomparableFormatTo(const Schema& sc, char* dst) const {
+  if (values_.empty()) {
+    throw std::runtime_error("cannot encode key of empty row");
+  }
+  const auto idx = sc.KeyColumnIndex();
+  if (idx >= values_.size()) {
+    throw std::runtime_error("key column index out of range");
+  }
+  return values_[idx].EncodeMemcomparableFormatTo(dst);
+}
+
+size_t Row::PeekSerializedSize(const char* src, size_t max_len,
+                               const Schema& sc) {
+  if (max_len < sizeof(slot_t)) {
+    throw std::runtime_error("truncated row header");
+  }
+  constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
+  slot_t count_raw = 0;
+  DeserializeSlot(src, &count_raw);
+  const bool has_map = (count_raw & kNullBitmapFlag) != 0;
+  const auto count = static_cast<slot_t>(count_raw & ~kNullBitmapFlag);
+  if (count != sc.ColumnCount()) {
+    throw std::runtime_error("column count mismatch");
+  }
+  size_t need = sizeof(count_raw);
+  const size_t bmp_bytes = (static_cast<size_t>(count) + 7) / 8;
+  if (has_map) {
+    if (max_len - need < bmp_bytes) {
+      throw std::runtime_error("truncated row nullmap");
+    }
+    need += bmp_bytes;
+  }
+  const char* bitmap = src + sizeof(count_raw);
+  for (slot_t i = 0; i < count; ++i) {
+    if (has_map && (bitmap[i / 8] & static_cast<char>(1U << (i % 8))) != 0) {
+      continue;
+    }
+    const ValueType vt = sc.GetColumn(i).Type();
+    switch (vt) {
+      case ValueType::kInt64:
+      case ValueType::kDate:
+      case ValueType::kDouble:
+        need += sizeof(int64_t);
+        break;
+      case ValueType::kVarChar: {
+        if (max_len - need < sizeof(bin_size_t)) {
+          throw std::runtime_error("truncated varchar header");
+        }
+        bin_size_t len = 0;
+        DeserializeSlot(src + need, &len);
+        need += sizeof(bin_size_t) + len;
+        break;
+      }
+      default:
+        throw std::runtime_error("null column cannot be deserialized");
+    }
+    if (need > max_len) {
+      throw std::runtime_error("row exceeds available bytes");
+    }
+  }
+  return need;
+}
+
+size_t Row::DeserializeBounded(const char* src, size_t max_len,
+                               const Schema& sc) {
+  const size_t need = PeekSerializedSize(src, max_len, sc);
+  const auto decoded = TryDeserialize(src, sc);
+  if (!decoded.HasValue()) {
+    throw std::runtime_error(decoded.GetStatus().GetMessage());
+  }
+  return need;
+}
+
 Status Row::TryDecodeMemcomparableFormat(std::string_view src) {
   values_.clear();
   while (!src.empty()) {

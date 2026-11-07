@@ -68,11 +68,13 @@ ZigZagJoin::ZigZagJoin(Executor left, const std::vector<slot_t>& left_keys,
                  std::move(output_schema)) {}
 
 bool ZigZagJoin::LoadLeft() {
+  DataChunk batch;
   while (true) {
-    PositionedRow candidate;
-    if (!left_->Next(&candidate.row, &candidate.position)) {
+    if (left_->NextBatch(&batch, 1) == 0) {
       break;
     }
+    PositionedRow candidate{.row = batch.RowAt(0),
+                            .position = batch.PositionAt(0)};
     if (!candidate.row.IsValid()) {
       return FailWith(
           StatusError(StatusCode::kCorrupt,
@@ -115,41 +117,42 @@ bool ZigZagJoin::LoadRight() {
   if (right_loaded_) {
     return GetStatus() == Status::kSuccess;
   }
-  while (true) {
-    PositionedRow candidate;
-    if (!right_->Next(&candidate.row, &candidate.position)) {
-      break;
-    }
-    if (!candidate.row.IsValid()) {
-      return FailWith(
-          StatusError(StatusCode::kCorrupt,
-                      "ZigZagJoin right input returned an invalid row"));
-    }
-    if (right_key_ >= candidate.row.values_.size()) {
-      return FailWith(
-          StatusError(StatusCode::kCorrupt,
-                      "ZigZagJoin right key column is outside the row"));
-    }
-    const Value& value = candidate.row[right_key_];
-    if (value.IsNull()) {
-      if (right_order_.previous.has_value()) {
+  DataChunk batch;
+  while (right_->NextBatch(&batch) != 0) {
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      PositionedRow candidate{.row = batch.RowAt(i),
+                              .position = batch.PositionAt(i)};
+      if (!candidate.row.IsValid()) {
+        return FailWith(
+            StatusError(StatusCode::kCorrupt,
+                        "ZigZagJoin right input returned an invalid row"));
+      }
+      if (right_key_ >= candidate.row.values_.size()) {
+        return FailWith(
+            StatusError(StatusCode::kCorrupt,
+                        "ZigZagJoin right key column is outside the row"));
+      }
+      const Value& value = candidate.row[right_key_];
+      if (value.IsNull()) {
+        if (right_order_.previous.has_value()) {
+          return FailWith(StatusError(StatusCode::kInvalidArgument,
+                                      "ZigZagJoin right input is not ordered"));
+        }
+        continue;
+      }
+      if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
+        return FailWith(
+            StatusError(StatusCode::kInvalidArgument,
+                        "ZigZagJoin supports only signed INT64 keys"));
+      }
+      const int64_t key = value.value.int_value;
+      if (right_order_.previous.has_value() && key < *right_order_.previous) {
         return FailWith(StatusError(StatusCode::kInvalidArgument,
                                     "ZigZagJoin right input is not ordered"));
       }
-      continue;
+      right_order_.previous = key;
+      right_rows_.push_back(std::move(candidate));
     }
-    if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
-      return FailWith(
-          StatusError(StatusCode::kInvalidArgument,
-                      "ZigZagJoin supports only signed INT64 keys"));
-    }
-    const int64_t key = value.value.int_value;
-    if (right_order_.previous.has_value() && key < *right_order_.previous) {
-      return FailWith(StatusError(StatusCode::kInvalidArgument,
-                                  "ZigZagJoin right input is not ordered"));
-    }
-    right_order_.previous = key;
-    right_rows_.push_back(std::move(candidate));
   }
   if (FailWithChildOf(*right_)) {
     return false;
@@ -202,7 +205,7 @@ std::pair<size_t, size_t> ZigZagJoin::CandidateRange(int64_t left) const {
   }
 }
 
-bool ZigZagJoin::Next(Row* destination, RowPosition* position) {
+bool ZigZagJoin::NextRow(Row* destination, RowPosition* position) {
   if (GetStatus() != Status::kSuccess) {
     return false;
   }
@@ -247,7 +250,7 @@ size_t ZigZagJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   Row row;
   while (destination->Size() < max_rows) {
     RowPosition position;
-    if (!Next(&row, &position)) {
+    if (!NextRow(&row, &position)) {
       break;
     }
     destination->Append(std::move(row), position);

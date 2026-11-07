@@ -4,6 +4,11 @@
 conflicting shared/exclusive holders to release, then returns `false`
 (caller should abort / retry). Non-waiting mode (`wait=false`) is try-lock.
 
+`DeadlockPolicy::kNoWait` also makes the transaction manager's page-specific
+and all-index undo-reservation drains immediate checks. The byte reservation
+and page admission checks remain active: operations that fit may proceed;
+operations requiring a foreign reservation to drain return a retryable conflict.
+
 `GetSharedLock` remains non-blocking: if an exclusive lock is held it returns
 `false` immediately (readers do not queue behind writers).
 

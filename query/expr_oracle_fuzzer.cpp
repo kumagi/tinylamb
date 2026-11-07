@@ -307,6 +307,26 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   std::mt19937 run_rng(seed32);
   std::string report = RunExprOracleIteration(run_rng, verbose, &trace);
   if (report.empty()) {
+    if (std::getenv("TINYLAMB_EXPR_ROW_ORACLE") != nullptr) {
+      std::mt19937 row_rng(seed32);
+      RowExprOracleTrace row_trace;
+      row_trace.seed = trace.seed;
+      std::string row_report =
+          RunRowExprOracleIteration(row_rng, verbose, &row_trace);
+      if (!row_report.empty()) {
+        std::string row_text = "-- tinylamb-row-expr-oracle-test v1\n";
+        row_text += "-- seed: " + std::to_string(row_trace.seed) + "\n";
+        row_text += "-- predicate_sql: " + row_trace.predicate_sql + "\n";
+        row_text += "-- predicate_ast: " + row_trace.predicate_ast + "\n";
+        row_text += "-- failure: " +
+                    FormatFuzzFailureSummary(row_trace.failure, row_report) +
+                    "\n";
+        const std::string row_path = "row_expr_oracle_fuzz-repro-" +
+                                     std::to_string(row_trace.seed) + ".test";
+        EmitFuzzFinding("row_expr_oracle_fuzz", row_trace.seed, row_path,
+                        row_text, row_report, "");
+      }
+    }
     return;
   }
 
@@ -327,14 +347,7 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
 
   const std::string path =
       "expr_oracle_fuzz-repro-" + std::to_string(trace.seed) + ".test";
-  std::ofstream file(path);
-  file << text;
-  file.close();
-
-  std::cerr << "[expr_oracle_fuzz] seed=" << trace.seed << "\n"
-            << report << "regression test written to " << path
-            << (verify.empty() ? "" : "\n" + verify) << "\n";
-  abort();
+  EmitFuzzFinding("expr_oracle_fuzz", trace.seed, path, text, report, verify);
 }
 
 namespace {

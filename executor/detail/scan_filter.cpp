@@ -5,11 +5,13 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,9 +40,11 @@
 #include "expression/parameter_slot.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
+#include "index/index_scan_iterator.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
 #include "type/column_name.hpp"
@@ -131,6 +135,79 @@ bool IsIntLike(const Value& value) {
 }
 
 }  // namespace
+
+bool FastLikeMatch(std::string_view value, std::string_view pattern) {
+  if (pattern.find('_') == std::string_view::npos) {
+    const size_t first_wild = pattern.find('%');
+    if (first_wild == std::string_view::npos) {
+      return value == pattern;
+    }
+    size_t pos = 0;
+    if (first_wild > 0) {
+      if (value.size() < first_wild ||
+          std::memcmp(value.data(), pattern.data(), first_wild) != 0) {
+        return false;
+      }
+      pos = first_wild;
+    }
+    const size_t last_wild = pattern.rfind('%');
+    const size_t tail_len = pattern.size() - last_wild - 1;
+    size_t p = first_wild;
+    while (p < last_wild) {
+      size_t sep = pattern.find('%', p + 1);
+      if (sep == std::string_view::npos || sep > last_wild) {
+        sep = last_wild;
+      }
+      const size_t seg_len = sep - (p + 1);
+      if (seg_len > 0) {
+        const size_t avail =
+            value.size() >= pos + tail_len ? value.size() - tail_len - pos : 0;
+        if (seg_len > avail) {
+          return false;
+        }
+        const size_t found =
+            value.substr(pos, avail).find(pattern.substr(p + 1, seg_len));
+        if (found == std::string_view::npos) {
+          return false;
+        }
+        pos += found + seg_len;
+      }
+      p = sep;
+    }
+    if (tail_len > 0) {
+      if (value.size() < pos + tail_len ||
+          std::memcmp(value.data() + value.size() - tail_len,
+                      pattern.data() + last_wild + 1, tail_len) != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+  size_t value_pos = 0;
+  size_t pattern_pos = 0;
+  size_t wildcard = std::string_view::npos;
+  size_t retry = 0;
+  while (value_pos < value.size()) {
+    if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
+      wildcard = pattern_pos++;
+      retry = value_pos;
+    } else if (pattern_pos < pattern.size() &&
+               (pattern[pattern_pos] == '_' ||
+                pattern[pattern_pos] == value[value_pos])) {
+      ++value_pos;
+      ++pattern_pos;
+    } else if (wildcard != std::string_view::npos) {
+      pattern_pos = wildcard + 1;
+      value_pos = ++retry;
+    } else {
+      return false;
+    }
+  }
+  while (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
+    ++pattern_pos;
+  }
+  return pattern_pos == pattern.size();
+}
 
 bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   if (pred.column_payload) {
@@ -236,6 +313,13 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   }
   if (value.type == ValueType::kVarChar &&
       pred.constant.type == ValueType::kVarChar) {
+    if ((pred.op == BinaryOperation::kLike ||
+         pred.op == BinaryOperation::kNotLike) &&
+        !value.IsCaseInsensitive() && !pred.constant.IsCaseInsensitive()) {
+      const bool matched = FastLikeMatch(value.value.varchar_value,
+                                         pred.constant.value.varchar_value);
+      return pred.op == BinaryOperation::kLike ? matched : !matched;
+    }
     StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
     return cmp.HasValue() && cmp.Value().Truthy();
   }
@@ -411,13 +495,31 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
     return std::nullopt;
   }
   const BinaryExpression& binary = folded->AsBinaryExpression();
-  if (!IsComparison(binary.Op())) {
+  const bool is_like = binary.Op() == BinaryOperation::kLike ||
+                       binary.Op() == BinaryOperation::kNotLike;
+  if (!IsComparison(binary.Op()) && !is_like) {
     return std::nullopt;
   }
   Expression column = binary.Left();
   Expression constant = binary.Right();
   BinaryOperation op = binary.Op();
-  if (column->Type() == TypeTag::kConstantValue &&
+  auto try_fold_closed_constant = [](Expression* expr_ptr) {
+    const Expression& expr = *expr_ptr;
+    if (!expr || expr->Type() == TypeTag::kConstantValue ||
+        expr->Type() == TypeTag::kColumnValue) {
+      return;
+    }
+    if (!ContainsVolatileCall(expr) && !ContainsParameterSlot(expr) &&
+        !ContainsQuery(expr) && expr->TouchedColumns().empty()) {
+      StatusOr<Value> val = expr->TryEvaluate(Row(), Schema());
+      if (val.HasValue()) {
+        *expr_ptr = ConstantValueExp(val.MoveValue());
+      }
+    }
+  };
+  try_fold_closed_constant(&column);
+  try_fold_closed_constant(&constant);
+  if (!is_like && column->Type() == TypeTag::kConstantValue &&
       constant->Type() == TypeTag::kColumnValue) {
     std::swap(column, constant);
     op = FlipCompare(op);
@@ -426,7 +528,7 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   // predicates in the residual (bytecode/AST) path.
   static const bool colcol_disabled =
       std::getenv("TINYLAMB_DISABLE_COLCOL_COMPARE") != nullptr;
-  if (!colcol_disabled && column->Type() == TypeTag::kColumnValue &&
+  if (!is_like && !colcol_disabled && column->Type() == TypeTag::kColumnValue &&
       constant->Type() == TypeTag::kColumnValue) {
     // Like-kind column pairs only: the positional match below cannot raise
     // for these, while anything exotic (arrays, intervals, mixed numeric
@@ -473,19 +575,122 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
   compiled.column = static_cast<slot_t>(*offset);
   compiled.op = op;
   compiled.constant = constant->AsConstantValue().GetValue();
-  if (compiled.constant.type == ValueType::kInt64 ||
-      compiled.constant.type == ValueType::kDate) {
+  const Column& target_col = schema.GetColumn(static_cast<size_t>(*offset));
+  if (is_like) {
+    if (target_col.Type() != ValueType::kVarChar ||
+        compiled.constant.type != ValueType::kVarChar ||
+        compiled.constant.IsCaseInsensitive()) {
+      return std::nullopt;
+    }
+    return compiled;
+  }
+  if ((compiled.constant.type == ValueType::kInt64 ||
+       compiled.constant.type == ValueType::kDate) &&
+      target_col.Type() == ValueType::kDouble && !target_col.IsUnsigned() &&
+      compiled.constant.type == ValueType::kInt64 &&
+      !compiled.constant.IsUnsigned() &&
+      compiled.constant.value.int_value >= -(int64_t{1} << 53) &&
+      compiled.constant.value.int_value <= (int64_t{1} << 53)) {
+    compiled.double_payload = true;
+    compiled.double_constant =
+        static_cast<double>(compiled.constant.value.int_value);
+  } else if (compiled.constant.type == ValueType::kInt64 ||
+             compiled.constant.type == ValueType::kDate) {
     compiled.int_payload = true;
     compiled.int_constant = compiled.constant.value.int_value;
   } else if (compiled.constant.type == ValueType::kDouble) {
-    compiled.double_payload = true;
-    compiled.double_constant = compiled.constant.value.double_value;
+    const double d = compiled.constant.value.double_value;
+    bool translated_to_int = false;
+    if (target_col.Type() == ValueType::kInt64 && !target_col.IsUnsigned() &&
+        std::isfinite(d) && d >= -static_cast<double>(int64_t{1} << 52) &&
+        d <= static_cast<double>(int64_t{1} << 52)) {
+      const auto fl = static_cast<int64_t>(std::floor(d));
+      const auto cl = static_cast<int64_t>(std::ceil(d));
+      if (fl == cl) {
+        compiled.int_payload = true;
+        compiled.int_constant = fl;
+        compiled.constant = Value(fl);
+        translated_to_int = true;
+      } else if (op == BinaryOperation::kGreaterThan ||
+                 op == BinaryOperation::kGreaterThanEquals) {
+        compiled.op = BinaryOperation::kGreaterThan;
+        compiled.int_payload = true;
+        compiled.int_constant = fl;
+        compiled.constant = Value(fl);
+        translated_to_int = true;
+      } else if (op == BinaryOperation::kLessThan ||
+                 op == BinaryOperation::kLessThanEquals) {
+        compiled.op = BinaryOperation::kLessThanEquals;
+        compiled.int_payload = true;
+        compiled.int_constant = fl;
+        compiled.constant = Value(fl);
+        translated_to_int = true;
+      }
+    }
+    if (!translated_to_int) {
+      compiled.double_payload = true;
+      compiled.double_constant = d;
+    }
   } else if (compiled.constant.type == ValueType::kVarChar &&
              !compiled.constant.IsCaseInsensitive() &&
              PlainStringComparable(compiled.constant.value.varchar_value)) {
     compiled.plain_string_payload = true;
   }
   return compiled;
+}
+
+// Restrict early evaluation to bare, like-typed comparisons. Arbitrary
+// expressions can throw or be volatile even for rows a join would reject.
+bool IsNonThrowingScanComparison(const Expression& predicate,
+                                 const Schema& schema) {
+  if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const BinaryExpression& binary = predicate->AsBinaryExpression();
+  const auto operand_type =
+      [&](const Expression& operand) -> std::optional<ValueType> {
+    if (!operand) {
+      return std::nullopt;
+    }
+    if (operand->Type() == TypeTag::kConstantValue) {
+      return operand->AsConstantValue().GetValue().type;
+    }
+    if (operand->Type() == TypeTag::kColumnValue) {
+      const auto offset =
+          LocalColumnOffset(schema, operand->AsColumnValue().GetColumnName());
+      if (offset) {
+        return schema.GetColumn(*offset).Type();
+      }
+      return std::nullopt;
+    }
+    if (!ContainsVolatileCall(operand) && !ContainsParameterSlot(operand) &&
+        !ContainsQuery(operand) && !ContainsAggregate(operand) &&
+        operand->TouchedColumns().empty()) {
+      StatusOr<Value> val = operand->TryEvaluate(Row(), Schema());
+      if (val.HasValue()) {
+        return val.Value().type;
+      }
+    }
+    return std::nullopt;
+  };
+  const auto left = operand_type(binary.Left());
+  const auto right = operand_type(binary.Right());
+  const bool numeric_cross =
+      left && right &&
+      ((*left == ValueType::kInt64 && *right == ValueType::kDouble) ||
+       (*left == ValueType::kDouble && *right == ValueType::kInt64));
+  if (!left || !right ||
+      (*left != *right && *left != ValueType::kNull &&
+       *right != ValueType::kNull && !numeric_cross)) {
+    return false;
+  }
+  const auto scalar = [](ValueType type) {
+    return type == ValueType::kNull || type == ValueType::kInt64 ||
+           type == ValueType::kDate || type == ValueType::kDouble ||
+           type == ValueType::kVarChar;
+  };
+  return scalar(*left) && scalar(*right) &&
+         TryCompileSimpleCompare(predicate, schema).has_value();
 }
 
 // Compile a single AND expression into a DisjunctiveBranch.
@@ -495,6 +700,8 @@ namespace {
 // Ceiling for the AND-of-OR cross product; beyond this the OR conjunct is
 // evaluated as an ordinary residual instead of multiplying branch count.
 constexpr size_t kMaxDisjunctiveBranches = 32;
+
+}  // namespace
 
 bool MatchPrefixIn(const Row& row, const PrefixInPredicate& pred) {
   if (pred.column >= row.Count()) {
@@ -575,6 +782,8 @@ std::optional<PrefixInPredicate> TryCompilePrefixIn(const Expression& predicate,
   return compiled;
 }
 
+namespace {
+
 Expression ConjoinAll(const std::vector<Expression>& predicates);
 
 // Compiles `col [NOT] IN (uncorrelated subquery)` into one immutable value
@@ -627,11 +836,17 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
     return mbail("type");
   }
   const SelectStatement& statement = *query.Query();
+  const bool grouped_subquery =
+      !statement.GroupBy().empty() || statement.Having() != nullptr;
+  const bool allow_grouped_subquery =
+      context.execution_runtime() != nullptr &&
+      context.execution_runtime()->root_statement != nullptr &&
+      context.execution_runtime()->root_statement->Sources().size() > 1;
   // SELECT AS STRUCT members are composite; LIMIT/OFFSET change the member
   // set; GROUP BY / HAVING produce aggregate rows.  None of those shapes
   // reduce to a plain value set.
   if (statement.AsStruct() || statement.HasLimit() || statement.Offset() != 0 ||
-      !statement.GroupBy().empty() || statement.Having() ||
+      (grouped_subquery && !allow_grouped_subquery) ||
       statement.SelectList().size() != 1) {
     return mbail("sub shape");
   }
@@ -656,9 +871,8 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
   // back to the generic execution below the moment the estimate looks stale.
   static const bool direct_fill_disabled =
       std::getenv("TINYLAMB_DISABLE_ARENA_MEMBERSHIP") != nullptr;
-  if (!direct_fill_disabled && statement.Sources().size() == 1 &&
-      statement.WhereClause() == nullptr &&
-      statement.SelectList().size() == 1 &&
+  if (!direct_fill_disabled && !grouped_subquery &&
+      statement.Sources().size() == 1 && statement.SelectList().size() == 1 &&
       statement.SelectList()[0].expression->Type() == TypeTag::kColumnValue &&
       !statement.SelectList()[0]
            .expression->AsColumnValue()
@@ -688,127 +902,323 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
         if (slot.has_value() && (column_type == ValueType::kInt64 ||
                                  column_type == ValueType::kDate)) {
           const size_t reserve_members = stats.Value()->Rows();
-          values->Reserve(reserve_members);
-          const std::vector<slot_t> projection{static_cast<slot_t>(*slot)};
-          bool overflow = false;
-          static const bool parallel_membership_disabled =
-              std::getenv("TINYLAMB_DISABLE_PARALLEL_MEMBERSHIP") != nullptr;
-          // Morsel-parallel fill: the serial walk boxes one Row per member
-          // on one thread (Q22: 1.5M orders rows ≈ 90 ms of the filter
-          // phase).  Workers collect raw int payloads per morsel chunk; the
-          // merge reuses the serial path's distinct-bound guard so the
-          // stale-stats fallback decision stays identical.
-          std::vector<Table::ScanMorsel> morsels;
-          size_t worker_count = 0;
-          if (!parallel_membership_disabled && reserve_members >= 65536) {
-            morsels = table.Value()->BuildScanMorsels(context.txn_, 8);
-            if (morsels.size() >= 4) {
-              worker_count = std::min<size_t>(
-                  {morsels.size(),
-                   static_cast<size_t>(std::thread::hardware_concurrency()),
-                   size_t{16}});
-            }
-          }
-          if (worker_count >= 2) {
-            std::vector<std::vector<int64_t>> cells(worker_count);
-            std::vector<char> saw_null(worker_count, 0);
-            {
-              std::vector<std::jthread> threads;
-              threads.reserve(worker_count);
-              for (size_t w = 0; w < worker_count; ++w) {
-                threads.emplace_back([&, w] {
-                  size_t mi = w;
-                  while (mi < morsels.size()) {
-                    Iterator iterator = table.Value()->BeginMorselScan(
-                        context.txn_, morsels[mi], projection);
-                    while (iterator.IsValid()) {
-                      const Row& row = *iterator;
-                      if (row.values_.size() == 1) {
-                        const Value& member = row.values_[0];
-                        if (member.IsNull()) {
-                          saw_null[w] = 1;
-                        } else {
-                          cells[w].push_back(member.value.int_value);
-                        }
-                      }
-                      ++iterator;
-                    }
-                    mi += worker_count;
-                  }
-                });
-              }
-            }
-            size_t total = 0;
-            for (const std::vector<int64_t>& chunk : cells) {
-              total += chunk.size();
-            }
-            if (total > reserve_members) {
-              // More members than the distinct bound the reserve absorbed:
-              // the stale-stats case, identical verdict to the serial guard.
-              overflow = true;
-            } else {
-              for (const std::vector<int64_t>& chunk : cells) {
-                for (const int64_t member : chunk) {
-                  if (values->Size() >= reserve_members) {
-                    overflow = true;
-                    break;
-                  }
-                  values->Insert(member);
-                }
-                if (overflow) {
+          const slot_t col_idx = static_cast<slot_t>(*slot);
+          {
+            std::vector<SimpleComparePredicate> local_simple;
+            bool local_filter_ok = true;
+            if (statement.WhereClause() != nullptr) {
+              for (const Expression& conj :
+                   SplitConjuncts(statement.WhereClause())) {
+                auto sc = TryCompileSimpleCompare(conj, table_schema);
+                if (!sc.has_value()) {
+                  local_filter_ok = false;
                   break;
                 }
-              }
-              if (!overflow) {
-                contains_null = false;
-                for (const char flag : saw_null) {
-                  contains_null = contains_null || flag != 0;
+                const Column& lcol = table_schema.GetColumn(sc->column);
+                if ((lcol.Type() != ValueType::kInt64 &&
+                     lcol.Type() != ValueType::kDate) ||
+                    lcol.IsUnsigned()) {
+                  local_filter_ok = false;
+                  break;
                 }
-                if (total > 0) {
-                  has_domain = true;
-                  domain_type = column_type;
-                  domain_unsigned = table_schema.GetColumn(*slot).IsUnsigned();
+                if (sc->column_payload) {
+                  const Column& rcol = table_schema.GetColumn(sc->right_column);
+                  if (rcol.Type() != lcol.Type() || rcol.IsUnsigned()) {
+                    local_filter_ok = false;
+                    break;
+                  }
+                } else if (!sc->int_payload || sc->constant.IsNull() ||
+                           sc->constant.IsUnsigned()) {
+                  local_filter_ok = false;
+                  break;
+                }
+                local_simple.push_back(std::move(*sc));
+              }
+            }
+            std::shared_ptr<const LSTableStore> store =
+                local_filter_ok
+                    ? GetOrBuildLSTableStore(context.txn_, *table.Value(), true)
+                    : nullptr;
+            if (store != nullptr &&
+                store->layout_generation == table.Value()->LayoutGeneration() &&
+                store->first_pid == table.Value()->FirstPageId() &&
+                col_idx < store->column_min_int.size()) {
+              bool valid = true;
+              if (store->uncommitted_owner_txn != 0) {
+                valid = (store->uncommitted_owner_txn == context.txn_.ID());
+              } else if (!context.txn_.IsReadOnly() &&
+                         !context.txn_.WriteSetEmpty()) {
+                valid = false;
+              } else if (context.txn_.HasAnyPageVersionChains()) {
+                for (const page_id_t pid : store->page_ids) {
+                  if (context.txn_.HasPageVersionChains(pid)) {
+                    valid = false;
+                    break;
+                  }
+                }
+              }
+              if (valid) {
+                if (!values->TryReserveDense(store->column_min_int[col_idx],
+                                             store->column_max_int[col_idx])) {
+                  values->Reserve(
+                      std::max<size_t>(reserve_members, store->total_rows));
+                }
+                contains_null = store->column_has_null[col_idx] != 0;
+                const bool col_unsigned =
+                    table_schema.GetColumn(col_idx).IsUnsigned();
+                const auto eval_local_simple =
+                    [&](const LSTablePageBlock& blk,
+                        uint32_t r) noexcept -> bool {
+                  for (const SimpleComparePredicate& sc : local_simple) {
+                    const LSTableColumnBlock& lc = blk.columns[sc.column];
+                    if (lc.IsNull(r)) return false;
+                    if (sc.column_payload) {
+                      const LSTableColumnBlock& rc =
+                          blk.columns[sc.right_column];
+                      if (rc.IsNull(r)) return false;
+                      if (!ComparePositional(sc.op, lc.int_cells[r],
+                                             rc.int_cells[r])) {
+                        return false;
+                      }
+                    } else {
+                      if (!ComparePositional(sc.op, lc.int_cells[r],
+                                             sc.int_constant)) {
+                        return false;
+                      }
+                    }
+                  }
+                  return true;
+                };
+                if (values->IsDenseMode() && store->total_rows >= 32768 &&
+                    store->blocks.size() >= 2) {
+                  const size_t nworkers = std::min<size_t>(
+                      {store->blocks.size(),
+                       static_cast<size_t>(std::thread::hardware_concurrency()),
+                       size_t{16}});
+                  if (nworkers >= 2) {
+                    std::vector<char> worker_saw_null(nworkers, 0);
+                    {
+                      std::vector<std::jthread> threads;
+                      threads.reserve(nworkers);
+                      for (size_t w = 0; w < nworkers; ++w) {
+                        threads.emplace_back([&, w] {
+                          const size_t b_begin =
+                              (store->blocks.size() * w) / nworkers;
+                          const size_t b_end =
+                              (store->blocks.size() * (w + 1)) / nworkers;
+                          bool have_last = false;
+                          int64_t last_key = 0;
+                          for (size_t bi = b_begin; bi < b_end; ++bi) {
+                            const LSTablePageBlock& blk = store->blocks[bi];
+                            if (blk.row_count == 0) continue;
+                            const LSTableColumnBlock& col =
+                                blk.columns[col_idx];
+                            const int64_t* __restrict cells =
+                                col.int_cells.data();
+                            if (!col.has_null && local_simple.empty()) {
+                              for (uint32_t r = 0; r < blk.row_count; ++r) {
+                                const int64_t k = cells[r];
+                                if (have_last && k == last_key) continue;
+                                last_key = k;
+                                have_last = true;
+                                values->InsertDenseAtomic(k);
+                              }
+                            } else {
+                              for (uint32_t r = 0; r < blk.row_count; ++r) {
+                                const int64_t k = cells[r];
+                                if (!col.has_null && have_last &&
+                                    k == last_key) {
+                                  continue;
+                                }
+                                if (!eval_local_simple(blk, r)) continue;
+                                if (col.IsNull(r)) {
+                                  worker_saw_null[w] = 1;
+                                } else {
+                                  last_key = k;
+                                  have_last = true;
+                                  values->InsertDenseAtomic(k);
+                                }
+                              }
+                            }
+                          }
+                        });
+                      }
+                    }
+                    values->FinalizeDenseBounds();
+                    for (const char flag : worker_saw_null) {
+                      contains_null = contains_null || (flag != 0);
+                    }
+                    if (!values->Empty()) {
+                      has_domain = true;
+                      domain_type = column_type;
+                      domain_unsigned = col_unsigned;
+                    }
+                    direct_filled = true;
+                  }
+                }
+                if (!direct_filled) {
+                  for (const LSTablePageBlock& blk : store->blocks) {
+                    if (blk.row_count == 0) {
+                      continue;
+                    }
+                    const LSTableColumnBlock& col = blk.columns[col_idx];
+                    const int64_t* __restrict cells = col.int_cells.data();
+                    if (!col.has_null && local_simple.empty()) {
+                      if (!has_domain) {
+                        has_domain = true;
+                        domain_type = column_type;
+                        domain_unsigned = col_unsigned;
+                      }
+                      for (uint32_t r = 0; r < blk.row_count; ++r) {
+                        values->Insert(cells[r]);
+                      }
+                    } else {
+                      for (uint32_t r = 0; r < blk.row_count; ++r) {
+                        if (!eval_local_simple(blk, r)) {
+                          continue;
+                        }
+                        if (col.IsNull(r)) {
+                          contains_null = true;
+                        } else {
+                          if (!has_domain) {
+                            has_domain = true;
+                            domain_type = column_type;
+                            domain_unsigned = col_unsigned;
+                          }
+                          values->Insert(cells[r]);
+                        }
+                      }
+                    }
+                  }
+                  direct_filled = true;
                 }
               }
             }
-          } else {
-            Iterator iterator =
-                table.Value()->BeginFullScan(context.txn_, projection);
-            while (iterator.IsValid()) {
-              const Row& row = *iterator;
-              if (row.values_.size() == 1) {
-                const Value& member = row.values_[0];
-                if (member.IsNull()) {
-                  contains_null = true;
-                } else {
-                  if (!has_domain) {
+          }
+          if (!direct_filled && statement.WhereClause() == nullptr) {
+            values->Reserve(reserve_members);
+            const std::vector<slot_t> projection{col_idx};
+            bool overflow = false;
+            static const bool parallel_membership_disabled =
+                std::getenv("TINYLAMB_DISABLE_PARALLEL_MEMBERSHIP") != nullptr;
+            // Morsel-parallel fill: the serial walk boxes one Row per member
+            // on one thread (Q22: 1.5M orders rows ≈ 90 ms of the filter
+            // phase).  Workers collect raw int payloads per morsel chunk; the
+            // merge reuses the serial path's distinct-bound guard so the
+            // stale-stats fallback decision stays identical.
+            std::vector<Table::ScanMorsel> morsels;
+            size_t worker_count = 0;
+            if (!parallel_membership_disabled && reserve_members >= 65536) {
+              morsels = table.Value()->BuildScanMorsels(context.txn_, 8);
+              if (morsels.size() >= 4) {
+                worker_count = std::min<size_t>(
+                    {morsels.size(),
+                     static_cast<size_t>(std::thread::hardware_concurrency()),
+                     size_t{16}});
+              }
+            }
+            if (worker_count >= 2) {
+              std::vector<std::vector<int64_t>> cells(worker_count);
+              std::vector<char> saw_null(worker_count, 0);
+              {
+                std::vector<std::jthread> threads;
+                threads.reserve(worker_count);
+                for (size_t w = 0; w < worker_count; ++w) {
+                  threads.emplace_back([&, w] {
+                    size_t mi = w;
+                    while (mi < morsels.size()) {
+                      Iterator iterator = table.Value()->BeginMorselScan(
+                          context.txn_, morsels[mi], projection);
+                      while (iterator.IsValid()) {
+                        const Row& row = *iterator;
+                        if (row.values_.size() == 1) {
+                          const Value& member = row.values_[0];
+                          if (member.IsNull()) {
+                            saw_null[w] = 1;
+                          } else {
+                            cells[w].push_back(member.value.int_value);
+                          }
+                        }
+                        ++iterator;
+                      }
+                      mi += worker_count;
+                    }
+                  });
+                }
+              }
+              size_t total = 0;
+              for (const std::vector<int64_t>& chunk : cells) {
+                total += chunk.size();
+              }
+              if (total > reserve_members) {
+                // More members than the distinct bound the reserve absorbed:
+                // the stale-stats case, identical verdict to the serial guard.
+                overflow = true;
+              } else {
+                for (const std::vector<int64_t>& chunk : cells) {
+                  for (const int64_t member : chunk) {
+                    if (values->Size() >= reserve_members) {
+                      overflow = true;
+                      break;
+                    }
+                    values->Insert(member);
+                  }
+                  if (overflow) {
+                    break;
+                  }
+                }
+                if (!overflow) {
+                  contains_null = false;
+                  for (const char flag : saw_null) {
+                    contains_null = contains_null || flag != 0;
+                  }
+                  if (total > 0) {
                     has_domain = true;
                     domain_type = column_type;
                     domain_unsigned =
                         table_schema.GetColumn(*slot).IsUnsigned();
                   }
-                  if (values->Size() >= reserve_members) {
-                    // Distinct keys reached the reserve bound: the
-                    // stale-stats case the reserve cannot absorb.  Rebuild
-                    // generically.
-                    overflow = true;
-                    break;
-                  }
-                  values->Insert(member.value.int_value);
                 }
               }
-              ++iterator;
+            } else {
+              Iterator iterator =
+                  table.Value()->BeginFullScan(context.txn_, projection);
+              while (iterator.IsValid()) {
+                const Row& row = *iterator;
+                if (row.values_.size() == 1) {
+                  const Value& member = row.values_[0];
+                  if (member.IsNull()) {
+                    contains_null = true;
+                  } else {
+                    if (!has_domain) {
+                      has_domain = true;
+                      domain_type = column_type;
+                      domain_unsigned =
+                          table_schema.GetColumn(*slot).IsUnsigned();
+                    }
+                    if (values->Size() >= reserve_members) {
+                      // Distinct keys reached the reserve bound: the
+                      // stale-stats case the reserve cannot absorb.  Rebuild
+                      // generically.
+                      overflow = true;
+                      break;
+                    }
+                    values->Insert(member.value.int_value);
+                  }
+                }
+                ++iterator;
+              }
             }
-          }
-          if (!overflow) {
-            direct_filled = true;
-          } else {
-            contains_null = false;
-            bail = false;
-            has_domain = false;
-            domain_type = ValueType::kNull;
-            domain_unsigned = false;
-            values = std::make_shared<FlatIntSet>();
+            if (!overflow) {
+              direct_filled = true;
+            } else {
+              contains_null = false;
+              bail = false;
+              has_domain = false;
+              domain_type = ValueType::kNull;
+              domain_unsigned = false;
+              values = std::make_shared<FlatIntSet>();
+            }
           }
         }
       }
@@ -820,7 +1230,28 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
     if (members == nullptr || members->schema.ColumnCount() != 1) {
       return mbail("exec");
     }
-    values->Reserve(members->TotalRows());
+    bool reserved_dense = false;
+    if (!members->HasSpill() && !members->rows.empty()) {
+      int64_t min_k = std::numeric_limits<int64_t>::max();
+      int64_t max_k = std::numeric_limits<int64_t>::min();
+      bool any_k = false;
+      for (const Row& row : members->rows) {
+        if (!row.values_.empty() && !row.values_[0].IsNull() &&
+            (row.values_[0].type == ValueType::kInt64 ||
+             row.values_[0].type == ValueType::kDate)) {
+          const int64_t v = row.values_[0].value.int_value;
+          min_k = std::min(min_k, v);
+          max_k = std::max(max_k, v);
+          any_k = true;
+        }
+      }
+      if (any_k && values->TryReserveDense(min_k, max_k)) {
+        reserved_dense = true;
+      }
+    }
+    if (!reserved_dense) {
+      values->Reserve(members->TotalRows());
+    }
   }
   const Status iteration =
       direct_filled ? Status::kSuccess
@@ -869,6 +1300,251 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
   if (membership_peel_debug) {
     std::cerr << "[prebuilt-mem] peeled: members=" << compiled.values->Size()
               << " contains_null=" << contains_null << "\n";
+  }
+  return compiled;
+}
+
+// A selective equality-prefix index can supply just the matching heap rows.
+// Recheck every local predicate against the MVCC-visible image: a prefix seek
+// is an enclosure, not a proof of the WHERE clause. The read gate and stale-key
+// test are the same contract as the physical index executors.
+std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
+    Table& table, const Schema& local_schema, slot_t key_column,
+    const std::vector<Expression>& predicates,
+    const TableStatistics& statistics, double build_rows,
+    const FilterCompileEnv& env) {
+  if (table.IndexCount() == 0 || !(build_rows >= 0) ||
+      build_rows > static_cast<double>(env.input_rows) * 2.0) {
+    return nullptr;
+  }
+  std::vector<SimpleComparePredicate> comparisons;
+  for (const auto& predicate : predicates) {
+    auto comparison = TryCompileSimpleCompare(predicate, local_schema);
+    if (!comparison ||
+        local_schema.GetColumn(comparison->column).IsUnsigned() ||
+        (comparison->column_payload &&
+         local_schema.GetColumn(comparison->right_column).IsUnsigned())) {
+      return nullptr;
+    }
+    comparisons.push_back(std::move(*comparison));
+  }
+  const Index* selected = nullptr;
+  const Value* equality = nullptr;
+  for (size_t i = 0; i < table.IndexCount() && selected == nullptr; ++i) {
+    const Index& index = table.GetIndex(i);
+    if (index.sc_.key_.empty()) continue;
+    for (size_t p = 0; p < comparisons.size(); ++p) {
+      const auto& comparison = comparisons[p];
+      const auto type = local_schema.GetColumn(comparison.column).Type();
+      if (!comparison.column_payload &&
+          comparison.op == BinaryOperation::kEquals &&
+          comparison.column == index.sc_.key_.front() &&
+          (type == ValueType::kInt64 || type == ValueType::kDate) &&
+          comparison.constant.type == type &&
+          !comparison.constant.IsUnsigned()) {
+        // Cost the index prefix itself, not the more selective conjunction:
+        // a different residual must not disguise an almost-full heap walk.
+        const double prefix_rows =
+            static_cast<double>(statistics.Rows()) *
+            statistics.EstimateSelectivity(local_schema, predicates[p]);
+        if (!(prefix_rows >= 0 &&
+              prefix_rows <= static_cast<double>(env.input_rows) * 2.0 &&
+              prefix_rows <= static_cast<double>(statistics.Rows()) * 0.1)) {
+          continue;
+        }
+        selected = &index;
+        equality = &comparison.constant;
+        break;
+      }
+    }
+  }
+  if (selected == nullptr ||
+      env.context->txn_.IndexKeysMayBeStale(selected->Root())) {
+    return nullptr;
+  }
+  // Estimates choose capacity only. Actual distinct-key overflow abandons the
+  // optimization, rather than truncating the answer or filling a full table.
+  constexpr size_t kMaxExistsKeys = 65536;
+  // ANALYZE's NDV is approximate. A small underestimate must not abandon a
+  // 100-key build after almost finishing it, then pay for a full table scan.
+  // Keep slack within the same charged bound; real overflow still falls back.
+  const size_t reserve_keys = static_cast<size_t>(std::clamp(
+      std::ceil(build_rows * 2.0), 128.0, static_cast<double>(kMaxExistsKeys)));
+  auto charge =
+      TryReserveQueryMemory(FlatIntSet::ReservationBytes(reserve_keys));
+  if (charge == nullptr) return nullptr;
+  struct ChargedSet {
+    std::shared_ptr<QueryMemoryCharge> charge;
+    FlatIntSet values;
+  };
+  auto owner = std::make_shared<ChargedSet>();
+  owner->charge = std::move(charge);
+  owner->values.Reserve(reserve_keys);
+  auto& values = owner->values;
+  auto guard = env.context->txn_.AcquireIndexReadGuard(selected->Root());
+  if (env.context->txn_.IndexKeysMayBeStale(selected->Root())) {
+    return nullptr;
+  }
+  size_t visited = 0;
+  {
+    IndexScanIterator iterator(
+        table, *selected, env.context->txn_, std::vector<Value>{*equality},
+        std::vector<Value>{*equality}, true, false, &guard);
+    while (iterator.IsValid()) {
+      ++visited;
+      const Row& row = *iterator;
+      if (std::ranges::all_of(comparisons, [&](const auto& comparison) {
+            return MatchSimpleCompare(row, comparison);
+          })) {
+        const Value& key = row[key_column];
+        if (!key.IsNull()) {
+          if (values.Size() >= reserve_keys &&
+              !values.Contains(key.value.int_value)) {
+            return nullptr;
+          }
+          values.Insert(key.value.int_value);
+        }
+      }
+      ++iterator;
+    }
+    if (!iterator.GetStatus().ok()) return nullptr;
+  }
+  if (auto* runtime = env.context->execution_runtime()) {
+    ++runtime->prebuilt_exists_index_builds;
+    runtime->prebuilt_exists_index_rows += visited;
+    runtime->prebuilt_exists_keys += values.Size();
+    runtime->scan_rows += visited;
+    runtime->scan_values_available += visited * local_schema.ColumnCount();
+    runtime->scan_values_decoded += visited * local_schema.ColumnCount();
+  }
+  return std::shared_ptr<const FlatIntSet>(owner, &owner->values);
+}
+
+// A selective, single-key EXISTS can build one row-independent membership
+// set instead of re-entering the correlated runtime for every outer row.
+// Keep the domain-pruned correlated build for large/nonselective inner inputs.
+std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
+    const Expression& predicate, const Schema& schema,
+    const FilterCompileEnv& env) {
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") != nullptr;
+  if (disabled || !predicate || predicate->Type() != TypeTag::kQueryExp ||
+      env.input_rows == 0) {
+    return std::nullopt;
+  }
+  const auto& query = predicate->AsQueryExpression();
+  if (!query.Exists() || query.Test() || query.ArrayResult()) {
+    return std::nullopt;
+  }
+  const SelectStatement& sub = *query.Query();
+  if (sub.Sources().size() != 1 || !sub.WithQueries().empty() ||
+      !sub.UnionAll().empty() || sub.GetSetOperationTree() || sub.Qualify() ||
+      sub.HasLimit() || sub.Offset() != 0 || !sub.GroupBy().empty() ||
+      sub.Having() || sub.Distinct() || !sub.OrderBy().empty() ||
+      sub.AsStruct() || sub.ForUpdate() || sub.HasDistinctOn()) {
+    return std::nullopt;
+  }
+  const auto& source = sub.Sources()[0];
+  if (source.query || source.unnest || source.sample || source.join_condition ||
+      env.ctes->contains(source.table)) {
+    return std::nullopt;
+  }
+  auto table = env.context->GetTable(source.table);
+  auto stats = env.context->GetStats(source.table);
+  if (!table.HasValue() || !stats.HasValue() || stats.Value()->Rows() == 0) {
+    return std::nullopt;
+  }
+  const Schema local_schema =
+      QualifySchema(table.Value()->GetSchema(),
+                    source.alias.empty() ? source.table : source.alias);
+  for (const auto& item : sub.SelectList()) {
+    if (!item.expression ||
+        (item.expression->Type() != TypeTag::kConstantValue &&
+         (item.expression->Type() != TypeTag::kColumnValue ||
+          (item.expression->AsColumnValue().GetColumnName().name != "*" &&
+           !LocalColumnOffset(
+               local_schema,
+               item.expression->AsColumnValue().GetColumnName()))))) {
+      return std::nullopt;
+    }
+  }
+  Expression local_key;
+  ColumnName outer_key;
+  std::vector<Expression> rest;
+  for (const auto& conjunct : SplitConjuncts(sub.WhereClause())) {
+    if (!conjunct) {
+      return std::nullopt;
+    }
+    if (conjunct->Type() == TypeTag::kBinaryExp) {
+      const auto& binary = conjunct->AsBinaryExpression();
+      if (binary.Op() == BinaryOperation::kEquals &&
+          binary.Left()->Type() == TypeTag::kColumnValue &&
+          binary.Right()->Type() == TypeTag::kColumnValue) {
+        const auto& left = binary.Left()->AsColumnValue().GetColumnName();
+        const auto& right = binary.Right()->AsColumnValue().GetColumnName();
+        const bool left_local =
+            LocalColumnOffset(local_schema, left).has_value();
+        const bool right_local =
+            LocalColumnOffset(local_schema, right).has_value();
+        if (left_local != right_local) {
+          if (local_key) return std::nullopt;
+          local_key = left_local ? binary.Left() : binary.Right();
+          outer_key = left_local ? right : left;
+          continue;
+        }
+      }
+    }
+    if (!IsNonThrowingScanComparison(conjunct, local_schema)) {
+      return std::nullopt;
+    }
+    rest.push_back(conjunct);
+  }
+  const auto probe = LocalColumnOffset(schema, outer_key);
+  if (!local_key || !probe) {
+    return std::nullopt;
+  }
+  const auto local = LocalColumnOffset(
+      local_schema, local_key->AsColumnValue().GetColumnName());
+  if (!local) {
+    return std::nullopt;
+  }
+  const Column& inner_column =
+      local_schema.GetColumn(static_cast<size_t>(*local));
+  const Column& outer_column = schema.GetColumn(static_cast<size_t>(*probe));
+  if ((inner_column.Type() != ValueType::kInt64 &&
+       inner_column.Type() != ValueType::kDate) ||
+      inner_column.Type() != outer_column.Type() ||
+      inner_column.IsUnsigned() != outer_column.IsUnsigned()) {
+    return std::nullopt;
+  }
+  const Expression local_filter = rest.empty() ? nullptr : ConjoinAll(rest);
+  const double build_rows = static_cast<double>(stats.Value()->Rows()) *
+                            (local_filter ? stats.Value()->EstimateSelectivity(
+                                                local_schema, local_filter)
+                                          : 1.0);
+  if (!rest.empty()) {
+    if (auto values = TryBuildIndexedExistsKeys(
+            *table.Value(), local_schema, static_cast<slot_t>(*local), rest,
+            *stats.Value(), build_rows, env)) {
+      PrebuiltMembershipPredicate compiled;
+      compiled.column = static_cast<slot_t>(*probe);
+      compiled.negated = query.Negated();
+      compiled.domain_type = outer_column.Type();
+      compiled.values = std::move(values);
+      compiled.existence = true;
+      return compiled;
+    }
+  }
+  auto rewritten = std::make_shared<SelectStatement>(sub);
+  rewritten->SetWhereClause(local_filter);
+  rewritten->SetSelectList({NamedExpression("", local_key)});
+  Expression membership = QueryExpressionExp(
+      std::move(rewritten), ColumnValueExp(outer_key), false, query.Negated());
+  auto compiled =
+      TryCompilePrebuiltMembership(membership, schema, *env.context, *env.ctes);
+  if (compiled) {
+    compiled->existence = true;
+    compiled->contains_null = false;
   }
   return compiled;
 }
@@ -1129,17 +1805,65 @@ std::optional<PrebuiltScalarComparePredicate> TryCompilePrebuiltScalarCompare(
   return compiled;
 }
 
+Expression TryExpandConstantInList(const Expression& expr) {
+  if (!expr) {
+    return expr;
+  }
+  bool negated = false;
+  const InExpression* in_ptr = nullptr;
+  if (expr->Type() == TypeTag::kInExp) {
+    in_ptr = &expr->AsInExpression();
+  } else if (expr->Type() == TypeTag::kUnaryExp &&
+             expr->AsUnaryExpression().Op() == UnaryOperation::kNot &&
+             expr->AsUnaryExpression().Child() &&
+             expr->AsUnaryExpression().Child()->Type() == TypeTag::kInExp) {
+    negated = true;
+    in_ptr = &expr->AsUnaryExpression().Child()->AsInExpression();
+  } else {
+    return expr;
+  }
+  const InExpression& in = *in_ptr;
+  if (!in.child_ || in.child_->Type() != TypeTag::kColumnValue ||
+      in.list_.empty() || in.list_.size() > kMaxDisjunctiveBranches) {
+    return expr;
+  }
+  for (const Expression& item : in.list_) {
+    if (!item || item->Type() != TypeTag::kConstantValue ||
+        item->AsConstantValue().GetValue().IsNull()) {
+      return expr;
+    }
+  }
+  const BinaryOperation eq_op =
+      negated ? BinaryOperation::kNotEquals : BinaryOperation::kEquals;
+  const BinaryOperation join_op =
+      negated ? BinaryOperation::kAnd : BinaryOperation::kOr;
+  Expression acc = BinaryExpressionExp(in.child_, eq_op, in.list_[0]);
+  for (size_t i = 1; i < in.list_.size(); ++i) {
+    acc =
+        BinaryExpressionExp(std::move(acc), join_op,
+                            BinaryExpressionExp(in.child_, eq_op, in.list_[i]));
+  }
+  return acc;
+}
+
 CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
     const Expression& and_expr, const Schema& schema) {
   CompiledScanFilter::DisjunctiveBranch branch;
   std::vector<Expression> conjuncts = SplitConjuncts(and_expr);
-  for (const Expression& conjunct : conjuncts) {
-    if (auto simple = TryCompileSimpleCompare(conjunct, schema)) {
-      branch.simple.push_back(std::move(*simple));
-    } else if (auto prefix_in = TryCompilePrefixIn(conjunct, schema)) {
-      branch.prefix_in.push_back(std::move(*prefix_in));
-    } else {
-      branch.residual.push_back(conjunct);
+  for (const Expression& raw_conjunct : conjuncts) {
+    const Expression expanded =
+        (raw_conjunct && raw_conjunct->Type() == TypeTag::kUnaryExp &&
+         raw_conjunct->AsUnaryExpression().Op() == UnaryOperation::kNot)
+            ? TryExpandConstantInList(raw_conjunct)
+            : raw_conjunct;
+    for (const Expression& conjunct : SplitConjuncts(expanded)) {
+      if (auto simple = TryCompileSimpleCompare(conjunct, schema)) {
+        branch.simple.push_back(std::move(*simple));
+      } else if (auto prefix_in = TryCompilePrefixIn(conjunct, schema)) {
+        branch.prefix_in.push_back(std::move(*prefix_in));
+      } else {
+        branch.residual.push_back(conjunct);
+      }
     }
   }
   return branch;
@@ -1154,6 +1878,8 @@ CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
 // aggregates need the runtime context.  Anything referencing a column
 // fails the empty-schema evaluation and stays runtime, which makes this
 // self-gating: only genuinely constant trees pass.
+}  // namespace
+
 std::optional<Value> TryDecideConstantConjunct(const Expression& predicate) {
   if (!predicate) {
     return std::nullopt;
@@ -1179,11 +1905,9 @@ std::optional<Value> TryDecideConstantConjunct(const Expression& predicate) {
   return decided.MoveValue();
 }
 
-}  // namespace
-
-CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
-                                     const Schema& schema,
-                                     const FilterCompileEnv* env) {
+static CompiledScanFilter CompileScanFilterUncached(
+    const std::vector<Expression>& predicates, const Schema& schema,
+    const FilterCompileEnv* env) {
   CompiledScanFilter compiled;
   // Accumulated AND-of-OR state: every OR predicate contributes its own
   // branch list, and the conjunction across predicates is the cross
@@ -1213,15 +1937,37 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       }
       continue;
     }
+    Expression eff_predicate = TryExpandConstantInList(predicate);
+    if (eff_predicate != predicate &&
+        eff_predicate->Type() == TypeTag::kBinaryExp &&
+        eff_predicate->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
+      std::vector<SimpleComparePredicate> expanded_simples;
+      bool all_simple = true;
+      for (const Expression& sub : SplitConjuncts(eff_predicate)) {
+        if (auto sc = TryCompileSimpleCompare(sub, schema)) {
+          expanded_simples.push_back(std::move(*sc));
+        } else {
+          all_simple = false;
+          break;
+        }
+      }
+      if (all_simple && !expanded_simples.empty()) {
+        for (auto& sc : expanded_simples) {
+          compiled.simple.push_back(std::move(sc));
+        }
+        continue;
+      }
+      eff_predicate = predicate;
+    }
     // Decompose OR expressions into disjunctive branches.
     // Each OR branch is compiled independently into simple + residual.
     // Only create disjunctive branches when the branch has at least one
     // SimpleCompare predicate AND no query subexpressions.  Otherwise
     // the branch evaluation overhead exceeds the original tree traversal.
-    if (predicate->Type() == TypeTag::kBinaryExp &&
-        predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
-      std::vector<Expression> disjuncts = SplitDisjuncts(predicate);
-      if (disjuncts.size() >= 2 && !ContainsQuery(predicate)) {
+    if (eff_predicate->Type() == TypeTag::kBinaryExp &&
+        eff_predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+      std::vector<Expression> disjuncts = SplitDisjuncts(eff_predicate);
+      if (disjuncts.size() >= 2 && !ContainsQuery(eff_predicate)) {
         bool all_branches_usable = true;
         std::vector<CompiledScanFilter::DisjunctiveBranch> new_branches;
         for (const Expression& disjunct : disjuncts) {
@@ -1229,6 +1975,41 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
           if (branch.simple.empty()) {
             all_branches_usable = false;
             break;
+          }
+          if (branch.residual.size() == 1 &&
+              branch.residual[0]->Type() == TypeTag::kInExp) {
+            const Expression expanded_in =
+                TryExpandConstantInList(branch.residual[0]);
+            if (expanded_in != branch.residual[0] &&
+                expanded_in->Type() == TypeTag::kBinaryExp &&
+                expanded_in->AsBinaryExpression().Op() ==
+                    BinaryOperation::kOr) {
+              const std::vector<Expression> in_disjuncts =
+                  SplitDisjuncts(expanded_in);
+              if (new_branches.size() + in_disjuncts.size() <=
+                  kMaxDisjunctiveBranches) {
+                std::vector<SimpleComparePredicate> in_simples;
+                bool all_in_simple = true;
+                for (const Expression& id : in_disjuncts) {
+                  if (auto sc = TryCompileSimpleCompare(id, schema)) {
+                    in_simples.push_back(std::move(*sc));
+                  } else {
+                    all_in_simple = false;
+                    break;
+                  }
+                }
+                if (all_in_simple && !in_simples.empty()) {
+                  for (SimpleComparePredicate& sc : in_simples) {
+                    CompiledScanFilter::DisjunctiveBranch sub_b;
+                    sub_b.simple = branch.simple;
+                    sub_b.simple.push_back(std::move(sc));
+                    sub_b.prefix_in = branch.prefix_in;
+                    new_branches.push_back(std::move(sub_b));
+                  }
+                  continue;
+                }
+              }
+            }
           }
           new_branches.push_back(std::move(branch));
         }
@@ -1271,9 +2052,17 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
       // conjunct then leaves the residual entirely, which both removes the
       // per-row contextful dispatch and lets the worker programs complete
       // (TryParallelFilterRows).
-      if (auto membership = TryCompilePrebuiltMembership(
-              predicate, schema, *env->context, *env->ctes)) {
+      if (auto membership =
+              env->prebuild_only_exists
+                  ? std::optional<PrebuiltMembershipPredicate>()
+                  : TryCompilePrebuiltMembership(predicate, schema,
+                                                 *env->context, *env->ctes)) {
         compiled.prebuilt_membership.push_back(std::move(*membership));
+      } else if (auto existence =
+                     TryCompilePrebuiltExists(predicate, schema, *env)) {
+        compiled.prebuilt_membership.push_back(std::move(*existence));
+      } else if (env->prebuild_only_exists) {
+        compiled.residual.push_back(predicate);
       } else if (auto scalar = TryCompilePrebuiltScalarCompare(
                      predicate, schema, *env->context, *env->ctes)) {
         compiled.prebuilt_scalar_compare.push_back(std::move(*scalar));
@@ -1328,8 +2117,59 @@ CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
   return compiled;
 }
 
+CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
+                                     const Schema& schema,
+                                     const FilterCompileEnv* env) {
+  if (predicates.empty())
+    return CompileScanFilterUncached(predicates, schema, env);
+  auto key = ScalarExpressionCacheKey(predicates, schema);
+  if (!key) return CompileScanFilterUncached(predicates, schema, env);
+  key->push_back(BytecodeEnabled() ? char{1} : char{0});
+  struct Cache {
+    size_t bytes{0};
+    std::unordered_map<std::string, CompiledScanFilter> entries;
+  };
+  static thread_local Cache cache;
+  if (auto found = cache.entries.find(*key); found != cache.entries.end())
+    return found->second;
+  std::vector<Expression> frozen;
+  frozen.reserve(predicates.size());
+  for (const auto& predicate : predicates)
+    frozen.push_back(FreezeScalarBindings(predicate));
+  auto filter = CompileScanFilterUncached(frozen, schema, env);
+  // Overcharge AST ownership by the key size, then account the expanded OR
+  // branches separately: their cross-product can exceed the input AST size.
+  size_t bytes = key->capacity() * 64 + sizeof(CompiledScanFilter);
+  const auto comparisons_bytes = [](const auto& comparisons) {
+    size_t total = comparisons.capacity() * sizeof(SimpleComparePredicate);
+    for (const auto& comparison : comparisons)
+      if (comparison.constant.type == ValueType::kVarChar)
+        total += 2 * comparison.constant.value.varchar_value.size() + 32;
+    return total;
+  };
+  bytes += comparisons_bytes(filter.simple);
+  for (const auto& branch : filter.disjunctive_branches)
+    bytes += sizeof(branch) + comparisons_bytes(branch.simple);
+  constexpr size_t kLimit = 2 * 1024 * 1024;
+  if (bytes > kLimit) return filter;
+  if (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes) {
+    cache.entries.clear();
+    cache.bytes = 0;
+  }
+  cache.bytes += bytes;
+  cache.entries.emplace(std::move(*key), filter);
+  return filter;
+}
+
 bool MatchPrebuiltMembership(const Row& row,
                              const PrebuiltMembershipPredicate& pred) {
+  if (pred.runtime_filter != nullptr) {
+    const Value& probe = row[pred.column];
+    if (probe.IsNull() || probe.type != pred.domain_type) {
+      return false;
+    }
+    return !pred.runtime_filter->Reject(probe.value.int_value);
+  }
   const FlatIntSet& values = *pred.values;
   // An empty candidate set is decisive without consulting the probe: no
   // comparison exists that could produce UNKNOWN, so `x IN ()` is FALSE and
@@ -1339,6 +2179,9 @@ bool MatchPrebuiltMembership(const Row& row,
     return pred.negated;
   }
   const Value& probe = row[pred.column];
+  if (probe.IsNull() && pred.existence) {
+    return pred.negated;
+  }
   if (probe.IsNull()) {
     // `x IN (s)` with NULL x is UNKNOWN; `x NOT IN (s)` likewise.  A WHERE
     // conjunct keeps the row only on TRUE, so both polarities reject.
@@ -1541,7 +2384,7 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
   std::vector<IntegerPeekCompare> peeks;
   peeks.reserve(filter.simple.size());
   for (const SimpleComparePredicate& pred : filter.simple) {
-    if (!pred.int_payload) {
+    if (!pred.int_payload || pred.constant.IsUnsigned()) {
       continue;
     }
     IntegerPeekCompare peek;
@@ -1626,7 +2469,7 @@ WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
   if (!filter.residual.empty()) {
     if (filter.residual_bytecode) {
       programs.residual = *filter.residual_bytecode;
-    } else if (auto compiled = BytecodeCompiler::Compile(
+    } else if (auto compiled = BytecodeCompiler::CompileRowCached(
                    ConjoinAll(filter.residual), schema,
                    BytecodeCompiler::Context::kFilter)) {
       programs.residual = std::move(*compiled);
@@ -1641,9 +2484,9 @@ WorkerScanFilterPrograms CompileWorkerFilter(const CompiledScanFilter& filter,
       if (branch.residual.empty()) {
         continue;
       }
-      if (auto compiled =
-              BytecodeCompiler::Compile(ConjoinAll(branch.residual), schema,
-                                        BytecodeCompiler::Context::kFilter)) {
+      if (auto compiled = BytecodeCompiler::CompileRowCached(
+              ConjoinAll(branch.residual), schema,
+              BytecodeCompiler::Context::kFilter)) {
         programs.branch_residuals[b] = std::move(*compiled);
       } else {
         return programs;
@@ -1863,6 +2706,15 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
       *error = std::move(status);
     }
   };
+  size_t total_in_memory = 0;
+  for (size_t w = 0; w < workers; ++w) {
+    if (!shards[w].HasSpill()) {
+      total_in_memory += shards[w].rows.size();
+    }
+  }
+  if (total_in_memory > 0) {
+    result->rows.reserve(result->rows.size() + total_in_memory);
+  }
   for (size_t w = 0; w < workers; ++w) {
     for (Row& row : deferred[w]) {
       Status deferred_error{Status::kSuccess};
@@ -1881,12 +2733,7 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
       record_error(
           shards[w].ForEachRow([&](const Row& row) { result->AddRow(row); }));
     } else {
-      // In-memory shards move their rows into the result; every row is dead
-      // after ResetContents below, and the copy variant cost one full row
-      // copy per surviving row on multi-million-row filters.
-      for (Row& row : shards[w].rows) {
-        result->AddRow(std::move(row));
-      }
+      result->MergeInMemoryShard(std::move(shards[w]));
     }
     record_error(shards[w].GetStatus());
     shards[w].ResetContents();
@@ -1899,259 +2746,6 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
   return true;
 }
 
-bool TryParallelTableScan(TransactionContext& context, Table& table,
-                          const std::vector<slot_t>* projection,
-                          const RuntimeFilterGroup* runtime_filter,
-                          ValueType runtime_filter_type,
-                          std::optional<slot_t> full_key_column,
-                          bool filter_during_scan,
-                          const CompiledScanFilter* scan_filter,
-                          const Schema& result_schema, const Scope* outer,
-                          const CteMap& ctes, Relation* result, Status* error) {
-  std::vector<Table::ScanMorsel> morsels =
-      table.BuildScanMorsels(context.txn_, 8);
-  constexpr size_t kMaxParallelScanWorkers = 16;
-  const auto workers = std::min<size_t>(
-      {kMaxParallelScanWorkers,
-       static_cast<size_t>(std::thread::hardware_concurrency()),
-       std::max<size_t>(1, morsels.size())});
-  if (workers <= 1 || morsels.size() < 8) {
-    return false;
-  }
-
-  std::vector<Relation> shards(workers);
-  std::vector<size_t> shard_seen(workers, 0);
-  std::vector<size_t> shard_out(workers, 0);
-  // When every non-simple filter component compiled to context-free
-  // bytecode, workers decide rows themselves; only rows whose program
-  // raised are deferred for a contextful MatchScanFilter re-check.
-  // Simple-only filters keep the original tight inline loop: the generic
-  // worker evaluator adds measurable per-row overhead on multi-million-row
-  // scans with nothing non-simple to evaluate.
-  static const bool worker_filter_disabled =
-      std::getenv("TINYLAMB_DISABLE_WORKER_FILTER") != nullptr;
-  const WorkerScanFilterPrograms worker_programs =
-      filter_during_scan && scan_filter != nullptr && !worker_filter_disabled &&
-              (!scan_filter->residual.empty() ||
-               !scan_filter->disjunctive_branches.empty())
-          ? CompileWorkerFilter(*scan_filter, result_schema)
-          : WorkerScanFilterPrograms{};
-  std::vector<std::vector<Row>> deferred_rows(worker_programs.complete ? workers
-                                                                       : 0);
-  std::mutex error_mu;
-  std::exception_ptr error_ex;
-  std::optional<std::vector<slot_t>> proj_opt;
-  if (projection != nullptr) {
-    proj_opt = *projection;
-  }
-
-  {
-    std::vector<std::jthread> threads;
-    threads.reserve(workers);
-    for (size_t w = 0; w < workers; ++w) {
-      try {
-        threads.emplace_back([&, w] {
-          try {
-            auto& local = shards[w];
-            // Static rotation: worker w scans morsels w, w+W, w+2W, ... .
-            // The atomic counter this replaced handed morsels to whichever
-            // worker grabbed them, so shard contents — and therefore the
-            // shard-order concatenation below — changed run to run.  With
-            // fixed ownership the concatenated relation is a deterministic
-            // function of the table state, which the FP aggregates downstream
-            // (TPC-DS rank boundaries) read as exact bits.
-            for (size_t mi = w; mi < morsels.size(); mi += workers) {
-              Iterator iterator = table.BeginMorselScan(
-                  context.txn_, morsels[mi], proj_opt, nullptr, full_key_column,
-                  nullptr, runtime_filter, runtime_filter_type);
-              while (iterator.IsValid()) {
-                ++shard_seen[w];
-                bool matches = true;
-                if (worker_programs.complete) {
-                  switch (MatchScanFilterWorker(*iterator, result_schema,
-                                                *scan_filter,
-                                                worker_programs)) {
-                    case 0:
-                      matches = false;
-                      break;
-                    case 1:
-                      break;
-                    default:
-                      deferred_rows[w].push_back(std::move(*iterator));
-                      matches = false;
-                      break;
-                  }
-                } else if (filter_during_scan && scan_filter) {
-                  // Worker threads only evaluate the simple
-                  // (constant-vs-column) predicates. Residual predicates may
-                  // contain query expressions whose evaluation touches the
-                  // shared TransactionContext and its explicit execution
-                  // runtime, neither of which is safe on worker threads.
-                  for (const SimpleComparePredicate& pred :
-                       scan_filter->simple) {
-                    if (!MatchSimpleCompare(*iterator, pred)) {
-                      matches = false;
-                      break;
-                    }
-                  }
-                }
-                if (matches) {
-                  // The row is fully consumed here: move it instead of paying
-                  // one string copy per cell (the next ++ re-decodes anyway).
-                  local.AddRow(std::move(*iterator));
-                  ++shard_out[w];
-                }
-                ++iterator;
-              }
-              if (iterator.GetStatus() != Status::kSuccess) {
-                std::scoped_lock lock(error_mu);
-                if (error != nullptr && *error == Status::kSuccess) {
-                  *error = iterator.GetStatus();
-                }
-                break;
-              }
-            }
-          } catch (...) {
-            std::scoped_lock lock(error_mu);
-            if (!error_ex) {
-              error_ex = std::current_exception();
-            }
-          }
-        });
-      } catch (...) {
-        std::scoped_lock lock(error_mu);
-        if (!error_ex) {
-          error_ex = std::current_exception();
-        }
-        break;
-      }
-    }
-  }
-  if (error_ex) {
-    if (error != nullptr) {
-      try {
-        std::rethrow_exception(error_ex);
-      } catch (const std::exception& ex) {
-        *error = StatusError(StatusCode::kRuntimeError, ex.what());
-      } catch (...) {
-        *error = StatusError(StatusCode::kRuntimeError,
-                             "parallel table scan worker failed");
-      }
-    }
-    return false;
-  }
-  // A spill that fails mid-append is a truncated result, not a clean one.
-  // Every merge branch below must surface the worker-shard status; the sticky
-  // Relation::spill_error_ is otherwise discarded by ResetContents() and the
-  // caller sees a short but "successful" result.
-  const auto record_error = [&](Status status) {
-    if (error != nullptr && error->ok() && status != Status::kSuccess) {
-      *error = std::move(status);
-    }
-  };
-  if (worker_programs.complete) {
-    // Workers decided every row except the deferred ones; move results and
-    // re-check the deferred rows with the contextful evaluator.
-    for (size_t w = 0; w < workers; ++w) {
-      for (Row& row : deferred_rows[w]) {
-        Status deferred_error{Status::kSuccess};
-        if (MatchScanFilter(row, result_schema, *scan_filter, outer, context,
-                            ctes, &deferred_error)) {
-          result->AddRow(std::move(row));
-        }
-        if (!deferred_error.ok() && error != nullptr && error->ok()) {
-          *error = std::move(deferred_error);
-        }
-      }
-      deferred_rows[w].clear();
-      record_error(shards[w].FinishSpill());
-      // Move the in-memory rows into the result (a per-row deep copy here
-      // materialized every scanned row twice); rows that spilled to disk
-      // still stream back through the spill files.
-      for (Row& row : shards[w].rows) {
-        result->AddRow(std::move(row));
-      }
-      if (shards[w].spill) {
-        record_error(shards[w].spill->ForEachRow(
-            [&](const Row& row) { result->AddRow(row); }));
-      }
-      if (shards[w].spill_tail_) {
-        record_error(shards[w].spill_tail_->ForEachRow(
-            [&](const Row& row) { result->AddRow(row); }));
-      }
-      record_error(shards[w].GetStatus());
-      shards[w].ResetContents();
-    }
-  } else if (filter_during_scan && scan_filter != nullptr &&
-             (!scan_filter->residual.empty() ||
-              !scan_filter->disjunctive_branches.empty())) {
-    // Re-apply residual predicates on the main thread.
-    CompiledScanFilter residual_only;
-    residual_only.residual = scan_filter->residual;
-    residual_only.disjunctive_branches = scan_filter->disjunctive_branches;
-    for (size_t w = 0; w < workers; ++w) {
-      record_error(shards[w].FinishSpill());
-      // Move the in-memory rows into the result (a per-row deep copy here
-      // materialized every scanned row twice); rows that spilled to disk
-      // still stream back through the spill files.
-      for (Row& row : shards[w].rows) {
-        if (!MatchScanFilter(row, result_schema, residual_only, outer, context,
-                             ctes, error)) {
-          continue;
-        }
-        result->AddRow(std::move(row));
-      }
-      if (shards[w].spill) {
-        record_error(shards[w].spill->ForEachRow([&](const Row& row) {
-          if (!MatchScanFilter(row, result_schema, residual_only, outer,
-                               context, ctes, error)) {
-            return;
-          }
-          result->AddRow(row);
-        }));
-      }
-      if (shards[w].spill_tail_) {
-        record_error(shards[w].spill_tail_->ForEachRow([&](const Row& row) {
-          if (!MatchScanFilter(row, result_schema, residual_only, outer,
-                               context, ctes, error)) {
-            return;
-          }
-          result->AddRow(row);
-        }));
-      }
-      record_error(shards[w].GetStatus());
-      shards[w].ResetContents();
-    }
-  } else {
-    for (size_t w = 0; w < workers; ++w) {
-      record_error(shards[w].FinishSpill());
-      for (Row& row : shards[w].rows) {
-        result->AddRow(std::move(row));
-      }
-      if (shards[w].spill) {
-        record_error(shards[w].spill->ForEachRow(
-            [&](const Row& row) { result->AddRow(row); }));
-      }
-      if (shards[w].spill_tail_) {
-        record_error(shards[w].spill_tail_->ForEachRow(
-            [&](const Row& row) { result->AddRow(row); }));
-      }
-      record_error(shards[w].GetStatus());
-      shards[w].ResetContents();
-    }
-  }
-  for (size_t w = 0; w < workers; ++w) {
-    if (context.execution_runtime() != nullptr) {
-      context.execution_runtime()->scan_rows += shard_seen[w];
-      context.execution_runtime()->scan_values_available +=
-          shard_seen[w] * table.GetSchema().ColumnCount();
-      context.execution_runtime()->scan_values_decoded +=
-          shard_out[w] * result_schema.ColumnCount();
-      context.execution_runtime()->scan_output_rows += shard_out[w];
-    }
-  }
-  return true;
-}
 Relation UnnestValueToRelation(const SelectSource& source,
                                const Value& array_val) {
   auto trim_part = [](std::string_view text) {
@@ -2449,6 +3043,619 @@ bool ContainsReentrantQueryIn(const Expression& expression,
                               std::string_view table);
 }  // namespace
 
+namespace {
+// A selective numeric range supplies an enclosure of the visible rows. Keep
+// physical table order so floating-point aggregates and stable ties retain
+// the full-scan contract. Estimates choose this path, never bound its answer.
+StatusOr<bool> TrySelectiveIndexSource(
+    TransactionContext& context, const Table& table,
+    const TableStatistics& statistics, const Schema& filter_schema,
+    const std::vector<slot_t>* projection, const CompiledScanFilter& filter,
+    const ScanRuntimeFilter* runtime_filter, const Scope* outer,
+    const CteMap& ctes, Relation* result) {
+  if (table.IndexCount() == 0 || statistics.Rows() < 1024) return false;
+  const bool pure_range =
+      !filter.simple.empty() && !filter.compile_decided_reject &&
+      filter.prefix_in.empty() && filter.prebuilt_membership.empty() &&
+      filter.prebuilt_scalar_compare.empty() &&
+      filter.disjunctive_branches.empty() && !filter.needs_unsigned_tagging;
+  const auto* exact = runtime_filter && runtime_filter->enabled()
+                          ? runtime_filter->group->ExactKeys()
+                          : nullptr;
+  const auto local_expression = [&](const auto& self,
+                                    const Expression& expression) -> bool {
+    if (!expression) return true;
+    switch (expression->Type()) {
+      case TypeTag::kColumnValue:
+      case TypeTag::kConstantValue:
+      case TypeTag::kBinaryExp:
+      case TypeTag::kUnaryExp:
+      case TypeTag::kCaseExp:
+      case TypeTag::kInExp:
+        return std::ranges::all_of(
+            ExpressionChildren(expression),
+            [&](const Expression& child) { return self(self, child); });
+      default:
+        return false;
+    }
+  };
+  const auto local_predicates = [&](const auto& predicates) {
+    return std::ranges::all_of(predicates, [&](const Expression& predicate) {
+      return local_expression(local_expression, predicate);
+    });
+  };
+  // A literal LIKE over a local string column does not widen the key
+  // enclosure. Evaluate it only after restoring heap order, just as on the
+  // full scan. Other residuals keep the previous conservative range gate.
+  const bool safe_range =
+      pure_range &&
+      std::ranges::all_of(filter.residual, [&](const Expression& expression) {
+        if (!expression || expression->Type() != TypeTag::kBinaryExp)
+          return false;
+        const auto& binary = expression->AsBinaryExpression();
+        if ((binary.Op() != BinaryOperation::kLike &&
+             binary.Op() != BinaryOperation::kNotLike) ||
+            binary.Left()->Type() != TypeTag::kColumnValue ||
+            binary.Right()->Type() != TypeTag::kConstantValue)
+          return false;
+        const auto offset = LocalColumnOffset(
+            filter_schema, binary.Left()->AsColumnValue().GetColumnName());
+        return offset &&
+               filter_schema.GetColumn(*offset).Type() == ValueType::kVarChar &&
+               binary.Right()->AsConstantValue().GetValue().type ==
+                   ValueType::kVarChar;
+      });
+  if (exact && (exact->size() > 1024 || !local_predicates(filter.residual) ||
+                !std::ranges::all_of(filter.disjunctive_branches,
+                                     [&](const auto& branch) {
+                                       return local_predicates(branch.residual);
+                                     })))
+    exact = nullptr;
+  if (!safe_range && !exact) return false;
+  const Index* selected = nullptr;
+  std::vector<Value> begin, end;
+  const std::vector<int64_t>* selected_keys = nullptr;
+  double best = 0.05;
+  const Schema& schema = table.GetSchema();
+  for (size_t i = 0; i < table.IndexCount(); ++i) {
+    const Index& index = table.GetIndex(i);
+    if (index.sc_.key_.empty() || index.RetainsDeletedEntries()) continue;
+    const slot_t key = index.sc_.key_.front();
+    const Column& column = schema.GetColumn(key);
+    if (column.IsUnsigned() || (column.Type() != ValueType::kInt64 &&
+                                column.Type() != ValueType::kDate))
+      continue;
+    if (key >= statistics.Columns()) continue;
+    if (exact && runtime_filter->column < filter_schema.ColumnCount()) {
+      const slot_t runtime_column = projection
+                                        ? (*projection)[runtime_filter->column]
+                                        : runtime_filter->column;
+      if (runtime_column == key && runtime_filter->type == column.Type()) {
+        double matches = 0;
+        for (int64_t raw : *exact) {
+          if (runtime_filter->group->Reject(raw)) continue;
+          Value value(raw);
+          value.type = column.Type();
+          matches += statistics.Column(key).EstimateEqual(value);
+        }
+        const double fraction =
+            matches / static_cast<double>(statistics.Rows());
+        if (fraction >= 0 && fraction < best) {
+          selected = &index;
+          selected_keys = exact;
+          best = fraction;
+        }
+      }
+    }
+    if (!safe_range) continue;
+    std::optional<Value> lower, upper;
+    for (const auto& predicate : filter.simple) {
+      if (predicate.column_payload ||
+          predicate.column >= filter_schema.ColumnCount())
+        continue;
+      const slot_t full_column =
+          projection ? (*projection)[predicate.column] : predicate.column;
+      if (full_column != key || predicate.constant.IsNull() ||
+          predicate.constant.type != column.Type() ||
+          predicate.constant.IsUnsigned())
+        continue;
+      const auto op = predicate.op;
+      if (op == BinaryOperation::kEquals ||
+          op == BinaryOperation::kGreaterThan ||
+          op == BinaryOperation::kGreaterThanEquals) {
+        if (!lower ||
+            predicate.constant.value.int_value > lower->value.int_value)
+          lower = predicate.constant;
+      }
+      if (op == BinaryOperation::kEquals || op == BinaryOperation::kLessThan ||
+          op == BinaryOperation::kLessThanEquals) {
+        if (!upper ||
+            predicate.constant.value.int_value < upper->value.int_value)
+          upper = predicate.constant;
+      }
+    }
+    if (!lower && !upper) continue;
+    // Cost the enclosure itself; an unrelated predicate must not disguise
+    // a broad index range as a selective lookup.
+    if (key >= statistics.Columns()) continue;
+    const double fraction =
+        statistics.Column(key).EstimateRange(lower, true, upper, true) /
+        static_cast<double>(statistics.Rows());
+    if (fraction >= 0 && fraction < best) {
+      selected = &index;
+      selected_keys = nullptr;
+      begin = lower ? std::vector<Value>{*lower} : std::vector<Value>{};
+      end = upper ? std::vector<Value>{*upper} : std::vector<Value>{};
+      best = fraction;
+    }
+  }
+  if (!selected || context.txn_.IndexKeysMayBeStale(selected->Root()))
+    return false;
+  constexpr size_t kMaxRows = 8192;
+  constexpr size_t kBytes = 4 * 1024 * 1024;
+  auto charge = TryReserveQueryMemory(kBytes);
+  if (!charge) return false;
+  auto guard = context.txn_.AcquireIndexReadGuard(selected->Root());
+  if (context.txn_.IndexKeysMayBeStale(selected->Root())) return false;
+  std::vector<Expression> early_memberships;
+  if (!filter.needs_unsigned_tagging) {
+    for (const auto& expression : filter.residual) {
+      if (!expression || expression->Type() != TypeTag::kInExp) continue;
+      const auto& membership = expression->AsInExpression();
+      if (membership.child_ &&
+          membership.child_->Type() == TypeTag::kColumnValue &&
+          std::ranges::all_of(membership.list_, [](const Expression& value) {
+            return value && value->Type() == TypeTag::kConstantValue;
+          }))
+        early_memberships.push_back(expression);
+    }
+  }
+  struct SourceRow {
+    RowPosition position;
+    Row row;
+    size_t page_ordinal{0};
+  };
+  std::vector<SourceRow> rows;
+  size_t bytes = 0, visited = 0;
+  const size_t scans = selected_keys ? selected_keys->size() : 1;
+  for (size_t seek = 0; seek < scans; ++seek) {
+    if (selected_keys) {
+      const int64_t raw = (*selected_keys)[seek];
+      if (runtime_filter->group->Reject(raw)) continue;
+      Value value(raw);
+      value.type = schema.GetColumn(selected->sc_.key_.front()).Type();
+      begin = end = std::vector<Value>{value};
+    }
+    IndexScanIterator iterator(table, *selected, context.txn_, begin, end, true,
+                               false, &guard);
+    if (projection) RETURN_IF_FAIL(iterator.SetProjection(*projection));
+    while (iterator.IsValid()) {
+      if (++visited > kMaxRows) return false;
+      const Row& full_row = *iterator;
+      RETURN_IF_FAIL(iterator.GetStatus());
+      if (!full_row.IsValid()) {
+        ++iterator;
+        continue;
+      }
+      if (full_row.Count() != filter_schema.ColumnCount())
+        return StatusError(StatusCode::kCorrupt,
+                           "indexed source row width mismatch");
+      const Row& row = full_row;
+      bool matches = true;
+      if (!filter.needs_unsigned_tagging) {
+        matches =
+            std::ranges::all_of(filter.simple, [&](const auto& predicate) {
+              return MatchSimpleCompare(row, predicate);
+            });
+        if (matches && !filter.disjunctive_branches.empty()) {
+          matches = std::ranges::any_of(
+              filter.disjunctive_branches, [&](const auto& branch) {
+                return std::ranges::all_of(
+                    branch.simple, [&](const auto& predicate) {
+                      return MatchSimpleCompare(row, predicate);
+                    });
+              });
+        }
+      }
+      for (const auto& membership : early_memberships) {
+        if (!matches) break;
+        const auto value = membership->TryEvaluate(row, filter_schema);
+        // Errors stay on the ordered canonical path. Only a clean rejection
+        // can discard a row before restoring physical order.
+        if (value.HasValue() &&
+            (value.Value().IsNull() || !value.Value().Truthy()))
+          matches = false;
+      }
+      if (matches && runtime_filter && runtime_filter->enabled()) {
+        const Value& key = row[runtime_filter->column];
+        matches = !runtime_filter->Reject(static_cast<int8_t>(key.type),
+                                          key.IsNull(), key.value.int_value);
+      }
+      if (matches) {
+        bytes += row.values_.capacity() * sizeof(Value) +
+                 sizeof(RowPosition) * 4 + sizeof(Row) * 2;
+        for (const Value& value : row.values_) {
+          if (value.type == ValueType::kVarChar)
+            bytes += 2 * value.value.varchar_value.size() + 32;
+        }
+        if (bytes > kBytes / 2) return false;
+        rows.push_back({iterator.Position(), std::move(*iterator), 0});
+      }
+      ++iterator;
+    }
+    RETURN_IF_FAIL(iterator.GetStatus());
+  }
+  if (rows.size() > 1) {
+    std::unordered_map<page_id_t, size_t> page_order;
+    const auto morsels = table.BuildScanMorsels(context.txn_);
+    size_t ordinal = 0;
+    for (const auto& morsel : morsels)
+      for (page_id_t page : morsel) {
+        if (page_order.size() * 64 + bytes > kBytes) return false;
+        page_order.emplace(page, ordinal++);
+      }
+    for (auto& row : rows) {
+      const auto found = page_order.find(row.position.page_id);
+      if (found == page_order.end()) return false;
+      row.page_ordinal = found->second;
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const auto& a, const auto& b) {
+                       return a.page_ordinal != b.page_ordinal
+                                  ? a.page_ordinal < b.page_ordinal
+                                  : a.position.slot < b.position.slot;
+                     });
+  }
+  // The auxiliary reservation remains held until its buffers are destroyed;
+  // Relation independently charges (and can spill) the transferred rows.
+  Status eval_error{Status::kSuccess};
+  size_t emitted = 0;
+  for (auto& row : rows) {
+    if (MatchScanFilter(row.row, filter_schema, filter, outer, context, ctes,
+                        &eval_error)) {
+      result->AddRow(std::move(row.row));
+      ++emitted;
+    }
+    RETURN_IF_FAIL(eval_error);
+  }
+  RETURN_IF_FAIL(result->GetStatus());
+  if (auto* runtime = context.execution_runtime()) {
+    ++runtime->selective_index_scans;
+    runtime->selective_index_rows += visited;
+    runtime->scan_rows += visited;
+    runtime->scan_values_available += visited * schema.ColumnCount();
+    runtime->scan_values_decoded += visited * filter_schema.ColumnCount();
+    runtime->scan_output_rows += emitted;
+  }
+  return true;
+}
+
+void MaterializeSingleArenaRow(const BaseRelationArena& arena,
+                               const Schema& schema, size_t index, Row* row) {
+  const size_t stride = arena.stride;
+  const int64_t* cells = arena.cells.data() + (index * stride);
+  row->values_.resize(stride);
+  for (size_t c = 0; c < stride; ++c) {
+    Value& dst = row->values_[c];
+    if (arena.IsNull(index, c)) [[unlikely]] {
+      if (dst.type != ValueType::kNull) {
+        dst = Value();
+      }
+      continue;
+    }
+    const ValueType type = arena.slot_types.size() == stride
+                               ? arena.slot_types[c]
+                               : schema.GetColumn(c).Type();
+    if (type == ValueType::kVarChar) {
+      const std::string_view sv = arena.Varchar(index, c);
+      dst.type = ValueType::kVarChar;
+      dst.owned_data.assign(sv.data(), sv.size());
+      dst.value.varchar_value = dst.owned_data;
+    } else if (type == ValueType::kDouble) {
+      dst.type = ValueType::kDouble;
+      dst.value.double_value = std::bit_cast<double>(cells[c]);
+    } else {
+      dst.type = type;
+      dst.value.int_value = cells[c];
+      if (type == ValueType::kInt64 && schema.ColumnCount() > c &&
+          schema.GetColumn(c).IsUnsigned()) [[unlikely]] {
+        dst.SetUnsigned();
+      }
+    }
+  }
+}
+
+std::optional<bool> TryMatchSimpleCompareArena(
+    const BaseRelationArena& arena, size_t row,
+    const SimpleComparePredicate& pred) {
+  const size_t stride = arena.stride;
+  if (pred.column >= stride || arena.slot_types.size() != stride) {
+    return std::nullopt;
+  }
+  if (pred.column_payload) {
+    if (pred.right_column >= stride) {
+      return std::nullopt;
+    }
+    if (arena.IsNull(row, pred.column) ||
+        arena.IsNull(row, pred.right_column)) {
+      return false;
+    }
+    const ValueType lt = arena.slot_types[pred.column];
+    const ValueType rt = arena.slot_types[pred.right_column];
+    const int64_t* row_cells = arena.cells.data() + (row * stride);
+    if ((lt == ValueType::kInt64 || lt == ValueType::kDate) &&
+        (rt == ValueType::kInt64 || rt == ValueType::kDate)) {
+      return ComparePositional(pred.op, row_cells[pred.column],
+                               row_cells[pred.right_column]);
+    }
+    if (lt == ValueType::kDouble && rt == ValueType::kDouble) {
+      return ComparePositional(
+          pred.op, std::bit_cast<double>(row_cells[pred.column]),
+          std::bit_cast<double>(row_cells[pred.right_column]));
+    }
+    if (lt == ValueType::kVarChar && rt == ValueType::kVarChar) {
+      return ComparePositional(pred.op, arena.Varchar(row, pred.column),
+                               arena.Varchar(row, pred.right_column));
+    }
+    return std::nullopt;
+  }
+  if (arena.IsNull(row, pred.column) || pred.constant.IsNull()) {
+    return false;
+  }
+  const ValueType vt = arena.slot_types[pred.column];
+  const int64_t* row_cells = arena.cells.data() + (row * stride);
+  if (pred.int_payload && !pred.constant.IsUnsigned() &&
+      (vt == ValueType::kInt64 || vt == ValueType::kDate)) {
+    return ComparePositional(pred.op, row_cells[pred.column],
+                             pred.int_constant);
+  }
+  if (pred.double_payload && vt == ValueType::kDouble) {
+    return ComparePositional(pred.op,
+                             std::bit_cast<double>(row_cells[pred.column]),
+                             pred.double_constant);
+  }
+  if (vt == ValueType::kVarChar && pred.constant.type == ValueType::kVarChar &&
+      !pred.constant.IsCaseInsensitive()) {
+    const std::string_view l = arena.Varchar(row, pred.column);
+    const std::string_view r = pred.constant.value.varchar_value;
+    if (pred.op == BinaryOperation::kLike ||
+        pred.op == BinaryOperation::kNotLike) {
+      const bool matched = FastLikeMatch(l, r);
+      return pred.op == BinaryOperation::kLike ? matched : !matched;
+    }
+    if (pred.plain_string_payload) {
+      return ComparePositional(pred.op, l, r);
+    }
+  }
+  return std::nullopt;
+}
+
+bool TryFilterArenaCache(
+    TransactionContext& context, const BaseRelationArena& arena,
+    const Schema& cached_schema, const CompiledScanFilter* filter,
+    const Schema* filter_view, const Scope* outer, const CteMap& ctes,
+    const ScanRuntimeFilter* runtime_filter, Relation* result, Status* error) {
+  if (arena.rows == 0 || arena.slot_types.size() != arena.stride) {
+    return false;
+  }
+  for (size_t c = 0; c < cached_schema.ColumnCount(); ++c) {
+    if (cached_schema.GetColumn(c).IsUnsigned()) {
+      return false;
+    }
+  }
+  if (filter != nullptr && filter->compile_decided_reject) {
+    return true;
+  }
+  const bool has_non_simple =
+      filter != nullptr &&
+      (filter->needs_unsigned_tagging || !filter->prefix_in.empty() ||
+       !filter->prebuilt_membership.empty() ||
+       !filter->prebuilt_scalar_compare.empty() || !filter->residual.empty() ||
+       !filter->disjunctive_branches.empty());
+  const WorkerScanFilterPrograms programs =
+      (filter != nullptr && has_non_simple && filter_view != nullptr)
+          ? CompileWorkerFilter(*filter, *filter_view)
+          : WorkerScanFilterPrograms{};
+  constexpr size_t kMinParallelFilterRows = 32768;
+  constexpr size_t kMaxParallelFilterWorkers = 16;
+  static const bool parallel_filter_disabled =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
+  const size_t workers =
+      (!parallel_filter_disabled && arena.rows >= kMinParallelFilterRows &&
+       (!has_non_simple || programs.complete))
+          ? std::min({kMaxParallelFilterWorkers,
+                      static_cast<size_t>(std::thread::hardware_concurrency()),
+                      arena.rows / 8192})
+          : 1;
+
+  auto row_passes_arena_precheck = [&](size_t r, size_t* key_rej,
+                                       size_t* key_null_rej,
+                                       bool* all_simple_decided) -> bool {
+    if (runtime_filter != nullptr && runtime_filter->enabled()) {
+      const slot_t col = runtime_filter->column;
+      if (col < arena.stride) {
+        const bool is_null = arena.IsNull(r, col);
+        const ValueType col_type = arena.slot_types[col];
+        const int64_t val = is_null ? 0 : arena.cells[(r * arena.stride) + col];
+        if (runtime_filter->Reject(static_cast<int8_t>(col_type), is_null,
+                                   val)) {
+          ++(*key_rej);
+          if (is_null) {
+            ++(*key_null_rej);
+          }
+          return false;
+        }
+      }
+    }
+    *all_simple_decided = true;
+    if (filter != nullptr) {
+      for (const SimpleComparePredicate& pred : filter->simple) {
+        const std::optional<bool> verdict =
+            TryMatchSimpleCompareArena(arena, r, pred);
+        if (!verdict.has_value()) {
+          *all_simple_decided = false;
+        } else if (!*verdict) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  if (workers > 1) {
+    std::vector<Relation> shards(workers);
+    std::vector<std::vector<Row>> deferred(workers);
+    std::atomic<size_t> key_rejected{0};
+    std::atomic<size_t> key_null_rejected{0};
+    std::mutex error_mu;
+    std::exception_ptr error_ex;
+    const size_t chunk_rows =
+        std::max<size_t>(1, (arena.rows + (workers * 4) - 1) / (workers * 4));
+    {
+      std::vector<std::jthread> threads;
+      threads.reserve(workers);
+      for (size_t w = 0; w < workers; ++w) {
+        try {
+          threads.emplace_back([&, w] {
+            try {
+              auto& local = shards[w];
+              size_t local_key_rej = 0;
+              size_t local_key_null_rej = 0;
+              for (size_t chunk = w; chunk < workers * 4; chunk += workers) {
+                const size_t begin = chunk * chunk_rows;
+                if (begin >= arena.rows) {
+                  break;
+                }
+                const size_t end = std::min(arena.rows, begin + chunk_rows);
+                for (size_t r = begin; r < end; ++r) {
+                  bool all_simple_decided = true;
+                  if (!row_passes_arena_precheck(r, &local_key_rej,
+                                                 &local_key_null_rej,
+                                                 &all_simple_decided)) {
+                    continue;
+                  }
+                  Row row;
+                  MaterializeSingleArenaRow(arena, cached_schema, r, &row);
+                  if (!has_non_simple && all_simple_decided) {
+                    local.AddRow(std::move(row));
+                    continue;
+                  }
+                  if (filter != nullptr && filter_view != nullptr &&
+                      programs.complete) {
+                    switch (MatchScanFilterWorker(row, *filter_view, *filter,
+                                                  programs)) {
+                      case 0:
+                        break;
+                      case 1:
+                        local.AddRow(std::move(row));
+                        break;
+                      default:
+                        deferred[w].push_back(std::move(row));
+                        break;
+                    }
+                  } else {
+                    deferred[w].push_back(std::move(row));
+                  }
+                }
+              }
+              key_rejected.fetch_add(local_key_rej, std::memory_order_relaxed);
+              key_null_rejected.fetch_add(local_key_null_rej,
+                                          std::memory_order_relaxed);
+            } catch (...) {
+              std::scoped_lock lock(error_mu);
+              if (!error_ex) {
+                error_ex = std::current_exception();
+              }
+            }
+          });
+        } catch (...) {
+          std::scoped_lock lock(error_mu);
+          if (!error_ex) {
+            error_ex = std::current_exception();
+          }
+          break;
+        }
+      }
+    }
+    if (error_ex) {
+      if (error != nullptr && error->ok()) {
+        try {
+          std::rethrow_exception(error_ex);
+        } catch (const std::exception& ex) {
+          *error = StatusError(StatusCode::kRuntimeError, ex.what());
+        } catch (...) {
+          *error = StatusError(StatusCode::kRuntimeError,
+                               "parallel arena filter worker failed");
+        }
+      }
+      return true;
+    }
+    const auto record_error = [&](Status status) {
+      if (error != nullptr && error->ok() && status != Status::kSuccess) {
+        *error = std::move(status);
+      }
+    };
+    for (size_t w = 0; w < workers; ++w) {
+      for (Row& row : deferred[w]) {
+        Status deferred_error{Status::kSuccess};
+        if (filter == nullptr ||
+            MatchScanFilter(row, *filter_view, *filter, outer, context, ctes,
+                            &deferred_error)) {
+          result->AddRow(std::move(row));
+        }
+        record_error(std::move(deferred_error));
+      }
+      deferred[w].clear();
+      record_error(shards[w].FinishSpill());
+      if (shards[w].HasSpill()) {
+        record_error(
+            shards[w].ForEachRow([&](const Row& row) { result->AddRow(row); }));
+      } else {
+        for (Row& row : shards[w].rows) {
+          result->AddRow(std::move(row));
+        }
+      }
+      record_error(shards[w].GetStatus());
+      shards[w].ResetContents();
+    }
+    if (context.execution_runtime() != nullptr) {
+      context.execution_runtime()->key_filter_rejected += key_rejected.load();
+      context.execution_runtime()->key_filter_null_rejected +=
+          key_null_rejected.load();
+    }
+    return true;
+  }
+
+  size_t key_rej = 0;
+  size_t key_null_rej = 0;
+  for (size_t r = 0; r < arena.rows; ++r) {
+    if (error != nullptr && !error->ok()) {
+      break;
+    }
+    bool all_simple_decided = true;
+    if (!row_passes_arena_precheck(r, &key_rej, &key_null_rej,
+                                   &all_simple_decided)) {
+      continue;
+    }
+    Row row;
+    MaterializeSingleArenaRow(arena, cached_schema, r, &row);
+    if (!has_non_simple && all_simple_decided) {
+      result->AddRow(std::move(row));
+      continue;
+    }
+    if (filter == nullptr || MatchScanFilter(row, *filter_view, *filter, outer,
+                                             context, ctes, error)) {
+      result->AddRow(std::move(row));
+    }
+  }
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->key_filter_rejected += key_rej;
+    context.execution_runtime()->key_filter_null_rejected += key_null_rej;
+  }
+  return true;
+}
+}  // namespace
+
 StatusOr<Relation> LoadSource(TransactionContext& context,
                               const SelectSource& source, const Scope* outer,
                               const CteMap& ctes,
@@ -2498,7 +3705,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                      (MaterializeRelation(*cte->second)));
     result = std::move(materialized);
   } else {
-    const bool reusable =
+    bool reusable =
         context.execution_runtime() != nullptr &&
         context.execution_runtime()->reusable_base_relations.contains(
             source.table);
@@ -2514,8 +3721,6 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       return load_qualifier.empty() ? schema
                                     : QualifySchema(schema, load_qualifier);
     };
-    const bool filter_during_scan =
-        !reusable && scan_predicates != nullptr && !scan_predicates->empty();
     RelationPtr cached_entry;
     if (reusable) {
       const auto cached =
@@ -2523,7 +3728,36 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       if (cached != context.execution_runtime()->base_relations.end()) {
         cached_entry = cached->second;
       }
+      StatusOr<std::shared_ptr<Table>> table_chk =
+          context.GetTable(source.table);
+      const bool large_lstable =
+          table_chk.HasValue() &&
+          table_chk.Value()->GetLSTableStore() != nullptr &&
+          table_chk.Value()->GetLSTableStore()->total_rows > 16384;
+      if (cached_entry && cached_entry->rows.empty() &&
+          !cached_entry->HasSpill() && large_lstable) {
+        const auto arena_it =
+            context.execution_runtime()->base_relation_arenas.find(cache_key);
+        const bool has_arena =
+            arena_it !=
+                context.execution_runtime()->base_relation_arenas.end() &&
+            arena_it->second != nullptr && arena_it->second->rows > 0;
+        if (!has_arena) {
+          ++context.execution_runtime()->base_scan_cache_hits;
+          cached_entry.reset();
+          reusable = false;
+        }
+      } else if (!cached_entry && large_lstable) {
+        auto marker = std::make_shared<Relation>(context.execution_runtime());
+        context.execution_runtime()->base_relations.emplace(cache_key,
+                                                            std::move(marker));
+        reusable = false;
+      } else if (!cached_entry && int_runtime_filter != nullptr) {
+        reusable = false;
+      }
     }
+    const bool filter_during_scan =
+        !reusable && scan_predicates != nullptr && !scan_predicates->empty();
     if (cached_entry) {
       // Materialize only rows that survive this alias's local predicates so
       // we never deep-copy a multi-million-row cache and filter afterwards.
@@ -2531,104 +3765,168 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       result.schema = cached_relation.schema;
       RETURN_IF_FAIL(cached_relation.FinishSpill());
       RETURN_IF_FAIL(cached_relation.GetStatus());
-      // A typed fill publishes the arena without Rows: box the rows back
-      // (once) before any consumer iterates them.  TryParallelFilterRows and
-      // ForEachRow both read Relation::rows, so an unboxed arena would read
-      // as a silently EMPTY relation here (the aggregation consumer in
-      // relational.cpp boxes through the same helper on its cache hits).
-      MaterializeCacheRowsIfNeeded(cache_key, &cached_relation,
-                                   context.execution_runtime());
+      const BaseRelationArena* unboxed_arena = nullptr;
+      if (cached_relation.rows.empty() && !cached_relation.HasSpill() &&
+          context.execution_runtime() != nullptr) {
+        const auto arena_it =
+            context.execution_runtime()->base_relation_arenas.find(cache_key);
+        if (arena_it !=
+                context.execution_runtime()->base_relation_arenas.end() &&
+            arena_it->second != nullptr && arena_it->second->rows > 0 &&
+            arena_it->second->published_rowsless &&
+            !arena_it->second->rows_boxed) {
+          unboxed_arena = arena_it->second.get();
+        }
+      }
       if (scan_predicates == nullptr || scan_predicates->empty()) {
-        const CompiledScanFilter pass_through;
         Status key_error{Status::kSuccess};
-        if (TryParallelFilterRows(context, cached_relation, pass_through,
-                                  cached_relation.schema, outer, ctes,
-                                  int_runtime_filter, &result, &key_error)) {
+        if (unboxed_arena != nullptr &&
+            (int_runtime_filter != nullptr && int_runtime_filter->enabled()) &&
+            TryFilterArenaCache(context, *unboxed_arena, cached_relation.schema,
+                                nullptr, nullptr, outer, ctes,
+                                int_runtime_filter, &result, &key_error)) {
           RETURN_IF_FAIL(key_error);
         } else {
-          Status iteration = cached_relation.ForEachRow([&](const Row& row) {
-            if (int_runtime_filter != nullptr &&
-                int_runtime_filter->enabled()) {
-              const Value& key = row[int_runtime_filter->column];
-              if (int_runtime_filter->Reject(static_cast<int8_t>(key.type),
-                                             key.IsNull(),
-                                             key.value.int_value)) {
-                if (context.execution_runtime() != nullptr) {
-                  ++context.execution_runtime()->key_filter_rejected;
-                  if (key.IsNull()) {
-                    ++context.execution_runtime()->key_filter_null_rejected;
+          if (unboxed_arena != nullptr && unboxed_arena->rows >= 32768) {
+            MaterializeCacheRowsParallel(cache_key, &cached_relation,
+                                         context.execution_runtime());
+          } else {
+            MaterializeCacheRowsIfNeeded(cache_key, &cached_relation,
+                                         context.execution_runtime());
+          }
+          const CompiledScanFilter pass_through;
+          if (TryParallelFilterRows(context, cached_relation, pass_through,
+                                    cached_relation.schema, outer, ctes,
+                                    int_runtime_filter, &result, &key_error)) {
+            RETURN_IF_FAIL(key_error);
+          } else {
+            Status iteration = cached_relation.ForEachRow([&](const Row& row) {
+              if (int_runtime_filter != nullptr &&
+                  int_runtime_filter->enabled()) {
+                const Value& key = row[int_runtime_filter->column];
+                if (int_runtime_filter->Reject(static_cast<int8_t>(key.type),
+                                               key.IsNull(),
+                                               key.value.int_value)) {
+                  if (context.execution_runtime() != nullptr) {
+                    ++context.execution_runtime()->key_filter_rejected;
+                    if (key.IsNull()) {
+                      ++context.execution_runtime()->key_filter_null_rejected;
+                    }
+                  }
+                  return;
+                }
+                for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
+                  if (!ext.enabled() || ext.column >= row.Count()) continue;
+                  const Value& ek = row[ext.column];
+                  if (ext.Reject(static_cast<int8_t>(ek.type), ek.IsNull(),
+                                 ek.value.int_value)) {
+                    if (context.execution_runtime() != nullptr) {
+                      ++context.execution_runtime()->key_filter_rejected;
+                    }
+                    return;
                   }
                 }
-                return;
               }
-            }
-            result.AddRow(row);
-          });
-          RETURN_IF_FAIL(iteration);
+              result.AddRow(row);
+            });
+            RETURN_IF_FAIL(iteration);
+          }
         }
       } else {
         const auto filter_begin = std::chrono::steady_clock::now();
+        const std::vector<Expression> folded_scan_preds =
+            FoldRowIndependentSubqueries(context, *scan_predicates, outer,
+                                         ctes);
+        if (unboxed_arena != nullptr && unboxed_arena->rows_boxed) {
+          unboxed_arena = nullptr;
+        }
+        const std::vector<Expression>& effective_scan_preds =
+            folded_scan_preds.empty() ? *scan_predicates : folded_scan_preds;
         const Schema filter_view = filter_view_of(cached_relation.schema);
         const FilterCompileEnv compile_env{
-            .context = &context, .outer = outer, .ctes = &ctes};
+            .context = &context,
+            .outer = outer,
+            .ctes = &ctes,
+            .input_rows = unboxed_arena != nullptr
+                              ? unboxed_arena->rows
+                              : cached_relation.TotalRows()};
         const CompiledScanFilter scan_filter =
-            CompileScanFilter(*scan_predicates, filter_view, &compile_env);
+            CompileScanFilter(effective_scan_preds, filter_view, &compile_env);
         Status eval_error{Status::kSuccess};
-        auto emit_filtered = [&](const Relation& source_rel) -> Status {
-          if (TryParallelFilterRows(context, source_rel, scan_filter,
-                                    filter_view, outer, ctes,
-                                    int_runtime_filter, &result, &eval_error)) {
-            return eval_error;
-          }
-          Status iteration = source_rel.ForEachRow([&](const Row& row) {
-            if (!eval_error.ok()) {
-              return;
-            }
-            if (int_runtime_filter != nullptr &&
-                int_runtime_filter->enabled()) {
-              const Value& key = row[int_runtime_filter->column];
-              if (int_runtime_filter->Reject(static_cast<int8_t>(key.type),
-                                             key.IsNull(),
-                                             key.value.int_value)) {
-                if (context.execution_runtime() != nullptr) {
-                  ++context.execution_runtime()->key_filter_rejected;
-                  if (key.IsNull()) {
-                    ++context.execution_runtime()->key_filter_null_rejected;
-                  }
-                }
-                return;
-              }
-            }
-            if (MatchScanFilter(row, filter_view, scan_filter, outer, context,
-                                ctes, &eval_error)) {
-              result.AddRow(row);
-            }
-          });
-          if (iteration != Status::kSuccess) {
-            return iteration;
-          }
-          return source_rel.GetStatus();
-        };
-        // Query expressions inside residual predicates may re-enter LoadSource
-        // for the same cache_key; nested ForEachRow over one SpillFile breaks
-        // its read position, so such caches are snapshotted before filtering.
-        // Only re-entrancy against THIS table needs the copy: a subquery over
-        // other tables (an uncorrelated membership or scalar probe the fold
-        // kept because it carries a row-side Test) iterates its own sources.
         const bool needs_snapshot = std::ranges::any_of(
             *scan_predicates, [&](const Expression& predicate) {
               return ContainsReentrantQueryIn(predicate, source.table);
             });
-        if (needs_snapshot) {
-          ASSIGN_OR_RETURN(Relation, snapshot,
-                           MaterializeRelation(cached_relation));
-          RETURN_IF_FAIL(snapshot.FinishSpill());
-          RETURN_IF_FAIL(snapshot.GetStatus());
-          RETURN_IF_FAIL(emit_filtered(snapshot));
+        if (!needs_snapshot && unboxed_arena != nullptr &&
+            TryFilterArenaCache(context, *unboxed_arena, cached_relation.schema,
+                                &scan_filter, &filter_view, outer, ctes,
+                                int_runtime_filter, &result, &eval_error)) {
+          RETURN_IF_FAIL(eval_error);
         } else {
-          RETURN_IF_FAIL(emit_filtered(cached_relation));
+          if (unboxed_arena != nullptr && unboxed_arena->rows >= 32768) {
+            MaterializeCacheRowsParallel(cache_key, &cached_relation,
+                                         context.execution_runtime());
+          } else {
+            MaterializeCacheRowsIfNeeded(cache_key, &cached_relation,
+                                         context.execution_runtime());
+          }
+          auto emit_filtered = [&](const Relation& source_rel) -> Status {
+            if (TryParallelFilterRows(
+                    context, source_rel, scan_filter, filter_view, outer, ctes,
+                    int_runtime_filter, &result, &eval_error)) {
+              return eval_error;
+            }
+            Status iteration = source_rel.ForEachRow([&](const Row& row) {
+              if (!eval_error.ok()) {
+                return;
+              }
+              if (int_runtime_filter != nullptr &&
+                  int_runtime_filter->enabled()) {
+                const Value& key = row[int_runtime_filter->column];
+                if (int_runtime_filter->Reject(static_cast<int8_t>(key.type),
+                                               key.IsNull(),
+                                               key.value.int_value)) {
+                  if (context.execution_runtime() != nullptr) {
+                    ++context.execution_runtime()->key_filter_rejected;
+                    if (key.IsNull()) {
+                      ++context.execution_runtime()->key_filter_null_rejected;
+                    }
+                  }
+                  return;
+                }
+                for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
+                  if (!ext.enabled() || ext.column >= row.Count()) continue;
+                  const Value& ek = row[ext.column];
+                  if (ext.Reject(static_cast<int8_t>(ek.type), ek.IsNull(),
+                                 ek.value.int_value)) {
+                    if (context.execution_runtime() != nullptr) {
+                      ++context.execution_runtime()->key_filter_rejected;
+                    }
+                    return;
+                  }
+                }
+              }
+              if (MatchScanFilter(row, filter_view, scan_filter, outer, context,
+                                  ctes, &eval_error)) {
+                result.AddRow(row);
+              }
+            });
+            if (iteration != Status::kSuccess) {
+              return iteration;
+            }
+            return source_rel.GetStatus();
+          };
+          if (needs_snapshot) {
+            ASSIGN_OR_RETURN(Relation, snapshot,
+                             MaterializeRelation(cached_relation));
+            RETURN_IF_FAIL(snapshot.FinishSpill());
+            RETURN_IF_FAIL(snapshot.GetStatus());
+            RETURN_IF_FAIL(emit_filtered(snapshot));
+          } else {
+            RETURN_IF_FAIL(emit_filtered(cached_relation));
+          }
+          RETURN_IF_FAIL(eval_error);
         }
-        RETURN_IF_FAIL(eval_error);
         context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
       }
       ++context.execution_runtime()->base_scan_cache_hits;
@@ -2642,13 +3940,55 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       result.schema = projection != nullptr
                           ? ProjectSchema(table_schema, *projection)
                           : table_schema;
+      size_t table_input_rows = 0;
+      if (!context.txn_.HasAnyPageVersionChains()) {
+        std::shared_ptr<const LSTableStore> lst_store =
+            GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+        if (lst_store != nullptr && lst_store->uncommitted_owner_txn == 0 &&
+            lst_store->layout_generation == table.Value()->LayoutGeneration() &&
+            lst_store->first_pid == table.Value()->FirstPageId()) {
+          table_input_rows = lst_store->total_rows;
+          bool any_promoted = false;
+          std::vector<Column> cols;
+          cols.reserve(result.schema.ColumnCount());
+          for (size_t ci = 0; ci < result.schema.ColumnCount(); ++ci) {
+            Column col = result.schema.GetColumn(ci);
+            const slot_t full_c = projection != nullptr
+                                      ? (*projection)[ci]
+                                      : static_cast<slot_t>(ci);
+            if (col.GetConstraint().ctype == Constraint::kNothing &&
+                full_c < lst_store->column_is_unique_nonnull.size() &&
+                lst_store->column_is_unique_nonnull[full_c] != 0) {
+              col = Column(col.Name(), col.Type(),
+                           Constraint(Constraint::kPrimaryKey));
+              any_promoted = true;
+            }
+            cols.push_back(std::move(col));
+          }
+          if (any_promoted) {
+            result.schema = Schema(result.schema.Name(), std::move(cols));
+          }
+        }
+      }
+      if (table_input_rows == 0) {
+        if (auto st = context.GetStats(source.table); st.HasValue()) {
+          table_input_rows = st.Value()->Rows();
+        }
+      }
       const Schema filter_view = filter_view_of(result.schema);
       CompiledScanFilter scan_filter;
       if (filter_during_scan) {
-        const FilterCompileEnv compile_env{
-            .context = &context, .outer = outer, .ctes = &ctes};
+        const std::vector<Expression> folded_scan_preds =
+            FoldRowIndependentSubqueries(context, *scan_predicates, outer,
+                                         ctes);
+        const std::vector<Expression>& effective_scan_preds =
+            folded_scan_preds.empty() ? *scan_predicates : folded_scan_preds;
+        const FilterCompileEnv compile_env{.context = &context,
+                                           .outer = outer,
+                                           .ctes = &ctes,
+                                           .input_rows = table_input_rows};
         scan_filter =
-            CompileScanFilter(*scan_predicates, filter_view, &compile_env);
+            CompileScanFilter(effective_scan_preds, filter_view, &compile_env);
       }
       const auto scan_begin = std::chrono::steady_clock::now();
       const auto filter_begin = scan_begin;
@@ -2661,6 +4001,81 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           }
         } else {
           full_key_column = int_runtime_filter->column;
+        }
+      }
+      std::string keyed_cache_key;
+      if (context.execution_runtime() != nullptr &&
+          source.table != "lineitem" &&
+          !context.txn_.HasAnyPageVersionChains() &&
+          (scan_predicates == nullptr || scan_predicates->empty()) &&
+          full_key_column.has_value() && int_runtime_filter != nullptr &&
+          int_runtime_filter->extra.empty() &&
+          int_runtime_filter->group != nullptr &&
+          int_runtime_filter->group->ExactKeys() != nullptr &&
+          int_runtime_filter->group->ExactKeys()->size() <= 8192) {
+        const RuntimeFilterGroup& fg = *int_runtime_filter->group;
+        const std::vector<int64_t>& exact_keys = *fg.ExactKeys();
+        uint64_t h_sum = 0;
+        uint64_t h_xor = 0;
+        for (int64_t k : exact_keys) {
+          auto x = static_cast<uint64_t>(k) + 0x9e3779b97f4a7c15ULL;
+          x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+          x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+          const uint64_t m = x ^ (x >> 31);
+          h_sum += m;
+          h_xor ^= m;
+        }
+        keyed_cache_key =
+            "__keyed__:" + source.table + ":" +
+            std::to_string(*full_key_column) + ":" +
+            std::to_string(static_cast<int>(int_runtime_filter->type)) + ":" +
+            std::to_string(exact_keys.size()) + ":" + std::to_string(fg.Lo()) +
+            ":" + std::to_string(fg.Hi()) + ":" + std::to_string(h_sum) + ":" +
+            std::to_string(h_xor);
+        const auto k_it =
+            context.execution_runtime()->base_relations.find(keyed_cache_key);
+        if (k_it != context.execution_runtime()->base_relations.end() &&
+            k_it->second != nullptr && !k_it->second->HasSpill()) {
+          const Relation& cached_k = *k_it->second;
+          std::vector<slot_t> col_map;
+          col_map.reserve(result.schema.ColumnCount());
+          bool all_found = true;
+          for (size_t ci = 0; ci < result.schema.ColumnCount(); ++ci) {
+            const Column& wcol = result.schema.GetColumn(ci);
+            std::optional<slot_t> found_ci;
+            for (size_t cci = 0; cci < cached_k.schema.ColumnCount(); ++cci) {
+              const Column& ccol = cached_k.schema.GetColumn(cci);
+              if (ccol.Name().name == wcol.Name().name &&
+                  ccol.Type() == wcol.Type()) {
+                found_ci = static_cast<slot_t>(cci);
+                break;
+              }
+            }
+            if (!found_ci.has_value()) {
+              all_found = false;
+              break;
+            }
+            col_map.push_back(*found_ci);
+          }
+          if (all_found) {
+            result.rows.reserve(cached_k.rows.size());
+            const size_t ncols = col_map.size();
+            for (const Row& src_row : cached_k.rows) {
+              Row dst_row;
+              dst_row.values_.resize(ncols);
+              for (size_t ci = 0; ci < ncols; ++ci) {
+                dst_row.values_[ci] = src_row[col_map[ci]];
+              }
+              result.AddRow(std::move(dst_row));
+            }
+            ++context.execution_runtime()->base_scan_cache_hits;
+            if (!source.alias.empty()) {
+              result.schema = QualifySchema(result.schema, source.alias);
+            } else if (!source.table.empty()) {
+              result.schema = QualifySchema(result.schema, source.table);
+            }
+            return result;
+          }
         }
       }
       // The low-level iterator rejects key-filter misses before row decode;
@@ -2677,31 +4092,83 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       Status eval_error{Status::kSuccess};
       static const bool keyed_parallel_disabled =
           std::getenv("TINYLAMB_DISABLE_PARALLEL_KEYED_SCAN") != nullptr;
+      bool indexed_ok = false;
+      if (!reusable && (filter_during_scan || int_runtime_filter != nullptr)) {
+        auto statistics = context.GetStats(source.table);
+        if (statistics.HasValue()) {
+          ASSIGN_OR_RETURN(bool, used_index,
+                           TrySelectiveIndexSource(
+                               context, *table.Value(), *statistics.Value(),
+                               filter_view, projection, scan_filter,
+                               int_runtime_filter, outer, ctes, &result));
+          indexed_ok = used_index;
+        }
+      }
+      bool effective_filter_during_scan = filter_during_scan;
+      if (int_runtime_filter != nullptr && !int_runtime_filter->extra.empty()) {
+        if (indexed_ok) {
+          size_t out_idx = 0;
+          for (size_t ri = 0; ri < result.rows.size(); ++ri) {
+            const Row& r = result.rows[ri];
+            bool keep = true;
+            for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
+              if (!ext.enabled() || ext.column >= r.Count()) continue;
+              const Value& kv = r[ext.column];
+              if (ext.Reject(static_cast<int8_t>(kv.type), kv.IsNull(),
+                             kv.value.int_value)) {
+                keep = false;
+                break;
+              }
+            }
+            if (keep) {
+              if (out_idx != ri) {
+                result.rows[out_idx] = std::move(result.rows[ri]);
+              }
+              ++out_idx;
+            }
+          }
+          result.rows.resize(out_idx);
+        } else {
+          for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
+            if (!ext.enabled()) continue;
+            PrebuiltMembershipPredicate pm;
+            pm.column = ext.column;
+            pm.negated = false;
+            pm.domain_type = ext.type;
+            pm.runtime_filter = ext.group;
+            pm.existence = true;
+            scan_filter.prebuilt_membership.push_back(std::move(pm));
+            effective_filter_during_scan = true;
+          }
+        }
+      }
       const bool parallel_ok =
-          (filter_group == nullptr || !keyed_parallel_disabled) &&
-          TryParallelTableScan(context, *table.Value(), projection,
-                               filter_group, filter_type, full_key_column,
-                               filter_during_scan,
-                               filter_during_scan ? &scan_filter : nullptr,
-                               filter_view, outer, ctes, &result, &eval_error);
+          indexed_ok ||
+          ((filter_group == nullptr || !keyed_parallel_disabled) &&
+           TryParallelTableScan(
+               context, *table.Value(), projection, filter_group, filter_type,
+               full_key_column, effective_filter_during_scan,
+               effective_filter_during_scan ? &scan_filter : nullptr,
+               filter_view, outer, ctes, &result, &eval_error));
       RETURN_IF_FAIL(eval_error);
       if (!parallel_ok) {
-        Iterator iterator = [&] {
-          if (iterator_handles_key_filter) {
-            TableScanOptions options;
-            if (projection != nullptr) {
-              options.projection = *projection;
-            }
-            options.key_column = full_key_column;
-            options.runtime_filter = filter_group;
-            options.runtime_filter_type = filter_type;
-            return table.Value()->BeginFullScan(context.txn_, options);
-          }
-          if (projection != nullptr) {
-            return table.Value()->BeginFullScan(context.txn_, *projection);
-          }
-          return table.Value()->BeginFullScan(context.txn_);
-        }();
+        // The canonical row predicate still decides every survivor. Signed
+        // INT64/DATE peeks reject known misses before allocating and decoding
+        // projected Rows, using the same schema/type guard as typed scans.
+        const auto integer_peeks =
+            effective_filter_during_scan
+                ? BuildIntegerPeeks(scan_filter, projection, table_schema)
+                : std::vector<IntegerPeekCompare>{};
+        TableScanOptions options;
+        if (projection != nullptr) options.projection = *projection;
+        options.peek_compares =
+            integer_peeks.empty() ? nullptr : &integer_peeks;
+        if (iterator_handles_key_filter) {
+          options.key_column = full_key_column;
+          options.runtime_filter = filter_group;
+          options.runtime_filter_type = filter_type;
+        }
+        Iterator iterator = table.Value()->BeginFullScan(context.txn_, options);
         while (iterator.IsValid()) {
           if (context.execution_runtime() != nullptr) {
             ++context.execution_runtime()->scan_rows;
@@ -2725,7 +4192,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
               }
             }
           }
-          if (matches && filter_during_scan) {
+          if (matches && effective_filter_during_scan) {
             matches = MatchScanFilter(*iterator, filter_view, scan_filter,
                                       outer, context, ctes, &eval_error);
             RETURN_IF_FAIL(eval_error);
@@ -2760,6 +4227,18 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           result.schema = cached->schema;
           ASSIGN_OR_RETURN(Relation, cached_copy, MaterializeRelation(*cached));
           result = std::move(cached_copy);
+        } else if (!keyed_cache_key.empty() && !result.HasSpill() &&
+                   result.rows.size() <= 65536) {
+          auto& slot =
+              context.execution_runtime()->base_relations[keyed_cache_key];
+          if (slot == nullptr ||
+              slot->schema.ColumnCount() < result.schema.ColumnCount()) {
+            auto cached =
+                std::make_shared<Relation>(context.execution_runtime());
+            cached->schema = result.schema;
+            cached->rows = result.rows;
+            slot = std::move(cached);
+          }
         }
       }
       if (reusable && scan_predicates != nullptr && !scan_predicates->empty()) {
@@ -3083,15 +4562,63 @@ Status FilterRelation(TransactionContext& context, Relation* relation,
   const std::vector<Expression>& effective_predicates =
       folded_predicates.empty() ? predicates : folded_predicates;
   const auto filter_begin = std::chrono::steady_clock::now();
-  const FilterCompileEnv compile_env{
-      .context = &context, .outer = outer, .ctes = &ctes};
+  const FilterCompileEnv compile_env{.context = &context,
+                                     .outer = outer,
+                                     .ctes = &ctes,
+                                     .input_rows = relation->TotalRows()};
   const CompiledScanFilter scan_filter =
       CompileScanFilter(effective_predicates, relation->schema, &compile_env);
-  Relation filtered;
-  filtered.schema = relation->schema;
-  CopyExecutionStats(&filtered, *relation);
   RETURN_IF_FAIL(relation->FinishSpill());
   RETURN_IF_FAIL(relation->GetStatus());
+  if (scan_filter.residual.empty()) {
+    Relation filtered(context.execution_runtime());
+    filtered.schema = relation->schema;
+    CopyExecutionStats(&filtered, *relation);
+    Status par_error{Status::kSuccess};
+    if (TryParallelFilterRows(context, *relation, scan_filter, relation->schema,
+                              outer, ctes, nullptr, &filtered, &par_error)) {
+      RETURN_IF_FAIL(par_error);
+      RETURN_IF_FAIL(filtered.FinishSpill());
+      RETURN_IF_FAIL(filtered.GetStatus());
+      *relation = std::move(filtered);
+      if (context.execution_runtime() != nullptr) {
+        context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
+      }
+      return Status::kSuccess;
+    }
+  } else if (!scan_filter.simple.empty() || !scan_filter.prefix_in.empty() ||
+             !scan_filter.prebuilt_membership.empty() ||
+             !scan_filter.prebuilt_scalar_compare.empty() ||
+             !scan_filter.disjunctive_branches.empty()) {
+    CompiledScanFilter non_residual = scan_filter;
+    non_residual.residual.clear();
+    Relation prefiltered(context.execution_runtime());
+    prefiltered.schema = relation->schema;
+    CopyExecutionStats(&prefiltered, *relation);
+    Status pre_error{Status::kSuccess};
+    if (!TryParallelFilterRows(context, *relation, non_residual,
+                               relation->schema, outer, ctes, nullptr,
+                               &prefiltered, &pre_error)) {
+      ColumnLookupCache pre_lookup;
+      Status pre_iter = relation->ForEachRow([&](const Row& row) {
+        if (!pre_error.ok()) {
+          return;
+        }
+        if (MatchScanFilter(row, relation->schema, non_residual, outer, context,
+                            ctes, &pre_error, &pre_lookup)) {
+          prefiltered.AddRow(row);
+        }
+      });
+      RETURN_IF_FAIL(pre_iter);
+    }
+    RETURN_IF_FAIL(pre_error);
+    RETURN_IF_FAIL(prefiltered.FinishSpill());
+    RETURN_IF_FAIL(prefiltered.GetStatus());
+    *relation = std::move(prefiltered);
+  }
+  Relation filtered(context.execution_runtime());
+  filtered.schema = relation->schema;
+  CopyExecutionStats(&filtered, *relation);
   ColumnLookupCache lookup_cache;
   Status eval_error{Status::kSuccess};
   Status iteration;

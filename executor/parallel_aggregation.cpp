@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -23,11 +24,15 @@
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/parallel_scan.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/binary_expression.hpp"
+#include "expression/column_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
+#include "table/lstable_bridge.hpp"
 #include "type/row.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -124,6 +129,39 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
           input.kind = AggregateInputKind::kInt64Column;
           input.column = static_cast<size_t>(offset);
           int64_column_indices_.push_back(index);
+        }
+      } else {
+        generic_indices_.push_back(index);
+      }
+    } else if (!aggregate.Distinct() && !has_filter &&
+               (aggregate.GetType() == AggregationType::kCount ||
+                aggregate.GetType() == AggregationType::kSum ||
+                aggregate.GetType() == AggregationType::kAvg ||
+                aggregate.GetType() == AggregationType::kMin ||
+                aggregate.GetType() == AggregationType::kMax) &&
+               aggregate.Child()->Type() == TypeTag::kBinaryExp) {
+      const auto& bin = aggregate.Child()->AsBinaryExpression();
+      if ((bin.Op() == BinaryOperation::kMultiply ||
+           bin.Op() == BinaryOperation::kAdd ||
+           bin.Op() == BinaryOperation::kSubtract) &&
+          bin.Left()->Type() == TypeTag::kColumnValue &&
+          bin.Right()->Type() == TypeTag::kColumnValue) {
+        const int lhs_offset =
+            input_schema_.Offset(bin.Left()->AsColumnValue().GetColumnName());
+        const int rhs_offset =
+            input_schema_.Offset(bin.Right()->AsColumnValue().GetColumnName());
+        if (lhs_offset >= 0 && rhs_offset >= 0 &&
+            input_schema_.GetColumn(static_cast<size_t>(lhs_offset)).Type() ==
+                ValueType::kDouble &&
+            input_schema_.GetColumn(static_cast<size_t>(rhs_offset)).Type() ==
+                ValueType::kDouble) {
+          input.kind = AggregateInputKind::kDoubleBinaryColumn;
+          input.column = static_cast<size_t>(lhs_offset);
+          input.trailing_column = static_cast<size_t>(rhs_offset);
+          input.binary_op = bin.Op();
+          double_binary_column_indices_.push_back(index);
+        } else {
+          generic_indices_.push_back(index);
         }
       } else {
         generic_indices_.push_back(index);
@@ -282,6 +320,18 @@ Status ParallelAggregationExecutor::Accumulate(PartialState* state,
       RETURN_IF_FAIL(
           AccumulateDoubleColumn(state, index, chunk.ColumnAt(input.column)));
     } else {
+      generic_scratch.push_back(index);
+    }
+  }
+  for (const size_t index : double_binary_column_indices_) {
+    const AggregateInput& input = inputs_[index];
+    const ColumnVector& lhs = chunk.ColumnAt(input.column);
+    const ColumnVector& rhs = chunk.ColumnAt(input.trailing_column);
+    if (lhs.Type() == ValueType::kDouble && rhs.Type() == ValueType::kDouble) {
+      RETURN_IF_FAIL(AccumulateDoubleBinaryColumn(state, index, lhs, rhs,
+                                                  input.binary_op));
+    } else if (lhs.Type() != ValueType::kNull &&
+               rhs.Type() != ValueType::kNull) {
       generic_scratch.push_back(index);
     }
   }
@@ -632,6 +682,531 @@ Status ParallelAggregationExecutor::AccumulateDoubleColumn(
     }
     default:
       break;
+  }
+  return Status::kSuccess;
+}
+
+Status ParallelAggregationExecutor::AccumulateDoubleBinaryColumn(
+    PartialState* state, size_t aggregate_index, const ColumnVector& lhs,
+    const ColumnVector& rhs, BinaryOperation op) const {
+  const AggregationType type = aggregates_[aggregate_index]
+                                   .expression->AsAggregateExpression()
+                                   .GetType();
+  const std::vector<double>& lhs_data = lhs.DoubleData();
+  const std::vector<double>& rhs_data = rhs.DoubleData();
+  const auto eval = [op](double a, double b) noexcept -> double {
+    switch (op) {
+      case BinaryOperation::kMultiply:
+        return a * b;
+      case BinaryOperation::kAdd:
+        return a + b;
+      case BinaryOperation::kSubtract:
+        return a - b;
+      default:
+        return 0.0;
+    }
+  };
+  switch (type) {
+    case AggregationType::kCount: {
+      int64_t& count = state->values[aggregate_index].value.int_value;
+      for (size_t row = 0; row < lhs.Size(); ++row) {
+        if (!lhs.IsNull(row) && !rhs.IsNull(row)) {
+          ++count;
+        }
+      }
+      break;
+    }
+    case AggregationType::kSum: {
+      double sum = 0.0;
+      bool any = false;
+      for (size_t row = 0; row < lhs.Size(); ++row) {
+        if (lhs.IsNull(row) || rhs.IsNull(row)) {
+          continue;
+        }
+        sum += eval(lhs_data[row], rhs_data[row]);
+        any = true;
+      }
+      if (!any) {
+        break;
+      }
+      Value& total = state->values[aggregate_index];
+      total =
+          total.IsNull() ? Value(sum) : Value(total.value.double_value + sum);
+      break;
+    }
+    case AggregationType::kAvg: {
+      double& total = state->values[aggregate_index].value.double_value;
+      int64_t& count = state->counts[aggregate_index];
+      for (size_t row = 0; row < lhs.Size(); ++row) {
+        if (lhs.IsNull(row) || rhs.IsNull(row)) {
+          continue;
+        }
+        total += eval(lhs_data[row], rhs_data[row]);
+        ++count;
+      }
+      break;
+    }
+    case AggregationType::kMin: {
+      Value& best = state->values[aggregate_index];
+      for (size_t row = 0; row < lhs.Size(); ++row) {
+        if (lhs.IsNull(row) || rhs.IsNull(row)) {
+          continue;
+        }
+        const double v = eval(lhs_data[row], rhs_data[row]);
+        if (std::isnan(v)) {
+          best = Value(std::numeric_limits<double>::quiet_NaN());
+          continue;
+        }
+        if (best.IsNull() || v < best.value.double_value) {
+          best = Value(v);
+        }
+      }
+      break;
+    }
+    case AggregationType::kMax: {
+      Value& best = state->values[aggregate_index];
+      for (size_t row = 0; row < lhs.Size(); ++row) {
+        if (lhs.IsNull(row) || rhs.IsNull(row)) {
+          continue;
+        }
+        const double v = eval(lhs_data[row], rhs_data[row]);
+        if (std::isnan(v)) {
+          best = Value(std::numeric_limits<double>::quiet_NaN());
+          continue;
+        }
+        if (best.IsNull() || best.value.double_value < v) {
+          best = Value(v);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return Status::kSuccess;
+}
+
+Status ParallelAggregationExecutor::AccumulateLSTableBlock(
+    PartialState* state, const ParallelScan& scan, const LSTablePageBlock& blk,
+    const uint32_t* rows, size_t count) const {
+  for (const size_t index : row_count_indices_) {
+    state->values[index].value.int_value += static_cast<int64_t>(count);
+  }
+  for (const size_t index : int64_column_indices_) {
+    const slot_t col_slot = scan.TableColumnSlot(inputs_[index].column);
+    const LSTableColumnBlock& col = blk.columns[col_slot];
+    const AggregationType type =
+        aggregates_[index].expression->AsAggregateExpression().GetType();
+    const int64_t* data = col.int_cells.data();
+    switch (type) {
+      case AggregationType::kCount: {
+        int64_t& cnt = state->values[index].value.int_value;
+        if (!col.has_null) {
+          cnt += static_cast<int64_t>(count);
+        } else if (rows == nullptr) {
+          for (size_t r = 0; r < count; ++r) {
+            if (!col.IsNull(r)) {
+              ++cnt;
+            }
+          }
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            if (!col.IsNull(rows[i])) {
+              ++cnt;
+            }
+          }
+        }
+        break;
+      }
+      case AggregationType::kSum: {
+        if (col.is_unsigned) {
+          uint64_t sum = 0;
+          bool any = false;
+          bool overflow = false;
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (col.IsNull(r)) {
+              continue;
+            }
+            if (__builtin_add_overflow(sum, static_cast<uint64_t>(data[r]),
+                                       &sum)) {
+              overflow = true;
+            }
+            any = true;
+          }
+          if (!any) {
+            break;
+          }
+          Value& total = state->values[index];
+          if (overflow ||
+              (!total.IsNull() &&
+               __builtin_add_overflow(
+                   static_cast<uint64_t>(total.value.int_value), sum, &sum))) {
+            return StatusError(StatusCode::kIsInfinity,
+                               "uint64 overflow in SUM");
+          }
+          total = Value(static_cast<int64_t>(sum)).WithUnsigned();
+          break;
+        }
+        int64_t sum = 0;
+        bool any = false;
+        bool overflow = false;
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          if (__builtin_add_overflow(sum, data[r], &sum)) {
+            overflow = true;
+          }
+          any = true;
+        }
+        if (!any) {
+          break;
+        }
+        Value& total = state->values[index];
+        if (overflow ||
+            (!total.IsNull() &&
+             __builtin_add_overflow(total.value.int_value, sum, &sum))) {
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow on '+'");
+        }
+        total = Value(sum);
+        break;
+      }
+      case AggregationType::kAvg: {
+        double& total = state->values[index].value.double_value;
+        int64_t& cnt = state->counts[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          total += col.is_unsigned
+                       ? static_cast<double>(static_cast<uint64_t>(data[r]))
+                       : static_cast<double>(data[r]);
+          ++cnt;
+        }
+        break;
+      }
+      case AggregationType::kMin: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          if (col.is_unsigned) {
+            if (best.IsNull() ||
+                static_cast<uint64_t>(data[r]) <
+                    static_cast<uint64_t>(best.value.int_value)) {
+              best = Value(data[r]).WithUnsigned();
+            }
+          } else if (best.IsNull() || data[r] < best.value.int_value) {
+            best = Value(data[r]);
+          }
+        }
+        break;
+      }
+      case AggregationType::kMax: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          if (col.is_unsigned) {
+            if (best.IsNull() || static_cast<uint64_t>(best.value.int_value) <
+                                     static_cast<uint64_t>(data[r])) {
+              best = Value(data[r]).WithUnsigned();
+            }
+          } else if (best.IsNull() || best.value.int_value < data[r]) {
+            best = Value(data[r]);
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  for (const size_t index : double_column_indices_) {
+    const slot_t col_slot = scan.TableColumnSlot(inputs_[index].column);
+    const LSTableColumnBlock& col = blk.columns[col_slot];
+    const AggregationType type =
+        aggregates_[index].expression->AsAggregateExpression().GetType();
+    const int64_t* data = col.int_cells.data();
+    switch (type) {
+      case AggregationType::kCount: {
+        int64_t& cnt = state->values[index].value.int_value;
+        if (!col.has_null) {
+          cnt += static_cast<int64_t>(count);
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (!col.IsNull(r)) {
+              ++cnt;
+            }
+          }
+        }
+        break;
+      }
+      case AggregationType::kSum: {
+        double sum = 0.0;
+        bool any = false;
+        if (!col.has_null) {
+          any = count > 0;
+          if (rows == nullptr) {
+            for (size_t r = 0; r < count; ++r) {
+              sum += std::bit_cast<double>(data[r]);
+            }
+          } else {
+            for (size_t i = 0; i < count; ++i) {
+              sum += std::bit_cast<double>(data[rows[i]]);
+            }
+          }
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (col.IsNull(r)) {
+              continue;
+            }
+            sum += std::bit_cast<double>(data[r]);
+            any = true;
+          }
+        }
+        if (any) {
+          Value& total = state->values[index];
+          total = total.IsNull() ? Value(sum)
+                                 : Value(total.value.double_value + sum);
+        }
+        break;
+      }
+      case AggregationType::kAvg: {
+        double& total = state->values[index].value.double_value;
+        int64_t& cnt = state->counts[index];
+        if (!col.has_null) {
+          if (rows == nullptr) {
+            for (size_t r = 0; r < count; ++r) {
+              total += std::bit_cast<double>(data[r]);
+            }
+          } else {
+            for (size_t i = 0; i < count; ++i) {
+              total += std::bit_cast<double>(data[rows[i]]);
+            }
+          }
+          cnt += static_cast<int64_t>(count);
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (col.IsNull(r)) {
+              continue;
+            }
+            total += std::bit_cast<double>(data[r]);
+            ++cnt;
+          }
+        }
+        break;
+      }
+      case AggregationType::kMin: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          const auto v = std::bit_cast<double>(data[r]);
+          if (std::isnan(v)) {
+            best = Value(std::numeric_limits<double>::quiet_NaN());
+            continue;
+          }
+          if (best.IsNull() || v < best.value.double_value) {
+            best = Value(v);
+          }
+        }
+        break;
+      }
+      case AggregationType::kMax: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (col.IsNull(r)) {
+            continue;
+          }
+          const auto v = std::bit_cast<double>(data[r]);
+          if (std::isnan(v)) {
+            best = Value(std::numeric_limits<double>::quiet_NaN());
+            continue;
+          }
+          if (best.IsNull() || best.value.double_value < v) {
+            best = Value(v);
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  for (const size_t index : double_binary_column_indices_) {
+    const AggregateInput& input = inputs_[index];
+    const slot_t lhs_slot = scan.TableColumnSlot(input.column);
+    const slot_t rhs_slot = scan.TableColumnSlot(input.trailing_column);
+    const LSTableColumnBlock& lhs_col = blk.columns[lhs_slot];
+    const LSTableColumnBlock& rhs_col = blk.columns[rhs_slot];
+    const int64_t* lhs_data = lhs_col.int_cells.data();
+    const int64_t* rhs_data = rhs_col.int_cells.data();
+    const AggregationType type =
+        aggregates_[index].expression->AsAggregateExpression().GetType();
+    const auto eval = [op = input.binary_op](double a,
+                                             double b) noexcept -> double {
+      switch (op) {
+        case BinaryOperation::kMultiply:
+          return a * b;
+        case BinaryOperation::kAdd:
+          return a + b;
+        case BinaryOperation::kSubtract:
+          return a - b;
+        default:
+          return 0.0;
+      }
+    };
+    switch (type) {
+      case AggregationType::kCount: {
+        int64_t& cnt = state->values[index].value.int_value;
+        if (!lhs_col.has_null && !rhs_col.has_null) {
+          cnt += static_cast<int64_t>(count);
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (!lhs_col.IsNull(r) && !rhs_col.IsNull(r)) {
+              ++cnt;
+            }
+          }
+        }
+        break;
+      }
+      case AggregationType::kSum: {
+        double sum = 0.0;
+        bool any = false;
+        if (!lhs_col.has_null && !rhs_col.has_null) {
+          any = count > 0;
+          if (rows == nullptr) {
+            for (size_t r = 0; r < count; ++r) {
+              sum += eval(std::bit_cast<double>(lhs_data[r]),
+                          std::bit_cast<double>(rhs_data[r]));
+            }
+          } else {
+            for (size_t i = 0; i < count; ++i) {
+              const uint32_t r = rows[i];
+              sum += eval(std::bit_cast<double>(lhs_data[r]),
+                          std::bit_cast<double>(rhs_data[r]));
+            }
+          }
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (lhs_col.IsNull(r) || rhs_col.IsNull(r)) {
+              continue;
+            }
+            sum += eval(std::bit_cast<double>(lhs_data[r]),
+                        std::bit_cast<double>(rhs_data[r]));
+            any = true;
+          }
+        }
+        if (any) {
+          Value& total = state->values[index];
+          total = total.IsNull() ? Value(sum)
+                                 : Value(total.value.double_value + sum);
+        }
+        break;
+      }
+      case AggregationType::kAvg: {
+        double& total = state->values[index].value.double_value;
+        int64_t& cnt = state->counts[index];
+        if (!lhs_col.has_null && !rhs_col.has_null) {
+          if (rows == nullptr) {
+            for (size_t r = 0; r < count; ++r) {
+              total += eval(std::bit_cast<double>(lhs_data[r]),
+                            std::bit_cast<double>(rhs_data[r]));
+            }
+          } else {
+            for (size_t i = 0; i < count; ++i) {
+              const uint32_t r = rows[i];
+              total += eval(std::bit_cast<double>(lhs_data[r]),
+                            std::bit_cast<double>(rhs_data[r]));
+            }
+          }
+          cnt += static_cast<int64_t>(count);
+        } else {
+          for (size_t i = 0; i < count; ++i) {
+            const uint32_t r =
+                rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+            if (lhs_col.IsNull(r) || rhs_col.IsNull(r)) {
+              continue;
+            }
+            total += eval(std::bit_cast<double>(lhs_data[r]),
+                          std::bit_cast<double>(rhs_data[r]));
+            ++cnt;
+          }
+        }
+        break;
+      }
+      case AggregationType::kMin: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (lhs_col.IsNull(r) || rhs_col.IsNull(r)) {
+            continue;
+          }
+          const double v = eval(std::bit_cast<double>(lhs_data[r]),
+                                std::bit_cast<double>(rhs_data[r]));
+          if (std::isnan(v)) {
+            best = Value(std::numeric_limits<double>::quiet_NaN());
+            continue;
+          }
+          if (best.IsNull() || v < best.value.double_value) {
+            best = Value(v);
+          }
+        }
+        break;
+      }
+      case AggregationType::kMax: {
+        Value& best = state->values[index];
+        for (size_t i = 0; i < count; ++i) {
+          const uint32_t r =
+              rows == nullptr ? static_cast<uint32_t>(i) : rows[i];
+          if (lhs_col.IsNull(r) || rhs_col.IsNull(r)) {
+            continue;
+          }
+          const double v = eval(std::bit_cast<double>(lhs_data[r]),
+                                std::bit_cast<double>(rhs_data[r]));
+          if (std::isnan(v)) {
+            best = Value(std::numeric_limits<double>::quiet_NaN());
+            continue;
+          }
+          if (best.IsNull() || best.value.double_value < v) {
+            best = Value(v);
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
   }
   return Status::kSuccess;
 }
@@ -1000,8 +1575,7 @@ Row ParallelAggregationExecutor::Finalize(PartialState state) const {
   return Row(std::move(state.values));
 }
 
-bool ParallelAggregationExecutor::Next(Row* destination,
-                                       RowPosition* /*position*/) {
+bool ParallelAggregationExecutor::Execute(Row* destination) {
   if (errored_) {
     return FailWith(error_);
   }
@@ -1012,6 +1586,50 @@ bool ParallelAggregationExecutor::Next(Row* destination,
   partials.reserve(worker_count_);
   for (size_t worker = 0; worker < worker_count_; ++worker) {
     partials.push_back(MakeState());
+  }
+
+  if (auto* scan = dynamic_cast<ParallelScan*>(child_.get());
+      scan != nullptr && generic_indices_.empty() &&
+      stat_column_indices_.empty()) {
+    bool can_fold_lstable = true;
+    for (const NamedExpression& named : aggregates_) {
+      const auto& aggregate = named.expression->AsAggregateExpression();
+      const AggregationType type = aggregate.GetType();
+      if (aggregate.Distinct() ||
+          (type != AggregationType::kCount && type != AggregationType::kSum &&
+           type != AggregationType::kAvg && type != AggregationType::kMin &&
+           type != AggregationType::kMax)) {
+        can_fold_lstable = false;
+        break;
+      }
+    }
+    if (can_fold_lstable) {
+      StatusOr<bool> folded = scan->TryFoldLSTableBlocks(
+          worker_count_,
+          [&](size_t worker, const LSTablePageBlock& blk, const uint32_t* rows,
+              size_t count) -> Status {
+            return AccumulateLSTableBlock(&partials[worker], *scan, blk, rows,
+                                          count);
+          });
+      if (!folded.HasValue()) {
+        errored_ = true;
+        error_ = folded.GetStatus();
+        return FailWith(error_);
+      }
+      if (folded.Value()) {
+        PartialState merged = MakeState();
+        for (const PartialState& partial : partials) {
+          if (Status st = Merge(&merged, partial); st != Status::kSuccess) {
+            errored_ = true;
+            error_ = st;
+            return FailWith(st);
+          }
+        }
+        *destination = Finalize(merged);
+        executed_ = true;
+        return true;
+      }
+    }
   }
 
   std::mutex input_mutex;
@@ -1118,7 +1736,7 @@ size_t ParallelAggregationExecutor::NextBatch(DataChunk* destination,
     return 0;
   }
   Row row;
-  if (!Next(&row, nullptr)) {
+  if (!Execute(&row)) {
     return 0;
   }
   destination->Append(std::move(row));
@@ -1133,6 +1751,8 @@ void ParallelAggregationExecutor::Dump(std::ostream& out, int indent) const {
         << *aggregate.expression;
   }
   out << "\n" << Indent(static_cast<size_t>(indent)) << "}";
+  out << "\n" << Indent(static_cast<size_t>(indent) + 2);
+  child_->Dump(out, indent + 2);
 }
 
 }  // namespace tinylamb

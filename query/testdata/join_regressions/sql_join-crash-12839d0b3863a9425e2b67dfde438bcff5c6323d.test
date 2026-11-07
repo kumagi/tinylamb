@@ -1,0 +1,27 @@
+-- tinylamb-join-test v1
+-- seed: 281520242
+-- setup: CREATE TABLE fact (u INT64, k INT64, a INT64);
+-- setup: CREATE TABLE dim (k INT64, tag VARCHAR(8));
+-- setup: INSERT INTO fact VALUES (0, 3, -3);
+-- setup: INSERT INTO fact VALUES (1, NULL, 1);
+-- setup: INSERT INTO fact VALUES (2, 0, NULL);
+-- setup: INSERT INTO dim VALUES (3, 'x');
+-- setup: INSERT INTO dim VALUES (NULL, 'yy');
+-- setup: INSERT INTO dim VALUES (0, 'yy');
+-- setup: INSERT INTO dim VALUES (0, 'x');
+-- query: SELECT d.tag, COUNT(*) FROM fact f LEFT JOIN dim d ON f.k = d.k GROUP BY d.tag HAVING COUNT(*) >= 2;
+-- expect: |"x"|,|2|,
+-- query: SELECT f.u, f.a, d.tag FROM fact f CROSS JOIN dim d WHERE f.a IS NOT NULL;
+-- expect: |0|,|-3|,|"x"|,
+-- expect: |0|,|-3|,|"x"|,
+-- expect: |0|,|-3|,|"yy"|,
+-- expect: |0|,|-3|,|"yy"|,
+-- expect: |1|,|1|,|"x"|,
+-- expect: |1|,|1|,|"x"|,
+-- expect: |1|,|1|,|"yy"|,
+-- expect: |1|,|1|,|"yy"|,
+-- query: WITH xd AS (SELECT k FROM dim WHERE tag = 'x') SELECT COUNT(*) FROM fact f WHERE f.k IN (SELECT k FROM xd);
+-- expect: |2|,
+-- query: SELECT COUNT(*), COUNT(d.tag), COUNT(DISTINCT f.k), SUM(f.a), MIN(f.a), MAX(d.k) FROM fact f CROSS JOIN dim d;
+-- expect: |12|,|12|,|2|,|-8|,|-3|,|3|,
+-- failure: BOUNDS_TRAP (tinylamb::relational_detail::TryFusedGroupedJoin@executor/detail/fused_grouped_join.cpp:2501)

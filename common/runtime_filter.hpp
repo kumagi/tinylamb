@@ -86,7 +86,9 @@ class RuntimeFilter {
 // pattern is unpredictable on data-ordered probe streams.
 class ExactSetRuntimeFilter final : public RuntimeFilter {
  public:
-  explicit ExactSetRuntimeFilter(std::vector<int64_t> sorted_distinct_keys);
+  explicit ExactSetRuntimeFilter(std::vector<int64_t> sorted_distinct_keys,
+                                 bool already_sorted_unique = false,
+                                 bool skip_hash_table = false);
 
   [[nodiscard]] RuntimeFilterKind Kind() const override {
     return RuntimeFilterKind::kExactSet;
@@ -94,9 +96,17 @@ class ExactSetRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] bool Reject(int64_t key) const override;
   [[nodiscard]] size_t DistinctKeys() const override { return keys_.size(); }
   [[nodiscard]] size_t MemoryBytes() const override {
+    size_t table_slots = table_.size();
+    if (table_slots == 0 && !keys_.empty()) {
+      table_slots = 16;
+      while (table_slots < keys_.size() * 2) {
+        table_slots <<= 1U;
+      }
+    }
     return sizeof(*this) + keys_.size() * sizeof(int64_t) +
-           table_.size() * sizeof(uint32_t);
+           table_slots * sizeof(uint32_t);
   }
+  [[nodiscard]] const std::vector<int64_t>& Keys() const { return keys_; }
   [[nodiscard]] int64_t Min() const { return keys_.front(); }
   [[nodiscard]] int64_t Max() const { return keys_.back(); }
 
@@ -136,7 +146,7 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   // `distinct_keys` sizes the bitset at ~10 bits/key (false-positive rate
   // well under 2%); the bit count is rounded up to a power of two.
   BloomRuntimeFilter(std::vector<uint64_t> bits, size_t bit_count,
-                     size_t distinct_keys);
+                     size_t distinct_keys, size_t nominal_bit_count = 0);
 
   [[nodiscard]] RuntimeFilterKind Kind() const override {
     return RuntimeFilterKind::kBloom;
@@ -144,7 +154,9 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] bool Reject(int64_t key) const override;
   [[nodiscard]] size_t DistinctKeys() const override { return distinct_keys_; }
   [[nodiscard]] size_t MemoryBytes() const override {
-    return sizeof(*this) + bits_.size() * sizeof(uint64_t);
+    const size_t words =
+        nominal_bit_count_ != 0 ? (nominal_bit_count_ / 64) : bits_.size();
+    return sizeof(*this) + words * sizeof(uint64_t);
   }
   [[nodiscard]] size_t BitCount() const { return bit_count_; }
   // A malformed bitset (non power-of-two size, or fewer words than the bit
@@ -163,6 +175,7 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   std::vector<uint64_t> bits_;
   size_t bit_count_;
   size_t distinct_keys_;
+  size_t nominal_bit_count_{0};
   size_t mask_;
   bool disabled_{false};
 };
@@ -187,12 +200,29 @@ class RejectAllRuntimeFilter final : public RuntimeFilter {
 // immutable once the group is built.
 class RuntimeFilterGroup final {
  public:
+  static constexpr uint64_t kMaxDenseSpan = 33'554'432ULL;
+
   RuntimeFilterGroup() = default;
   explicit RuntimeFilterGroup(
-      std::vector<std::unique_ptr<RuntimeFilter>> parts);
+      std::vector<std::unique_ptr<RuntimeFilter>> parts,
+      const std::vector<int64_t>* sorted_distinct_keys = nullptr);
+  RuntimeFilterGroup(std::vector<std::unique_ptr<RuntimeFilter>> parts,
+                     std::vector<uint64_t> prebuilt_dense_bits, int64_t lo,
+                     int64_t hi);
 
   [[nodiscard]] bool empty() const { return parts_.empty(); }
-  [[nodiscard]] bool Reject(int64_t key) const {
+  [[nodiscard]] bool Reject(int64_t key) const noexcept {
+    if (reject_all_) [[unlikely]] {
+      return true;
+    }
+    if (has_bounds_ && (key < lo_ || key > hi_)) {
+      return true;
+    }
+    if (has_dense_bits_) {
+      const uint64_t off =
+          static_cast<uint64_t>(key) - static_cast<uint64_t>(lo_);
+      return (dense_bits_[off >> 6] & (uint64_t{1} << (off & 63))) == 0;
+    }
     for (const std::unique_ptr<RuntimeFilter>& part : parts_) {
       if (part->Reject(key)) {
         return true;
@@ -200,15 +230,92 @@ class RuntimeFilterGroup final {
     }
     return false;
   }
+  // Sound range rejection for ZoneMap block pruning: returns true when NO key
+  // in [min_key, max_key] can match the filter.
+  [[nodiscard]] bool RejectRange(int64_t min_key,
+                                 int64_t max_key) const noexcept {
+    if (reject_all_) [[unlikely]] {
+      return true;
+    }
+    if (min_key > max_key) [[unlikely]] {
+      return false;
+    }
+    if (has_bounds_ && (max_key < lo_ || min_key > hi_)) {
+      return true;
+    }
+    if (has_dense_bits_) {
+      const int64_t clamped_min = min_key > lo_ ? min_key : lo_;
+      const int64_t clamped_max = max_key < hi_ ? max_key : hi_;
+      if (clamped_min > clamped_max) {
+        return true;
+      }
+      const uint64_t off_lo =
+          static_cast<uint64_t>(clamped_min) - static_cast<uint64_t>(lo_);
+      const uint64_t off_hi =
+          static_cast<uint64_t>(clamped_max) - static_cast<uint64_t>(lo_);
+      const size_t word_lo = static_cast<size_t>(off_lo >> 6);
+      const size_t word_hi = static_cast<size_t>(off_hi >> 6);
+      if (word_hi - word_lo <= 8) {
+        const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
+        const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));
+        if (word_lo == word_hi) {
+          return (dense_bits_[word_lo] & low_mask & high_mask) == 0;
+        }
+        if ((dense_bits_[word_lo] & low_mask) != 0) {
+          return false;
+        }
+        for (size_t w = word_lo + 1; w < word_hi; ++w) {
+          if (dense_bits_[w] != 0) {
+            return false;
+          }
+        }
+        return (dense_bits_[word_hi] & high_mask) == 0;
+      }
+      return false;
+    }
+    if (exact_keys_ != nullptr) {
+      if (exact_keys_->empty()) {
+        return true;
+      }
+      if (max_key < exact_keys_->front() || min_key > exact_keys_->back()) {
+        return true;
+      }
+      size_t lo = 0;
+      size_t hi = exact_keys_->size();
+      while (lo < hi) {
+        const size_t mid = lo + ((hi - lo) >> 1);
+        if ((*exact_keys_)[mid] < min_key) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      return lo == exact_keys_->size() || (*exact_keys_)[lo] > max_key;
+    }
+    return false;
+  }
+  [[nodiscard]] bool has_dense_bits() const noexcept { return has_dense_bits_; }
+  [[nodiscard]] const uint64_t* dense_bits_data() const noexcept {
+    return dense_bits_.data();
+  }
+  [[nodiscard]] size_t dense_bits_word_count() const noexcept {
+    return dense_bits_.size();
+  }
+  [[nodiscard]] bool has_bounds() const noexcept { return has_bounds_; }
+  [[nodiscard]] int64_t Lo() const noexcept { return lo_; }
+  [[nodiscard]] int64_t Hi() const noexcept { return hi_; }
+  // A borrowed sorted enclosure of every key accepted by the conjunction.
+  // Null means no exact part exists; callers must still apply Reject().
+  [[nodiscard]] const std::vector<int64_t>* ExactKeys() const {
+    return exact_keys_;
+  }
   [[nodiscard]] size_t PartCount() const { return parts_.size(); }
   [[nodiscard]] bool Has(RuntimeFilterKind kind) const;
   // True when the group rejects unconditionally (the build side contributed no
   // comparable key at all). Such a filter has no comparison domain, so a
   // consumer may bind it to any INT64/DATE column regardless of the build
   // side's declared type.
-  [[nodiscard]] bool RejectsAll() const {
-    return Has(RuntimeFilterKind::kRejectAll);
-  }
+  [[nodiscard]] bool RejectsAll() const { return reject_all_; }
   [[nodiscard]] size_t DistinctKeys() const;
   [[nodiscard]] size_t MemoryBytes() const;
   // Stable, order-independent summary for EXPLAIN / rule fingerprints.
@@ -216,6 +323,13 @@ class RuntimeFilterGroup final {
 
  private:
   std::vector<std::unique_ptr<RuntimeFilter>> parts_;
+  std::vector<uint64_t> dense_bits_;
+  const std::vector<int64_t>* exact_keys_{nullptr};
+  int64_t lo_{0};
+  int64_t hi_{0};
+  bool has_bounds_{false};
+  bool has_dense_bits_{false};
+  bool reject_all_{false};
 };
 
 // Ingests build-side key observations and picks the cheapest sound filter.
@@ -242,6 +356,9 @@ class RuntimeFilterBuilder {
   static constexpr size_t kMaxTrackedKeys = 2000000;
 
   void Observe(int64_t key);
+  void Reserve(size_t count) {
+    keys_.reserve(std::min(count, kMaxTrackedKeys));
+  }
   // A build row whose join key is NULL. NULLs never join, so they only matter
   // as "the build side is not all-NULL"; the filter itself stays NULL-free.
   void ObserveNull();
@@ -255,12 +372,13 @@ class RuntimeFilterBuilder {
   // false; callers that want "no build key at all prunes everything" pass
   // true and get a RejectAll part.
   [[nodiscard]] std::shared_ptr<const RuntimeFilterGroup> Build(
-      bool allow_reject_all = false) const;
+      bool allow_reject_all = false,
+      size_t max_exact_keys = kMaxExactKeys) const;
 
   // Convenience for callers that already hold a key collection (the
   // relational path's uncorrelated-IN membership filter).
   [[nodiscard]] static std::shared_ptr<const RuntimeFilterGroup> FromKeys(
-      const std::vector<int64_t>& keys);
+      const std::vector<int64_t>& keys, size_t max_exact_keys = kMaxExactKeys);
 
  private:
   std::vector<int64_t> keys_;
@@ -283,6 +401,11 @@ struct ScanRuntimeFilter {
   std::shared_ptr<const RuntimeFilterGroup> group;
   slot_t column{0};
   ValueType type{ValueType::kInt64};
+  // Additional selective runtime filters on other columns of the same table
+  // discovered by BuildInput when multiple selective join partners are already
+  // loaded (e.g. lineitem joined with both filtered orders and filtered
+  // supplier/part).
+  std::vector<ScanRuntimeFilter> extra;
 
   [[nodiscard]] bool enabled() const {
     return group != nullptr && !group->empty();

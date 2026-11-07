@@ -127,6 +127,12 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
         set(_googlesql_asset "execute_query_macos")
         set(_googlesql_sha256
             "f0e9532a6a6285f97fc684461825fb481c07879f08dd28c25e2322d52f99ac29")
+    elseif(EXISTS "/tmp/eq_client")
+        file(MAKE_DIRECTORY "${_googlesql_download_dir}")
+        file(COPY_FILE "/tmp/eq_client" "${_googlesql_executable}")
+        file(CHMOD "${_googlesql_executable}"
+             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
     else()
         message(WARNING
                 "No prebuilt GoogleSQL parser is available for this platform; "
@@ -264,12 +270,8 @@ tinylamb_add_layer(tinylamb_common
         SOURCES
         common/serdes.cpp
         common/log_message.cpp
-        common/debug.cpp
         common/encoder.cpp
         common/decoder.cpp
-        common/vm_cache_impl.cpp
-        common/vm_cache_impl.hpp
-        common/ring_buffer.hpp
         common/runtime_filter.cpp)
 
 # Layer 2: type system.
@@ -294,51 +296,57 @@ tinylamb_add_layer(tinylamb_page
         ALIAS tinylamb::page
         SOURCES
         page/page.cpp
-        page/page_pool.cpp
         page/row_page.cpp
-        page/pax_block.cpp
-        page/pax_page.cpp
         page/page_manager.cpp
-        page/meta_page.cpp
         page/page_type.cpp
         page/page_ref.cpp
-        page/leaf_page.cpp
-        page/branch_page.cpp
         recovery/logger.cpp
         recovery/log_record.cpp
-        recovery/log_record_oracle.cpp
         recovery/recovery_manager.cpp
         recovery/checkpoint_manager.cpp
-        transaction/lock_manager.cpp
         transaction/transaction.cpp
         transaction/transaction_manager.cpp
         DEPENDS tinylamb::type)
 
-# Layer 4: index structures (B+ tree, LSM).
+# Layer 4: index structures (LSM-Tree index).
 tinylamb_add_layer(tinylamb_index
         ALIAS tinylamb::index
         SOURCES
-        index/b_plus_tree.cpp
-        index/b_plus_tree_iterator.cpp
-        index/b_plus_tree_oracle.cpp
-        index/lsm_tree_oracle.cpp
+        index/lsm_index.cpp
         index/index.cpp
         index/index_schema.cpp
-        index/lsm_tree.cpp
-        index/lsm_detail/lsm_view.cpp
-        index/lsm_detail/blob_file.cpp
-        index/lsm_detail/sorted_run.cpp
         DEPENDS tinylamb::page)
 
 # Layer 5: table access (includes index_scan_iterator to avoid table<->index cycle).
+set(TINYLAMB_PAX_SOURCES
+        table/memtable/memtable.cpp
+        table/memtable/skiplist.cpp
+        table/sorted_run/sorted_run.cpp
+        table/pax_chunk/pax_chunk.cpp
+        table/pax_chunk/pax_chunk_codecs.cpp
+        table/pax_chunk/pax_chunk_access.cpp
+        table/pax_chunk/pax_chunk_encode.cpp
+        table/pax_chunk/pax_chunk_scan.cpp
+        table/pax_chunk/pax_chunk_aggregate.cpp
+        table/workload/workload.cpp
+        table/fragment/fragment.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set(_pax_compile_opts "-Wno-pedantic;-Wno-shadow;-Wno-undef")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        list(APPEND _pax_compile_opts "-mavx2" "-mbmi2")
+    endif()
+    set_source_files_properties(${TINYLAMB_PAX_SOURCES}
+            PROPERTIES COMPILE_OPTIONS "${_pax_compile_opts}")
+endif()
 tinylamb_add_layer(tinylamb_table
         ALIAS tinylamb::table
         SOURCES
         table/table.cpp
         table/full_scan_iterator.cpp
+        table/lstable_bridge.cpp
         table/table_statistics.cpp
-        table/hyper_log_log.cpp
         index/index_scan_iterator.cpp
+        ${TINYLAMB_PAX_SOURCES}
         DEPENDS tinylamb::index)
 
 # Layer 6: catalog and database orchestration.
@@ -400,7 +408,6 @@ tinylamb_add_layer(tinylamb_executor
         executor/grouped_aggregate.cpp
         executor/parallel_aggregation.cpp
         executor/zone_map.cpp
-        executor/query_scheduler.cpp
         executor/query_memory.cpp
         executor/spill_file.cpp
         executor/data_chunk.cpp
@@ -412,7 +419,6 @@ tinylamb_add_layer(tinylamb_executor
         executor/merge_join.cpp
         executor/merge_append.cpp
         executor/cross_join.cpp
-        executor/nested_loop_join.cpp
         executor/insert.cpp
         executor/update.cpp
         executor/delete.cpp
@@ -421,7 +427,6 @@ tinylamb_add_layer(tinylamb_executor
         executor/topn.cpp
         executor/limit.cpp
         executor/table_sample.cpp
-        executor/max1_row.cpp
         executor/minmax_index.cpp
         executor/set_operation.cpp
         executor/distinct.cpp
@@ -430,46 +435,40 @@ tinylamb_add_layer(tinylamb_executor
         executor/apply.cpp
         executor/recursive_cte.cpp
         executor/window.cpp
-        executor/returning.cpp
         executor/relational.cpp
         executor/relational_factory.cpp
         executor/detail/relation.cpp
         executor/detail/subquery_runtime.cpp
         executor/detail/window_eval.cpp
         executor/detail/expression_eval.cpp
+        executor/detail/function_eval.cpp
+        executor/detail/aggregate_accumulator.cpp
         executor/detail/scan_filter.cpp
+        executor/detail/parallel_table_scan.cpp
         executor/detail/planning_heuristics.cpp
+        executor/detail/build_input.cpp
+        executor/detail/fused_grouped_join.cpp
+        executor/detail/stream_grouped_join.cpp
+        executor/detail/typed_column_eval.cpp
+        executor/detail/typed_stream_aggregate.cpp
         executor/detail/explain_format.cpp
         executor/detail/work_table_index.cpp
         executor/index_scan.cpp
         executor/index_only_scan.cpp
         executor/parallel_index_scan.cpp
-        executor/lsm_scan.cpp
         executor/lookup_join.cpp
         executor/late_materialization_join.cpp
         executor/bitmap_scan.cpp
         executor/multi_index_covering_scan.cpp
-        executor/truncate.cpp
-        executor/partial_aggregate.cpp
-        executor/merge.cpp
-        executor/grouping_sets.cpp
         executor/selection_vector.cpp
-        executor/vectorized_expression.cpp
-        executor/materialize.cpp
-        executor/operator_memory.cpp
         executor/parallel_hash_join.cpp
         executor/parallel_merge_join.cpp
         executor/simd_comparison.cpp
-        executor/numa_arena.cpp
-        executor/remote_scan.cpp
         executor/batch_nested_loop_join.cpp
         executor/pdqsort.cpp
         executor/incremental_sort.cpp
-        executor/partial_sort.cpp
         executor/skip_scan_distinct.cpp
         executor/constant_executor.cpp
-        executor/analyze_scan.cpp
-        executor/cardinality_probe.cpp
         plan/full_scan_plan.cpp
         plan/projection_plan.cpp
         plan/selection_plan.cpp
@@ -477,6 +476,7 @@ tinylamb_add_layer(tinylamb_executor
         plan/relational_plan.cpp
         plan/optimizer.cpp
         plan/cascades.cpp
+        plan/cascades_search.cpp
         plan/limit_plan.cpp
         plan/sample_plan.cpp
         plan/group_by_plan.cpp
@@ -492,8 +492,6 @@ tinylamb_add_layer(tinylamb_executor
         plan/distinct_plan.cpp
         plan/sort_distinct_plan.cpp
         plan/values_plan.cpp
-        plan/max1_row_plan.cpp
-        plan/materialize_plan.cpp
         plan/minmax_index_plan.cpp
         plan/incremental_sort_plan.cpp
         plan/band_join_plan.cpp
@@ -508,7 +506,6 @@ tinylamb_add_layer(tinylamb_executor
         plan/plan.cpp
         plan/index_scan_plan.cpp
         plan/bitmap_scan_plan.cpp
-        plan/lsm_scan_plan.cpp
         query/query_data.cpp
         DEPENDS tinylamb::expression)
 
@@ -532,8 +529,10 @@ add_library(tinylamb_sql
         query/googlesql_frontend.cpp
         query/googlesql_ast.cpp
         query/googlesql_ast_visitor.cpp
+        query/googlesql_ast_visitor_dml.cpp
         query/sql_template.cpp
         query/sql_engine.cpp
+        query/select_rewrites.cpp
         query/join_reduction.cpp
         query/sql_oracle_fuzzer.cpp
         query/sql_join_fuzzer.cpp
@@ -628,6 +627,27 @@ add_executable(tinylamb_tpcc_benchmark benchmark/tpcc_benchmark.cpp)
 tinylamb_apply_options(tinylamb_tpcc_benchmark)
 target_link_libraries(tinylamb_tpcc_benchmark PRIVATE tinylamb::tpcc)
 
+if(NOT APPLE)
+add_executable(tinylamb_tpcc_tcp_benchmark EXCLUDE_FROM_ALL benchmark/tpcc_tcp_benchmark.cpp)
+tinylamb_apply_options(tinylamb_tpcc_tcp_benchmark)
+target_link_libraries(tinylamb_tpcc_tcp_benchmark PRIVATE tinylamb::tpcc)
+
+add_executable(tinylamb_tpcc_three_benchmark EXCLUDE_FROM_ALL
+        benchmark/tpcc_tcp_benchmark.cpp benchmark/tpcc_workload.cpp)
+tinylamb_apply_options(tinylamb_tpcc_three_benchmark)
+target_compile_definitions(tinylamb_tpcc_three_benchmark PRIVATE TINYLAMB_TPCC_EXTERNAL_ONLY=1)
+target_link_libraries(tinylamb_tpcc_three_benchmark PRIVATE tinylamb_type tinylamb_common)
+option(TINYLAMB_TPCC_MYSQL "Enable MySQL C client for the optional TPC-C TCP benchmark" OFF)
+if(TINYLAMB_TPCC_MYSQL)
+    find_path(TINYLAMB_MYSQL_INCLUDE_DIR mysql.h PATH_SUFFIXES mysql REQUIRED)
+    find_library(TINYLAMB_MYSQL_LIBRARY NAMES mysqlclient libmysqlclient.so.24 REQUIRED)
+    target_compile_definitions(tinylamb_tpcc_three_benchmark PRIVATE TINYLAMB_TPCC_MYSQL=1)
+    target_include_directories(tinylamb_tpcc_three_benchmark PRIVATE
+            ${TINYLAMB_MYSQL_INCLUDE_DIR} ${TINYLAMB_MYSQL_INCLUDE_DIR}/..)
+    target_link_libraries(tinylamb_tpcc_three_benchmark PRIVATE ${TINYLAMB_MYSQL_LIBRARY})
+endif()
+endif()
+
 # TPC-H DBGEN is an executable build dependency of the benchmark only.  It is
 # deliberately not linked into tinylamb and is not downloaded when building
 # the database, server, or unit-test targets.
@@ -696,8 +716,6 @@ function(add_benchmark file_path)
             tinylamb::core
     )
 endfunction()
-
-add_benchmark("index/lsm_detail/lsm_tree_bench.cpp")
 
 ########################################
 ## Testing
@@ -771,6 +789,8 @@ if(BUILD_TESTING)
         list(APPEND _test_env
              "TINYLAMB_AGGREGATE_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/aggregate_regressions")
         list(APPEND _test_env
+             "TINYLAMB_JOIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/join_regressions")
+        list(APPEND _test_env
              "TINYLAMB_GRIFFIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/griffin_regressions")
         if(SIMPLE_TEST_TIMEOUT)
             gtest_discover_tests(${target_name} PROPERTIES
@@ -782,11 +802,10 @@ if(BUILD_TESTING)
         endif()
     endfunction()
 
-add_simple_test(common/vm_cache_test.cpp)
 add_simple_test(common/log_message_test.cpp)
-add_simple_test(common/debug_test.cpp)
 add_simple_test(common/crc32c_test.cpp)
 add_simple_test(common/serdes_test.cpp)
+add_simple_test(common/string_util_test.cpp)
 add_simple_test(common/runtime_filter_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/collation_test.cpp)
@@ -794,33 +813,18 @@ add_simple_test(type/row_test.cpp)
 add_simple_test(type/constraint_test.cpp)
 add_simple_test(type/column_test.cpp)
 add_simple_test(type/schema_test.cpp)
-add_simple_test(page/leaf_page_test.cpp)
-add_simple_test(page/branch_page_test.cpp)
-add_simple_test(page/page_pool_test.cpp)
 add_simple_test(page/page_manager_test.cpp)
-add_simple_test(page/row_page_test.cpp)
-add_simple_test(page/pax_layout_test.cpp)
-add_simple_test(page/pax_block_test.cpp)
-add_simple_test(page/pax_page_test.cpp)
-add_simple_test(page/page_type_test.cpp)
 add_simple_test(recovery/logger_test.cpp)
 add_simple_test(recovery/logger_segment_test.cpp)
-add_simple_test(recovery/log_record_test.cpp)
-add_simple_test(recovery/log_record_oracle_test.cpp)
 add_simple_test(recovery/recovery_manager_test.cpp)
 add_simple_test(recovery/checkpoint_manager_test.cpp)
-add_simple_test(index/b_plus_tree_test.cpp)
-add_simple_test(index/b_plus_tree_oracle_test.cpp)
-add_simple_test(index/lsm_tree_oracle_test.cpp)
-add_simple_test(index/b_plus_tree_iterator_test.cpp)
-add_simple_test(index/lsm_tree_test.cpp)
+add_simple_test(index/lsm_index_test.cpp)
 add_simple_test(table/table_test.cpp)
 add_simple_test(table/index_test.cpp)
 add_simple_test(table/full_scan_iterator_test.cpp)
 add_simple_test(table/full_scan_mvcc_fastpath_test.cpp)
 add_simple_test(index/index_scan_iterator_test.cpp)
 add_simple_test(transaction/transaction_test.cpp)
-add_simple_test(transaction/lock_manager_test.cpp)
 add_simple_test(expression/expression_test.cpp)
 add_simple_test(expression/differential_test.cpp)
 add_simple_test(expression/rewrite_test.cpp)
@@ -829,7 +833,6 @@ add_simple_test(expression/jit_test.cpp)
 add_simple_test(expression/parameter_slot_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(executor/parallel_index_scan_test.cpp)
-add_simple_test(executor/lsm_scan_test.cpp)
 add_simple_test(executor/relational_regression_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/distinct_test.cpp)
@@ -839,11 +842,34 @@ add_simple_test(executor/grouped_aggregate_test.cpp)
 add_simple_test(executor/window_spill_test.cpp)
 add_simple_test(executor/detail/flat_int_key_map_test.cpp)
 add_simple_test(executor/detail/work_table_index_test.cpp)
+add_simple_test(executor/detail/scan_filter_test.cpp)
+add_simple_test(executor/detail/planning_heuristics_test.cpp)
+add_simple_test(executor/detail/typed_stream_aggregate_test.cpp)
+add_simple_test(executor/detail/fused_grouped_join_test.cpp)
 add_simple_test(executor/merge_append_test.cpp)
 add_simple_test(expression/function_call_test.cpp)
 add_simple_test(expression/json_text_test.cpp)
 add_simple_test(query/join_reduction_test.cpp)
-add_simple_test(executor/query_scheduler_test.cpp)
+add_simple_test(query/select_rewrites_test.cpp)
+add_simple_test(table/pax_chunk/pax_chunk_codecs_test.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(pax_chunk_codecs_test PRIVATE ${_pax_compile_opts})
+endif()
+add_simple_test(table/fuzz/pax_storage_fuzzer_test.cpp)
+target_sources(pax_storage_fuzzer_test PRIVATE
+        table/fuzz/row_codec_fuzzer.cpp
+        table/fuzz/memcmp_fuzzer.cpp
+        table/fuzz/pax_mutate_fuzzer.cpp
+        table/fuzz/lsm_merge_fuzzer.cpp
+        table/fuzz/memtable_model_fuzzer.cpp
+        table/fuzz/schema_fuzzer.cpp
+        table/fuzz/chunk_footer_fuzzer.cpp
+        table/fuzz/region_scheme_fuzzer.cpp
+        table/fuzz/nullmap_varchar_fuzzer.cpp
+        table/fuzz/footer_sections_fuzzer.cpp
+        table/fuzz/encode_agree_fuzzer.cpp)
+target_compile_definitions(pax_storage_fuzzer_test PRIVATE TINYLAMB_FUZZ_NO_MAIN_SYMBOL=1)
+target_compile_options(pax_storage_fuzzer_test PRIVATE -UNDEBUG)
 add_simple_test(executor/spill_file_test.cpp)
 add_simple_test(executor/query_memory_test.cpp)
 add_simple_test(database/catalog_test.cpp)
@@ -860,11 +886,6 @@ add_simple_test(plan/full_scan_plan_test.cpp)
 add_simple_test(plan/late_materialization_join_plan_test.cpp)
 add_simple_test(plan/plan_memo_oracle_test.cpp)
 add_simple_test(table/table_statistics_test.cpp)
-add_simple_test(table/hyper_log_log_test.cpp)
-add_simple_test(index/lsm_detail/blob_file_test.cpp)
-add_simple_test(index/lsm_detail/lsm_view_test.cpp)
-add_simple_test(index/lsm_detail/cache_test.cpp)
-add_simple_test(index/lsm_detail/sorted_run_test.cpp)
 add_simple_test(query/query_test.cpp)
 add_simple_test(query/date_array_and_compare_test.cpp)
 add_simple_test(query/late_materialization_sql_test.cpp)
@@ -902,13 +923,11 @@ target_link_libraries(tpcc_workload_test PRIVATE tinylamb::tpcc)
 
 # Coverage-focused tests.
 add_simple_test(executor/relational_extra_test.cpp)
-add_simple_test(common/vm_cache_extra_test.cpp)
 add_simple_test(benchmark/tpcc_workload_extra_test.cpp)
 target_link_libraries(tpcc_workload_extra_test PRIVATE tinylamb::tpcc)
 add_simple_test(server/postgres_server_extra_test.cpp)
 target_link_libraries(postgres_server_extra_test PRIVATE tinylamb::postgres_server)
 add_simple_test(table/table_statistics_extra_test.cpp)
-add_simple_test(index/lsm_cache_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
 add_simple_test(query/sql_bugfix_regression_test.cpp)
 add_simple_test(query/analytical_features_test.cpp)
@@ -917,17 +936,16 @@ add_simple_test(query/merge_test.cpp)
 add_simple_test(query/alter_table_test.cpp)
 add_simple_test(query/matview_test.cpp)
 add_simple_test(query/sibling_aggregate_fusion_test.cpp)
-add_simple_test(index/bplus_tree_extra_test.cpp)
 add_simple_test(type/value_extra_test.cpp)
 add_simple_test(type/row_schema_extra_test.cpp)
 add_simple_test(common/util_extra_test.cpp)
 add_simple_test(plan/plan_extra_test.cpp)
 add_simple_test(executor/executor_extra_test.cpp)
-add_simple_test(recovery/recovery_extra_test.cpp)
 # The checkpoint-storm scenario needs ~33 min even on a quiet machine
 # (2003s measured 2026-09-28); the 1500s default truncates it.
 add_simple_test(database/database_extra_test.cpp TIMEOUT 2700)
 add_simple_test(transaction/transaction_extra_test.cpp)
+add_simple_test(transaction/index_key_history_test.cpp)
 add_simple_test(query/sql_function_coverage_test.cpp)
 add_simple_test(query/sql_function_edge_test.cpp)
 add_simple_test(query/sql_expression_matrix_test.cpp)
@@ -949,8 +967,6 @@ add_simple_test(executor/late_materialization_join_test.cpp)
 add_simple_test(plan/cascades_rules_coverage_test.cpp)
 add_simple_test(type/interval_test.cpp)
 add_simple_test(transaction/transaction_coverage_test.cpp)
-add_simple_test(index/bptree_coverage_test.cpp)
-add_simple_test(page/page_extra_test.cpp)
 add_simple_test(expression/expr_extra_test.cpp)
 add_simple_test(expression/function_coverage_test.cpp)
 add_simple_test(expression/function_call_ast_sweep_test.cpp)
@@ -982,12 +998,6 @@ add_simple_test(query/sql_dml_paths_coverage_test.cpp)
 add_simple_test(query/sql_ast_function_sweep_test.cpp)
 add_simple_test(cli_main_test.cpp)
 add_dependencies(cli_main_test tinylamb)
-
-# Concurrency tests.
-add_simple_test(page/row_page_concurrent_test.cpp)
-add_simple_test(index/b_plus_tree_concurrent_test.cpp)
-add_simple_test(index/b_plus_tree_concurrent_fuzz_test.cpp)
-add_simple_test(index/lsm_detail/cache_concurrent_test.cpp)
 
 add_executable(rule_fuzzer plan/rule_fuzzer.cpp)
 tinylamb_apply_options(rule_fuzzer)
@@ -1039,17 +1049,20 @@ function(add_fuzzer_test file_path)
 endfunction()
 
 add_fuzzer_test(recovery/logger_fuzzer.cpp)
-add_fuzzer_test(recovery/log_record_fuzzer.cpp)
 add_fuzzer_test(type/value_fuzzer.cpp)
 add_fuzzer_test(type/date_interval_fuzzer.cpp)
-add_fuzzer_test(page/row_page_fuzzer.cpp)
-add_fuzzer_test(page/leaf_page_fuzzer.cpp)
-add_fuzzer_test(page/pax_page_fuzzer.cpp)
-add_fuzzer_test(index/lsm_detail/lsm_view_fuzzer.cpp)
-add_fuzzer_test(index/lsm_detail/cache_fuzzer.cpp)
-add_fuzzer_test(index/lsm_tree_fuzzer.cpp)
-add_fuzzer_test(index/b_plus_tree_fuzzer.cpp)
 add_fuzzer_test(table/table_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/row_codec_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/memcmp_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/pax_mutate_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/lsm_merge_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/memtable_model_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/schema_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/chunk_footer_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/region_scheme_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/nullmap_varchar_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/footer_sections_fuzzer.cpp)
+add_fuzzer_test(table/fuzz/encode_agree_fuzzer.cpp)
 add_fuzzer_test(expression/expression_fuzzer.cpp)
 add_fuzzer_test(expression/cast_fuzzer.cpp)
 add_fuzzer_test(expression/function_fuzzer.cpp)
@@ -1101,14 +1114,6 @@ function(add_replay_test file_path input_mode)
 endfunction()
 
 add_replay_test(recovery/logger_fuzzer_replay.cpp FILE)
-add_replay_test(recovery/log_record_fuzzer_replay.cpp DIRECTORY)
-add_replay_test(page/row_page_fuzzer_replay.cpp DIRECTORY)
-add_replay_test(page/leaf_page_fuzzer_replay.cpp FILE)
-add_replay_test(page/pax_page_fuzzer_replay.cpp FILE)
-add_replay_test(index/lsm_detail/lsm_view_fuzzer_replay.cpp FILE)
-add_replay_test(index/lsm_detail/cache_fuzzer_replay.cpp FILE)
-add_replay_test(index/lsm_tree_fuzzer_replay.cpp FILE)
-add_replay_test(index/b_plus_tree_fuzzer_replay.cpp FILE)
 add_replay_test(table/table_fuzzer_replay.cpp FILE)
 add_replay_test(server/postgres_protocol_fuzzer_replay.cpp DIRECTORY
         tinylamb::postgres_server)

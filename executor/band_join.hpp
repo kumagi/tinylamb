@@ -28,7 +28,6 @@ class BandJoin final : public ExecutorBase {
            JoinKind kind = JoinKind::kInner, size_t left_width = 0,
            size_t right_width = 0, Schema output_schema = Schema());
 
-  bool Next(Row* dst, RowPosition* rp) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;

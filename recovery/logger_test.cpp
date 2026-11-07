@@ -70,6 +70,31 @@ class LoggerTest : public ::testing::Test {
   std::unique_ptr<Logger> l_;
 };
 
+TEST_F(LoggerTest, CommitDrivenSyncKeepsRequestedBarriersImmediate) {
+  l_->SetCommitDrivenSync(true);
+  const auto target = l_->AddLog("requested").Value() + 9;
+  WaitForCommit(target);
+  // The short background timer must not start an avoidable pre-commit sync.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_LT(l_->DurableLSN(), target);
+  ASSERT_SUCCESS(l_->WaitForDurable(target));
+  EXPECT_GE(l_->DurableLSN(), target);
+  const auto tail = l_->AddLog("finish").Value() + 6;
+  ASSERT_SUCCESS(l_->Finish());
+  EXPECT_GE(l_->DurableLSN(), tail);
+}
+
+TEST_F(LoggerTest, CommitDrivenSyncStillHasBoundedBackgroundProgress) {
+  l_->SetCommitDrivenSync(true);
+  const auto target = l_->AddLog("background").Value() + 10;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (l_->DurableLSN() < target &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_GE(l_->DurableLSN(), target);
+}
+
 TEST_F(LoggerTest, Construct) {
   // Arrange -- nothing to set up; default Logger constructed by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()
@@ -193,6 +218,8 @@ TEST_F(LoggerTest, WaitForDurableObservesFsync) {
   l_->WaitForDurable(lsn + payload.size());
   EXPECT_GE(l_->DurableLSN(), lsn + payload.size());
   EXPECT_GE(l_->CommittedLSN(), lsn + payload.size());
+  EXPECT_GT(l_->GetSyncStats().count, 0U);
+  EXPECT_GT(l_->GetSyncStats().nanoseconds, 0U);
 }
 
 TEST_F(LoggerTest, FinishDrainsWithoutSpin) {
@@ -499,5 +526,169 @@ TEST_F(LoggerTest, TryCopyBufferedNeverServesPreopenBytes) {
       reopened->TryCopyBuffered(fresh_lsn, served.data(), served.size()));
   EXPECT_EQ(served, fresh);
   EXPECT_EQ(reopened->Finish(), Status::kSuccess);
+}
+
+TEST_F(LoggerTest, FixedSegmentsRetainLogicalEndAndPersistedGeometry) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kSegment = 4096;
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                        Logger::Create(log_name_, 32, 60'000, kSegment, true));
+  ASSERT_TRUE(fixed->FixedSizeSegments());
+  EXPECT_EQ(std::filesystem::file_size(log_name_), kSegment + 64);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment), 0);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("durable-prefix"), 0);
+  ASSERT_SUCCESS(fixed->WaitForDurable(14));
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment), 14);
+  ASSERT_SUCCESS(fixed->Finish());
+  fixed.reset();
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, reopened,
+                        Logger::Create(log_name_, 32, 60'000, kSegment / 2));
+  EXPECT_TRUE(reopened->FixedSizeSegments());
+  EXPECT_EQ(reopened->SegmentSize(), kSegment);
+  EXPECT_EQ(reopened->DurableLSN(), 14);
+  ASSERT_SUCCESS_AND_EQ(reopened->AddLog("-more"), 14);
+  ASSERT_SUCCESS(reopened->WaitForDurable(19));
+  ASSERT_SUCCESS(reopened->Finish());
+  std::ifstream input(log_name_, std::ios::binary);
+  std::string prefix(19, '\0');
+  input.read(prefix.data(), prefix.size());
+  EXPECT_EQ(prefix, "durable-prefix-more");
+  EXPECT_EQ(std::filesystem::file_size(log_name_), kSegment + 64);
+}
+
+TEST_F(LoggerTest, FixedSegmentsRollAndLogicalTruncateWithoutChangingSize) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kSegment = 128;
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                        Logger::Create(log_name_, 32, 60'000, kSegment, true));
+  const std::string payload(100, 'x');
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 0);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), kSegment);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog(payload), 2 * kSegment);
+  ASSERT_SUCCESS(fixed->WaitForDurable(fixed->BufferedLSN()));
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 0, kSegment),
+                        100);
+  ASSERT_SUCCESS_AND_EQ(Logger::SegmentLogicalSize(log_name_, 1, kSegment),
+                        100);
+  ASSERT_SUCCESS(fixed->TruncateTo(130));
+  EXPECT_FALSE(std::filesystem::exists(Logger::SegmentPath(log_name_, 2)));
+  EXPECT_EQ(std::filesystem::file_size(Logger::SegmentPath(log_name_, 1)),
+            kSegment + 64);
+  ASSERT_SUCCESS_AND_EQ(fixed->AddLog("replacement"), 130);
+  ASSERT_SUCCESS(fixed->WaitForDurable(141));
+  ASSERT_SUCCESS(fixed->Finish());
+  fixed.reset();
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, reopened,
+                        Logger::Create(log_name_, 32, 1, kSegment));
+  EXPECT_EQ(reopened->BufferedLSN(), 141);
+}
+
+TEST_F(LoggerTest, PreallocationRequestNeverConvertsExistingRawSeries) {
+  ASSERT_SUCCESS(l_->AddLog("legacy").GetStatus());
+  ASSERT_SUCCESS(l_->Finish());
+  l_.reset();
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, raw,
+                        Logger::Create(log_name_, 32, 1, 4096, true));
+  EXPECT_FALSE(raw->FixedSizeSegments());
+  EXPECT_EQ(raw->BufferedLSN(), 6);
+  ASSERT_SUCCESS(raw->Finish());
+  EXPECT_EQ(std::filesystem::file_size(log_name_), 6);
+}
+
+TEST_F(LoggerTest, FixedSegmentsRejectEitherDamagedSlotAndForcedScanKeepsBody) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kSegment = 4096;
+  for (const size_t damage_offset :
+       {kSegment, kSegment + 32, kSegment + 28, kSegment + 60}) {
+    RemoveLogAndSegments(log_name_);
+    {
+      ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                            Logger::Create(log_name_, 32, 1, kSegment, true));
+      ASSERT_SUCCESS(fixed->AddLog("acknowledged").GetStatus());
+      ASSERT_SUCCESS(fixed->WaitForDurable(fixed->BufferedLSN()));
+      ASSERT_SUCCESS(fixed->Finish());
+    }
+    std::fstream frame(log_name_,
+                       std::ios::binary | std::ios::in | std::ios::out);
+    frame.seekg(damage_offset);
+    char original = 0;
+    frame.get(original);
+    frame.seekp(damage_offset);
+    frame.put(static_cast<char>(original ^ 0x5a));
+    frame.close();
+    EXPECT_FALSE(Logger::SegmentLogicalSize(log_name_, 0, kSegment).HasValue());
+    EXPECT_FALSE(Logger::Create(log_name_, 32, 1, kSegment).HasValue());
+    ASSIGN_OR_ASSERT_FAIL(
+        std::unique_ptr<Logger>, forced,
+        Logger::Create(log_name_, 32, 60'000, kSegment, false, true));
+    // An older valid slot is not a safe prefix proof after corruption.
+    EXPECT_EQ(forced->BufferedLSN(), kSegment);
+    std::ifstream body(log_name_, std::ios::binary);
+    std::string prefix(12, '\0');
+    body.read(prefix.data(), prefix.size());
+    EXPECT_EQ(prefix, "acknowledged");
+    ASSERT_SUCCESS(forced->TruncateTo(12));
+    ASSERT_SUCCESS(forced->Finish());
+  }
+}
+
+TEST_F(LoggerTest, FixedSegmentsRejectPhysicalLengthDamage) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  constexpr size_t kSegment = 4096;
+  for (const size_t length :
+       {size_t{3}, kSegment, kSegment + 32, kSegment + 63, kSegment + 65}) {
+    RemoveLogAndSegments(log_name_);
+    {
+      ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                            Logger::Create(log_name_, 32, 1, kSegment, true));
+      ASSERT_SUCCESS(fixed->AddLog("acknowledged").GetStatus());
+      ASSERT_SUCCESS(fixed->Finish());
+    }
+    std::filesystem::resize_file(log_name_, length);
+    EXPECT_FALSE(Logger::Create(log_name_, 32, 1, kSegment).HasValue());
+    ASSIGN_OR_ASSERT_FAIL(
+        std::unique_ptr<Logger>, forced,
+        Logger::Create(log_name_, 32, 60'000, kSegment, false, true));
+    EXPECT_EQ(forced->BufferedLSN(), std::min(length, kSegment));
+    ASSERT_SUCCESS(forced->TruncateTo(std::min(length, size_t{12})));
+    ASSERT_SUCCESS(forced->Finish());
+  }
+}
+
+TEST_F(LoggerTest, FixedSegmentsSyncFailureNeverAdvancesDurableEnd) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                        Logger::Create(log_name_, 32, 60'000, 4096, true));
+  fixed->SetCommitDrivenSync(true);
+  ASSERT_SUCCESS(fixed->AddLog("first").GetStatus());
+  ASSERT_SUCCESS(fixed->WaitForDurable(5));
+  Logger::SetBeforeSyncHookForTest([](int) { return EIO; });
+  ASSERT_SUCCESS(fixed->AddLog("unacknowledged").GetStatus());
+  const Status status = fixed->WaitForDurable(fixed->BufferedLSN());
+  Logger::SetBeforeSyncHookForTest({});
+  EXPECT_NE(status, Status::kSuccess);
+  EXPECT_EQ(fixed->DurableLSN(), 5);
+  EXPECT_NE(fixed->Finish(), Status::kSuccess);
+}
+
+TEST_F(LoggerTest, FixedFrameWithoutMetadataIsNeverMigratedAsLegacyBytes) {
+  l_.reset();
+  RemoveLogAndSegments(log_name_);
+  {
+    ASSIGN_OR_ASSERT_FAIL(std::unique_ptr<Logger>, fixed,
+                          Logger::Create(log_name_, 32, 1, 4096, true));
+    ASSERT_SUCCESS(fixed->AddLog("committed").GetStatus());
+    ASSERT_SUCCESS(fixed->Finish());
+  }
+  std::filesystem::remove(Logger::SegmentMetadataPath(log_name_));
+  EXPECT_FALSE(Logger::Create(log_name_, 32, 1, 2048).HasValue());
+  EXPECT_EQ(std::filesystem::file_size(log_name_), 4160);
+  EXPECT_FALSE(std::filesystem::exists(Logger::SegmentPath(log_name_, 1)));
+  EXPECT_FALSE(std::filesystem::exists(Logger::SegmentMetadataPath(log_name_)));
 }
 }  // namespace tinylamb

@@ -39,13 +39,14 @@
 #include "common/log_message.hpp"
 #include "common/status_or.hpp"
 #include "full_scan_iterator.hpp"
-#include "index/b_plus_tree.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "index/index_schema.hpp"
+#include "index/lsm_index.hpp"
 #include "iterator.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/scan_options.hpp"
 #include "transaction/transaction.hpp"
 #include "type/row.hpp"
@@ -70,7 +71,7 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   {
     ASSIGN_OR_RETURN(
         PageRef, root_page,
-        txn.GetPageManager()->AllocateNewPage(txn, PageType::kLeafPage));
+        txn.GetPageManager()->AllocateNewPage(txn, PageType::kRowPage));
     root_pid = root_page->PageID();
     indexes_.emplace_back(idx.name_, idx.key_, root_pid, idx.include_,
                           idx.mode_);
@@ -80,16 +81,8 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
   while (it.IsValid()) {
     Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
     if (status != Status::kSuccess) {
-      // Drop the half-built index so later Insert/Delete stop touching it,
-      // and recycle every page it allocated.  The partial build may have
-      // grown past the root via splits and foster chains; destroying only
-      // the root would leak those pages off the free list forever.
       indexes_.pop_back();
-      for (const page_id_t pid : BPlusTree::CollectPageIds(txn, root_pid)) {
-        ASSIGN_OR_RETURN(PageRef, page, txn.GetPageManager()->GetPage(pid));
-        txn.GetPageManager()->DestroyPage(txn, page.get());
-        page.PageUnlock();
-      }
+      std::ignore = LsmIndex(root_pid).Destroy(txn);
       return status;
     }
     ++it;
@@ -98,11 +91,6 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
 }
 
 namespace {
-// Phase1-4: once the append point has less free space left than this, the
-// next Insert call pre-allocates and links a fresh tail page so the
-// allocation cost (and the page-full chain walk) leaves the hot path.
-constexpr bin_size_t kTailPreallocateThreshold = kPageBodySize / 16;
-
 // Best-effort compensations run after the primary failure is already decided;
 // their own failures must stay observable instead of vanishing into
 // std::ignore, or heap/index divergence goes undiagnosed.
@@ -310,7 +298,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
   // under its latch). The `next_page_id_ == 0` guard makes the rotation
   // idempotent under latch serialization: whoever runs second sees the link
   // and skips. Chain order and last_pid_'s "tail" meaning are unchanged.
-  if (ref->body.row_page.free_size_ < kTailPreallocateThreshold &&
+  if (ref->body.row_page.ShouldPreallocateNextBlock() &&
       ref->body.row_page.next_page_id_ == 0) {
     const Status claim =
         page_manager->TryReserveTableTail(txn.ID(), first_pid_, ref->PageID());
@@ -409,14 +397,26 @@ bool IndexCoversUnchanged(const Index& idx,
 
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
+  const auto contextualize = [&](Status status, std::string_view phase) {
+    if (status == Status::kSuccess) return status;
+    return StatusError(status.GetCode(),
+                       "table update " + std::string(phase) + " at " +
+                           std::to_string(pos.page_id) + "/" +
+                           std::to_string(pos.slot) + ": " + ToString(status));
+  };
   // An UPDATE rewrites the slot in place, so the pre-image stays reachable for
   // older snapshots: the in-process rewrite latch keeps any clustering proof
   // from outliving it (see Table::RowsRewrittenInPlace).
   const RowMutationScope mutation(*this, /*rewrites_in_place=*/true);
-  ASSIGN_OR_RETURN(TableLease, lease, AcquireLease(txn.ID()));
+  StatusOr<TableLease> acquired = AcquireLease(txn.ID());
+  if (!acquired.HasValue()) {
+    return contextualize(acquired.GetStatus(), "lease");
+  }
+  TableLease lease = acquired.MoveValue();
   PageManager* const page_manager = txn.GetPageManager();
-  RETURN_IF_FAIL(
-      page_manager->CheckTableTailPage(txn.ID(), first_pid_, pos.page_id));
+  RETURN_IF_FAIL(contextualize(
+      page_manager->CheckTableTailPage(txn.ID(), first_pid_, pos.page_id),
+      "tail visibility"));
   RETURN_IF_FAIL(CheckRowConstraints(row));
   // Phase2-3: the previous image feeds index maintenance only. Tables
   // without indexes skip the deserialize roundtrip entirely; RowPage::Update
@@ -432,7 +432,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   Row original_row;
   {
     StatusOr<Row> visible = Read(txn, pos);
-    RETURN_IF_FAIL(visible.GetStatus());
+    RETURN_IF_FAIL(contextualize(visible.GetStatus(), "before-image read"));
     original_row = visible.MoveValue();
   }
   RowPosition new_pos = pos;
@@ -484,6 +484,17 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // first one landed on whenever the live routing agrees.
   std::vector<page_id_t> idx_cursors(indexes_.size(), 0);
   RETURN_IF_FAIL(row.CheckSerializable());
+  // Pre-acquire the write intent BEFORE latching the target page (the same
+  // protocol Table::Delete already follows): RowPage::Update's internal
+  // AddWriteSet then short-circuits on the write-set entry, so a genuine
+  // same-row conflict parks LATCH-FREE here. Waiting latched used to hold
+  // the page content latch for the whole intent wait -- which blocked the
+  // conflicting owner's abort undo (it needs that latch) and manufactured
+  // the multi-second write-intent escape-hatch stalls the detector cannot
+  // see (the latch edge is not in the wait-for graph).
+  if (!txn.AddWriteSet(new_pos)) {
+    return contextualize(Status::kConflicts, "write intent");
+  }
   ASSIGN_OR_RETURN(PageRef, page,
                    txn.GetPageManager()->GetPage(new_pos.page_id));
   if (page.IsNull()) {
@@ -494,17 +505,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   txn.DebugSetPhase("rowpage-update");
   std::string serialized_row(row.Size(), '\0');
   row.Serialize(serialized_row.data());
-  // Pre-acquire the write intent BEFORE latching the target page (the same
-  // protocol Table::Delete already follows): RowPage::Update's internal
-  // AddWriteSet then short-circuits on the write-set entry, so a genuine
-  // same-row conflict parks LATCH-FREE here. Waiting latched used to hold
-  // the page content latch for the whole intent wait -- which blocked the
-  // conflicting owner's abort undo (it needs that latch) and manufactured
-  // the multi-second write-intent escape-hatch stalls the detector cannot
-  // see (the latch edge is not in the wait-for graph).
-  if (!txn.AddWriteSet(new_pos)) {
-    return Status::kConflicts;
-  }
   // Best-effort compensations: a failed index mutation must not leave applied
   // entries behind (old keys deleted / new keys partially inserted).
   const auto reinstate_old_keys = [&](size_t count, const RowPosition& at) {
@@ -588,7 +588,9 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       page.PageUnlock();
       reinstate_old_keys(deleted, pos);
       const Status restore_status = restore_physical_row();
-      return restore_status == Status::kSuccess ? failure : restore_status;
+      return contextualize(
+          restore_status == Status::kSuccess ? failure : restore_status,
+          "in-place index update");
     }
     size_t inserted = 0;
     // Release the in-place page's exclusive latch BEFORE the insert loop:
@@ -611,25 +613,54 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       undo_index_inserts(inserted);
       reinstate_old_keys(indexes_.size(), pos);
       const Status restore_status = restore_physical_row();
-      return restore_status == Status::kSuccess ? failure : restore_status;
+      return contextualize(
+          restore_status == Status::kSuccess ? failure : restore_status,
+          "in-place index update");
     }
     return new_pos;
   }
   if (s != Status::kNoSpace) {
-    return s;
+    return contextualize(s, "in-place row write");
   }
   // PRODUCTION RESTRUCTURE: reserve the relocation target BEFORE deleting
   // the original row.  The old delete-first ordering compensated failures by
   // rewriting the old image, but RowPage::Update cannot resurrect a deleted
   // (empty) slot, so every failed relocation silently destroyed the row.
   // With reserve-first, a failure leaves the row untouched at pos.
+  // Use the same owner-visible append cursor as INSERT. Walking from the
+  // source row repeatedly scans the rest of a large table, and cannot heal
+  // a conservative catalog hint lying BEFORE that source after a restart.
+  // Only a walk beginning at the cached cursor can advance its expected-link
+  // proof all the way to the tail before reserving growth.
+  page.PageUnlock();
+  const page_id_t cached_tail =
+      page_manager->GetTableTailFor(txn.ID(), first_pid_, last_pid_);
+  ASSIGN_OR_RETURN(PageRef, target, page_manager->GetPage(cached_tail));
+  if (target.IsNull() && cached_tail != first_pid_) {
+    ASSIGN_OR_RETURN(PageRef, head, page_manager->GetPage(first_pid_));
+    target = std::move(head);
+  }
+  if (target.IsNull()) {
+    return contextualize(Status::kCorrupt, "relocation target");
+  }
+  page = std::move(target);
   for (;;) {
+    StatusOr<slot_t> inserted = page->Insert(txn, serialized_row);
+    if (inserted.HasValue()) {
+      new_pos = RowPosition(page->PageID(), inserted.Value());
+      page.PageUnlock();
+      break;
+    }
+    if (inserted.GetStatus() != Status::kNoSpace) {
+      return contextualize(inserted.GetStatus(), "relocation insert");
+    }
     const page_id_t predecessor = page->PageID();
     const page_id_t next_page = page->body.row_page.next_page_id_;
     if (next_page != 0) {
       const Status visible =
           page_manager->CheckTableTailPage(txn.ID(), first_pid_, next_page);
       if (visible == Status::kSuccess) {
+        page_manager->AdvanceTableTail(first_pid_, predecessor, next_page);
         ASSIGN_OR_RETURN(PageRef, next_ref, page_manager->GetPage(next_page));
         if (next_ref.IsNull()) {
           LOG(ERROR) << "table " << schema_.Name() << " chain page "
@@ -642,16 +673,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
           continue;
         }
         page = std::move(next_ref);
-        StatusOr<slot_t> next_pos = page->Insert(txn, serialized_row);
-        if (next_pos.HasValue()) {
-          new_pos.page_id = page->PageID();
-          new_pos.slot = next_pos.Value();
-          page.PageUnlock();
-          break;
-        }
-        if (next_pos.GetStatus() != Status::kNoSpace) {
-          return next_pos.GetStatus();
-        }
         continue;
       }
       page.PageUnlock();
@@ -667,8 +688,21 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
 
     page.PageUnlock();
-    RETURN_IF_FAIL(
-        page_manager->ReserveTableTail(txn, first_pid_, predecessor));
+    const Status reserved =
+        page_manager->ReserveTableTail(txn, first_pid_, predecessor);
+    if (reserved == Status::kConflicts && reserved.GetMessage().empty()) {
+      // A successor was published between the full-page observation and the
+      // reservation. As in INSERT, re-read the link; a timeout/cycle error
+      // has a message and remains a statement failure.
+      ASSIGN_OR_RETURN(PageRef, retry, page_manager->GetPage(predecessor));
+      if (retry.IsNull()) {
+        ASSIGN_OR_RETURN(PageRef, head, page_manager->GetPage(first_pid_));
+        retry = std::move(head);
+      }
+      page = std::move(retry);
+      continue;
+    }
+    RETURN_IF_FAIL(contextualize(reserved, "tail reservation"));
     StatusOr<PageRef> retry_result = page_manager->GetPage(predecessor);
     if (!retry_result.HasValue()) {
       page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
@@ -695,10 +729,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     if (!new_slot.HasValue()) {
       page_manager->DestroyPage(txn, new_page.get());
       page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
-      return new_slot.GetStatus();
+      return contextualize(new_slot.GetStatus(), "new tail insert");
     }
     new_pos = RowPosition(new_page->PageID(), new_slot.Value());
-    RETURN_IF_FAIL(LinkReservedTableTail(txn, page, new_page));
+    RETURN_IF_FAIL(contextualize(LinkReservedTableTail(txn, page, new_page),
+                                 "tail publication"));
     new_page.PageUnlock();
     page.PageUnlock();
     break;
@@ -728,7 +763,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                : copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
     reinstate_old_keys(deleted, pos);
-    return failure;
+    return contextualize(failure, "relocation index update");
   }
   ASSIGN_OR_RETURN(PageRef, source_page,
                    txn.GetPageManager()->GetPage(pos.page_id));
@@ -748,7 +783,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                : copy_page->Delete(txn, new_pos.slot));
     copy_page.PageUnlock();
     reinstate_old_keys(indexes_.size(), pos);
-    return delete_status;
+    return contextualize(delete_status, "relocation source delete");
   }
   size_t inserted = 0;
   for (; inserted < indexes_.size(); ++inserted) {
@@ -763,7 +798,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // original keys at the relocated position.
     undo_index_inserts(inserted);
     reinstate_old_keys(indexes_.size(), new_pos);
-    return failure;
+    return contextualize(failure, "relocation index update");
   }
   return new_pos;
 }
@@ -1051,7 +1086,7 @@ Status Table::IndexDeleteGuarded(Transaction& txn, const Index& idx,
     }
     return Status::kSuccess;
   }
-  txn.MarkIndexKeysChanged(idx.Root());
+  txn.MarkIndexKeysChanged(idx.Root(), key);
   // Rows whose key bears a NULL were inserted through the multi-value list
   // encoding (see IndexInsert); deleting them must read that list, not the
   // single-value image, or the stale entry keeps blocking scans.
@@ -1101,6 +1136,25 @@ Iterator Table::BeginMorselScan(
   return Iterator(owned.release());
 }
 
+std::shared_ptr<const LSTableStore> Table::GetLSTableStore() const {
+  if (incarnation_state_ == nullptr) {
+    return nullptr;
+  }
+  return std::static_pointer_cast<const LSTableStore>(
+      incarnation_state_->GetLSTableStoreRaw());
+}
+
+void Table::SetLSTableStore(std::shared_ptr<const LSTableStore> store) const {
+  if (incarnation_state_ != nullptr) {
+    incarnation_state_->SetLSTableStoreRaw(std::move(store));
+  }
+}
+
+std::shared_ptr<const LSTableStore> Table::RebuildLSTableStore(
+    Transaction& txn) const {
+  return BuildLSTableStore(txn, *this);
+}
+
 std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
     Transaction& txn, size_t pages_per_morsel) const {
   StatusOr<TableLease> lease = AcquireLease(txn.ID());
@@ -1108,6 +1162,34 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
     return {};
   }
   pages_per_morsel = std::max<size_t>(1, pages_per_morsel);
+  if (txn.IsReadOnly() && !txn.IsFailed() && !RowsRewrittenInPlace()) {
+    std::shared_ptr<const LSTableStore> store =
+        GetOrBuildLSTableStore(txn, *this, /*allow_lazy_build=*/false);
+    if (store != nullptr && !store->page_ids.empty()) {
+      bool clean = true;
+      if (txn.HasAnyPageVersionChains()) {
+        for (const page_id_t pid : store->page_ids) {
+          if (txn.HasPageVersionChains(pid)) {
+            clean = false;
+            break;
+          }
+        }
+      }
+      if (clean && store->layout_generation == LayoutGeneration()) {
+        std::vector<ScanMorsel> morsels;
+        morsels.reserve((store->page_ids.size() + pages_per_morsel - 1) /
+                        pages_per_morsel);
+        for (const page_id_t pid : store->page_ids) {
+          if (morsels.empty() || morsels.back().size() == pages_per_morsel) {
+            morsels.emplace_back();
+            morsels.back().reserve(pages_per_morsel);
+          }
+          morsels.back().push_back(pid);
+        }
+        return morsels;
+      }
+    }
+  }
   std::vector<ScanMorsel> morsels;
   page_id_t page_id = first_pid_;
   std::unordered_set<page_id_t> visited;
@@ -1155,6 +1237,137 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
     page_id = next_page;
   }
   return morsels;
+}
+
+std::shared_ptr<const Table::IntegerKeyCounts> Table::TryReadIntegerKeyCounts(
+    Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
+    int64_t minimum, size_t span) const {
+  return ReadIntegerKeyCounts(txn, morsels, column, minimum, span, false);
+}
+
+std::shared_ptr<const Table::IntegerKeyCounts>
+Table::FindCachedIntegerKeyCounts(Transaction& txn, slot_t column,
+                                  int64_t minimum, size_t span) const {
+  return ReadIntegerKeyCounts(txn, {}, column, minimum, span, true);
+}
+
+std::shared_ptr<const Table::IntegerKeyCounts> Table::ReadIntegerKeyCounts(
+    Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
+    int64_t minimum, size_t span, bool cached_pages_only) const {
+  // This is an exact physical projection, never an optimizer estimate. Just
+  // like FullScanIterator's physical path, every page must have no MVCC
+  // chains while its content latch is held. A stable layout generation
+  // rejects a mutation crossing the pass; page LSNs also cover runtime undo.
+  constexpr size_t kCacheBytes = 1024 * 1024;
+  if (!txn.IsReadOnly() || txn.IsFailed() || !incarnation_state_ || span == 0 ||
+      span > 65536 ||
+      static_cast<__int128_t>(minimum) + span - 1 >
+          std::numeric_limits<int64_t>::max() ||
+      column >= schema_.ColumnCount() ||
+      schema_.GetColumn(column).Type() != ValueType::kInt64 ||
+      schema_.GetColumn(column).IsUnsigned())
+    return nullptr;
+  auto lease = AcquireLease(txn.ID());
+  if (!lease.HasValue()) return nullptr;
+  size_t pages = 0;
+  for (const auto& morsel : morsels) {
+    if (morsel.size() >
+        kCacheBytes / sizeof(std::pair<page_id_t, lsn_t>) - pages)
+      return nullptr;
+    pages += morsel.size();
+  }
+  if (pages * sizeof(std::pair<page_id_t, lsn_t>) + span * sizeof(uint64_t) >
+      kCacheBytes)
+    return nullptr;
+  struct Cache {
+    std::weak_ptr<TableIncarnation> owner;
+    uint64_t generation{};
+    page_id_t head{};
+    slot_t column{};
+    int64_t minimum{};
+    size_t span{};
+    std::vector<std::pair<page_id_t, lsn_t>> stamps;
+    std::shared_ptr<const IntegerKeyCounts> counts;
+  };
+  // One entry per caller thread. Replacing a table/domain drops the old
+  // entry; no SQL text, dimension payload, or query result is retained.
+  thread_local Cache cache;
+  const uint64_t generation = LayoutGeneration();
+  const bool matching =
+      cache.counts && cache.owner.lock() == incarnation_state_ &&
+      cache.generation == generation && cache.head == first_pid_ &&
+      cache.column == column && cache.minimum == minimum && cache.span == span;
+  if (cached_pages_only) {
+    if (!matching) return nullptr;
+    page_id_t expected = first_pid_;
+    for (const auto& [pid, lsn] : cache.stamps) {
+      if (pid != expected) return nullptr;
+      auto page = txn.GetPageManager()->GetPage(pid, true);
+      if (!page.HasValue() || page.Value().IsNull() ||
+          page.Value()->Type() != PageType::kRowPage ||
+          txn.HasPageVersionChains(pid))
+        return nullptr;
+      if (page.Value()->PageLSN() != lsn) {
+        cache.counts.reset();
+        return nullptr;
+      }
+      expected = page.Value()->body.row_page.next_page_id_;
+    }
+    if (expected != 0 || generation != LayoutGeneration() || txn.IsFailed())
+      return nullptr;
+    return cache.counts;
+  }
+  const bool hit = matching && cache.stamps.size() == pages;
+  auto counts = hit ? nullptr : std::make_shared<IntegerKeyCounts>();
+  if (counts) counts->counts.assign(span, 0);
+  std::vector<std::pair<page_id_t, lsn_t>> stamps;
+  if (!hit) stamps.reserve(pages);
+  size_t index = 0;
+  page_id_t expected_page = first_pid_;
+  Row row;
+  const std::vector<slot_t> projection{column};
+  for (const auto& morsel : morsels) {
+    for (page_id_t pid : morsel) {
+      auto ref = txn.GetPageManager()->GetPage(pid, true);
+      if (!ref.HasValue() || ref.Value().IsNull() ||
+          ref.Value()->Type() != PageType::kRowPage ||
+          txn.HasPageVersionChains(pid))
+        return nullptr;
+      const Page& page = *ref.Value();
+      if (pid != expected_page) return nullptr;
+      expected_page = page.body.row_page.next_page_id_;
+      if (hit) {
+        if (cache.stamps[index++] != std::pair{pid, page.PageLSN()}) {
+          cache.counts.reset();
+          return nullptr;
+        }
+        continue;
+      }
+      stamps.emplace_back(pid, page.PageLSN());
+      const RowPage& rows = page.body.row_page;
+      for (slot_t slot = 0; slot < rows.RowMax(); ++slot) {
+        const std::string_view image = rows.GetRow(slot);
+        if (image.empty()) continue;
+        const auto decoded =
+            row.TryDeserializeProjected(image.data(), schema_, projection);
+        if (!decoded.HasValue() || decoded.Value() > image.size() ||
+            row.Count() != 1)
+          return nullptr;
+        ++counts->rows;
+        if (row[0].IsNull()) continue;
+        const uint64_t offset = static_cast<uint64_t>(row[0].value.int_value) -
+                                static_cast<uint64_t>(minimum);
+        if (offset < span) ++counts->counts[offset];
+      }
+    }
+  }
+  if (expected_page != 0 || generation == 0 ||
+      generation != LayoutGeneration() || txn.IsFailed())
+    return nullptr;
+  if (hit) return cache.counts;
+  cache = {incarnation_state_, generation, first_pid_, column, minimum, span,
+           std::move(stamps),  counts};
+  return counts;
 }
 
 Iterator Table::BeginIndexScan(Transaction& txn, const Index& index,
@@ -1215,6 +1428,7 @@ std::ostream& operator<<(std::ostream& o, const Table& t) {
 
 Decoder& operator>>(Decoder& d, Table& t) {
   d >> t.schema_ >> t.first_pid_ >> t.last_pid_ >> t.indexes_;
+  t.incarnation_ = 0;
   if (!d.AtEnd()) {
     d >> t.incarnation_;
   }

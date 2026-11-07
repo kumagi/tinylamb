@@ -10,8 +10,12 @@
 #include <poll.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigset_t APIs
 #include <signal.h>
+#include <spawn.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -20,6 +24,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -49,6 +54,34 @@ constexpr std::chrono::seconds kNegativeCacheTtl{1};
 // Hard bound for one parse round trip; a stuck or flooded child is killed
 // instead of blocking the worker forever (§7.2).
 constexpr std::chrono::seconds kParseTimeout{5};
+
+size_t MaxCachedStatementsPerShard() {
+  static const size_t kPerShard = []() -> size_t {
+    if (const char* env = std::getenv("TINYLAMB_PARSE_CACHE_SIZE")) {
+      char* end = nullptr;
+      const unsigned long long val = std::strtoull(env, &end, 10);
+      if (val >= kParseCacheShards && end != nullptr && *end == '\0') {
+        return static_cast<size_t>(val / kParseCacheShards);
+      }
+    }
+    return kMaxCachedStatementsPerShard;
+  }();
+  return kPerShard;
+}
+
+std::chrono::seconds NegativeCacheTtlSeconds() {
+  static const std::chrono::seconds kTtl = []() {
+    if (const char* env = std::getenv("TINYLAMB_NEGATIVE_CACHE_TTL_SEC")) {
+      char* end = nullptr;
+      const long val = std::strtol(env, &end, 10);
+      if (val > 0 && end != nullptr && *end == '\0') {
+        return std::chrono::seconds(val);
+      }
+    }
+    return kNegativeCacheTtl;
+  }();
+  return kTtl;
+}
 
 // Tests that exercise EINTR retry on multi-MB inputs under sanitizer
 // slowdown need a larger round-trip budget than the production default.
@@ -104,6 +137,59 @@ class BlockedSigPipe {
   sigset_t old_{};
 };
 
+// Optional Unix-domain socket fast-path for a pre-warmed GoogleSQL parser
+// zygote (TINYLAMB_GOOGLESQL_ZYGOTE_SOCK). Passes (stdin_fd, stdout_fd) via
+// SCM_RIGHTS and returns the connected socket fd (which will yield a 1-byte
+// exit status when the parse finishes), or -1 to fall back to posix_spawn.
+int TryConnectZygote(int stdin_fd, int stdout_fd) {
+  const char* sock_path = std::getenv("TINYLAMB_GOOGLESQL_ZYGOTE_SOCK");
+  if (sock_path == nullptr || *sock_path == '\0') {
+    return -1;
+  }
+  const int sock = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (sock < 0) {
+    return -1;
+  }
+  struct sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  if (std::strlen(sock_path) >= sizeof(addr.sun_path)) {
+    ::close(sock);
+    return -1;
+  }
+  std::strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+  if (::connect(sock, reinterpret_cast<const struct sockaddr*>(&addr),
+                sizeof(addr)) != 0) {
+    ::close(sock);
+    return -1;
+  }
+  std::array<int, 2> pass_fds = {stdin_fd, stdout_fd};
+  char payload = 'x';
+  struct iovec iov{};
+  iov.iov_base = &payload;
+  iov.iov_len = 1;
+  alignas(struct cmsghdr) std::array<char, CMSG_SPACE(sizeof(pass_fds))>
+      cmsg_buf{};
+  struct msghdr msg{};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cmsg_buf.data();
+  msg.msg_controllen = cmsg_buf.size();
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(pass_fds));
+  std::memcpy(CMSG_DATA(cmsg), pass_fds.data(), sizeof(pass_fds));
+  ssize_t sent = -1;
+  do {
+    sent = ::sendmsg(sock, &msg, MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  if (sent <= 0) {
+    ::close(sock);
+    return -1;
+  }
+  return sock;
+}
+
 GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
@@ -125,31 +211,72 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
             .error = "cannot create GoogleSQL pipe: " + reason};
   }
 
-  const pid_t child = fork();
-  if (child < 0) {
-    const std::string reason(std::strerror(errno));
-    CloseAll(input_pipe);
-    CloseAll(output_pipe);
-    return {
-        .ok = false, .ast = {}, .error = "cannot start GoogleSQL: " + reason};
-  }
-  if (child == 0) {
-    dup2(input_pipe[0], STDIN_FILENO);
-    dup2(output_pipe[1], STDOUT_FILENO);
-    dup2(output_pipe[1], STDERR_FILENO);
-    CloseAll(input_pipe);
-    CloseAll(output_pipe);
-    execl(TINYLAMB_GOOGLESQL_EXECUTABLE, TINYLAMB_GOOGLESQL_EXECUTABLE,
-          "--mode=parse", "-", static_cast<char*>(nullptr));
-    _exit(127);
+  BlockedSigPipe blocked_sigpipe;
+  const int zygote_sock = TryConnectZygote(input_pipe[0], output_pipe[1]);
+  pid_t child = -1;
+  if (zygote_sock < 0) {
+    if (input_pipe[0] > STDERR_FILENO && output_pipe[1] > STDERR_FILENO) {
+      posix_spawn_file_actions_t actions{};
+      int spawn_err = posix_spawn_file_actions_init(&actions);
+      if (spawn_err == 0) {
+        spawn_err = posix_spawn_file_actions_adddup2(&actions, input_pipe[0],
+                                                     STDIN_FILENO);
+        if (spawn_err == 0) {
+          spawn_err = posix_spawn_file_actions_adddup2(&actions, output_pipe[1],
+                                                       STDOUT_FILENO);
+        }
+        if (spawn_err == 0) {
+          spawn_err = posix_spawn_file_actions_adddup2(&actions, output_pipe[1],
+                                                       STDERR_FILENO);
+        }
+        if (spawn_err == 0) {
+          char arg0[] = TINYLAMB_GOOGLESQL_EXECUTABLE;
+          char arg1[] = "--mode=parse";
+          char arg2[] = "-";
+          char* const argv[] = {arg0, arg1, arg2, nullptr};
+          spawn_err = posix_spawn(&child, TINYLAMB_GOOGLESQL_EXECUTABLE,
+                                  &actions, nullptr, argv, environ);
+        }
+        posix_spawn_file_actions_destroy(&actions);
+      }
+      if (spawn_err != 0) {
+        const std::string reason(std::strerror(spawn_err));
+        CloseAll(input_pipe);
+        CloseAll(output_pipe);
+        return {.ok = false,
+                .ast = {},
+                .error = "cannot start GoogleSQL: " + reason};
+      }
+    } else {
+      child = fork();
+      if (child < 0) {
+        const std::string reason(std::strerror(errno));
+        CloseAll(input_pipe);
+        CloseAll(output_pipe);
+        return {.ok = false,
+                .ast = {},
+                .error = "cannot start GoogleSQL: " + reason};
+      }
+      if (child == 0) {
+        dup2(input_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        CloseAll(input_pipe);
+        CloseAll(output_pipe);
+        execl(TINYLAMB_GOOGLESQL_EXECUTABLE, TINYLAMB_GOOGLESQL_EXECUTABLE,
+              "--mode=parse", "-", static_cast<char*>(nullptr));
+        _exit(127);
+      }
+    }
   }
 
   close(input_pipe[0]);
+  input_pipe[0] = -1;
   close(output_pipe[1]);
+  output_pipe[1] = -1;
 
   const auto deadline =
       std::chrono::steady_clock::now() + ParseTimeoutSeconds();
-  BlockedSigPipe blocked_sigpipe;
   bool input_open = true;
   bool output_open = true;
   size_t written = 0;
@@ -167,6 +294,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     // POLLOUT event will ever fire.
     if (input_open && written >= sql.size()) {
       close(input_pipe[1]);
+      input_pipe[1] = -1;
       input_open = false;
     }
     const int timeout_ms = static_cast<int>(
@@ -174,11 +302,13 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
             std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
             std::chrono::milliseconds(100))
             .count());
+    // Pass fd = -1 for closed endpoints so poll() ignores them instead of
+    // returning immediately with POLLNVAL and busy-spinning in kernel space.
     std::array<pollfd, 2> fds{};
-    fds[0] = {.fd = output_pipe[0],
+    fds[0] = {.fd = output_open ? output_pipe[0] : -1,
               .events = static_cast<short>(output_open ? POLLIN : 0),
               .revents = 0};
-    fds[1] = {.fd = input_pipe[1],
+    fds[1] = {.fd = (input_open && written < sql.size()) ? input_pipe[1] : -1,
               .events = static_cast<short>(
                   input_open && written < sql.size() ? POLLOUT : 0),
               .revents = 0};
@@ -193,49 +323,112 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
       continue;
     }
 
-    if (output_open && (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-      std::array<char, 4096> buffer{};
-      // Blocking syscalls under the caller's parse-cache shard mutex are the
-      // documented per-shard miss serialization; every syscall here is
-      // poll-driven with a deadline, so the critical section stays bounded.
-      // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
-      const ssize_t count = read(output_pipe[0], buffer.data(), buffer.size());
-      if (count > 0) {
-        output.append(buffer.data(), static_cast<size_t>(count));
-        if (output.size() > kMaxChildOutputBytes) {
+    if (output_open &&
+        (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+      if ((fds[0].revents & POLLNVAL) != 0) {
+        output_pipe[0] = -1;
+        output_open = false;
+      } else {
+        std::array<char, 4096> buffer{};
+        // Blocking syscalls under the caller's parse-cache shard mutex are the
+        // documented per-shard miss serialization; every syscall here is
+        // poll-driven with a deadline, so the critical section stays bounded.
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
+        const ssize_t count =
+            read(output_pipe[0], buffer.data(), buffer.size());
+        if (count > 0) {
+          output.append(buffer.data(), static_cast<size_t>(count));
+          if (output.size() > kMaxChildOutputBytes) {
+            close(output_pipe[0]);
+            output_pipe[0] = -1;
+            output_open = false;
+          }
+        } else if (count == 0 || (errno != EINTR && errno != EAGAIN &&
+                                  errno != EWOULDBLOCK)) {
           close(output_pipe[0]);
+          output_pipe[0] = -1;
           output_open = false;
         }
-      } else if (count == 0 ||
-                 (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        close(output_pipe[0]);
-        output_open = false;
       }
     }
 
     if (input_open && written < sql.size() &&
-        (fds[1].revents & (POLLOUT | POLLHUP | POLLERR)) != 0) {
-      const ssize_t count =
-          write(input_pipe[1], sql.data() + written, sql.size() - written);
-      if (count >= 0) {
-        written += static_cast<size_t>(count);
-      } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-        // EPIPE: the child died early; stop feeding it.
-        close(input_pipe[1]);
+        (fds[1].revents & (POLLOUT | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+      if ((fds[1].revents & POLLNVAL) != 0) {
+        input_pipe[1] = -1;
         input_open = false;
+      } else {
+        const ssize_t count =
+            write(input_pipe[1], sql.data() + written, sql.size() - written);
+        if (count >= 0) {
+          written += static_cast<size_t>(count);
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+          // EPIPE: the child died early; stop feeding it.
+          close(input_pipe[1]);
+          input_pipe[1] = -1;
+          input_open = false;
+        }
       }
     }
   }
-  if (output_open) {
+  if (output_open && output_pipe[0] >= 0) {
     close(output_pipe[0]);
   }
-  if (input_open) {
+  if (input_open && input_pipe[1] >= 0) {
     close(input_pipe[1]);
+  }
+
+  if (zygote_sock >= 0) {
+    uint8_t exit_code = 1;
+    bool got_status = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto remaining = deadline - std::chrono::steady_clock::now();
+      const int timeout_ms = std::max(
+          1, static_cast<int>(
+                 std::min<std::chrono::milliseconds>(
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         remaining),
+                     std::chrono::milliseconds(100))
+                     .count()));
+      pollfd pfd{.fd = zygote_sock, .events = POLLIN, .revents = 0};
+      const int r = ::poll(&pfd, 1, timeout_ms);
+      if (r < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        break;
+      }
+      if (r == 0) {
+        continue;
+      }
+      // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
+      const ssize_t n = ::read(zygote_sock, &exit_code, 1);
+      if (n == 1) {
+        got_status = true;
+        break;
+      }
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    ::close(zygote_sock);
+    if (!got_status) {
+      GoogleSqlParseResult timed_out;
+      timed_out.ok = false;
+      timed_out.error = "GoogleSQL parser timed out";
+      return timed_out;
+    }
+    if (exit_code != 0 || output.starts_with("ERROR:")) {
+      return {.ok = false, .ast = {}, .error = std::move(output)};
+    }
+    return {.ok = true, .ast = std::move(output), .error = {}};
   }
 
   // Reap the child with a deadline; escalate to SIGKILL on overrun.
   int status = 0;
   bool reaped = false;
+  std::chrono::microseconds poll_backoff{50};
   while (std::chrono::steady_clock::now() < deadline) {
     const pid_t done = waitpid(
         child, &status, WNOHANG);  // NOLINT(misc-include-cleaner) glibc macro
@@ -246,7 +439,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
     if (done < 0 && errno == EINTR) {
       continue;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::this_thread::sleep_for(poll_backoff);
+    poll_backoff = std::min(poll_backoff * 2, std::chrono::microseconds(2000));
   }
   if (!reaped) {
     kill(child, SIGKILL);
@@ -886,11 +1080,224 @@ std::string NormalizeCaseInsensitiveLike(std::string_view sql) {
   return result;
 }
 
+std::string NormalizeCreateTableEngine(std::string_view sql) {
+  const std::string mask = MaskLiteralsAndComments(sql);
+  const std::string lower_mask = ToLowerCopy(mask);
+  const size_t n = lower_mask.size();
+  auto skip_ws = [&](size_t p) {
+    while (p < n && IsSqlSpace(lower_mask[p])) {
+      ++p;
+    }
+    return p;
+  };
+  auto read_word = [&](size_t p, std::string_view* out_word) -> size_t {
+    p = skip_ws(p);
+    if (p >= n || !IsIdentChar(lower_mask[p])) {
+      return std::string::npos;
+    }
+    const size_t start = p;
+    while (p < n && IsIdentChar(lower_mask[p])) {
+      ++p;
+    }
+    *out_word = std::string_view(lower_mask.data() + start, p - start);
+    return p;
+  };
+
+  size_t pos = 0;
+  std::string_view word;
+  pos = read_word(pos, &word);
+  if (pos == std::string::npos || word != "create") {
+    return std::string(sql);
+  }
+  while (true) {
+    size_t next = read_word(pos, &word);
+    if (next == std::string::npos) {
+      return std::string(sql);
+    }
+    pos = next;
+    if (word == "or" || word == "replace" || word == "temp" ||
+        word == "temporary") {
+      continue;
+    }
+    break;
+  }
+  if (word != "table") {
+    return std::string(sql);
+  }
+  // Skip optional IF NOT EXISTS and table name path.
+  pos = skip_ws(pos);
+  {
+    size_t probe = pos;
+    std::string_view w1;
+    std::string_view w2;
+    std::string_view w3;
+    size_t p1 = read_word(probe, &w1);
+    if (p1 != std::string::npos && w1 == "function") {
+      return std::string(sql);
+    }
+    if (p1 != std::string::npos && w1 == "if") {
+      size_t p2 = read_word(p1, &w2);
+      size_t p3 =
+          p2 != std::string::npos ? read_word(p2, &w3) : std::string::npos;
+      if (p3 != std::string::npos && w2 == "not" && w3 == "exists") {
+        pos = p3;
+      }
+    }
+  }
+  pos = skip_ws(pos);
+  // Advance past table path (ident, backtick-quoted ident, or dotted path).
+  while (pos < n) {
+    if (sql[pos] == '`') {
+      ++pos;
+      while (pos < n && sql[pos] != '`') {
+        ++pos;
+      }
+      if (pos < n) {
+        ++pos;
+      }
+    } else if (IsIdentChar(lower_mask[pos])) {
+      while (pos < n && IsIdentChar(lower_mask[pos])) {
+        ++pos;
+      }
+    } else {
+      break;
+    }
+    pos = skip_ws(pos);
+    if (pos < n && lower_mask[pos] == '.') {
+      ++pos;
+      pos = skip_ws(pos);
+      continue;
+    }
+    break;
+  }
+  pos = skip_ws(pos);
+  // Optional column definition list `(...)`.
+  if (pos < n && lower_mask[pos] == '(') {
+    int depth = 0;
+    while (pos < n) {
+      if (lower_mask[pos] == '(') {
+        ++depth;
+      } else if (lower_mask[pos] == ')') {
+        --depth;
+        if (depth == 0) {
+          ++pos;
+          break;
+        }
+      }
+      ++pos;
+    }
+  }
+  pos = skip_ws(pos);
+  if (pos >= n) {
+    return std::string(sql);
+  }
+
+  auto extract_token_value = [&](size_t p, std::string* out_val,
+                                 size_t* out_end) -> bool {
+    while (p < n && IsSqlSpace(sql[p])) {
+      ++p;
+    }
+    if (p >= n) {
+      return false;
+    }
+    if (sql[p] == '\'' || sql[p] == '"') {
+      const char quote = sql[p];
+      const size_t val_start = p + 1;
+      ++p;
+      while (p < n && sql[p] != quote) {
+        if (sql[p] == '\\' && p + 1 < n) {
+          p += 2;
+          continue;
+        }
+        ++p;
+      }
+      if (p >= n) {
+        return false;
+      }
+      *out_val = std::string(sql.substr(val_start, p - val_start));
+      *out_end = p + 1;
+      return true;
+    }
+    if (IsIdentChar(sql[p])) {
+      const size_t val_start = p;
+      while (p < n && IsIdentChar(sql[p])) {
+        ++p;
+      }
+      *out_val = std::string(sql.substr(val_start, p - val_start));
+      *out_end = p;
+      return true;
+    }
+    return false;
+  };
+
+  const size_t clause_start = pos;
+  std::string_view kw;
+  const size_t after_kw = read_word(pos, &kw);
+  if (after_kw == std::string::npos) {
+    return std::string(sql);
+  }
+  if (kw == "using") {
+    std::string engine_val;
+    size_t clause_end = 0;
+    if (extract_token_value(after_kw, &engine_val, &clause_end)) {
+      std::string out(sql.substr(0, clause_start));
+      out += "OPTIONS (engine = '";
+      out += engine_val;
+      out += "')";
+      out += sql.substr(clause_end);
+      return out;
+    }
+  } else if (kw == "engine" || kw == "storage_engine") {
+    size_t p = skip_ws(after_kw);
+    if (p < n && lower_mask[p] == '=') {
+      ++p;
+    }
+    std::string engine_val;
+    size_t clause_end = 0;
+    if (extract_token_value(p, &engine_val, &clause_end)) {
+      std::string out(sql.substr(0, clause_start));
+      out += "OPTIONS (engine = '";
+      out += engine_val;
+      out += "')";
+      out += sql.substr(clause_end);
+      return out;
+    }
+  } else if (kw == "with" || kw == "options") {
+    size_t p = skip_ws(after_kw);
+    if (p < n && lower_mask[p] == '(') {
+      ++p;
+      std::string_view opt_key;
+      size_t after_key = read_word(p, &opt_key);
+      if (after_key != std::string::npos &&
+          (opt_key == "engine" || opt_key == "storage_engine")) {
+        size_t eq_pos = skip_ws(after_key);
+        if (eq_pos < n && lower_mask[eq_pos] == '=') {
+          ++eq_pos;
+          std::string engine_val;
+          size_t val_end = 0;
+          if (extract_token_value(eq_pos, &engine_val, &val_end)) {
+            size_t close_pos = skip_ws(val_end);
+            if (close_pos < n && lower_mask[close_pos] == ')') {
+              std::string out(sql.substr(0, clause_start));
+              out += "OPTIONS (engine = '";
+              out += engine_val;
+              out += "')";
+              out += sql.substr(close_pos + 1);
+              return out;
+            }
+          }
+        }
+      }
+    }
+  }
+  return std::string(sql);
+}
+
 }  // namespace
 
 GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
-  std::string current_sql =
-      NormalizeCaseInsensitiveLike(NormalizeGroupByDistinct(sql));
+  std::string current_sql = NormalizeCreateTableEngine(
+      NormalizeCaseInsensitiveLike(NormalizeGroupByDistinct(sql)));
 
   size_t dist_start = 0;
   size_t dist_end = 0;
@@ -1028,6 +1435,8 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
   const std::string cache_key(sql);
   ParseShard& shard = ShardFor(cache_key);
   std::scoped_lock cache_lock(shard.mutex);
+  const size_t max_per_shard = MaxCachedStatementsPerShard();
+  const auto neg_ttl = NegativeCacheTtlSeconds();
   const auto now = std::chrono::steady_clock::now();
   {
     const auto cached = shard.cache.find(cache_key);
@@ -1036,7 +1445,7 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
     }
     const auto failed = shard.negative_cache.find(cache_key);
     if (failed != shard.negative_cache.end()) {
-      if (now - failed->second < kNegativeCacheTtl) {
+      if (now - failed->second < neg_ttl) {
         return {.ok = false,
                 .ast = {},
                 .error = "GoogleSQL parse failed (recently cached)"};
@@ -1047,7 +1456,7 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
 
   GoogleSqlParseResult parsed = ParseViaSubprocess(sql);
   if (parsed.ok) {
-    if (shard.cache.size() >= kMaxCachedStatementsPerShard) {
+    if (shard.cache.size() >= max_per_shard) {
       // unordered_map iteration order is unspecified, so this evicts an
       // ARBITRARY entry, deliberately not the oldest: entries are equally
       // likely to be re-parsed in OLTP bursts and a true LRU/FIFO list
@@ -1058,7 +1467,7 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
     shard.cache.emplace(cache_key, parsed.ast);
     shard.negative_cache.erase(cache_key);
   } else {
-    if (shard.negative_cache.size() >= kMaxCachedStatementsPerShard) {
+    if (shard.negative_cache.size() >= max_per_shard) {
       shard.negative_cache.erase(shard.negative_cache.begin());
     }
     shard.negative_cache.insert_or_assign(cache_key,

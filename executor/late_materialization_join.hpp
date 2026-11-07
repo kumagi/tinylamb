@@ -43,7 +43,6 @@ class LateMaterializationJoin final : public ExecutorBase {
   LateMaterializationJoin& operator=(LateMaterializationJoin&&) = delete;
   ~LateMaterializationJoin() override;
 
-  bool Next(Row* destination, RowPosition* position) override;
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& output, int indent) const override;
@@ -67,6 +66,7 @@ class LateMaterializationJoin final : public ExecutorBase {
     Row key;
   };
 
+  bool NextRow(Row* destination, RowPosition* position);
   bool Validate();
   bool LoadNextIdentity();
   bool LoadEquiCandidates(const Row& left_row);
