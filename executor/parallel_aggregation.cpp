@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/extended_float.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -44,12 +45,12 @@ namespace {
 
 // Long-double conversion mirroring the ground-truth accumulator: numeric
 // values convert, anything else raises like the serial path's ToLongDouble.
-StatusOr<long double> StatInputToLongDouble(const Value& value) {
+StatusOr<platform::ExtendedFloat> StatInputToLongDouble(const Value& value) {
   if (value.type == ValueType::kDouble) {
-    return static_cast<long double>(value.value.double_value);
+    return static_cast<platform::ExtendedFloat>(value.value.double_value);
   }
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-    return static_cast<long double>(value.value.int_value);
+    return static_cast<platform::ExtendedFloat>(value.value.int_value);
   }
   return StatusError(StatusCode::kInvalidArgument, "numeric value required");
 }
@@ -1227,11 +1228,11 @@ Status ParallelAggregationExecutor::AccumulateStatColumns(
   const std::vector<double>* trailing_doubles =
       trailing != nullptr && trailing_is_double ? &trailing->DoubleData()
                                                 : nullptr;
-  long double& sx = state->stat_sx[aggregate_index];
-  long double& sxx = state->stat_sxx[aggregate_index];
-  long double& sy = state->stat_sy[aggregate_index];
-  long double& syy = state->stat_syy[aggregate_index];
-  long double& sxy = state->stat_sxy[aggregate_index];
+  platform::ExtendedFloat& sx = state->stat_sx[aggregate_index];
+  platform::ExtendedFloat& sxx = state->stat_sxx[aggregate_index];
+  platform::ExtendedFloat& sy = state->stat_sy[aggregate_index];
+  platform::ExtendedFloat& syy = state->stat_syy[aggregate_index];
+  platform::ExtendedFloat& sxy = state->stat_sxy[aggregate_index];
   int64_t& count = state->counts[aggregate_index];
   for (size_t row = 0; row < child.Size(); ++row) {
     if (child.IsNull(row)) {
@@ -1241,19 +1242,20 @@ Status ParallelAggregationExecutor::AccumulateStatColumns(
       // Paired-row semantics: rows where either side is NULL are skipped.
       continue;
     }
-    const long double y = child_is_double
-                              ? static_cast<long double>((*child_doubles)[row])
-                              : static_cast<long double>((*child_ints)[row]);
+    const platform::ExtendedFloat y =
+        child_is_double
+            ? static_cast<platform::ExtendedFloat>((*child_doubles)[row])
+            : static_cast<platform::ExtendedFloat>((*child_ints)[row]);
     if (trailing == nullptr) {
       // Single-input forms (VAR_* / STDDEV_*) fold into the x slot exactly
       // like the ground-truth accumulator.
       sx += y;
       sxx += y * y;
     } else {
-      const long double x =
+      const platform::ExtendedFloat x =
           trailing_is_double
-              ? static_cast<long double>((*trailing_doubles)[row])
-              : static_cast<long double>((*trailing_ints)[row]);
+              ? static_cast<platform::ExtendedFloat>((*trailing_doubles)[row])
+              : static_cast<platform::ExtendedFloat>((*trailing_ints)[row]);
       sy += y;
       syy += y * y;
       sx += x;
@@ -1286,14 +1288,15 @@ Status ParallelAggregationExecutor::AccumulateStatValue(
       return Status::kSuccess;
     }
   }
-  ASSIGN_OR_RETURN(long double, y, (StatInputToLongDouble(value)));
-  long double& sx = state->stat_sx[aggregate_index];
-  long double& sxx = state->stat_sxx[aggregate_index];
-  long double& sy = state->stat_sy[aggregate_index];
-  long double& syy = state->stat_syy[aggregate_index];
-  long double& sxy = state->stat_sxy[aggregate_index];
+  ASSIGN_OR_RETURN(platform::ExtendedFloat, y, (StatInputToLongDouble(value)));
+  platform::ExtendedFloat& sx = state->stat_sx[aggregate_index];
+  platform::ExtendedFloat& sxx = state->stat_sxx[aggregate_index];
+  platform::ExtendedFloat& sy = state->stat_sy[aggregate_index];
+  platform::ExtendedFloat& syy = state->stat_syy[aggregate_index];
+  platform::ExtendedFloat& sxy = state->stat_sxy[aggregate_index];
   if (two_input) {
-    ASSIGN_OR_RETURN(long double, x, (StatInputToLongDouble(other)));
+    ASSIGN_OR_RETURN(platform::ExtendedFloat, x,
+                     (StatInputToLongDouble(other)));
     sy += y;
     syy += y * y;
     sx += x;
@@ -1431,73 +1434,73 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
   // expression so both execution paths agree bit for bit.
   const AggregationType type =
       aggregates_[index].expression->AsAggregateExpression().GetType();
-  const long double sx = state.stat_sx[index];
-  const long double sxx = state.stat_sxx[index];
-  const long double sy = state.stat_sy[index];
-  const long double syy = state.stat_syy[index];
-  const long double sxy = state.stat_sxy[index];
+  const platform::ExtendedFloat sx = state.stat_sx[index];
+  const platform::ExtendedFloat sxx = state.stat_sxx[index];
+  const platform::ExtendedFloat sy = state.stat_sy[index];
+  const platform::ExtendedFloat syy = state.stat_syy[index];
+  const platform::ExtendedFloat sxy = state.stat_sxy[index];
   const int64_t count = state.counts[index];
   switch (type) {
     case AggregationType::kVarPop: {
       if (count == 0) {
         return {};
       }
-      const long double mean = sx / count;
-      const long double ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat mean = sx / count;
+      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / count));
     }
     case AggregationType::kVarSamp: {
       if (count < 2) {
         return {};
       }
-      const long double mean = sx / count;
-      const long double ssd = sxx - (count * mean * mean);
+      const platform::ExtendedFloat mean = sx / count;
+      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / (count - 1)));
     }
     case AggregationType::kStddevPop: {
       if (count == 0) {
         return {};
       }
-      const long double mean = sx / count;
-      const long double ssd = sxx - (count * mean * mean);
-      return Value(static_cast<double>(std::sqrt(ssd / count)));
+      const platform::ExtendedFloat mean = sx / count;
+      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(platform::Sqrt(ssd / count)));
     }
     case AggregationType::kStddevSamp: {
       if (count < 2) {
         return {};
       }
-      const long double mean = sx / count;
-      const long double ssd = sxx - (count * mean * mean);
-      return Value(static_cast<double>(std::sqrt(ssd / (count - 1))));
+      const platform::ExtendedFloat mean = sx / count;
+      const platform::ExtendedFloat ssd = sxx - (count * mean * mean);
+      return Value(static_cast<double>(platform::Sqrt(ssd / (count - 1))));
     }
     case AggregationType::kCovarPop: {
       if (count == 0) {
         return {};
       }
-      const long double mx = sx / count;
-      const long double my = sy / count;
-      const long double sdd = sxy - (count * mx * my);
+      const platform::ExtendedFloat mx = sx / count;
+      const platform::ExtendedFloat my = sy / count;
+      const platform::ExtendedFloat sdd = sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / count));
     }
     case AggregationType::kCovarSamp: {
       if (count < 2) {
         return {};
       }
-      const long double mx = sx / count;
-      const long double my = sy / count;
-      const long double sdd = sxy - (count * mx * my);
+      const platform::ExtendedFloat mx = sx / count;
+      const platform::ExtendedFloat my = sy / count;
+      const platform::ExtendedFloat sdd = sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / (count - 1)));
     }
     case AggregationType::kCorr: {
       if (count < 2) {
         return {};
       }
-      const long double mx = sx / count;
-      const long double my = sy / count;
-      const long double sdd = sxy - (count * mx * my);
-      const long double vx = sxx - (count * mx * mx);
-      const long double vy = syy - (count * my * my);
-      return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
+      const platform::ExtendedFloat mx = sx / count;
+      const platform::ExtendedFloat my = sy / count;
+      const platform::ExtendedFloat sdd = sxy - (count * mx * my);
+      const platform::ExtendedFloat vx = sxx - (count * mx * mx);
+      const platform::ExtendedFloat vy = syy - (count * my * my);
+      return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }
     case AggregationType::kRegrCount:
       return Value(count);
@@ -1513,11 +1516,11 @@ Value ParallelAggregationExecutor::FinalizeStat(const PartialState& state,
         return {};
       }
       // x is the trailing argument, y the child: Σx lives in sx.
-      const long double mx = sx / count;
-      const long double my = sy / count;
-      const long double reg_sxy = sxy - (count * mx * my);
-      const long double reg_sxx = sxx - (count * mx * mx);
-      const long double reg_syy = syy - (count * my * my);
+      const platform::ExtendedFloat mx = sx / count;
+      const platform::ExtendedFloat my = sy / count;
+      const platform::ExtendedFloat reg_sxy = sxy - (count * mx * my);
+      const platform::ExtendedFloat reg_sxx = sxx - (count * mx * mx);
+      const platform::ExtendedFloat reg_syy = syy - (count * my * my);
       switch (type) {
         case AggregationType::kRegrAvgX:
           return Value(static_cast<double>(mx));

@@ -3,10 +3,9 @@
 #include "server/postgres_server.hpp"
 
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
-#include <bits/pthreadtypes.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigaction/sigemptyset
 #include <signal.h>
 #include <sys/poll.h>
@@ -24,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/socket.hpp"
 #include "common/random_string.hpp"
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
@@ -40,8 +40,8 @@ namespace {
 bool SendAll(int fd, const std::string& bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
-    const ssize_t sent =
-        send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+    const ssize_t sent = platform::SendNoSignal(fd, bytes.data() + offset,
+                                                bytes.size() - offset);
     if (sent <= 0) {
       return false;
     }
@@ -100,7 +100,7 @@ std::string QueryMessage(const std::string& sql) {
 }
 
 int ConnectClient(uint16_t port) {
-  const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   if (client < 0) {
     return -1;
   }
@@ -175,7 +175,7 @@ TEST(PostgresServerTest, ExecutesQueriesOverTcpProtocol) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -308,7 +308,7 @@ TEST(PostgresServerTest, TransactionsOverTcpProtocol) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -395,7 +395,7 @@ TEST(PostgresServerTest, SingleMessageImplicitBlockRollsBackWithControl) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -620,7 +620,7 @@ TEST(PostgresServerTest, StartupPacketVariants) {
     StopGuard stop_guard{&server};
 
     auto ConnectRaw = [&]() {
-      const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
       if (client < 0) {
         return -1;
       }
@@ -1050,7 +1050,7 @@ TEST(PostgresServerTest, InvalidStartupPacketLength) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1104,7 +1104,7 @@ TEST(PostgresServerTest, MalformedStartupPacketWithoutTerminator) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -1186,7 +1186,7 @@ TEST(PostgresServerTest, ServerDestructorClosesLiveClients) {
 
 TEST(PostgresServerTest, ListenFailsWhenPortAlreadyInUse) {
   const std::string path = "postgres_server_bindfail_test-" + RandomString();
-  const int conflict = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int conflict = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   ASSERT_GE(conflict, 0);
   const int enabled = 1;
   setsockopt(conflict, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
@@ -1563,7 +1563,7 @@ TEST(PostgresServerTest, QueueAppendsAfterPartialWrite) {
     // Connect with a tiny receive window so the server cannot write a large
     // reply in one pass and must keep output pending.
     auto ConnectSmallWindow = [&]() {
-      const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
       if (client < 0) {
         return -1;
       }
@@ -2066,7 +2066,7 @@ TEST(PostgresServerTest, DisconnectDuringLargeResponse) {
     // Act -- a client with a tiny receive buffer asks for a wide projection of
     // the whole table (several MB) and then disconnects before reading.  The
     // server's send must fail cleanly instead of crashing or hanging.
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     const int receive_buffer = 4096;
     setsockopt(client, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
@@ -2126,7 +2126,7 @@ TEST(PostgresServerTest, ClientResetForcesRecvError) {
     // Act -- a client declares a startup packet larger than it sends and then
     // closes with SO_LINGER, forcing an RST.  The server's next recv fails
     // with ECONNRESET and must drop the client without taking the server down.
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     linger reset{.l_onoff = 1, .l_linger = 0};
     setsockopt(client, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
@@ -2230,7 +2230,7 @@ TEST(PostgresServerTest, GssEncRequestDeclinedThenNormalStartup) {
     std::jthread server_thread([&] { run_result = server.Run(&run_error); });
     StopGuard stop_guard{&server};
 
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     ASSERT_GE(client, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/random.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/cast_expression.hpp"
@@ -51,9 +52,7 @@ struct TypedExpr {
 class Gen {
  public:
   explicit Gen(std::mt19937& rng) : rng_(rng) {}
-  int Pick(int lo, int hi) {
-    return std::uniform_int_distribution<int>(lo, hi)(rng_);
-  }
+  int Pick(int lo, int hi) { return platform::UniformInt<int>(rng_, lo, hi); }
   bool Chance(int percent) { return Pick(1, 100) <= percent; }
 
  private:

@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -29,9 +30,7 @@ constexpr int64_t kNullRepr = INT64_MIN;
 class Gen {
  public:
   explicit Gen(std::mt19937& rng) : rng_(rng) {}
-  int Pick(int lo, int hi) {
-    return std::uniform_int_distribution<int>(lo, hi)(rng_);
-  }
+  int Pick(int lo, int hi) { return platform::UniformInt<int>(rng_, lo, hi); }
   bool Chance(int percent) { return Pick(1, 100) <= percent; }
 
  private:

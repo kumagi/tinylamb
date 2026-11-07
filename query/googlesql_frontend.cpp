@@ -5,7 +5,6 @@
 
 #include "query/googlesql_frontend.hpp"
 
-#include <bits/types/sigset_t.h>
 #include <fcntl.h>
 #include <poll.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigset_t APIs
@@ -36,13 +35,17 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/platform/os.hpp"
+#include "common/platform/process.hpp"
+#include "common/platform/socket.hpp"
+
 namespace tinylamb {
 namespace {
 
 // Everything in this anonymous namespace is only reachable when the external
 // GoogleSQL parser is wired in; guard the definitions themselves so builds
 // without TINYLAMB_GOOGLESQL_EXECUTABLE stay warning-clean.
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
 
 constexpr size_t kParseCacheShards = 16;
 constexpr size_t kMaxCachedStatements = 1024;
@@ -146,7 +149,7 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
   if (sock_path == nullptr || *sock_path == '\0') {
     return -1;
   }
-  const int sock = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int sock = platform::OpenSocket(AF_UNIX, SOCK_STREAM, 0, {});
   if (sock < 0) {
     return -1;
   }
@@ -181,7 +184,7 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
   std::memcpy(CMSG_DATA(cmsg), pass_fds.data(), sizeof(pass_fds));
   ssize_t sent = -1;
   do {
-    sent = ::sendmsg(sock, &msg, MSG_NOSIGNAL);
+    sent = platform::SendMsgNoSignal(sock, &msg);
   } while (sent < 0 && errno == EINTR);
   if (sent <= 0) {
     ::close(sock);
@@ -193,15 +196,16 @@ int TryConnectZygote(int stdin_fd, int stdout_fd) {
 GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   std::array<int, 2> input_pipe{};
   std::array<int, 2> output_pipe{};
-  // O_CLOEXEC keeps concurrent parses' descriptors out of the child; only
-  // the dup2'd std{in,out,err} survive exec.
-  if (pipe2(input_pipe.data(), O_CLOEXEC) != 0) {
+  // Close-on-exec (plus POSIX_SPAWN_CLOEXEC_DEFAULT where the platform cannot
+  // set it atomically) keeps concurrent parses' descriptors out of the child;
+  // only the dup2'd std{in,out,err} survive exec.
+  if (platform::OpenPipe(input_pipe, {}) != 0) {
     return {.ok = false,
             .ast = {},
             .error = std::string("cannot create GoogleSQL pipe: ") +
                      std::strerror(errno)};
   }
-  if (pipe2(output_pipe.data(), O_CLOEXEC) != 0) {
+  if (platform::OpenPipe(output_pipe, {}) != 0) {
     const std::string reason(errno == EMFILE || errno == ENFILE
                                  ? std::string("too many open files")
                                  : std::strerror(errno));
@@ -234,8 +238,14 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
           char arg1[] = "--mode=parse";
           char arg2[] = "-";
           char* const argv[] = {arg0, arg1, arg2, nullptr};
-          spawn_err = posix_spawn(&child, TINYLAMB_GOOGLESQL_EXECUTABLE,
-                                  &actions, nullptr, argv, environ);
+          posix_spawnattr_t attributes{};
+          spawn_err = platform::InitSpawnAttributes(&attributes);
+          if (spawn_err == 0) {
+            spawn_err =
+                posix_spawn(&child, TINYLAMB_GOOGLESQL_EXECUTABLE, &actions,
+                            &attributes, argv, platform::Environment());
+            posix_spawnattr_destroy(&attributes);
+          }
         }
         posix_spawn_file_actions_destroy(&actions);
       }
@@ -1413,12 +1423,12 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
   return ParseRawSubprocess(current_sql);
 }
 
-#endif  // TINYLAMB_GOOGLESQL_EXECUTABLE && defined(__unix__)
+#endif  // TINYLAMB_GOOGLESQL_EXECUTABLE && defined(TINYLAMB_OS_POSIX)
 
 }  // namespace
 
 bool GoogleSqlFrontend::Available() {
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
   return access(TINYLAMB_GOOGLESQL_EXECUTABLE, X_OK) == 0;
 #else
   return false;
@@ -1426,7 +1436,7 @@ bool GoogleSqlFrontend::Available() {
 }
 
 GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(__unix__)
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
   // The parser is an external process. Sharded caches avoid a single global
   // reader/writer lock on OLTP parse bursts; the shard lock is deliberately
   // HELD across a cache-miss parse so a burst of distinct statements

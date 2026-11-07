@@ -25,7 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "common/env_endian.hpp"
+#include "common/platform/endian.hpp"
 #include "table/workload/workload.hpp"
 
 namespace tinylamb {

@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -648,10 +649,9 @@ std::string SubstituteIdentifiers(const std::string& sql,
       bool substituted = false;
       for (const std::string& table : meta.tables) {
         if (token == table && !meta.tables.empty()) {
-          if (std::uniform_int_distribution<size_t>(0, 2)(rng) == 0) {
-            std::uniform_int_distribution<size_t> pick(0,
-                                                       meta.tables.size() - 1);
-            out += meta.tables[pick(rng)];
+          if (platform::UniformInt<size_t>(rng, 0, 2) == 0) {
+            out += meta.tables[platform::UniformInt<size_t>(
+                rng, 0, meta.tables.size() - 1)];
             substituted = true;
           }
           break;
@@ -662,17 +662,16 @@ std::string SubstituteIdentifiers(const std::string& sql,
           if (token != col.name) {
             continue;
           }
-          if (std::uniform_int_distribution<size_t>(0, 2)(rng) != 0) {
+          if (platform::UniformInt<size_t>(rng, 0, 2) != 0) {
             break;
           }
-          const bool same_table =
-              std::uniform_int_distribution<int>(0, 1)(rng) == 0;
+          const bool same_table = platform::UniformInt<int>(rng, 0, 1) == 0;
           const std::vector<const ColumnMeta*> candidates =
               meta.ColumnsOfType(col.type, rng, same_table, col.table);
           if (!candidates.empty()) {
-            std::uniform_int_distribution<size_t> pick(0,
-                                                       candidates.size() - 1);
-            out += candidates[pick(rng)]->name;
+            out += candidates[platform::UniformInt<size_t>(
+                                  rng, 0, candidates.size() - 1)]
+                       ->name;
             substituted = true;
           }
           break;
@@ -857,13 +856,13 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
 
   // 1. Reshuffle: merge two random seed cases and shuffle their statements.
   const auto& pool = SeedPool();
-  std::uniform_int_distribution<size_t> pick_case(0, pool.size() - 1);
   std::vector<std::string> statements;
   for (size_t side = 0; side < 2; ++side) {
-    const std::vector<std::string>& src = pool[pick_case(rng)];
+    const std::vector<std::string>& src =
+        pool[platform::UniformInt<size_t>(rng, 0, pool.size() - 1)];
     statements.insert(statements.end(), src.begin(), src.end());
   }
-  std::shuffle(statements.begin(), statements.end(), rng);
+  platform::Shuffle(statements.begin(), statements.end(), rng);
 
   ScopedDb db_holder("griffin_fuzz");
   if (db_holder.get() == nullptr) {

@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -423,25 +424,23 @@ std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
 
   // Random rows per seed
   for (int r = 0; r < 8; ++r) {
-    const int pick_i = std::uniform_int_distribution<int>(0, 100)(rng);
-    const int pick_f = std::uniform_int_distribution<int>(0, 100)(rng);
-    const int pick_b = std::uniform_int_distribution<int>(0, 100)(rng);
-    const int pick_s = std::uniform_int_distribution<int>(0, 100)(rng);
+    const int pick_i = platform::UniformInt<int>(rng, 0, 100);
+    const int pick_f = platform::UniformInt<int>(rng, 0, 100);
+    const int pick_b = platform::UniformInt<int>(rng, 0, 100);
+    const int pick_s = platform::UniformInt<int>(rng, 0, 100);
 
     std::optional<int64_t> i_v =
-        (pick_i < 20)
-            ? std::nullopt
-            : std::optional<int64_t>(
-                  std::uniform_int_distribution<int64_t>(-50, 50)(rng));
-    std::optional<double> f_v =
-        (pick_f < 20)
-            ? std::nullopt
-            : std::optional<double>(
-                  std::uniform_int_distribution<int>(-50, 50)(rng) / 10.0);
-    std::optional<int64_t> b_v =
-        (pick_b < 20) ? std::nullopt
+        (pick_i < 20) ? std::nullopt
                       : std::optional<int64_t>(
-                            std::uniform_int_distribution<int>(0, 1)(rng));
+                            platform::UniformInt<int64_t>(rng, -50, 50));
+    std::optional<double> f_v =
+        (pick_f < 20) ? std::nullopt
+                      : std::optional<double>(
+                            platform::UniformInt<int>(rng, -50, 50) / 10.0);
+    std::optional<int64_t> b_v =
+        (pick_b < 20)
+            ? std::nullopt
+            : std::optional<int64_t>(platform::UniformInt<int>(rng, 0, 1));
     std::optional<std::string> s_v =
         (pick_s < 20)
             ? std::nullopt
@@ -455,7 +454,7 @@ std::pair<Schema, std::vector<Row>> BuildRowFuzzDataset(std::mt19937& rng) {
 RowGenPred GenRowPred(std::mt19937& rng, int depth = 0,
                       const ExprGenConfig& config = {}) {
   auto pick = [&](int lo, int hi) {
-    return std::uniform_int_distribution<int>(lo, hi)(rng);
+    return platform::UniformInt<int>(rng, lo, hi);
   };
 
   if (depth >= 2 || pick(0, 10) < 4) {

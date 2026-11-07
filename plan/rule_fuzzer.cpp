@@ -15,10 +15,11 @@
 #include <random>
 #include <string>
 #include <string_view>
-#include <syncstream>
 #include <thread>
 #include <vector>
 
+#include "common/platform/random.hpp"
+#include "common/platform/synced_stream.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -621,7 +622,7 @@ void Worker(int thread_id, uint64_t base_seed, bool trace_cases,
          std::chrono::steady_clock::now() < deadline) {
     const auto pass = static_cast<uint32_t>(rng() % 9);
     if (trace_cases) {
-      std::osyncstream(std::cerr)
+      platform::SyncedOStream(std::cerr)
           << "[case] worker=" << thread_id << " iteration=" << iteration
           << " pass=" << pass << '\n';
     }
@@ -672,7 +673,7 @@ void Worker(int thread_id, uint64_t base_seed, bool trace_cases,
       if (all_rules.size() > 5) {
         const size_t num_to_drop =
             1 + (rng() % std::min<size_t>(10, all_rules.size() - 5));
-        std::shuffle(all_rules.begin(), all_rules.end(), memo_rng);
+        platform::Shuffle(all_rules.begin(), all_rules.end(), memo_rng);
         for (size_t i = 0; i < num_to_drop; ++i) {
           rules.Remove(all_rules[i]);
         }

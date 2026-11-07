@@ -40,6 +40,7 @@
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "page/page.hpp"
@@ -1041,7 +1042,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
     }
     written += static_cast<size_t>(n);
   }
-  if (::fdatasync(lock_fd_) != 0) {
+  if (platform::DataSync(lock_fd_) != 0) {
     return StatusError(
         StatusCode::kIOError,
         "fdatasync failed on checkpoint: " + std::string(std::strerror(errno)));

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -491,9 +492,7 @@ RPredPtr CopyPred(const RPred& p) {
 class Gen {
  public:
   explicit Gen(std::mt19937& rng) : rng_(rng) {}
-  int Pick(int lo, int hi) {
-    return std::uniform_int_distribution<int>(lo, hi)(rng_);
-  }
+  int Pick(int lo, int hi) { return platform::UniformInt<int>(rng_, lo, hi); }
   bool Chance(int percent) { return Pick(1, 100) <= percent; }
   const std::string& PickFrom(const std::vector<std::string>& v) {
     return v[static_cast<size_t>(Pick(0, static_cast<int>(v.size()) - 1))];
@@ -2137,8 +2136,8 @@ int OracleSession::SelectFlavour(int flavour_count) {
   if (rewards_.size() != static_cast<size_t>(flavour_count)) {
     rewards_.assign(static_cast<size_t>(flavour_count), 1);
   }
-  if (std::uniform_int_distribution<int>(1, 10)(rng_) <= 2) {
-    return std::uniform_int_distribution<int>(0, flavour_count - 1)(rng_);
+  if (platform::UniformInt<int>(rng_, 1, 10) <= 2) {
+    return platform::UniformInt<int>(rng_, 0, flavour_count - 1);
   }
   int best = 0;
   for (int i = 1; i < flavour_count; ++i) {
@@ -2179,8 +2178,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // fresh database could otherwise replay a plan compiled for a previous
   // iteration's database.
   const std::string tab =
-      "t" +
-      std::to_string(std::uniform_int_distribution<int64_t>(0, INT32_MAX)(rng));
+      "t" + std::to_string(platform::UniformInt<int64_t>(rng, 0, INT32_MAX));
   t.table = tab;
   t.setup.push_back("CREATE TABLE " + tab +
                     " (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));");
@@ -3669,8 +3667,7 @@ std::string RunAmoebaIteration(std::mt19937& rng, bool verbose) {
   Database& db = *sdb;
   TransactionContext ctx = db.BeginContext();
   const std::string tab =
-      "t" +
-      std::to_string(std::uniform_int_distribution<int64_t>(0, INT32_MAX)(rng));
+      "t" + std::to_string(platform::UniformInt<int64_t>(rng, 0, INT32_MAX));
   if (!RunUpdate(db, ctx,
                  "CREATE TABLE " + tab +
                      " (u INT64, a INT64, b INT64, flag BOOL, s "

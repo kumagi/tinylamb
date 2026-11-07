@@ -272,7 +272,19 @@ tinylamb_add_layer(tinylamb_common
         common/log_message.cpp
         common/encoder.cpp
         common/decoder.cpp
-        common/runtime_filter.cpp)
+        common/runtime_filter.cpp
+        common/platform/cpu_affinity.cpp
+        common/platform/event_poller.cpp
+        common/platform/file_io.cpp
+        common/platform/process.cpp
+        common/platform/socket.cpp
+        common/platform/time_format.cpp
+        common/platform/time_zone.cpp)
+if(APPLE)
+    # common/platform/time_zone.cpp: Apple's libc++ ships no C++20 tzdb, so
+    # zone lookups go through CFTimeZone.
+    target_link_libraries(tinylamb_common PUBLIC "-framework CoreFoundation")
+endif()
 
 # Layer 2: type system.
 tinylamb_add_layer(tinylamb_type
@@ -512,9 +524,16 @@ tinylamb_add_layer(tinylamb_executor
 # Aggregate target preserving tinylamb::core backward compatibility.
 add_library(tinylamb_core INTERFACE)
 add_library(tinylamb::core ALIAS tinylamb_core)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24" AND
+   (CMAKE_CXX_LINK_GROUP_USING_RESCAN_SUPPORTED OR
+    CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED))
     target_link_libraries(tinylamb_core INTERFACE
             "$<LINK_GROUP:RESCAN,${TINYLAMB_LAYER_LIBS}>"
+            Threads::Threads)
+elseif(APPLE)
+    # ld64 rescans static archives on its own and rejects --start-group.
+    target_link_libraries(tinylamb_core INTERFACE
+            ${TINYLAMB_LAYER_LIBS}
             Threads::Threads)
 else()
     target_link_libraries(tinylamb_core INTERFACE
@@ -614,20 +633,15 @@ target_include_directories(
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
 
-# postgres_server.cpp uses Linux-only APIs (epoll/eventfd/accept4); the
-# standalone server executable is therefore not built on macOS.
-if(NOT APPLE)
 add_executable(tinylamb_server server/postgres_server_main.cpp)
 tinylamb_apply_options(tinylamb_server)
 target_link_libraries(tinylamb_server PRIVATE tinylamb::postgres_server)
-endif()
 
 
 add_executable(tinylamb_tpcc_benchmark benchmark/tpcc_benchmark.cpp)
 tinylamb_apply_options(tinylamb_tpcc_benchmark)
 target_link_libraries(tinylamb_tpcc_benchmark PRIVATE tinylamb::tpcc)
 
-if(NOT APPLE)
 add_executable(tinylamb_tpcc_tcp_benchmark EXCLUDE_FROM_ALL benchmark/tpcc_tcp_benchmark.cpp)
 tinylamb_apply_options(tinylamb_tpcc_tcp_benchmark)
 target_link_libraries(tinylamb_tpcc_tcp_benchmark PRIVATE tinylamb::tpcc)
@@ -645,7 +659,6 @@ if(TINYLAMB_TPCC_MYSQL)
     target_include_directories(tinylamb_tpcc_three_benchmark PRIVATE
             ${TINYLAMB_MYSQL_INCLUDE_DIR} ${TINYLAMB_MYSQL_INCLUDE_DIR}/..)
     target_link_libraries(tinylamb_tpcc_three_benchmark PRIVATE ${TINYLAMB_MYSQL_LIBRARY})
-endif()
 endif()
 
 # TPC-H DBGEN is an executable build dependency of the benchmark only.  It is
@@ -687,7 +700,8 @@ target_link_libraries(tinylamb_tpcds_benchmark PRIVATE tinylamb::sql)
 add_executable(tinylamb_pg_read_benchmark
         benchmark/pg_read_benchmark.cpp)
 tinylamb_apply_options(tinylamb_pg_read_benchmark)
-target_link_libraries(tinylamb_pg_read_benchmark PRIVATE Threads::Threads)
+target_link_libraries(tinylamb_pg_read_benchmark PRIVATE tinylamb::common
+        Threads::Threads)
 
 add_executable(tinylamb_expression_jit_benchmark EXCLUDE_FROM_ALL
         benchmark/expression_jit_benchmark.cpp)
@@ -792,18 +806,26 @@ if(BUILD_TESTING)
              "TINYLAMB_JOIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/join_regressions")
         list(APPEND _test_env
              "TINYLAMB_GRIFFIN_REGRESSION_DIR=${CMAKE_SOURCE_DIR}/query/testdata/griffin_regressions")
+        # Test listing runs right after each link. The 5 s default is too
+        # tight under a fully parallel build, and on macOS the first launch of
+        # a freshly linked (LLVM-sized) binary also waits for the system's
+        # executable scan.
         if(SIMPLE_TEST_TIMEOUT)
-            gtest_discover_tests(${target_name} PROPERTIES
+            gtest_discover_tests(${target_name}
+                                 DISCOVERY_TIMEOUT 120
+                                 PROPERTIES
                                  ENVIRONMENT "${_test_env}"
                                  TIMEOUT ${SIMPLE_TEST_TIMEOUT})
         else()
-            gtest_discover_tests(${target_name} PROPERTIES ENVIRONMENT
-                                                           "${_test_env}")
+            gtest_discover_tests(${target_name}
+                                 DISCOVERY_TIMEOUT 120
+                                 PROPERTIES ENVIRONMENT "${_test_env}")
         endif()
     endfunction()
 
 add_simple_test(common/log_message_test.cpp)
 add_simple_test(common/crc32c_test.cpp)
+add_simple_test(common/platform/platform_test.cpp)
 add_simple_test(common/serdes_test.cpp)
 add_simple_test(common/string_util_test.cpp)
 add_simple_test(common/runtime_filter_test.cpp)

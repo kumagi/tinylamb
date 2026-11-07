@@ -24,6 +24,8 @@
 #include <thread>
 #include <vector>
 
+#include "common/platform/socket.hpp"
+
 namespace {
 
 struct Options {
@@ -55,8 +57,8 @@ uint32_t ReadUint32(std::string_view input, size_t offset) {
 bool SendAll(int fd, const std::string& bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
-    const ssize_t sent =
-        send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+    const ssize_t sent = tinylamb::platform::SendNoSignal(
+        fd, bytes.data() + offset, bytes.size() - offset);
     if (sent > 0) {
       offset += static_cast<size_t>(sent);
       continue;
@@ -132,7 +134,7 @@ std::string QueryMessage(std::string_view query) {
 }
 
 int Connect(const Options& options) {
-  const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int fd = tinylamb::platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   if (fd < 0) {
     return -1;
   }

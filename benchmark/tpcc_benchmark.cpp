@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
         const uint64_t sql_invocations =
             tinylamb::SqlEngine::ThreadExecutionCount() - sql_before;
         result.sql_statements =
-            std::max(result.sql_statements, sql_invocations);
+            std::max<uint64_t>(result.sql_statements, sql_invocations);
         const auto elapsed = Clock::now() - before;
         TypeStats& stats = worker_stats[static_cast<size_t>(worker)]
                                .types[static_cast<size_t>(type)];

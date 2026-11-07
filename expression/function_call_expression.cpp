@@ -60,6 +60,8 @@
 #include "common/constants.hpp"
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
+#include "common/platform/time_format.hpp"
+#include "common/platform/time_zone.hpp"
 #include "common/regex_guard.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
@@ -283,29 +285,17 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   if (zone_name == "NZ-CHAT") {
     zone_name = "Pacific/Chatham";
   }
-  try {
-    const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone != nullptr) {
-      int y = (ct != nullptr) ? ct->year : 2000;
-      int mon = (ct != nullptr) ? ct->month : 1;
-      int d = (ct != nullptr) ? ct->day : 1;
-      int h = (ct != nullptr) ? ct->hour : 0;
-      int min = (ct != nullptr) ? ct->minute : 0;
-      int s = (ct != nullptr) ? ct->second : 0;
-      y = std::max(y, 1970);
-      std::chrono::year_month_day ymd{
-          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
-          std::chrono::day{static_cast<unsigned>(d)}};
-      std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{min} +
-                    std::chrono::seconds{s};
-      auto loc_info = zone->get_info(loc_tp);
-      return static_cast<int>(loc_info.first.offset.count());
-    }
-  } catch (...) {
-    return default_offset;
-  }
-  return default_offset;
+  int y = (ct != nullptr) ? ct->year : 2000;
+  int mon = (ct != nullptr) ? ct->month : 1;
+  int d = (ct != nullptr) ? ct->day : 1;
+  int h = (ct != nullptr) ? ct->hour : 0;
+  int min = (ct != nullptr) ? ct->minute : 0;
+  int s = (ct != nullptr) ? ct->second : 0;
+  y = std::max(y, 1970);
+  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
+      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
+      min, s);
+  return offset.value_or(default_offset);
 }
 
 CivilTime ValueToCivilTime(const Value& val) {
@@ -3555,12 +3545,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     tm.tm_hour = ct.hour;
     tm.tm_min = ct.minute;
     tm.tm_sec = ct.second;
-    timegm(&tm);
+    platform::TimeGm(&tm);
     std::array<char, 128> buf{};
-    const auto format_time = static_cast<size_t (*)(
-        char*, size_t, const char*, const struct tm*) noexcept>(&std::strftime);
+    // %z/%Z render from the struct (UTC here), never the host's zone.
     const size_t formatted =
-        format_time(buf.data(), buf.size(), fmt.c_str(), &tm);
+        platform::FormatTime(buf.data(), buf.size(), fmt.c_str(), &tm);
     if (formatted == 0) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TIMESTAMP format produced no output: " + fmt);
@@ -3594,7 +3583,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     tm.tm_year = 100;
     tm.tm_mon = 0;
     tm.tm_mday = 1;
-    char* parsed_end = strptime(input.c_str(), fmt.c_str(), &tm);
+    const char* parsed_end =
+        platform::ParseTime(input.c_str(), fmt.c_str(), &tm);
     if (parsed_end == nullptr) {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP failed for: " + input);

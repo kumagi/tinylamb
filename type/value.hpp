@@ -23,8 +23,8 @@
 #include <memory>
 #include <vector>
 
-#include "common/env_endian.hpp"
 #include "common/exc_shim.hpp"
+#include "common/platform/endian.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
 #include "type/value_type.hpp"
@@ -552,11 +552,16 @@ class Value {
     return copy;
   }
 
+  // Initialized through the widest member so every byte is defined: `{0}`
+  // would set only the 8-byte int_value and leave half of the 16-byte
+  // string_view indeterminate. libstdc++ lays string_view out as {size, ptr}
+  // (so a NULL value happened to read as ""), libc++ as {ptr, size} (so it
+  // read a garbage length). int_value and double_value still read as 0.
   union {
     int64_t int_value;
     std::string_view varchar_value;
     double double_value;
-  } value{0};
+  } value{.varchar_value = std::string_view{}};
   ValueType type{ValueType::kNull};
   std::string owned_data;
   std::shared_ptr<ArrayPayload> array_;

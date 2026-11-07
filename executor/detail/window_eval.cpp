@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/extended_float.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -315,10 +316,10 @@ std::string ElementSqlTypeOf(const Value& value) {
 bool DistanceWithin(const Value& key, const Value& candidate, double off,
                     bool inclusive_le) {
   if (key.type == ValueType::kInt64 && candidate.type == ValueType::kInt64) {
-    const long double diff =
-        static_cast<long double>(key.value.int_value) -
-        static_cast<long double>(candidate.value.int_value);
-    const auto bound = static_cast<long double>(off);
+    const platform::ExtendedFloat diff =
+        static_cast<platform::ExtendedFloat>(key.value.int_value) -
+        static_cast<platform::ExtendedFloat>(candidate.value.int_value);
+    const auto bound = static_cast<platform::ExtendedFloat>(off);
     return inclusive_le ? diff <= bound : diff >= bound;
   }
   const double dk = NumericOf(key);
@@ -333,28 +334,28 @@ bool DistanceWithin(const Value& key, const Value& candidate, double off,
 bool CandidateAtMostKeyPlusOffset(const Value& candidate, const Value& key,
                                   double off) {
   const bool key_int = key.type == ValueType::kInt64;
-  const long double limit =
-      key_int ? static_cast<long double>(key.value.int_value) +
-                    static_cast<long double>(off)
-              : static_cast<long double>(NumericOf(key) + off);
-  const long double cand =
+  const platform::ExtendedFloat limit =
+      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) +
+                    static_cast<platform::ExtendedFloat>(off)
+              : static_cast<platform::ExtendedFloat>(NumericOf(key) + off);
+  const platform::ExtendedFloat cand =
       candidate.type == ValueType::kInt64
-          ? static_cast<long double>(candidate.value.int_value)
-          : static_cast<long double>(NumericOf(candidate));
+          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
+          : static_cast<platform::ExtendedFloat>(NumericOf(candidate));
   return cand <= limit;
 }
 
 bool CandidateAtLeastKeyMinusOffset(const Value& candidate, const Value& key,
                                     double off) {
   const bool key_int = key.type == ValueType::kInt64;
-  const long double limit =
-      key_int ? static_cast<long double>(key.value.int_value) -
-                    static_cast<long double>(off)
-              : static_cast<long double>(NumericOf(key) - off);
-  const long double cand =
+  const platform::ExtendedFloat limit =
+      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) -
+                    static_cast<platform::ExtendedFloat>(off)
+              : static_cast<platform::ExtendedFloat>(NumericOf(key) - off);
+  const platform::ExtendedFloat cand =
       candidate.type == ValueType::kInt64
-          ? static_cast<long double>(candidate.value.int_value)
-          : static_cast<long double>(NumericOf(candidate));
+          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
+          : static_cast<platform::ExtendedFloat>(NumericOf(candidate));
   return cand >= limit;
 }
 struct WindowRuntime {
@@ -916,23 +917,27 @@ struct WindowRuntime {
           }
           const double off = opt_bound->numeric;
           const bool key_int = key.type == ValueType::kInt64;
-          const long double asc_limit =
-              key_int ? static_cast<long double>(key.value.int_value) -
-                            static_cast<long double>(off)
-                      : static_cast<long double>(NumericOf(key) - off);
-          const long double desc_limit =
-              key_int ? static_cast<long double>(key.value.int_value) +
-                            static_cast<long double>(off)
-                      : static_cast<long double>(NumericOf(key) + off);
+          const platform::ExtendedFloat asc_limit =
+              key_int
+                  ? static_cast<platform::ExtendedFloat>(key.value.int_value) -
+                        static_cast<platform::ExtendedFloat>(off)
+                  : static_cast<platform::ExtendedFloat>(NumericOf(key) - off);
+          const platform::ExtendedFloat desc_limit =
+              key_int
+                  ? static_cast<platform::ExtendedFloat>(key.value.int_value) +
+                        static_cast<platform::ExtendedFloat>(off)
+                  : static_cast<platform::ExtendedFloat>(NumericOf(key) + off);
           for (size_t j = 0; j <= position; ++j) {
             const Value& candidate = order_values[j][0];
             if (candidate.IsNull()) {
               continue;
             }
-            const long double cand =
+            const platform::ExtendedFloat cand =
                 candidate.type == ValueType::kInt64
-                    ? static_cast<long double>(candidate.value.int_value)
-                    : static_cast<long double>(NumericOf(candidate));
+                    ? static_cast<platform::ExtendedFloat>(
+                          candidate.value.int_value)
+                    : static_cast<platform::ExtendedFloat>(
+                          NumericOf(candidate));
             if (asc ? cand <= asc_limit : cand >= desc_limit) {
               reached = j;
             }

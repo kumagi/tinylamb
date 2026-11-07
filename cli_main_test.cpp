@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 
+#include "common/platform/process.hpp"
 #include "gtest/gtest.h"
 
 namespace {
@@ -61,14 +62,12 @@ class CliMainTest : public ::testing::Test {
 
  private:
   static std::filesystem::path BinaryPath(std::string_view name) {
-    std::array<char, 4096> self{};
-    const ssize_t len =
-        ::readlink("/proc/self/exe", self.data(), self.size() - 1);
-    if (len <= 0) {
+    const std::filesystem::path self =
+        tinylamb::platform::CurrentExecutablePath();
+    if (self.empty()) {
       return {name};
     }
-    self[static_cast<size_t>(len)] = '\0';
-    return std::filesystem::path(self.data()).parent_path() / name;
+    return self.parent_path() / name;
   }
 
   static void ReadFile(const std::filesystem::path& path, std::string* out) {

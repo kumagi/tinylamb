@@ -41,6 +41,7 @@
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/serdes.hpp"
 
 namespace tinylamb {
@@ -72,19 +73,7 @@ StatusOr<int> CreateFile(const std::filesystem::path& path) {
 
 // fdatasync (F_FULLFSYNC on macOS) with EINTR retry. The caller must check
 // the result: silently skipping a sync would break the durability guarantee.
-int FdataSync(int fd) {
-  int rc = 0;
-#ifdef __APPLE__
-  do {
-    rc = ::fcntl(fd, F_FULLFSYNC);
-  } while (rc < 0 && errno == EINTR);
-#else
-  do {
-    rc = ::fdatasync(fd);
-  } while (rc < 0 && errno == EINTR);
-#endif
-  return rc;
-}
+int FdataSync(int fd) { return platform::DataSync(fd); }
 
 int OpenDirForSync(const std::filesystem::path& dir) {
   return ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
@@ -182,17 +171,9 @@ int InitializeFixedFile(int fd, uint64_t index, size_t size, size_t end,
     return -1;
   }
   const off_t physical_size = static_cast<off_t>(size + kTailBytes);
-#ifdef __linux__
-  int allocated = 0;
-  do {
-    allocated = ::posix_fallocate(fd, 0, physical_size);
-  } while (allocated == EINTR);
-  if (allocated != 0 && allocated != EOPNOTSUPP && allocated != ENOSYS &&
-      allocated != EINVAL) {
-    errno = allocated;
+  if (platform::Preallocate(fd, physical_size) != 0) {
     return -1;
   }
-#endif
   // ftruncate also repairs an explicitly forced overlong frame. It never
   // alters the data prefix [0, size); logical truncation only changes slots.
   if (::ftruncate(fd, physical_size) != 0) {
@@ -1312,7 +1293,9 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
   if (before == 0) {
     return;
   }
-#ifdef POSIX_FADV_DONTNEED
+  if constexpr (!platform::kSupportsAdviseDontNeed) {
+    return;
+  }
   // Drop [0, before) from page cache across the segment files: those bytes
   // are now safe to discard because the checkpoint that anchored them has
   // been durably committed to the master record. Without this hint fdatasync
@@ -1353,15 +1336,12 @@ void Logger::AdviseOldBytesDurable(lsn_t before) const {
     const lsn_t advise_to =
         std::min<lsn_t>(segment_start + segment_size_, before);
     if (advise_to > advise_from) {
-      ::posix_fadvise(fd, static_cast<off_t>(advise_from - segment_start),
-                      static_cast<off_t>(advise_to - advise_from),
-                      POSIX_FADV_DONTNEED);
+      platform::AdviseDontNeed(fd,
+                               static_cast<off_t>(advise_from - segment_start),
+                               static_cast<off_t>(advise_to - advise_from));
     }
     ::close(fd);
   }
-#else
-  (void)before;
-#endif
 }
 
 void Logger::SetRecycleBoundaryValidator(std::function<bool(lsn_t)> validator) {

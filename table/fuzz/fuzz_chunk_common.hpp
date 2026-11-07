@@ -44,7 +44,7 @@
 
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
-#include "common/env_endian.hpp"
+#include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/sorted_run/sorted_run.hpp"

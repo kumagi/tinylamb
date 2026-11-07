@@ -68,7 +68,7 @@ void EvaluateVectorComparison(const T* lhs, const T* rhs, size_t count,
   const size_t full_words = count / 64;
   for (size_t w = 0; w < full_words; ++w) {
     uint64_t word_mask = 0;
-    const size_t base = w * 16;
+    const size_t base = w * 64;
     for (size_t i = 0; i < 64; ++i) {
       const size_t index = base + i;
       word_mask |= static_cast<uint64_t>(compare(lhs[index], rhs[index])) << i;

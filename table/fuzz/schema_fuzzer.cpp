@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/env_endian.hpp"
+#include "common/platform/endian.hpp"
 #include "table/fuzz/fuzz_chunk_common.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
 #include "table/memtable/memtable.hpp"

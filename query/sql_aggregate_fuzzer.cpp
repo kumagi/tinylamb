@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "common/platform/extended_float.hpp"
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -38,9 +40,7 @@ __extension__ typedef __int128 int128_t;
 class Gen {
  public:
   explicit Gen(std::mt19937& rng) : rng_(rng) {}
-  int Pick(int lo, int hi) {
-    return std::uniform_int_distribution<int>(lo, hi)(rng_);
-  }
+  int Pick(int lo, int hi) { return platform::UniformInt<int>(rng_, lo, hi); }
   bool Chance(int percent) { return Pick(1, 100) <= percent; }
 
  private:
@@ -742,19 +742,19 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
     case AggSpec::Kind::kVarSamp:
     case AggSpec::Kind::kStddevPop:
     case AggSpec::Kind::kStddevSamp: {
-      // Bit-exact mirror of the engine accumulator: long double sx/sxx.
+      // Bit-exact mirror of the engine accumulator: ExtendedFloat sx/sxx.
       // Generation restricts the column to the small int domain so the
       // sums are exact regardless of morsel ordering.
       const bool samp = spec.kind == AggSpec::Kind::kVarSamp ||
                         spec.kind == AggSpec::Kind::kStddevSamp;
-      long double sx = 0.0L, sxx = 0.0L;
+      platform::ExtendedFloat sx = 0.0, sxx = 0.0;
       int64_t n = 0;
       for (const MRow& r : rows) {
         const int64_t v = CellOf(r, spec.col);
         if (v == kNullRepr) {
           continue;
         }
-        const auto x = static_cast<long double>(v);
+        const auto x = static_cast<platform::ExtendedFloat>(v);
         sx += x;
         sxx += x * x;
         ++n;
@@ -762,12 +762,15 @@ std::string ComputeAgg(const AggSpec& spec, const std::vector<MRow>& input) {
       if (n < (samp ? 2 : 1)) {
         return {"NULL"};
       }
-      const long double mean = sx / static_cast<long double>(n);
-      const long double ssd = sxx - (static_cast<long double>(n) * mean * mean);
-      long double res = ssd / static_cast<long double>(samp ? n - 1 : n);
+      const platform::ExtendedFloat mean =
+          sx / static_cast<platform::ExtendedFloat>(n);
+      const platform::ExtendedFloat ssd =
+          sxx - (static_cast<platform::ExtendedFloat>(n) * mean * mean);
+      platform::ExtendedFloat res =
+          ssd / static_cast<platform::ExtendedFloat>(samp ? n - 1 : n);
       if (spec.kind == AggSpec::Kind::kStddevPop ||
           spec.kind == AggSpec::Kind::kStddevSamp) {
-        res = std::sqrt(res);
+        res = platform::Sqrt(res);
       }
       return FmtDbl(static_cast<double>(res));
     }

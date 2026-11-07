@@ -8,7 +8,6 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -20,10 +19,13 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "common/platform/cpu_affinity.hpp"
+#include "common/platform/socket.hpp"
 #include "common/random_string.hpp"
 #include "database/database.hpp"
 #include "gtest/gtest.h"
@@ -40,8 +42,8 @@ namespace {
 bool SendAll(int fd, const std::string& bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
-    const ssize_t sent =
-        send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+    const ssize_t sent = platform::SendNoSignal(fd, bytes.data() + offset,
+                                                bytes.size() - offset);
     if (sent <= 0) {
       return false;
     }
@@ -120,7 +122,7 @@ char ReadyForQueryStatus(const std::string& wire) {
 }
 
 int ConnectClient(uint16_t port) {
-  const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int client = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
   if (client < 0) {
     return -1;
   }
@@ -256,12 +258,16 @@ TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
   }
   auto database = Database::Create(path).MoveValue();
   ASSERT_NE(database, nullptr);
-  auto context = database->BeginReadOnlyContext();
-  SqlEngine engine(*database);
-  auto result = engine.Execute(context, "SELECT COUNT(*) FROM durable_rows");
-  ASSERT_TRUE(result.HasValue()) << engine.LastError();
-  EXPECT_EQ(result.Value().Collect(), std::vector<Row>({Row({Value(8)})}));
-  EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  {
+    // The result's executors hold index read gates owned by the storage that
+    // DeleteAll() tears down, so they must be gone first.
+    auto context = database->BeginReadOnlyContext();
+    SqlEngine engine(*database);
+    auto result = engine.Execute(context, "SELECT COUNT(*) FROM durable_rows");
+    ASSERT_TRUE(result.HasValue()) << engine.LastError();
+    EXPECT_EQ(result.Value().Collect(), std::vector<Row>({Row({Value(8)})}));
+    EXPECT_EQ(context.PreCommit(), Status::kSuccess);
+  }
   database->DeleteAll();
 }
 
@@ -1082,11 +1088,14 @@ TEST(PostgresServerExtraTest, RunRestoresCallingThreadCpuAffinity) {
   std::string error;
   ASSERT_TRUE(server.Listen(&error)) << error;
   std::jthread thread([&] {
-    cpu_set_t before{}, after{};
-    EXPECT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+    const std::optional<platform::CpuSet> before =
+        platform::CpuSet::CurrentThread();
+    EXPECT_EQ(before.has_value(), platform::CpuSet::Supported());
     EXPECT_EQ(server.Run(&error), 0) << error;
-    EXPECT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
-    EXPECT_TRUE(CPU_EQUAL(&before, &after));
+    const std::optional<platform::CpuSet> after =
+        platform::CpuSet::CurrentThread();
+    EXPECT_EQ(after.has_value(), platform::CpuSet::Supported());
+    EXPECT_TRUE(before == after);
   });
   StopGuard stop{&server};
   const int fd = ConnectClient(server.BoundPort());

@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/time_format.hpp"
+#include "common/platform/time_zone.hpp"
 #include "common/set_operation.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/window_eval.hpp"
@@ -234,23 +236,11 @@ int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
   if (zone_name == "NZ-CHAT") {
     zone_name = "Pacific/Chatham";
   }
-  try {
-    const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone != nullptr) {
-      int y = Y < 1970 ? 1970 : Y;
-      std::chrono::year_month_day ymd{
-          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(M)},
-          std::chrono::day{static_cast<unsigned>(D)}};
-      std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{m} +
-                    std::chrono::seconds{s};
-      auto loc_info = zone->get_info(loc_tp);
-      return static_cast<int>(loc_info.first.offset.count());
-    }
-  } catch (...) {
-    return default_offset;
-  }
-  return default_offset;
+  int y = Y < 1970 ? 1970 : Y;
+  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
+      zone_name, y, static_cast<unsigned>(M), static_cast<unsigned>(D), h, m,
+      s);
+  return offset.value_or(default_offset);
 }
 
 StatusOr<std::string> SqlTypeFromAst(const GoogleSqlAstNode& node);
@@ -3286,9 +3276,9 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
   t.tm_min = m - total_offset_mins;
   t.tm_sec = static_cast<int>(s_val);
   t.tm_isdst = 0;
-  time_t epoch = timegm(&t);
+  const int64_t epoch = platform::TimeGm(&t);
   struct tm utc = {};
-  gmtime_r(&epoch, &utc);
+  platform::GmTime(epoch, &utc);
   std::array<char, 64> buf{};
   size_t dot_pos = text.find('.');
   if (dot_pos != std::string::npos) {

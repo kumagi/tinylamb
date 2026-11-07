@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/hash.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -1064,7 +1065,9 @@ size_t EstimateJoinRowsCached(
 }
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions) {
-  return std::hash<std::string>{}(key) % partitions;
+  // Platform-stable: partition assignment decides the order spilled rows come
+  // back in, which must not depend on the standard library's std::hash.
+  return static_cast<size_t>(platform::StableHashBytes(key) % partitions);
 }
 
 size_t SpillPartitionOf(int64_t key, size_t partitions) {

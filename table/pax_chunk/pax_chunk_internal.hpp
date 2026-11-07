@@ -48,8 +48,8 @@
 
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
-#include "common/env_endian.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
 #include "table/sorted_run/sorted_run.hpp"
 #include "table/workload/workload.hpp"

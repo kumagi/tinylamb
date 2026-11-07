@@ -8,6 +8,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -427,19 +428,27 @@ TEST(GoogleSqlFrontendTest, ForkFailureReportsError) {
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
   }
-  // Cap the process count so the parser subprocess cannot be forked.
-  struct rlimit original = {};
-  ASSERT_EQ(getrlimit(RLIMIT_NPROC, &original), 0);
-  struct rlimit tight = original;
-  tight.rlim_cur = 1;
-  ASSERT_EQ(setrlimit(RLIMIT_NPROC, &tight), 0);
-
-  const GoogleSqlParseResult result =
-      GoogleSqlFrontend::Parse("SELECT 1618033;");
-  EXPECT_FALSE(result.ok);
-  EXPECT_NE(result.error.find("cannot start GoogleSQL"), std::string::npos);
-
-  ASSERT_EQ(setrlimit(RLIMIT_NPROC, &original), 0);
+  if (geteuid() == 0) {
+    // Linux exempts root (CAP_SYS_RESOURCE) from RLIMIT_NPROC.
+    GTEST_SKIP() << "RLIMIT_NPROC does not constrain root";
+  }
+  // Cap the process count so the parser subprocess cannot be forked. The
+  // cap is applied in a throwaway child: macOS refuses to raise
+  // RLIMIT_NPROC back (EPERM), which would poison the rest of this binary.
+  EXPECT_EXIT(
+      {
+        struct rlimit tight = {};
+        if (getrlimit(RLIMIT_NPROC, &tight) != 0) std::_Exit(2);
+        tight.rlim_cur = 1;
+        if (setrlimit(RLIMIT_NPROC, &tight) != 0) std::_Exit(3);
+        const GoogleSqlParseResult result =
+            GoogleSqlFrontend::Parse("SELECT 1618033;");
+        const bool reported =
+            !result.ok &&
+            result.error.find("cannot start GoogleSQL") != std::string::npos;
+        std::_Exit(reported ? 0 : 1);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 TEST(GoogleSqlFrontendTest, NonZeroParserExitIsReportedAsFailure) {

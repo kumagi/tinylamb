@@ -77,13 +77,27 @@ struct JitInt64Kernels::Impl {
 
 #ifdef TINYLAMB_HAS_LLVM
 namespace {
-std::mutex jit_cache_mutex;
-std::unordered_map<BinaryOperation, std::shared_ptr<JitInt64Kernels::Impl>>
-    filter_kernel_cache;
-std::shared_ptr<JitInt64Kernels::Impl> projection_kernel_cache;
-std::shared_ptr<JitInt64Kernels::Impl> sum_kernel_cache;
-std::shared_ptr<JitInt64Kernels::Impl> projection_checked_kernel_cache;
-std::shared_ptr<JitInt64Kernels::Impl> sum_checked_kernel_cache;
+// The process-wide kernel caches are intentionally never destroyed. Tearing
+// an LLJIT down during static destruction races LLVM's own statics: on
+// Darwin, ORC deregisters compact-unwind sections through a function-local
+// static UnwindInfoManager that may already be gone at exit (SIGSEGV in
+// UnwindInfoManager::deregisterSectionsImpl). The OS reclaims the JIT memory
+// at exit anyway.
+using KernelImplPtr = std::shared_ptr<JitInt64Kernels::Impl>;
+std::mutex& jit_cache_mutex =
+    *new std::mutex;  // NOLINT(cppcoreguidelines-owning-memory)
+std::unordered_map<BinaryOperation, KernelImplPtr>& filter_kernel_cache =
+    *new std::unordered_map<
+        BinaryOperation,
+        KernelImplPtr>;  // NOLINT(cppcoreguidelines-owning-memory)
+KernelImplPtr& projection_kernel_cache =
+    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
+KernelImplPtr& sum_kernel_cache =
+    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
+KernelImplPtr& projection_checked_kernel_cache =
+    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
+KernelImplPtr& sum_checked_kernel_cache =
+    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
 
 void InitializeLlvm() {
   static std::once_flag initialized;

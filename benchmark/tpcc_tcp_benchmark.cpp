@@ -19,11 +19,12 @@
 #include <latch>
 #include <string>
 #include <string_view>
-#include <syncstream>
 #include <thread>
 #include <vector>
 
 #include "benchmark/tpcc_workload.hpp"
+#include "common/platform/socket.hpp"
+#include "common/platform/synced_stream.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #ifdef TINYLAMB_TPCC_MYSQL
@@ -55,7 +56,7 @@ class Session final : public TpccSqlSession {
     if (fd_ >= 0) close(fd_);
   }
   Status Connect(int port) {
-    fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd_ = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
     if (fd_ < 0) return Status::kIOError;
     timeval timeout{.tv_sec = 15, .tv_usec = 0};
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -118,7 +119,7 @@ class Session final : public TpccSqlSession {
       const auto us =
           std::chrono::duration<double, std::micro>(Clock::now() - before)
               .count();
-      std::osyncstream(std::cerr)
+      platform::SyncedOStream(std::cerr)
           << "TPCC_SQL {\"txn\":" << trace_sequence_
           << ",\"type\":" << trace_type_ << ",\"us\":" << us
           << ",\"status\":" << static_cast<int>(status.GetCode())
@@ -131,7 +132,7 @@ class Session final : public TpccSqlSession {
  private:
   bool Send(std::string_view bytes) {
     while (!bytes.empty()) {
-      const ssize_t n = send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+      const ssize_t n = platform::SendNoSignal(fd_, bytes.data(), bytes.size());
       if (n < 0 && errno == EINTR) continue;
       if (n <= 0) return false;
       bytes.remove_prefix(static_cast<size_t>(n));

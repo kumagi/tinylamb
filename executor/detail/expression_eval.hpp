@@ -15,6 +15,7 @@
 
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
+#include "common/platform/extended_float.hpp"
 #include "common/status_or.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -243,11 +244,11 @@ struct AggregateAccumulator {
   // Extended-aggregate state. Kept in one variant-ish blob so the common
   // aggregate path stays lean.
   struct StatState {
-    long double sx = 0;   // Σx (or Σy for two-input forms)
-    long double sxx = 0;  // Σx²
-    long double sy = 0;   // Σy
-    long double syy = 0;  // Σy²
-    long double sxy = 0;  // Σxy
+    platform::ExtendedFloat sx = 0;   // Σx (or Σy for two-input forms)
+    platform::ExtendedFloat sxx = 0;  // Σx²
+    platform::ExtendedFloat sy = 0;   // Σy
+    platform::ExtendedFloat syy = 0;  // Σy²
+    platform::ExtendedFloat sxy = 0;  // Σxy
   };
   StatState stat_;
   bool saw_any_ = false;                        // ANY_VALUE captured its value
@@ -259,7 +260,7 @@ struct AggregateAccumulator {
   bool top_count_valid_ = false;
   struct SumWeight {
     Value value;
-    long double sum = 0;
+    platform::ExtendedFloat sum = 0;
     int64_t int_sum = 0;
     int64_t weights = 0;  // non-null weight count (0 => NULL sum)
     bool is_double = false;

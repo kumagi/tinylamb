@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/random.hpp"
 #include "common/status_or.hpp"
 #ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 #include "database/database.hpp"
@@ -136,7 +137,7 @@ std::string SqlLiteral(std::string_view text) {
 TpccNurand TpccNurand::FromSeed(uint64_t seed) {
   std::mt19937_64 rng(seed);
   auto pick = [&](int lower, int upper) {
-    return std::uniform_int_distribution<int>(lower, upper)(rng);
+    return platform::UniformInt<int>(rng, lower, upper);
   };
   TpccNurand nurand;
   nurand.c_id = pick(0, 1023);
@@ -439,7 +440,7 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
 
   std::mt19937_64 rng(seed);
   auto load_random = [&](int lower, int upper) {
-    return std::uniform_int_distribution<int>(lower, upper)(rng);
+    return platform::UniformInt<int>(rng, lower, upper);
   };
   const TpccNurand nurand = TpccNurand::FromSeed(seed);
 
@@ -538,8 +539,8 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
       std::vector<int> customer_permutation(
           static_cast<size_t>(scale.customers_per_district));
       std::iota(customer_permutation.begin(), customer_permutation.end(), 1);
-      std::shuffle(customer_permutation.begin(), customer_permutation.end(),
-                   rng);
+      platform::Shuffle(customer_permutation.begin(),
+                        customer_permutation.end(), rng);
       const int delivered_orders =
           scale.initial_orders_per_district - scale.new_orders_per_district;
       for (int order_id = 1; status == Status::kSuccess &&
@@ -603,7 +604,7 @@ Status TpccWorkload::Initialize(Database& database, const TpccScale& scale,
 #endif
 
 int TpccWorkload::Random(int lower, int upper) {
-  return std::uniform_int_distribution<int>(lower, upper)(random_);
+  return platform::UniformInt<int>(random_, lower, upper);
 }
 
 int TpccWorkload::NURand(int a, int x, int y, int c) {

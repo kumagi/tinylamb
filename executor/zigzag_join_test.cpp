@@ -459,6 +459,11 @@ TEST(ZigZagJoinTest, RuleRequiresTwoOrderedIndexesAndRejectsResiduals) {
                   .empty());
 
   ASSERT_SUCCESS(read_context.PreCommit());
+  // The executors hold index read gates owned by the storage DeleteAll()
+  // tears down; release them first.
+  executor.reset();
+  scan_executor.reset();
+  swapped_executor.reset();
   database->DeleteAll();
 }
 

@@ -28,6 +28,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"

@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/time_format.hpp"
 #include "expression/expression.hpp"
 #include "type/collation.hpp"
 #include "type/column_name.hpp"
@@ -652,7 +653,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       tm.tm_hour = hour;
       tm.tm_min = minute;
       tm.tm_sec = second;
-      time_t epoch = timegm(&tm);
+      int64_t epoch = platform::TimeGm(&tm);
       const size_t zone = text.find_first_of("+-Zz", 19);
       if (zone == std::string_view::npos) {
         // The repository's default session zone is UTC-8 (the same default

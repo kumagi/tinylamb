@@ -16,8 +16,6 @@
 
 #include "type/value.hpp"
 
-#include <endian.h>
-
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -39,6 +37,7 @@
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/endian.hpp"
 #include "common/serdes.hpp"
 #include "type/collation.hpp"
 #include "type/date.hpp"

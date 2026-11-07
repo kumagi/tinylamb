@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
@@ -264,9 +265,9 @@ TEST_F(LoggerTest, ReopenExistingWalKeepsContent) {
 }
 
 TEST_F(LoggerTest, WriteErrorUnblocksAllWaiters) {
-  // Arrange -- point the log fd at /dev/full so every write() fails with
-  // ENOSPC while the fd itself stays valid.
-  const int full_fd = ::open("/dev/full", O_WRONLY);
+  // Arrange -- point the log fd at a write-failing descriptor (/dev/full on
+  // Linux: ENOSPC) so every write() fails while the fd itself stays valid.
+  const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
   ASSERT_EQ(::dup2(full_fd, l_->Fd()), l_->Fd());
   ASSERT_EQ(::close(full_fd), 0);
@@ -294,7 +295,7 @@ TEST_F(LoggerTest, WriteErrorUnblocksAllWaiters) {
   // of blocking forever.
   EXPECT_TRUE(failed);
   EXPECT_TRUE(l_->Failed());
-  EXPECT_EQ(l_->ErrorNumber(), ENOSPC);
+  EXPECT_EQ(l_->ErrorNumber(), platform::kWriteFailingErrno);
   EXPECT_FALSE(l_->AddLog(std::string(16, 'b')).HasValue());
   EXPECT_NE(l_->WaitForDurable(l_->BufferedLSN() + 4096), Status::kSuccess);
   EXPECT_NE(l_->Finish(), Status::kSuccess);

@@ -34,6 +34,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/platform/random.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -345,8 +346,10 @@ class ColumnCollector {
       sample_.push_back(value);
       return;
     }
-    std::uniform_int_distribution<uint64_t> pick(0, non_null_count_ - 1);
-    const uint64_t slot = pick(rng_);
+    // Portable draw: statistics (and thus plans) must not depend on the
+    // standard library's distribution algorithm.
+    const auto slot =
+        platform::UniformInt<uint64_t>(rng_, 0, non_null_count_ - 1);
     if (slot < kStatSampleSize) {
       sample_[slot] = value;
     }

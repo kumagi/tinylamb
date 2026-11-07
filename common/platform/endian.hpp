@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef TINYLAMB_ENV_ENDIAN_HPP
-#define TINYLAMB_ENV_ENDIAN_HPP
+#ifndef TINYLAMB_COMMON_PLATFORM_ENDIAN_HPP
+#define TINYLAMB_COMMON_PLATFORM_ENDIAN_HPP
 
 #if defined(__APPLE__)
 
@@ -89,4 +89,4 @@ inline uint64_t le64toh(uint64_t x) { return htole64(x); }
 
 #endif
 
-#endif  // TINYLAMB_ENV_ENDIAN_HPP
+#endif  // TINYLAMB_COMMON_PLATFORM_ENDIAN_HPP

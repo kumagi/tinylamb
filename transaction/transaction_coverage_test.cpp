@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -94,7 +95,7 @@ bool WaitForCondition(const std::function<bool()>& condition,
 // Redirects the WAL file descriptor to /dev/full: every subsequent write
 // fails with ENOSPC.  The flush worker stays alive until the next write.
 void PointWalAtDevFull(Logger* logger) {
-  const int full_fd = ::open("/dev/full", O_WRONLY);
+  const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
   ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
   ASSERT_EQ(::close(full_fd), 0);

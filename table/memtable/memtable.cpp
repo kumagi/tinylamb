@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/env_endian.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
 #include "common/version.hpp"
 #include "table/memtable/skiplist.hpp"

@@ -31,6 +31,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -1038,7 +1039,7 @@ TEST_F(OptimizerTest, PhysicalRuleSubsetsPreserveOrderedLimitResults) {
   // registration order during the subset sweep.
   std::mt19937 rng(  // NOLINT(cert-msc51-cpp, cert-msc32-c)
       0x54494E59U);  // "TINY": deterministic seed is intentional in a test.
-  std::shuffle(masks.begin(), masks.end(), rng);
+  platform::Shuffle(masks.begin(), masks.end(), rng);
 
   size_t planned_subsets = 0;
   for (const uint32_t mask : masks) {
@@ -1171,7 +1172,7 @@ TEST_F(OptimizerTest, JoinChainMatchesGoldenResultUnderRuleSubsets) {
   // Fixed seed keeps failures reproducible.
   std::mt19937 rng(  // NOLINT(cert-msc51-cpp, cert-msc32-c)
       0x4A4F494EU);  // "JOIN": deterministic seed is intentional in a test.
-  std::shuffle(physical_masks.begin(), physical_masks.end(), rng);
+  platform::Shuffle(physical_masks.begin(), physical_masks.end(), rng);
 
   size_t planned = 0;
   auto check = [&](const OptimizerOptions& options, uint32_t order_mask,

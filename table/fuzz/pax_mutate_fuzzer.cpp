@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
-#include "common/env_endian.hpp"
+#include "common/platform/endian.hpp"
 #include "common/status_or.hpp"
 #include "table/fuzz/fuzz_helpers.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"

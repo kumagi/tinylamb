@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/log_message.hpp"
+#include "common/platform/os.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -32,7 +33,7 @@ namespace tinylamb {
 // stack trace.  Bridging SIGTRAP to `abort()` lets libFuzzer's SIGABRT handler
 // symbolize the stack and persist the crashing input.
 inline void InstallFuzzSigtrapBridge() {
-#if defined(__unix__) && defined(SIGTRAP)
+#if defined(TINYLAMB_OS_POSIX) && defined(SIGTRAP)
   static const bool kInstalled = []() {
     struct sigaction sa{};
     sa.sa_handler = [](int /*sig*/) {

@@ -28,6 +28,7 @@
 #include <thread>
 #include <tuple>
 
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -52,7 +53,7 @@ namespace tinylamb {
 namespace {
 
 void ForceIndexScanWalFailure(Logger* logger) {
-  const int full_fd = ::open("/dev/full", O_WRONLY);
+  const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
   ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
   ASSERT_EQ(::close(full_fd), 0);

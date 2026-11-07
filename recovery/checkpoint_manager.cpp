@@ -40,6 +40,7 @@
 #include "common/constants.hpp"
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/serdes.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/log_record.hpp"
@@ -79,9 +80,7 @@ Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
     int rc = -1;
     int sync_errno = errno;
     if (fd >= 0) {
-      do {
-        rc = ::fdatasync(fd);
-      } while (rc < 0 && errno == EINTR);
+      rc = platform::DataSync(fd);
       sync_errno = errno;
       ::close(fd);
     }

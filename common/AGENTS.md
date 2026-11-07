@@ -26,6 +26,33 @@ enum header `type/value_type.hpp`, allowlisted).
   iterator (table/full_scan_iterator.cpp) can reject a probe row before row
   decode.
 
+## `platform/` — OS abstraction (Linux + macOS)
+
+All OS- and libc-specific code goes through `common/platform/`; the rest of
+the tree must not include Linux-only headers (`<sys/epoll.h>`,
+`<sys/eventfd.h>`, `<endian.h>`, `<asm-generic/…>`, `<bits/…>`, `<sched.h>`
+affinity) or call Linux-only APIs (`fdatasync`, `accept4`, `pipe2`,
+`SOCK_CLOEXEC`/`SOCK_NONBLOCK`, `sched_*affinity`, `posix_fadvise`), nor
+rely on libstdc++-only library features (`std::chrono::locate_zone`,
+`std::osyncstream`). Each header documents the per-platform behaviour.
+
+- `endian.hpp` — `htobe64`/`be64toh` family (glibc `<endian.h>`, Apple
+  `OSByteOrder`, or a portable fallback).
+- `file_io.hpp` — `DataSync` (fdatasync / `F_FULLFSYNC`), `AdviseDontNeed`,
+  `Preallocate`.
+- `socket.hpp` — `OpenSocket`/`AcceptSocket`/`OpenPipe` with atomic or
+  fcntl-applied `FdFlags`, `SendNoSignal`, `InitSpawnAttributes`
+  (`POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS).
+- `event_poller.hpp` — level-triggered `EventPoller` (epoll / kqueue) and the
+  cross-thread `Waker` (eventfd / pipe).
+- `cpu_affinity.hpp` — `CpuSet` thread pinning; unsupported (no-op) on macOS.
+- `time_zone.hpp` — IANA zone lookup (C++20 tzdb on Linux, `CFTimeZone` on
+  macOS; links CoreFoundation).
+- `synced_stream.hpp` — `SyncedOStream` (`std::osyncstream` or a locked
+  fallback).
+
+Test: `./build/platform_test`.
+
 ## Before reading code here
 
 `Status` codes (`kSuccess/kNoSpace/kConflicts/kDuplicates/kNotExists/

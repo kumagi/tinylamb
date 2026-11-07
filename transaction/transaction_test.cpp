@@ -34,6 +34,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
@@ -551,7 +552,7 @@ TEST_F(TransactionTest, PreCommitLoggerFailureLeavesAbortedNotHalfCommitted) {
 
   // Point the WAL fd at /dev/full so the commit record can never persist and
   // WaitForDurable must surface a write error.
-  const int full_fd = ::open("/dev/full", O_WRONLY);
+  const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
   ASSERT_EQ(::dup2(full_fd, l_->Fd()), l_->Fd());
   ASSERT_EQ(::close(full_fd), 0);

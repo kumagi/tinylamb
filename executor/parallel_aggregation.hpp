@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/platform/extended_float.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/query_memory.hpp"
@@ -68,11 +69,13 @@ class ParallelAggregationExecutor final : public ExecutorBase {
     // Long-double partial sums for statistical aggregates, indexed like
     // values/counts.  They mirror AggregateAccumulator::StatState so merged
     // partials finalize exactly like the serial ground-truth path.
-    std::vector<long double> stat_sx;   // Σ second COVAR arg (or sole input)
-    std::vector<long double> stat_sxx;  // Σ of its square
-    std::vector<long double> stat_sy;   // Σ first COVAR arg
-    std::vector<long double> stat_syy;  // Σ of its square
-    std::vector<long double> stat_sxy;  // Σ of the pairwise products
+    std::vector<platform::ExtendedFloat>
+        stat_sx;  // Σ second COVAR arg (or sole input)
+    std::vector<platform::ExtendedFloat> stat_sxx;  // Σ of its square
+    std::vector<platform::ExtendedFloat> stat_sy;   // Σ first COVAR arg
+    std::vector<platform::ExtendedFloat> stat_syy;  // Σ of its square
+    std::vector<platform::ExtendedFloat>
+        stat_sxy;  // Σ of the pairwise products
     std::vector<relational_detail::DistinctValueSet> distinct_values;
     // Every retained distinct value holds a forced global-budget reservation;
     // release the retained total when the state dies so the process-wide

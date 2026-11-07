@@ -54,6 +54,8 @@
 #include "common/constants.hpp"
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
+#include "common/platform/time_format.hpp"
+#include "common/platform/time_zone.hpp"
 #include "common/regex_guard.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
@@ -307,29 +309,17 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   if (zone_name == "NZ-CHAT") {
     zone_name = "Pacific/Chatham";
   }
-  try {
-    const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone != nullptr) {
-      int y = (ct != nullptr) ? ct->year : 2000;
-      int mon = (ct != nullptr) ? ct->month : 1;
-      int d = (ct != nullptr) ? ct->day : 1;
-      int h = (ct != nullptr) ? ct->hour : 0;
-      int min = (ct != nullptr) ? ct->minute : 0;
-      int s = (ct != nullptr) ? ct->second : 0;
-      y = std::max(y, 1970);
-      std::chrono::year_month_day ymd{
-          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
-          std::chrono::day{static_cast<unsigned>(d)}};
-      std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{min} +
-                    std::chrono::seconds{s};
-      auto loc_info = zone->get_info(loc_tp);
-      return static_cast<int>(loc_info.first.offset.count());
-    }
-  } catch (...) {
-    return default_offset;
-  }
-  return default_offset;
+  int y = (ct != nullptr) ? ct->year : 2000;
+  int mon = (ct != nullptr) ? ct->month : 1;
+  int d = (ct != nullptr) ? ct->day : 1;
+  int h = (ct != nullptr) ? ct->hour : 0;
+  int min = (ct != nullptr) ? ct->minute : 0;
+  int s = (ct != nullptr) ? ct->second : 0;
+  y = std::max(y, 1970);
+  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
+      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
+      min, s);
+  return offset.value_or(default_offset);
 }
 
 // CURRENT_DATE('foo') and friends must reject unknown zone names the way
@@ -354,14 +344,10 @@ Status TryValidateTimeZoneName(std::string_view tz_str) {
   if (zone_name == "NZ-CHAT") {
     zone_name = "Pacific/Chatham";
   }
-  try {
-    static_cast<void>(std::chrono::locate_zone(zone_name));
-    return Status::kSuccess;
-  } catch (...) {
+  if (!platform::IsKnownTimeZone(zone_name)) {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid timezone: " + std::string(tz_str));
   }
-
   return Status::kSuccess;
 }
 
@@ -1541,9 +1527,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             t.tm_hour = h;
             t.tm_min = m;
             t.tm_sec = static_cast<int>(sec);
-            time_t epoch = timegm(&t) - tz_offset_sec + tz2_sec;
+            const int64_t epoch =
+                platform::TimeGm(&t) - tz_offset_sec + tz2_sec;
             struct tm target = {};
-            gmtime_r(&epoch, &target);
+            platform::GmTime(epoch, &target);
             std::chrono::year_month_day ymd{
                 std::chrono::year{target.tm_year + 1900},
                 std::chrono::month{static_cast<unsigned>(target.tm_mon + 1)},
@@ -1567,9 +1554,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             t.tm_hour = h;
             t.tm_min = m;
             t.tm_sec = static_cast<int>(sec);
-            time_t epoch = timegm(&t) - tz_offset_sec + default_tz_sec;
+            const int64_t epoch =
+                platform::TimeGm(&t) - tz_offset_sec + default_tz_sec;
             struct tm target = {};
-            gmtime_r(&epoch, &target);
+            platform::GmTime(epoch, &target);
             std::chrono::year_month_day ymd{
                 std::chrono::year{target.tm_year + 1900},
                 std::chrono::month{static_cast<unsigned>(target.tm_mon + 1)},
@@ -2755,11 +2743,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_hour = ct.hour;
     tm.tm_min = ct.minute;
     tm.tm_sec = ct.second;
-    timegm(&tm);
+    platform::TimeGm(&tm);
     std::array<char, 128> buf{};
-    const auto format_time = static_cast<size_t (*)(
-        char*, size_t, const char*, const struct tm*) noexcept>(&std::strftime);
-    format_time(buf.data(), buf.size(), fmt.c_str(), &tm);
+    // %z/%Z render from the struct (UTC here), never the host's zone.
+    platform::FormatTime(buf.data(), buf.size(), fmt.c_str(), &tm);
     return Value(std::string(buf.data()));
   }
   if (name == "parse_timestamp") {
@@ -2789,7 +2776,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     tm.tm_year = 100;  // 2000 default
     tm.tm_mon = 0;
     tm.tm_mday = 1;
-    char* parsed_end = strptime(input.c_str(), fmt.c_str(), &tm);
+    const char* parsed_end =
+        platform::ParseTime(input.c_str(), fmt.c_str(), &tm);
     if (parsed_end == nullptr) {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP failed for: " + input);
@@ -3074,7 +3062,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     struct tm tm = {};
     tm.tm_year = 70;
     tm.tm_mday = 1;
-    char* res = strptime(val.c_str(), fmt.c_str(), &tm);
+    const char* res = platform::ParseTime(val.c_str(), fmt.c_str(), &tm);
     if (res == nullptr || *res != '\0') {
       return StatusError(StatusCode::kInvalidArgument,
                          "failed to parse date: " + val);

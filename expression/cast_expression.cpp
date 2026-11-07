@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/time_zone.hpp"
 #include "expression/expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/proto_text.hpp"
@@ -286,29 +287,17 @@ int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
   if (zone_name == "NZ-CHAT") {
     zone_name = "Pacific/Chatham";
   }
-  try {
-    const auto* zone = std::chrono::locate_zone(zone_name);
-    if (zone != nullptr) {
-      int y = (ct != nullptr) ? ct->year : 2000;
-      int mon = (ct != nullptr) ? static_cast<int>(ct->month) : 1;
-      int d = (ct != nullptr) ? static_cast<int>(ct->day) : 1;
-      int h = (ct != nullptr) ? ct->hour : 0;
-      int min = (ct != nullptr) ? ct->minute : 0;
-      int s = (ct != nullptr) ? ct->second : 0;
-      y = std::max(y, 1970);
-      std::chrono::year_month_day ymd{
-          std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(mon)},
-          std::chrono::day{static_cast<unsigned>(d)}};
-      std::chrono::local_days loc_d{ymd};
-      auto loc_tp = loc_d + std::chrono::hours{h} + std::chrono::minutes{min} +
-                    std::chrono::seconds{s};
-      auto loc_info = zone->get_info(loc_tp);
-      return static_cast<int>(loc_info.first.offset.count());
-    }
-  } catch (...) {  // NOLINT(bugprone-empty-catch)
-    // Unknown zone identifiers fall back to the caller-provided default.
-  }
-  return default_offset;
+  int y = (ct != nullptr) ? ct->year : 2000;
+  int mon = (ct != nullptr) ? static_cast<int>(ct->month) : 1;
+  int d = (ct != nullptr) ? static_cast<int>(ct->day) : 1;
+  int h = (ct != nullptr) ? ct->hour : 0;
+  int min = (ct != nullptr) ? ct->minute : 0;
+  int s = (ct != nullptr) ? ct->second : 0;
+  y = std::max(y, 1970);
+  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
+      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
+      min, s);
+  return offset.value_or(default_offset);
 }
 
 std::string ToUpper(std::string str) {

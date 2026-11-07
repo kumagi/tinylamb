@@ -2,14 +2,10 @@
 
 #include "server/postgres_server.hpp"
 
-#include <asm-generic/socket.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sched.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -42,6 +38,9 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/cpu_affinity.hpp"
+#include "common/platform/event_poller.hpp"
+#include "common/platform/socket.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -75,36 +74,35 @@ constexpr size_t kMaxQueuedOutputBytes = 64U << 20;  // 64 MiB
 // storage threads retain the caller's entire allowed CPU set. Changing the
 // calling thread's affinity never enlarges that set. SQL executed on the I/O
 // thread temporarily restores it so newly spawned query threads can use it.
+// Thread pinning is Linux-only; elsewhere platform::CpuSet::CurrentThread()
+// is nullopt and both scopes below are no-ops.
 struct IoCpuMasks {
-  cpu_set_t available;
-  cpu_set_t io;
+  platform::CpuSet available;
+  platform::CpuSet io;
 };
 thread_local const IoCpuMasks* current_io_masks = nullptr;
 
 class ScopedIoCpuAffinity {
  public:
   ScopedIoCpuAffinity() {
-    if (std::getenv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr ||
-        sched_getaffinity(0, sizeof(masks_.available), &masks_.available) !=
-            0 ||
-        CPU_COUNT(&masks_.available) < 2)
-      return;
-    CPU_ZERO(&masks_.io);
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-      if (!CPU_ISSET(cpu, &masks_.available)) continue;
-      CPU_SET(cpu, &masks_.io);
-      if (sched_setaffinity(0, sizeof(masks_.io), &masks_.io) == 0) {
-        previous_ = current_io_masks;
-        current_io_masks = &masks_;
-        cpu_ = cpu;
-      }
-      break;
+    if (std::getenv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) return;
+    const std::optional<platform::CpuSet> available =
+        platform::CpuSet::CurrentThread();
+    if (!available.has_value() || available->Count() < 2) return;
+    masks_.available = *available;
+    const int cpu = masks_.available.First();
+    if (cpu < 0) return;
+    masks_.io = platform::CpuSet::Single(cpu);
+    if (masks_.io.ApplyToCurrentThread()) {
+      previous_ = current_io_masks;
+      current_io_masks = &masks_;
+      cpu_ = cpu;
     }
   }
   ~ScopedIoCpuAffinity() {
     if (cpu_ < 0) return;
     current_io_masks = previous_;
-    (void)sched_setaffinity(0, sizeof(masks_.available), &masks_.available);
+    (void)masks_.available.ApplyToCurrentThread();
   }
   ScopedIoCpuAffinity(const ScopedIoCpuAffinity&) = delete;
   ScopedIoCpuAffinity& operator=(const ScopedIoCpuAffinity&) = delete;
@@ -119,15 +117,14 @@ class ScopedIoCpuAffinity {
 class ScopedSqlCpuAffinity {
  public:
   ScopedSqlCpuAffinity() : masks_(current_io_masks) {
-    if (masks_ && sched_setaffinity(0, sizeof(masks_->available),
-                                    &masks_->available) == 0)
+    if (masks_ && masks_->available.ApplyToCurrentThread())
       current_io_masks = nullptr;
     else
       masks_ = nullptr;
   }
   ~ScopedSqlCpuAffinity() {
     if (!masks_) return;
-    (void)sched_setaffinity(0, sizeof(masks_->io), &masks_->io);
+    (void)masks_->io.ApplyToCurrentThread();
     current_io_masks = masks_;
   }
   ScopedSqlCpuAffinity(const ScopedSqlCpuAffinity&) = delete;
@@ -290,12 +287,8 @@ class PostgresServer::Impl {
     if (listener_fd_ >= 0) {
       close(listener_fd_);
     }
-    if (wake_fd_ >= 0) {
-      close(wake_fd_);
-    }
-    if (epoll_fd_ >= 0) {
-      close(epoll_fd_);
-    }
+    waker_.Close();
+    poller_.Close();
     if (reserve_fd_ >= 0) {
       close(reserve_fd_);
     }
@@ -325,10 +318,9 @@ class PostgresServer::Impl {
 
     for (addrinfo* address = addresses; address != nullptr;
          address = address->ai_next) {
-      const int candidate =
-          socket(address->ai_family,
-                 address->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                 address->ai_protocol);
+      const int candidate = platform::OpenSocket(
+          address->ai_family, address->ai_socktype, address->ai_protocol,
+          {.nonblocking = true, .close_on_exec = true});
       if (candidate < 0) {
         continue;
       }
@@ -361,18 +353,16 @@ class PostgresServer::Impl {
       bound_port_ = ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
     }
 
-    epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ < 0) {
-      *error = ErrnoMessage("epoll_create1");
+    if (!poller_.Open()) {
+      *error = ErrnoMessage("event poller");
       return false;
     }
-    wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (wake_fd_ < 0) {
-      *error = ErrnoMessage("eventfd");
+    if (!waker_.Open()) {
+      *error = ErrnoMessage("event loop waker");
       return false;
     }
-    if (!AddEpollFd(listener_fd_, EPOLLIN, error) ||
-        !AddEpollFd(wake_fd_, EPOLLIN, error)) {
+    if (!AddPollFd(listener_fd_, platform::kPollReadable, error) ||
+        !AddPollFd(waker_.ReadFd(), platform::kPollReadable, error)) {
       return false;
     }
     // Reserve one descriptor so AcceptClients() can still drain the
@@ -398,30 +388,27 @@ class PostgresServer::Impl {
     }
     ScopedIoCpuAffinity affinity;
     io_cpu_ = affinity.Cpu();
-    std::array<epoll_event, 64> events{};
+    std::array<platform::PollResult, 64> events{};
     while (!stopping_.load()) {
       // Bounded wait so the idle-connection sweep below keeps running even
       // when no events arrive.
-      const int count = epoll_wait(epoll_fd_, events.data(), events.size(),
-                                   kIdleSweepIntervalMs);
+      const int count = poller_.Wait(events, kIdleSweepIntervalMs);
       if (count < 0) {
         if (errno == EINTR) {
           continue;
         }
-        *error = ErrnoMessage("epoll_wait");
+        *error = ErrnoMessage("event poller wait");
         return 1;
       }
       for (int i = 0; i < count; ++i) {
-        const int fd = events[static_cast<size_t>(i)].data.fd;
+        const int fd = events[static_cast<size_t>(i)].fd;
         const uint32_t flags = events[static_cast<size_t>(i)].events;
         if (fd == listener_fd_) {
           AcceptClients();
           continue;
         }
-        if (fd == wake_fd_) {
-          uint64_t ignored = 0;
-          const ssize_t read_size = read(wake_fd_, &ignored, sizeof(ignored));
-          (void)read_size;
+        if (fd == waker_.ReadFd()) {
+          waker_.Drain();
           ProcessReadCompletions();
           continue;
         }
@@ -432,15 +419,16 @@ class PostgresServer::Impl {
         // A completion can re-enable reads after epoll returned an older
         // RDHUP-only event. Drain the socket before deciding it is closed:
         // that event may still have complete pipelined queries behind it.
-        if ((flags & EPOLLIN) != 0U ||
-            ((flags & EPOLLRDHUP) != 0U &&
+        if ((flags & platform::kPollReadable) != 0U ||
+            ((flags & platform::kPollPeerClosed) != 0U &&
              !clients_.at(fd).read_query_in_flight)) {
           alive = ReadClient(fd);
         }
-        if (alive && clients_.contains(fd) && (flags & EPOLLOUT) != 0U) {
+        if (alive && clients_.contains(fd) &&
+            (flags & platform::kPollWritable) != 0U) {
           alive = WriteClient(fd);
         }
-        if ((flags & (EPOLLERR | EPOLLHUP)) != 0U) {
+        if ((flags & (platform::kPollError | platform::kPollHangup)) != 0U) {
           alive = false;
         }
         if (!alive) {
@@ -494,11 +482,7 @@ class PostgresServer::Impl {
 
   void RequestStop() {
     stopping_.store(true);
-    if (wake_fd_ >= 0) {
-      const uint64_t wake = 1;
-      const ssize_t write_size = write(wake_fd_, &wake, sizeof(wake));
-      (void)write_size;
-    }
+    waker_.Wake();
   }
 
   uint16_t BoundPort() const { return bound_port_; }
@@ -537,8 +521,8 @@ class PostgresServer::Impl {
       }
       ssize_t sent;
       do {
-        sent = send(fd, response.data(), response.size(),
-                    MSG_NOSIGNAL | MSG_DONTWAIT);
+        sent = platform::SendNoSignal(fd, response.data(), response.size(),
+                                      MSG_DONTWAIT);
       } while (sent < 0 && errno == EINTR);
       *failure = sent < 0 ? errno : 0;
       return sent;
@@ -568,7 +552,8 @@ class PostgresServer::Impl {
     std::string input;
     std::string output;
     size_t output_offset{0};
-    uint32_t registered_events{EPOLLIN | EPOLLRDHUP};
+    uint32_t registered_events{platform::kPollReadable |
+                               platform::kPollPeerClosed};
     std::string user;
     std::string database;
     std::unique_ptr<TransactionContext> transaction;
@@ -628,12 +613,9 @@ class PostgresServer::Impl {
     bool reply_send_failed{false};
   };
 
-  bool AddEpollFd(int fd, uint32_t events, std::string* error) const {
-    epoll_event event{};
-    event.events = events;
-    event.data.fd = fd;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) != 0) {
-      *error = ErrnoMessage("epoll_ctl add");
+  bool AddPollFd(int fd, uint32_t interest, std::string* error) const {
+    if (!poller_.Add(fd, interest)) {
+      *error = ErrnoMessage("event poller add");
       return false;
     }
     return true;
@@ -646,7 +628,7 @@ class PostgresServer::Impl {
       reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
       if (reserve_fd_ >= 0) {
         std::string error;
-        if (AddEpollFd(listener_fd_, EPOLLIN, &error)) {
+        if (AddPollFd(listener_fd_, platform::kPollReadable, &error)) {
           listener_shed_due_to_fd_pressure_ = false;
         } else {
           std::cerr << error << '\n';
@@ -659,18 +641,18 @@ class PostgresServer::Impl {
       }
     }
     while (true) {
-      const int fd =
-          accept4(listener_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      const int fd = platform::AcceptSocket(
+          listener_fd_, {.nonblocking = true, .close_on_exec = true});
       if (fd < 0) {
         if ((errno == EMFILE || errno == ENFILE) && reserve_fd_ >= 0) {
           // Descriptor exhaustion: the level-triggered listener stays
           // readable and would spin forever. Consume (and shed) one pending
           // connection via the reserved descriptor, then restore it.
-          const std::string reason = ErrnoMessage("accept4");
+          const std::string reason = ErrnoMessage("accept");
           ::close(reserve_fd_);
           reserve_fd_ = -1;
-          const int shed = accept4(listener_fd_, nullptr, nullptr,
-                                   SOCK_NONBLOCK | SOCK_CLOEXEC);
+          const int shed = platform::AcceptSocket(
+              listener_fd_, {.nonblocking = true, .close_on_exec = true});
           if (shed >= 0) {
             ::close(shed);
           }
@@ -682,12 +664,11 @@ class PostgresServer::Impl {
             // the level-triggered loop. Shed the listener from epoll until a
             // future AcceptClients call restores the reserve: the cost is a
             // delayed accept, not a busy loop.
-            epoll_event dummy{};
-            (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listener_fd_, &dummy);
+            (void)poller_.Remove(listener_fd_);
             listener_shed_due_to_fd_pressure_ = true;
           }
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-          std::cerr << ErrnoMessage("accept4") << '\n';
+          std::cerr << ErrnoMessage("accept") << '\n';
         }
         return;
       }
@@ -705,7 +686,8 @@ class PostgresServer::Impl {
       // by the event loop until shutdown.
       clients_.try_emplace(fd, fd, next_client_id_++, NextSecret());
       std::string error;
-      if (!AddEpollFd(fd, EPOLLIN | EPOLLRDHUP, &error)) {
+      if (!AddPollFd(fd, platform::kPollReadable | platform::kPollPeerClosed,
+                     &error)) {
         std::cerr << error << '\n';
         CloseClient(fd);
         continue;
@@ -834,7 +816,7 @@ class PostgresServer::Impl {
     while (client.output_offset < client.output.size()) {
       const char* data = client.output.data() + client.output_offset;
       const size_t remaining = client.output.size() - client.output_offset;
-      const ssize_t size = send(fd, data, remaining, MSG_NOSIGNAL);
+      const ssize_t size = platform::SendNoSignal(fd, data, remaining);
       if (size > 0) {
         client.output_offset += static_cast<size_t>(size);
         client.last_activity = std::chrono::steady_clock::now();
@@ -863,19 +845,17 @@ class PostgresServer::Impl {
   }
 
   void UpdateClientInterest(Client& client) const {
-    epoll_event event{};
-    event.events = 0;
+    uint32_t interest = 0;
     if (!client.read_query_in_flight && !client.peer_eof_seen &&
         !client.close_after_write) {
-      event.events |= EPOLLIN | EPOLLRDHUP;
+      interest |= platform::kPollReadable | platform::kPollPeerClosed;
     }
     if (client.output_offset < client.output.size()) {
-      event.events |= EPOLLOUT;
+      interest |= platform::kPollWritable;
     }
-    event.data.fd = client.fd;
-    if (event.events == client.registered_events) return;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client.fd, &event) == 0)
-      client.registered_events = event.events;
+    if (interest == client.registered_events) return;
+    if (poller_.Modify(client.fd, interest))
+      client.registered_events = interest;
   }
 
   static void Queue(Client& client, const std::string& message) {
@@ -1058,7 +1038,8 @@ class PostgresServer::Impl {
     }
     ssize_t sent;
     do {
-      sent = send(client.fd, response.data(), response.size(), MSG_NOSIGNAL);
+      sent =
+          platform::SendNoSignal(client.fd, response.data(), response.size());
     } while (sent < 0 && errno == EINTR);
     if (sent == static_cast<ssize_t>(response.size())) return;
     if (sent > 0) {
@@ -1924,12 +1905,8 @@ class PostgresServer::Impl {
       if (completion.session) AbortOpenTransaction(*completion.session);
       pending_worker_tasks_.fetch_sub(1);
     }
-    if (wake_loop && wake_fd_ >= 0) {
-      const uint64_t wake = 1;
-      ssize_t written;
-      do {
-        written = write(wake_fd_, &wake, sizeof(wake));
-      } while (written < 0 && errno == EINTR);
+    if (wake_loop) {
+      waker_.Wake();
     }
   }
 
@@ -2214,7 +2191,7 @@ class PostgresServer::Impl {
     } else {
       AbortOpenTransaction(found->second);
     }
-    (void)epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    (void)poller_.Remove(fd);
     found->second.reply_socket->Close();
     clients_.erase(found);
   }
@@ -2271,8 +2248,9 @@ class PostgresServer::Impl {
   std::deque<ReadCompletion> read_completions_;
   std::mt19937_64 secret_rng_{std::random_device{}()};
   int listener_fd_{-1};
-  int epoll_fd_{-1};
-  int wake_fd_{-1};
+  // Registration is logically const for the event loop's bookkeeping.
+  mutable platform::EventPoller poller_;
+  platform::Waker waker_;
   int reserve_fd_{-1};
   // Set when AcceptClients shed the listener from epoll after losing the
   // EMFILE reserve descriptor; cleared once the reserve is restored.

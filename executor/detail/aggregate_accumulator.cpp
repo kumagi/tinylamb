@@ -31,6 +31,7 @@
 #include "common/constants.hpp"
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
+#include "common/platform/extended_float.hpp"
 #include "common/regex_guard.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -232,7 +233,7 @@ namespace {
 
 // Forward declarations for helpers defined further below (sketch codec and
 // long-double conversion); the accumulator methods above use them.
-StatusOr<long double> TryToLongDouble(const Value& value);
+StatusOr<platform::ExtendedFloat> TryToLongDouble(const Value& value);
 std::string FormatWeightDouble(double w);
 
 }  // namespace
@@ -272,9 +273,10 @@ Status AggregateAccumulator::TryApplyCore(
                     std::to_string(weight.value.int_value));
           }
           entry.int_sum = next_sum;
-          entry.sum = static_cast<long double>(next_sum);
+          entry.sum = static_cast<platform::ExtendedFloat>(next_sum);
         } else {
-          entry.sum += static_cast<long double>(weight.value.int_value);
+          entry.sum +=
+              static_cast<platform::ExtendedFloat>(weight.value.int_value);
         }
       } else if (weight.type == ValueType::kDouble) {
         const double w = weight.value.double_value;
@@ -293,9 +295,9 @@ Status AggregateAccumulator::TryApplyCore(
         }
         if (!entry.is_double) {
           entry.is_double = true;
-          entry.sum = static_cast<long double>(entry.int_sum);
+          entry.sum = static_cast<platform::ExtendedFloat>(entry.int_sum);
         }
-        entry.sum += static_cast<long double>(w);
+        entry.sum += static_cast<platform::ExtendedFloat>(w);
         entry.is_double = true;
       } else if (weight.type == ValueType::kNull) {
         // fall through: NULL weight contributes nothing
@@ -531,7 +533,7 @@ Status AggregateAccumulator::TryApplyCore(
     case AggregationType::kVarPop:
     case AggregationType::kStddevSamp:
     case AggregationType::kStddevPop: {
-      ASSIGN_OR_RETURN(long double, x, (TryToLongDouble(value)));
+      ASSIGN_OR_RETURN(platform::ExtendedFloat, x, (TryToLongDouble(value)));
 
       stat_.sx += x;
       stat_.sxx += x * x;
@@ -560,9 +562,9 @@ Status AggregateAccumulator::TryApplyCore(
       if (other.IsNull()) {
         break;
       }
-      ASSIGN_OR_RETURN(long double, y, (TryToLongDouble(value)));
+      ASSIGN_OR_RETURN(platform::ExtendedFloat, y, (TryToLongDouble(value)));
 
-      ASSIGN_OR_RETURN(long double, x, (TryToLongDouble(other)));
+      ASSIGN_OR_RETURN(platform::ExtendedFloat, x, (TryToLongDouble(other)));
 
       stat_.sy += y;
       stat_.syy += y * y;
@@ -787,12 +789,12 @@ int64_t& AggregateAccumulator::FindOrAddTopCount(const Value& value) {
 namespace {
 
 // Long-double conversion shared by the statistical accumulators.
-StatusOr<long double> TryToLongDouble(const Value& value) {
+StatusOr<platform::ExtendedFloat> TryToLongDouble(const Value& value) {
   if (value.type == ValueType::kDouble) {
-    return static_cast<long double>(value.value.double_value);
+    return static_cast<platform::ExtendedFloat>(value.value.double_value);
   }
   if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-    return static_cast<long double>(value.value.int_value);
+    return static_cast<platform::ExtendedFloat>(value.value.int_value);
   }
   return StatusError(StatusCode::kInvalidArgument, "numeric value required");
 }
@@ -1648,62 +1650,62 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       if (count == 0) {
         return Value();
       }
-      const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - (count * mean * mean);
+      const platform::ExtendedFloat mean = stat_.sx / count;
+      const platform::ExtendedFloat ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / count));
     }
     case AggregationType::kVarSamp: {
       if (count < 2) {
         return Value();
       }
-      const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - (count * mean * mean);
+      const platform::ExtendedFloat mean = stat_.sx / count;
+      const platform::ExtendedFloat ssd = stat_.sxx - (count * mean * mean);
       return Value(static_cast<double>(ssd / (count - 1)));
     }
     case AggregationType::kStddevPop: {
       if (count == 0) {
         return Value();
       }
-      const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - (count * mean * mean);
-      return Value(static_cast<double>(std::sqrt(ssd / count)));
+      const platform::ExtendedFloat mean = stat_.sx / count;
+      const platform::ExtendedFloat ssd = stat_.sxx - (count * mean * mean);
+      return Value(static_cast<double>(platform::Sqrt(ssd / count)));
     }
     case AggregationType::kStddevSamp: {
       if (count < 2) {
         return Value();
       }
-      const long double mean = stat_.sx / count;
-      const long double ssd = stat_.sxx - (count * mean * mean);
-      return Value(static_cast<double>(std::sqrt(ssd / (count - 1))));
+      const platform::ExtendedFloat mean = stat_.sx / count;
+      const platform::ExtendedFloat ssd = stat_.sxx - (count * mean * mean);
+      return Value(static_cast<double>(platform::Sqrt(ssd / (count - 1))));
     }
     case AggregationType::kCovarPop: {
       if (count == 0) {
         return Value();
       }
-      const long double mx = stat_.sx / count;
-      const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - (count * mx * my);
+      const platform::ExtendedFloat mx = stat_.sx / count;
+      const platform::ExtendedFloat my = stat_.sy / count;
+      const platform::ExtendedFloat sdd = stat_.sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / count));
     }
     case AggregationType::kCovarSamp: {
       if (count < 2) {
         return Value();
       }
-      const long double mx = stat_.sx / count;
-      const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - (count * mx * my);
+      const platform::ExtendedFloat mx = stat_.sx / count;
+      const platform::ExtendedFloat my = stat_.sy / count;
+      const platform::ExtendedFloat sdd = stat_.sxy - (count * mx * my);
       return Value(static_cast<double>(sdd / (count - 1)));
     }
     case AggregationType::kCorr: {
       if (count < 2) {
         return Value();
       }
-      const long double mx = stat_.sx / count;
-      const long double my = stat_.sy / count;
-      const long double sdd = stat_.sxy - (count * mx * my);
-      const long double vx = stat_.sxx - (count * mx * mx);
-      const long double vy = stat_.syy - (count * my * my);
-      return Value(static_cast<double>(sdd / std::sqrt(vx * vy)));
+      const platform::ExtendedFloat mx = stat_.sx / count;
+      const platform::ExtendedFloat my = stat_.sy / count;
+      const platform::ExtendedFloat sdd = stat_.sxy - (count * mx * my);
+      const platform::ExtendedFloat vx = stat_.sxx - (count * mx * mx);
+      const platform::ExtendedFloat vy = stat_.syy - (count * my * my);
+      return Value(static_cast<double>(sdd / platform::Sqrt(vx * vy)));
     }
     case AggregationType::kMode: {
       // First-insertion order + strictly-greater comparison keeps the first
@@ -1733,11 +1735,11 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       // x is the trailing argument, y the child: Σx lives in sx.
-      const long double mx = stat_.sx / count;
-      const long double my = stat_.sy / count;
-      const long double sxy = stat_.sxy - (count * mx * my);
-      const long double sxx = stat_.sxx - (count * mx * mx);
-      const long double syy = stat_.syy - (count * my * my);
+      const platform::ExtendedFloat mx = stat_.sx / count;
+      const platform::ExtendedFloat my = stat_.sy / count;
+      const platform::ExtendedFloat sxy = stat_.sxy - (count * mx * my);
+      const platform::ExtendedFloat sxx = stat_.sxx - (count * mx * mx);
+      const platform::ExtendedFloat syy = stat_.syy - (count * my * my);
       switch (expression->GetType()) {
         case AggregationType::kRegrAvgX:
           return Value(static_cast<double>(mx));
