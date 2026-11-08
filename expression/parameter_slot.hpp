@@ -23,11 +23,13 @@
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -134,6 +136,113 @@ class ParameterSlot final : public ConstantValue {
   bool use_prepared_values_;
 };
 
+inline bool SamePrintedExpression(const Expression& left,
+                                  const Expression& right);
+
+// QueryExpression::ToString() elides the inner SelectStatement ("EXISTS(...)",
+// "SCALAR_SUBQUERY(...)", ...), so two distinct subqueries produce identical
+// printed text.  Verify that every kQueryExp node in two structurally matching
+// trees points to the same SelectStatement and carries the same flags.
+inline bool SameQuerySubtrees(  // NOLINT(misc-no-recursion)
+    const Expression& left, const Expression& right) {
+  if (left == right) {
+    return true;
+  }
+  if (!left || !right || left->Type() != right->Type()) {
+    return false;
+  }
+  switch (left->Type()) {
+    case TypeTag::kQueryExp: {
+      const auto& lq = left->AsQueryExpression();
+      const auto& rq = right->AsQueryExpression();
+      if (lq.Query() != rq.Query() || lq.Exists() != rq.Exists() ||
+          lq.Negated() != rq.Negated() ||
+          lq.ArrayResult() != rq.ArrayResult() ||
+          lq.ArrayElementSqlType() != rq.ArrayElementSqlType() ||
+          lq.Op() != rq.Op() || lq.Mode() != rq.Mode() ||
+          static_cast<bool>(lq.Test()) != static_cast<bool>(rq.Test())) {
+        return false;
+      }
+      return !lq.Test() || SamePrintedExpression(lq.Test(), rq.Test());
+    }
+    case TypeTag::kBinaryExp: {
+      const auto& lb = left->AsBinaryExpression();
+      const auto& rb = right->AsBinaryExpression();
+      return lb.Op() == rb.Op() && SameQuerySubtrees(lb.Left(), rb.Left()) &&
+             SameQuerySubtrees(lb.Right(), rb.Right());
+    }
+    case TypeTag::kUnaryExp: {
+      const auto& lu = left->AsUnaryExpression();
+      const auto& ru = right->AsUnaryExpression();
+      return lu.Op() == ru.Op() && SameQuerySubtrees(lu.Child(), ru.Child());
+    }
+    case TypeTag::kCastExp:
+      return SameQuerySubtrees(left->AsCastExpression().Child(),
+                               right->AsCastExpression().Child());
+    case TypeTag::kCaseExp: {
+      const auto& lc = left->AsCaseExpression();
+      const auto& rc = right->AsCaseExpression();
+      if (lc.when_clauses_.size() != rc.when_clauses_.size() ||
+          static_cast<bool>(lc.else_clause_) !=
+              static_cast<bool>(rc.else_clause_)) {
+        return false;
+      }
+      for (size_t i = 0; i < lc.when_clauses_.size(); ++i) {
+        if (!SameQuerySubtrees(lc.when_clauses_[i].first,
+                               rc.when_clauses_[i].first) ||
+            !SameQuerySubtrees(lc.when_clauses_[i].second,
+                               rc.when_clauses_[i].second)) {
+          return false;
+        }
+      }
+      return !lc.else_clause_ ||
+             SameQuerySubtrees(lc.else_clause_, rc.else_clause_);
+    }
+    case TypeTag::kInExp: {
+      const auto& li = left->AsInExpression();
+      const auto& ri = right->AsInExpression();
+      if (li.list_.size() != ri.list_.size() ||
+          !SameQuerySubtrees(li.child_, ri.child_)) {
+        return false;
+      }
+      for (size_t i = 0; i < li.list_.size(); ++i) {
+        if (!SameQuerySubtrees(li.list_[i], ri.list_[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case TypeTag::kFunctionCallExp: {
+      const auto& lf = left->AsFunctionCallExpression();
+      const auto& rf = right->AsFunctionCallExpression();
+      if (lf.Args().size() != rf.Args().size()) {
+        return false;
+      }
+      for (size_t i = 0; i < lf.Args().size(); ++i) {
+        if (!SameQuerySubtrees(lf.Args()[i], rf.Args()[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case TypeTag::kArrayExp: {
+      const auto& la = left->AsArrayExpression();
+      const auto& ra = right->AsArrayExpression();
+      if (la.Elements().size() != ra.Elements().size()) {
+        return false;
+      }
+      for (size_t i = 0; i < la.Elements().size(); ++i) {
+        if (!SameQuerySubtrees(la.Elements()[i], ra.Elements()[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return true;
+  }
+}
+
 // Pointer identity, or the same shape. Two ParameterSlots that currently hold
 // the same value are still different parameters: `d_w_id = 1 AND d_id = 1`
 // must not compare equal and let a rewrite move one slot onto the other column.
@@ -153,7 +262,8 @@ inline bool SamePrintedExpression(const Expression& left,
              left_slot->Index() == right_slot->Index();
     }
   }
-  return left->ToString() == right->ToString();
+  return left->ToString() == right->ToString() &&
+         SameQuerySubtrees(left, right);
 }
 
 inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)

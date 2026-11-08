@@ -335,6 +335,9 @@ void TransactionManager::DeadlockDetectorLoop() {
         for (VersionShard& shard : version_shards_) {
           shard.write_intent_released.notify_all();
         }
+        if (page_manager_ != nullptr) {
+          page_manager_->NotifyTableTailWaiters();
+        }
       }
     }
   }

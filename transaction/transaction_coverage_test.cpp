@@ -1,8 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +20,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -97,8 +95,8 @@ bool WaitForCondition(const std::function<bool()>& condition,
 void PointWalAtDevFull(Logger* logger) {
   const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
-  ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
-  ASSERT_EQ(::close(full_fd), 0);
+  ASSERT_EQ(platform::Dup2(full_fd, logger->Fd()), logger->Fd());
+  ASSERT_EQ(platform::CloseFile(full_fd), 0);
 }
 
 // Kills the flush worker for good: after this, AddLog and WaitForDurable

@@ -1,13 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -74,12 +66,15 @@ bool SendAll(int fd, const std::string& bytes) {
 bool ReadUntilReady(int fd, bool* server_error) {
   std::string input;
   while (true) {
-    pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
-    if (poll(&descriptor, 1, 30000) <= 0) {
+    pollfd descriptor{.fd = static_cast<decltype(pollfd::fd)>(fd),
+                      .events = POLLIN,
+                      .revents = 0};
+    if (tinylamb::platform::PollSockets(&descriptor, 1, 30000) <= 0) {
       return false;
     }
     std::array<char, 8192> buffer{};
-    const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+    const ssize_t received =
+        tinylamb::platform::RecvSocket(fd, buffer.data(), buffer.size(), 0);
     if (received <= 0) {
       return false;
     }
@@ -145,12 +140,12 @@ int Connect(const Options& options) {
       connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
           0 ||
       !SendAll(fd, StartupMessage(options))) {
-    close(fd);
+    tinylamb::platform::CloseSocket(fd);
     return -1;
   }
   bool server_error = false;
   if (!ReadUntilReady(fd, &server_error) || server_error) {
-    close(fd);
+    tinylamb::platform::CloseSocket(fd);
     return -1;
   }
   return fd;
@@ -253,7 +248,7 @@ int main(int argc, char** argv) {
         }
       }
       (void)SendAll(fd, std::string("X\0\0\0\4", 5));
-      close(fd);
+      tinylamb::platform::CloseSocket(fd);
     });
   }
 

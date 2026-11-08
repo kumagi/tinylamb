@@ -242,6 +242,10 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     // QueryResults are lazy: drain or the INSERT never happens.
     result.Value().Drain();
   }
+  // Commit setup so read-only queries can trigger lazy LSTableStore creation
+  // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
 
   const int query_count = g.Pick(2, 5);
   std::string report;
@@ -954,6 +958,79 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     return report;  // first mismatch is enough; keep the session short
   }
 
+  // On multi-super-block (`large`, 9,000-row) rounds, probe the 3 selectivity
+  // patterns of `TryStreamGroupedJoin` across 4,096-row LSTable super-blocks:
+  //   0: Pattern A (<5% sparse gather across block 0 & block 1 boundary)
+  //   1: Pattern C (100% block 0) + Pattern B (~22% block 1) + 0% block 2
+  //   2: Pattern B (>92% high-selectivity block 0) + Pattern C (100% block 1/2)
+  if (large) {
+    struct JoinSelProbe {
+      std::string where_sql;
+      int64_t u_lo;
+      int64_t u_hi;
+    };
+    const std::array<JoinSelProbe, 3> kJoinSelProbes = {{
+        {"f.u >= 4000 AND f.u < 4180", 4000, 4180},
+        {"f.u < 5000", 0, 5000},
+        {"f.u >= 300", 300, 9000},
+    }};
+    for (const JoinSelProbe& sp : kJoinSelProbes) {
+      const std::string sql =
+          "SELECT d.tag, COUNT(*), SUM(f.a) FROM fact f JOIN dim d ON f.k = "
+          "d.k WHERE " +
+          sp.where_sql + " GROUP BY d.tag;";
+      std::map<int64_t, std::pair<int64_t, int64_t>> groups;
+      for (const FactRow& f : facts) {
+        if (f.u < sp.u_lo || f.u >= sp.u_hi || f.k == kNullRepr) {
+          continue;
+        }
+        auto range = dims_by_k.equal_range(f.k);
+        for (auto it = range.first; it != range.second; ++it) {
+          auto& [cnt, sum_a] = groups[it->second->tag];
+          ++cnt;
+          if (f.a != kNullRepr) {
+            sum_a += f.a;
+          }
+        }
+      }
+      std::vector<std::string> expected;
+      for (const auto& [tag, agg] : groups) {
+        expected.push_back(FmtStr(tag) + "," + Fmt(agg.first) + "," +
+                           Fmt(agg.second) + ",");
+      }
+      std::sort(expected.begin(), expected.end());
+      std::string error;
+      auto got = RunQuery(db, ctx, sql, &error);
+      if (!got.has_value()) {
+        report += "[JOIN MISMATCH] selectivity probe failed: " + sql +
+                  " :: " + error + "\n";
+        return report;
+      }
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      std::sort(actual.begin(), actual.end());
+      t.queries.push_back({sql, expected});
+      if (actual != expected) {
+        report += "[JOIN MISMATCH] " + sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
+
   // Cross-mode / index-independence verification: build secondary covering
   // indexes on fact and dim, run ANALYZE, and re-verify every recorded query
   // under both the default optimizer and the Cascades grouped route /
@@ -966,6 +1043,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       res.Value().Drain();
     }
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   for (const QueryExpect& qe : t.queries) {
     for (int mode = 0; mode < 2; ++mode) {
       std::string error;
@@ -1023,6 +1102,8 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
     }
     result.Value().Drain();
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   auto check_queries = [&](bool force_relational,
                            const char* tag) -> std::string {
     for (const QueryExpect& q : trace.queries) {
@@ -1072,6 +1153,8 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
       res.Value().Drain();
     }
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   if (std::string rep = check_queries(false, "[JOIN-INDEXED REPLAY MISMATCH]");
       !rep.empty()) {
     return rep;

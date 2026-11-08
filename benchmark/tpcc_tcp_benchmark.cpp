@@ -2,11 +2,6 @@
 
 // Tiny/PG use Simple Query; the optional MySQL adapter uses COM_QUERY.
 // All transports share one TPC-C generator, without transaction rewrites.
-#include <arpa/inet.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -61,7 +56,7 @@ class Session final : public TpccSqlSession {
   Session& operator=(Session&&) = delete;
   ~Session() override {
     if (fd_ >= 0) {
-      close(fd_);
+      platform::CloseSocket(fd_);
     }
   }
   Status Connect(int port) {
@@ -69,11 +64,9 @@ class Session final : public TpccSqlSession {
     if (fd_ < 0) {
       return Status::kIOError;
     }
-    timeval timeout{.tv_sec = 15, .tv_usec = 0};
-    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    int yes = 1;
-    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    (void)platform::SetSocketTimeout(fd_, SO_RCVTIMEO, 15000);
+    (void)platform::SetSocketTimeout(fd_, SO_SNDTIMEO, 15000);
+    (void)platform::SetSocketOptInt(fd_, IPPROTO_TCP, TCP_NODELAY, 1);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
@@ -159,7 +152,7 @@ class Session final : public TpccSqlSession {
   }
   bool Read(char* data, size_t size) const {
     while (size != 0U) {
-      const ssize_t n = recv(fd_, data, size, 0);
+      const ssize_t n = platform::RecvSocket(fd_, data, size, 0);
       if (n < 0 && errno == EINTR) {
         continue;
       }

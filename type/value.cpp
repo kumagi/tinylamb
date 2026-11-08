@@ -647,6 +647,7 @@ std::string FormatDoubleShortest(double value) {
     case ValueType::kArray: {
       std::string out = "ARRAY<" + ArrayElementSqlType() + ">[";
       const auto& elements = ArrayElements();
+      out.reserve(out.size() + elements.size() * 8 + 2);
       for (size_t i = 0; i < elements.size(); ++i) {
         if (i != 0) {
           out += ", ";

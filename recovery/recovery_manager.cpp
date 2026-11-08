@@ -16,10 +16,6 @@
 
 #include "recovery/recovery_manager.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -39,6 +35,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/status_or.hpp"
 #include "page/page_manager.hpp"
 #include "recovery/log_record.hpp"
@@ -56,7 +53,7 @@ RecoveryManager::RecoveryManager(std::string_view log_path, PageManager* pm,
 
 RecoveryManager::ReadFd::~ReadFd() {
   if (fd >= 0) {
-    ::close(fd);
+    platform::CloseFile(fd);
     fd = -1;
   }
 }
@@ -80,7 +77,8 @@ std::shared_ptr<RecoveryManager::ReadFd> RecoveryManager::SegmentFdFor(
   if (ec || !present) {
     return {};
   }
-  const int raw_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  const int raw_fd =
+      platform::OpenFile(path, {.mode = platform::OpenMode::kReadOnly});
   if (raw_fd < 0) {
     return {};
   }
@@ -90,7 +88,7 @@ std::shared_ptr<RecoveryManager::ReadFd> RecoveryManager::SegmentFdFor(
     const auto logical = Logger::SegmentLogicalSize(
         log_name_, index, segment_size_, TornTailTruncationAllowed());
     if (!logical.HasValue()) {
-      ::close(raw_fd);
+      platform::CloseFile(raw_fd);
       return {};
     }
   }
@@ -98,7 +96,7 @@ std::shared_ptr<RecoveryManager::ReadFd> RecoveryManager::SegmentFdFor(
   try {
     fd = std::make_shared<ReadFd>(raw_fd);
   } catch (...) {
-    ::close(raw_fd);
+    platform::CloseFile(raw_fd);
     return {};
   }
   if (segment_fds_.size() >= kMaxCachedReadFds) {
@@ -195,20 +193,21 @@ RecoveryManager::ReadAtResult RecoveryManager::ReadAtDetailed(
         {len - done, segment_size_ - offset,
          static_cast<size_t>(std::min<lsn_t>(
              logical_end - absolute, std::numeric_limits<size_t>::max()))});
-    struct stat file_stat{};
-    if (::fstat(fd->fd, &file_stat) != 0) {
+    int64_t file_size = 0;
+    if (platform::FileSize(fd->fd, &file_size) != 0) {
       return {.bytes = done, .status = ReadAtStatus::kUnavailable};
     }
     ssize_t nread = 0;
     do {
-      nread = ::pread(fd->fd, dst + done, want, static_cast<off_t>(offset));
+      nread = platform::Pread(fd->fd, dst + done, want,
+                              static_cast<int64_t>(offset));
     } while (nread < 0 && errno == EINTR);
     if (nread < 0) {
       return {.bytes = done, .status = ReadAtStatus::kUnavailable};
     }
     const auto bytes_read = static_cast<size_t>(std::max<ssize_t>(nread, 0));
     const bool reached_file_end =
-        std::cmp_greater_equal(offset + bytes_read, file_stat.st_size);
+        std::cmp_greater_equal(offset + bytes_read, file_size);
     if (nread == 0) {
       if (!reached_file_end) {
         return {.bytes = done, .status = ReadAtStatus::kShort};

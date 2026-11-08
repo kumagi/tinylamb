@@ -2288,4 +2288,77 @@ TEST_F(RelationalRegressionTest,
   context.Abort();
 }
 
+TEST_F(RelationalRegressionTest,
+       SelectivityAdaptiveLSTableKernelsMatchAcrossAllRegimes) {
+  RelationalRun(*rs_,
+                "CREATE TABLE SelAdaptiveLineitem ("
+                "shipday INT64, k_int INT64, rf VARCHAR(4), ls VARCHAR(4), "
+                "qty DOUBLE, price DOUBLE, disc DOUBLE, tax DOUBLE)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, tbl,
+                          setup.GetTable("SelAdaptiveLineitem"));
+    for (int64_t i = 0; i < 2000; ++i) {
+      const int64_t shipday = i % 1000;
+      const int64_t k_int = i % 10;
+      const char* rf = (i % 2 == 0) ? "A" : "B";
+      const char* ls = (i % 4 < 2) ? "F" : "O";
+      const double qty = static_cast<double>((i % 50) + 1);
+      const double price = 100.0 + static_cast<double>(i % 20);
+      const double disc = 0.05 * static_cast<double>(i % 3);
+      const double tax = 0.02 * static_cast<double>(i % 4);
+      ASSERT_TRUE(
+          tbl->Insert(setup.txn_,
+                      Row({Value(shipday), Value(k_int), Value(rf), Value(ls),
+                           Value(qty), Value(price), Value(disc), Value(tax)}))
+              .HasValue());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  // Exercise Pattern C (s=100% kDenseAllPass), Pattern B (s=50%
+  // kSelectionPrefetch), and Pattern A (s=1% kSparseGather) on the Q1 5-term
+  // shape, bounded-int group key, general dict group key, and table scan.
+  for (const int64_t threshold : {int64_t{999}, int64_t{499}, int64_t{9}}) {
+    const int64_t expected_rows = (threshold + 1) * 2;
+    // 1. Q1 5-term shape
+    const auto q1_rows = RelationalRun(
+        *rs_,
+        "SELECT rf, ls, SUM(qty), SUM(price), SUM(price * (1.0 - disc)), "
+        "SUM(price * (1.0 - disc) * (1.0 + tax)), AVG(qty), AVG(price), "
+        "AVG(disc), COUNT(*) FROM SelAdaptiveLineitem "
+        "WHERE shipday <= " +
+            std::to_string(threshold) + " GROUP BY rf, ls ORDER BY rf, ls");
+    ASSERT_EQ(q1_rows.size(), 4U);
+    int64_t total_cnt = 0;
+    for (const Row& r : q1_rows) {
+      total_cnt += r[9].value.int_value;
+    }
+    EXPECT_EQ(total_cnt, expected_rows);
+
+    // 2. Bounded-int group key
+    const auto bint_rows = RelationalRun(
+        *rs_,
+        "SELECT k_int, SUM(price * (1.0 - disc)), COUNT(*) "
+        "FROM SelAdaptiveLineitem WHERE shipday <= " +
+            std::to_string(threshold) + " GROUP BY k_int ORDER BY k_int");
+    ASSERT_EQ(bint_rows.size(), 10U);
+    int64_t bint_cnt = 0;
+    for (const Row& r : bint_rows) {
+      bint_cnt += r[2].value.int_value;
+    }
+    EXPECT_EQ(bint_cnt, expected_rows);
+
+    // 3. General dict group key
+    const auto dict_rows = RelationalRun(
+        *rs_,
+        "SELECT rf, SUM(price * disc), COUNT(*) "
+        "FROM SelAdaptiveLineitem WHERE shipday <= " +
+            std::to_string(threshold) + " GROUP BY rf ORDER BY rf");
+    ASSERT_EQ(dict_rows.size(), 2U);
+    EXPECT_EQ(dict_rows[0][2].value.int_value + dict_rows[1][2].value.int_value,
+              expected_rows);
+  }
+}
+
 }  // namespace tinylamb

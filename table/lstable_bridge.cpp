@@ -337,7 +337,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
   const bool any_version_chains = txn.HasAnyPageVersionChains();
   std::unordered_set<page_id_t> visited;
   constexpr uint64_t kMaxLSTableRows = 16'777'216ULL;
-  constexpr uint64_t kMaxLSTableBytes = 1ULL << 30;
+  constexpr uint64_t kMaxLSTableBytes = 4ULL << 30;
   uint64_t estimated_bytes = 0;
   while (page_id != 0) {
     if (!visited.insert(page_id).second) {

@@ -5018,6 +5018,48 @@ TEST_F(OptimizerTest, NotExistsBecomesAntiJoin) {
   EXPECT_EQ(CountRows(executor), 80);
 }
 
+TEST_F(OptimizerTest, DistinctCorrelatedExistsConjunctsBothSurvive) {
+  // Regression for sql_session_fuzz-repro-11321685160750415786 &
+  // 17469116453365515993: two sibling EXISTS / NOT EXISTS conjuncts with
+  // different inner correlation predicates share the printed form
+  // "EXISTS(...)" / "NOT EXISTS(...)" and must not be deduplicated into one.
+  QueryData query;
+  query.from_ = {"Sc1"};
+  Expression first_exists = ExistsSubquery(
+      {NamedExpression("e1")}, "Sc3",
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("Sc1", "c1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                              BinaryOperation::kLessThan,
+                              ConstantValueExp(Value(10)))));
+  Expression second_exists = ExistsSubquery(
+      {NamedExpression("e1")}, "Sc3",
+      BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                              BinaryOperation::kEquals,
+                              ColumnValueExp(ColumnName("Sc1", "c1"))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(ColumnValueExp(ColumnName("Sc3", "e1")),
+                              BinaryOperation::kGreaterThan,
+                              ConstantValueExp(Value(5)))));
+  query.where_ = BinaryExpressionExp(
+      std::move(first_exists), BinaryOperation::kAnd, std::move(second_exists));
+  query.select_ = {NamedExpression("c1")};
+
+  TransactionContext context = rs_->BeginContext();
+  ASSERT_SUCCESS(query.Rewrite(context));
+  const auto plan_or = Optimizer::Optimize(query, context);
+  ASSERT_EQ(plan_or.GetStatus(), Status::kSuccess);
+  Executor executor = plan_or.Value()->EmitExecutor(context);
+  // First EXISTS matches c1 in 1..9; second matches c1 in 6..20;
+  // intersection is 6..9 -> 4 rows.
+  EXPECT_EQ(CountRows(executor), 4);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
 TEST_F(OptimizerTest, NotInWithoutNotNullConstraintUsesNullAwareAntiJoin) {
   // Arrange: fixture columns carry no NOT NULL constraint, so `NOT IN` uses
   // the null-aware anti implementation rather than silently treating NULL as

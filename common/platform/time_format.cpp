@@ -20,7 +20,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+
+#include "common/platform/os.hpp"
 
 namespace tinylamb::platform {
 
@@ -52,7 +55,16 @@ void CivilFromDays(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
   *y = yoe + (era * 400) + (*m <= 2 ? 1 : 0);
 }
 
+#if !defined(_WIN32)
 std::array<char, 4> kGmtZoneName = {'G', 'M', 'T', '\0'};
+#else
+struct WinTmZoneShadow {
+  const struct tm* ptr = nullptr;
+  long gmtoff = 0;
+  const char* zone = "GMT";
+};
+thread_local WinTmZoneShadow tls_win_tm_shadow;
+#endif
 
 }  // namespace
 
@@ -73,8 +85,12 @@ void GmTime(int64_t seconds, struct tm* out) {
   out->tm_wday = static_cast<int>(((days % 7) + 11) % 7);  // 1970-01-01: Thu
   out->tm_yday = static_cast<int>(days - DaysFromCivil(y, 1, 1));
   out->tm_isdst = 0;
+#if !defined(_WIN32)
   out->tm_gmtoff = 0;
   out->tm_zone = kGmtZoneName.data();
+#else
+  tls_win_tm_shadow = {.ptr = out, .gmtoff = 0, .zone = "GMT"};
+#endif
 }
 
 int64_t TimeGm(struct tm* tm) {
@@ -86,6 +102,15 @@ int64_t TimeGm(struct tm* tm) {
                           (int64_t{tm->tm_min} * 60) + tm->tm_sec;
   GmTime(seconds, tm);
   return seconds;
+}
+
+void LocalTime(std::time_t seconds, struct tm* out) {
+  *out = {};
+#if defined(_WIN32)
+  (void)::localtime_s(out, &seconds);
+#else
+  (void)::localtime_r(&seconds, out);
+#endif
 }
 
 #ifdef __GLIBC__
@@ -115,12 +140,36 @@ bool IsSpace(char c) {
 }
 bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
+void SetTmGmtoff(struct tm* tm, long offset) {
+#if !defined(_WIN32)
+  tm->tm_gmtoff = offset;
+#else
+  tls_win_tm_shadow = {.ptr = tm, .gmtoff = offset, .zone = "GMT"};
+#endif
+}
+
+long GetTmGmtoff(const struct tm* tm) {
+#if !defined(_WIN32)
+  return tm->tm_gmtoff;
+#else
+  return tls_win_tm_shadow.ptr == tm ? tls_win_tm_shadow.gmtoff : 0L;
+#endif
+}
+
+const char* GetTmZone(const struct tm* tm) {
+#if !defined(_WIN32)
+  return tm->tm_zone;
+#else
+  return tls_win_tm_shadow.ptr == tm ? tls_win_tm_shadow.zone : "GMT";
+#endif
+}
+
 // glibc's "%z": optional leading blanks, then "Z", or a sign followed by
 // "hh", "hhmm" or "hh:mm" (minutes < 60). Stores the offset in tm_gmtoff.
 const char* ParseOffset(const char* rp, struct tm* tm) {
   while (IsSpace(*rp)) ++rp;
   if (*rp == 'Z') {
-    tm->tm_gmtoff = 0;
+    SetTmGmtoff(tm, 0);
     return rp + 1;
   }
   if (*rp != '+' && *rp != '-') return nullptr;
@@ -138,7 +187,7 @@ const char* ParseOffset(const char* rp, struct tm* tm) {
     return nullptr;
   }
   long offset = (value / 100) * 3600L + (value % 100) * 60L;
-  tm->tm_gmtoff = negative ? -offset : offset;
+  SetTmGmtoff(tm, negative ? -offset : offset);
   return rp;
 }
 
@@ -149,6 +198,237 @@ const char* SkipZoneName(const char* rp) {
   return rp;
 }
 
+#if defined(_WIN32)
+const char* ParseIntField(const char* rp, int max_digits, int min_val,
+                          int max_val, int* out,
+                          bool allow_leading_space = true) {
+  if (allow_leading_space) {
+    while (*rp == ' ' || *rp == '\t') ++rp;
+  }
+  bool neg = false;
+  if (min_val < 0 && (*rp == '+' || *rp == '-')) {
+    neg = (*rp == '-');
+    ++rp;
+  }
+  if (!IsDigit(*rp)) return nullptr;
+  int val = 0;
+  int count = 0;
+  while (count < max_digits && IsDigit(*rp)) {
+    val = (val * 10) + (*rp - '0');
+    ++rp;
+    ++count;
+  }
+  if (neg) val = -val;
+  if (val < min_val || val > max_val) return nullptr;
+  *out = val;
+  return rp;
+}
+
+bool StartsWithIgnoreCase(const char* s, const char* prefix, size_t* len) {
+  size_t i = 0;
+  while (prefix[i] != '\0') {
+    if (std::tolower(static_cast<unsigned char>(s[i])) !=
+        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+      return false;
+    }
+    ++i;
+  }
+  *len = i;
+  return true;
+}
+
+const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
+  static constexpr std::array<const char*, 12> kMonthsFull = {
+      "January", "February", "March",     "April",   "May",      "June",
+      "July",    "August",   "September", "October", "November", "December"};
+  static constexpr std::array<const char*, 12> kMonthsAbbr = {
+      "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  static constexpr std::array<const char*, 7> kDaysFull = {
+      "Sunday",   "Monday", "Tuesday", "Wednesday",
+      "Thursday", "Friday", "Saturday"};
+  static constexpr std::array<const char*, 7> kDaysAbbr = {
+      "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+  for (const char* fp = fmt; *fp != '\0'; ++fp) {
+    if (IsSpace(*fp)) {
+      while (IsSpace(*rp)) ++rp;
+      continue;
+    }
+    if (*fp != '%') {
+      if (*rp != *fp) return nullptr;
+      ++rp;
+      continue;
+    }
+    ++fp;
+    if (*fp == 'E' || *fp == 'O') ++fp;
+    switch (*fp) {
+      case '%':
+        if (*rp != '%') return nullptr;
+        ++rp;
+        break;
+      case 'n':
+      case 't':
+        while (IsSpace(*rp)) ++rp;
+        break;
+      case 'Y': {
+        int y = 0;
+        rp = ParseIntField(rp, 4, -9999, 9999, &y);
+        if (rp == nullptr) return nullptr;
+        tm->tm_year = y - 1900;
+        break;
+      }
+      case 'y': {
+        int y = 0;
+        rp = ParseIntField(rp, 2, 0, 99, &y);
+        if (rp == nullptr) return nullptr;
+        tm->tm_year = (y >= 69 ? y : y + 100);
+        break;
+      }
+      case 'C': {
+        int c = 0;
+        rp = ParseIntField(rp, 2, 0, 99, &c);
+        if (rp == nullptr) return nullptr;
+        tm->tm_year = (c * 100) - 1900 + (tm->tm_year % 100);
+        break;
+      }
+      case 'm': {
+        int m = 0;
+        rp = ParseIntField(rp, 2, 1, 12, &m);
+        if (rp == nullptr) return nullptr;
+        tm->tm_mon = m - 1;
+        break;
+      }
+      case 'B':
+      case 'b':
+      case 'h': {
+        while (IsSpace(*rp)) ++rp;
+        bool matched = false;
+        for (int i = 0; i < 12; ++i) {
+          size_t len = 0;
+          if (StartsWithIgnoreCase(rp, kMonthsFull[i], &len) ||
+              StartsWithIgnoreCase(rp, kMonthsAbbr[i], &len)) {
+            tm->tm_mon = i;
+            rp += len;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) return nullptr;
+        break;
+      }
+      case 'd':
+      case 'e': {
+        int d = 0;
+        rp = ParseIntField(rp, 2, 1, 31, &d);
+        if (rp == nullptr) return nullptr;
+        tm->tm_mday = d;
+        break;
+      }
+      case 'j': {
+        int j = 0;
+        rp = ParseIntField(rp, 3, 1, 366, &j);
+        if (rp == nullptr) return nullptr;
+        tm->tm_yday = j - 1;
+        break;
+      }
+      case 'H': {
+        int h = 0;
+        rp = ParseIntField(rp, 2, 0, 23, &h);
+        if (rp == nullptr) return nullptr;
+        tm->tm_hour = h;
+        break;
+      }
+      case 'I': {
+        int h = 0;
+        rp = ParseIntField(rp, 2, 1, 12, &h);
+        if (rp == nullptr) return nullptr;
+        tm->tm_hour = (h == 12) ? 0 : h;
+        break;
+      }
+      case 'p': {
+        while (IsSpace(*rp)) ++rp;
+        size_t len = 0;
+        if (StartsWithIgnoreCase(rp, "AM", &len)) {
+          if (tm->tm_hour == 12) tm->tm_hour = 0;
+          rp += len;
+        } else if (StartsWithIgnoreCase(rp, "PM", &len)) {
+          if (tm->tm_hour < 12) tm->tm_hour += 12;
+          rp += len;
+        } else {
+          return nullptr;
+        }
+        break;
+      }
+      case 'M': {
+        int m = 0;
+        rp = ParseIntField(rp, 2, 0, 59, &m);
+        if (rp == nullptr) return nullptr;
+        tm->tm_min = m;
+        break;
+      }
+      case 'S': {
+        int s = 0;
+        rp = ParseIntField(rp, 2, 0, 60, &s);
+        if (rp == nullptr) return nullptr;
+        tm->tm_sec = s;
+        break;
+      }
+      case 'a':
+      case 'A': {
+        while (IsSpace(*rp)) ++rp;
+        bool matched = false;
+        for (int i = 0; i < 7; ++i) {
+          size_t len = 0;
+          if (StartsWithIgnoreCase(rp, kDaysFull[i], &len) ||
+              StartsWithIgnoreCase(rp, kDaysAbbr[i], &len)) {
+            tm->tm_wday = i;
+            rp += len;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) return nullptr;
+        break;
+      }
+      case 'w': {
+        int w = 0;
+        rp = ParseIntField(rp, 1, 0, 6, &w);
+        if (rp == nullptr) return nullptr;
+        tm->tm_wday = w;
+        break;
+      }
+      case 'u': {
+        int u = 0;
+        rp = ParseIntField(rp, 1, 1, 7, &u);
+        if (rp == nullptr) return nullptr;
+        tm->tm_wday = u % 7;
+        break;
+      }
+      case 'F':
+        rp = PortableStrptime(rp, "%Y-%m-%d", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'T':
+        rp = PortableStrptime(rp, "%H:%M:%S", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'R':
+        rp = PortableStrptime(rp, "%H:%M", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'D':
+        rp = PortableStrptime(rp, "%m/%d/%y", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      default:
+        return nullptr;
+    }
+  }
+  return rp;
+}
+#endif
+
 }  // namespace
 
 const char* ParseTime(const char* input, const char* format, struct tm* tm) {
@@ -157,7 +437,11 @@ const char* ParseTime(const char* input, const char* format, struct tm* tm) {
   const char* rp = input;
   auto flush = [&]() -> bool {
     if (piece.empty()) return true;
+#if defined(_WIN32)
+    rp = PortableStrptime(rp, piece.c_str(), tm);
+#else
     rp = ::strptime(rp, piece.c_str(), tm);
+#endif
     piece.clear();
     return rp != nullptr;
   };
@@ -204,7 +488,7 @@ size_t FormatTime(char* out, size_t size, const char* format,
       ++spec;
     }
     if (*spec == 'z') {
-      const long offset = tm->tm_gmtoff;
+      const long offset = GetTmGmtoff(tm);
       const long magnitude = offset < 0 ? -offset : offset;
       std::array<char, 16> text{};
       (void)std::snprintf(text.data(), text.size(), "%c%02ld%02ld",
@@ -215,7 +499,7 @@ size_t FormatTime(char* out, size_t size, const char* format,
       continue;
     }
     if (*spec == 'Z') {
-      for (const char* zone = tm->tm_zone; zone != nullptr && *zone != '\0';
+      for (const char* zone = GetTmZone(tm); zone != nullptr && *zone != '\0';
            ++zone) {
         if (*zone == '%') expanded.push_back('%');
         expanded.push_back(*zone);

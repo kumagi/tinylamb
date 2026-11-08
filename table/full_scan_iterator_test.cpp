@@ -16,9 +16,6 @@
 
 #include "full_scan_iterator.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +28,7 @@
 
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -56,8 +54,8 @@ namespace {
 void ForceScanWalFailure(Logger* logger) {
   const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
-  ASSERT_EQ(::dup2(full_fd, logger->Fd()), logger->Fd());
-  ASSERT_EQ(::close(full_fd), 0);
+  ASSERT_EQ(platform::Dup2(full_fd, logger->Fd()), logger->Fd());
+  ASSERT_EQ(platform::CloseFile(full_fd), 0);
   std::ignore = logger->AddLog("dead");
   ASSERT_NE(logger->WaitForDurable(logger->BufferedLSN()), Status::kSuccess);
   ASSERT_TRUE(logger->Failed());

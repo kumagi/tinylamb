@@ -636,6 +636,8 @@ class Transaction final {
   void DebugSetTid(int64_t tid) noexcept {
     debug_tid_.store(tid, std::memory_order_relaxed);
   }
+  void NoteWaitForHolder(txn_id_t holder, RowPosition row) const;
+  void ClearWaitForHolder() const;
   // Why the last AcquireWriteIntent (via AddWriteSet) returned false.  Owner-
   // thread confined: written by the thread that runs the transaction's writes
   // and read by that same thread's executor to build the conflict diagnostic.

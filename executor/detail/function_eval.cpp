@@ -1355,7 +1355,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
-    gmtime_r(&now, &t);
+    platform::GmTime(static_cast<int64_t>(now), &t);
     std::array<char, 32> buf{};
     (void)snprintf(buf.data(), buf.size(), "%02d:%02d:%02d", t.tm_hour,
                    t.tm_min, t.tm_sec);
@@ -1393,7 +1393,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
-    gmtime_r(&now, &t);
+    platform::GmTime(static_cast<int64_t>(now), &t);
     CivilTime current{.year = t.tm_year + 1900,
                       .month = t.tm_mon + 1,
                       .day = t.tm_mday,
@@ -1423,7 +1423,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
-    gmtime_r(&now, &t);
+    platform::GmTime(static_cast<int64_t>(now), &t);
     std::chrono::year_month_day ymd{
         std::chrono::year{t.tm_year + 1900},
         std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
@@ -6137,7 +6137,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   if (name == "current_timestamp") {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    gmtime_r(&now, &tm);
+    platform::GmTime(static_cast<int64_t>(now), &tm);
     std::array<char, 32> buffer{};
     if (std::strftime(buffer.data(), buffer.size(), "%Y-%m-%d %H:%M:%S", &tm) ==
         0) {

@@ -1,13 +1,5 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
-// clang-format off
-// NOLINTNEXTLINE(modernize-deprecated-headers) // POSIX setenv/unsetenv live here.
-#include <stdlib.h>
-// clang-format on
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -37,6 +29,7 @@
 
 #include "benchmark/tpch_queries.hpp"
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "executor/executor_base.hpp"
@@ -368,27 +361,21 @@ bool GenerateData(const Options& options, std::string* error) {
     return false;
   }
 
-  const std::string executable = fs::absolute(options.dbgen).string();
+  const fs::path executable = fs::absolute(options.dbgen);
   const std::string data_dir = fs::absolute(options.data_dir).string();
   const std::string config_dir = fs::absolute(options.dbgen_config).string();
   const std::string scale = ScaleText(options.scale_factor);
-  const pid_t child = fork();
-  if (child < 0) {
-    *error = "fork failed";
-    return false;
-  }
-  if (child == 0) {
-    setenv("DSS_PATH", data_dir.c_str(), 1);
-    setenv("DSS_CONFIG", config_dir.c_str(), 1);
-    setenv("DSS_DIST", "dists.dss", 1);
-    execl(executable.c_str(), executable.c_str(), "-q", "-f", "-s",
-          scale.c_str(), static_cast<char*>(nullptr));
-    _exit(127);
-  }
-  int status = 0;
-  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
-      WEXITSTATUS(status) != 0) {
-    *error = "DBGEN failed with status " + std::to_string(status);
+  std::string spawn_error;
+  const int rc =
+      tinylamb::platform::RunProcess(executable, {"-q", "-f", "-s", scale},
+                                     {{"DSS_PATH", data_dir},
+                                      {"DSS_CONFIG", config_dir},
+                                      {"DSS_DIST", "dists.dss"}},
+                                     &spawn_error);
+  if (rc != 0) {
+    *error = spawn_error.empty()
+                 ? ("DBGEN failed with status " + std::to_string(rc))
+                 : spawn_error;
     return false;
   }
   for (const TableSpec& table : Tables()) {
@@ -851,11 +838,12 @@ int main(int argc, char** argv) {
   }
 
   if (std::getenv("TINYLAMB_PAGE_POOL_BYTES") == nullptr) {
-    setenv("TINYLAMB_PAGE_POOL_BYTES", "17179869184", 0);
+    tinylamb::platform::SetEnv("TINYLAMB_PAGE_POOL_BYTES", "17179869184", 0);
   }
   // Cap query working memory so join/agg/sort spill before the host thrashs.
   if (std::getenv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
-    setenv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592", 0);  // 8 GiB
+    tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592",
+                               0);  // 8 GiB
   }
   const Clock::time_point load_begin = Clock::now();
   auto database_or_status =

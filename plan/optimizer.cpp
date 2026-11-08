@@ -2012,6 +2012,28 @@ struct DecorrelationSpec {
   std::vector<Expression> inner_conjuncts;
 };
 
+bool SameExpressionList(const std::vector<Expression>& left,
+                        const std::vector<Expression>& right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < left.size(); ++i) {
+    if (!SameExpression(left[i], right[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameDecorrelationSpec(const DecorrelationSpec& left,
+                           const DecorrelationSpec& right) {
+  return left.kind == right.kind && left.from == right.from &&
+         left.aliases == right.aliases &&
+         SameExpressionList(left.outer_keys, right.outer_keys) &&
+         SameExpressionList(left.inner_keys, right.inner_keys) &&
+         SameExpressionList(left.inner_conjuncts, right.inner_conjuncts);
+}
+
 using TablesMap = std::unordered_map<std::string, std::shared_ptr<Table>>;
 
 // True when the underlying table column cannot hold NULL. When this is false,
@@ -2911,7 +2933,8 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
           // already reshaped and silently drops every row.
           const auto duplicate =
               std::ranges::find_if(candidates, [&](const auto& entry) {
-                return SameExpression(entry.second, conjunct);
+                return SameDecorrelationSpec(entry.first, *spec) ||
+                       SameExpression(entry.second, conjunct);
               });
           if (duplicate == candidates.end()) {
             candidates.emplace_back(std::move(*spec), conjunct);
@@ -2933,7 +2956,7 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
           // ("u" output for ColumnValue(t.u)) drops the qualifier, so the
           // key is only covered when the item emits it under the same name.
           const bool key_covered = std::ranges::any_of(
-              expanded_select, [&](const NamedExpression& item) {
+              projection_items, [&](const NamedExpression& item) {
                 if (!item.expression ||
                     item.expression->Type() != TypeTag::kColumnValue ||
                     item.expression->AsColumnValue().GetColumnName() != key) {

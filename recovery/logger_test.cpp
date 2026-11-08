@@ -16,9 +16,6 @@
 
 #include "logger.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -37,6 +34,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
@@ -270,8 +268,8 @@ TEST_F(LoggerTest, WriteErrorUnblocksAllWaiters) {
   // Linux: ENOSPC) so every write() fails while the fd itself stays valid.
   const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
-  ASSERT_EQ(::dup2(full_fd, l_->Fd()), l_->Fd());
-  ASSERT_EQ(::close(full_fd), 0);
+  ASSERT_EQ(platform::Dup2(full_fd, l_->Fd()), l_->Fd());
+  ASSERT_EQ(platform::CloseFile(full_fd), 0);
 
   // Act -- enqueue data; the worker hits ENOSPC and must record the failure
   // instead of dying silently. The enqueue itself may observe the failure

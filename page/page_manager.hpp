@@ -150,6 +150,7 @@ class PageManager {
   void AdvanceTableTail(page_id_t first_page, page_id_t expected,
                         page_id_t next);
   void ForgetTableTail(page_id_t first_page);
+  void NotifyTableTailWaiters();
 
   // LSM-Tree Index operations (arbitrary key and value sizes).
   Status LsmInsert(Transaction& txn, page_id_t tree_id, std::string_view key,

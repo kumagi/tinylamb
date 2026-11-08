@@ -571,6 +571,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     return new_pos;
   }
   if (s == Status::kSuccess) {
+    // Release the in-place page's exclusive latch BEFORE index maintenance:
+    // holding a RowPage latch while IndexDelete/IndexInsert acquires
+    // AcquireIndexWriteGuard inverts lock order against IndexScan, which holds
+    // AcquireIndexReadGuard while pinning RowPages via Table::Read.
+    page.PageUnlock();
     Status failure = Status::kSuccess;
     size_t deleted = 0;
     for (; deleted < indexes_.size(); ++deleted) {
@@ -581,13 +586,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       }
     }
     if (deleted < indexes_.size()) {
-      // The physical row was rewritten in place: put back the deleted keys
-      // and roll the row image back to the pre-update one.  Release the
-      // in-place page's exclusive latch BEFORE reinstating: the
-      // versioned-unique probe in IndexInsert re-pins this same row page
-      // shared when a retained entry lives there (see the insert loop
-      // below); recursive shared_mutex acquisition on one thread is UB.
-      page.PageUnlock();
       reinstate_old_keys(deleted, pos);
       const Status restore_status = restore_physical_row();
       return contextualize(
@@ -595,13 +593,6 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
           "in-place index update");
     }
     size_t inserted = 0;
-    // Release the in-place page's exclusive latch BEFORE the insert loop:
-    // a versioned-unique IndexInsert probes Read(txn, value.pos), which
-    // re-pins the same row page shared when a retained entry lives there --
-    // recursive shared_mutex acquisition on one thread is UB/hang (the
-    // relocation path below unlocks for the same reason).  The latch is
-    // re-taken by restore_physical_row's GetPage on failure.
-    page.PageUnlock();
     for (; inserted < indexes_.size(); ++inserted) {
       failure = IndexInsert(txn, indexes_[inserted], row, new_pos,
                             &idx_cursors[inserted]);

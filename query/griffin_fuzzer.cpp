@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -757,9 +758,9 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
 bool SetBytecodeDisabled(bool disabled) {
   const bool was = std::getenv("TINYLAMB_DISABLE_BYTECODE") != nullptr;
   if (disabled) {
-    setenv("TINYLAMB_DISABLE_BYTECODE", "1", 1);
+    platform::SetEnv("TINYLAMB_DISABLE_BYTECODE", "1");
   } else {
-    unsetenv("TINYLAMB_DISABLE_BYTECODE");
+    platform::UnsetEnv("TINYLAMB_DISABLE_BYTECODE");
   }
   return was;
 }

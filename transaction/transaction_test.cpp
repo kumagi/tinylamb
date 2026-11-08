@@ -16,9 +16,6 @@
 
 #include "transaction/transaction.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +31,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -554,8 +552,8 @@ TEST_F(TransactionTest, PreCommitLoggerFailureLeavesAbortedNotHalfCommitted) {
   // WaitForDurable must surface a write error.
   const int full_fd = platform::OpenWriteFailingDescriptor();
   ASSERT_GE(full_fd, 0);
-  ASSERT_EQ(::dup2(full_fd, l_->Fd()), l_->Fd());
-  ASSERT_EQ(::close(full_fd), 0);
+  ASSERT_EQ(platform::Dup2(full_fd, l_->Fd()), l_->Fd());
+  ASSERT_EQ(platform::CloseFile(full_fd), 0);
 
   EXPECT_NE(txn.PreCommit(), Status::kSuccess);
 

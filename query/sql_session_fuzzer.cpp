@@ -324,7 +324,7 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
     auto p = std::make_unique<SPred>();
     if (subq != SubqMode::kNone &&
         t.columns[static_cast<size_t>(col)].type == ColType::kInt &&
-        g.Chance(18)) {
+        g.Chance(28)) {
       // col [NOT] IN (SELECT int_col FROM tblN) — exercises the semi/anti
       // decorrelation path inside UPDATE/DELETE WHERE clauses.  The
       // subquery's relation must differ from the target: a self-referencing
@@ -360,7 +360,7 @@ SPredPtr GenPred(Gen& g, const MirrorTable& t,
           }
           p->sub_render =
               "(SELECT " + ColName(sub_col) + " FROM " + sub_t.name + ")";
-          const int flavor = g.Pick(0, 4);
+          const int flavor = g.Pick(0, 5);
           if (flavor == 0 || flavor == 1) {
             p->kind = SPred::Kind::kInSubquery;
             return p;
@@ -1253,6 +1253,9 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     return "";
   }
   Database* db = sdb.get();
+  // Both contexts execute on this single thread, so a conflicting writer's
+  // holder cannot progress while the waiter parks; fail conflicts at once.
+  db->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
 
   // ---- setup phase: schema + seed rows under one committed txn ----
   TransactionContext setup_ctx = db->BeginContext();
@@ -1420,6 +1423,7 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
                std::to_string(step) + "\n";
       }
       db = sdb.get();
+      db->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
       ctxs[static_cast<size_t>(0)] = db->BeginContext();
       ctxs[static_cast<size_t>(1)] = db->BeginContext();
       owner.clear();
@@ -1862,7 +1866,8 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       kIndex,
       kDropTable,
       kCreateTable,
-      kAnalyze
+      kAnalyze,
+      kMerge
     };
     Op op = Op::kCheck;
     const int roll = g.Pick(1, 100);
@@ -1887,6 +1892,11 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       // invisible to the row mirror but it walks the stats B+Tree inside
       // the open transaction, so abort/crash must roll it back cleanly.
       op = Op::kAnalyze;
+    } else if (roll <= 90 && !target->rows.empty() &&
+               target->unique_keys.empty()) {
+      // MERGE INTO with WHEN MATCHED (UPDATE / DELETE) and WHEN NOT MATCHED
+      // (INSERT) against a single-row inline source table on unique key `u`.
+      op = Op::kMerge;
     } else {
       op = Op::kCheck;
     }
@@ -2442,6 +2452,79 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         t.steps.push_back({.sql = sql});
         break;
       }
+      case Op::kMerge: {
+        // Choose whether the single-row source matches an existing `u` (65%)
+        // or inserts a fresh `target->next_u` (35%).
+        const bool match_existing = g.Chance(65) && !target->rows.empty();
+        const size_t match_pos =
+            match_existing ? static_cast<size_t>(g.Pick(
+                                 0, static_cast<int>(target->rows.size()) - 1))
+                           : target->rows.size();
+        const int64_t su =
+            match_existing ? RowU(target->rows[match_pos]) : target->next_u;
+        std::vector<std::pair<int64_t, ColType>> src_values;
+        std::string src_select = "SELECT " + std::to_string(su) + " AS su";
+        std::string ins_vals = "(src.su";
+        for (size_t i = 1; i < target->columns.size(); ++i) {
+          // Use non-NULL literals in the inline SELECT so GoogleSQL infers the
+          // exact column type (INT64 / VARCHAR / DOUBLE) without CAST.
+          const ColType ct = target->columns[i].type;
+          int64_t repr = 0;
+          std::string lit;
+          if (ct == ColType::kInt) {
+            repr = g.Pick(-3, 3);
+            lit = std::to_string(repr);
+          } else if (ct == ColType::kDbl) {
+            repr = g.Pick(-6, 6);
+            lit = DblLit(repr);
+          } else {
+            repr = g.Chance(55) ? kStrA : kStrB;
+            lit = (repr == kStrA ? "'a'" : "'bb'");
+          }
+          src_values.emplace_back(repr, ct);
+          const std::string alias = "sc" + std::to_string(i);
+          src_select += ", " + lit + " AS " + alias;
+          ins_vals += ", src." + alias;
+        }
+        ins_vals += ")";
+        const std::string sql = "MERGE INTO " + target->name + " USING (" +
+                                src_select + ") AS src ON " + target->name +
+                                ".u = src.su "
+                                "WHEN MATCHED AND " +
+                                target->name +
+                                ".c1 IS NOT NULL THEN UPDATE SET c1 = src.sc1 "
+                                "WHEN MATCHED THEN DELETE "
+                                "WHEN NOT MATCHED THEN INSERT VALUES " +
+                                ins_vals + ";";
+        if (verbose) {
+          std::cerr << "[session][stmt] " << sql << "\n";
+        }
+        std::string why;
+        if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
+          t.steps.push_back({.sql = sql});
+          std::string err = "MERGE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
+        }
+        t.steps.push_back({.sql = sql});
+        if (match_existing) {
+          Row& r = target->rows[match_pos];
+          if (!r[1].IsNull()) {
+            const Row built = BuildRow(su, src_values);
+            r[1] = built[1];
+          } else {
+            target->rows.erase(target->rows.begin() +
+                               static_cast<ptrdiff_t>(match_pos));
+          }
+        } else {
+          target->rows.push_back(BuildRow(su, src_values));
+          ++target->next_u;
+        }
+        break;
+      }
       case Op::kCheck: {
         std::string error;
         error.reserve(64);
@@ -2517,6 +2600,7 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
     return "failed to create replay database\n";
   }
   Database* db = sdb.get();
+  db->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
   // Context 0 begins implicitly; context 1 begins at "-- begin2" so its
   // snapshot timestamp matches generation exactly.
   std::array<std::optional<TransactionContext>, 2> ctxs;
@@ -2558,6 +2642,7 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         return "replay crash reopen failed at step " + std::to_string(i) + "\n";
       }
       db = sdb.get();
+      db->SetDeadlockPolicy(Database::DeadlockPolicy::kNoWait);
       ctxs[static_cast<size_t>(0)].emplace(db->BeginContext());
       if (ctxs[static_cast<size_t>(1)].has_value()) {
         ctxs[static_cast<size_t>(1)].emplace(db->BeginContext());

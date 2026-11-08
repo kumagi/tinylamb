@@ -33,6 +33,9 @@ namespace tinylamb::platform {
 int64_t TimeGm(struct tm* tm);
 // Fills `out` with the UTC calendar time of `seconds` since the epoch.
 void GmTime(int64_t seconds, struct tm* out);
+// Fills `out` with the local calendar time of `seconds` since the epoch
+// (localtime_r on POSIX, localtime_s on Windows).
+void LocalTime(std::time_t seconds, struct tm* out);
 
 // strptime(3)/strftime(3) with glibc's time-zone semantics on every platform.
 // The engine works on UTC-normalized `struct tm` values, so the process's

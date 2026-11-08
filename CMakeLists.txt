@@ -145,6 +145,8 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
         file(CHMOD "${_googlesql_executable}"
              PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
                          GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    elseif(WIN32)
+        set(_googlesql_executable "execute_query.exe")
     else()
         message(WARNING
                 "No prebuilt GoogleSQL parser is available for this platform; "
@@ -152,7 +154,7 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
         set(TINYLAMB_ENABLE_GOOGLESQL OFF)
     endif()
 
-    if(TINYLAMB_ENABLE_GOOGLESQL AND NOT EXISTS "${_googlesql_executable}")
+    if(TINYLAMB_ENABLE_GOOGLESQL AND NOT WIN32 AND NOT EXISTS "${_googlesql_executable}")
         if(EXISTS "/google/bin/releases/googlesql-devtools/execute_query/execute_query")
             file(MAKE_DIRECTORY "${_googlesql_download_dir}")
             file(COPY "/google/bin/releases/googlesql-devtools/execute_query/execute_query"
@@ -299,6 +301,8 @@ if(APPLE)
     # common/platform/time_zone.cpp: Apple's libc++ ships no C++20 tzdb, so
     # zone lookups go through CFTimeZone.
     target_link_libraries(tinylamb_common PUBLIC "-framework CoreFoundation")
+elseif(WIN32)
+    target_link_libraries(tinylamb_common PUBLIC ws2_32)
 endif()
 
 # Layer 2: type system.
@@ -711,7 +715,9 @@ target_compile_definitions(tinylamb_tpch_benchmark PRIVATE
     TINYLAMB_TPCH_DBGEN_EXECUTABLE="${_tpch_dbgen_source_dir}/dbgen"
     TINYLAMB_TPCH_DBGEN_CONFIG="${_tpch_dbgen_source_dir}"
     TINYLAMB_TPCH_DBGEN_COMMIT="${TINYLAMB_TPCH_DBGEN_COMMIT}")
-add_dependencies(tinylamb_tpch_benchmark tinylamb_tpch_dbgen)
+if(NOT WIN32)
+    add_dependencies(tinylamb_tpch_benchmark tinylamb_tpch_dbgen)
+endif()
 
 add_executable(tinylamb_tpcds_benchmark EXCLUDE_FROM_ALL
         benchmark/tpcds_benchmark.cpp)
@@ -836,14 +842,20 @@ if(BUILD_TESTING)
         # tight under a fully parallel build, and on macOS the first launch of
         # a freshly linked (LLVM-sized) binary also waits for the system's
         # executable scan.
+        set(_discovery_mode "")
+        if(CMAKE_CROSSCOMPILING)
+            set(_discovery_mode DISCOVERY_MODE PRE_TEST)
+        endif()
         if(SIMPLE_TEST_TIMEOUT)
             gtest_discover_tests(${target_name}
+                                 ${_discovery_mode}
                                  DISCOVERY_TIMEOUT 120
                                  PROPERTIES
                                  ENVIRONMENT "${_test_env}"
                                  TIMEOUT ${SIMPLE_TEST_TIMEOUT})
         else()
             gtest_discover_tests(${target_name}
+                                 ${_discovery_mode}
                                  DISCOVERY_TIMEOUT 120
                                  PROPERTIES ENVIRONMENT "${_test_env}")
         endif()

@@ -5,6 +5,11 @@
 
 #include "query/googlesql_frontend.hpp"
 
+#include "common/platform/os.hpp"
+#include "common/platform/process.hpp"
+#include "common/platform/socket.hpp"
+
+#if defined(TINYLAMB_OS_POSIX)
 #include <fcntl.h>
 #include <poll.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers) POSIX sigset_t APIs
@@ -17,6 +22,15 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#elif defined(TINYLAMB_OS_WINDOWS)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -26,6 +40,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <ranges>
@@ -35,17 +50,14 @@
 #include <unordered_map>
 #include <utility>
 
-#include "common/platform/os.hpp"
-#include "common/platform/process.hpp"
-#include "common/platform/socket.hpp"
-
 namespace tinylamb {
 namespace {
 
 // Everything in this anonymous namespace is only reachable when the external
 // GoogleSQL parser is wired in; guard the definitions themselves so builds
 // without TINYLAMB_GOOGLESQL_EXECUTABLE stay warning-clean.
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
+    (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
 
 constexpr size_t kParseCacheShards = 16;
 constexpr size_t kMaxCachedStatements = 1024;
@@ -114,6 +126,134 @@ std::array<ParseShard, kParseCacheShards> parse_shards;
 ParseShard& ShardFor(std::string_view sql) {
   return parse_shards[std::hash<std::string_view>{}(sql) % kParseCacheShards];
 }
+
+#if defined(TINYLAMB_OS_WINDOWS)
+
+std::filesystem::path ResolveGoogleSqlExecutable() {
+  if (const char* env = std::getenv("TINYLAMB_GOOGLESQL_BIN");
+      env != nullptr && *env != '\0') {
+    return std::filesystem::path(env);
+  }
+  const std::filesystem::path configured(TINYLAMB_GOOGLESQL_EXECUTABLE);
+  std::error_code ec;
+  if (std::filesystem::exists(configured, ec)) {
+    return configured;
+  }
+  const std::filesystem::path exe_dir =
+      platform::CurrentExecutablePath().parent_path();
+  if (!exe_dir.empty()) {
+    const std::filesystem::path sibling = exe_dir / "execute_query.exe";
+    if (std::filesystem::exists(sibling, ec)) {
+      return sibling;
+    }
+  }
+  return configured;
+}
+
+GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
+  const std::filesystem::path exe_path = ResolveGoogleSqlExecutable();
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = nullptr;
+
+  HANDLE stdin_read = INVALID_HANDLE_VALUE;
+  HANDLE stdin_write = INVALID_HANDLE_VALUE;
+  if (!::CreatePipe(&stdin_read, &stdin_write, &sa, 0)) {
+    return {.ok = false, .ast = {}, .error = "cannot create GoogleSQL pipe"};
+  }
+  (void)::SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+
+  HANDLE stdout_read = INVALID_HANDLE_VALUE;
+  HANDLE stdout_write = INVALID_HANDLE_VALUE;
+  if (!::CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
+    ::CloseHandle(stdin_read);
+    ::CloseHandle(stdin_write);
+    return {.ok = false, .ast = {}, .error = "cannot create GoogleSQL pipe"};
+  }
+  (void)::SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = stdin_read;
+  si.hStdOutput = stdout_write;
+  si.hStdError = stdout_write;
+
+  PROCESS_INFORMATION pi{};
+  std::wstring cmdline = L"\"" + exe_path.wstring() + L"\" --mode=parse -";
+  const BOOL started =
+      ::CreateProcessW(exe_path.c_str(), cmdline.data(), nullptr, nullptr, TRUE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+  ::CloseHandle(stdin_read);
+  ::CloseHandle(stdout_write);
+  if (!started) {
+    ::CloseHandle(stdin_write);
+    ::CloseHandle(stdout_read);
+    return {.ok = false, .ast = {}, .error = "cannot start GoogleSQL"};
+  }
+
+  std::thread writer([stdin_write, sql]() {
+    size_t written = 0;
+    while (written < sql.size()) {
+      const DWORD chunk = static_cast<DWORD>(
+          std::min<size_t>(sql.size() - written, 64U * 1024U));
+      DWORD n = 0;
+      if (!::WriteFile(stdin_write, sql.data() + written, chunk, &n, nullptr)) {
+        break;
+      }
+      written += n;
+    }
+    ::CloseHandle(stdin_write);
+  });
+
+  std::string output;
+  std::thread reader([stdout_read, &output]() {
+    std::array<char, 4096> buffer{};
+    for (;;) {
+      DWORD n = 0;
+      if (!::ReadFile(stdout_read, buffer.data(),
+                      static_cast<DWORD>(buffer.size()), &n, nullptr) ||
+          n == 0) {
+        break;
+      }
+      output.append(buffer.data(), n);
+      if (output.size() > kMaxChildOutputBytes) {
+        break;
+      }
+    }
+    ::CloseHandle(stdout_read);
+  });
+
+  const auto timeout_ms =
+      static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             ParseTimeoutSeconds())
+                             .count());
+  const DWORD wait_rc = ::WaitForSingleObject(pi.hProcess, timeout_ms);
+  bool timed_out = false;
+  if (wait_rc == WAIT_TIMEOUT) {
+    timed_out = true;
+    (void)::TerminateProcess(pi.hProcess, 1);
+    (void)::WaitForSingleObject(pi.hProcess, INFINITE);
+  }
+  writer.join();
+  reader.join();
+
+  DWORD exit_code = 1;
+  (void)::GetExitCodeProcess(pi.hProcess, &exit_code);
+  ::CloseHandle(pi.hThread);
+  ::CloseHandle(pi.hProcess);
+
+  if (timed_out) {
+    return {.ok = false, .ast = {}, .error = "GoogleSQL parser timed out"};
+  }
+  if (exit_code != 0 || output.starts_with("ERROR:")) {
+    return {.ok = false, .ast = {}, .error = std::move(output)};
+  }
+  return {.ok = true, .ast = std::move(output), .error = {}};
+}
+
+#else  // TINYLAMB_OS_POSIX
 
 void CloseAll(std::array<int, 2>& pipes) {
   ::close(pipes[0]);
@@ -471,6 +611,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   }
   return {.ok = true, .ast = std::move(output), .error = {}};
 }
+
+#endif  // TINYLAMB_OS_WINDOWS
 
 std::string ToLowerCopy(std::string_view s) {
   std::string result;
@@ -1424,20 +1566,24 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
   return ParseRawSubprocess(current_sql);
 }
 
-#endif  // TINYLAMB_GOOGLESQL_EXECUTABLE && defined(TINYLAMB_OS_POSIX)
+#endif  // TINYLAMB_GOOGLESQL_EXECUTABLE
 
 }  // namespace
 
 bool GoogleSqlFrontend::Available() {
 #if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
   return access(TINYLAMB_GOOGLESQL_EXECUTABLE, X_OK) == 0;
+#elif defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_WINDOWS)
+  std::error_code ec;
+  return std::filesystem::exists(ResolveGoogleSqlExecutable(), ec);
 #else
   return false;
 #endif
 }
 
 GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
-#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && defined(TINYLAMB_OS_POSIX)
+#if defined(TINYLAMB_GOOGLESQL_EXECUTABLE) && \
+    (defined(TINYLAMB_OS_POSIX) || defined(TINYLAMB_OS_WINDOWS))
   // The parser is an external process. Sharded caches avoid a single global
   // reader/writer lock on OLTP parse bursts; the shard lock is deliberately
   // HELD across a cache-miss parse so a burst of distinct statements

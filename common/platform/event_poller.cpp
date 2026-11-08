@@ -16,22 +16,28 @@
 
 #include "common/platform/event_poller.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 
+#include "common/platform/os.hpp"
 #include "common/platform/socket.hpp"
 
-#ifdef __linux__
+#if defined(TINYLAMB_OS_LINUX)
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#else
+#include <unistd.h>
+#elif defined(TINYLAMB_OS_MACOS)
+#include <fcntl.h>
 #include <sys/event.h>
 #include <sys/time.h>
+#include <unistd.h>
+#elif defined(TINYLAMB_OS_WINDOWS)
+#include <chrono>
+#include <thread>
+#include <vector>
 #endif
 
 namespace tinylamb::platform {
@@ -46,7 +52,9 @@ EventPoller::~EventPoller() { Close(); }
 
 void EventPoller::Close() {
   if (poll_fd_ >= 0) {
+#if !defined(TINYLAMB_OS_WINDOWS)
     ::close(poll_fd_);
+#endif
     poll_fd_ = -1;
   }
 #ifndef __linux__
@@ -180,6 +188,170 @@ void Waker::Drain() const {
   do {
     got = ::read(read_fd_, &ignored, sizeof(ignored));
   } while (got < 0 && errno == EINTR);
+}
+
+#elif defined(TINYLAMB_OS_WINDOWS)
+
+bool EventPoller::Open() {
+  if (poll_fd_ >= 0) return true;
+  poll_fd_ = 1;
+  return true;
+}
+
+bool EventPoller::Add(int fd, uint32_t interest) {
+  if (poll_fd_ < 0 || fd < 0) {
+    errno = EBADF;
+    return false;
+  }
+  std::scoped_lock lock(mu_);
+  interest_[fd] = interest;
+  return true;
+}
+
+bool EventPoller::Modify(int fd, uint32_t interest) {
+  if (poll_fd_ < 0) {
+    errno = EBADF;
+    return false;
+  }
+  std::scoped_lock lock(mu_);
+  const auto found = interest_.find(fd);
+  if (found == interest_.end()) {
+    errno = ENOENT;
+    return false;
+  }
+  found->second = interest;
+  return true;
+}
+
+bool EventPoller::Remove(int fd) {
+  if (poll_fd_ < 0) {
+    errno = EBADF;
+    return false;
+  }
+  std::scoped_lock lock(mu_);
+  const auto found = interest_.find(fd);
+  if (found == interest_.end()) {
+    errno = ENOENT;
+    return false;
+  }
+  interest_.erase(found);
+  return true;
+}
+
+int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
+  if (poll_fd_ < 0) {
+    errno = EBADF;
+    return -1;
+  }
+  std::vector<WSAPOLLFD> poll_fds;
+  std::vector<uint32_t> interests;
+  {
+    std::scoped_lock lock(mu_);
+    poll_fds.reserve(interest_.size());
+    interests.reserve(interest_.size());
+    for (const auto& [fd, interest] : interest_) {
+      SHORT ev = 0;
+      if ((interest & (kPollReadable | kPollPeerClosed)) != 0U) {
+        ev |= POLLRDNORM;
+      }
+      if ((interest & kPollWritable) != 0U) {
+        ev |= POLLWRNORM;
+      }
+      poll_fds.push_back(
+          WSAPOLLFD{.fd = static_cast<SOCKET>(fd), .events = ev, .revents = 0});
+      interests.push_back(interest);
+    }
+  }
+  if (poll_fds.empty()) {
+    if (timeout_ms > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+    }
+    return 0;
+  }
+  const int count = PollSockets(poll_fds.data(), poll_fds.size(), timeout_ms);
+  if (count < 0) return -1;
+  if (count == 0) return 0;
+
+  const size_t capacity = std::min(out.size(), kMaxBatch);
+  int written = 0;
+  for (size_t i = 0;
+       i < poll_fds.size() && static_cast<size_t>(written) < capacity; ++i) {
+    const SHORT rev = poll_fds[i].revents;
+    if (rev == 0) continue;
+    const int fd = static_cast<int>(poll_fds[i].fd);
+    const uint32_t req = interests[i];
+    uint32_t bits = 0;
+    if ((rev & (POLLERR | POLLNVAL)) != 0) {
+      bits |= kPollError;
+    }
+    if ((rev & POLLHUP) != 0) {
+      if ((req & (kPollReadable | kPollPeerClosed)) != 0U) {
+        bits |= kPollReadable | kPollPeerClosed;
+      } else {
+        bits |= kPollHangup;
+      }
+    }
+    if ((rev & POLLIN) != 0) {
+      bits |= kPollReadable;
+      if ((req & kPollPeerClosed) != 0U) {
+        char peek = 0;
+        const int peeked = ::recv(static_cast<SOCKET>(fd), &peek, 1, MSG_PEEK);
+        if (peeked == 0) {
+          bits |= kPollPeerClosed;
+        } else if (peeked == SOCKET_ERROR &&
+                   ::WSAGetLastError() != WSAEWOULDBLOCK) {
+          bits |= kPollError;
+        }
+      }
+    }
+    if ((rev & POLLOUT) != 0) {
+      bits |= kPollWritable;
+    }
+    if (bits != 0U) {
+      out[static_cast<size_t>(written++)] = {.fd = fd, .events = bits};
+    }
+  }
+  return written;
+}
+
+Waker::~Waker() { Close(); }
+
+bool Waker::Open() {
+  if (read_fd_ >= 0) return true;
+  std::array<int, 2> fds{-1, -1};
+  if (OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}) != 0) {
+    return false;
+  }
+  read_fd_ = fds[0];
+  write_fd_ = fds[1];
+  return true;
+}
+
+void Waker::Close() {
+  if (read_fd_ >= 0) CloseSocket(read_fd_);
+  if (write_fd_ >= 0) CloseSocket(write_fd_);
+  read_fd_ = -1;
+  write_fd_ = -1;
+}
+
+void Waker::Wake() const {
+  if (write_fd_ < 0) return;
+  const char one = 1;
+  ssize_t written = 0;
+  do {
+    written = SendNoSignal(write_fd_, &one, sizeof(one));
+  } while (written < 0 && errno == EINTR);
+}
+
+void Waker::Drain() const {
+  if (read_fd_ < 0) return;
+  std::array<char, 256> buffer{};
+  for (;;) {
+    const ssize_t got = RecvSocket(read_fd_, buffer.data(), buffer.size());
+    if (got > 0) continue;
+    if (got < 0 && errno == EINTR) continue;
+    break;
+  }
 }
 
 #else  // kqueue

@@ -260,4 +260,24 @@ TEST(ParameterSlotTest, SlotizeRejectsParameterValueMismatch) {
   EXPECT_FALSE(ok);
 }
 
+TEST(ParameterSlotTest, SamePrintedExpressionKeepsDistinctSubqueriesDistinct) {
+  // QueryExpression::ToString() prints "EXISTS(...)" for every EXISTS node.
+  // Two nodes backed by different SelectStatement instances must not compare
+  // equal under SamePrintedExpression, even when wrapped in unary/binary
+  // containers.
+  std::shared_ptr<SelectStatement> q1(
+      reinterpret_cast<SelectStatement*>(0x1000), [](SelectStatement*) {});
+  std::shared_ptr<SelectStatement> q2(
+      reinterpret_cast<SelectStatement*>(0x2000), [](SelectStatement*) {});
+  Expression e1 = QueryExpressionExp(q1, nullptr, true, false);
+  Expression e2 = QueryExpressionExp(q2, nullptr, true, false);
+  Expression e1_dup = QueryExpressionExp(q1, nullptr, true, false);
+  EXPECT_EQ(e1->ToString(), e2->ToString());
+  EXPECT_TRUE(SamePrintedExpression(e1, e1_dup));
+  EXPECT_FALSE(SamePrintedExpression(e1, e2));
+  EXPECT_FALSE(
+      SamePrintedExpression(UnaryExpressionExp(e1, UnaryOperation::kNot),
+                            UnaryExpressionExp(e2, UnaryOperation::kNot)));
+}
+
 }  // namespace tinylamb

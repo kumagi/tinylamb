@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -1203,16 +1204,16 @@ struct ScopedEnv {
       prev_ = prev;
     }
     if (value != nullptr) {
-      setenv(name, value, 1);
+      platform::SetEnv(name, value);
     } else {
-      unsetenv(name);
+      platform::UnsetEnv(name);
     }
   }
   ~ScopedEnv() {
     if (had_prev_) {
-      setenv(name_, prev_.c_str(), 1);
+      platform::SetEnv(name_, prev_.c_str());
     } else {
-      unsetenv(name_);
+      platform::UnsetEnv(name_);
     }
   }
   ScopedEnv(const ScopedEnv&) = delete;
@@ -1813,6 +1814,10 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
       lst_ready = false;
       break;
     }
+  }
+  if (lst_ready) {
+    (void)ctx.txn_.PreCommit();
+    ctx = db.BeginContext();
   }
 
   for (const std::string& sql : t.xmode_probes) {
@@ -3559,6 +3564,27 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                            std::to_string(hi_b) + ";");
     }
 
+    // Compound correlated EXISTS + NOT EXISTS + IN subquery conjuncts/disjuncts
+    // (stresses subquery_runtime.cpp RuntimeId cache keys & decorrelation).
+    if (!stab.empty()) {
+      candidates.push_back(
+          "SELECT " + tab + ".u, " + tab + ".a, " + tab + ".b FROM " + tab +
+          " WHERE (NOT EXISTS (SELECT 1 FROM " + stab +
+          " s1 WHERE s1.a = " + tab + ".a AND s1.b < " + tab +
+          ".b) AND NOT EXISTS (SELECT 1 FROM " + stab +
+          " s2 WHERE s2.b = " + tab + ".b AND s2.flag IS TRUE)) OR " + tab +
+          ".a IN (SELECT s3.a FROM " + stab + " s3 WHERE s3.a IS NOT NULL);");
+    }
+
+    // Q1-style 6-term multi-aggregate over (a, flag) with COALESCE/NULLIF/CASE
+    {
+      candidates.push_back(
+          "SELECT a, flag, COUNT(*), COUNT(a), SUM(a), SUM(b), "
+          "MIN(COALESCE(a, 0) + COALESCE(b, 0)), "
+          "MAX(CASE WHEN flag IS TRUE THEN a ELSE b END) FROM " +
+          tab + " WHERE (" + t.predicate + ") GROUP BY a, flag;");
+    }
+
     // Sample 2 distinct composite probes per iteration to keep per-seed latency
     // low while covering all 6 composite query families uniformly across seeds.
     std::shuffle(candidates.begin(), candidates.end(), xrng);
@@ -3639,6 +3665,10 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   if (!setup_err.empty()) {
     return setup_err;
   }
+  // Commit setup so all read-only oracle probes can exercise committed MVCC
+  // versions and lazy LSTableStore creation (`GetOrBuildLSTableStore`).
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   std::string report;
   CheckTlp(db, ctx, trace.tlp, &report, verbose);
   CheckTlpAgg(db, ctx, trace.tlp_agg, &report, verbose);

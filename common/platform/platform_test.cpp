@@ -18,11 +18,6 @@
 // both Linux (epoll, eventfd, accept4, tzdb) and macOS (kqueue, pipe,
 // fcntl, CFTimeZone).
 
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +33,7 @@
 #include "common/platform/endian.hpp"
 #include "common/platform/event_poller.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/socket.hpp"
 #include "common/platform/synced_stream.hpp"
 #include "common/platform/time_zone.hpp"
@@ -45,9 +41,6 @@
 
 namespace tinylamb::platform {
 namespace {
-
-bool IsCloseOnExec(int fd) { return (::fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0; }
-bool IsNonBlocking(int fd) { return (::fcntl(fd, F_GETFL) & O_NONBLOCK) != 0; }
 
 uint32_t WaitFor(EventPoller& poller, int fd, int timeout_ms = 1000) {
   std::array<PollResult, 8> results{};
@@ -83,7 +76,7 @@ std::array<int, 2> TcpPair() {
   const int server =
       AcceptSocket(listener, {.nonblocking = true, .close_on_exec = true});
   EXPECT_GE(server, 0);
-  ::close(listener);
+  CloseSocket(listener);
   return {client, server};
 }
 
@@ -101,14 +94,16 @@ TEST(PlatformEndianTest, BigEndianRoundTrip) {
 TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() /
-      ("platform_file_io_" + std::to_string(::getpid()));
-  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+      ("platform_file_io_" + std::to_string(GetPid()));
+  const int fd = OpenFile(
+      path, {.mode = OpenMode::kReadWrite, .create = true, .truncate = true},
+      0644);
   ASSERT_GE(fd, 0);
   EXPECT_EQ(Preallocate(fd, 8192), 0);
-  ASSERT_EQ(::write(fd, "abc", 3), 3);
+  ASSERT_EQ(Write(fd, "abc", 3), 3);
   EXPECT_EQ(DataSync(fd), 0);
   AdviseDontNeed(fd, 0, 3);  // best effort; must not crash
-  ::close(fd);
+  CloseFile(fd);
   EXPECT_EQ(DataSync(fd), -1);  // closed descriptor reports failure
   std::filesystem::remove(path);
 }
@@ -118,21 +113,21 @@ TEST(PlatformSocketTest, FlagsAreApplied) {
   ASSERT_GE(blocking, 0);
   EXPECT_TRUE(IsCloseOnExec(blocking));
   EXPECT_FALSE(IsNonBlocking(blocking));
-  ::close(blocking);
+  CloseSocket(blocking);
 
   const int nonblocking = OpenSocket(
       AF_INET, SOCK_STREAM, 0, {.nonblocking = true, .close_on_exec = false});
   ASSERT_GE(nonblocking, 0);
   EXPECT_FALSE(IsCloseOnExec(nonblocking));
   EXPECT_TRUE(IsNonBlocking(nonblocking));
-  ::close(nonblocking);
+  CloseSocket(nonblocking);
 
   std::array<int, 2> fds{-1, -1};
   ASSERT_EQ(OpenPipe(fds, {.nonblocking = true, .close_on_exec = true}), 0);
   for (int fd : fds) {
     EXPECT_TRUE(IsCloseOnExec(fd));
     EXPECT_TRUE(IsNonBlocking(fd));
-    ::close(fd);
+    CloseSocket(fd);
   }
 }
 
@@ -140,7 +135,7 @@ TEST(PlatformSocketTest, AcceptAppliesFlagsAndSendSkipsSigPipe) {
   auto [client, server] = TcpPair();
   EXPECT_TRUE(IsCloseOnExec(server));
   EXPECT_TRUE(IsNonBlocking(server));
-  ::close(server);
+  CloseSocket(server);
   // Writing into a connection the peer closed must fail with EPIPE/ECONNRESET
   // instead of killing the process with SIGPIPE.
   ssize_t sent = 0;
@@ -149,7 +144,7 @@ TEST(PlatformSocketTest, AcceptAppliesFlagsAndSendSkipsSigPipe) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   EXPECT_LT(sent, 0);
-  ::close(client);
+  CloseSocket(client);
 }
 
 TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
@@ -160,16 +155,16 @@ TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
   ASSERT_TRUE(poller.Add(server, kPollReadable | kPollPeerClosed));
   EXPECT_EQ(WaitFor(poller, server, 50), 0U);  // nothing to read yet
 
-  ASSERT_EQ(::write(client, "hi", 2), 2);
+  ASSERT_EQ(SendNoSignal(client, "hi", 2), 2);
   EXPECT_NE(WaitFor(poller, server) & kPollReadable, 0U);
   // Level-triggered: still readable until drained.
   EXPECT_NE(WaitFor(poller, server) & kPollReadable, 0U);
   std::array<char, 8> buffer{};
-  ASSERT_EQ(::read(server, buffer.data(), buffer.size()), 2);
+  ASSERT_EQ(RecvSocket(server, buffer.data(), buffer.size()), 2);
   EXPECT_EQ(WaitFor(poller, server, 50), 0U);
 
   // Read and write readiness of one descriptor come back as one result.
-  ASSERT_EQ(::write(client, "x", 1), 1);
+  ASSERT_EQ(SendNoSignal(client, "x", 1), 1);
   // Let the byte arrive before asking for write readiness too, which is
   // immediate and would otherwise win the race on a non-synchronous loopback.
   EXPECT_NE(WaitFor(poller, server) & kPollReadable, 0U);
@@ -178,20 +173,20 @@ TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
   const uint32_t both = WaitFor(poller, server);
   EXPECT_NE(both & kPollReadable, 0U);
   EXPECT_NE(both & kPollWritable, 0U);
-  ASSERT_EQ(::read(server, buffer.data(), buffer.size()), 1);
+  ASSERT_EQ(RecvSocket(server, buffer.data(), buffer.size()), 1);
 
   // Dropping read interest stops read reports.
   ASSERT_TRUE(poller.Modify(server, kPollWritable));
-  ASSERT_EQ(::write(client, "y", 1), 1);
+  ASSERT_EQ(SendNoSignal(client, "y", 1), 1);
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   const uint32_t write_only = WaitFor(poller, server);
   EXPECT_NE(write_only & kPollWritable, 0U);
   EXPECT_EQ(write_only & kPollReadable, 0U);
-  ASSERT_EQ(::read(server, buffer.data(), buffer.size()), 1);
+  ASSERT_EQ(RecvSocket(server, buffer.data(), buffer.size()), 1);
 
   // Peer half-close is reported as readable + peer-closed.
   ASSERT_TRUE(poller.Modify(server, kPollReadable | kPollPeerClosed));
-  ASSERT_EQ(::shutdown(client, SHUT_WR), 0);
+  ASSERT_EQ(ShutdownSocket(client, SHUT_WR), 0);
   const uint32_t closed = WaitFor(poller, server);
   EXPECT_NE(closed & kPollReadable, 0U);
   EXPECT_NE(closed & kPollPeerClosed, 0U);
@@ -199,8 +194,8 @@ TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {
   ASSERT_TRUE(poller.Remove(server));
   EXPECT_EQ(WaitFor(poller, server, 50), 0U);
   EXPECT_FALSE(poller.Remove(server));
-  ::close(client);
-  ::close(server);
+  CloseSocket(client);
+  CloseSocket(server);
 }
 
 TEST(PlatformEventPollerTest, WakerWakesWaitFromAnotherThread) {

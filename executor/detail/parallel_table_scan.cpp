@@ -844,6 +844,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               continue;
             }
             bool zone_rejected = false;
+            bool dict_all_pass = true;
             for (const LSTableDictColFilter& df : lstable_dict_filters) {
               const LSTableColumnBlock& dcol = blk->columns[df.column];
               if (((dcol.dict_mask[0] & df.pass_mask[0]) |
@@ -853,9 +854,55 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                 zone_rejected = true;
                 break;
               }
+              if (dcol.has_null || dcol.dict_codes.empty() ||
+                  ((dcol.dict_mask[0] & ~df.pass_mask[0]) |
+                   (dcol.dict_mask[1] & ~df.pass_mask[1]) |
+                   (dcol.dict_mask[2] & ~df.pass_mask[2]) |
+                   (dcol.dict_mask[3] & ~df.pass_mask[3])) != 0) {
+                dict_all_pass = false;
+              }
             }
             if (zone_rejected) {
               continue;
+            }
+            bool peek_all_pass = true;
+            if (peek_ptr != nullptr) {
+              for (const IntegerPeekCompare& pred : *peek_ptr) {
+                const LSTableColumnBlock& pcol = blk->columns[pred.column];
+                if (pcol.has_null || !pcol.has_min_max) {
+                  peek_all_pass = false;
+                  break;
+                }
+                bool all_ok = false;
+                switch (pred.op) {
+                  case BinaryOperation::kEquals:
+                    all_ok = (pcol.min_int == pred.constant &&
+                              pcol.max_int == pred.constant);
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    all_ok = (pred.constant < pcol.min_int ||
+                              pred.constant > pcol.max_int);
+                    break;
+                  case BinaryOperation::kLessThan:
+                    all_ok = (pcol.max_int < pred.constant);
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    all_ok = (pcol.max_int <= pred.constant);
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    all_ok = (pcol.min_int > pred.constant);
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    all_ok = (pcol.min_int >= pred.constant);
+                    break;
+                  default:
+                    break;
+                }
+                if (!all_ok) {
+                  peek_all_pass = false;
+                  break;
+                }
+              }
             }
             for (const LSTableDoubleZonePredicate& dz : lstable_double_zones) {
               const LSTableColumnBlock& dcol = blk->columns[dz.column];
@@ -906,6 +953,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
             if (zone_rejected) {
               continue;
             }
+            bool col_cmp_all_pass = true;
             for (const LSTableIntColCompare& cc : lstable_col_compares) {
               const LSTableColumnBlock& lcol = blk->columns[cc.left_col];
               const LSTableColumnBlock& rcol = blk->columns[cc.right_col];
@@ -913,12 +961,16 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                 zone_rejected = true;
                 break;
               }
+              bool all_ok = false;
               switch (cc.op) {
                 case BinaryOperation::kEquals:
                   if (lcol.max_int < rcol.min_int ||
                       lcol.min_int > rcol.max_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.min_int == lcol.max_int &&
+                            rcol.min_int == rcol.max_int &&
+                            lcol.min_int == rcol.min_int);
                   break;
                 case BinaryOperation::kNotEquals:
                   if (lcol.min_int == lcol.max_int &&
@@ -926,32 +978,41 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                       lcol.min_int == rcol.min_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.max_int < rcol.min_int ||
+                            lcol.min_int > rcol.max_int);
                   break;
                 case BinaryOperation::kLessThan:
                   if (lcol.min_int >= rcol.max_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.max_int < rcol.min_int);
                   break;
                 case BinaryOperation::kLessThanEquals:
                   if (lcol.min_int > rcol.max_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.max_int <= rcol.min_int);
                   break;
                 case BinaryOperation::kGreaterThan:
                   if (lcol.max_int <= rcol.min_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.min_int > rcol.max_int);
                   break;
                 case BinaryOperation::kGreaterThanEquals:
                   if (lcol.max_int < rcol.min_int) {
                     zone_rejected = true;
                   }
+                  all_ok = (lcol.min_int >= rcol.max_int);
                   break;
                 default:
                   break;
               }
               if (zone_rejected) {
                 break;
+              }
+              if (!all_ok || lcol.has_null || rcol.has_null) {
+                col_cmp_all_pass = false;
               }
             }
             if (zone_rejected) {
@@ -1057,6 +1118,21 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                   .has_null = ecol->has_null,
                   .group = erf.group,
               };
+            }
+            const bool block_all_pass =
+                rf_col == nullptr && fast_extra_rf_count == 0 &&
+                dict_all_pass && peek_all_pass && col_cmp_all_pass;
+            if (fast_in_memory_append && block_all_pass) {
+              // Pattern C: Dense All-Pass Streaming (s_block = 100%).
+              const uint32_t nrows = blk->row_count;
+              for (uint32_t r = 0; r < nrows; ++r) {
+                Row& out_row = local.rows.emplace_back();
+                materialize_lstable_row(*blk, proj_cols_ptr, col_count, r,
+                                        &out_row);
+              }
+              shard_seen[w] += nrows;
+              shard_out[w] += nrows;
+              continue;
             }
             for (uint32_t r = 0; r < blk->row_count; ++r) {
               if (rf_col != nullptr) {
@@ -1175,7 +1251,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                   continue;
                 }
               }
-              if (!lstable_dict_filters.empty()) {
+              if (!dict_all_pass) {
                 bool dict_ok = true;
                 for (const LSTableDictColFilter& df : lstable_dict_filters) {
                   const LSTableColumnBlock& dcol = blk->columns[df.column];
@@ -1189,7 +1265,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                   continue;
                 }
               }
-              if (peek_ptr != nullptr) {
+              if (!peek_all_pass && peek_ptr != nullptr) {
                 bool peek_ok = true;
                 for (const IntegerPeekCompare& pred : *peek_ptr) {
                   const LSTableColumnBlock& pcol = blk->columns[pred.column];
@@ -1204,7 +1280,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                   continue;
                 }
               }
-              if (!lstable_col_compares.empty()) {
+              if (!col_cmp_all_pass) {
                 bool cc_ok = true;
                 for (const LSTableIntColCompare& cc : lstable_col_compares) {
                   const LSTableColumnBlock& lcol = blk->columns[cc.left_col];

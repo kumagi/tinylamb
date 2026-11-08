@@ -288,6 +288,13 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       if (sv.size() < lf.sub0.size() + lf.sub1.size()) {
         return false;
       }
+#if defined(_WIN32)
+      const size_t p0 = sv.find(lf.sub0);
+      if (p0 == std::string_view::npos) {
+        return false;
+      }
+      return sv.find(lf.sub1, p0 + lf.sub0.size()) != std::string_view::npos;
+#else
       const void* p0 =
           memmem(sv.data(), sv.size(), lf.sub0.data(), lf.sub0.size());
       if (p0 == nullptr) {
@@ -299,6 +306,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       const void* p1 = memmem(sv.data() + after0, sv.size() - after0,
                               lf.sub1.data(), lf.sub1.size());
       return p1 != nullptr;
+#endif
     }
     return Like(sv, lf.pattern);
   };
@@ -1034,6 +1042,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
         worker_frequencies[worker].assign(dimension_rows, 0);
         local_freq = worker_frequencies[worker].data();
       }
+      std::vector<uint32_t> blk_sel_rows;
       TypedCellBatch batch;
       if (key_counts) {
         visible[0] = key_counts->rows;
@@ -1117,6 +1126,14 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                   const size_t* __restrict dgroups = dense_groups.data();
                   const size_t dsize = dense_groups.size();
                   for (uint32_t r = 0; r < nrows; ++r) {
+                    if (r + 8 < nrows) {
+                      const uint64_t pf_off =
+                          static_cast<uint64_t>(kcells[r + 8]) -
+                          static_cast<uint64_t>(dense_min);
+                      if (pf_off < dsize) {
+                        __builtin_prefetch(&dgroups[pf_off], 0, 1);
+                      }
+                    }
                     const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
                                             static_cast<uint64_t>(dense_min);
                     if (offset >= dsize) {
@@ -1207,28 +1224,116 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                 probe_int_filters.size() == 1 && local_freq != nullptr &&
                 !identity_dense_rows) {
               const ProbeIntFilter& iflt = probe_int_filters[0];
+              const LSTableColumnBlock& fcol = blk->columns[iflt.full_col];
               const int64_t* __restrict kcells = kcol.int_cells.data();
-              const int64_t* __restrict fcells =
-                  blk->columns[iflt.full_col].int_cells.data();
+              const int64_t* __restrict fcells = fcol.int_cells.data();
               const size_t* __restrict drows = dense_rows.data();
               const size_t dsize = dense_rows.size();
               const uint32_t nrows = blk->row_count;
+              bool peek_all_pass = false;
+              if (fcol.has_min_max) {
+                switch (iflt.op) {
+                  case BinaryOperation::kEquals:
+                    peek_all_pass = (fcol.min_int == iflt.constant &&
+                                     fcol.max_int == iflt.constant);
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    peek_all_pass = (iflt.constant < fcol.min_int ||
+                                     iflt.constant > fcol.max_int);
+                    break;
+                  case BinaryOperation::kLessThan:
+                    peek_all_pass = (fcol.max_int < iflt.constant);
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    peek_all_pass = (fcol.max_int <= iflt.constant);
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    peek_all_pass = (fcol.min_int > iflt.constant);
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    peek_all_pass = (fcol.min_int >= iflt.constant);
+                    break;
+                  default:
+                    break;
+                }
+              }
               size_t blk_matched = 0;
-              for (uint32_t r = 0; r < nrows; ++r) {
-                if (!MatchIntegerCompare(fcells[r], iflt.op, iflt.constant)) {
-                  continue;
+              if (peek_all_pass) {
+                // Pattern C: Dense All-Pass Streaming (s_block = 100%).
+                for (uint32_t r = 0; r < nrows; ++r) {
+                  if (r + 8 < nrows) {
+                    const uint64_t pf_off =
+                        static_cast<uint64_t>(kcells[r + 8]) -
+                        static_cast<uint64_t>(dense_min);
+                    if (pf_off < dsize) {
+                      __builtin_prefetch(&drows[pf_off], 0, 1);
+                    }
+                  }
+                  const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
+                                          static_cast<uint64_t>(dense_min);
+                  if (offset >= dsize) {
+                    continue;
+                  }
+                  const size_t target_row = drows[offset];
+                  if (target_row == kNoDenseRow) {
+                    continue;
+                  }
+                  ++local_freq[target_row];
+                  ++blk_matched;
                 }
-                const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
-                                        static_cast<uint64_t>(dense_min);
-                if (offset >= dsize) {
-                  continue;
+              } else {
+                // Pattern B / A: Build per-block Selection Vector first.
+                if (blk_sel_rows.size() < nrows) {
+                  blk_sel_rows.resize(nrows);
                 }
-                const size_t target_row = drows[offset];
-                if (target_row == kNoDenseRow) {
-                  continue;
+                uint32_t* __restrict sel = blk_sel_rows.data();
+                uint32_t blk_filtered = 0;
+                for (uint32_t r = 0; r < nrows; ++r) {
+                  sel[blk_filtered] = r;
+                  blk_filtered += static_cast<uint32_t>(
+                      MatchIntegerCompare(fcells[r], iflt.op, iflt.constant));
                 }
-                ++local_freq[target_row];
-                ++blk_matched;
+                if (blk_filtered * 20U >= nrows) {
+                  // Pattern B: Selection Vector + Software Prefetch (s >= 5%).
+                  for (uint32_t si = 0; si < blk_filtered; ++si) {
+                    if (si + 8 < blk_filtered) {
+                      const uint64_t pf_off =
+                          static_cast<uint64_t>(kcells[sel[si + 8]]) -
+                          static_cast<uint64_t>(dense_min);
+                      if (pf_off < dsize) {
+                        __builtin_prefetch(&drows[pf_off], 0, 1);
+                      }
+                    }
+                    const uint64_t offset =
+                        static_cast<uint64_t>(kcells[sel[si]]) -
+                        static_cast<uint64_t>(dense_min);
+                    if (offset >= dsize) {
+                      continue;
+                    }
+                    const size_t target_row = drows[offset];
+                    if (target_row == kNoDenseRow) {
+                      continue;
+                    }
+                    ++local_freq[target_row];
+                    ++blk_matched;
+                  }
+                } else {
+                  // Pattern A: Sparse Gather (s < 5%).
+                  for (uint32_t si = 0; si < blk_filtered; ++si) {
+                    const uint64_t offset =
+                        static_cast<uint64_t>(kcells[sel[si]]) -
+                        static_cast<uint64_t>(dense_min);
+                    if (offset >= dsize) {
+                      continue;
+                    }
+                    const size_t target_row = drows[offset];
+                    if (target_row == kNoDenseRow) {
+                      continue;
+                    }
+                    ++local_freq[target_row];
+                    ++blk_matched;
+                  }
+                }
               }
               comparisons[m] += blk_matched;
               continue;

@@ -302,4 +302,31 @@ TEST(SqlOracleFuzzer, EmitFuzzFindingPersistsAndContinuesWhenConfigured) {
   ASSERT_EQ(unsetenv("TINYLAMB_FUZZ_FINDINGS_DIR"), 0);
 }
 
+TEST(SqlOracleFuzzer, LSTableDictAllPassExcludesNullRows) {
+  OracleTrace trace;
+  trace.table = "dict_null_t";
+  trace.setup = {
+      "CREATE TABLE dict_null_t (u INT64, a INT64, b INT64, flag BOOL, "
+      "s VARCHAR(8));",
+      "INSERT INTO dict_null_t VALUES (0, 2, -2, TRUE, 'a');",
+      "INSERT INTO dict_null_t VALUES (1, 1, 2, NULL, '');",
+      "INSERT INTO dict_null_t VALUES (2, 1, NULL, FALSE, NULL);",
+      "INSERT INTO dict_null_t VALUES (3, NULL, 1, TRUE, 'zz');",
+      "INSERT INTO dict_null_t VALUES (4, -1, 0, NULL, NULL);",
+      "INSERT INTO dict_null_t VALUES (5, 0, -3, FALSE, 'bb');",
+  };
+  trace.predicate = "(s != '') OR (s != 'bb')";
+  trace.tlp = {
+      "SELECT COALESCE(a, 0), b FROM dict_null_t WHERE (s != '') OR "
+      "(s != 'bb');",
+      "SELECT COALESCE(a, 0), b FROM dict_null_t WHERE ((s != '') OR "
+      "(s != 'bb')) AND (s IS NOT NULL);",
+      "SELECT COALESCE(a, 0), b FROM dict_null_t WHERE ((s != '') OR "
+      "(s != 'bb')) AND NOT (s IS NOT NULL);",
+      "SELECT COALESCE(a, 0), b FROM dict_null_t WHERE ((s != '') OR "
+      "(s != 'bb')) AND (s IS NOT NULL) IS NULL;",
+  };
+  EXPECT_EQ(ReplayOracleTrace(trace, true), "");
+}
+
 }  // namespace tinylamb

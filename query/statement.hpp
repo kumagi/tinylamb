@@ -34,6 +34,7 @@
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/table_sample_spec.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
@@ -680,11 +681,29 @@ class SelectStatement : public Statement {
     auto append_string = [&](std::string_view text) {
       stream << text.size() << ':' << text << ';';
     };
-    auto append_expression = [&](const Expression& expression) {
+    auto append_expression = [&](auto& self,
+                                 const Expression& expression) -> void {
       if (!expression) {
         stream << "<null>;";
         return;
       }
+      auto walk_nested_special = [&](auto& walk_self,
+                                     const Expression& node) -> void {
+        if (!node) {
+          return;
+        }
+        if (node->Type() == TypeTag::kQueryExp ||
+            node->Type() == TypeTag::kAggregateExp ||
+            node->Type() == TypeTag::kWindowFunctionExp) {
+          self(self, node);
+          return;
+        }
+        for (const Expression& child : ExpressionChildren(node)) {
+          if (child) {
+            walk_self(walk_self, child);
+          }
+        }
+      };
       stream << "e" << static_cast<int>(expression->Type()) << ':';
       if (expression->Type() == TypeTag::kQueryExp) {
         const auto& query = expression->AsQueryExpression();
@@ -700,8 +719,7 @@ class SelectStatement : public Statement {
                << ':';
         append_string(query.ArrayElementSqlType());
         if (query.Test()) {
-          stream << static_cast<int>(query.Test()->Type()) << ':'
-                 << query.Test()->ToString() << ';';
+          self(self, query.Test());
         } else {
           stream << "<null>;";
         }
@@ -710,13 +728,18 @@ class SelectStatement : public Statement {
         stream << static_cast<const void*>(expression.get());
       } else {
         stream << expression->ToString();
+        for (const Expression& child : ExpressionChildren(expression)) {
+          if (child) {
+            walk_nested_special(walk_nested_special, child);
+          }
+        }
       }
       stream << ';';
     };
     stream << "select;";
     for (const NamedExpression& item : select_list_) {
       append_string(item.name);
-      append_expression(item.expression);
+      append_expression(append_expression, item.expression);
     }
     stream << "from;";
     for (const std::string& table : from_clause_) {
@@ -732,8 +755,8 @@ class SelectStatement : public Statement {
         stream << "<null>";
       }
       stream << ";j=" << static_cast<int>(source.join_type) << ';';
-      append_expression(source.join_condition);
-      append_expression(source.unnest);
+      append_expression(append_expression, source.join_condition);
+      append_expression(append_expression, source.unnest);
       append_string(source.offset_alias);
       stream << source.is_lateral << source.from_nested_join << ';';
       for (const std::string& column : source.using_columns) {
@@ -745,17 +768,17 @@ class SelectStatement : public Statement {
       stream << ';';
     }
     stream << "where;";
-    append_expression(where_clause_);
+    append_expression(append_expression, where_clause_);
     stream << "order;";
     for (const OrderByTerm& term : order_by_) {
-      append_expression(term.expression);
+      append_expression(append_expression, term.expression);
       stream << term.ascending << ':' << term.nulls_first.value_or(false)
              << ';';
     }
     stream << "limit;" << has_limit_ << ':' << limit_ << ':' << offset_
            << ";distinct;" << distinct_ << ';';
     for (const Expression& expression : distinct_on_) {
-      append_expression(expression);
+      append_expression(append_expression, expression);
     }
     stream << "ties;" << with_ties_ << ";aliases;";
     std::vector<std::pair<std::string, std::string>> aliases(aliases_.begin(),
@@ -767,12 +790,12 @@ class SelectStatement : public Statement {
     }
     stream << "group;" << group_all_ << ';';
     for (const Expression& expression : group_by_) {
-      append_expression(expression);
+      append_expression(append_expression, expression);
     }
     stream << "having;";
-    append_expression(having_);
+    append_expression(append_expression, having_);
     stream << "qualify;";
-    append_expression(qualify_);
+    append_expression(append_expression, qualify_);
     stream << "with;";
     for (const std::string& name : with_query_order_) {
       append_string(name);

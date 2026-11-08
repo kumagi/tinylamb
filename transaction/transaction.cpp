@@ -695,6 +695,26 @@ StatusOr<lsn_t> Transaction::DestroyPageLog(
       LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
 }
 
+void Transaction::NoteWaitForHolder(txn_id_t holder, RowPosition row) const {
+  if (transaction_manager_ == nullptr || holder == 0 || holder == txn_id_) {
+    return;
+  }
+  if (transaction_manager_->GetDeadlockPolicy() ==
+      TransactionManager::DeadlockPolicy::kDeadlockDetect) {
+    transaction_manager_->AddWaitForEdge(txn_id_, holder, row);
+  }
+}
+
+void Transaction::ClearWaitForHolder() const {
+  if (transaction_manager_ == nullptr) {
+    return;
+  }
+  if (transaction_manager_->GetDeadlockPolicy() ==
+      TransactionManager::DeadlockPolicy::kDeadlockDetect) {
+    transaction_manager_->RemoveWaitForEdge(txn_id_);
+  }
+}
+
 void Transaction::CommitWait() const {
   while (transaction_manager_->CommittedLSN() < prev_lsn_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

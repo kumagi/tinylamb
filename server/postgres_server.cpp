@@ -2,14 +2,6 @@
 
 #include "server/postgres_server.hpp"
 
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -40,6 +32,9 @@
 #include "common/constants.hpp"
 #include "common/platform/cpu_affinity.hpp"
 #include "common/platform/event_poller.hpp"
+#include "common/platform/file_io.hpp"
+#include "common/platform/os.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/socket.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -297,15 +292,15 @@ class PostgresServer::Impl {
     StopReadWorkers();
     for (auto& [fd, client] : clients_) {
       AbortOpenTransaction(client);
-      close(fd);
+      platform::CloseSocket(fd);
     }
     if (listener_fd_ >= 0) {
-      close(listener_fd_);
+      platform::CloseSocket(listener_fd_);
     }
     waker_.Close();
     poller_.Close();
     if (reserve_fd_ >= 0) {
-      close(reserve_fd_);
+      platform::CloseFile(reserve_fd_);
     }
   }
 
@@ -318,6 +313,7 @@ class PostgresServer::Impl {
       return false;
     }
 
+    platform::EnsureSocketSubsystemInitialized();
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -339,15 +335,13 @@ class PostgresServer::Impl {
       if (candidate < 0) {
         continue;
       }
-      const int enabled = 1;
-      setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, &enabled,
-                 sizeof(enabled));
+      (void)platform::SetSocketOptInt(candidate, SOL_SOCKET, SO_REUSEADDR, 1);
       if (bind(candidate, address->ai_addr, address->ai_addrlen) == 0 &&
           listen(candidate, options_.backlog) == 0) {
         listener_fd_ = candidate;
         break;
       }
-      close(candidate);
+      platform::CloseSocket(candidate);
     }
     freeaddrinfo(addresses);
     if (listener_fd_ < 0) {
@@ -383,7 +377,9 @@ class PostgresServer::Impl {
     // Reserve one descriptor so AcceptClients() can still drain the
     // listener when the process hits EMFILE/ENFILE (level-triggered epoll
     // would otherwise spin forever on the readable listener).
-    reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+#if defined(TINYLAMB_OS_POSIX)
+    reserve_fd_ = platform::OpenFile("/dev/null", {});
+#endif
     // Authentication is a stub: every connecting user is trusted. Warn when
     // the listen address reaches beyond loopback.
     if (options_.listen_address != "127.0.0.1" &&
@@ -534,7 +530,7 @@ class PostgresServer::Impl {
     void Close() {
       std::scoped_lock lock(mutex);
       if (fd >= 0) {
-        close(fd);
+        platform::CloseSocket(fd);
       }
       fd = -1;
     }
@@ -647,17 +643,18 @@ class PostgresServer::Impl {
   }
 
   void AcceptClients() {
+#if defined(TINYLAMB_OS_POSIX)
     // A previous EMFILE shed removed the listener from epoll; try to restore
     // the reserve descriptor (and the epoll registration) before accepting.
     if (listener_shed_due_to_fd_pressure_) {
-      reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      reserve_fd_ = platform::OpenFile("/dev/null", {});
       if (reserve_fd_ >= 0) {
         std::string error;
         if (AddPollFd(listener_fd_, platform::kPollReadable, &error)) {
           listener_shed_due_to_fd_pressure_ = false;
         } else {
           std::cerr << error << '\n';
-          ::close(reserve_fd_);
+          platform::CloseFile(reserve_fd_);
           reserve_fd_ = -1;
           return;
         }
@@ -665,25 +662,27 @@ class PostgresServer::Impl {
         return;
       }
     }
+#endif
     while (true) {
       const int fd = platform::AcceptSocket(
           listener_fd_, {.nonblocking = true, .close_on_exec = true});
       if (fd < 0) {
+#if defined(TINYLAMB_OS_POSIX)
         if ((errno == EMFILE || errno == ENFILE) && reserve_fd_ >= 0) {
           // Descriptor exhaustion: the level-triggered listener stays
           // readable and would spin forever. Consume (and shed) one pending
           // connection via the reserved descriptor, then restore it.
           const std::string reason = ErrnoMessage("accept");
-          ::close(reserve_fd_);
+          platform::CloseFile(reserve_fd_);
           reserve_fd_ = -1;
           const int shed = platform::AcceptSocket(
               listener_fd_, {.nonblocking = true, .close_on_exec = true});
           if (shed >= 0) {
-            ::close(shed);
+            platform::CloseSocket(shed);
           }
           std::cerr << "descriptor limit hit (" << reason
                     << "); shed one pending connection\n";
-          reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+          reserve_fd_ = platform::OpenFile("/dev/null", {});
           if (reserve_fd_ < 0) {
             // Without a reserve descriptor the next EMFILE accept would spin
             // the level-triggered loop. Shed the listener from epoll until a
@@ -692,17 +691,18 @@ class PostgresServer::Impl {
             (void)poller_.Remove(listener_fd_);
             listener_shed_due_to_fd_pressure_ = true;
           }
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        } else
+#endif
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
           std::cerr << ErrnoMessage("accept") << '\n';
         }
         return;
       }
       // Disable Nagle so small responses are not delayed waiting for ACKs.
-      const int enabled = 1;
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+      (void)platform::SetSocketOptInt(fd, IPPROTO_TCP, TCP_NODELAY, 1);
       if (clients_.size() >= options_.max_connections) {
         // Over capacity: shed immediately; the client observes EOF.
-        close(fd);
+        platform::CloseSocket(fd);
         continue;
       }
       // Register the client before adding the fd to epoll: if the map insert
@@ -760,7 +760,8 @@ class PostgresServer::Impl {
     bool eof_seen = false;
     size_t cached_packets = 0;
     while (true) {
-      const ssize_t size = recv(fd, buffer.data(), buffer.size(), 0);
+      const ssize_t size =
+          platform::RecvSocket(fd, buffer.data(), buffer.size(), 0);
       if (size > 0) {
         client.last_activity = std::chrono::steady_clock::now();
         if (client.input.empty() &&
@@ -1064,8 +1065,9 @@ class PostgresServer::Impl {
     Queue(client, pgwire::ParameterStatus("integer_datetimes", "on"));
     Queue(client, pgwire::ParameterStatus("standard_conforming_strings", "on"));
     Queue(client, pgwire::ParameterStatus("TimeZone", "UTC"));
-    Queue(client, pgwire::BackendKeyData(static_cast<uint32_t>(getpid()),
-                                         client.secret));
+    Queue(client,
+          pgwire::BackendKeyData(static_cast<uint32_t>(platform::GetPid()),
+                                 client.secret));
     Queue(client, pgwire::ReadyForQuery('I'));
     client.startup_complete = true;
     return true;
@@ -2358,7 +2360,7 @@ class PostgresServer::Impl {
   int reserve_fd_{-1};
   // Set when AcceptClients shed the listener from epoll after losing the
   // EMFILE reserve descriptor; cleared once the reserve is restored.
-  bool listener_shed_due_to_fd_pressure_{false};
+  [[maybe_unused]] bool listener_shed_due_to_fd_pressure_{false};
   uint16_t bound_port_{0};
   std::atomic<bool> stopping_{false};
   bool read_workers_stopping_{false};

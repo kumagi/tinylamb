@@ -24,6 +24,8 @@
 #include <iostream>
 #include <tuple>
 
+#include "common/platform/time_format.hpp"
+
 namespace tinylamb::detail {
 [[noreturn]] void LogFatalAbort() { std::abort(); }
 }  // namespace tinylamb::detail
@@ -46,7 +48,7 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
   std::tm now_tm{};
   // localtime() is not thread-safe (shared static buffer); use the reentrant
   // form so concurrent loggers on worker threads do not race.
-  std::ignore = localtime_r(&now_time, &now_tm);
+  tinylamb::platform::LocalTime(now_time, &now_tm);
   std::ignore =
       strftime(buff.data(), buff.size(), "%Y-%m-%d %H:%M:%S ", &now_tm);
 

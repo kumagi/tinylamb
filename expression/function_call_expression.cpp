@@ -3390,7 +3390,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const std::time_t now =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
-    gmtime_r(&now, &utc);
+    platform::GmTime(static_cast<int64_t>(now), &utc);
     std::ostringstream output;
     output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S");
     return Value(output.str());
@@ -3425,7 +3425,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
-    gmtime_r(&now, &t);
+    platform::GmTime(static_cast<int64_t>(now), &t);
     CivilTime current{.year = t.tm_year + 1900,
                       .month = t.tm_mon + 1,
                       .day = t.tm_mday,
@@ -3454,7 +3454,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
-    gmtime_r(&now, &t);
+    platform::GmTime(static_cast<int64_t>(now), &t);
     std::chrono::year_month_day ymd{
         std::chrono::year{t.tm_year + 1900},
         std::chrono::month{static_cast<unsigned>(t.tm_mon + 1)},
@@ -3997,6 +3997,33 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       const auto generate = [&](auto current, auto stop,
                                 auto stride) -> StatusOr<Value> {
         using Integer = decltype(current);
+        if ((descending ? current >= stop : current <= stop) && stride != 0) {
+          if constexpr (std::is_unsigned_v<Integer>) {
+            const uint64_t diff =
+                descending ? (current - stop) : (stop - current);
+            const uint64_t abs_stride = descending
+                                            ? (uint64_t{0} - stride)
+                                            : static_cast<uint64_t>(stride);
+            if (abs_stride != 0 && diff / abs_stride >= kMaxGeneratedElements) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "GENERATE_ARRAY generated too many elements");
+            }
+          } else {
+            const __int128 diff = descending ? (static_cast<__int128>(current) -
+                                                static_cast<__int128>(stop))
+                                             : (static_cast<__int128>(stop) -
+                                                static_cast<__int128>(current));
+            const __int128 abs_stride = descending
+                                            ? -static_cast<__int128>(stride)
+                                            : static_cast<__int128>(stride);
+            if (abs_stride > 0 &&
+                diff / abs_stride >=
+                    static_cast<__int128>(kMaxGeneratedElements)) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "GENERATE_ARRAY generated too many elements");
+            }
+          }
+        }
         std::vector<Value> elements;
         while (descending ? current >= stop : current <= stop) {
           if (elements.size() == kMaxGeneratedElements) {
@@ -4046,6 +4073,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
 
     if ((step > 0 && start > end) || (step < 0 && start < end)) {
       return Value::Array({}, "DOUBLE");
+    }
+    if (std::isfinite(start) && std::isfinite(end) && std::isfinite(step)) {
+      if (start != end && (start + step) == start) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_ARRAY generated too many elements");
+      }
+      const double approx_steps = (end - start) / step;
+      if (std::isfinite(approx_steps) &&
+          approx_steps > static_cast<double>(kMaxGeneratedElements) * 2.0) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_ARRAY generated too many elements");
+      }
     }
 
     std::vector<Value> elements;

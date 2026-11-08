@@ -2880,6 +2880,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
 
         std::array<uint16_t, 256> dict_pair_to_group{};
         dict_pair_to_group.fill(0xFFFFU);
+        std::vector<uint32_t> blk_sel_rows;
+        std::vector<uint8_t> blk_row_groups;
         if (fast_dict_double_agg && bounded_int_group_key) {
           if (bounded_has_double_term) {
             bounded_worker_sums[worker].assign(bounded_int_span, 0.0);
@@ -2988,7 +2990,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if (dict_all_pass) {
             for (const LSTableAggDictFilter& df : lstable_agg_dict_filters) {
               const LSTableColumnBlock& dcol = blk.columns[df.full_column];
-              if (((dcol.dict_mask[0] & ~df.pass_mask[0]) |
+              if (dcol.has_null || dcol.dict_codes.empty() ||
+                  ((dcol.dict_mask[0] & ~df.pass_mask[0]) |
                    (dcol.dict_mask[1] & ~df.pass_mask[1]) |
                    (dcol.dict_mask[2] & ~df.pass_mask[2]) |
                    (dcol.dict_mask[3] & ~df.pass_mask[3])) != 0) {
@@ -3332,12 +3335,177 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                               .int_cells.data()
                     : nullptr;
 
+            enum class BlockSelectivityMode : uint8_t {
+              kEmpty = 0,
+              kSparseGather = 1,
+              kSelectionPrefetch = 2,
+              kDenseAllPass = 3,
+            };
+            const auto build_block_selection = [&]() -> BlockSelectivityMode {
+              if (block_all_pass) {
+                blk_matched = nrows;
+                return BlockSelectivityMode::kDenseAllPass;
+              }
+              if (blk_sel_rows.size() < nrows) {
+                blk_sel_rows.resize(nrows);
+              }
+              uint32_t* __restrict sel = blk_sel_rows.data();
+              uint32_t matched = 0;
+              if (dict_all_pass && mship_cells == nullptr &&
+                  peek_ptr != nullptr && peek_ptr->size() == 1) {
+                const IntegerPeekCompare& pred = (*peek_ptr)[0];
+                const int64_t* __restrict pcells =
+                    blk.columns[pred.column].int_cells.data();
+                const int64_t k = pred.constant;
+                switch (pred.op) {
+                  case BinaryOperation::kLessThanEquals:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] <= k);
+                    }
+                    break;
+                  case BinaryOperation::kLessThan:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] < k);
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] >= k);
+                    }
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] > k);
+                    }
+                    break;
+                  case BinaryOperation::kEquals:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] == k);
+                    }
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      sel[matched] = r;
+                      matched += static_cast<uint32_t>(pcells[r] != k);
+                    }
+                    break;
+                  default:
+                    break;
+                }
+              } else if (dict_all_pass && mship_cells == nullptr &&
+                         peek_ptr != nullptr && peek_ptr->size() == 2 &&
+                         (*peek_ptr)[0].column == (*peek_ptr)[1].column &&
+                         (*peek_ptr)[0].op ==
+                             BinaryOperation::kGreaterThanEquals &&
+                         (*peek_ptr)[1].op == BinaryOperation::kLessThan &&
+                         (*peek_ptr)[1].constant >= (*peek_ptr)[0].constant) {
+                const int64_t* __restrict pcells =
+                    blk.columns[(*peek_ptr)[0].column].int_cells.data();
+                const int64_t plo = (*peek_ptr)[0].constant;
+                const auto pspan = static_cast<uint64_t>(
+                    (*peek_ptr)[1].constant - (*peek_ptr)[0].constant);
+                for (uint32_t r = 0; r < nrows; ++r) {
+                  sel[matched] = r;
+                  matched += static_cast<uint32_t>(std::cmp_less(
+                      static_cast<uint64_t>(pcells[r] - plo), pspan));
+                }
+              } else if (!dict_all_pass &&
+                         lstable_agg_dict_filters.size() == 1 &&
+                         peek_all_pass && mship_cells == nullptr) {
+                const LSTableColumnBlock& dcol =
+                    blk.columns[lstable_agg_dict_filters[0].full_column];
+                if (!dcol.dict_codes.empty()) {
+                  const uint8_t* __restrict dc0 = dcol.dict_codes.data();
+                  const uint8_t* __restrict pass0 =
+                      lstable_agg_dict_filters[0].pass.data();
+                  for (uint32_t r = 0; r < nrows; ++r) {
+                    sel[matched] = r;
+                    matched += pass0[dc0[r]];
+                  }
+                }
+              } else {
+                for (uint32_t r = 0; r < nrows; ++r) {
+                  if (!dict_all_pass) {
+                    bool dict_ok = true;
+                    for (const LSTableAggDictFilter& df :
+                         lstable_agg_dict_filters) {
+                      const LSTableColumnBlock& dcol =
+                          blk.columns[df.full_column];
+                      if (dcol.dict_codes.empty() ||
+                          df.pass[dcol.dict_codes[r]] == 0) {
+                        dict_ok = false;
+                        break;
+                      }
+                    }
+                    if (!dict_ok) {
+                      continue;
+                    }
+                  }
+                  if (!peek_all_pass && peek_ptr != nullptr &&
+                      !peek_ptr->empty()) {
+                    bool peek_ok = true;
+                    for (const IntegerPeekCompare& pred : *peek_ptr) {
+                      if (!MatchIntegerCompare(
+                              blk.columns[pred.column].int_cells[r], pred.op,
+                              pred.constant)) {
+                        peek_ok = false;
+                        break;
+                      }
+                    }
+                    if (!peek_ok) {
+                      continue;
+                    }
+                  }
+                  if (mship_cells != nullptr &&
+                      !stream_prebuilt_membership->values->Contains(
+                          mship_cells[r])) {
+                    continue;
+                  }
+                  sel[matched++] = r;
+                }
+              }
+              blk_matched = matched;
+              if (matched == 0) {
+                return BlockSelectivityMode::kEmpty;
+              }
+              if (matched == nrows) {
+                return BlockSelectivityMode::kDenseAllPass;
+              }
+              return (matched * 20U >= nrows)
+                         ? BlockSelectivityMode::kSelectionPrefetch
+                         : BlockSelectivityMode::kSparseGather;
+            };
+
+            const auto resolve_dict_group_slow =
+                [&](uint32_t r, size_t pair_code) -> uint16_t {
+              scratch.clear();
+              for (const slot_t offset : plan.key_offsets) {
+                const LSTableColumnBlock& kcol =
+                    blk.columns[proj_to_full[offset]];
+                Value kv;
+                kv.type = ValueType::kVarChar;
+                kv.value.varchar_value = kcol.VarcharAt(r);
+                scratch.push_back(CanonicalDistinctValue(kv));
+              }
+              bool inserted = false;
+              const size_t new_g =
+                  local.FindOrInsert(scratch, 0, plan.aggregates.size(),
+                                     aggregate_expressions, &inserted);
+              const auto g = static_cast<uint16_t>(new_g);
+              dict_pair_to_group[pair_code] = g;
+              return g;
+            };
+
             // Specialized unrolled fast path for Q01's 5-term grouped double
-            // aggregation when all rows in the block pass filters.
-            const bool is_q1_5term_fast =
-                block_all_pass && dict_group_key &&
-                dict_group_total_codes > 0 && dict_group_total_codes <= 8 &&
-                nterms == 5 &&
+            // aggregation across all three block selectivity regimes.
+            const bool is_q1_5term_shape =
+                dict_group_key && dict_group_total_codes > 0 &&
+                dict_group_total_codes <= 8 && nterms == 5 &&
                 fast_dict_terms[0].shape ==
                     TypedDoubleExprInput::Shape::kSingleDoubleCol &&
                 fast_dict_terms[1].shape ==
@@ -3355,71 +3523,125 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 term_ptrs[0].codes0 != nullptr &&
                 term_ptrs[2].dict1_omd != nullptr &&
                 term_ptrs[3].dict2_opt != nullptr;
-            if (is_q1_5term_fast) {
-              const slot_t key_full0 = proj_to_full[plan.key_offsets[0]];
-              const uint8_t* __restrict codes0 =
-                  blk.columns[key_full0].dict_codes.data();
-              const uint8_t* __restrict codes1 =
-                  plan.key_offsets.size() == 2
-                      ? blk.columns[proj_to_full[plan.key_offsets[1]]]
-                            .dict_codes.data()
-                      : nullptr;
-              const uint8_t* __restrict q_codes = term_ptrs[0].codes0;
-              const double* __restrict q_dict = term_ptrs[0].dict0;
-              const int64_t* __restrict p_cells = term_ptrs[1].col0;
-              const uint8_t* __restrict d_codes = term_ptrs[2].codes1;
-              const double* __restrict d_dict = term_ptrs[2].dict1;
-              const double* __restrict omd_dict = term_ptrs[2].dict1_omd;
-              const uint8_t* __restrict t_codes = term_ptrs[3].codes2;
-              const double* __restrict opt_dict = term_ptrs[3].dict2_opt;
-              std::array<std::array<double, 5>, 8> blk_sums{};
-              for (uint32_t r = 0; r < nrows; ++r) {
-                const size_t pair_code = codes1 == nullptr
-                                             ? static_cast<size_t>(codes0[r])
-                                             : (static_cast<size_t>(codes0[r]) *
-                                                dict_group_stride1) +
-                                                   codes1[r];
-                uint16_t g = dict_pair_to_group[pair_code];
-                if (g == 0xFFFFU) [[unlikely]] {
-                  scratch.clear();
-                  for (const slot_t offset : plan.key_offsets) {
-                    const LSTableColumnBlock& kcol =
-                        blk.columns[proj_to_full[offset]];
-                    Value kv;
-                    kv.type = ValueType::kVarChar;
-                    kv.value.varchar_value = kcol.VarcharAt(r);
-                    scratch.push_back(CanonicalDistinctValue(kv));
+            if (is_q1_5term_shape) {
+              const BlockSelectivityMode mode = build_block_selection();
+              if (mode != BlockSelectivityMode::kEmpty) {
+                const slot_t key_full0 = proj_to_full[plan.key_offsets[0]];
+                const uint8_t* __restrict codes0 =
+                    blk.columns[key_full0].dict_codes.data();
+                const uint8_t* __restrict codes1 =
+                    plan.key_offsets.size() == 2
+                        ? blk.columns[proj_to_full[plan.key_offsets[1]]]
+                              .dict_codes.data()
+                        : nullptr;
+                const uint8_t* __restrict q_codes = term_ptrs[0].codes0;
+                const double* __restrict q_dict = term_ptrs[0].dict0;
+                const int64_t* __restrict p_cells = term_ptrs[1].col0;
+                const uint8_t* __restrict d_codes = term_ptrs[2].codes1;
+                const double* __restrict d_dict = term_ptrs[2].dict1;
+                const double* __restrict omd_dict = term_ptrs[2].dict1_omd;
+                const uint8_t* __restrict t_codes = term_ptrs[3].codes2;
+                const double* __restrict opt_dict = term_ptrs[3].dict2_opt;
+                const uint32_t* __restrict sel = blk_sel_rows.data();
+                alignas(64) std::array<std::array<double, 5>, 8> blk_sums{};
+                std::array<uint32_t, 8> blk_pair_counts{};
+                std::array<uint32_t, 8> blk_pair_first_row{};
+                if (mode == BlockSelectivityMode::kDenseAllPass) {
+                  for (uint32_t r = 0; r < nrows; ++r) {
+                    const size_t pc = codes1 == nullptr
+                                          ? static_cast<size_t>(codes0[r])
+                                          : (static_cast<size_t>(codes0[r]) *
+                                             dict_group_stride1) +
+                                                codes1[r];
+                    if (blk_pair_counts[pc] == 0) [[unlikely]] {
+                      blk_pair_first_row[pc] = r;
+                    }
+                    ++blk_pair_counts[pc];
+                    const uint8_t dc = d_codes[r];
+                    const double q = q_dict[q_codes[r]];
+                    const auto p = std::bit_cast<double>(p_cells[r]);
+                    const double disc_p = p * omd_dict[dc];
+                    const double charge = disc_p * opt_dict[t_codes[r]];
+                    const double d = d_dict[dc];
+                    double* __restrict gs = blk_sums[pc].data();
+                    gs[0] += q;
+                    gs[1] += p;
+                    gs[2] += disc_p;
+                    gs[3] += charge;
+                    gs[4] += d;
                   }
-                  bool inserted = false;
-                  const size_t new_g =
-                      local.FindOrInsert(scratch, 0, plan.aggregates.size(),
-                                         aggregate_expressions, &inserted);
-                  g = static_cast<uint16_t>(new_g);
-                  dict_pair_to_group[pair_code] = g;
+                } else if (mode == BlockSelectivityMode::kSelectionPrefetch &&
+                           blk_matched * 2U < nrows) {
+                  constexpr uint32_t kPrefetchAhead = 16;
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    if (si + kPrefetchAhead < blk_matched) {
+                      __builtin_prefetch(&p_cells[sel[si + kPrefetchAhead]], 0,
+                                         1);
+                    }
+                    const uint32_t r = sel[si];
+                    const size_t pc = codes1 == nullptr
+                                          ? static_cast<size_t>(codes0[r])
+                                          : (static_cast<size_t>(codes0[r]) *
+                                             dict_group_stride1) +
+                                                codes1[r];
+                    if (blk_pair_counts[pc] == 0) [[unlikely]] {
+                      blk_pair_first_row[pc] = r;
+                    }
+                    ++blk_pair_counts[pc];
+                    const uint8_t dc = d_codes[r];
+                    const double q = q_dict[q_codes[r]];
+                    const auto p = std::bit_cast<double>(p_cells[r]);
+                    const double disc_p = p * omd_dict[dc];
+                    const double charge = disc_p * opt_dict[t_codes[r]];
+                    const double d = d_dict[dc];
+                    double* __restrict gs = blk_sums[pc].data();
+                    gs[0] += q;
+                    gs[1] += p;
+                    gs[2] += disc_p;
+                    gs[3] += charge;
+                    gs[4] += d;
+                  }
+                } else {
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    const uint32_t r = sel[si];
+                    const size_t pc = codes1 == nullptr
+                                          ? static_cast<size_t>(codes0[r])
+                                          : (static_cast<size_t>(codes0[r]) *
+                                             dict_group_stride1) +
+                                                codes1[r];
+                    if (blk_pair_counts[pc] == 0) [[unlikely]] {
+                      blk_pair_first_row[pc] = r;
+                    }
+                    ++blk_pair_counts[pc];
+                    const uint8_t dc = d_codes[r];
+                    const double q = q_dict[q_codes[r]];
+                    const auto p = std::bit_cast<double>(p_cells[r]);
+                    const double disc_p = p * omd_dict[dc];
+                    const double charge = disc_p * opt_dict[t_codes[r]];
+                    const double d = d_dict[dc];
+                    double* __restrict gs = blk_sums[pc].data();
+                    gs[0] += q;
+                    gs[1] += p;
+                    gs[2] += disc_p;
+                    gs[3] += charge;
+                    gs[4] += d;
+                  }
                 }
-                ++blk_group_counts[g];
-                const uint8_t dc = d_codes[r];
-                const double q = q_dict[q_codes[r]];
-                const auto p = std::bit_cast<double>(p_cells[r]);
-                const double disc_p = p * omd_dict[dc];
-                const double charge = disc_p * opt_dict[t_codes[r]];
-                const double d = d_dict[dc];
-                double* __restrict gs = blk_sums[g].data();
-                gs[0] += q;
-                gs[1] += p;
-                gs[2] += disc_p;
-                gs[3] += charge;
-                gs[4] += d;
-              }
-              blk_matched = nrows;
-              for (size_t g = 0; g < local.GroupCount() && g < 8; ++g) {
-                if (blk_group_counts[g] == 0) {
-                  continue;
-                }
-                for (size_t ti = 0; ti < 5; ++ti) {
-                  local.SlimDoubleTotal(g,
-                                        fast_dict_terms[ti].primary_agg_idx) +=
-                      blk_sums[g][ti];
+                for (size_t pc = 0; pc < dict_group_total_codes && pc < 8;
+                     ++pc) {
+                  if (blk_pair_counts[pc] == 0) {
+                    continue;
+                  }
+                  uint16_t g = dict_pair_to_group[pc];
+                  if (g == 0xFFFFU) [[unlikely]] {
+                    g = resolve_dict_group_slow(blk_pair_first_row[pc], pc);
+                  }
+                  blk_group_counts[g] += blk_pair_counts[pc];
+                  for (size_t ti = 0; ti < 5; ++ti) {
+                    local.SlimDoubleTotal(
+                        g, fast_dict_terms[ti].primary_agg_idx) +=
+                        blk_sums[pc][ti];
+                  }
                 }
               }
             } else if (plan.key_offsets.empty()) {
@@ -3518,40 +3740,46 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     lstable_agg_dict_filters[1].pass.data();
                 const int64_t* __restrict pcells =
                     blk.columns[(*peek_ptr)[0].column].int_cells.data();
-                const int64_t plo = (*peek_ptr)[0].constant;
+                const auto plo_u =
+                    static_cast<uint64_t>((*peek_ptr)[0].constant);
                 const auto pspan = static_cast<uint64_t>(
                     (*peek_ptr)[1].constant - (*peek_ptr)[0].constant);
                 const BlockTermPtrs& ptrs = term_ptrs[0];
+                if (blk_sel_rows.size() < nrows) {
+                  blk_sel_rows.resize(nrows);
+                }
+                uint32_t* __restrict sel = blk_sel_rows.data();
+                // Stage 1: Compact selection vector over 1-byte dictionary
+                // codes (8 KiB total per block) without touching 8-byte pcells.
+                uint32_t matched = 0;
+                for (uint32_t r = 0; r < nrows; ++r) {
+                  sel[matched] = r;
+                  matched += static_cast<uint32_t>(
+                      (pass0[dc0[r]] & pass1[dc1[r]]) != 0);
+                }
+                // Stage 2: Refine selection vector in-place by date range only
+                // for the surviving dictionary-matched rows.
+                if (!peek_all_pass && matched > 0) {
+                  uint32_t date_matched = 0;
+                  for (uint32_t si = 0; si < matched; ++si) {
+                    const uint32_t r = sel[si];
+                    const uint64_t d = static_cast<uint64_t>(pcells[r]) - plo_u;
+                    sel[date_matched] = r;
+                    date_matched += static_cast<uint32_t>(d < pspan);
+                  }
+                  matched = date_matched;
+                }
+                blk_matched = matched;
                 double sum0 = 0.0;
-                if (peek_all_pass) {
-                  for (uint32_t r = 0; r < nrows; ++r) {
-                    if ((pass0[dc0[r]] & pass1[dc1[r]]) == 0) {
-                      continue;
-                    }
-                    ++blk_matched;
-                    const double v0 = ptrs.codes0 != nullptr
-                                          ? ptrs.dict0[ptrs.codes0[r]]
-                                          : std::bit_cast<double>(ptrs.col0[r]);
-                    const double v1 = ptrs.codes1 != nullptr
-                                          ? ptrs.dict1[ptrs.codes1[r]]
-                                          : std::bit_cast<double>(ptrs.col1[r]);
-                    sum0 += v0 * v1;
-                  }
-                } else {
-                  for (uint32_t r = 0; r < nrows; ++r) {
-                    if ((pass0[dc0[r]] & pass1[dc1[r]]) == 0 ||
-                        std::cmp_greater_equal(pcells[r] - plo, pspan)) {
-                      continue;
-                    }
-                    ++blk_matched;
-                    const double v0 = ptrs.codes0 != nullptr
-                                          ? ptrs.dict0[ptrs.codes0[r]]
-                                          : std::bit_cast<double>(ptrs.col0[r]);
-                    const double v1 = ptrs.codes1 != nullptr
-                                          ? ptrs.dict1[ptrs.codes1[r]]
-                                          : std::bit_cast<double>(ptrs.col1[r]);
-                    sum0 += v0 * v1;
-                  }
+                for (uint32_t si = 0; si < matched; ++si) {
+                  const uint32_t r = sel[si];
+                  const double v0 = ptrs.codes0 != nullptr
+                                        ? ptrs.dict0[ptrs.codes0[r]]
+                                        : std::bit_cast<double>(ptrs.col0[r]);
+                  const double v1 = ptrs.codes1 != nullptr
+                                        ? ptrs.dict1[ptrs.codes1[r]]
+                                        : std::bit_cast<double>(ptrs.col1[r]);
+                  sum0 += v0 * v1;
                 }
                 blk_ungrouped_sums[0] = sum0;
               } else {
@@ -3704,55 +3932,34 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                   blk.columns[key_full0].int_cells.data();
               uint32_t* __restrict w_cnts =
                   bounded_worker_counts[worker].data();
+              const BlockSelectivityMode mode = build_block_selection();
+              if (mode == BlockSelectivityMode::kEmpty) {
+                continue;
+              }
               if (nterms == 0) {
-                if (block_all_pass) {
+                if (mode == BlockSelectivityMode::kDenseAllPass) {
                   for (uint32_t r = 0; r < nrows; ++r) {
                     const auto idx =
                         static_cast<size_t>(key_cells[r] - bounded_int_min);
                     ++w_cnts[idx];
                   }
-                  blk_matched = nrows;
+                } else if (mode == BlockSelectivityMode::kSelectionPrefetch) {
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    if (si + 8 < blk_matched) {
+                      const auto pf_idx = static_cast<size_t>(
+                          key_cells[sel[si + 8]] - bounded_int_min);
+                      __builtin_prefetch(&w_cnts[pf_idx], 1, 1);
+                    }
+                    const auto idx = static_cast<size_t>(key_cells[sel[si]] -
+                                                         bounded_int_min);
+                    ++w_cnts[idx];
+                  }
                 } else {
-                  for (uint32_t r = 0; r < nrows; ++r) {
-                    if (!dict_all_pass) {
-                      bool dict_ok = true;
-                      for (const LSTableAggDictFilter& df :
-                           lstable_agg_dict_filters) {
-                        const LSTableColumnBlock& dcol =
-                            blk.columns[df.full_column];
-                        if (dcol.dict_codes.empty() ||
-                            df.pass[dcol.dict_codes[r]] == 0) {
-                          dict_ok = false;
-                          break;
-                        }
-                      }
-                      if (!dict_ok) {
-                        continue;
-                      }
-                    }
-                    if (!peek_all_pass && peek_ptr != nullptr &&
-                        !peek_ptr->empty()) {
-                      bool peek_ok = true;
-                      for (const IntegerPeekCompare& pred : *peek_ptr) {
-                        if (!MatchIntegerCompare(
-                                blk.columns[pred.column].int_cells[r], pred.op,
-                                pred.constant)) {
-                          peek_ok = false;
-                          break;
-                        }
-                      }
-                      if (!peek_ok) {
-                        continue;
-                      }
-                    }
-                    if (mship_cells != nullptr &&
-                        !stream_prebuilt_membership->values->Contains(
-                            mship_cells[r])) {
-                      continue;
-                    }
-                    ++blk_matched;
-                    const auto idx =
-                        static_cast<size_t>(key_cells[r] - bounded_int_min);
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    const auto idx = static_cast<size_t>(key_cells[sel[si]] -
+                                                         bounded_int_min);
                     ++w_cnts[idx];
                   }
                 }
@@ -3761,72 +3968,59 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     bounded_worker_int_sums[worker].data();
                 const FastDictDoubleTerm& term = fast_dict_terms[0];
                 const BlockTermPtrs& ptrs = term_ptrs[0];
-                if (block_all_pass &&
-                    term.int_shape == TypedIntExprInput::Shape::kSingleIntCol) {
-                  const int64_t* __restrict c0 = ptrs.col0;
-                  for (uint32_t r = 0; r < nrows; ++r) {
+                auto eval_int_term_at = [&](uint32_t r) -> int64_t {
+                  switch (term.int_shape) {
+                    case TypedIntExprInput::Shape::kSingleIntCol:
+                      return ptrs.col0[r];
+                    case TypedIntExprInput::Shape::kMulTwoIntCols:
+                      return ptrs.col0[r] * ptrs.col1[r];
+                    case TypedIntExprInput::Shape::kMulTwoIntColsPlusCol:
+                      return (ptrs.col0[r] * ptrs.col1[r]) + ptrs.col2[r];
+                    default:
+                      return 0;
+                  }
+                };
+                if (mode == BlockSelectivityMode::kDenseAllPass) {
+                  if (term.int_shape ==
+                      TypedIntExprInput::Shape::kSingleIntCol) {
+                    const int64_t* __restrict c0 = ptrs.col0;
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      const auto idx =
+                          static_cast<size_t>(key_cells[r] - bounded_int_min);
+                      w_isums[idx] += c0[r];
+                      ++w_cnts[idx];
+                    }
+                  } else {
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      const auto idx =
+                          static_cast<size_t>(key_cells[r] - bounded_int_min);
+                      w_isums[idx] += eval_int_term_at(r);
+                      ++w_cnts[idx];
+                    }
+                  }
+                } else if (mode == BlockSelectivityMode::kSelectionPrefetch) {
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    if (si + 8 < blk_matched) {
+                      const uint32_t pf_r = sel[si + 8];
+                      const auto pf_idx = static_cast<size_t>(key_cells[pf_r] -
+                                                              bounded_int_min);
+                      __builtin_prefetch(&w_isums[pf_idx], 1, 1);
+                      __builtin_prefetch(&w_cnts[pf_idx], 1, 1);
+                    }
+                    const uint32_t r = sel[si];
                     const auto idx =
                         static_cast<size_t>(key_cells[r] - bounded_int_min);
-                    w_isums[idx] += c0[r];
+                    w_isums[idx] += eval_int_term_at(r);
                     ++w_cnts[idx];
                   }
-                  blk_matched = nrows;
                 } else {
-                  for (uint32_t r = 0; r < nrows; ++r) {
-                    if (!dict_all_pass) {
-                      bool dict_ok = true;
-                      for (const LSTableAggDictFilter& df :
-                           lstable_agg_dict_filters) {
-                        const LSTableColumnBlock& dcol =
-                            blk.columns[df.full_column];
-                        if (dcol.dict_codes.empty() ||
-                            df.pass[dcol.dict_codes[r]] == 0) {
-                          dict_ok = false;
-                          break;
-                        }
-                      }
-                      if (!dict_ok) {
-                        continue;
-                      }
-                    }
-                    if (!peek_all_pass && peek_ptr != nullptr &&
-                        !peek_ptr->empty()) {
-                      bool peek_ok = true;
-                      for (const IntegerPeekCompare& pred : *peek_ptr) {
-                        if (!MatchIntegerCompare(
-                                blk.columns[pred.column].int_cells[r], pred.op,
-                                pred.constant)) {
-                          peek_ok = false;
-                          break;
-                        }
-                      }
-                      if (!peek_ok) {
-                        continue;
-                      }
-                    }
-                    if (mship_cells != nullptr &&
-                        !stream_prebuilt_membership->values->Contains(
-                            mship_cells[r])) {
-                      continue;
-                    }
-                    ++blk_matched;
-                    int64_t iv = 0;
-                    switch (term.int_shape) {
-                      case TypedIntExprInput::Shape::kSingleIntCol:
-                        iv = ptrs.col0[r];
-                        break;
-                      case TypedIntExprInput::Shape::kMulTwoIntCols:
-                        iv = ptrs.col0[r] * ptrs.col1[r];
-                        break;
-                      case TypedIntExprInput::Shape::kMulTwoIntColsPlusCol:
-                        iv = (ptrs.col0[r] * ptrs.col1[r]) + ptrs.col2[r];
-                        break;
-                      default:
-                        break;
-                    }
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    const uint32_t r = sel[si];
                     const auto idx =
                         static_cast<size_t>(key_cells[r] - bounded_int_min);
-                    w_isums[idx] += iv;
+                    w_isums[idx] += eval_int_term_at(r);
                     ++w_cnts[idx];
                   }
                 }
@@ -3834,59 +4028,19 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 double* __restrict w_sums = bounded_worker_sums[worker].data();
                 const FastDictDoubleTerm& term = fast_dict_terms[0];
                 const BlockTermPtrs& ptrs = term_ptrs[0];
-                for (uint32_t r = 0; r < nrows; ++r) {
-                  if (!dict_all_pass) {
-                    bool dict_ok = true;
-                    for (const LSTableAggDictFilter& df :
-                         lstable_agg_dict_filters) {
-                      const LSTableColumnBlock& dcol =
-                          blk.columns[df.full_column];
-                      if (dcol.dict_codes.empty() ||
-                          df.pass[dcol.dict_codes[r]] == 0) {
-                        dict_ok = false;
-                        break;
-                      }
-                    }
-                    if (!dict_ok) {
-                      continue;
-                    }
-                  }
-                  if (!peek_all_pass && peek_ptr != nullptr &&
-                      !peek_ptr->empty()) {
-                    bool peek_ok = true;
-                    for (const IntegerPeekCompare& pred : *peek_ptr) {
-                      if (!MatchIntegerCompare(
-                              blk.columns[pred.column].int_cells[r], pred.op,
-                              pred.constant)) {
-                        peek_ok = false;
-                        break;
-                      }
-                    }
-                    if (!peek_ok) {
-                      continue;
-                    }
-                  }
-                  if (mship_cells != nullptr &&
-                      !stream_prebuilt_membership->values->Contains(
-                          mship_cells[r])) {
-                    continue;
-                  }
-                  ++blk_matched;
+                auto eval_double_term_at = [&](uint32_t r) -> double {
                   const double v0 = ptrs.codes0 != nullptr
                                         ? ptrs.dict0[ptrs.codes0[r]]
                                         : std::bit_cast<double>(ptrs.col0[r]);
-                  double val = 0.0;
                   switch (term.shape) {
                     case TypedDoubleExprInput::Shape::kSingleDoubleCol:
-                      val = v0;
-                      break;
+                      return v0;
                     case TypedDoubleExprInput::Shape::kMulTwoDoubleCols: {
                       const double v1 =
                           ptrs.codes1 != nullptr
                               ? ptrs.dict1[ptrs.codes1[r]]
                               : std::bit_cast<double>(ptrs.col1[r]);
-                      val = v0 * v1;
-                      break;
+                      return v0 * v1;
                     }
                     case TypedDoubleExprInput::Shape::kMulConstMinusCol: {
                       const double f1 =
@@ -3896,8 +4050,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                  (ptrs.codes1 != nullptr
                                       ? ptrs.dict1[ptrs.codes1[r]]
                                       : std::bit_cast<double>(ptrs.col1[r])));
-                      val = v0 * f1;
-                      break;
+                      return v0 * f1;
                     }
                     case TypedDoubleExprInput::Shape::
                         kMulConstMinusColMulConstPlusCol: {
@@ -3915,137 +4068,123 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                  (ptrs.codes2 != nullptr
                                       ? ptrs.dict2[ptrs.codes2[r]]
                                       : std::bit_cast<double>(ptrs.col2[r])));
-                      val = v0 * f1 * f2;
-                      break;
+                      return v0 * f1 * f2;
                     }
                     default:
-                      break;
+                      return 0.0;
                   }
-                  const auto idx =
-                      static_cast<size_t>(key_cells[r] - bounded_int_min);
-                  w_sums[idx] += val;
-                  ++w_cnts[idx];
+                };
+                if (mode == BlockSelectivityMode::kDenseAllPass) {
+                  for (uint32_t r = 0; r < nrows; ++r) {
+                    const auto idx =
+                        static_cast<size_t>(key_cells[r] - bounded_int_min);
+                    w_sums[idx] += eval_double_term_at(r);
+                    ++w_cnts[idx];
+                  }
+                } else if (mode == BlockSelectivityMode::kSelectionPrefetch) {
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    if (si + 8 < blk_matched) {
+                      const uint32_t pf_r = sel[si + 8];
+                      const auto pf_idx = static_cast<size_t>(key_cells[pf_r] -
+                                                              bounded_int_min);
+                      __builtin_prefetch(&w_sums[pf_idx], 1, 1);
+                      __builtin_prefetch(&w_cnts[pf_idx], 1, 1);
+                    }
+                    const uint32_t r = sel[si];
+                    const auto idx =
+                        static_cast<size_t>(key_cells[r] - bounded_int_min);
+                    w_sums[idx] += eval_double_term_at(r);
+                    ++w_cnts[idx];
+                  }
+                } else {
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    const uint32_t r = sel[si];
+                    const auto idx =
+                        static_cast<size_t>(key_cells[r] - bounded_int_min);
+                    w_sums[idx] += eval_double_term_at(r);
+                    ++w_cnts[idx];
+                  }
                 }
               }
-              if (blk_matched > 0) {
-                scanned[worker] += blk_matched;
-                emitted[worker] += blk_matched;
-                aggregate_updates[worker] += blk_matched;
-              }
+              scanned[worker] += blk_matched;
+              emitted[worker] += blk_matched;
+              aggregate_updates[worker] += blk_matched;
               continue;
             } else {
-              const slot_t key_full0 = proj_to_full[plan.key_offsets[0]];
-              const uint8_t* codes0 = blk.columns[key_full0].dict_codes.data();
-              const uint8_t* codes1 =
-                  plan.key_offsets.size() == 2
-                      ? blk.columns[proj_to_full[plan.key_offsets[1]]]
-                            .dict_codes.data()
-                      : nullptr;
-              for (uint32_t r = 0; r < nrows; ++r) {
-                if (!dict_all_pass) {
-                  bool dict_ok = true;
-                  for (const LSTableAggDictFilter& df :
-                       lstable_agg_dict_filters) {
-                    const LSTableColumnBlock& dcol =
-                        blk.columns[df.full_column];
-                    if (dcol.dict_codes.empty() ||
-                        df.pass[dcol.dict_codes[r]] == 0) {
-                      dict_ok = false;
-                      break;
+              const BlockSelectivityMode mode = build_block_selection();
+              if (mode != BlockSelectivityMode::kEmpty) {
+                const slot_t key_full0 = proj_to_full[plan.key_offsets[0]];
+                const uint8_t* __restrict codes0 =
+                    blk.columns[key_full0].dict_codes.data();
+                const uint8_t* __restrict codes1 =
+                    plan.key_offsets.size() == 2
+                        ? blk.columns[proj_to_full[plan.key_offsets[1]]]
+                              .dict_codes.data()
+                        : nullptr;
+                if (blk_row_groups.size() < blk_matched) {
+                  blk_row_groups.resize(blk_matched);
+                }
+                uint8_t* __restrict rg = blk_row_groups.data();
+                if (mode == BlockSelectivityMode::kDenseAllPass) {
+                  for (uint32_t r = 0; r < nrows; ++r) {
+                    const size_t pair_code =
+                        codes1 == nullptr ? static_cast<size_t>(codes0[r])
+                                          : (static_cast<size_t>(codes0[r]) *
+                                             dict_group_stride1) +
+                                                codes1[r];
+                    uint16_t g = dict_pair_to_group[pair_code];
+                    if (g == 0xFFFFU) [[unlikely]] {
+                      g = resolve_dict_group_slow(r, pair_code);
                     }
+                    rg[r] = static_cast<uint8_t>(g);
+                    ++blk_group_counts[g];
                   }
-                  if (!dict_ok) {
-                    continue;
-                  }
-                }
-                if (!peek_all_pass && peek_ptr != nullptr &&
-                    !peek_ptr->empty()) {
-                  bool peek_ok = true;
-                  for (const IntegerPeekCompare& pred : *peek_ptr) {
-                    if (!MatchIntegerCompare(
-                            blk.columns[pred.column].int_cells[r], pred.op,
-                            pred.constant)) {
-                      peek_ok = false;
-                      break;
+                } else {
+                  const uint32_t* __restrict sel = blk_sel_rows.data();
+                  for (uint32_t si = 0; si < blk_matched; ++si) {
+                    const uint32_t r = sel[si];
+                    const size_t pair_code =
+                        codes1 == nullptr ? static_cast<size_t>(codes0[r])
+                                          : (static_cast<size_t>(codes0[r]) *
+                                             dict_group_stride1) +
+                                                codes1[r];
+                    uint16_t g = dict_pair_to_group[pair_code];
+                    if (g == 0xFFFFU) [[unlikely]] {
+                      g = resolve_dict_group_slow(r, pair_code);
                     }
-                  }
-                  if (!peek_ok) {
-                    continue;
+                    rg[si] = static_cast<uint8_t>(g);
+                    ++blk_group_counts[g];
                   }
                 }
-                if (mship_cells != nullptr &&
-                    !stream_prebuilt_membership->values->Contains(
-                        mship_cells[r])) {
-                  continue;
-                }
-                ++blk_matched;
-                const size_t pair_code = codes1 == nullptr
-                                             ? static_cast<size_t>(codes0[r])
-                                             : (static_cast<size_t>(codes0[r]) *
-                                                dict_group_stride1) +
-                                                   codes1[r];
-                uint16_t g = dict_pair_to_group[pair_code];
-                if (g == 0xFFFFU) [[unlikely]] {
-                  scratch.clear();
-                  for (const slot_t offset : plan.key_offsets) {
-                    const LSTableColumnBlock& kcol =
-                        blk.columns[proj_to_full[offset]];
-                    Value kv;
-                    kv.type = ValueType::kVarChar;
-                    kv.value.varchar_value = kcol.VarcharAt(r);
-                    scratch.push_back(CanonicalDistinctValue(kv));
-                  }
-                  bool inserted = false;
-                  const size_t new_g =
-                      local.FindOrInsert(scratch, 0, plan.aggregates.size(),
-                                         aggregate_expressions, &inserted);
-                  g = static_cast<uint16_t>(new_g);
-                  dict_pair_to_group[pair_code] = g;
-                }
-                ++blk_group_counts[g];
-                double prev_val = 0.0;
+                const size_t n_groups_now =
+                    std::min<size_t>(local.GroupCount(), 256);
                 for (size_t ti = 0; ti < nterms; ++ti) {
                   const FastDictDoubleTerm& term = fast_dict_terms[ti];
                   const BlockTermPtrs& ptrs = term_ptrs[ti];
-                  const double v0 = ptrs.codes0 != nullptr
-                                        ? ptrs.dict0[ptrs.codes0[r]]
-                                        : std::bit_cast<double>(ptrs.col0[r]);
-                  double val = 0.0;
-                  switch (term.shape) {
-                    case TypedDoubleExprInput::Shape::kSingleDoubleCol:
-                      val = v0;
-                      break;
-                    case TypedDoubleExprInput::Shape::kMulTwoDoubleCols: {
-                      const double v1 =
-                          ptrs.codes1 != nullptr
-                              ? ptrs.dict1[ptrs.codes1[r]]
-                              : std::bit_cast<double>(ptrs.col1[r]);
-                      val = v0 * v1;
-                      break;
+                  alignas(64) std::array<double, 256> grp_acc{};
+                  for (size_t g = 0; g < n_groups_now; ++g) {
+                    if (blk_group_counts[g] != 0) {
+                      grp_acc[g] =
+                          local.SlimDoubleTotal(g, term.primary_agg_idx);
                     }
-                    case TypedDoubleExprInput::Shape::kMulConstMinusCol: {
-                      const double f1 =
-                          ptrs.dict1_omd != nullptr
-                              ? ptrs.dict1_omd[ptrs.codes1[r]]
-                              : (term.k0 -
-                                 (ptrs.codes1 != nullptr
-                                      ? ptrs.dict1[ptrs.codes1[r]]
-                                      : std::bit_cast<double>(ptrs.col1[r])));
-                      val = v0 * f1;
-                      break;
-                    }
-                    case TypedDoubleExprInput::Shape::
-                        kMulConstMinusColMulConstPlusCol: {
-                      const double f2 =
-                          ptrs.dict2_opt != nullptr
-                              ? ptrs.dict2_opt[ptrs.codes2[r]]
-                              : (term.k1 +
-                                 (ptrs.codes2 != nullptr
-                                      ? ptrs.dict2[ptrs.codes2[r]]
-                                      : std::bit_cast<double>(ptrs.col2[r])));
-                      if (term.reuse_prev_mul_const_minus) {
-                        val = prev_val * f2;
-                      } else {
+                  }
+                  auto eval_term_at = [&](uint32_t r) -> double {
+                    const double v0 = ptrs.codes0 != nullptr
+                                          ? ptrs.dict0[ptrs.codes0[r]]
+                                          : std::bit_cast<double>(ptrs.col0[r]);
+                    switch (term.shape) {
+                      case TypedDoubleExprInput::Shape::kSingleDoubleCol:
+                        return v0;
+                      case TypedDoubleExprInput::Shape::kMulTwoDoubleCols: {
+                        const double v1 =
+                            ptrs.codes1 != nullptr
+                                ? ptrs.dict1[ptrs.codes1[r]]
+                                : std::bit_cast<double>(ptrs.col1[r]);
+                        return v0 * v1;
+                      }
+                      case TypedDoubleExprInput::Shape::kMulConstMinusCol: {
                         const double f1 =
                             ptrs.dict1_omd != nullptr
                                 ? ptrs.dict1_omd[ptrs.codes1[r]]
@@ -4053,15 +4192,54 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                    (ptrs.codes1 != nullptr
                                         ? ptrs.dict1[ptrs.codes1[r]]
                                         : std::bit_cast<double>(ptrs.col1[r])));
-                        val = v0 * f1 * f2;
+                        return v0 * f1;
                       }
-                      break;
+                      case TypedDoubleExprInput::Shape::
+                          kMulConstMinusColMulConstPlusCol: {
+                        const double f1 =
+                            ptrs.dict1_omd != nullptr
+                                ? ptrs.dict1_omd[ptrs.codes1[r]]
+                                : (term.k0 -
+                                   (ptrs.codes1 != nullptr
+                                        ? ptrs.dict1[ptrs.codes1[r]]
+                                        : std::bit_cast<double>(ptrs.col1[r])));
+                        const double f2 =
+                            ptrs.dict2_opt != nullptr
+                                ? ptrs.dict2_opt[ptrs.codes2[r]]
+                                : (term.k1 +
+                                   (ptrs.codes2 != nullptr
+                                        ? ptrs.dict2[ptrs.codes2[r]]
+                                        : std::bit_cast<double>(ptrs.col2[r])));
+                        return v0 * f1 * f2;
+                      }
+                      default:
+                        return 0.0;
                     }
-                    default:
-                      break;
+                  };
+                  if (mode == BlockSelectivityMode::kDenseAllPass) {
+                    for (uint32_t r = 0; r < nrows; ++r) {
+                      grp_acc[rg[r]] += eval_term_at(r);
+                    }
+                  } else if (mode == BlockSelectivityMode::kSelectionPrefetch) {
+                    const uint32_t* __restrict sel = blk_sel_rows.data();
+                    for (uint32_t si = 0; si < blk_matched; ++si) {
+                      if (si + 16 < blk_matched && ptrs.col0 != nullptr) {
+                        __builtin_prefetch(&ptrs.col0[sel[si + 16]], 0, 1);
+                      }
+                      grp_acc[rg[si]] += eval_term_at(sel[si]);
+                    }
+                  } else {
+                    const uint32_t* __restrict sel = blk_sel_rows.data();
+                    for (uint32_t si = 0; si < blk_matched; ++si) {
+                      grp_acc[rg[si]] += eval_term_at(sel[si]);
+                    }
                   }
-                  prev_val = val;
-                  local.SlimDoubleTotal(g, term.primary_agg_idx) += val;
+                  for (size_t g = 0; g < n_groups_now; ++g) {
+                    if (blk_group_counts[g] != 0) {
+                      local.SlimDoubleTotal(g, term.primary_agg_idx) =
+                          grp_acc[g];
+                    }
+                  }
                 }
               }
             }
@@ -4676,8 +4854,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               group_index = g;
             } else if (int_key && !plan.key_offsets.empty() &&
                        !is_null(plan.key_offsets[0])) {
-              const int64_t raw_key =
-                  blk.columns[proj_to_full[plan.key_offsets[0]]].int_cells[r];
+              const LSTableColumnBlock& key_col =
+                  blk.columns[proj_to_full[plan.key_offsets[0]]];
+              if (r + 8 < blk.row_count) {
+                local.PrefetchGroupSlot(key_col.int_cells[r + 8]);
+              }
+              const int64_t raw_key = key_col.int_cells[r];
               const size_t mru_idx = TypedWorkerGroups::MruSlot(raw_key);
               if (local.mru_groups[mru_idx] != SIZE_MAX &&
                   local.mru_keys[mru_idx] == raw_key) {

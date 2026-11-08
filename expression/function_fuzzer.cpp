@@ -184,15 +184,29 @@ const auto kNonStrictFunctions = std::to_array<const char* const>({
     "nulliferror",
 });
 
-Value MakeArg(Cursor& c) {
+Value MakeArg(Cursor& c, bool bounded_sequence = false) {
   switch (c.Next() % 8) {
     case 0:
       return {};  // NULL
     case 1:
       return Value(static_cast<int64_t>(c.Next()) - 127);
-    case 2:
+    case 2: {
+      if (bounded_sequence) {
+        const uint8_t b = c.Next();
+        if (b == 255) {
+          // Exercise the > 1,000,000 element guard in O(1) without spending
+          // seconds materializing 500k..999k elements on every shift input.
+          return Value(int64_t{1'000'005});
+        }
+        return Value(int64_t{1} << (b % 10));
+      }
       return Value(int64_t{1} << (c.Next() % 64));
+    }
     case 3:
+      if (bounded_sequence) {
+        return Value(static_cast<double>(static_cast<int16_t>(c.Next()) - 128) /
+                     3.0);
+      }
       return Value(static_cast<double>(static_cast<int32_t>(c.Next() << 16)) /
                    3.0);
     case 4: {
@@ -272,9 +286,13 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     args.push_back(IntervalExpressionExp(static_cast<int64_t>(c.Next()) - 127,
                                          kUnits[c.Next() % kUnits.size()]));
   } else {
+    const bool bounded_seq =
+        (name == "generate_array" || name == "generate_series" ||
+         name == "generate_date_array" || name == "repeat" || name == "lpad" ||
+         name == "rpad");
     const size_t argc = 1 + (c.Next() % 3);
     for (size_t i = 0; i < argc; ++i) {
-      Value v = MakeArg(c);
+      Value v = MakeArg(c, bounded_seq);
       has_null |= v.IsNull();
       args.push_back(ConstantValueExp(v));
     }
@@ -310,11 +328,19 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   assert(first.HasValue() == join_ctx.HasValue());
   if (first.HasValue() && join_ctx.HasValue()) {
     assert(first.Value().IsNull() == join_ctx.Value().IsNull() &&
-           first.Value().AsString() == join_ctx.Value().AsString());
+           first.Value() == join_ctx.Value());
+    if (!first.Value().IsArray() ||
+        first.Value().ArrayElements().size() <= 64) {
+      assert(first.Value().AsString() == join_ctx.Value().AsString());
+    }
   }
   if (first.HasValue() && second.HasValue()) {
     assert(first.Value().IsNull() == second.Value().IsNull() &&
-           first.Value().AsString() == second.Value().AsString());
+           first.Value() == second.Value());
+    if (!first.Value().IsArray() ||
+        first.Value().ArrayElements().size() <= 64) {
+      assert(first.Value().AsString() == second.Value().AsString());
+    }
   }
   if (strict && has_null && first.HasValue()) {
     // A strict builtin that evaluated at all must fold to NULL, never to a

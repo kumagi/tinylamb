@@ -16,10 +16,6 @@
 
 #include "page/page_manager.hpp"
 
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -267,15 +263,16 @@ bool LsmTreeState::FlushAndCompactIfIdleLocked() {
 StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
     std::string_view db_name, size_t /*capacity*/, bool /*initialize_meta*/) {
   const std::string path(db_name);
-  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+  const int fd = platform::OpenFile(
+      path, {.mode = platform::OpenMode::kReadWrite, .create = true}, 0644);
   if (fd < 0) {
     return StatusError(
         StatusCode::kIOError,
         "failed to open database file " + path + ": " + std::strerror(errno));
   }
-  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+  if (platform::TryLockExclusive(fd) != 0) {
     const int err = errno;
-    ::close(fd);
+    platform::CloseFile(fd);
     if (err == EWOULDBLOCK || err == EAGAIN) {
       return StatusError(StatusCode::kConflicts,
                          "database file is already open: " + path);
@@ -294,8 +291,8 @@ PageManager::~PageManager() { CloseDatabaseFile(); }
 
 void PageManager::CloseDatabaseFile() {
   if (lock_fd_ >= 0) {
-    (void)::flock(lock_fd_, LOCK_UN);
-    ::close(lock_fd_);
+    (void)platform::UnlockFile(lock_fd_);
+    platform::CloseFile(lock_fd_);
     lock_fd_ = -1;
   }
 }
@@ -1162,7 +1159,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   if (lock_fd_ < 0) {
     return Status::kIOError;
   }
-  if (::ftruncate(lock_fd_, 0) != 0) {
+  if (platform::Truncate(lock_fd_, 0) != 0) {
     return StatusError(
         StatusCode::kIOError,
         "ftruncate failed on checkpoint: " + std::string(std::strerror(errno)));
@@ -1170,8 +1167,8 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   size_t written = 0;
   while (written < buf.size()) {
     const ssize_t n =
-        ::pwrite(lock_fd_, buf.data() + written, buf.size() - written,
-                 static_cast<off_t>(written));
+        platform::Pwrite(lock_fd_, buf.data() + written, buf.size() - written,
+                         static_cast<int64_t>(written));
     if (n <= 0) {
       if (errno == EINTR) {
         continue;
@@ -1643,6 +1640,17 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
                          "transaction already holds a table tail reservation");
     }
   }
+  txn_id_t recorded_holder = 0;
+  struct WaitCleanup {
+    const Transaction* watcher;
+    txn_id_t* recorded_holder;
+    ~WaitCleanup() {
+      if (watcher != nullptr && *recorded_holder != 0) {
+        watcher->ClearWaitForHolder();
+        watcher->DebugSetPhase(nullptr);
+      }
+    }
+  } cleanup{.watcher = watcher, .recorded_holder = &recorded_holder};
   const auto start = std::chrono::steady_clock::now();
   const auto deadline = start + kTableTailWaitTimeout;
   bool waited = false;
@@ -1661,6 +1669,11 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
                                          : res->second.predecessor;
       return visible_tail == expected ? Status::kSuccess : Status::kConflicts;
     }
+    if (watcher != nullptr && res->second.owner != recorded_holder) {
+      recorded_holder = res->second.owner;
+      watcher->DebugSetPhase("tail-reservation-wait");
+      watcher->NoteWaitForHolder(recorded_holder, RowPosition(first_page, 0));
+    }
     waited = true;
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -1671,6 +1684,11 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
         lock, std::min(kTableTailWaitSlice,
                        std::chrono::duration_cast<std::chrono::milliseconds>(
                            deadline - now)));
+  }
+  if (watcher != nullptr && recorded_holder != 0) {
+    watcher->ClearWaitForHolder();
+    watcher->DebugSetPhase(nullptr);
+    recorded_holder = 0;
   }
   if (waited) {
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1744,6 +1762,17 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
                                              page_id_t page_id,
                                              const Transaction* watcher) {
   std::unique_lock lock(table_tails_mu_);
+  txn_id_t recorded_holder = 0;
+  struct WaitCleanup {
+    const Transaction* watcher;
+    txn_id_t* recorded_holder;
+    ~WaitCleanup() {
+      if (watcher != nullptr && *recorded_holder != 0) {
+        watcher->ClearWaitForHolder();
+        watcher->DebugSetPhase(nullptr);
+      }
+    }
+  } cleanup{.watcher = watcher, .recorded_holder = &recorded_holder};
   const auto deadline =
       std::chrono::steady_clock::now() + kTableTailWaitTimeout;
   for (;;) {
@@ -1760,6 +1789,12 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
     if (watcher != nullptr && watcher->IsWounded()) {
       return StatusError(StatusCode::kConflicts,
                          "wounded while waiting for unpublished table tail");
+    }
+    if (watcher != nullptr && it->second.owner != recorded_holder) {
+      recorded_holder = it->second.owner;
+      watcher->DebugSetPhase("tail-page-wait");
+      watcher->NoteWaitForHolder(recorded_holder,
+                                 RowPosition(first_page, page_id));
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
@@ -1858,6 +1893,11 @@ void PageManager::ForgetTableTail(page_id_t first_page) {
       ++it;
     }
   }
+  table_tails_cv_.notify_all();
+}
+
+void PageManager::NotifyTableTailWaiters() {
+  std::scoped_lock lock(table_tails_mu_);
   table_tails_cv_.notify_all();
 }
 

@@ -2934,9 +2934,8 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
         context.execution_runtime()
             ->uncorrelated_key_memo
             .emplace(&statement,
-                     std::make_pair(
-                         stmt_id,
-                         UncorrelatedCacheKey(statement, ctes, exists_only)))
+                     std::make_pair(stmt_id, UncorrelatedCacheKey(
+                                                 statement, ctes, exists_only)))
             .first;
   }
   const std::string& structural_key = key_memo->second.second;

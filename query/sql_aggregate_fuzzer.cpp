@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "common/platform/extended_float.hpp"
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
@@ -831,52 +832,68 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   // small-table domain (-3..3) is kept so group counts stay meaningful.
   const bool large = g.Chance(12);
   const int row_count = large ? g.Pick(8300, 8450) : g.Pick(5, 12);
-  std::string batch;
-  int pending = 0;
   // Per-column flag for INT64 extremes: VAR_*/STDDEV_* accumulation order
   // is only bit-exact when every term stays inside the long-double
   // mantissa, so those aggregates are generated only for extreme-free
   // columns.
   std::array<bool, 2> col_extreme{false, false};
-  for (int i = 0; i < row_count; ++i) {
-    MRow r;
-    r.u = i;
-    r.a = g.Chance(25) ? kNullRepr : g.Pick(-3, 3);
-    r.b = g.Chance(25) ? kNullRepr : g.Pick(-2, 2);
-    // INT64 extremes stress SUM/running aggregates (never kNullRepr).
-    if (g.Chance(8)) {
-      r.a = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
-      col_extreme[0] = true;
+  if (large) {
+    // Single-statement UNNEST(GENERATE_SERIES(...)) setup for multi-block
+    // tables (>2 full 4,096-row LSTable super-blocks): avoids 42 separate
+    // parser round-trips while producing FOR-encoded integers and
+    // dictionary-compressible DOUBLEs that exercise all LSTable layouts.
+    t.setup.push_back(
+        "INSERT INTO t SELECT n, "
+        "CASE WHEN MOD(n, 11) = 0 THEN NULL ELSE MOD(n, 7) - 3 END, "
+        "CASE WHEN MOD(n, 13) = 0 THEN NULL ELSE MOD(n, 5) - 2 END, "
+        "CASE WHEN MOD(n, 17) = 0 THEN NULL WHEN MOD(n, 2) = 0 THEN 'x' ELSE "
+        "'yy' END, "
+        "CASE WHEN MOD(n, 19) = 0 THEN NULL WHEN MOD(n, 3) = 0 THEN 0.5 WHEN "
+        "MOD(n, 3) = 1 THEN -1.5 ELSE 2.25 END "
+        "FROM UNNEST(GENERATE_SERIES(0, " +
+        std::to_string(row_count - 1) + ")) AS n;");
+    mirror.reserve(static_cast<size_t>(row_count));
+    for (int i = 0; i < row_count; ++i) {
+      MRow r;
+      r.u = i;
+      r.a = (i % 11 == 0) ? kNullRepr : (i % 7) - 3;
+      r.b = (i % 13 == 0) ? kNullRepr : (i % 5) - 2;
+      r.s = (i % 17 == 0) ? kNullRepr : ((i % 2 == 0) ? 0 : 1);
+      r.f_null = (i % 19 == 0);
+      if (!r.f_null) {
+        r.f = (i % 3 == 0) ? 0.5 : ((i % 3 == 1) ? -1.5 : 2.25);
+      }
+      mirror.push_back(r);
     }
-    if (g.Chance(8)) {
-      r.b = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
-      col_extreme[1] = true;
-    }
-    r.s = g.Chance(15) ? kNullRepr : g.Pick(0, 1);
-    r.f_null = g.Chance(25);
-    if (!r.f_null) {
-      static constexpr std::array<double, 10> kFPool = {
-          0.5, -1.5, 2.25, -3.0, 100.5, 1e-300, 1e17, 3.7, -0.25, 7.0};
-      r.f = g.Chance(8) ? 1e300 : kFPool[static_cast<size_t>(g.Pick(0, 9))];
-    }
-    mirror.push_back(r);
-    const std::string tuple =
-        "(" + std::to_string(r.u) + ", " + CellSql(0, r.a) + ", " +
-        CellSql(1, r.b) + ", " + CellSql(2, r.s) + ", " +
-        (r.f_null ? std::string("NULL") : FormatDoubleShortest(r.f)) + ")";
-    if (!large) {
+  } else {
+    for (int i = 0; i < row_count; ++i) {
+      MRow r;
+      r.u = i;
+      r.a = g.Chance(25) ? kNullRepr : g.Pick(-3, 3);
+      r.b = g.Chance(25) ? kNullRepr : g.Pick(-2, 2);
+      // INT64 extremes stress SUM/running aggregates (never kNullRepr).
+      if (g.Chance(8)) {
+        r.a = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+        col_extreme[0] = true;
+      }
+      if (g.Chance(8)) {
+        r.b = g.Chance(50) ? INT64_MAX : INT64_MIN + 1;
+        col_extreme[1] = true;
+      }
+      r.s = g.Chance(15) ? kNullRepr : g.Pick(0, 1);
+      r.f_null = g.Chance(25);
+      if (!r.f_null) {
+        static constexpr std::array<double, 10> kFPool = {
+            0.5, -1.5, 2.25, -3.0, 100.5, 1e-300, 1e17, 3.7, -0.25, 7.0};
+        r.f = g.Chance(8) ? 1e300 : kFPool[static_cast<size_t>(g.Pick(0, 9))];
+      }
+      mirror.push_back(r);
+      const std::string tuple =
+          "(" + std::to_string(r.u) + ", " + CellSql(0, r.a) + ", " +
+          CellSql(1, r.b) + ", " + CellSql(2, r.s) + ", " +
+          (r.f_null ? std::string("NULL") : FormatDoubleShortest(r.f)) + ")";
       t.setup.push_back("INSERT INTO t VALUES " + tuple + ";");
-      continue;
     }
-    batch += (pending == 0 ? "" : ", ") + tuple;
-    if (++pending == 200) {
-      t.setup.push_back("INSERT INTO t VALUES " + batch + ";");
-      batch.clear();
-      pending = 0;
-    }
-  }
-  if (pending != 0) {
-    t.setup.push_back("INSERT INTO t VALUES " + batch + ";");
   }
 
   // ScopedDb deletes the throwaway .db/.log pair when the iteration ends.
@@ -904,6 +921,10 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       return "";
     }
   }
+  // Commit setup so read-only queries can trigger lazy LSTableStore creation
+  // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
 
   std::string report;
   const std::string pk_group_sql =
@@ -1810,6 +1831,98 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     return report;
   }
 
+  // On multi-super-block (`large`) rounds, explicitly probe the 3 selectivity
+  // regimes of the selectivity-adaptive LSTable kernels across the 4,096-row
+  // super-block boundaries:
+  //   0: Pattern A (<5% sparse gather across block 0 & block 1 boundary)
+  //   1: Pattern C (100% block 0) + Pattern B (~22% block 1) + 0% block 2
+  //   2: Pattern B (>90% high-selectivity block 0) + Pattern C (100% block 1/2)
+  //   3: Ungrouped Q6-style scalar SUM(f), COUNT(*), SUM(a) under sparse gather
+  if (large) {
+    struct SelProbe {
+      std::string where_sql;
+      int64_t u_lo;
+      int64_t u_hi;
+      bool ungrouped;
+    };
+    const std::array<SelProbe, 4> kSelProbes = {{
+        {"u >= 4000 AND u < 4180", 4000, 4180, false},
+        {"u < 5000", 0, 5000, false},
+        {"u >= 400", 400, row_count, false},
+        {"u >= 4000 AND u < 4200 AND a BETWEEN -2 AND 2", 4000, 4200, true},
+    }};
+    for (const SelProbe& sp : kSelProbes) {
+      std::string sql;
+      std::vector<std::string> expected;
+      if (sp.ungrouped) {
+        sql =
+            "SELECT COUNT(*), COUNT(a), SUM(a), SUM(f), MIN(b), MAX(b) "
+            "FROM t WHERE " +
+            sp.where_sql + ";";
+        std::vector<MRow> surv;
+        for (const MRow& r : mirror) {
+          if (r.u >= sp.u_lo && r.u < sp.u_hi && r.a != kNullRepr &&
+              r.a >= -2 && r.a <= 2) {
+            surv.push_back(r);
+          }
+        }
+        std::string row;
+        row +=
+            ComputeAgg({"COUNT(*)", -1, AggSpec::Kind::kCountStar}, surv) + ",";
+        row += ComputeAgg({"COUNT(a)", 0, AggSpec::Kind::kCount}, surv) + ",";
+        row += ComputeAgg({"SUM(a)", 0, AggSpec::Kind::kSum}, surv) + ",";
+        row += ComputeAgg({"SUM(f)", 3, AggSpec::Kind::kSum}, surv) + ",";
+        row += ComputeAgg({"MIN(b)", 1, AggSpec::Kind::kMin}, surv) + ",";
+        row += ComputeAgg({"MAX(b)", 1, AggSpec::Kind::kMax}, surv) + ",";
+        expected.push_back(row);
+      } else {
+        sql =
+            "SELECT a, s, COUNT(*), COUNT(a), SUM(a), SUM(f), AVG(f) "
+            "FROM t WHERE " +
+            sp.where_sql + " GROUP BY a, s;";
+        std::map<std::string, std::vector<MRow>> groups;
+        for (const MRow& r : mirror) {
+          if (r.u >= sp.u_lo && r.u < sp.u_hi) {
+            const std::string key = GroupKey(0, r) + "#" + GroupKey(2, r);
+            groups[key].push_back(r);
+          }
+        }
+        for (const auto& [k, rows] : groups) {
+          std::string row = FmtInt(rows[0].a) + "," + FmtStr(rows[0].s) + ",";
+          row += ComputeAgg({"COUNT(*)", -1, AggSpec::Kind::kCountStar}, rows) +
+                 ",";
+          row += ComputeAgg({"COUNT(a)", 0, AggSpec::Kind::kCount}, rows) + ",";
+          row += ComputeAgg({"SUM(a)", 0, AggSpec::Kind::kSum}, rows) + ",";
+          row += ComputeAgg({"SUM(f)", 3, AggSpec::Kind::kSum}, rows) + ",";
+          row += ComputeAgg({"AVG(f)", 3, AggSpec::Kind::kAvg}, rows) + ",";
+          expected.push_back(row);
+        }
+        std::sort(expected.begin(), expected.end());
+      }
+      std::string error;
+      auto got = RunQuery(db, ctx, sql, &error);
+      if (!got.has_value()) {
+        report += "[AGGREGATE MISMATCH] selectivity probe failed: " + sql +
+                  " :: " + error + "\n";
+        return report;
+      }
+      const std::vector<std::string> actual = FormatRows(*got);
+      t.queries.push_back({sql, expected});
+      if (actual != expected && !RowsAlmostEqual(actual, expected)) {
+        report += "[AGGREGATE MISMATCH] " + sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
+
   // Cross-mode / index-independence verification: re-verify every recorded
   // aggregate/window query after building secondary indexes + ANALYZE, and
   // under the Cascades grouped route (TINYLAMB_GROUPED_ROUTE=cascades).
@@ -1818,11 +1931,13 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
     res.Value().Drain();
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   for (int pass = 0; pass < 2; ++pass) {
     if (pass == 1) {
-      setenv("TINYLAMB_GROUPED_ROUTE", "cascades", 1);
+      platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
     }
     for (const AggQueryExpect& qe : t.queries) {
       std::string error;
@@ -1835,9 +1950,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       std::sort(expected.begin(), expected.end());
       if (actual != expected && !RowsAlmostEqual(actual, expected)) {
         if (prev_route != nullptr) {
-          setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+          platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
         } else {
-          unsetenv("TINYLAMB_GROUPED_ROUTE");
+          platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
         }
         report += std::string(pass == 0 ? "[AGGREGATE-INDEXED MISMATCH] "
                                         : "[AGGREGATE-CASCADES MISMATCH] ") +
@@ -1855,9 +1970,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     }
   }
   if (prev_route != nullptr) {
-    setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+    platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
   } else {
-    unsetenv("TINYLAMB_GROUPED_ROUTE");
+    platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
   return report;
 }
@@ -1884,6 +1999,8 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       return "setup stream-error: " + sql;
     }
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   auto check_all = [&](const char* tag) -> std::string {
     for (const AggQueryExpect& q : trace.queries) {
       std::string error;
@@ -1921,18 +2038,20 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
     res.Value().Drain();
   }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
   if (std::string rep = check_all("[AGGREGATE-INDEXED REPLAY MISMATCH]");
       !rep.empty()) {
     return rep;
   }
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
-  setenv("TINYLAMB_GROUPED_ROUTE", "cascades", 1);
+  platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
   std::string rep = check_all("[AGGREGATE-CASCADES REPLAY MISMATCH]");
   if (prev_route != nullptr) {
-    setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+    platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
   } else {
-    unsetenv("TINYLAMB_GROUPED_ROUTE");
+    platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
   return rep;
 }
