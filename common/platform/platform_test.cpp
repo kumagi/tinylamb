@@ -213,7 +213,9 @@ TEST(PlatformEventPollerTest, WakerWakesWaitFromAnotherThread) {
 
   std::thread wake_thread([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    for (int i = 0; i < 1000; ++i) waker.Wake();  // coalesces, never blocks
+    for (int i = 0; i < 1000; ++i) {
+      waker.Wake();  // coalesces, never blocks
+    }
   });
   EXPECT_NE(WaitFor(poller, waker.ReadFd(), 5000) & kPollReadable, 0U);
   wake_thread.join();
@@ -224,14 +226,26 @@ TEST(PlatformEventPollerTest, WakerWakesWaitFromAnotherThread) {
 TEST(PlatformCpuAffinityTest, CurrentThreadMatchesSupport) {
   const std::optional<CpuSet> current = CpuSet::CurrentThread();
   EXPECT_EQ(current.has_value(), CpuSet::Supported());
-  if (!current.has_value()) return;
+  if (!current.has_value()) {
+    return;
+  }
   EXPECT_GE(current->Count(), 1);
   const int first = current->First();
   ASSERT_GE(first, 0);
   ASSERT_TRUE(CpuSet::Single(first).ApplyToCurrentThread());
-  EXPECT_EQ(CpuSet::CurrentThread()->Count(), 1);
+  const std::optional<CpuSet> pinned = CpuSet::CurrentThread();
+  ASSERT_TRUE(pinned.has_value());
+  if (!pinned.has_value()) {
+    return;
+  }
+  EXPECT_EQ(pinned->Count(), 1);
   ASSERT_TRUE(current->ApplyToCurrentThread());
-  EXPECT_TRUE(*CpuSet::CurrentThread() == *current);
+  const std::optional<CpuSet> restored = CpuSet::CurrentThread();
+  ASSERT_TRUE(restored.has_value());
+  if (!restored.has_value()) {
+    return;
+  }
+  EXPECT_TRUE(*restored == *current);
 }
 
 TEST(PlatformTimeZoneTest, KnownZonesAreExactAndCaseSensitive) {

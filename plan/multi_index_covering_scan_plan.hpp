@@ -42,7 +42,7 @@ class MultiIndexCoveringScanPlan final : public PlanBase {
                              Expression where, size_t estimated_rows,
                              size_t access_rows);
 
-  Executor EmitExecutor(TransactionContext& context) const override;
+  Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override;
   bool InstallParameterSlots(const std::vector<Value>& parameters,
                              size_t* cursor,

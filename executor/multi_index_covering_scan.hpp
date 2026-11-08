@@ -74,8 +74,8 @@ class MultiIndexCoveringScan : public ExecutorBase {
   };
 
   void Build();
-  void FillFromImage(Row* values, const Participant& participant,
-                     const Row& image) const;
+  static void FillFromImage(Row* values, const Participant& participant,
+                            const Row& image);
   [[nodiscard]] Row AssembleFromHeap(const Row& heap_row) const;
 
   Transaction& txn_;

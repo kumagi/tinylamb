@@ -411,7 +411,9 @@ Transaction TransactionManager::Begin(bool read_only) {
 
 Status TransactionManager::PreCommit(Transaction& txn,
                                      lsn_t* external_durability_target) {
-  if (external_durability_target) *external_durability_target = 0;
+  if (external_durability_target != nullptr) {
+    *external_durability_target = 0;
+  }
   TransactionFinishGuard finish_guard(txn);
   if (txn.IsFinished()) {
     return Status::kRuntimeError;
@@ -522,7 +524,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
       // cascades was exactly this: drain waits riding other transactions'
       // commit fsyncs).
       ReleaseIndexUndoReservations(txn);
-      if (external_durability_target) {
+      if (external_durability_target != nullptr) {
         // Both barriers participate explicitly; never assume the own commit
         // follows every dependency. Publication is already irrevocable, so
         // the finished transaction needs no registry slot during this wait.
@@ -609,7 +611,7 @@ Status TransactionManager::PreCommit(Transaction& txn,
     // commit LSN before its result is returned -- never skipped just because
     // there is no own commit record to flush.
     const lsn_t dependence = txn.DurabilityDependence();
-    if (external_durability_target) {
+    if (external_durability_target != nullptr) {
       *external_durability_target = dependence;
       txn.DebugSetPhase(nullptr);
       ForgetTransaction(txn);
@@ -846,14 +848,17 @@ bool TransactionManager::AcquireWriteIntent(
   static const bool kProgressResetDisabled =
       std::getenv("TINYLAMB_INTENT_NO_PROGRESS_RESET") != nullptr;
   auto check_holder_progress = [&]() {
-    if (kProgressResetDisabled) {
-      return;
-    }
     const txn_id_t current = holder_id();
     if (current != observed_holder) {
       observed_holder = current;
-      wait_begin = std::chrono::steady_clock::now();
-      intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+      if (policy == DeadlockPolicy::kDeadlockDetect && current != 0 &&
+          current != txn.ID()) {
+        AddWaitForEdge(txn.ID(), current, rp);
+      }
+      if (!kProgressResetDisabled) {
+        wait_begin = std::chrono::steady_clock::now();
+        intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+      }
     }
   };
   // Try-lock path: caller (TryAddWriteSet) does not want to wait, regardless
@@ -865,8 +870,10 @@ bool TransactionManager::AcquireWriteIntent(
       if (chain.pending) {
         return chain.pending->owner == txn.ID();
       }
-      chain.pending = PendingVersion{
-          .owner = txn.ID(), .value = std::nullopt, .staged = false};
+      chain.pending = PendingVersion{.owner = txn.ID(),
+                                     .owner_thread = std::this_thread::get_id(),
+                                     .value = std::nullopt,
+                                     .staged = false};
       // Install the before-image as the base committed version while the
       // shard mutex is held: until RegisterVersionWrite stages the new
       // value, readers must see the old row instead of kNotExists.
@@ -1143,14 +1150,128 @@ bool TransactionManager::AcquireWriteIntent(
   // the latest physical row after reserving its own unstaged intent. This is
   // the TPC-C isolation behavior (T2 waits and completes), not SI's
   // first-updater-wins abort.
-  chain.pending =
-      PendingVersion{.owner = txn.ID(), .value = std::nullopt, .staged = false};
+  chain.pending = PendingVersion{.owner = txn.ID(),
+                                 .owner_thread = std::this_thread::get_id(),
+                                 .value = std::nullopt,
+                                 .staged = false};
   if (before && chain.committed.empty()) {
     chain.committed.push_back(
         {0, std::numeric_limits<uint64_t>::max(),
          std::optional<std::string>(std::string(*before))});
   }
   return true;
+}
+
+bool TransactionManager::HasForeignWriteIntent(const Transaction& txn,
+                                               const RowPosition& rp) const {
+  if (page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
+  const VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  if (found == shard.versions.end()) {
+    return false;
+  }
+  const auto& pending = found->second.pending;
+  if (!pending.has_value()) {
+    return false;
+  }
+  return pending->owner != txn.ID();
+}
+
+Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
+                                                 const RowPosition& rp) {
+  if (fail_stop_.load(std::memory_order_acquire)) {
+    return StatusError(StatusCode::kIOError,
+                       "transaction manager is fail-stopped");
+  }
+  if (txn.IsFinished()) {
+    return Status::kConflicts;
+  }
+  if (txn.IsWounded()) {
+    return Status::kConflicts;
+  }
+  if (GetDeadlockPolicy() == DeadlockPolicy::kNoWait) {
+    return Status::kConflicts;
+  }
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::unique_lock lock(shard.mutex);
+  auto holder_id = [&]() -> txn_id_t {
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end() || !found->second.pending) {
+      return 0;
+    }
+    return found->second.pending->owner;
+  };
+  const txn_id_t initial_holder = holder_id();
+  if (initial_holder == 0 || initial_holder == txn.ID()) {
+    return Status::kSuccess;
+  }
+  {
+    const auto found = shard.versions.find(rp);
+    if (found != shard.versions.end() && found->second.pending &&
+        found->second.pending->owner_thread == std::this_thread::get_id()) {
+      return Status::kDuplicates;
+    }
+  }
+  {
+    std::scoped_lock graph_lock(wait_for_mu_);
+    txn_id_t cursor = initial_holder;
+    for (size_t hops = 0; hops <= wait_for_edges_.size() && cursor != 0;
+         ++hops) {
+      if (cursor == txn.ID()) {
+        return Status::kConflicts;
+      }
+      const auto edge = wait_for_edges_.find(cursor);
+      cursor = edge == wait_for_edges_.end() ? 0 : edge->second.holder;
+    }
+  }
+  AddWaitForEdge(txn.ID(), initial_holder, rp);
+  auto wait_begin = std::chrono::steady_clock::now();
+  auto intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+  txn_id_t observed_holder = initial_holder;
+  auto available = [&] {
+    if (txn.IsWounded()) {
+      return true;
+    }
+    const auto found = shard.versions.find(rp);
+    if (found == shard.versions.end() || !found->second.pending) {
+      return true;
+    }
+    return found->second.pending->owner == txn.ID();
+  };
+  txn.DebugSetPhase("unique-intent-wait");
+  while (!available()) {
+    const txn_id_t current = holder_id();
+    if (current != observed_holder) {
+      observed_holder = current;
+      if (current != 0 && current != txn.ID()) {
+        AddWaitForEdge(txn.ID(), current, rp);
+      }
+      wait_begin = std::chrono::steady_clock::now();
+      intent_wait_deadline = wait_begin + GetWriteIntentWaitLimit();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= intent_wait_deadline &&
+        !ExtendIntentDeadlineForDurabilityBarrier(wait_begin,
+                                                  &intent_wait_deadline)) {
+      RemoveWaitForEdge(txn.ID());
+      txn.DebugSetPhase(nullptr);
+      RecordIntentWaitTimeout(txn, rp);
+      txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kTimeout);
+      return Status::kConflicts;
+    }
+    shard.write_intent_released.wait_for(lock, kWriteIntentPollInterval);
+  }
+  RemoveWaitForEdge(txn.ID());
+  txn.DebugSetPhase(nullptr);
+  if (txn.IsWounded()) {
+    txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
+    return Status::kConflicts;
+  }
+  return Status::kSuccess;
 }
 
 Status TransactionManager::WaitForWALDurable(lsn_t lsn) {
@@ -1506,6 +1627,50 @@ StatusOr<std::optional<std::string>> TransactionManager::ReadVersion(
   return Status::kNotExists;
 }
 
+StatusOr<std::optional<std::string>> TransactionManager::ReadLatestVersion(
+    const Transaction& txn, const RowPosition& rp,
+    std::optional<std::string_view> physical) const {
+  if (fail_stop_.load(std::memory_order_acquire)) {
+    return StatusError(StatusCode::kIOError,
+                       "transaction manager is fail-stopped");
+  }
+  if (physical && page_chain_counts_[PageChainShardIndex(rp.page_id)].load(
+                      std::memory_order_acquire) == 0) {
+    return std::optional<std::string>();
+  }
+  VersionShard& shard = version_shards_[VersionShardIndex(rp)];
+  std::scoped_lock lock(shard.mutex);
+  const auto found = shard.versions.find(rp);
+  if (found == shard.versions.end()) {
+    if (!physical) {
+      return Status::kNotExists;
+    }
+    return std::optional<std::string>();
+  }
+  const VersionChain& chain = found->second;
+  if (chain.pending && chain.pending->owner == txn.ID() &&
+      chain.pending->staged) {
+    if (!chain.pending->value) {
+      return Status::kNotExists;
+    }
+    return *chain.pending->value;
+  }
+  if (!chain.committed.empty()) {
+    const CommittedVersion& latest = chain.committed.back();
+    if (latest.commit_lsn != 0) {
+      txn.RecordDurabilityDependence(latest.commit_lsn);
+    }
+    if (!latest.value) {
+      return Status::kNotExists;
+    }
+    return *latest.value;
+  }
+  if (!physical) {
+    return Status::kNotExists;
+  }
+  return std::optional<std::string>();
+}
+
 bool TransactionManager::HasVersionChain(const RowPosition& rp) const {
   // Read fast path: page_chain_counts_ is maintained at every chain
   // create/erase under the same shard mutex, so a zero count proves this row
@@ -1669,14 +1834,18 @@ void TransactionManager::MarkPendingIndexMutation(page_id_t index_root) {
 void TransactionManager::TrackIndexKeyMutation(txn_id_t owner,
                                                page_id_t index_root,
                                                std::string_view key) {
-  if (!index_key_tracking_complete_.load(std::memory_order_acquire)) return;
+  if (!index_key_tracking_complete_.load(std::memory_order_acquire)) {
+    return;
+  }
   IndexKeyHistory& history =
       index_key_history_[IndexMutationShardIndex(index_root)];
-  if (!history.precise) return;
+  if (!history.precise) {
+    return;
+  }
   try {
     constexpr size_t kMaxPendingOwners = 128;
     constexpr size_t kMaxPendingKeys = 512;
-    constexpr size_t kMaxPendingBytes = 64 * 1024;
+    constexpr size_t kMaxPendingBytes = size_t{64} * 1024;
     auto pending =
         std::find_if(history.pending.begin(), history.pending.end(),
                      [&](const PendingIndexKeys& p) {
@@ -1684,8 +1853,9 @@ void TransactionManager::TrackIndexKeyMutation(txn_id_t owner,
                      });
     if (pending != history.pending.end() &&
         std::find(pending->keys.begin(), pending->keys.end(), key) !=
-            pending->keys.end())
+            pending->keys.end()) {
       return;
+    }
     if (key.empty() || key.size() > kMaxPendingBytes - history.pending_bytes ||
         history.pending_keys >= kMaxPendingKeys ||
         (pending == history.pending.end() &&
@@ -1709,7 +1879,9 @@ void TransactionManager::FinishIndexKeyChanges(
     txn_id_t owner, page_id_t index_root, std::optional<uint64_t> commit_ts) {
   IndexKeyHistory& history =
       index_key_history_[IndexMutationShardIndex(index_root)];
-  if (!history.precise) return;
+  if (!history.precise) {
+    return;
+  }
   try {
     auto pending =
         std::find_if(history.pending.begin(), history.pending.end(),
@@ -1723,7 +1895,7 @@ void TransactionManager::FinishIndexKeyChanges(
       return;
     }
     constexpr size_t kMaxHistoryKeys = 512;
-    constexpr size_t kMaxHistoryBytes = 64 * 1024;
+    constexpr size_t kMaxHistoryBytes = size_t{64} * 1024;
     for (std::string& key : pending->keys) {
       history.pending_bytes -= key.size();
       --history.pending_keys;
@@ -1839,6 +2011,70 @@ bool TransactionManager::IndexKeysMayBeStale(const Transaction& txn,
 
 bool TransactionManager::RequiresHistoricalRead(const Transaction& txn) const {
   return IndexKeysMayBeStale(txn);
+}
+
+namespace {
+thread_local std::vector<std::pair<const std::shared_mutex*, uint32_t>>
+    tls_held_index_read_gates;
+
+uint32_t* FindTlsGateCount(const std::shared_mutex* m) {
+  for (auto& entry : tls_held_index_read_gates) {
+    if (entry.first == m) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+TransactionManager::IndexReadGuard::IndexReadGuard(std::shared_mutex& mutex)
+    : tracked_mutex_(&mutex) {
+  if (uint32_t* count = FindTlsGateCount(&mutex);
+      count != nullptr && *count > 0) {
+    ++(*count);
+    borrowed_ = true;
+    return;
+  }
+  lock_ = std::shared_lock<std::shared_mutex>(mutex);
+  if (uint32_t* count = FindTlsGateCount(&mutex)) {
+    *count = 1;
+  } else {
+    tls_held_index_read_gates.emplace_back(&mutex, 1U);
+  }
+}
+
+TransactionManager::IndexReadGuard::IndexReadGuard(
+    IndexReadGuard&& other) noexcept
+    : lock_(std::move(other.lock_)),
+      tracked_mutex_(std::exchange(other.tracked_mutex_, nullptr)),
+      borrowed_(std::exchange(other.borrowed_, false)) {}
+
+TransactionManager::IndexReadGuard&
+TransactionManager::IndexReadGuard::operator=(IndexReadGuard&& other) noexcept {
+  if (this != &other) {
+    if (tracked_mutex_ != nullptr) {
+      if (uint32_t* count = FindTlsGateCount(tracked_mutex_);
+          count != nullptr && *count > 0) {
+        --(*count);
+      }
+    }
+    if (lock_.owns_lock()) {
+      lock_.unlock();
+    }
+    lock_ = std::move(other.lock_);
+    tracked_mutex_ = std::exchange(other.tracked_mutex_, nullptr);
+    borrowed_ = std::exchange(other.borrowed_, false);
+  }
+  return *this;
+}
+
+TransactionManager::IndexReadGuard::~IndexReadGuard() {
+  if (tracked_mutex_ != nullptr) {
+    if (uint32_t* count = FindTlsGateCount(tracked_mutex_);
+        count != nullptr && *count > 0) {
+      --(*count);
+    }
+  }
 }
 
 TransactionManager::IndexReadGuard TransactionManager::AcquireIndexReadGuard(
@@ -2123,7 +2359,9 @@ void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
         index_reservations_[IndexReservationShardIndex(pid)];
     std::scoped_lock lock(shard.mutex);
     auto [owner, inserted] = shard.bytes[pid].try_emplace(txn.ID(), 0);
-    if (inserted) ++shard.owner_pages[txn.ID()];
+    if (inserted) {
+      ++shard.owner_pages[txn.ID()];
+    }
     owner->second += bytes;
   }
 }
@@ -2189,8 +2427,9 @@ bool TransactionManager::HasForeignIndexReservations(txn_id_t self) const {
   for (const IndexReservationShard& shard : index_reservations_) {
     std::scoped_lock lock(shard.mutex);
     if (shard.owner_pages.size() > 1 ||
-        (!shard.owner_pages.empty() && !shard.owner_pages.contains(self)))
+        (!shard.owner_pages.empty() && !shard.owner_pages.contains(self))) {
       return true;
+    }
   }
   return false;
 }
@@ -2338,7 +2577,9 @@ void TransactionManager::ReleaseIndexUndoReservations(Transaction& txn) {
       page->second.erase(owner);
       const auto summary = shard.owner_pages.find(txn.ID());
       assert(summary != shard.owner_pages.end() && summary->second > 0);
-      if (--summary->second == 0) shard.owner_pages.erase(summary);
+      if (--summary->second == 0) {
+        shard.owner_pages.erase(summary);
+      }
       if (page->second.empty()) {
         shard.bytes.erase(page);
       }

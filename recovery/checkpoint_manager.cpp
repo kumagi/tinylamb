@@ -16,132 +16,85 @@
 
 #include "recovery/checkpoint_manager.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <array>
-#include <cerrno>
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <cstring>
 #include <exception>
-#include <filesystem>
-#include <fstream>
 #include <functional>
-#include <ios>
 #include <limits>
 #include <mutex>
 #include <string>
-#include <system_error>
+#include <string_view>
 #include <thread>
 
 #include "common/constants.hpp"
-#include "common/crc32c.hpp"
 #include "common/log_message.hpp"
-#include "common/platform/file_io.hpp"
-#include "common/serdes.hpp"
 #include "page/page_manager.hpp"
-#include "recovery/log_record.hpp"
 #include "recovery/logger.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
-namespace {
 
-Status WriteMasterRecord(const std::filesystem::path& path, lsn_t lsn) {
-  const std::filesystem::path tmp = path.string() + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      return StatusError(StatusCode::kIOError,
-                         "Failed to open master record: " + tmp.string());
-    }
-    std::array<char, kCheckpointMasterRecordSize> encoded{};
-    SerializeU32(encoded.data(), kCheckpointMasterMagic);
-    SerializeU32(encoded.data() + sizeof(uint32_t), kCheckpointMasterVersion);
-    SerializeU64(encoded.data() + (sizeof(uint32_t) * 2), lsn);
-    const uint32_t crc =
-        Crc32C(encoded.data(), kCheckpointMasterRecordSize - sizeof(uint32_t));
-    SerializeU32(
-        encoded.data() + kCheckpointMasterRecordSize - sizeof(uint32_t), crc);
-    out.write(encoded.data(), encoded.size());
-    out.flush();
-    if (!out) {
-      std::error_code ec;
-      std::filesystem::remove(tmp, ec);
-      return StatusError(StatusCode::kIOError,
-                         "Failed to write master record: " + tmp.string());
-    }
-    out.close();
-    const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
-    int rc = -1;
-    int sync_errno = errno;
-    if (fd >= 0) {
-      rc = platform::DataSync(fd);
-      sync_errno = errno;
-      ::close(fd);
-    }
-    if (rc != 0) {
-      std::error_code ec;
-      std::filesystem::remove(tmp, ec);
-      return StatusError(StatusCode::kIOError,
-                         "Failed to fsync master record: " + tmp.string() +
-                             ": " + std::strerror(sync_errno));
-    }
+CheckpointManager::CheckpointManager(std::string_view path,
+                                     TransactionManager* tm, PageManager* pm,
+                                     size_t interval)
+    : master_record_path(path),
+      tm_(tm),
+      pm_(pm),
+      interval_seconds_(interval),
+      checkpoint_worker_([this] { WorkerThreadTask(); }) {
+  if (pm_ != nullptr && interval_seconds_ != 0) {
+    pm_->SetCompactionCallback([this] { RequestCompaction(); });
   }
-  std::error_code rename_ec;
-  std::filesystem::rename(tmp, path, rename_ec);
-  if (rename_ec) {
-    std::error_code ec;
-    std::filesystem::remove(tmp, ec);
-    return StatusError(StatusCode::kIOError,
-                       "Failed to rename master record to " + path.string() +
-                           ": " + rename_ec.message());
-  }
-  return Status::kSuccess;
 }
-
-}  // namespace
 
 CheckpointManager::~CheckpointManager() { Stop(); }
 
 void CheckpointManager::Stop() {
-  stop_.store(true, std::memory_order_release);
+  if (pm_ != nullptr) {
+    pm_->SetCompactionCallback({});
+  }
+  {
+    std::scoped_lock lk(worker_wait_mu_);
+    stop_.store(true, std::memory_order_release);
+  }
   worker_wait_cv_.notify_all();
   if (checkpoint_worker_.joinable()) {
     checkpoint_worker_.join();
   }
 }
 
-void CheckpointManager::WorkerThreadTask() {
+void CheckpointManager::RequestCompaction() {
   {
-    std::unique_lock wait_lock(worker_wait_mu_);
-    worker_wait_cv_.wait(wait_lock, [this] {
-      return start_.load(std::memory_order_acquire) ||
-             stop_.load(std::memory_order_acquire);
-    });
+    std::scoped_lock lk(worker_wait_mu_);
+    compaction_requested_ = true;
   }
-  while (!stop_ && interval_seconds_ != 0) {
-    for (size_t waited = 0; waited < interval_seconds_ * 10 && !stop_;
-         ++waited) {
+  worker_wait_cv_.notify_one();
+}
+
+void CheckpointManager::WorkerThreadTask() {
+  while (!stop_.load(std::memory_order_acquire)) {
+    {
       std::unique_lock wait_lock(worker_wait_mu_);
-      worker_wait_cv_.wait_for(wait_lock, std::chrono::milliseconds(100),
-                               [this] { return stop_.load(); });
-    }
-    if (!stop_) {
-      try {
-        const auto res = WriteCheckpoint();
-        if (!res.HasValue()) {
-          LOG(ERROR) << "Periodic checkpoint failed: " << res.GetStatus();
-        }
-      } catch (const std::exception& error) {
-        LOG(ERROR) << "Periodic checkpoint threw: " << error.what();
-      } catch (...) {
-        LOG(ERROR) << "Periodic checkpoint threw an unknown exception";
+      worker_wait_cv_.wait(wait_lock, [this] {
+        return stop_.load(std::memory_order_acquire) ||
+               (start_.load(std::memory_order_acquire) &&
+                compaction_requested_);
+      });
+      if (stop_.load(std::memory_order_acquire) || interval_seconds_ == 0) {
+        return;
       }
+      compaction_requested_ = false;
+    }
+    try {
+      const auto res = WriteCheckpoint();
+      if (!res.HasValue()) {
+        LOG(ERROR) << "Background compaction failed: " << res.GetStatus();
+      }
+    } catch (const std::exception& error) {
+      LOG(ERROR) << "Background compaction threw: " << error.what();
+    } catch (...) {
+      LOG(ERROR) << "Background compaction threw an unknown exception";
     }
   }
 }
@@ -155,8 +108,10 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
   }
 
   lsn_t oldest_active_first_lsn = std::numeric_limits<lsn_t>::max();
+  lsn_t snap_lsn = 0;
   {
     std::scoped_lock lk(tm_->transaction_table_lock);
+    snap_lsn = tm_->logger_->BufferedLSN();
     for (const auto& it : tm_->active_transactions_) {
       std::scoped_lock chain_guard(it.second->chain_mu_);
       if (it.second->HasLogRecord()) {
@@ -166,9 +121,7 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     }
   }
 
-  const LogRecord begin = LogRecord::BeginCheckpointLogRecord();
-  ASSIGN_OR_RETURN(lsn_t, begin_lsn, tm_->logger_->AddLog(begin.Serialize()));
-  const lsn_t replay_start_lsn = std::min(begin_lsn, oldest_active_first_lsn);
+  const lsn_t replay_start_lsn = std::min(snap_lsn, oldest_active_first_lsn);
 
   func_for_test();
 
@@ -179,18 +132,9 @@ StatusOr<lsn_t> CheckpointManager::WriteCheckpoint(
     RETURN_IF_FAIL(pm_->WriteFuzzyCheckpoint(replay_start_lsn));
   }
 
-  RETURN_IF_FAIL(WriteMasterRecord(master_record_path, begin_lsn));
   tm_->logger_->AdviseOldBytesDurable(replay_start_lsn);
   tm_->logger_->RecycleUpTo(replay_start_lsn);
-  return begin_lsn;
-}
-
-void CheckpointManager::RemoveStaleMasterTmp() const {
-  const std::filesystem::path tmp = master_record_path + ".tmp";
-  std::error_code ec;
-  if (std::filesystem::exists(tmp, ec) && !ec) {
-    std::filesystem::remove(tmp, ec);
-  }
+  return replay_start_lsn;
 }
 
 }  // namespace tinylamb

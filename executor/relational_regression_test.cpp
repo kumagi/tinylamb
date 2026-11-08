@@ -693,7 +693,9 @@ TEST_F(RelationalRegressionTest,
     if (prepared.HasValue()) {
       Row row;
       size_t emitted = 0;
-      while (prepared.Value()->Next(&row, nullptr)) ++emitted;
+      while (prepared.Value()->Next(&row, nullptr)) {
+        ++emitted;
+      }
       EXPECT_EQ(emitted, 0U);
       EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess);
       prepared.Value().reset();
@@ -945,7 +947,7 @@ TEST_F(RelationalRegressionTest,
 }
 
 TEST_F(RelationalRegressionTest, SmallInnerBuildStreamsEverySpilledProbeRow) {
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -1042,7 +1044,7 @@ TEST_F(RelationalRegressionTest, CorrelatedLocalFilterAvoidsBuildSpill) {
             .GetStatus());
   }
   ASSERT_SUCCESS(setup.PreCommit());
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -1075,7 +1077,7 @@ TEST_F(RelationalRegressionTest, SelectiveExistsBuildsOneTwoValuedKeySet) {
   int64_t expected = 0;
   for (int i = 0; i < 1000; ++i) {
     const Value key = i % 101 == 0 ? Value() : Value(i % 100);
-    expected += !key.IsNull() && key == Value(7);
+    expected += static_cast<int64_t>(!key.IsNull() && key == Value(7));
     ASSERT_SUCCESS(parent.Insert(setup.txn_, Row({key})).GetStatus());
   }
   for (int i = 0; i < 2000; ++i) {
@@ -1153,7 +1155,7 @@ void BuildIndexedExistsTables(Database& database) {
   ASSERT_SUCCESS(setup.PreCommit());
 }
 
-const std::string kIndexedExistsSql =
+constexpr const char* kIndexedExistsSql =
     "SELECT COUNT(*) FROM IndexedParent p WHERE EXISTS "
     "(SELECT 1 FROM IndexedChild c WHERE c.k = p.k AND c.flag = 7 "
     "AND c.payload > 0)";
@@ -1227,7 +1229,7 @@ TEST_F(RelationalRegressionTest,
   const auto stale = ExplainAnalyze(*rs_, kIndexedExistsSql);
   EXPECT_NE(stale.find("prebuilt_exists_index_builds=0,"), std::string::npos)
       << stale;
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -1253,7 +1255,9 @@ TEST_F(RelationalRegressionTest,
     EXPECT_TRUE(prepared.HasValue()) << engine.LastError();
     if (prepared.HasValue()) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+      while (prepared.Value()->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
       EXPECT_TRUE(prepared.Value()->GetStatus().ok());
     }
     return rows;
@@ -1282,7 +1286,7 @@ TEST_F(RelationalRegressionTest, SpilledProbeFeedsGroupedJoinDirectly) {
             .GetStatus());
   }
   ASSERT_SUCCESS(setup.PreCommit());
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -1331,20 +1335,24 @@ TEST_F(RelationalRegressionTest, CorrelatedBuildKeepsItsSelectiveDomain) {
                           setup.GetTable("CorrFact"));
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, supplier,
                           setup.GetTable("CorrSupplier"));
-    for (int64_t p = 0; p < 1000; ++p)
-      for (int64_t s = 0; s < 16; ++s)
+    for (int64_t p = 0; p < 1000; ++p) {
+      for (int64_t s = 0; s < 16; ++s) {
         ASSERT_SUCCESS(fact->Insert(setup.txn_, Row({Value(p), Value(s),
-                                                     Value(p * 10 + s)}))
+                                                     Value((p * 10) + s)}))
                            .GetStatus());
-    for (int64_t s = 0; s < 16; ++s)
+      }
+    }
+    for (int64_t s = 0; s < 16; ++s) {
       ASSERT_SUCCESS(supplier->Insert(setup.txn_, Row({Value(s), Value(s % 2)}))
                          .GetStatus());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_, "INSERT INTO CorrOuter VALUES (2),(503),(999),(NULL)");
   RelationalRun(*rs_, "CREATE INDEX corr_part ON CorrFact(part)");
-  for (const auto* table : {"CorrFact", "CorrSupplier", "CorrOuter"})
+  for (const auto* table : {"CorrFact", "CorrSupplier", "CorrOuter"}) {
     RelationalRun(*rs_, std::string("ANALYZE ") + table);
+  }
   const std::string sql =
       "SELECT d.id FROM CorrOuter d WHERE d.id*10+1 = "
       "(SELECT MIN(f.v) FROM CorrFact f JOIN CorrSupplier s ON f.supplier=s.id "
@@ -1353,8 +1361,9 @@ TEST_F(RelationalRegressionTest, CorrelatedBuildKeepsItsSelectiveDomain) {
             std::vector<Row>(
                 {Row({Value(2)}), Row({Value(503)}), Row({Value(999)})}));
   std::string profile;
-  for (const auto& row : RelationalRun(*rs_, "EXPLAIN ANALYZE " + sql))
+  for (const auto& row : RelationalRun(*rs_, "EXPLAIN ANALYZE " + sql)) {
     profile += row[0].AsString();
+  }
   EXPECT_NE(profile.find("selective_index_scans=1"), std::string::npos)
       << profile;
 }
@@ -1384,9 +1393,10 @@ TEST_F(RelationalRegressionTest, ParallelSourceRetainsAllCompiledFilterKinds) {
                        Value(i % 4), Value(std::string(100, 'x'))}))
               .GetStatus());
     }
-    for (int64_t k = 0; k < 16; ++k)
+    for (int64_t k = 0; k < 16; ++k) {
       ASSERT_SUCCESS(
           dim->Insert(setup.txn_, Row({Value(k), Value(k % 2)})).GetStatus());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_,
@@ -1435,11 +1445,12 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                           setup.GetTable("RangeSource"));
-    for (int64_t i = 0; i < 4000; ++i)
+    for (int64_t i = 0; i < 4000; ++i) {
       ASSERT_TRUE(table
                       ->Insert(setup.txn_, Row({Value(i), Value(3999 - i),
                                                 Value("payload")}))
                       .HasValue());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_, "CREATE INDEX range_k ON RangeSource(k)");
@@ -1476,9 +1487,10 @@ TEST_F(RelationalRegressionTest,
   const auto expected = read(old, &visited);
   ASSERT_EQ(expected.size(), 20U);
   EXPECT_LT(visited, 100U);
-  for (int64_t i = 0; i < 20; ++i)
+  for (int64_t i = 0; i < 20; ++i) {
     EXPECT_EQ(expected[static_cast<size_t>(i)],
               Row({Value(980 + i), Value(3019 - i), Value("payload")}));
+  }
   // A selective key enclosure remains useful with a local LIKE residual.
   // The canonical residual still decides the rows after heap order is restored.
   for (const auto op : {BinaryOperation::kLike, BinaryOperation::kNotLike}) {
@@ -1524,7 +1536,9 @@ TEST_F(RelationalRegressionTest,
     relational_detail::ExecutionRuntime runtime;
     old.set_execution_runtime(&runtime);
     RuntimeFilterBuilder builder;
-    for (int64_t k = 3000; k < 3065; ++k) builder.Observe(k);
+    for (int64_t k = 3000; k < 3065; ++k) {
+      builder.Observe(k);
+    }
     const ScanRuntimeFilter filter{
         .group = builder.Build(), .column = 1, .type = ValueType::kInt64};
     auto loaded = relational_detail::LoadSource(old, source, nullptr, {},
@@ -1537,8 +1551,9 @@ TEST_F(RelationalRegressionTest,
     ASSERT_EQ(rows.size(), 65U);
     EXPECT_EQ(runtime.selective_index_scans, 1U);
     EXPECT_EQ(runtime.scan_rows, 65U);
-    for (size_t i = 1; i < rows.size(); ++i)
+    for (size_t i = 1; i < rows.size(); ++i) {
       EXPECT_GT(rows[i - 1][1].value.int_value, rows[i][1].value.int_value);
+    }
   }
   {
     auto only_one = predicates;
@@ -1560,18 +1575,22 @@ TEST_F(RelationalRegressionTest,
     auto writer = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                           writer.GetTable("RangeSource"));
-    for (int64_t i = 0; i < 20; ++i)
+    for (int64_t i = 0; i < 20; ++i) {
       ASSERT_TRUE(table
                       ->Insert(writer.txn_,
-                               Row({Value(4000 + round * 20 + i), Value(3001),
+                               Row({Value(4000 + (round * 20) + i), Value(3001),
                                     Value(std::string(4096, 'a'))}))
                       .HasValue());
+    }
     const auto own = read(writer, &visited);
     ASSERT_EQ(own.size(), expected.size() + 20);
-    for (size_t i = 0; i < expected.size(); ++i) EXPECT_EQ(own[i], expected[i]);
-    for (size_t i = expected.size(); i < own.size(); ++i)
-      EXPECT_EQ(own[i][0], Value(4000 + round * 20 +
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(own[i], expected[i]);
+    }
+    for (size_t i = expected.size(); i < own.size(); ++i) {
+      EXPECT_EQ(own[i][0], Value(4000 + (round * 20) +
                                  static_cast<int64_t>(i - expected.size())));
+    }
     EXPECT_EQ(read(old, &visited), expected);
     writer.Abort();
     auto fresh = rs_->BeginReadOnlyContext();
@@ -1597,9 +1616,13 @@ TEST_F(RelationalRegressionTest,
       "SELECT g,MIN(u) AS lo,MAX(u) AS hi FROM UnsignedGroups GROUP BY g";
   for (bool reuse : {false, true}) {
     SCOPED_TRACE(reuse);
-    const auto rows =
-        RelationalRun(*rs_, (reuse ? branch + " UNION ALL " + branch : branch) +
-                                " ORDER BY g NULLS FIRST");
+    std::string sql = branch;
+    if (reuse) {
+      sql += " UNION ALL ";
+      sql += branch;
+    }
+    sql += " ORDER BY g NULLS FIRST";
+    const auto rows = RelationalRun(*rs_, sql);
     const size_t copies = reuse ? 2 : 1;
     ASSERT_EQ(rows.size(), 3 * copies);
     for (size_t i = 0; i < copies; ++i) {
@@ -1611,8 +1634,10 @@ TEST_F(RelationalRegressionTest,
         EXPECT_TRUE(zero[c].IsUnsigned());
         EXPECT_EQ(zero[c].AsString(), "0");
       }
-      const Row& large = rows[2 * copies + i];
-      for (size_t c = 0; c < 3; ++c) EXPECT_TRUE(large[c].IsUnsigned());
+      const Row& large = rows[(2 * copies) + i];
+      for (size_t c = 0; c < 3; ++c) {
+        EXPECT_TRUE(large[c].IsUnsigned());
+      }
       EXPECT_EQ(large[0].AsString(), "18446744073709551615");
       EXPECT_EQ(large[1].AsString(), "5");
       EXPECT_EQ(large[2].AsString(), "18446744073709551610");
@@ -1695,9 +1720,10 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("StreamFact"));
-    for (int i = 0; i < 2000; ++i)
+    for (int i = 0; i < 2000; ++i) {
       ASSERT_SUCCESS(
           fact->Insert(setup.txn_, Row({Value(100), Value(i)})).GetStatus());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_, "ANALYZE StreamDim");
@@ -1722,7 +1748,9 @@ TEST_F(RelationalRegressionTest,
     EXPECT_TRUE(prepared.HasValue());
     if (prepared.HasValue()) {
       Row row;
-      while (prepared.Value()->Next(&row, nullptr)) rows.push_back(row);
+      while (prepared.Value()->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
       EXPECT_TRUE(prepared.Value()->GetStatus().ok());
     }
     return rows;
@@ -1734,7 +1762,7 @@ TEST_F(RelationalRegressionTest,
   fresh[1] = Row({Value(0), Value(23), Value(20), Value(4), Value(3)});
   EXPECT_EQ(RelationalRun(*rs_, sql), fresh);
   ASSERT_SUCCESS(old.PreCommit());
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -1758,11 +1786,12 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("PrefixFact"));
-    for (int64_t value : values)
+    for (int64_t value : values) {
       ASSERT_SUCCESS(
           fact->Insert(setup.txn_, Row({Value(1), Value(value),
                                         Value(std::string(12000, 'x'))}))
               .GetStatus());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
     RelationalRun(*rs_, "ANALYZE PrefixDim");
     RelationalRun(*rs_, "ANALYZE PrefixFact");
@@ -1810,8 +1839,9 @@ TEST_F(RelationalRegressionTest,
              Value(std::string(128, 'p'))});
         ASSERT_TRUE(table->Insert(setup.txn_, row).HasValue());
         if (i % 13 != 0 && i % 11 != 0 && i % 7 != 0 && i >= count / 2 &&
-            i % 100 >= 42 && i % 2 == 0 && i % 3 == 0)
+            i % 100 >= 42 && i % 2 == 0 && i % 3 == 0) {
           expected.push_back(i);
+        }
       }
       ASSERT_SUCCESS(setup.PreCommit());
     }
@@ -1821,9 +1851,9 @@ TEST_F(RelationalRegressionTest,
     source.alias = "r";
     const std::vector<slot_t> projection{1, 2, 3, 4};
     const auto compare = [](const char* column, BinaryOperation operation,
-                            Value value) {
+                            const Value& value) {
       return BinaryExpressionExp(ColumnValueExp(ColumnName("r", column)),
-                                 operation, ConstantValueExp(std::move(value)));
+                                 operation, ConstantValueExp(value));
     };
     const std::vector<Expression> predicates{
         compare("i", BinaryOperation::kGreaterThanEquals, Value(count / 2)),
@@ -1870,9 +1900,10 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
                           setup.GetTable("FrontierDim"));
-    for (int64_t i = 0; i < 100; ++i)
+    for (int64_t i = 0; i < 100; ++i) {
       ASSERT_TRUE(
           dim->Insert(setup.txn_, Row({Value(i), Value(i % 10)})).HasValue());
+    }
     ASSERT_TRUE(dim->Insert(setup.txn_, Row({Value(1), Value(1)})).HasValue());
     ASSERT_TRUE(dim->Insert(setup.txn_, Row({Value(), Value(1)})).HasValue());
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
@@ -1917,35 +1948,42 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
                           setup.GetTable("DenseDim"));
-    for (int64_t k = -128; k < 128; ++k)
+    for (int64_t k = -128; k < 128; ++k) {
       ASSERT_TRUE(
           dim->Insert(setup.txn_,
                       Row({Value(k), k % 7 == 0 ? Value() : Value(k % 4),
                            k % 5 == 0 ? Value() : Value(2)}))
               .HasValue());
+    }
     ASSERT_TRUE(dim->Insert(setup.txn_, Row({Value(129), Value(99), Value()}))
                     .HasValue());
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("DenseFact"));
     for (int64_t i = 0; i < 20000; ++i) {
-      const int64_t k = i % 300 - 150;
+      const int64_t k = (i % 300) - 150;
       ASSERT_TRUE(
           fact->Insert(setup.txn_, Row({i % 17 == 0 ? Value() : Value(k),
                                         Value(std::string(256, 'x'))}))
               .HasValue());
-      if (i % 17 == 0) continue;
+      if (i % 17 == 0) {
+        continue;
+      }
       if (k == 129) {
         ++expected[99][0];
         continue;
       }
-      if (k < -128 || k >= 128) continue;
+      if (k < -128 || k >= 128) {
+        continue;
+      }
       auto& group = expected[k % 7 == 0 ? 1000 : k % 4];
       ++group[0];
       if (k % 5 != 0) {
         ++group[1];
         group[2] += 2;
       }
-      if (k == 1) ++ones;
+      if (k == 1) {
+        ++ones;
+      }
     }
     ASSERT_SUCCESS(setup.PreCommit());
   }
@@ -1968,13 +2006,14 @@ TEST_F(RelationalRegressionTest,
     }
   };
   {
-    struct RestoreBudget {
+    struct
+        RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
       size_t limit = QueryMemoryBudget::Global().Limit();
       ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
     } restore;
     // The fact spans many morsels. Its unselected payload must not make
     // nonnegative frequency folding allocate a group table for each morsel.
-    QueryMemoryBudget::Global().ResetForTest(512 * 1024);
+    QueryMemoryBudget::Global().ResetForTest(size_t{512} * 1024);
     check(RelationalRun(*rs_, sql), false);
     const auto profile = ExplainAnalyze(*rs_, sql);
     EXPECT_NE(profile.find("streamed_grouped_joins=1"), std::string::npos)
@@ -1989,7 +2028,9 @@ TEST_F(RelationalRegressionTest,
   RelationalRun(*rs_, "UPDATE DenseDim SET v=-1 WHERE k=1");
   std::vector<Row> old_rows;
   Row row;
-  while (prepared.Value()->Next(&row, nullptr)) old_rows.push_back(row);
+  while (prepared.Value()->Next(&row, nullptr)) {
+    old_rows.push_back(row);
+  }
   ASSERT_SUCCESS(prepared.Value()->GetStatus());
   check(old_rows, false);
   check(RelationalRun(*rs_, sql), true);
@@ -2022,12 +2063,16 @@ TEST_F(RelationalRegressionTest,
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("CachedFact"));
     for (int64_t i = 0; i < 2000; ++i) {
-      const Value key = i % 7 == 0 ? Value() : Value(i % 2 + 1);
+      const Value key = i % 7 == 0 ? Value() : Value((i % 2) + 1);
       ASSIGN_OR_ASSERT_FAIL(
           RowPosition, pos,
           fact->Insert(setup.txn_, Row({key, Value(std::string(64, 'p'))})));
-      if (i == 1) first = pos;  // key 2, changed below while old is open.
-      if (!key.IsNull()) (i % 2 == 0 ? ones : twos)++;
+      if (i == 1) {
+        first = pos;  // key 2, changed below while old is open.
+      }
+      if (!key.IsNull()) {
+        (i % 2 == 0 ? ones : twos)++;
+      }
     }
     ASSERT_SUCCESS(setup.PreCommit());
   }
@@ -2040,9 +2085,13 @@ TEST_F(RelationalRegressionTest,
     std::vector<Row> rows;
     auto plan = engine.Prepare(context, sql);
     EXPECT_TRUE(plan.HasValue());
-    if (!plan.HasValue()) return rows;
+    if (!plan.HasValue()) {
+      return rows;
+    }
     Row row;
-    while (plan.Value()->Next(&row, nullptr)) rows.push_back(row);
+    while (plan.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
     EXPECT_SUCCESS(plan.Value()->GetStatus());
     return rows;
   };
@@ -2055,12 +2104,14 @@ TEST_F(RelationalRegressionTest,
       std::chrono::steady_clock::now() + std::chrono::seconds(3);
   do {
     counts = fact->TryReadIntegerKeyCounts(old.txn_, morsels, 0, 1, 2);
-    if (counts) break;
+    if (counts) {
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   } while (std::chrono::steady_clock::now() < deadline);
   ASSERT_NE(counts, nullptr);
   const std::vector<Row> initial{
-      Row({Value(0), Value(ones + twos), Value(3 * ones + 5 * twos)})};
+      Row({Value(0), Value(ones + twos), Value((3 * ones) + (5 * twos))})};
   EXPECT_EQ(read(old), initial);
   // Reusing fact counts must never cache the dimension's aggregate payload.
   RelationalRun(*rs_, "UPDATE CachedDim SET v=7 WHERE k=1");
@@ -2068,7 +2119,7 @@ TEST_F(RelationalRegressionTest,
     auto fresh = rs_->BeginReadOnlyContext();
     EXPECT_EQ(read(fresh),
               std::vector<Row>({Row({Value(0), Value(ones + twos),
-                                     Value(7 * ones + 5 * twos)})}));
+                                     Value((7 * ones) + (5 * twos))})}));
     fresh.Abort();
   }
   auto writer = rs_->BeginContext();
@@ -2082,7 +2133,7 @@ TEST_F(RelationalRegressionTest,
     EXPECT_EQ(
         read(fresh),
         std::vector<Row>({Row({Value(0), Value(ones + twos),
-                               Value(7 * (ones + 1) + 5 * (twos - 1))})}));
+                               Value((7 * (ones + 1)) + (5 * (twos - 1)))})}));
     fresh.Abort();
   }
   old.Abort();
@@ -2095,7 +2146,9 @@ TEST_F(RelationalRegressionTest,
         std::chrono::steady_clock::now() + std::chrono::seconds(3);
     do {
       warmed = fact->TryReadIntegerKeyCounts(warm.txn_, morsels, 0, 1, 2);
-      if (warmed) break;
+      if (warmed) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < until);
     ASSERT_NE(warmed, nullptr);
@@ -2103,8 +2156,8 @@ TEST_F(RelationalRegressionTest,
     auto fresh = rs_->BeginReadOnlyContext();
     EXPECT_EQ(
         read(fresh),
-        std::vector<Row>({Row({Value(0), Value(ones + 2 * twos - 1),
-                               Value(7 * (ones + 1) + 9 * (twos - 1))})}));
+        std::vector<Row>({Row({Value(0), Value(ones + (2 * twos) - 1),
+                               Value((7 * (ones + 1)) + (9 * (twos - 1)))})}));
     fresh.Abort();
     warm.Abort();
     RelationalRun(*rs_, "DELETE FROM CachedDim WHERE v=4");
@@ -2115,8 +2168,8 @@ TEST_F(RelationalRegressionTest,
   {
     auto fresh = rs_->BeginReadOnlyContext();
     EXPECT_EQ(read(fresh),
-              std::vector<Row>({Row({Value(0), Value(ones + 2 * twos - 1),
-                                     Value(-(ones + 1) + 9 * (twos - 1))})}));
+              std::vector<Row>({Row({Value(0), Value(ones + (2 * twos) - 1),
+                                     Value(-(ones + 1) + (9 * (twos - 1)))})}));
     fresh.Abort();
   }
   RelationalRun(*rs_, "DELETE FROM CachedDim WHERE v=4");
@@ -2157,8 +2210,9 @@ TEST_F(RelationalRegressionTest,
     auto setup = rs_->BeginContext();
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("ColumnFact"));
-    for (int64_t i = 0; i < 6000; ++i)
+    for (int64_t i = 0; i < 6000; ++i) {
       ASSERT_TRUE(fact->Insert(setup.txn_, Row({Value(i % 3)})).HasValue());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_, "ANALYZE");
@@ -2176,7 +2230,9 @@ TEST_F(RelationalRegressionTest,
     std::vector<Row> rows;
     if (plan.HasValue()) {
       Row row;
-      while (plan.Value()->Next(&row, nullptr)) rows.push_back(row);
+      while (plan.Value()->Next(&row, nullptr)) {
+        rows.push_back(row);
+      }
       EXPECT_SUCCESS(plan.Value()->GetStatus());
     }
     context.Abort();
@@ -2184,11 +2240,11 @@ TEST_F(RelationalRegressionTest,
   };
   EXPECT_EQ(read(), expected);
   EXPECT_EQ(read(), expected);
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
-  QueryMemoryBudget::Global().ResetForTest(512 * 1024);
+  QueryMemoryBudget::Global().ResetForTest(size_t{512} * 1024);
   EXPECT_EQ(read(), expected);
 }
 
@@ -2204,13 +2260,15 @@ TEST_F(RelationalRegressionTest,
                           setup.GetTable("WideColumnDim"));
     ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
                           setup.GetTable("WideColumnFact"));
-    for (int64_t i = 0; i < 20000; ++i)
+    for (int64_t i = 0; i < 20000; ++i) {
       ASSERT_TRUE(
           dim->Insert(setup.txn_, Row({Value(i), Value(0), Value(1), Value(2),
                                        Value(3), Value(4), Value(5), Value(6)}))
               .HasValue());
-    for (int64_t i = 0; i < 40000; ++i)
+    }
+    for (int64_t i = 0; i < 40000; ++i) {
       ASSERT_TRUE(fact->Insert(setup.txn_, Row({Value(i % 20000)})).HasValue());
+    }
     ASSERT_SUCCESS(setup.PreCommit());
   }
   RelationalRun(*rs_, "ANALYZE");

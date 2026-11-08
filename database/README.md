@@ -9,7 +9,7 @@ This directory is the heart of the database system, orchestrating the interactio
   - **Statistics Management**: To support query optimization, the `Database` class manages a persistent B+Tree for storing table statistics. Row counts and per-column histograms are stored as separate keys so each value fits in one leaf entry. These statistics, such as row counts and data distribution, are crucial for the query optimizer to generate efficient execution plans.
   - **Transaction Initiation**: It provides the `BeginContext` method, which creates a `TransactionContext` to start a new transaction, ensuring that all subsequent operations are performed within a transactional scope.
 
-- **`PageStorage`**: This component acts as an intermediary layer that brings together all the essential storage-related services. It integrates the `PageManager`, `LockManager`, `Logger`, `RecoveryManager`, and `TransactionManager` to provide a complete storage solution.
+- **`PageStorage`**: This component acts as an intermediary layer that brings together all the essential storage-related services (`database/page_storage.hpp`). It integrates `PageManager`, `Logger`, `RecoveryManager`, `CheckpointManager`, and `TransactionManager` to provide a complete storage solution.
   - **Lifecycle Management**: It is responsible for initializing and managing the lifecycle of all the core storage components, ensuring they work together seamlessly.
   - **Transaction Creation**: The `Begin` method on `PageStorage` is responsible for creating a new `Transaction` object, which is then wrapped in a `TransactionContext`.
 

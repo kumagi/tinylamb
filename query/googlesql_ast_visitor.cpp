@@ -75,6 +75,8 @@ using namespace ast_visitor_detail;
 
 namespace ast_visitor_detail {
 
+namespace {
+
 // User-facing parse/rewrite rejection: the AST visitor reports every
 // The AST dump does not carry per-pair set-operator text (only byte ranges
 // into the original SQL). Visit() stashes the source here so set operations
@@ -180,14 +182,6 @@ bool HasExplicitLateral(const GoogleSqlAstNode& table_subquery,
   SkipSqlTrivia(prefix, &position);
   return position < prefix.size() && prefix[position] == '(';
 }
-}  // namespace ast_visitor_detail
-
-namespace ast_visitor_detail {
-
-StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
-                                         const GoogleSqlAstNode& pivot);
-StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
-                                           const GoogleSqlAstNode& unpivot);
 
 int ParseTimeZoneOffset(std::string_view tz_str, int Y, int M, int D, int h,
                         int m, int s, int default_offset = 0) {
@@ -293,6 +287,8 @@ class ExpressionDepthGuard {
   bool failed_{false};
 };
 
+}  // namespace
+
 // Dump-produced literals must be digits-only and in range: std::stoll would
 // accept signs and std::stoull would wrap "-1" into a huge positive value.
 // Hex literals (0x / 0X) are accepted up to 16 digits; values above INT64_MAX
@@ -350,6 +346,8 @@ StatusOr<int64_t> ParseIntLiteral(const GoogleSqlAstNode& node) {
   return value;
 }
 
+namespace {
+
 StatusOr<uint64_t> ParseUnsignedLiteral(const GoogleSqlAstNode& node) {
   const std::string& text = node.detail;
   const bool digits_only =
@@ -391,6 +389,8 @@ StatusOr<double> ParseFloatLiteral(const GoogleSqlAstNode& node) {
 
 StatusOr<std::string> DecodeSingleComponent(std::string_view value_view);
 
+}  // namespace
+
 StatusOr<std::string> Identifier(const GoogleSqlAstNode& node) {
   if (node.kind != "Identifier") {
     return AstError<std::string>("GoogleSQL AST: expected Identifier");
@@ -404,6 +404,8 @@ StatusOr<std::string> Identifier(const GoogleSqlAstNode& node) {
   }
   return value;
 }
+
+namespace {
 
 StatusOr<std::vector<std::string>> PathParts(const GoogleSqlAstNode& path) {
   std::vector<std::string> result;
@@ -419,6 +421,8 @@ StatusOr<std::vector<std::string>> PathParts(const GoogleSqlAstNode& path) {
   }
   return result;
 }
+
+}  // namespace
 
 StatusOr<std::string> Path(const GoogleSqlAstNode& path) {
   ASSIGN_OR_RETURN(std::vector<std::string>, hv12514_0, (PathParts(path)));
@@ -441,6 +445,8 @@ StatusOr<std::string> Alias(const GoogleSqlAstNode& node) {
   return Identifier(*alias->Child("Identifier"));
 }
 
+namespace {
+
 // --- SQL UDF support (CREATE [TEMP] [AGGREGATE] FUNCTION) -------------------
 //
 // The visitor keeps a process-wide registry of user-defined SQL functions,
@@ -450,8 +456,6 @@ StatusOr<std::string> Alias(const GoogleSqlAstNode& node) {
 // served from the expression-layer runtime registry, while aggregate bodies
 // are spliced into every call site so the enclosing statement's aggregation
 // machinery computes their inner aggregates.
-
-StatusOr<Expression> VisitExpression(const GoogleSqlAstNode& node);
 
 struct UdfParameter {
   std::string name;
@@ -1040,11 +1044,10 @@ StatusOr<BinaryOperation> BinaryOp(std::string_view detail) {
       "GoogleSQL AST: unsupported binary operator " + std::string(detail));
 }
 
-StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
-    const GoogleSqlAstNode& query);
 StatusOr<Expression> ExpandUdfCall(const std::string& name,
                                    std::vector<Expression> arguments);
 
+}  // namespace
 }  // namespace ast_visitor_detail
 
 bool NeedsRelationalEvaluation(
@@ -1170,6 +1173,7 @@ bool NeedsRelationalEvaluation(
 }
 
 namespace ast_visitor_detail {
+namespace {
 
 StatusOr<Expression> FoldBoolean(
     const GoogleSqlAstNode& node,
@@ -1255,6 +1259,7 @@ std::unordered_map<std::string, SqlUdf>& UdfRegistry() {
   return registry;
 }
 
+}  // namespace
 }  // namespace ast_visitor_detail
 
 // TEMP views created by CREATE VIEW statements: name -> cloned statement
@@ -1269,6 +1274,7 @@ ViewRegistry() {
 }
 
 namespace ast_visitor_detail {
+namespace {
 
 size_t& ViewExpansionDepth() {
   static thread_local size_t depth = 0;
@@ -1289,6 +1295,7 @@ std::unique_ptr<GoogleSqlAstNode> CloneAstNode(
   return clone;
 }
 
+}  // namespace
 }  // namespace ast_visitor_detail
 
 void RegisterViewDefinition(std::string_view name,
@@ -1298,6 +1305,7 @@ void RegisterViewDefinition(std::string_view name,
 }
 
 namespace ast_visitor_detail {
+namespace {
 
 struct UdfExpansionFrame {
   const SqlUdf* udf;
@@ -3438,6 +3446,8 @@ void AlignAnonymousStructFieldNames(
   }
 }
 
+}  // namespace
+
 StatusOr<Expression> VisitExpression(
     const GoogleSqlAstNode&
         node) {  // NOLINT(misc-no-recursion) // Recursive AST descent by
@@ -4855,6 +4865,8 @@ StatusOr<Expression> VisitExpression(
                               node.kind);
 }
 
+namespace {
+
 StatusOr<TableSampleSpec> VisitTableSample(
     const GoogleSqlAstNode& sample_clause) {
   const GoogleSqlAstNode* method_node = sample_clause.Child("Identifier");
@@ -5168,8 +5180,8 @@ StatusOr<SelectSource> VisitTableSource(
             "TABLESAMPLE is not valid directly on a table function");
       }
       constexpr size_t kParameterCount = 3;
-      static constexpr std::string_view kParameters[kParameterCount] = {
-          "start", "stop", "step"};
+      static constexpr std::array<std::string_view, kParameterCount>
+          kParameters = {"start", "stop", "step"};
       std::vector<Expression> arguments(kParameterCount);
       std::vector<bool> bound(kParameterCount, false);
       size_t next_positional = 0;
@@ -5205,9 +5217,12 @@ StatusOr<SelectSource> VisitTableSource(
             break;
           }
           if (value_node == nullptr) {
-            return AstError<SelectSource>("table function " + function_name +
-                                          " argument " + parameter +
-                                          " is empty");
+            std::string msg = "table function ";
+            msg += function_name;
+            msg += " argument ";
+            msg += parameter;
+            msg += " is empty";
+            return AstError<SelectSource>(std::move(msg));
           }
           expression_node = value_node;
         }
@@ -5218,9 +5233,11 @@ StatusOr<SelectSource> VisitTableSource(
             ++parameter_index;
           }
           if (parameter_index == kParameterCount) {
-            return AstError<SelectSource>("table function " + function_name +
-                                          " has no argument named " +
-                                          parameter);
+            std::string msg = "table function ";
+            msg += function_name;
+            msg += " has no argument named ";
+            msg += parameter;
+            return AstError<SelectSource>(std::move(msg));
           }
         } else {
           parameter_index = next_positional++;
@@ -5970,6 +5987,8 @@ StatusOr<std::shared_ptr<SelectStatement>> FoldPipeOperators(
   return statement;
 }
 
+}  // namespace
+
 StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     const GoogleSqlAstNode& query) {  // NOLINT(misc-no-recursion) // Recursive
                                       // subquery/CTE traversal by design; SQL
@@ -6051,11 +6070,9 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               // both inputs produce (GoogleSQL's INNER default).  An ON/BY
               // list restricts either mode to the listed columns.
               const std::string match_text = UpperCopy(SliceSource(match_node));
-              if (match_text.find("STRICT") != std::string::npos ||
-                  match_text.find("BY NAME") != std::string::npos) {
-                match.by_name = true;
-              } else if (match_text.find("CORRESPONDING") !=
-                         std::string::npos) {
+              if (match_text.find("CORRESPONDING") != std::string::npos &&
+                  match_text.find("STRICT") == std::string::npos &&
+                  match_text.find("BY NAME") == std::string::npos) {
                 match.corresponding = true;
               } else {
                 match.by_name = true;
@@ -7485,6 +7502,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   return statement;
 }
 
+namespace {
+
 // CREATE [TEMP] FUNCTION / CREATE TEMP AGGREGATE FUNCTION / CREATE TABLE
 // FUNCTION: register scalar and aggregate SQL functions for later call-site
 // expansion. Table functions are registered as inert entries (their bodies
@@ -7877,6 +7896,8 @@ Status ValidateSelectAsProjections(
   return Status::kSuccess;
 }
 
+}  // namespace
+
 }  // namespace ast_visitor_detail
 
 std::string DecodeStringEscapes(std::string_view value, bool is_bytes,
@@ -7993,7 +8014,7 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     const auto paths = root.Children("PathExpression");
     const auto* items = root.Child("IndexItemList");
     if (paths.size() != 2 || items == nullptr || items->children.empty() ||
-        (root.detail != "" && root.detail != "UNIQUE")) {
+        (!root.detail.empty() && root.detail != "UNIQUE")) {
       return AstError<std::unique_ptr<Statement>>(
           "CREATE INDEX requires an ordinary column index");
     }
@@ -8007,17 +8028,17 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     // The pinned parser omits IF NOT EXISTS / OR REPLACE from its dump.
     // Read only the keyword prefix before the name, skipping comments;
     // never silently treat OR REPLACE as plain CREATE.
-    const std::string source = SliceSource(&root);
-    if (source.empty() || paths[0]->start < root.start ||
-        paths[0]->start - root.start > source.size()) {
+    const std::string stmt_source = SliceSource(&root);
+    if (stmt_source.empty() || paths[0]->start < root.start ||
+        paths[0]->start - root.start > stmt_source.size()) {
       return AstError<std::unique_ptr<Statement>>(
           "CREATE INDEX requires its SQL source");
     }
     const std::string header =
-        UpperCopy(source.substr(0, paths[0]->start - root.start));
+        UpperCopy(stmt_source.substr(0, paths[0]->start - root.start));
     std::vector<std::string> words;
     for (size_t i = 0; i < header.size();) {
-      if (std::isspace(static_cast<unsigned char>(header[i]))) {
+      if (std::isspace(static_cast<unsigned char>(header[i])) != 0) {
         ++i;
       } else if (header.compare(i, 2, "--") == 0) {
         const size_t end = header.find('\n', i + 2);
@@ -8028,7 +8049,7 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
       } else {
         const size_t begin = i;
         while (i < header.size() &&
-               std::isalpha(static_cast<unsigned char>(header[i]))) {
+               (std::isalpha(static_cast<unsigned char>(header[i])) != 0)) {
           ++i;
         }
         if (i == begin) {

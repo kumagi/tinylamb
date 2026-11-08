@@ -26,7 +26,7 @@
 
 #include "common/platform/socket.hpp"
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #else
@@ -49,42 +49,61 @@ void EventPoller::Close() {
     ::close(poll_fd_);
     poll_fd_ = -1;
   }
-#if !defined(__linux__)
+#ifndef __linux__
   std::scoped_lock lock(mu_);
   interest_.clear();
 #endif
 }
 
-#if defined(__linux__)
+#ifdef __linux__
 
 namespace {
 
 uint32_t ToEpoll(uint32_t interest) {
   uint32_t events = 0;
-  if ((interest & kPollReadable) != 0U) events |= EPOLLIN;
-  if ((interest & kPollWritable) != 0U) events |= EPOLLOUT;
-  if ((interest & kPollPeerClosed) != 0U) events |= EPOLLRDHUP;
+  if ((interest & kPollReadable) != 0U) {
+    events |= EPOLLIN;
+  }
+  if ((interest & kPollWritable) != 0U) {
+    events |= EPOLLOUT;
+  }
+  if ((interest & kPollPeerClosed) != 0U) {
+    events |= EPOLLRDHUP;
+  }
   return events;
 }
 
 uint32_t FromEpoll(uint32_t events) {
   uint32_t result = 0;
-  if ((events & EPOLLIN) != 0U) result |= kPollReadable;
-  if ((events & EPOLLOUT) != 0U) result |= kPollWritable;
-  if ((events & EPOLLRDHUP) != 0U) result |= kPollPeerClosed;
-  if ((events & EPOLLHUP) != 0U) result |= kPollHangup;
-  if ((events & EPOLLERR) != 0U) result |= kPollError;
+  if ((events & EPOLLIN) != 0U) {
+    result |= kPollReadable;
+  }
+  if ((events & EPOLLOUT) != 0U) {
+    result |= kPollWritable;
+  }
+  if ((events & EPOLLRDHUP) != 0U) {
+    result |= kPollPeerClosed;
+  }
+  if ((events & EPOLLHUP) != 0U) {
+    result |= kPollHangup;
+  }
+  if ((events & EPOLLERR) != 0U) {
+    result |= kPollError;
+  }
   return result;
 }
 
 }  // namespace
 
 bool EventPoller::Open() {
-  if (poll_fd_ >= 0) return true;
+  if (poll_fd_ >= 0) {
+    return true;
+  }
   poll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
   return poll_fd_ >= 0;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 bool EventPoller::Add(int fd, uint32_t interest) {
   epoll_event event{};
   event.events = ToEpoll(interest);
@@ -92,6 +111,7 @@ bool EventPoller::Add(int fd, uint32_t interest) {
   return ::epoll_ctl(poll_fd_, EPOLL_CTL_ADD, fd, &event) == 0;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 bool EventPoller::Modify(int fd, uint32_t interest) {
   epoll_event event{};
   event.events = ToEpoll(interest);
@@ -99,16 +119,20 @@ bool EventPoller::Modify(int fd, uint32_t interest) {
   return ::epoll_ctl(poll_fd_, EPOLL_CTL_MOD, fd, &event) == 0;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 bool EventPoller::Remove(int fd) {
   epoll_event ignored{};
   return ::epoll_ctl(poll_fd_, EPOLL_CTL_DEL, fd, &ignored) == 0;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
   std::array<epoll_event, kMaxBatch> events{};
   const int capacity = static_cast<int>(std::min(out.size(), events.size()));
   const int count = ::epoll_wait(poll_fd_, events.data(), capacity, timeout_ms);
-  if (count < 0) return -1;
+  if (count < 0) {
+    return -1;
+  }
   for (int i = 0; i < count; ++i) {
     const auto& event = events[static_cast<size_t>(i)];
     out[static_cast<size_t>(i)] = {.fd = event.data.fd,
@@ -120,20 +144,26 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
 Waker::~Waker() { Close(); }
 
 bool Waker::Open() {
-  if (read_fd_ >= 0) return true;
+  if (read_fd_ >= 0) {
+    return true;
+  }
   read_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   write_fd_ = read_fd_;
   return read_fd_ >= 0;
 }
 
 void Waker::Close() {
-  if (read_fd_ >= 0) ::close(read_fd_);
+  if (read_fd_ >= 0) {
+    ::close(read_fd_);
+  }
   read_fd_ = -1;
   write_fd_ = -1;
 }
 
 void Waker::Wake() const {
-  if (write_fd_ < 0) return;
+  if (write_fd_ < 0) {
+    return;
+  }
   const uint64_t one = 1;
   ssize_t written = 0;
   do {
@@ -142,7 +172,9 @@ void Waker::Wake() const {
 }
 
 void Waker::Drain() const {
-  if (read_fd_ < 0) return;
+  if (read_fd_ < 0) {
+    return;
+  }
   uint64_t ignored = 0;
   ssize_t got = 0;
   do {

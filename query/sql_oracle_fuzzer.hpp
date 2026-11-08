@@ -166,6 +166,13 @@ struct OracleTrace {
   std::vector<std::string> guard_probes;
   std::string guard_expected;
   bool guard_error{false};
+  // Cross-mode / cross-engine differential probes: composite queries (multi-way
+  // JOIN + GROUP BY / ROLLUP / GROUPING SETS + HAVING, sibling derived
+  // aggregate fusion, shared-CTE restriction pushdown, Window + QUALIFY,
+  // correlated subqueries, band joins) compared across unindexed relational
+  // AST fallback, default Cascades/Bytecode, Cascades grouped route, and
+  // USING lstable PAX columnar tables with ANALYZE.
+  std::vector<std::string> xmode_probes;
 
   bool operator==(const OracleTrace&) const = default;
 };
@@ -203,6 +210,7 @@ struct OracleIterationStats {
   bool recursive_ran{false};
   bool unnest_ran{false};
   bool guard_ran{false};
+  bool xmode_ran{false};
 };
 
 // QPG-flavoured plan feedback: remembers EXPLAIN fingerprints and rewards

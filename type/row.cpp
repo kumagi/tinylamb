@@ -395,13 +395,13 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
             continue;
           }
           uint64_t bits = 0;
-          std::memcpy(&bits, payload + i * sizeof(bits), sizeof(bits));
+          std::memcpy(&bits, payload + (i * sizeof(bits)), sizeof(bits));
           out[slot].value.int_value =
               static_cast<int64_t>(TINYLAMB_BSWAP64(bits));
           out[slot].type = types[i];
           out[slot].SetCollation(0);
         }
-        src = payload + static_cast<size_t>(count) * sizeof(uint64_t);
+        src = payload + (static_cast<size_t>(count) * sizeof(uint64_t));
       }
       return static_cast<size_t>(src - original_offset);
     }

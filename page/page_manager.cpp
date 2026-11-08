@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -52,21 +53,21 @@
 namespace tinylamb {
 
 namespace {
-constexpr char kFuzzyCheckpointMagic[8] = {'T', 'L', 'S', 'M',
-                                           'C', 'K', 'P', '1'};
-constexpr uint32_t kFuzzyCheckpointVersion = 1;
+constexpr std::array<char, 8> kFuzzyCheckpointMagic = {'T', 'L', 'S', 'M',
+                                                       'C', 'K', 'P', '1'};
+constexpr uint32_t kFuzzyCheckpointVersion = 2;
 constexpr auto kTableTailWaitTimeout = std::chrono::milliseconds(5000);
 constexpr auto kTableTailWaitSlice = std::chrono::milliseconds(5);
 
 void AppendU32(std::string* dst, uint32_t v) {
-  char buf[sizeof(uint32_t)];
-  std::memcpy(buf, &v, sizeof(uint32_t));
-  dst->append(buf, sizeof(uint32_t));
+  std::array<char, sizeof(uint32_t)> buf{};
+  std::memcpy(buf.data(), &v, sizeof(uint32_t));
+  dst->append(buf.data(), sizeof(uint32_t));
 }
 void AppendU64(std::string* dst, uint64_t v) {
-  char buf[sizeof(uint64_t)];
-  std::memcpy(buf, &v, sizeof(uint64_t));
-  dst->append(buf, sizeof(uint64_t));
+  std::array<char, sizeof(uint64_t)> buf{};
+  std::memcpy(buf.data(), &v, sizeof(uint64_t));
+  dst->append(buf.data(), sizeof(uint64_t));
 }
 void AppendString(std::string* dst, std::string_view sv) {
   AppendU32(dst, static_cast<uint32_t>(sv.size()));
@@ -125,8 +126,17 @@ bool LsmTreeState::LookupLiveLocked(std::string_view key,
     }
     return true;
   }
-  for (auto it = runs.rbegin(); it != runs.rend(); ++it) {
-    if (const auto* entry = it->Find(key)) {
+  if (auto cit = committed_mem.find(key); cit != committed_mem.end()) {
+    if (cit->second.deleted) {
+      return false;
+    }
+    if (value_out != nullptr) {
+      *value_out = cit->second.value;
+    }
+    return true;
+  }
+  for (const auto& run : std::ranges::reverse_view(runs)) {
+    if (const auto* entry = run.Find(key)) {
       if (entry->deleted) {
         return false;
       }
@@ -140,6 +150,66 @@ bool LsmTreeState::LookupLiveLocked(std::string_view key,
 }
 
 LsmSortedRun LsmTreeState::BuildCompactedCommittedRunLocked() const {
+  if (runs.empty() && committed_mem.empty()) {
+    LsmSortedRun compacted;
+    compacted.generation = next_generation;
+    return compacted;
+  }
+  if (committed_mem.empty() && runs.size() == 1 &&
+      std::ranges::none_of(runs[0].entries, &LsmSortedRun::Entry::deleted)) {
+    LsmSortedRun compacted = runs[0];
+    compacted.generation = next_generation;
+    return compacted;
+  }
+  if (runs.size() <= 1) {
+    LsmSortedRun compacted;
+    compacted.generation = next_generation;
+    const std::vector<LsmSortedRun::Entry>* base =
+        runs.empty() ? nullptr : &runs[0].entries;
+    const size_t base_n = base != nullptr ? base->size() : 0;
+    compacted.entries.reserve(base_n + committed_mem.size());
+    size_t i = 0;
+    auto it = committed_mem.begin();
+    while (i < base_n && it != committed_mem.end()) {
+      const int cmp = (*base)[i].key.compare(it->first);
+      if (cmp < 0) {
+        if (!(*base)[i].deleted) {
+          compacted.entries.push_back((*base)[i]);
+        }
+        ++i;
+      } else {
+        if (cmp == 0) {
+          ++i;
+        }
+        if (!it->second.deleted) {
+          compacted.entries.push_back(LsmSortedRun::Entry{
+              .key = it->first,
+              .value = it->second.value,
+              .deleted = false,
+              .committed_lsn = it->second.committed_lsn,
+          });
+        }
+        ++it;
+      }
+    }
+    while (i < base_n) {
+      if (!(*base)[i].deleted) {
+        compacted.entries.push_back((*base)[i]);
+      }
+      ++i;
+    }
+    for (; it != committed_mem.end(); ++it) {
+      if (!it->second.deleted) {
+        compacted.entries.push_back(LsmSortedRun::Entry{
+            .key = it->first,
+            .value = it->second.value,
+            .deleted = false,
+            .committed_lsn = it->second.committed_lsn,
+        });
+      }
+    }
+    return compacted;
+  }
   std::map<std::string, LsmSortedRun::Entry, std::less<>> merged;
   for (const LsmSortedRun& run : runs) {
     for (const LsmSortedRun::Entry& e : run.entries) {
@@ -165,9 +235,9 @@ LsmSortedRun LsmTreeState::BuildCompactedCommittedRunLocked() const {
   return compacted;
 }
 
-void LsmTreeState::FlushAndCompactIfIdleLocked() {
+bool LsmTreeState::FlushAndCompactIfIdleLocked() {
   if (active_uncommitted_ops != 0 || committed_mem.size() < kFlushThreshold) {
-    return;
+    return false;
   }
   LsmSortedRun flushed;
   flushed.generation = next_generation++;
@@ -189,7 +259,9 @@ void LsmTreeState::FlushAndCompactIfIdleLocked() {
     if (!compacted.entries.empty()) {
       runs.push_back(std::move(compacted));
     }
+    return true;
   }
+  return false;
 }
 
 StatusOr<std::unique_ptr<PageManager>> PageManager::Create(
@@ -228,7 +300,14 @@ void PageManager::CloseDatabaseFile() {
   }
 }
 
+void PageManager::SetCompactionCallback(std::function<void()> callback) {
+  std::scoped_lock lk(compaction_cb_mu_);
+  compaction_cb_ = std::move(callback);
+}
+
 void PageManager::DropAllState() {
+  max_committed_txn_id_.store(0, std::memory_order_release);
+  unpersisted_committed_ops_.store(0, std::memory_order_relaxed);
   {
     std::scoped_lock lk(blocks_mu_);
     blocks_.clear();
@@ -330,7 +409,11 @@ Status PageManager::LsmInsert(Transaction& txn, page_id_t tree_id,
   }
   std::unique_lock tree_lk(tree->mutex);
   if (tree->destroyed) {
+    if (tree->destroyed_by_txn != 0 && tree->destroyed_by_txn != txn.ID()) {
+      return Status::kConflicts;
+    }
     tree->destroyed = false;
+    tree->destroyed_by_txn = 0;
   }
   std::string existing;
   if (tree->LookupLiveLocked(key, &existing)) {
@@ -343,6 +426,7 @@ Status PageManager::LsmInsert(Transaction& txn, page_id_t tree_id,
       .value = std::string(value),
       .deleted = false,
       .generation = tree->next_generation++,
+      .uncommitted_txn = txn.ID(),
   };
   ++tree->active_uncommitted_ops;
   return Status::kSuccess;
@@ -368,6 +452,7 @@ Status PageManager::LsmUpdate(Transaction& txn, page_id_t tree_id,
       .value = std::string(value),
       .deleted = false,
       .generation = tree->next_generation++,
+      .uncommitted_txn = txn.ID(),
   };
   ++tree->active_uncommitted_ops;
   return Status::kSuccess;
@@ -391,6 +476,7 @@ Status PageManager::LsmDelete(Transaction& txn, page_id_t tree_id,
       .value = {},
       .deleted = true,
       .generation = tree->next_generation++,
+      .uncommitted_txn = txn.ID(),
   };
   ++tree->active_uncommitted_ops;
   return Status::kSuccess;
@@ -417,7 +503,7 @@ StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
 
 std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
     page_id_t tree_id, std::string_view begin, std::string_view end,
-    bool ascending) const {
+    bool ascending, txn_id_t reader_txn_id) const {
   cache_hits_.fetch_add(2, std::memory_order_relaxed);
   if (!begin.empty() && !end.empty() && end < begin) {
     return {};
@@ -463,6 +549,17 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
       }
     }
   }
+  auto cmem_it = begin.empty() ? tree->committed_mem.begin()
+                               : tree->committed_mem.lower_bound(begin);
+  for (; cmem_it != tree->committed_mem.end(); ++cmem_it) {
+    if (!end.empty() &&
+        (ascending ? (end < cmem_it->first) : (end <= cmem_it->first))) {
+      break;
+    }
+    if (in_bounds(cmem_it->first)) {
+      merged[cmem_it->first] = {cmem_it->second.value, cmem_it->second.deleted};
+    }
+  }
   auto mem_it = begin.empty() ? tree->memtable.begin()
                               : tree->memtable.lower_bound(begin);
   for (; mem_it != tree->memtable.end(); ++mem_it) {
@@ -470,9 +567,22 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
         (ascending ? (end < mem_it->first) : (end <= mem_it->first))) {
       break;
     }
-    if (in_bounds(mem_it->first)) {
-      merged[mem_it->first] = {mem_it->second.value, mem_it->second.deleted};
+    if (!in_bounds(mem_it->first)) {
+      continue;
     }
+    const bool foreign_uncommitted =
+        reader_txn_id != 0 && mem_it->second.uncommitted_txn != 0 &&
+        mem_it->second.uncommitted_txn != reader_txn_id;
+    if (foreign_uncommitted) {
+      if (mem_it->second.deleted) {
+        continue;
+      }
+      auto existing_it = merged.find(mem_it->first);
+      if (existing_it == merged.end() || existing_it->second.second) {
+        continue;
+      }
+    }
+    merged[mem_it->first] = {mem_it->second.value, mem_it->second.deleted};
   }
 
   std::vector<std::pair<std::string, std::string>> result;
@@ -484,9 +594,9 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
       }
     }
   } else {
-    for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
-      if (!it->second.second) {
-        result.emplace_back(it->first, std::move(it->second.first));
+    for (auto& it : std::ranges::reverse_view(merged)) {
+      if (!it.second.second) {
+        result.emplace_back(it.first, std::move(it.second.first));
       }
     }
   }
@@ -506,12 +616,18 @@ Status PageManager::LsmDestroy(Transaction& txn, page_id_t tree_id) {
   (void)lsn;
   std::unique_lock tree_lk(tree->mutex);
   tree->destroyed = true;
+  tree->destroyed_by_txn = txn.ID();
   ++tree->active_uncommitted_ops;
   return Status::kSuccess;
 }
 
 void PageManager::ApplyTransactionCommit(
     txn_id_t txn_id, lsn_t commit_lsn, const std::vector<LogRecord>& records) {
+  txn_id_t cur_max = max_committed_txn_id_.load(std::memory_order_relaxed);
+  while (txn_id > cur_max && !max_committed_txn_id_.compare_exchange_weak(
+                                 cur_max, txn_id, std::memory_order_release,
+                                 std::memory_order_relaxed)) {
+  }
   for (const LogRecord& r : records) {
     const lsn_t rec_lsn = r.record_lsn != 0 ? r.record_lsn : commit_lsn;
     switch (r.type) {
@@ -619,9 +735,8 @@ void PageManager::ApplyTransactionCommit(
             cit != tree->committed_mem.end()) {
           existing_lsn = cit->second.committed_lsn;
         } else {
-          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
-               ++rit) {
-            if (const auto* e = rit->Find(r.key); e != nullptr) {
+          for (auto& run : std::ranges::reverse_view(tree->runs)) {
+            if (const auto* e = run.Find(r.key); e != nullptr) {
               existing_lsn = e->committed_lsn;
               break;
             }
@@ -634,10 +749,15 @@ void PageManager::ApplyTransactionCommit(
               .committed_lsn = rec_lsn,
           };
         }
+        if (auto mit = tree->memtable.find(r.key);
+            mit != tree->memtable.end() &&
+            mit->second.uncommitted_txn == txn_id) {
+          mit->second.uncommitted_txn = 0;
+        }
         if (tree->active_uncommitted_ops > 0) {
           --tree->active_uncommitted_ops;
         }
-        tree->FlushAndCompactIfIdleLocked();
+        std::ignore = tree->FlushAndCompactIfIdleLocked();
         break;
       }
       case LogType::kLsmDelete: {
@@ -652,9 +772,8 @@ void PageManager::ApplyTransactionCommit(
             cit != tree->committed_mem.end()) {
           existing_lsn = cit->second.committed_lsn;
         } else {
-          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
-               ++rit) {
-            if (const auto* e = rit->Find(r.key); e != nullptr) {
+          for (auto& run : std::ranges::reverse_view(tree->runs)) {
+            if (const auto* e = run.Find(r.key); e != nullptr) {
               existing_lsn = e->committed_lsn;
               break;
             }
@@ -667,10 +786,15 @@ void PageManager::ApplyTransactionCommit(
               .committed_lsn = rec_lsn,
           };
         }
+        if (auto mit = tree->memtable.find(r.key);
+            mit != tree->memtable.end() &&
+            mit->second.uncommitted_txn == txn_id) {
+          mit->second.uncommitted_txn = 0;
+        }
         if (tree->active_uncommitted_ops > 0) {
           --tree->active_uncommitted_ops;
         }
-        tree->FlushAndCompactIfIdleLocked();
+        std::ignore = tree->FlushAndCompactIfIdleLocked();
         break;
       }
       case LogType::kLsmDestroy: {
@@ -682,6 +806,7 @@ void PageManager::ApplyTransactionCommit(
         if (tree != nullptr) {
           std::unique_lock tree_lk(tree->mutex);
           tree->committed_destroyed = true;
+          tree->destroyed_by_txn = 0;
           tree->committed_destroy_lsn = rec_lsn;
           tree->memtable.clear();
           tree->committed_mem.clear();
@@ -706,12 +831,32 @@ void PageManager::ApplyTransactionCommit(
       pending_destroyed_pages_.erase(it);
     }
   }
+  if (!records.empty()) {
+    const size_t ops = unpersisted_committed_ops_.fetch_add(
+                           records.size(), std::memory_order_relaxed) +
+                       records.size();
+    if (ops >= kCompactionPersistOpsThreshold) {
+      unpersisted_committed_ops_.store(0, std::memory_order_relaxed);
+      std::function<void()> cb;
+      {
+        std::scoped_lock lk(compaction_cb_mu_);
+        cb = compaction_cb_;
+      }
+      if (cb) {
+        cb();
+      }
+    }
+  }
 }
 
 void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
                                         const std::vector<LogRecord>& records) {
-  for (auto it = records.rbegin(); it != records.rend(); ++it) {
-    const LogRecord& r = *it;
+  txn_id_t cur_max = max_committed_txn_id_.load(std::memory_order_relaxed);
+  while (txn_id > cur_max && !max_committed_txn_id_.compare_exchange_weak(
+                                 cur_max, txn_id, std::memory_order_release,
+                                 std::memory_order_relaxed)) {
+  }
+  for (const auto& r : std::ranges::reverse_view(records)) {
     auto lock_page_if_needed = [](Page* p) {
       return p->IsExclusivelyOwnedByCurrentThread()
                  ? std::unique_lock<std::shared_mutex>()
@@ -887,6 +1032,7 @@ void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
         if (tree != nullptr) {
           std::unique_lock tree_lk(tree->mutex);
           tree->destroyed = false;
+          tree->destroyed_by_txn = 0;
           if (tree->active_uncommitted_ops > 0) {
             --tree->active_uncommitted_ops;
           }
@@ -904,11 +1050,13 @@ void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
 }
 
 Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
+  unpersisted_committed_ops_.store(0, std::memory_order_relaxed);
   std::string buf;
   buf.reserve(4096);
-  buf.append(kFuzzyCheckpointMagic, sizeof(kFuzzyCheckpointMagic));
+  buf.append(kFuzzyCheckpointMagic.data(), kFuzzyCheckpointMagic.size());
   AppendU32(&buf, kFuzzyCheckpointVersion);
   AppendU64(&buf, replay_start_lsn);
+  AppendU64(&buf, max_committed_txn_id_.load(std::memory_order_acquire));
 
   struct BlockSnapshot {
     page_id_t pid{0};
@@ -982,20 +1130,12 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
       }
     }
     for (auto [tid, t] : trees) {
-      std::unique_lock tree_lk(t->mutex);
+      std::shared_lock tree_lk(t->mutex);
       if (t->committed_destroyed && t->committed_mem.empty() &&
           t->runs.empty()) {
         continue;
       }
       LsmSortedRun compacted = t->BuildCompactedCommittedRunLocked();
-      if (t->active_uncommitted_ops == 0) {
-        t->committed_mem.clear();
-        t->memtable.clear();
-        t->runs.clear();
-        if (!compacted.entries.empty()) {
-          t->runs.push_back(compacted);
-        }
-      }
       tree_snaps.push_back(TreeSnapshot{
           .tree_id = tid,
           .compacted = std::move(compacted),
@@ -1072,11 +1212,11 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   if (static_cast<size_t>(in.gcount()) != buf.size()) {
     return Status::kCorrupt;
   }
-  constexpr size_t kMinSize = sizeof(kFuzzyCheckpointMagic) +
-                              sizeof(uint32_t) * 4 + sizeof(uint64_t) * 2;
+  constexpr size_t kMinSize = kFuzzyCheckpointMagic.size() +
+                              (sizeof(uint32_t) * 4) + (sizeof(uint64_t) * 2);
   if (buf.size() < kMinSize ||
-      std::memcmp(buf.data(), kFuzzyCheckpointMagic,
-                  sizeof(kFuzzyCheckpointMagic)) != 0) {
+      std::memcmp(buf.data(), kFuzzyCheckpointMagic.data(),
+                  kFuzzyCheckpointMagic.size()) != 0) {
     return Status::kCorrupt;
   }
   const size_t payload_size = buf.size() - sizeof(uint32_t);
@@ -1086,14 +1226,17 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
     return Status::kCorrupt;
   }
 
-  size_t off = sizeof(kFuzzyCheckpointMagic);
+  size_t off = kFuzzyCheckpointMagic.size();
   uint32_t version = 0;
   lsn_t replay_lsn = 0;
+  txn_id_t persisted_max_txn = 0;
   page_id_t max_pid = 10;
   uint32_t free_count = 0;
   if (!ConsumeU32(buf.data(), payload_size, &off, &version) ||
-      version != kFuzzyCheckpointVersion ||
+      (version != 1 && version != kFuzzyCheckpointVersion) ||
       !ConsumeU64(buf.data(), payload_size, &off, &replay_lsn) ||
+      (version >= 2 &&
+       !ConsumeU64(buf.data(), payload_size, &off, &persisted_max_txn)) ||
       !ConsumeU64(buf.data(), payload_size, &off, &max_pid) ||
       !ConsumeU32(buf.data(), payload_size, &off, &free_count)) {
     return Status::kCorrupt;
@@ -1103,6 +1246,8 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   blocks_.clear();
   lsm_trees_.clear();
   free_pages_.clear();
+  max_committed_txn_id_.store(persisted_max_txn, std::memory_order_release);
+  unpersisted_committed_ops_.store(0, std::memory_order_relaxed);
   max_page_id_ = std::max<page_id_t>(10, max_pid);
   committed_max_page_id_ = max_page_id_;
 
@@ -1215,6 +1360,11 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
 }
 
 Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
+  txn_id_t cur_max = max_committed_txn_id_.load(std::memory_order_relaxed);
+  while (r.owner > cur_max && !max_committed_txn_id_.compare_exchange_weak(
+                                  cur_max, r.owner, std::memory_order_release,
+                                  std::memory_order_relaxed)) {
+  }
   switch (r.type) {
     case LogType::kSystemAllocPage: {
       std::scoped_lock lk(blocks_mu_);
@@ -1351,9 +1501,8 @@ Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
             cit != tree->committed_mem.end()) {
           existing_lsn = cit->second.committed_lsn;
         } else {
-          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
-               ++rit) {
-            if (const auto* e = rit->Find(r.key); e != nullptr) {
+          for (auto& run : std::ranges::reverse_view(tree->runs)) {
+            if (const auto* e = run.Find(r.key); e != nullptr) {
               existing_lsn = e->committed_lsn;
               break;
             }
@@ -1383,9 +1532,8 @@ Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
             cit != tree->committed_mem.end()) {
           existing_lsn = cit->second.committed_lsn;
         } else {
-          for (auto rit = tree->runs.rbegin(); rit != tree->runs.rend();
-               ++rit) {
-            if (const auto* e = rit->Find(r.key); e != nullptr) {
+          for (auto& run : std::ranges::reverse_view(tree->runs)) {
+            if (const auto* e = run.Find(r.key); e != nullptr) {
               existing_lsn = e->committed_lsn;
               break;
             }
@@ -1633,13 +1781,10 @@ Status PageManager::WaitForTableTailQuiescence(page_id_t first_page,
     if (res != tail_reservations_.end() && res->second.owner != requester) {
       return true;
     }
-    for (const auto& [page_id, pending] : unpublished_tail_pages_) {
-      (void)page_id;
-      if (pending.first_page == first_page && pending.owner != requester) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(unpublished_tail_pages_, [&](const auto& entry) {
+      const auto& pending = entry.second;
+      return pending.first_page == first_page && pending.owner != requester;
+    });
   };
   if (!table_tails_cv_.wait_for(lock, kTableTailWaitTimeout,
                                 [&] { return !has_foreign_tail_work(); })) {

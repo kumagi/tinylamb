@@ -73,7 +73,7 @@ TEST(PaxChunkCodecsTest, ConstAndRleAndRleBpAndRleIdxRoundTrip) {
   std::vector<int64_t> runs;
   for (int r = 0; r < 16; ++r) {
     for (int k = 0; k < 20; ++k) {
-      runs.push_back(100 + r * 10);
+      runs.push_back(100 + (r * 10));
     }
   }
   const auto n = static_cast<uint32_t>(runs.size());
@@ -109,7 +109,7 @@ TEST(PaxChunkCodecsTest, ConstAndRleAndRleBpAndRleIdxRoundTrip) {
 TEST(PaxChunkCodecsTest, StreamVByteAndRle8AndRleDeltaRoundTrip) {
   std::vector<int64_t> vals(256);
   for (size_t i = 0; i < vals.size(); ++i) {
-    vals[i] = static_cast<int64_t>(i * 3 - 50);
+    vals[i] = static_cast<int64_t>((i * 3) - 50);
   }
   const auto n = static_cast<uint32_t>(vals.size());
 
@@ -149,7 +149,7 @@ TEST(PaxChunkCodecsTest, StreamVByteAndRle8AndRleDeltaRoundTrip) {
 TEST(PaxChunkCodecsTest, Bp128AndFastPforAndDeltaPForAndSimdForRoundTrip) {
   std::vector<int64_t> vals(300);
   for (size_t i = 0; i < vals.size(); ++i) {
-    vals[i] = 1000 + static_cast<int64_t>(i * 5 + (i % 7));
+    vals[i] = 1000 + static_cast<int64_t>((i * 5) + (i % 7));
   }
   // Inject a couple of outliers for PFOR exception lanes
   vals[33] = 500000;
@@ -187,7 +187,9 @@ TEST(PaxChunkCodecsTest, Bp128AndFastPforAndDeltaPForAndSimdForRoundTrip) {
   int64_t cur = 1000;
   for (size_t i = 0; i < delta_vals.size(); ++i) {
     cur += static_cast<int64_t>(5 + (i % 4));
-    if (i == 70) cur += 50000;
+    if (i == 70) {
+      cur += 50000;
+    }
     delta_vals[i] = cur;
   }
   const EncodedCol dfpfor = EncDeltaFastPforI64(delta_vals);
@@ -214,7 +216,7 @@ TEST(PaxChunkCodecsTest, Bp128AndFastPforAndDeltaPForAndSimdForRoundTrip) {
 TEST(PaxChunkCodecsTest, EliasFanoAndInterpAndPBitSRoundTrip) {
   std::vector<int64_t> mono(200);
   for (size_t i = 0; i < mono.size(); ++i) {
-    mono[i] = static_cast<int64_t>(i * 11 + 50);
+    mono[i] = static_cast<int64_t>((i * 11) + 50);
   }
   const auto n = static_cast<uint32_t>(mono.size());
 
@@ -258,7 +260,7 @@ TEST(PaxChunkCodecsTest, EliasFanoAndInterpAndPBitSRoundTrip) {
 TEST(PaxChunkCodecsTest, Float64AndVarcharCodecsRoundTrip) {
   std::vector<uint64_t> fbits(128);
   for (size_t i = 0; i < fbits.size(); ++i) {
-    const double d = 10.25 + static_cast<double>(i) * 0.5;
+    const double d = 10.25 + (static_cast<double>(i) * 0.5);
     fbits[i] = Chimp128Bits(d);
   }
   const auto fn = static_cast<uint32_t>(fbits.size());
@@ -283,6 +285,7 @@ TEST(PaxChunkCodecsTest, Float64AndVarcharCodecsRoundTrip) {
   std::vector<std::string> strs;
   std::vector<std::string_view> svs;
   strs.reserve(64);
+  svs.reserve(64);
   for (int i = 0; i < 64; ++i) {
     strs.push_back("Customer#" + std::to_string(1000 + (i % 8)));
   }

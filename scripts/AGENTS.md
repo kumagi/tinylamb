@@ -25,3 +25,10 @@ Not C++ layers; ignored by `check_layering.py` (`IGNORED_PREFIXES`).
   (`deploy`, `status`, `collect`, `logs`, `start`, `stop`, `restart`); keeps
   active DB/WAL/corpus/logs on `tmpfs` (`/tmp/tinylamb-fuzz`) and connects
   directly to `/tmp/googlesql_zygote.sock` (`TINYLAMB_GOOGLESQL_ZYGOTE_SOCK`).
+- `build_googlesql_parse.sh` — builds a native `aarch64` / `x86_64`
+  parser-only `execute_query` binary from `google/googlesql` (`2026.7.2`) with
+  a built-in zero-fork Unix-domain socket daemon (`--zygote_sock` /
+  `GOOGLESQL_ZYGOTE_SOCK`), replacing QEMU x86_64 emulation on ARM64.
+- `oci_small_fuzz.sh` + `remote_small_fuzz_supervisor.sh` — continuous
+  low-memory (`nice -n 19`, `-rss_limit_mb=192`) in-process C++ fuzzing
+  controller and supervisor for `ssh oci-small1` and `ssh oci-small2`.

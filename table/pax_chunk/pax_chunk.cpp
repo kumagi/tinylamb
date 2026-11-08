@@ -16,6 +16,8 @@
 
 #include "table/pax_chunk/pax_chunk.hpp"
 
+#include <algorithm>
+
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
 namespace tinylamb {
@@ -35,7 +37,7 @@ struct StrPredicate {
   std::string lo, hi;
   bool has_lo{false}, has_hi{false};
 
-  bool Matches(std::string_view v) const {
+  [[nodiscard]] bool Matches(std::string_view v) const {
     switch (op) {
       case StrScanOp::kEq:
         return v == needle;
@@ -50,18 +52,21 @@ struct StrPredicate {
       case StrScanOp::kGe:
         return v >= needle;
       case StrScanOp::kPrefix:
-        return v.size() >= needle.size() &&
-               v.compare(0, needle.size(), needle) == 0;
+        return v.size() >= needle.size() && v.starts_with(needle);
     }
     return false;
   }
   // Half-open [lo, hi) with either side unbounded.
-  bool MatchesRange(std::string_view v) const {
-    if (has_lo && !(v >= std::string_view(lo))) return false;
-    if (has_hi && !(v < std::string_view(hi))) return false;
+  [[nodiscard]] bool MatchesRange(std::string_view v) const {
+    if (has_lo && !(v >= std::string_view(lo))) {
+      return false;
+    }
+    if (has_hi && !(v < std::string_view(hi))) {
+      return false;
+    }
     return true;
   }
-  bool Eval(std::string_view v) const {
+  [[nodiscard]] bool Eval(std::string_view v) const {
     return range ? MatchesRange(v) : Matches(v);
   }
 };
@@ -73,10 +78,14 @@ struct StrPredicate {
 // and has no finite upper bound.
 bool PrefixUpperBound(const std::string& needle, std::string* out) {
   size_t i = needle.size();
-  while (i > 0 && static_cast<uint8_t>(needle[i - 1]) == 0xFFu) --i;
-  if (i == 0) return false;
+  while (i > 0 && static_cast<uint8_t>(needle[i - 1]) == 0xFFU) {
+    --i;
+  }
+  if (i == 0) {
+    return false;
+  }
   out->assign(needle, 0, i);
-  (*out)[i - 1] = static_cast<char>(static_cast<uint8_t>((*out)[i - 1]) + 1u);
+  (*out)[i - 1] = static_cast<char>(static_cast<uint8_t>((*out)[i - 1]) + 1U);
   return true;
 }
 
@@ -87,23 +96,37 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
                                                 uint32_t param, uint32_t n,
                                                 const char* region_end,
                                                 const StrPredicate& p) {
-  if (n == 0) return uint64_t{0};
-  if (region_end == nullptr || region_end <= r) return std::nullopt;
+  if (n == 0) {
+    return uint64_t{0};
+  }
+  if (region_end == nullptr || region_end <= r) {
+    return std::nullopt;
+  }
   switch (s) {
     case Scheme::kConst: {
-      if (r + 4 > region_end) return std::nullopt;
+      if (r + 4 > region_end) {
+        return std::nullopt;
+      }
       const uint32_t len = ReadBE32(r);
-      if (r + 4 + len > region_end) return std::nullopt;
+      if (r + 4 + len > region_end) {
+        return std::nullopt;
+      }
       return p.Eval(std::string_view(r + 4, len)) ? uint64_t{n} : uint64_t{0};
     }
     case Scheme::kPlain: {
       const char* q = r;
       uint64_t cnt = 0;
       for (uint32_t i = 0; i < n; ++i) {
-        if (q + 4 > region_end) return std::nullopt;
+        if (q + 4 > region_end) {
+          return std::nullopt;
+        }
         const uint32_t len = ReadBE32(q);
-        if (q + 4 + len > region_end) return std::nullopt;
-        if (p.Eval(std::string_view(q + 4, len))) ++cnt;
+        if (q + 4 + len > region_end) {
+          return std::nullopt;
+        }
+        if (p.Eval(std::string_view(q + 4, len))) {
+          ++cnt;
+        }
         q += 4 + len;
       }
       return cnt;
@@ -113,12 +136,16 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // read (the kConst/kFsst arms above and every sibling kDict decoder
       // gate the same way; a 1-byte cell at the data-area end would
       // otherwise read its ncodes from the footer's first byte).
-      if (r + 2 > region_end) return std::nullopt;
+      if (r + 2 > region_end) {
+        return std::nullopt;
+      }
       const uint16_t ncodes = ReadBE16(r);
       const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
-      if (r + dict_base > region_end) return std::nullopt;
+          2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
+      if (r + dict_base > region_end) {
+        return std::nullopt;
+      }
       if (ncodes == 0) {
         // Every code decodes to "" (matches VarcharRegionAt's clamp).
         return p.Eval(std::string_view()) ? uint64_t{n} : uint64_t{0};
@@ -127,9 +154,13 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       std::vector<uint8_t> code_pass(static_cast<size_t>(ncodes) + 1, 0);
       const char* d = dict;
       for (uint16_t c = 0; c < ncodes; ++c) {
-        if (d + 4 > region_end) return std::nullopt;
+        if (d + 4 > region_end) {
+          return std::nullopt;
+        }
         const uint32_t len = ReadBE32(d);
-        if (d + 4 + len > region_end) return std::nullopt;
+        if (d + 4 + len > region_end) {
+          return std::nullopt;
+        }
         code_pass[c] = p.Eval(std::string_view(d + 4, len)) ? 1 : 0;
         d += 4 + len;
       }
@@ -149,12 +180,16 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // only -- the comparisons the kDict pass table spends above happen as
       // 2 x log2(d) binary-search steps instead), then the rows scan as a
       // branch-free window test. Gates mirror the kDict arm above.
-      if (r + 2 > region_end) return std::nullopt;
+      if (r + 2 > region_end) {
+        return std::nullopt;
+      }
       const uint16_t ncodes = ReadBE16(r);
       const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
-      if (r + dict_base > region_end) return std::nullopt;
+          2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
+      if (r + dict_base > region_end) {
+        return std::nullopt;
+      }
       if (ncodes == 0) {
         // Every code decodes to "" (matches VarcharRegionAt's clamp).
         return p.Eval(std::string_view()) ? uint64_t{n} : uint64_t{0};
@@ -163,9 +198,13 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       entries.reserve(ncodes);
       const char* d = r + dict_base;
       for (uint16_t c = 0; c < ncodes; ++c) {
-        if (d + 4 > region_end) return std::nullopt;
+        if (d + 4 > region_end) {
+          return std::nullopt;
+        }
         const uint32_t len = ReadBE32(d);
-        if (d + 4 + len > region_end) return std::nullopt;
+        if (d + 4 + len > region_end) {
+          return std::nullopt;
+        }
         entries.emplace_back(d + 4, len);
         d += 4 + len;
       }
@@ -174,7 +213,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       auto lb = [&](std::string_view key) {
         uint16_t a = 0, b = ncodes;
         while (a < b) {
-          const uint16_t m = static_cast<uint16_t>(a + (b - a) / 2);
+          const auto m = static_cast<uint16_t>(a + ((b - a) / 2));
           if (entries[m] < key) {
             a = static_cast<uint16_t>(m + 1);
           } else {
@@ -186,7 +225,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       auto ub = [&](std::string_view key) {
         uint16_t a = 0, b = ncodes;
         while (a < b) {
-          const uint16_t m = static_cast<uint16_t>(a + (b - a) / 2);
+          const auto m = static_cast<uint16_t>(a + ((b - a) / 2));
           if (!(key < entries[m])) {
             a = static_cast<uint16_t>(m + 1);
           } else {
@@ -199,8 +238,12 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       if (p.range) {
         // Half-open [lo, hi): codes of values >= lo start at lb(lo); values
         // < hi end at lb(hi).
-        if (p.has_lo) wlo = lb(p.lo);
-        if (p.has_hi) whi = lb(p.hi);
+        if (p.has_lo) {
+          wlo = lb(p.lo);
+        }
+        if (p.has_hi) {
+          whi = lb(p.hi);
+        }
       } else if (p.op == StrScanOp::kNe) {
         // Complement of equality: count the rows equal to the needle and
         // subtract. A row equals needle when its code is the needle's rank
@@ -272,62 +315,85 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       return cnt;
     }
     case Scheme::kFsst: {
-      if (r + 6 > region_end) return std::nullopt;
+      if (r + 6 > region_end) {
+        return std::nullopt;
+      }
       const uint16_t nsym = ReadBE16(r);
       // Same cap as VarcharRegionAt (which fails closed to "" above this):
       // accepting bigger symbol tables here would make the pushdown count
       // rows the decode path reports as "".
-      if (nsym > 256) return std::nullopt;
+      if (nsym > 256) {
+        return std::nullopt;
+      }
       const char* sp = r + 2;
       const uint32_t tsl = ReadBE32(sp);
       sp += 4;
       std::vector<std::string_view> sym(nsym);
       for (uint16_t c = 0; c < nsym; ++c) {
-        if (sp + 1 > region_end) return std::nullopt;
-        const uint8_t sl = static_cast<uint8_t>(*sp++);
-        if (sp + sl > region_end) return std::nullopt;
+        if (sp + 1 > region_end) {
+          return std::nullopt;
+        }
+        const auto sl = static_cast<uint8_t>(*sp++);
+        if (sp + sl > region_end) {
+          return std::nullopt;
+        }
         sym[c] = std::string_view(sp, sl);
         sp += sl;
       }
       const char* otable = sp;
-      if (otable + static_cast<size_t>(n) * 4 > region_end) return std::nullopt;
-      const char* stream = otable + static_cast<size_t>(n) * 4;
-      if (stream + tsl > region_end) return std::nullopt;
+      if (otable + (static_cast<size_t>(n) * 4) > region_end) {
+        return std::nullopt;
+      }
+      const char* stream = otable + (static_cast<size_t>(n) * 4);
+      if (stream + tsl > region_end) {
+        return std::nullopt;
+      }
       std::string scratch;
       uint64_t cnt = 0;
       for (uint32_t i = 0; i < n; ++i) {
-        const uint32_t code_off = ReadBE32(otable + static_cast<size_t>(i) * 4);
+        const uint32_t code_off =
+            ReadBE32(otable + (static_cast<size_t>(i) * 4));
         const uint32_t next_off =
-            (i + 1 < n) ? ReadBE32(otable + (static_cast<size_t>(i) + 1) * 4)
+            (i + 1 < n) ? ReadBE32(otable + ((static_cast<size_t>(i) + 1) * 4))
                         : tsl;
-        if (code_off > next_off || next_off > tsl) return std::nullopt;
+        if (code_off > next_off || next_off > tsl) {
+          return std::nullopt;
+        }
         scratch.clear();
-        const uint8_t* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
-        const uint8_t* cend =
-            reinterpret_cast<const uint8_t*>(stream + next_off);
+        const auto* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
+        const auto* cend = reinterpret_cast<const uint8_t*>(stream + next_off);
         while (cp < cend) {
           const uint8_t code = *cp++;
           if (code == 0) {
-            if (cp >= cend) break;
+            if (cp >= cend) {
+              break;
+            }
             scratch.push_back(static_cast<char>(*cp++));
           } else if (code <= nsym) {
             scratch.append(sym[code - 1]);
           }
         }
-        if (p.Eval(scratch)) ++cnt;
+        if (p.Eval(scratch)) {
+          ++cnt;
+        }
       }
       return cnt;
     }
     case Scheme::kFrontCode: {
-      const uint32_t re = param & 0x7FFFu;
-      if (re == 0 || r + 6 > region_end) return std::nullopt;
+      const uint32_t re = param & 0x7FFFU;
+      if (re == 0 || r + 6 > region_end) {
+        return std::nullopt;
+      }
       const uint32_t nrestart = ReadBE16(r);
       const uint32_t stream_len = ReadBE32(r + 2);
       const char* rtable = r + 6;
-      if (rtable + static_cast<size_t>(nrestart) * 4 > region_end)
+      if (rtable + (static_cast<size_t>(nrestart) * 4) > region_end) {
         return std::nullopt;
-      const char* stream = rtable + static_cast<size_t>(nrestart) * 4;
-      if (stream + stream_len > region_end) return std::nullopt;
+      }
+      const char* stream = rtable + (static_cast<size_t>(nrestart) * 4);
+      if (stream + stream_len > region_end) {
+        return std::nullopt;
+      }
       const char* send = stream + stream_len;
 
       // Sorted regions (encoder-detected, param bit 15): every op is a
@@ -336,20 +402,29 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // materializes the column -- the flagship compressed-processing
       // property no other varchar scheme has (FSST/DICT codes are not
       // order preserving, PLAIN must walk every row).
-      if ((param & 0x8000u) != 0) {
+      if ((param & 0x8000U) != 0) {
         std::string scratch;
         auto value_at = [&](uint32_t idx) -> bool {
           const uint32_t block = idx / re;
-          if (block >= nrestart) return false;
-          const uint32_t ro = ReadBE32(rtable + static_cast<size_t>(block) * 4);
-          if (ro > stream_len) return false;
+          if (block >= nrestart) {
+            return false;
+          }
+          const uint32_t ro =
+              ReadBE32(rtable + (static_cast<size_t>(block) * 4));
+          if (ro > stream_len) {
+            return false;
+          }
           scratch.clear();
           const char* q = stream + ro;
           for (uint32_t i = block * re; i <= idx; ++i) {
-            if (q + 4 > send) return false;
+            if (q + 4 > send) {
+              return false;
+            }
             const uint32_t plen = ReadBE16(q);
             const uint32_t slen = ReadBE16(q + 2);
-            if (plen > scratch.size() || q + 4 + slen > send) return false;
+            if (plen > scratch.size() || q + 4 + slen > send) {
+              return false;
+            }
             scratch.resize(plen);
             scratch.append(q + 4, slen);
             q += 4 + slen;
@@ -362,8 +437,10 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         auto seek = [&](const std::string& key, bool excl) -> int64_t {
           uint32_t lo = 0, hi = n;
           while (lo < hi) {
-            const uint32_t mid = lo + (hi - lo) / 2;
-            if (!value_at(mid)) return -1;
+            const uint32_t mid = lo + ((hi - lo) / 2);
+            if (!value_at(mid)) {
+              return -1;
+            }
             const int c = scratch.compare(key);
             if (c < 0 || (excl && c == 0)) {
               lo = mid + 1;
@@ -373,29 +450,41 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
           }
           return static_cast<int64_t>(lo);
         };
-        int64_t cnt;
+        int64_t cnt = 0;
         if (p.range) {
           const int64_t a = p.has_lo ? seek(p.lo, false) : 0;
-          if (a < 0) return std::nullopt;
+          if (a < 0) {
+            return std::nullopt;
+          }
           const int64_t b =
               p.has_hi ? seek(p.hi, false) : static_cast<int64_t>(n);
-          if (b < 0) return std::nullopt;
+          if (b < 0) {
+            return std::nullopt;
+          }
           cnt = std::max<int64_t>(0, b - a);
         } else {
           switch (p.op) {
             case StrScanOp::kEq: {
               const int64_t a = seek(p.needle, false);
-              if (a < 0) return std::nullopt;
+              if (a < 0) {
+                return std::nullopt;
+              }
               const int64_t b = seek(p.needle, true);
-              if (b < 0) return std::nullopt;
+              if (b < 0) {
+                return std::nullopt;
+              }
               cnt = b - a;
               break;
             }
             case StrScanOp::kNe: {
               const int64_t a = seek(p.needle, false);
-              if (a < 0) return std::nullopt;
+              if (a < 0) {
+                return std::nullopt;
+              }
               const int64_t b = seek(p.needle, true);
-              if (b < 0) return std::nullopt;
+              if (b < 0) {
+                return std::nullopt;
+              }
               cnt = static_cast<int64_t>(n) - (b - a);
               break;
             }
@@ -407,7 +496,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
               break;
             case StrScanOp::kGt: {
               const int64_t b = seek(p.needle, true);
-              if (b < 0) return std::nullopt;
+              if (b < 0) {
+                return std::nullopt;
+              }
               cnt = static_cast<int64_t>(n) - b;
               break;
             }
@@ -418,24 +509,32 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
               // bound (the last non-0xFF byte incremented). Two binary
               // searches, no materialization.
               const int64_t a = seek(p.needle, false);
-              if (a < 0) return std::nullopt;
-              int64_t b = static_cast<int64_t>(n);
+              if (a < 0) {
+                return std::nullopt;
+              }
+              auto b = static_cast<int64_t>(n);
               std::string upper;
               if (PrefixUpperBound(p.needle, &upper)) {
                 b = seek(upper, false);
-                if (b < 0) return std::nullopt;
+                if (b < 0) {
+                  return std::nullopt;
+                }
               }
               cnt = b - a;
               break;
             }
             default: {  // kGe
               const int64_t a = seek(p.needle, false);
-              if (a < 0) return std::nullopt;
+              if (a < 0) {
+                return std::nullopt;
+              }
               cnt = static_cast<int64_t>(n) - a;
               break;
             }
           }
-          if (cnt < 0) return std::nullopt;
+          if (cnt < 0) {
+            return std::nullopt;
+          }
         }
         return static_cast<uint64_t>(cnt);
       }
@@ -447,14 +546,20 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       uint64_t cnt = 0;
       const char* q = stream;
       for (uint32_t i = 0; i < n; ++i) {
-        if (q + 4 > send) return std::nullopt;
+        if (q + 4 > send) {
+          return std::nullopt;
+        }
         const uint32_t plen = ReadBE16(q);
         const uint32_t slen = ReadBE16(q + 2);
-        if (plen > cur.size() || q + 4 + slen > send) return std::nullopt;
+        if (plen > cur.size() || q + 4 + slen > send) {
+          return std::nullopt;
+        }
         cur.resize(plen);
         cur.append(q + 4, slen);
         q += 4 + slen;
-        if (p.Eval(cur)) ++cnt;
+        if (p.Eval(cur)) {
+          ++cnt;
+        }
       }
       return cnt;
     }
@@ -463,37 +568,45 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // region over the entries), then one inner decode of the code
       // stream -- the kDict arm's shape with a cascaded code region
       // (mirrors the WASM vc_count_region s == 26 arm).
-      if (r + 11 > region_end) return std::nullopt;
+      if (r + 11 > region_end) {
+        return std::nullopt;
+      }
       const uint16_t d = ReadBE16(r);
       if (d == 0) {
         // Every code decodes to "" (matches VarcharRegionAt's clamp).
         return p.Eval(std::string_view()) ? uint64_t{n} : uint64_t{0};
       }
-      const uint8_t cs = static_cast<uint8_t>(r[2]);
+      const auto cs = static_cast<uint8_t>(r[2]);
       const uint32_t cparam = ReadBE32(r + 3);
       const uint64_t clen = ReadBE32(r + 7);
       const char* creg = r + 11;
-      if (clen > static_cast<uint64_t>(region_end - creg)) {
+      if (std::cmp_greater(clen, region_end - creg)) {
         return std::nullopt;
       }
       const char* pool_hdr = creg + clen;
       if (pool_hdr + 1 > region_end || !InnerSchemeOk(cs)) {
         return std::nullopt;
       }
-      const uint8_t ps = static_cast<uint8_t>(pool_hdr[0]);
+      const auto ps = static_cast<uint8_t>(pool_hdr[0]);
       std::vector<uint8_t> pass(static_cast<size_t>(d) + 1, 0);
       if (ps == 0) {
         const char* q = pool_hdr + 1;
         for (uint16_t c = 0; c < d; ++c) {
-          if (q + 4 > region_end) return std::nullopt;
+          if (q + 4 > region_end) {
+            return std::nullopt;
+          }
           const uint32_t len = ReadBE32(q);
-          if (q + 4 + len > region_end) return std::nullopt;
+          if (q + 4 + len > region_end) {
+            return std::nullopt;
+          }
           pass[c] = p.Eval(std::string_view(q + 4, len)) ? 1 : 0;
           q += 4 + len;
         }
       } else if (ps == static_cast<uint8_t>(Scheme::kFsst)) {
         const char* pool = pool_hdr + 1;
-        if (pool + 2 > region_end) return std::nullopt;
+        if (pool + 2 > region_end) {
+          return std::nullopt;
+        }
         const uint16_t nsym = ReadBE16(pool);
         for (uint16_t c = 0; c < d; ++c) {
           Value v =
@@ -511,7 +624,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       DecodeInnerI64All(creg, cs, cparam, n, pool_hdr, codes.data());
       uint64_t cnt = 0;
       for (uint32_t i = 0; i < n; ++i) {
-        const uint64_t code = static_cast<uint64_t>(codes[i]);
+        const auto code = static_cast<uint64_t>(codes[i]);
         cnt += pass[code < d ? code : d];
       }
       return cnt;
@@ -527,8 +640,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // decode path: the composite lexicographic fold across segments is
       // future work.
       TemplateRegion t;
-      if (!ParseTemplateRegion(r, n, param, region_end, &t))
+      if (!ParseTemplateRegion(r, n, param, region_end, &t)) {
         return std::nullopt;
+      }
       if (p.range || (p.op != StrScanOp::kEq && p.op != StrScanOp::kNe)) {
         return std::nullopt;
       }
@@ -536,7 +650,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       // place and every digit slot must hold exactly `widths[s]` ASCII
       // digits. Conforming rows have exactly this shape by construction.
       bool structure_ok = true;
-      int64_t target[kTemplateMaxSegments];
+      std::array<int64_t, kTemplateMaxSegments> target{};
       {
         std::string_view nd(p.needle);
         size_t pos = 0;
@@ -560,9 +674,11 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
               structure_ok = false;
               break;
             }
-            v = v * 10 + static_cast<uint64_t>(c - '0');
+            v = (v * 10) + static_cast<uint64_t>(c - '0');
           }
-          if (!structure_ok) break;
+          if (!structure_ok) {
+            break;
+          }
           pos += t.widths[seg];
           target[seg] = static_cast<int64_t>(v);
         }
@@ -581,8 +697,8 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         // (one row group), so a fixed 16-word mask covers it; the tail bits
         // past nconf are masked off before the popcount (a partial row
         // group leaves them stale otherwise).
-        uint64_t mask[(PaxChunk::kRowGroupSize + 63) / 64];
-        for (uint64_t& w : mask) w = ~UINT64_C(0);
+        std::array<uint64_t, (PaxChunk::kRowGroupSize + 63) / 64> mask{};
+        mask.fill(~UINT64_C(0));
         thread_local std::vector<int64_t> col;
         col.resize(t.nconf);
         for (uint32_t seg = 0; seg < t.nseg; ++seg) {
@@ -600,7 +716,7 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
           // Later segments only test the rows the earlier ones kept, so a
           // selective early segment shrinks the rest of the fold.
           for (uint32_t i = 0; i < t.nconf; ++i) {
-            if ((mask[i >> 6] >> (i & 63)) & 1) {
+            if (((mask[i >> 6] >> (i & 63)) & 1) != 0U) {
               if (col[static_cast<size_t>(i)] != target[seg]) {
                 mask[i >> 6] &= ~(UINT64_C(1) << (i & 63));
               }
@@ -622,7 +738,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         const char* q = t.exc;
         for (uint32_t e = 0; e < t.nexc; ++e) {
           const uint32_t len = ReadBE32(q);
-          if (p.Eval(std::string_view(q + 4, len))) ++eq_exc;
+          if (p.Eval(std::string_view(q + 4, len))) {
+            ++eq_exc;
+          }
           q += 4 + len;
         }
       }
@@ -655,7 +773,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
       }
       const bool prefix = p.op == StrScanOp::kPrefix;
       std::string ncodes;
-      if (!prefix) DStreamEncodeNeedle(t, p.needle, &ncodes);
+      if (!prefix) {
+        DStreamEncodeNeedle(t, p.needle, &ncodes);
+      }
       const size_t klen = ncodes.size();
       // Conforming records carry clen in one u8, so a needle encoding to
       // more than 255 code bytes cannot equal any of them; only the
@@ -668,14 +788,20 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         const char* send = t.stream + t.stream_len;
         uint32_t left = t.nconf;
         for (uint32_t b = 0; b < t.ndir && left > 0; ++b) {
-          const uint32_t off = ReadBE32(t.dir + static_cast<size_t>(b) * 4);
-          if (off > t.stream_len) return std::nullopt;
+          const uint32_t off = ReadBE32(t.dir + (static_cast<size_t>(b) * 4));
+          if (off > t.stream_len) {
+            return std::nullopt;
+          }
           const char* sp = t.stream + off;
           const uint32_t rows = std::min(kDStreamRestart, left);
           for (uint32_t k = 0; k < rows; ++k) {
-            if (sp + 1 > send) return std::nullopt;
+            if (sp + 1 > send) {
+              return std::nullopt;
+            }
             const uint32_t clen = static_cast<uint8_t>(*sp++);
-            if (static_cast<size_t>(send - sp) < clen) return std::nullopt;
+            if (std::cmp_less(send - sp, clen)) {
+              return std::nullopt;
+            }
             if (prefix) {
               // The PREFIX fold: the needle's BYTES are compared against
               // the row's EXPANDED codes, and the row is never
@@ -723,7 +849,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
               }
               // The row must be AT LEAST as long as the needle: a shorter
               // row that matched all its bytes is not a prefix match.
-              if (ok && matched == p.needle.size()) ++prefix_conf;
+              if (ok && matched == p.needle.size()) {
+                ++prefix_conf;
+              }
             } else if (clen == klen &&
                        std::memcmp(sp, ncodes.data(), klen) == 0) {
               ++eq_conf;
@@ -740,7 +868,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
         const char* q = t.exc;
         for (uint32_t e = 0; e < t.nexc; ++e) {
           const uint32_t len = ReadBE32(q);
-          if (p.Eval(std::string_view(q + 4, len))) ++eq_exc;
+          if (p.Eval(std::string_view(q + 4, len))) {
+            ++eq_exc;
+          }
           q += 4 + len;
         }
       }
@@ -765,7 +895,9 @@ uint64_t VarcharRegionMatchCountGeneric(const char* r, Scheme s, uint32_t param,
   for (uint32_t i = 0; i < n; ++i) {
     const Value v = VarcharRegionAt(r, s, param, n, i, region_end);
     if (v.IsNull()) {
-      if (p.Eval(std::string_view())) ++cnt;
+      if (p.Eval(std::string_view())) {
+        ++cnt;
+      }
     } else if (p.Eval(v.AsStringView())) {
       ++cnt;
     }
@@ -786,31 +918,49 @@ uint64_t VarcharRegionMatchCountGeneric(const char* r, Scheme s, uint32_t param,
 bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
                             const char* region_end, const StrPredicate& p,
                             std::vector<uint32_t>* out) {
-  if (n == 0) return true;
-  if (region_end == nullptr || region_end <= r) return false;
-  if (s == Scheme::kFrontCode && (param & 0x8000u) != 0) {
-    const uint32_t re = param & 0x7FFFu;
-    if (re == 0 || r + 6 > region_end) return false;
+  if (n == 0) {
+    return true;
+  }
+  if (region_end == nullptr || region_end <= r) {
+    return false;
+  }
+  if (s == Scheme::kFrontCode && (param & 0x8000U) != 0) {
+    const uint32_t re = param & 0x7FFFU;
+    if (re == 0 || r + 6 > region_end) {
+      return false;
+    }
     const uint32_t nrestart = ReadBE16(r);
     const uint32_t stream_len = ReadBE32(r + 2);
     const char* rtable = r + 6;
-    if (rtable + static_cast<size_t>(nrestart) * 4 > region_end) return false;
-    const char* stream = rtable + static_cast<size_t>(nrestart) * 4;
-    if (stream + stream_len > region_end) return false;
+    if (rtable + (static_cast<size_t>(nrestart) * 4) > region_end) {
+      return false;
+    }
+    const char* stream = rtable + (static_cast<size_t>(nrestart) * 4);
+    if (stream + stream_len > region_end) {
+      return false;
+    }
     const char* send = stream + stream_len;
     std::string scratch;
     auto value_at = [&](uint32_t idx) -> bool {
       const uint32_t block = idx / re;
-      if (block >= nrestart) return false;
-      const uint32_t ro = ReadBE32(rtable + static_cast<size_t>(block) * 4);
-      if (ro > stream_len) return false;
+      if (block >= nrestart) {
+        return false;
+      }
+      const uint32_t ro = ReadBE32(rtable + (static_cast<size_t>(block) * 4));
+      if (ro > stream_len) {
+        return false;
+      }
       scratch.clear();
       const char* q = stream + ro;
       for (uint32_t i = block * re; i <= idx; ++i) {
-        if (q + 4 > send) return false;
+        if (q + 4 > send) {
+          return false;
+        }
         const uint32_t plen = ReadBE16(q);
         const uint32_t slen = ReadBE16(q + 2);
-        if (plen > scratch.size() || q + 4 + slen > send) return false;
+        if (plen > scratch.size() || q + 4 + slen > send) {
+          return false;
+        }
         scratch.resize(plen);
         scratch.append(q + 4, slen);
         q += 4 + slen;
@@ -822,8 +972,10 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
     auto seek = [&](const std::string& key, bool excl) -> int64_t {
       uint32_t lo = 0, hi = n;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
-        if (!value_at(mid)) return -1;
+        const uint32_t mid = lo + ((hi - lo) / 2);
+        if (!value_at(mid)) {
+          return -1;
+        }
         const int c = scratch.compare(key);
         if (c < 0 || (excl && c == 0)) {
           lo = mid + 1;
@@ -835,35 +987,47 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
     };
     // The matching index window, in the same shape the count path computes.
     int64_t a = 0;
-    int64_t b = static_cast<int64_t>(n);
+    auto b = static_cast<int64_t>(n);
     if (p.range) {
       if (p.has_lo) {
         a = seek(p.lo, false);
-        if (a < 0) return false;
+        if (a < 0) {
+          return false;
+        }
       }
       if (p.has_hi) {
         b = seek(p.hi, false);
-        if (b < 0) return false;
+        if (b < 0) {
+          return false;
+        }
       }
     } else {
       switch (p.op) {
         case StrScanOp::kEq: {
           a = seek(p.needle, false);
-          if (a < 0) return false;
+          if (a < 0) {
+            return false;
+          }
           b = seek(p.needle, true);
-          if (b < 0) return false;
+          if (b < 0) {
+            return false;
+          }
           break;
         }
         case StrScanOp::kNe: {
           // The complement of the equality window: two ranges.
           const int64_t eq_a = seek(p.needle, false);
-          if (eq_a < 0) return false;
+          if (eq_a < 0) {
+            return false;
+          }
           const int64_t eq_b = seek(p.needle, true);
-          if (eq_b < 0) return false;
-          for (uint32_t i = 0; i < static_cast<uint32_t>(eq_a); ++i) {
+          if (eq_b < 0) {
+            return false;
+          }
+          for (uint32_t i = 0; std::cmp_less(i, eq_a); ++i) {
             out->push_back(i);
           }
-          for (int64_t i = eq_b; i < static_cast<int64_t>(n); ++i) {
+          for (int64_t i = eq_b; std::cmp_less(i, n); ++i) {
             out->push_back(static_cast<uint32_t>(i));
           }
           return true;
@@ -871,31 +1035,41 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
         case StrScanOp::kLt:
           a = 0;
           b = seek(p.needle, false);
-          if (b < 0) return false;
+          if (b < 0) {
+            return false;
+          }
           break;
         case StrScanOp::kLe:
           a = 0;
           b = seek(p.needle, true);
-          if (b < 0) return false;
+          if (b < 0) {
+            return false;
+          }
           break;
         case StrScanOp::kGt: {
           const int64_t gt = seek(p.needle, true);
-          if (gt < 0) return false;
-          for (int64_t i = gt; i < static_cast<int64_t>(n); ++i) {
+          if (gt < 0) {
+            return false;
+          }
+          for (int64_t i = gt; std::cmp_less(i, n); ++i) {
             out->push_back(static_cast<uint32_t>(i));
           }
           return true;
         }
         default: {  // kGe
           a = seek(p.needle, false);
-          if (a < 0) return false;
+          if (a < 0) {
+            return false;
+          }
           b = static_cast<int64_t>(n);
           break;
         }
       }
     }
-    if (b < a) b = a;
-    for (int64_t i = a; i < b; ++i) out->push_back(static_cast<uint32_t>(i));
+    b = std::max(b, a);
+    for (int64_t i = a; i < b; ++i) {
+      out->push_back(static_cast<uint32_t>(i));
+    }
     return true;
   }
   // The generic walk: decode every row and evaluate. The decode is the
@@ -904,7 +1078,9 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
     const Value v = VarcharRegionAt(r, s, param, n, i, region_end);
     const bool hit =
         v.IsNull() ? p.Eval(std::string_view()) : p.Eval(v.AsStringView());
-    if (hit) out->push_back(i);
+    if (hit) {
+      out->push_back(i);
+    }
   }
   return true;
 }
@@ -912,7 +1088,9 @@ bool VarcharRegionMatchRows(const char* r, Scheme s, uint32_t param, uint32_t n,
 uint64_t VarcharCountWith(const PaxChunk& chunk, slot_t col,
                           const StrPredicate& p) {
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (col >= f.column_count) return 0;
+  if (col >= f.column_count) {
+    return 0;
+  }
   // Hand-built-footer guard, same contract as ReduceColumn/TopKColumn.
   if (f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -924,8 +1102,10 @@ uint64_t VarcharCountWith(const PaxChunk& chunk, slot_t col,
   uint64_t total = 0;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const uint16_t rc = f.row_counts[g];
-    if (rc == 0) continue;
-    const uint32_t off = g * f.column_count + col;
+    if (rc == 0) {
+      continue;
+    }
+    const uint32_t off = (g * f.column_count) + col;
     // Offset-VALUE validation, same contract as every sibling consumer
     // (ReadRow / PointLookup / ReduceColumn / VectorizedScanColumn): the
     // raw `off > data.size()` gate this used to apply admitted offsets
@@ -933,13 +1113,17 @@ uint64_t VarcharCountWith(const PaxChunk& chunk, slot_t col,
     // differently-scoped reg_end check below caught. RegionStartAt rejects
     // anything past the data-area end so the pointer is never formed.
     const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
-    if (region == nullptr) continue;
+    if (region == nullptr) {
+      continue;
+    }
     const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
     // An unboundable region cannot be walked safely in any path; skip it
     // (contributes 0) rather than handing the generic decoder an unbounded
     // extent.
-    if (reg_end == nullptr || reg_end <= region) continue;
-    const Scheme s = static_cast<Scheme>(f.encodings[off]);
+    if (reg_end == nullptr || reg_end <= region) {
+      continue;
+    }
+    const auto s = static_cast<Scheme>(f.encodings[off]);
     const uint32_t prm = f.params[off];
     std::optional<uint64_t> c =
         VarcharRegionMatchCount(region, s, prm, rc, reg_end, p);
@@ -953,12 +1137,16 @@ uint64_t VarcharCountWith(const PaxChunk& chunk, slot_t col,
 
 uint64_t VarcharGateAndRecord(const PaxChunk& chunk, slot_t col,
                               const Schema* sc, WorkloadTracker* workload) {
-  if (col >= chunk.GetFooter().column_count) return 0;
+  if (col >= chunk.GetFooter().column_count) {
+    return 0;
+  }
   if (sc != nullptr && (col >= sc->ColumnCount() ||
                         sc->GetColumn(col).Type() != ValueType::kVarChar)) {
     return 0;  // predicate pushdown is a varchar-column surface
   }
-  if (workload != nullptr && sc != nullptr) workload->RecordFilter(*sc, col);
+  if (workload != nullptr && sc != nullptr) {
+    workload->RecordFilter(*sc, col);
+  }
   return 1;  // gate passed
 }
 
@@ -967,7 +1155,9 @@ uint64_t VarcharGateAndRecord(const PaxChunk& chunk, slot_t col,
 uint64_t VarcharFilterCount(const PaxChunk& chunk, slot_t col, StrScanOp op,
                             std::string_view needle, const Schema* sc,
                             WorkloadTracker* workload) {
-  if (!VarcharGateAndRecord(chunk, col, sc, workload)) return 0;
+  if (VarcharGateAndRecord(chunk, col, sc, workload) == 0U) {
+    return 0;
+  }
   StrPredicate p;
   p.op = op;
   p.needle = std::string(needle);
@@ -978,8 +1168,12 @@ uint64_t VarcharRangeCount(const PaxChunk& chunk, slot_t col,
                            std::optional<std::string_view> lo,
                            std::optional<std::string_view> hi, const Schema* sc,
                            WorkloadTracker* workload) {
-  if (!VarcharGateAndRecord(chunk, col, sc, workload)) return 0;
-  if (lo.has_value() && hi.has_value() && *lo >= *hi) return 0;
+  if (VarcharGateAndRecord(chunk, col, sc, workload) == 0U) {
+    return 0;
+  }
+  if (lo.has_value() && hi.has_value() && *lo >= *hi) {
+    return 0;
+  }
   StrPredicate p;
   p.range = true;
   if (lo.has_value()) {
@@ -1001,7 +1195,9 @@ PaxSelectionVector VarcharSelectionWith(const PaxChunk& chunk, slot_t col,
                                         const StrPredicate& p) {
   PaxSelectionVector sv;
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (col >= f.column_count) return sv;
+  if (col >= f.column_count) {
+    return sv;
+  }
   // Hand-built-footer guard, same contract as the count path.
   if (f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -1016,8 +1212,10 @@ PaxSelectionVector VarcharSelectionWith(const PaxChunk& chunk, slot_t col,
   std::vector<uint32_t> local;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const uint16_t rc = f.row_counts[g];
-    if (rc == 0) continue;
-    const uint32_t off = g * f.column_count + col;
+    if (rc == 0) {
+      continue;
+    }
+    const uint32_t off = (g * f.column_count) + col;
     const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
     if (region == nullptr) {
       base += rc;
@@ -1028,7 +1226,7 @@ PaxSelectionVector VarcharSelectionWith(const PaxChunk& chunk, slot_t col,
       base += rc;
       continue;
     }
-    const Scheme s = static_cast<Scheme>(f.encodings[off]);
+    const auto s = static_cast<Scheme>(f.encodings[off]);
     const uint32_t prm = f.params[off];
     local.clear();
     if (!VarcharRegionMatchRows(region, s, prm, rc, reg_end, p, &local)) {
@@ -1039,7 +1237,9 @@ PaxSelectionVector VarcharSelectionWith(const PaxChunk& chunk, slot_t col,
         const Value v = VarcharRegionAt(region, s, prm, rc, i, reg_end);
         const bool hit =
             v.IsNull() ? p.Eval(std::string_view()) : p.Eval(v.AsStringView());
-        if (hit) local.push_back(i);
+        if (hit) {
+          local.push_back(i);
+        }
       }
     }
     for (uint32_t i : local) {
@@ -1058,7 +1258,9 @@ PaxSelectionVector VarcharFilterSelection(const PaxChunk& chunk, slot_t col,
                                           StrScanOp op, std::string_view needle,
                                           const Schema* sc,
                                           WorkloadTracker* workload) {
-  if (!VarcharGateAndRecord(chunk, col, sc, workload)) return {};
+  if (VarcharGateAndRecord(chunk, col, sc, workload) == 0U) {
+    return {};
+  }
   StrPredicate p;
   p.op = op;
   p.needle = std::string(needle);
@@ -1070,8 +1272,12 @@ PaxSelectionVector VarcharRangeSelection(const PaxChunk& chunk, slot_t col,
                                          std::optional<std::string_view> hi,
                                          const Schema* sc,
                                          WorkloadTracker* workload) {
-  if (!VarcharGateAndRecord(chunk, col, sc, workload)) return {};
-  if (lo.has_value() && hi.has_value() && *lo >= *hi) return {};
+  if (VarcharGateAndRecord(chunk, col, sc, workload) == 0U) {
+    return {};
+  }
+  if (lo.has_value() && hi.has_value() && *lo >= *hi) {
+    return {};
+  }
   StrPredicate p;
   p.range = true;
   if (lo.has_value()) {
@@ -1094,7 +1300,7 @@ std::vector<uint32_t> SelectionRows(const PaxSelectionVector& sv) {
     while (word != 0) {
       const uint64_t bit = word & (~word + 1);  // the lowest set bit
       rows.push_back(static_cast<uint32_t>(
-          w * 64 + static_cast<size_t>(__builtin_ctzll(bit))));
+          (w * 64) + static_cast<size_t>(__builtin_ctzll(bit))));
       word ^= bit;
     }
   }

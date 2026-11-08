@@ -133,7 +133,7 @@ StatusOr<slot_t> RowPage::InsertRowAt(slot_t slot, std::string_view new_row) {
   const size_t new_slots = slot >= slots_.size()
                                ? (static_cast<size_t>(slot) + 1 - slots_.size())
                                : 0;
-  if (UsedBytes() + new_slots * kSlotEntryBytes + new_row.size() >
+  if (UsedBytes() + (new_slots * kSlotEntryBytes) + new_row.size() >
       kBlockBudgetBytes) {
     return Status::kNoSpace;
   }
@@ -170,8 +170,7 @@ Status RowPage::Update(page_id_t page_id, Transaction& txn, slot_t slot,
   }
   RETURN_IF_FAIL(UpdateRow(pos.slot, record));
   txn.RegisterVersionWrite(pos, prev_row, record);
-  const Status append =
-      txn.UpdateLog(page_id, slot, record, prev_row).GetStatus();
+  Status append = txn.UpdateLog(page_id, slot, record, prev_row).GetStatus();
   if (append != Status::kSuccess) {
     std::ignore = UpdateRow(pos.slot, prev_row);
     (void)txn.CancelStagedVersion(pos);
@@ -227,7 +226,7 @@ Status RowPage::Delete(page_id_t page_id, Transaction& txn, slot_t slot) {
     return Status::kConflicts;
   }
   txn.RegisterVersionWrite(pos, previous, std::nullopt);
-  const Status append = txn.DeleteLog(page_id, slot, previous).GetStatus();
+  Status append = txn.DeleteLog(page_id, slot, previous).GetStatus();
   if (append != Status::kSuccess) {
     (void)txn.CancelStagedVersion(pos);
     txn.MarkFailed();

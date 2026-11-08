@@ -16,10 +16,12 @@ ops to accelerate consecutive ops inside one UPDATE.
   peek compares) — the narrow cross-layer scan interface
   (`IndexScanIterator : IteratorBase`, see `index/AGENTS.md`).
 - `full_scan_iterator` visibility goes through `Transaction::ReadVersion`,
-  with a fast path: pages with `PageLSN <= snapshot` are read physically
-  without version resolution (boundary caveat: mutations stamped before the
-  snapshot began but still uncommitted can be served physically — see
-  `PhysicalReadEligible`). Returned rows are owned copies — valid after
+  with a fast path (`PhysicalReadEligible`): read-only transactions scanning a
+  page that currently has no MVCC version chains
+  (`txn.IsReadOnly() && !txn.HasPageVersionChains(pid)`) read the physical row
+  image directly without per-slot version resolution (every INSERT/UPDATE/DELETE
+  installs a version chain entry, so any page with uncommitted or historical
+  versions takes the MVCC path). Returned rows are owned copies — valid after
   the latch is released.
 - `full_scan_iterator` also applies a **dynamic join filter**
   (`common/runtime_filter.hpp`): `TableScanOptions::runtime_filter` +

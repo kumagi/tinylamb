@@ -106,20 +106,16 @@ bool MatchTypedStringInList(std::string_view v,
       return false;
     }
     const std::string_view sub = v.substr(0, list.prefix_len);
-    for (const std::string& item : list.strings) {
-      if (sub == std::string_view(item)) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(list.strings, [&](const std::string& item) {
+      return sub == std::string_view(item);
+    });
   }
-  for (const std::string& item : list.strings) {
-    if (v == std::string_view(item)) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(list.strings, [&](const std::string& item) {
+    return v == std::string_view(item);
+  });
 }
+
+namespace {
 
 BinaryOperation FlipTypedCompare(BinaryOperation operation) {
   switch (operation) {
@@ -135,6 +131,8 @@ BinaryOperation FlipTypedCompare(BinaryOperation operation) {
       return operation;
   }
 }
+
+}  // namespace
 
 bool DecideTypedFilterCompare(const Value& left, const Value& right,
                               const TypedFilterCompare& compare) {
@@ -393,6 +391,8 @@ std::optional<TypedConditionalInput> TryCompileTypedConditionalInput(
   return std::nullopt;
 }
 
+namespace {
+
 bool TryBuildTypedDoubleExprOps(const Expression& expr,
                                 const Schema& scan_schema,
                                 std::vector<TypedDoubleExprOp>* ops,
@@ -469,6 +469,8 @@ bool TryBuildTypedDoubleExprOps(const Expression& expr,
   return false;
 }
 
+}  // namespace
+
 std::optional<TypedDoubleExprInput> TryCompileTypedDoubleExpr(
     const Expression& expr, const Schema& scan_schema) {
   TypedDoubleExprInput compiled;
@@ -521,6 +523,8 @@ std::optional<TypedDoubleExprInput> TryCompileTypedDoubleExpr(
   return compiled;
 }
 
+namespace {
+
 bool TryBuildTypedIntExprOps(const Expression& expr, const Schema& scan_schema,
                              std::vector<TypedIntExprOp>* ops) {
   if (!expr || ops->size() >= 15) {
@@ -571,6 +575,8 @@ bool TryBuildTypedIntExprOps(const Expression& expr, const Schema& scan_schema,
   }
   return false;
 }
+
+}  // namespace
 
 std::optional<TypedIntExprInput> TryCompileTypedIntExpr(
     const Expression& expr, const Schema& scan_schema) {
@@ -669,7 +675,7 @@ Value EvaluateTypedConditionalOnRow(const TypedConditionalInput& cond,
               DecideTypedFilterCompare(left, right, cond.condition);
   }
   if (!matched) {
-    return Value();
+    return {};
   }
   if (cond.then_column.has_value()) {
     return row[*cond.then_column];
@@ -688,7 +694,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return Value();
+          return {};
         }
         stack[sp++] = v.value.double_value;
         break;
@@ -696,7 +702,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadIntColAsDouble: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return Value();
+          return {};
         }
         stack[sp++] = static_cast<double>(v.value.int_value);
         break;
@@ -1263,6 +1269,8 @@ TypedAggregationPlan PlanTypedAggregation(
   return plan;
 }
 
+namespace {
+
 BinaryOperation FlipHavingCompare(BinaryOperation operation) {
   switch (operation) {
     case BinaryOperation::kLessThan:
@@ -1277,6 +1285,8 @@ BinaryOperation FlipHavingCompare(BinaryOperation operation) {
       return operation;
   }
 }
+
+}  // namespace
 
 std::optional<PositionalHaving> TryCompilePositionalHaving(
     const Expression& having,
@@ -1478,10 +1488,13 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       for (; position < statement.SelectList().size(); ++position) {
         const Expression& item = statement.SelectList()[position].expression;
         if (item && item->Type() == TypeTag::kColumnValue &&
-            item->AsColumnValue().GetColumnName() == column)
+            item->AsColumnValue().GetColumnName() == column) {
           break;
+        }
       }
-      if (position == statement.SelectList().size()) return spec;
+      if (position == statement.SelectList().size()) {
+        return spec;
+      }
       term.expression =
           ConstantValueExp(Value(static_cast<int64_t>(position + 1)));
       continue;

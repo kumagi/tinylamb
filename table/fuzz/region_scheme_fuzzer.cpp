@@ -15,11 +15,13 @@
  */
 
 // Per-region corruption fuzz for the scheme families.
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -37,16 +39,16 @@ constexpr size_t kCaseCount = kSchemeCaseCount;
 
 PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
   *ok = false;
-  static int cache[kCaseCount];
+  static std::array<int, kCaseCount> cache;
   static bool cache_init = false;
   if (!cache_init) {
-    for (size_t i = 0; i < kCaseCount; ++i) cache[i] = -1;
+    cache.fill(-1);
     cache_init = true;
   }
   const auto idx = static_cast<size_t>(&c - kCases);
   int& slot = cache[idx];
   const int first = slot >= 0 ? slot : 0;
-  for (int s = first; s < static_cast<int>(c.nshapes); ++s) {
+  for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
     setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
     PaxChunk chunk = PaxChunk::BuildFromSortedRun(
         MakeRun(MakeStorageRows(c.shapes[s]), sc), sc);
@@ -57,7 +59,9 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
       *ok = true;
       return chunk;
     }
-    if (slot < 0 && s == 0) slot = 0;
+    if (slot < 0 && s == 0) {
+      slot = 0;
+    }
   }
   slot = static_cast<int>(c.nshapes);
   return PaxChunk{};
@@ -67,14 +71,20 @@ bool CellRange(const std::vector<char>& b, const PaxChunk::Footer& f,
                size_t cell, size_t* begin, size_t* end) {
   size_t fo = 0;
   size_t fs = 0;
-  if (!WireLayout(b, &fo, &fs)) return false;
-  if (cell >= f.column_offsets.size()) return false;
+  if (!WireLayout(b, &fo, &fs)) {
+    return false;
+  }
+  if (cell >= f.column_offsets.size()) {
+    return false;
+  }
   const size_t data_end = b.size() - fs - 4;
   const size_t off = f.column_offsets[cell];
   const size_t succ = (cell + 1 < f.column_offsets.size())
                           ? f.column_offsets[cell + 1]
                           : data_end;
-  if (off > succ || succ > data_end) return false;
+  if (off > succ || succ > data_end) {
+    return false;
+  }
   *begin = off;
   *end = succ;
   return true;
@@ -83,7 +93,9 @@ bool CellRange(const std::vector<char>& b, const PaxChunk::Footer& f,
 }  // namespace
 
 int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
-  if (size < 24) return 0;
+  if (size < 24) {
+    return 0;
+  }
 
   const SchemeCase& c = kCases[data[0] % kCaseCount];
   const size_t other_col = data[1] % 5;
@@ -96,10 +108,14 @@ int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
   const Schema sc = MakeStorageSchema();
   bool built = false;
   const PaxChunk good = BuildForced(sc, c, &built);
-  if (!built) return 0;
+  if (!built) {
+    return 0;
+  }
 
   std::vector<char> bytes = good.Data();
-  if (bytes.size() < 64) return 0;
+  if (bytes.size() < 64) {
+    return 0;
+  }
 
   size_t tb = 0;
   size_t te = 0;
@@ -113,7 +129,9 @@ int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
   const size_t trailer_lo = bytes.size() - 4;
   size_t p = 4;
   for (uint8_t k = 0; k < n_sites; ++k) {
-    if (p + 4 > size - 8) break;
+    if (p + 4 > size - 8) {
+      break;
+    }
     const uint32_t roll = static_cast<uint32_t>(data[p]) |
                           (static_cast<uint32_t>(data[p + 1]) << 8) |
                           (static_cast<uint32_t>(data[p + 2]) << 16) |
@@ -121,14 +139,16 @@ int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
     p += 4;
     size_t site = 0;
     if ((roll & 3) == 3 && have_other) {
-      site = ob + (roll >> 2) % (oe - ob);
+      site = ob + ((roll >> 2) % (oe - ob));
     } else if ((roll & 0x1F) == 0x1F) {
       size_t fo = 0;
       size_t fs = 0;
-      if (!WireLayout(bytes, &fo, &fs)) break;
+      if (!WireLayout(bytes, &fo, &fs)) {
+        break;
+      }
       site = (roll >> 5) % (fo > 0 ? fo : 1);
     } else if (have_target) {
-      site = tb + (roll >> 2) % (te - tb);
+      site = tb + ((roll >> 2) % (te - tb));
     } else {
       site = (roll >> 2) % bytes.size();
     }
@@ -136,19 +156,22 @@ int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
                   static_cast<uint8_t>(1 + ((roll >> 28) & 0x7)));
   }
 
-  if (resign) ResignChunkCrc(bytes);
+  if (resign) {
+    ResignChunkCrc(bytes);
+  }
 
   const Status v1 = PaxChunk::ValidateChunkBytes(bytes);
   if (v1 != PaxChunk::ValidateChunkBytes(bytes)) {
-    std::fprintf(stderr, "nondeterministic ValidateChunkBytes verdict\n");
+    std::cerr << "nondeterministic ValidateChunkBytes verdict\n";
     std::abort();
   }
-  if (v1 != Status::kSuccess) return 0;
+  if (v1 != Status::kSuccess) {
+    return 0;
+  }
 
   auto chunk_or = PaxChunk::Deserialize(bytes);
   if (!chunk_or.HasValue()) {
-    std::fprintf(stderr,
-                 "ValidateChunkBytes accepted but Deserialize rejected\n");
+    std::cerr << "ValidateChunkBytes accepted but Deserialize rejected\n";
     std::abort();
   }
   HammerChunk(chunk_or.Value(), sc, probe);

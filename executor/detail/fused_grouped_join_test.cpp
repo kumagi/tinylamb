@@ -116,6 +116,9 @@ TEST(FusedGroupedJoinTest, ClassifyProgramAndEvaluateProgramValueShapes) {
   const Expression direct_expr = ColumnValueExp(ColumnName("c0"));
   auto direct_prog = BytecodeCompiler::Compile(direct_expr, schema);
   ASSERT_TRUE(direct_prog.has_value());
+  if (!direct_prog.has_value()) {
+    return;
+  }
   const ProgramShape direct_shape =
       ClassifyProgram(*direct_prog, direct_expr, &schema);
   EXPECT_EQ(direct_shape.direct_column, 0);
@@ -130,6 +133,9 @@ TEST(FusedGroupedJoinTest, ClassifyProgramAndEvaluateProgramValueShapes) {
       ColumnValueExp(ColumnName("c1")));
   auto mul_prog = BytecodeCompiler::Compile(mul_expr, schema);
   ASSERT_TRUE(mul_prog.has_value());
+  if (!mul_prog.has_value()) {
+    return;
+  }
   const ProgramShape mul_shape = ClassifyProgram(*mul_prog, mul_expr, &schema);
   EXPECT_EQ(mul_shape.mul_col0, 0);
   EXPECT_EQ(mul_shape.mul_col1, 1);
@@ -145,6 +151,9 @@ TEST(FusedGroupedJoinTest, ClassifyProgramAndEvaluateProgramValueShapes) {
       ColumnValueExp(ColumnName("c0")), BinaryOperation::kMultiply, one_minus);
   auto disc_prog = BytecodeCompiler::Compile(disc_expr, schema);
   ASSERT_TRUE(disc_prog.has_value());
+  if (!disc_prog.has_value()) {
+    return;
+  }
   const ProgramShape disc_shape =
       ClassifyProgram(*disc_prog, disc_expr, &schema);
   EXPECT_EQ(disc_shape.mul_one_minus_col0, 0);
@@ -161,6 +170,9 @@ TEST(FusedGroupedJoinTest, ClassifyProgramAndEvaluateProgramValueShapes) {
       BinaryExpressionExp(disc_expr, BinaryOperation::kSubtract, cost_expr);
   auto profit_prog = BytecodeCompiler::Compile(profit_expr, schema);
   ASSERT_TRUE(profit_prog.has_value());
+  if (!profit_prog.has_value()) {
+    return;
+  }
   const ProgramShape profit_shape =
       ClassifyProgram(*profit_prog, profit_expr, &schema);
   EXPECT_EQ(profit_shape.profit_col0, 0);

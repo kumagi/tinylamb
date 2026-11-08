@@ -807,7 +807,9 @@ std::vector<PlanAlternative> ScanAlternatives(
     if (!required.sort_ascending.empty()) {
       return !required.sort_ascending.front();
     }
-    if (context.query == nullptr) return false;
+    if (context.query == nullptr) {
+      return false;
+    }
     const std::vector<bool>& ascending = context.query->order_ascending_;
     if (ascending.empty() || ascending.size() < required.ordering.size()) {
       return false;
@@ -1533,7 +1535,7 @@ std::vector<PlanAlternative> ScanAlternatives(
             RowEstimate(index_access + covering_rows));
         covering =
             RemoveIdentityProjection(std::move(covering), fallback_select);
-        covering = finalize(std::move(covering));
+        covering = finalize(covering);
         // The same shape as the bitmap AND price, discounted like every
         // covering (index-only) read: the intersection costs one index walk
         // per participant but saves every heap fetch the recheck would need.
@@ -3996,8 +3998,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               required.access_method == c::AccessMethod::kAny &&
               std::ranges::all_of(payload.aggregates, [](const auto& item) {
                 if (!item.expression ||
-                    item.expression->Type() != TypeTag::kAggregateExp)
+                    item.expression->Type() != TypeTag::kAggregateExp) {
                   return false;
+                }
                 const auto& aggregate =
                     item.expression->AsAggregateExpression();
                 return aggregate.GetType() == AggregationType::kCount &&
@@ -4021,8 +4024,9 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                                projection->GetSource()->GetSchema().Offset(
                                    item.expression->AsColumnValue()
                                        .GetColumnName()) >= 0;
-                      }))
+                      })) {
                 scan_input = projection->GetSource();
+              }
             }
             if (const auto* covering =
                     dynamic_cast<const IndexOnlyScanPlan*>(scan_input.get());
@@ -4034,19 +4038,24 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                     .GetValue()
                     .Truthy()) {
               for (const auto& [relation, table] : context.tables) {
-                if (table.get() != covering->ScanSource()) continue;
+                if (table.get() != covering->ScanSource()) {
+                  continue;
+                }
                 const auto found = context.statistics.find(relation);
                 if (found == context.statistics.end() || !found->second ||
                     table->GetSchema().ColumnCount() == 0 ||
-                    found->second->Columns() < table->GetSchema().ColumnCount())
+                    found->second->Columns() <
+                        table->GetSchema().ColumnCount()) {
                   break;
+                }
                 slot_t cheapest = 0;
-                for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i)
+                for (size_t i = 0; i < table->GetSchema().ColumnCount(); ++i) {
                   if (table->GetSchema().GetColumn(i).Type() ==
                       ValueType::kInt64) {
                     cheapest = static_cast<slot_t>(i);
                     break;
                   }
+                }
                 FullScanPlan heap(*table, *found->second);
                 aggregate_input = std::make_shared<FullScanPlan>(
                     heap, std::vector<slot_t>{cheapest});
@@ -4233,15 +4242,20 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                   logical.sort_ascending.begin(),
                   logical.sort_ascending.begin() + count);
               std::vector<std::optional<bool>> nulls;
-              for (size_t i = 0; i < count; ++i)
+              nulls.reserve(count);
+              for (size_t i = 0; i < count; ++i) {
                 nulls.push_back(keys[i].nulls_first);
+              }
               if (!children[0].plan->IsOrderedBy(prefix_expressions, directions,
-                                                 nulls))
+                                                 nulls)) {
                 continue;
+              }
               std::vector<SortKey> prefix, suffix;
               for (size_t i = 0; i < keys.size(); ++i) {
-                SortKey key{keys[i].expression, keys[i].ascending,
-                            keys[i].nulls_first, keys[i].collation};
+                SortKey key{.expression = keys[i].expression,
+                            .ascending = keys[i].ascending,
+                            .nulls_first = keys[i].nulls_first,
+                            .collation = keys[i].collation};
                 (i < count ? prefix : suffix).push_back(std::move(key));
               }
               const double rows = children[0].estimated_rows;

@@ -191,7 +191,7 @@ RecoveryManager::ReadAtResult RecoveryManager::ReadAtDetailed(
     }
     const auto offset =
         static_cast<size_t>(absolute % static_cast<lsn_t>(segment_size_));
-    const size_t want = std::min<size_t>(
+    const auto want = std::min<size_t>(
         {len - done, segment_size_ - offset,
          static_cast<size_t>(std::min<lsn_t>(
              logical_end - absolute, std::numeric_limits<size_t>::max()))});
@@ -495,11 +495,12 @@ Status RecoveryManager::RecoverFrom(lsn_t checkpoint_lsn,
   }
   const lsn_t filesize = std::min(on_disk, valid_end);
 
-  // Pass 1: discover all committed transactions and maximum transaction ID.
+  // Pass 1: discover all committed transactions and maximum transaction ID
+  // from scan_start (compacted prefix below scan_start is already persisted).
   std::unordered_set<txn_id_t> committed_txns;
-  txn_id_t max_seen_txn = 0;
+  txn_id_t max_seen_txn = pm_ != nullptr ? pm_->MaxCommittedTxnId() : 0;
   {
-    lsn_t offset = log_start;
+    lsn_t offset = scan_start;
     LogRecord log;
     while (offset < filesize) {
       const LogReadResult read = ReadLogDetailed(offset, &log);

@@ -204,6 +204,8 @@ class Table {
   [[nodiscard]] Status CheckRowConstraints(const Row& row) const;
   Status LinkReservedTableTail(Transaction& txn, PageRef& predecessor,
                                PageRef& successor) const;
+  [[nodiscard]] StatusOr<Row> ReadLatest(Transaction& txn,
+                                         RowPosition pos) const;
   Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos,
                      page_id_t* hint_leaf = nullptr) const;
@@ -211,7 +213,8 @@ class Table {
   // (table.cpp). Callers must hold the index write gate for idx.Root().
   Status IndexInsertGuarded(Transaction& txn, const Index& idx,
                             const Row& new_row, const RowPosition& pos,
-                            page_id_t* hint_leaf) const;
+                            page_id_t* hint_leaf,
+                            RowPosition* wait_pos = nullptr) const;
   Status IndexDelete(Transaction& txn, const Index& idx,
                      const RowPosition& pos) const;
   static Status IndexDelete(Transaction& txn, const Index& idx,

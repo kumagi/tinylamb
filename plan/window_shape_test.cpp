@@ -65,7 +65,7 @@ std::shared_ptr<WindowFunctionCallExpression> RowNumber(
 
 NamedExpression Output(const std::string& name,
                        std::shared_ptr<WindowFunctionCallExpression> window) {
-  return NamedExpression(name, Expression(std::move(window)));
+  return {name, Expression(std::move(window))};
 }
 
 Plan OrderedLeaf() {

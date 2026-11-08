@@ -24,7 +24,7 @@
 namespace tinylamb::platform {
 namespace {
 
-#if !defined(__linux__)
+#ifndef __linux__
 // Applies `flags` to an already-created descriptor. On failure closes `fd`
 // (preserving errno) and returns -1.
 int ApplyFlags(int fd, FdFlags flags) {
@@ -51,7 +51,7 @@ int ApplyFlags(int fd, FdFlags flags) {
 #endif
 
 void DisableSigPipe(int fd) {
-#if defined(SO_NOSIGPIPE)
+#ifdef SO_NOSIGPIPE
   const int enabled = 1;
   (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 #else
@@ -62,23 +62,33 @@ void DisableSigPipe(int fd) {
 }  // namespace
 
 int OpenSocket(int domain, int type, int protocol, FdFlags flags) {
-#if defined(__linux__)
-  if (flags.nonblocking) type |= SOCK_NONBLOCK;
-  if (flags.close_on_exec) type |= SOCK_CLOEXEC;
+#ifdef __linux__
+  if (flags.nonblocking) {
+    type |= SOCK_NONBLOCK;
+  }
+  if (flags.close_on_exec) {
+    type |= SOCK_CLOEXEC;
+  }
   const int fd = ::socket(domain, type, protocol);
 #else
   const int created = ::socket(domain, type, protocol);
   const int fd = created < 0 ? -1 : ApplyFlags(created, flags);
 #endif
-  if (fd >= 0) DisableSigPipe(fd);
+  if (fd >= 0) {
+    DisableSigPipe(fd);
+  }
   return fd;
 }
 
 int AcceptSocket(int listener, FdFlags flags) {
-#if defined(__linux__)
+#ifdef __linux__
   int accept_flags = 0;
-  if (flags.nonblocking) accept_flags |= SOCK_NONBLOCK;
-  if (flags.close_on_exec) accept_flags |= SOCK_CLOEXEC;
+  if (flags.nonblocking) {
+    accept_flags |= SOCK_NONBLOCK;
+  }
+  if (flags.close_on_exec) {
+    accept_flags |= SOCK_CLOEXEC;
+  }
   const int fd = ::accept4(listener, nullptr, nullptr, accept_flags);
 #else
   // BSD accept(2) inherits O_NONBLOCK from the listener; normalize to the
@@ -90,15 +100,21 @@ int AcceptSocket(int listener, FdFlags flags) {
     if (status >= 0) (void)::fcntl(fd, F_SETFL, status & ~O_NONBLOCK);
   }
 #endif
-  if (fd >= 0) DisableSigPipe(fd);
+  if (fd >= 0) {
+    DisableSigPipe(fd);
+  }
   return fd;
 }
 
 int OpenPipe(std::array<int, 2>& fds, FdFlags flags) {
-#if defined(__linux__)
+#ifdef __linux__
   int pipe_flags = 0;
-  if (flags.nonblocking) pipe_flags |= O_NONBLOCK;
-  if (flags.close_on_exec) pipe_flags |= O_CLOEXEC;
+  if (flags.nonblocking) {
+    pipe_flags |= O_NONBLOCK;
+  }
+  if (flags.close_on_exec) {
+    pipe_flags |= O_CLOEXEC;
+  }
   return ::pipe2(fds.data(), pipe_flags);
 #else
   if (::pipe(fds.data()) != 0) return -1;
@@ -128,8 +144,10 @@ ssize_t SendMsgNoSignal(int fd, const msghdr* message, int extra_flags) {
 
 int InitSpawnAttributes(posix_spawnattr_t* attributes) {
   const int rc = ::posix_spawnattr_init(attributes);
-  if (rc != 0) return rc;
-#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+  if (rc != 0) {
+    return rc;
+  }
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
   const int set = ::posix_spawnattr_setflags(
       attributes, static_cast<short>(POSIX_SPAWN_CLOEXEC_DEFAULT));
   if (set != 0) {

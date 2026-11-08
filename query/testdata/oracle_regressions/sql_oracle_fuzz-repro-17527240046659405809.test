@@ -1,0 +1,73 @@
+-- tinylamb-oracle-test v1
+-- seed: 17527240046659405809
+-- table: t122351790
+-- predicate: (s IS NOT NULL)
+-- setup: CREATE TABLE t122351790 (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));
+-- setup: INSERT INTO t122351790 VALUES (0, -3, 1, NULL, 'a');
+-- setup: INSERT INTO t122351790 VALUES (1, 0, -1, TRUE, 'a');
+-- setup: INSERT INTO t122351790 VALUES (2, 0, NULL, TRUE, NULL);
+-- setup: INSERT INTO t122351790 VALUES (3, NULL, 0, NULL, 'a');
+-- setup: INSERT INTO t122351790 VALUES (4, 2, -2, NULL, 'a');
+-- setup: INSERT INTO t122351790 VALUES (5, NULL, -2, FALSE, '');
+-- setup: INSERT INTO t122351790 VALUES (6, -1, -2, FALSE, 'a');
+-- setup: INSERT INTO t122351790 VALUES (7, 1, 1, FALSE, '');
+-- tlp: SELECT CASE WHEN flag THEN a ELSE b END FROM t122351790 WHERE (s IS NOT NULL);
+-- tlp: SELECT CASE WHEN flag THEN a ELSE b END FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL));
+-- tlp: SELECT CASE WHEN flag THEN a ELSE b END FROM t122351790 WHERE ((s IS NOT NULL)) AND NOT ((s IS NULL));
+-- tlp: SELECT CASE WHEN flag THEN a ELSE b END FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL)) IS NULL;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t122351790 WHERE (s IS NOT NULL) GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL)) GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t122351790 WHERE ((s IS NOT NULL)) AND NOT ((s IS NULL)) GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL)) IS NULL GROUP BY a;
+-- unionall: SELECT flag, s FROM t122351790 WHERE (s IS NOT NULL);
+-- unionall: SELECT flag, s FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL)) UNION ALL SELECT flag, s FROM t122351790 WHERE ((s IS NOT NULL)) AND NOT ((s IS NULL)) UNION ALL SELECT flag, s FROM t122351790 WHERE ((s IS NOT NULL)) AND ((s IS NULL)) IS NULL;
+-- orpartition: SELECT a FROM t122351790 WHERE ((s IS NOT NULL)) OR ((s IS NULL));
+-- orpartition: SELECT a FROM t122351790 WHERE ((s IS NOT NULL)) IS TRUE UNION ALL SELECT a FROM t122351790 WHERE ((s IS NULL)) IS TRUE AND ((s IS NOT NULL)) IS NOT TRUE;
+-- cqp: SELECT CASE WHEN (s IS NOT NULL) THEN b ELSE u END AS v FROM t122351790;
+-- cqp: SELECT b AS v FROM t122351790 WHERE ((s IS NOT NULL)) IS TRUE UNION ALL SELECT u AS v FROM t122351790 WHERE ((s IS NOT NULL)) IS NOT TRUE;
+-- norec: SELECT COUNT(*) FROM t122351790 WHERE (s IS NOT NULL);
+-- norec: SELECT SUM(CASE WHEN (s IS NOT NULL) THEN 1 ELSE 0 END) FROM t122351790;
+-- pqs: SELECT COUNT(*) FROM t122351790 WHERE (s IS NOT NULL);
+-- pqsu: SELECT u FROM t122351790 WHERE (s IS NOT NULL);
+-- pqsexpected: 7
+-- pqspivot: 4
+-- idxddl: CREATE INDEX idx_fuzz0 ON t122351790(flag);
+-- idxddl: CREATE INDEX idx_fuzz1 ON t122351790(flag,s);
+-- idxddl: CREATE INDEX idx_fuzz2 ON t122351790(b);
+-- idxddl: CREATE INDEX idx_fuzz3 ON t122351790(flag);
+-- idxprobe: SELECT COUNT(*) FROM t122351790 WHERE (s IS NOT NULL);
+-- skip: SELECT COUNT(DISTINCT a) FROM t122351790;
+-- skip: SELECT DISTINCT a FROM t122351790 ORDER BY a;
+-- skip: SELECT COUNT(DISTINCT a) FROM t122351790 WHERE (s IS NOT NULL);
+-- win: 12|2|1|0|-1|0|-4611686018427387904|SELECT u, MIN(b) OVER (ORDER BY u ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM t122351790 ORDER BY u;
+-- win: 60|0|2|0|-1|0|-4611686018427387904|SELECT u, COUNTIF(b > 2) OVER () FROM t122351790 ORDER BY u;
+-- topties: SELECT u, a FROM t122351790 ORDER BY a LIMIT 3 WITH TIES;
+-- toptieslimit: 3
+-- dqe: SELECT COUNT(*) FROM t122351790 WHERE (s IS NOT NULL);
+-- dqe: SELECT COUNT(*) FROM t122351790;
+-- dqe: DELETE FROM t122351790 WHERE (s IS NOT NULL);
+-- troc: DELETE FROM t122351790 WHERE ((s NOT LIKE '%z%') OR (a < 0));
+-- troc: UPDATE t122351790 SET a = 0 WHERE ((s LIKE '_') AND (s LIKE 'a%'));
+-- troc: UPDATE t122351790 SET a = (a + -2) WHERE (s IS NOT NULL);
+-- trocprobe: SELECT COUNT(*), SUM(a), SUM(b) FROM t122351790;
+-- orderby: SELECT u, a FROM t122351790 WHERE (s IS NOT NULL) ORDER BY a DESC, u LIMIT 6;
+-- orderbyexpect: [4, 2]
+-- orderbyexpect: [7, 1]
+-- orderbyexpect: [1, 0]
+-- orderbyexpect: [6, -1]
+-- orderbyexpect: [0, -3]
+-- orderbyexpect: [3, NULL]
+-- ordinalorder: SELECT * FROM (SELECT u, a FROM t122351790 WHERE (s IS NOT NULL) UNION ALL SELECT u, a FROM t122351790 WHERE (s IS NOT NULL)) q ORDER BY 2 NULLS LAST, u LIMIT 4;
+-- ordinalorderexpect: [0, -3]
+-- ordinalorderexpect: [0, -3]
+-- ordinalorderexpect: [6, -1]
+-- ordinalorderexpect: [6, -1]
+-- having: SELECT a, COUNT(*), SUM(b) FROM t122351790 GROUP BY a HAVING COUNT(*) = 0 AND COUNT(b) IS NOT NULL;
+-- unnest: SELECT x, p FROM UNNEST([0, -2, -3]) x WITH OFFSET p;
+-- unnestexpect: [0, 0]
+-- unnestexpect: [-2, 1]
+-- unnestexpect: [-3, 2]
+-- unnestordered: 1
+-- xmode: SELECT d1.a, d1.c1, d1.s1, d2.c2, d2.m2 FROM (SELECT a, COUNT(*) AS c1, SUM(b) AS s1 FROM t122351790 WHERE ((s IS NOT NULL)) GROUP BY a) d1 JOIN (SELECT a, COUNT(b) AS c2, MAX(u) AS m2 FROM t122351790 WHERE b IS NOT NULL OR flag IS TRUE GROUP BY a) d2 ON d1.a = d2.a;
+-- xmode: SELECT u, a, b FROM t122351790 WHERE a BETWEEN 0 AND 2 AND b BETWEEN -3 AND 3;
+-- failure: auto-generated by sql_oracle_fuzzer | predicate: (s IS NOT NULL) | [XMODE-OPT MISMATCH] | query: SELECT d1.a, d1.c1, d1.s1, d2.c2, d2.m2 FROM (SELECT a, COUNT(*) AS c1, SUM(b) AS s1 FROM t122351790 WHERE ((s IS NOT NULL)) GROUP BY a) d1 JOIN (SELECT a, COUNT(b) AS c2, MAX(u) AS m2 FROM t122351790 WHERE b IS NOT NULL OR flag IS TRUE GROUP BY a) d2 ON d1.a = d2.a; | expected (5): | [-1, 1, -2, 1, 6] | [-3, 1, 1, 1, 0] | [0, 1, -1, 1, 2] | [1, 1, 1, 1, 7] | [2, 1, -2, 1, 4] | actual (6): | [-1, 1, -2, 1, 6] | [-3, 1, 1, 1, 0] | [0, 1, -1, 1, 2] | [1, 1, 1, 1, 7] | [2, 1, -2, 1, 4] | [NULL, 2, -2,...

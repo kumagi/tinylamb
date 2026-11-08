@@ -27,38 +27,38 @@ namespace tinylamb::platform {
 namespace {
 
 int64_t FloorDiv(int64_t a, int64_t b) {
-  return a / b - ((a % b != 0) && ((a < 0) != (b < 0)) ? 1 : 0);
+  return (a / b) - ((a % b != 0) && ((a < 0) != (b < 0)) ? 1 : 0);
 }
 
 // Howard Hinnant's days_from_civil / civil_from_days.
 int64_t DaysFromCivil(int64_t y, int64_t m, int64_t d) {
   y -= m <= 2 ? 1 : 0;
   const int64_t era = FloorDiv(y, 400);
-  const int64_t yoe = y - era * 400;
-  const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + doe - 719468;
+  const int64_t yoe = y - (era * 400);
+  const int64_t doy = ((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+  const int64_t doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy;
+  return (era * 146097) + doe - 719468;
 }
 
 void CivilFromDays(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
   z += 719468;
   const int64_t era = FloorDiv(z, 146097);
-  const int64_t doe = z - era * 146097;
+  const int64_t doe = z - (era * 146097);
   const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
   const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
   const int64_t mp = (5 * doy + 2) / 153;
-  *d = doy - (153 * mp + 2) / 5 + 1;
+  *d = doy - ((153 * mp + 2) / 5) + 1;
   *m = mp < 10 ? mp + 3 : mp - 9;
-  *y = yoe + era * 400 + (*m <= 2 ? 1 : 0);
+  *y = yoe + (era * 400) + (*m <= 2 ? 1 : 0);
 }
 
-char kGmtZoneName[] = "GMT";
+std::array<char, 4> kGmtZoneName = {'G', 'M', 'T', '\0'};
 
 }  // namespace
 
 void GmTime(int64_t seconds, struct tm* out) {
   const int64_t days = FloorDiv(seconds, 86400);
-  const int64_t rem = seconds - days * 86400;
+  const int64_t rem = seconds - (days * 86400);
   int64_t y = 0;
   int64_t m = 0;
   int64_t d = 0;
@@ -74,21 +74,21 @@ void GmTime(int64_t seconds, struct tm* out) {
   out->tm_yday = static_cast<int>(days - DaysFromCivil(y, 1, 1));
   out->tm_isdst = 0;
   out->tm_gmtoff = 0;
-  out->tm_zone = kGmtZoneName;
+  out->tm_zone = kGmtZoneName.data();
 }
 
 int64_t TimeGm(struct tm* tm) {
   const int64_t month_index = tm->tm_mon;
   const int64_t year = int64_t{tm->tm_year} + 1900 + FloorDiv(month_index, 12);
-  const int64_t month = month_index - FloorDiv(month_index, 12) * 12 + 1;
+  const int64_t month = month_index - (FloorDiv(month_index, 12) * 12) + 1;
   const int64_t days = DaysFromCivil(year, month, 1) + tm->tm_mday - 1;
-  const int64_t seconds = days * 86400 + int64_t{tm->tm_hour} * 3600 +
-                          int64_t{tm->tm_min} * 60 + tm->tm_sec;
+  const int64_t seconds = (days * 86400) + (int64_t{tm->tm_hour} * 3600) +
+                          (int64_t{tm->tm_min} * 60) + tm->tm_sec;
   GmTime(seconds, tm);
   return seconds;
 }
 
-#if defined(__GLIBC__)
+#ifdef __GLIBC__
 
 const char* ParseTime(const char* input, const char* format, struct tm* tm) {
   return ::strptime(input, format, tm);
@@ -96,7 +96,14 @@ const char* ParseTime(const char* input, const char* format, struct tm* tm) {
 
 size_t FormatTime(char* out, size_t size, const char* format,
                   const struct tm* tm) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
   return std::strftime(out, size, format, tm);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 #else
@@ -222,7 +229,14 @@ size_t FormatTime(char* out, size_t size, const char* format,
     if (size > 0) out[0] = '\0';
     return 0;
   }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
   return std::strftime(out, size, expanded.c_str(), tm);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 #endif

@@ -16,11 +16,13 @@
 
 // Footer-SECTION fuzzing: aim mutations at the named optional footer sections
 // instead of at "the footer".
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -52,8 +54,12 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
                  SectionMap* out) {
   size_t footer_off = 0;
   size_t footer_size = 0;
-  if (!WireLayout(b, &footer_off, &footer_size)) return false;
-  if (footer_size < 16) return false;
+  if (!WireLayout(b, &footer_off, &footer_size)) {
+    return false;
+  }
+  if (footer_size < 16) {
+    return false;
+  }
   const size_t rg = f.row_group_count;
   const size_t cc = f.column_count;
   const size_t ncell = rg * cc;
@@ -74,85 +80,119 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
   size_t p = footer_off;
   auto need = [&](size_t n) { return n <= foot_end - p; };
   p += 30;
-  if (!need(rg * 2)) return false;
+  if (!need(rg * 2)) {
+    return false;
+  }
   out->sections.push_back({"row_counts", p, rg * 2});
   p += rg * 2;
-  if (!need(ncell * 4)) return false;
+  if (!need(ncell * 4)) {
+    return false;
+  }
   out->sections.push_back({"column_offsets", p, ncell * 4});
   p += ncell * 4;
   if (f.zone_map_present) {
-    if (!need(rg * 16)) return false;
+    if (!need(rg * 16)) {
+      return false;
+    }
     out->sections.push_back({"zone_maps", p, rg * 16});
     p += rg * 16;
   }
-  if (!need(ncell)) return false;
+  if (!need(ncell)) {
+    return false;
+  }
   out->sections.push_back({"encodings", p, ncell});
   p += ncell;
-  if (!need(ncell * 4)) return false;
+  if (!need(ncell * 4)) {
+    return false;
+  }
   out->sections.push_back({"params", p, ncell * 4});
   p += ncell * 4;
 
   auto section = [&](const char* name, bool present, size_t len,
                      size_t* flag_at) -> bool {
-    if (!need(1)) return false;
+    if (!need(1)) {
+      return false;
+    }
     *flag_at = p;
     p += 1;
     out->sections.push_back({name, *flag_at, 1});
     if (present) {
-      if (!need(len)) return false;
+      if (!need(len)) {
+        return false;
+      }
       out->sections.push_back({name, p, len});
       p += len;
     }
     return true;
   };
   size_t unused_flag = 0;
-  if (!section("col_stats", f.col_stats_present, cc * 17, &unused_flag))
+  if (!section("col_stats", f.col_stats_present, cc * 17, &unused_flag)) {
     return false;
+  }
   if (!section("all_zone_maps", f.all_zm_present,
-               f.all_zone_mins.size() * 8 + f.all_zone_maxs.size() * 8,
-               &unused_flag))
+               (f.all_zone_mins.size() * 8) + (f.all_zone_maxs.size() * 8),
+               &unused_flag)) {
     return false;
-  if (!section("bloom", f.bloom_present, f.rg_blooms.size() * 8, &unused_flag))
+  }
+  if (!section("bloom", f.bloom_present, f.rg_blooms.size() * 8,
+               &unused_flag)) {
     return false;
+  }
   if (!section("rg_sums", f.rg_sums_present, f.rg_sums.size() * 8,
-               &unused_flag))
+               &unused_flag)) {
     return false;
-  if (!section("hll", f.hll_present, f.hll_sketches.size(), &unused_flag))
+  }
+  if (!section("hll", f.hll_present, f.hll_sketches.size(), &unused_flag)) {
     return false;
+  }
 
-  if (!need(1)) return false;
+  if (!need(1)) {
+    return false;
+  }
   hash_flag_at = p;
   p += 1;
   out->sections.push_back({"hash_idx_flag", hash_flag_at, 1});
   if (f.hash_idx_present) {
-    if (!need(1)) return false;
+    if (!need(1)) {
+      return false;
+    }
     const size_t log2_at = p;
     const auto log2 = static_cast<size_t>(static_cast<uint8_t>(b[p]));
     p += 1;
     out->sections.push_back({"hash_idx_log2", log2_at, 1});
-    if (log2 >= 32) return false;
+    if (log2 >= 32) {
+      return false;
+    }
     const size_t sz = static_cast<size_t>(1) << log2;
-    if (!need(sz * 12)) return false;
+    if (!need(sz * 12)) {
+      return false;
+    }
     out->sections.push_back({"hash_idx_body", p, sz * 12});
     p += sz * 12;
   }
 
   if (!section("null_bitmaps", f.null_present, f.null_bitmaps.size(),
-               &null_flag_at))
+               &null_flag_at)) {
     return false;
+  }
   constexpr size_t kHistBins = 16;
-  constexpr size_t kExtStatsPerColumn = size_t{5} * 8 + kHistBins * 8;
+  constexpr size_t kExtStatsPerColumn = (size_t{5} * 8) + (kHistBins * 8);
   if (!section("ext_stats", f.ext_stats_present, cc * kExtStatsPerColumn,
-               &ext_flag_at))
+               &ext_flag_at)) {
     return false;
+  }
   const size_t pos_after_ext = p;
 
   const size_t crc_bytes = f.format_version >= 2 ? 8 : 0;
-  if (foot_end < pos_after_ext + crc_bytes) return false;
+  if (foot_end < pos_after_ext + crc_bytes) {
+    return false;
+  }
   size_t tail = foot_end - crc_bytes;
   if (f.pgm_present) {
-    const size_t body = 8 + f.pgm_segments.size() * 24;
-    if (tail < body + 1) return false;
+    const size_t body = 8 + (f.pgm_segments.size() * 24);
+    if (tail < body + 1) {
+      return false;
+    }
     const size_t body_at = tail - body;
     pgm_flag_at = body_at - 1;
     out->sections.push_back({"pgm_flag", pgm_flag_at, 1});
@@ -165,8 +205,12 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
   }
   if (f.xor_present) {
     size_t body = 4;
-    for (const auto& c : f.xor_cells) body += 16 + c.table.size();
-    if (tail < body + 1) return false;
+    for (const auto& c : f.xor_cells) {
+      body += 16 + c.table.size();
+    }
+    if (tail < body + 1) {
+      return false;
+    }
     const size_t body_at = tail - body;
     xor_flag_at = body_at - 1;
     out->sections.push_back({"xor8_flag", xor_flag_at, 1});
@@ -178,7 +222,9 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
     tail = body_at - 1;
   }
   if (f.inv_idx_present) {
-    if (tail <= pos_after_ext + 5) return false;
+    if (tail <= pos_after_ext + 5) {
+      return false;
+    }
     inv_flag_at = pos_after_ext;
     inv_count_at = pos_after_ext + 1;
     out->sections.push_back({"inv_idx_flag", inv_flag_at, 1});
@@ -193,30 +239,47 @@ bool MapSections(const PaxChunk::Footer& f, const std::vector<char>& b,
   auto count_is = [&](size_t at, uint64_t want) {
     return at != 0 && at + 4 <= b.size() && LoadBE32(b, at) == want;
   };
-  if (f.null_present && !flag_is_set(null_flag_at)) return false;
-  if (f.ext_stats_present && !flag_is_set(ext_flag_at)) return false;
-  if (f.hash_idx_present && !flag_is_set(hash_flag_at)) return false;
-  if (f.pgm_present && !flag_is_set(pgm_flag_at)) return false;
-  if (f.xor_present && !flag_is_set(xor_flag_at)) return false;
-  if (f.inv_idx_present && !flag_is_set(inv_flag_at)) return false;
-  if (f.inv_idx_present && !count_is(inv_count_at, f.inv_index.size()))
+  if (f.null_present && !flag_is_set(null_flag_at)) {
     return false;
-  if (f.xor_present && !count_is(xor_count_at, f.xor_cells.size()))
+  }
+  if (f.ext_stats_present && !flag_is_set(ext_flag_at)) {
     return false;
-  if (f.pgm_present && !count_is(pgm_count_at, f.pgm_segments.size()))
+  }
+  if (f.hash_idx_present && !flag_is_set(hash_flag_at)) {
     return false;
+  }
+  if (f.pgm_present && !flag_is_set(pgm_flag_at)) {
+    return false;
+  }
+  if (f.xor_present && !flag_is_set(xor_flag_at)) {
+    return false;
+  }
+  if (f.inv_idx_present && !flag_is_set(inv_flag_at)) {
+    return false;
+  }
+  if (f.inv_idx_present && !count_is(inv_count_at, f.inv_index.size())) {
+    return false;
+  }
+  if (f.xor_present && !count_is(xor_count_at, f.xor_cells.size())) {
+    return false;
+  }
+  if (f.pgm_present && !count_is(pgm_count_at, f.pgm_segments.size())) {
+    return false;
+  }
 
   out->mapped = true;
   return true;
 }
 
-constexpr uint8_t kValues[] = {0x00, 0x01, 0x7F, 0x80, 0xFF};
+constexpr std::array<uint8_t, 5> kValues = {0x00, 0x01, 0x7F, 0x80, 0xFF};
 
 PaxChunk BuildCompactChunk(uint8_t shape) {
-  static PaxChunk cache[16];
-  static bool built[16] = {};
+  static std::array<PaxChunk, 16> cache;
+  static std::array<bool, 16> built = {};
   const uint8_t idx = shape & 15;
-  if (built[idx]) return cache[idx];
+  if (built[idx]) {
+    return cache[idx];
+  }
 
   constexpr int64_t kRows = 200;
   const bool ramp = (idx & 1) != 0;
@@ -229,9 +292,9 @@ PaxChunk BuildCompactChunk(uint8_t shape) {
   for (int64_t i = 0; i < kRows; ++i) {
     rows.push_back(Row{
         Value(i),
-        Value(ramp ? i * 2 : i * 3 + 1),
+        Value(ramp ? i * 2 : (i * 3) + 1),
         Value("name-" + std::to_string(i % 61)),
-        Value(12.5 + static_cast<double>(i % 97) * 0.5),
+        Value(12.5 + (static_cast<double>(i % 97) * 0.5)),
         Value(two_valued ? static_cast<int64_t>(i & 1)
                          : static_cast<int64_t>(i % 5)),
     });
@@ -258,14 +321,14 @@ void CheckCurrent(std::vector<char>& work, char orig, const Schema& sc,
   if (!accepted) {
     auto parsed = PaxChunk::Deserialize(work);
     if (parsed.HasValue()) {
-      std::fprintf(stderr, "walk rejected but parser accepted: %s\n", what);
+      std::cerr << "walk rejected but parser accepted: " << what << "\n";
       std::abort();
     }
     return;
   }
   auto parsed = PaxChunk::Deserialize(work);
   if (!parsed.HasValue()) {
-    std::fprintf(stderr, "walk accepted but parser rejected: %s\n", what);
+    std::cerr << "walk accepted but parser rejected: " << what << "\n";
     std::abort();
   }
   const PaxChunk& chunk = parsed.Value();
@@ -275,14 +338,14 @@ void CheckCurrent(std::vector<char>& work, char orig, const Schema& sc,
     rows += f.row_counts[i];
   }
   if (rows != chunk.TotalRowCount()) {
-    std::fprintf(stderr, "row count disagrees with row_counts[] (%s)\n", what);
+    std::cerr << "row count disagrees with row_counts[] (" << what << ")\n";
     std::abort();
   }
   size_t idx = 0;
   const Status pl = chunk.PointLookup(key_probe, sc, &idx);
   if (pl == Status::kSuccess && idx >= chunk.TotalRowCount()) {
-    std::fprintf(stderr, "PointLookup returned row %zu of %zu (%s)\n", idx,
-                 chunk.TotalRowCount(), what);
+    std::cerr << "PointLookup returned row " << idx << " of "
+              << chunk.TotalRowCount() << " (" << what << ")\n";
     std::abort();
   }
   HammerChunk(chunk, sc, key_probe);
@@ -292,7 +355,9 @@ void CheckCurrent(std::vector<char>& work, char orig, const Schema& sc,
 void SweepSection(std::vector<char>& work, size_t off, size_t len,
                   size_t stride, size_t start, const Schema& sc,
                   int64_t key_probe, int full_budget, const char* name) {
-  if (len == 0) return;
+  if (len == 0) {
+    return;
+  }
   constexpr size_t kMaxSweepSites = 64;
   if (len > kMaxSweepSites * stride) {
     stride = (len + kMaxSweepSites - 1) / kMaxSweepSites;
@@ -303,18 +368,21 @@ void SweepSection(std::vector<char>& work, size_t off, size_t len,
       const char orig = work[at];
       work[at] = static_cast<char>(v);
       ResignChunkCrc(work);
-      char what[160];
-      std::snprintf(what, sizeof(what), "%s[%zu]=%02x", name, i, v);
+      std::array<char, 160> what{};
+      if (std::snprintf(what.data(), what.size(), "%s[%zu]=%02x", name, i, v) <
+          0) {
+        std::abort();
+      }
       if (full_budget > 0) {
         --full_budget;
-        CheckCurrent(work, orig, sc, key_probe, what);
+        CheckCurrent(work, orig, sc, key_probe, what.data());
       } else {
         const Status verdict = PaxChunk::ValidateChunkBytes(work);
         if (verdict == Status::kSuccess) {
           auto parsed = PaxChunk::Deserialize(work);
           if (!parsed.HasValue()) {
-            std::fprintf(stderr, "walk accepted but parser rejected: %s\n",
-                         what);
+            std::cerr << "walk accepted but parser rejected: " << what.data()
+                      << "\n";
             std::abort();
           }
         }
@@ -335,12 +403,16 @@ void PokeExtreme(std::vector<char>& bytes, size_t off, size_t width,
 }  // namespace
 
 int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
-  if (size < 12) return 0;
+  if (size < 12) {
+    return 0;
+  }
   const Schema sc = MakeStorageSchema();
   const auto shape = static_cast<uint8_t>(data[0] & 15);
   const PaxChunk good = BuildCompactChunk(shape);
   const std::vector<char>& base = good.Data();
-  if (base.size() < 128) return 0;
+  if (base.size() < 128) {
+    return 0;
+  }
 
   SectionMap map;
   if (!MapSections(good.GetFooter(), base, &map) || !map.mapped ||
@@ -350,15 +422,21 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
 
   const size_t sel = data[1] % map.sections.size();
   const Section& sec = map.sections[sel];
-  if (sec.len == 0) return 0;
+  if (sec.len == 0) {
+    return 0;
+  }
   const size_t stride = 1 + (data[2] % 7);
   const size_t start = data[3] % sec.len;
   const uint8_t mode = data[4] % 4;
   int64_t key_probe = 0;
-  if (size >= 16) std::memcpy(&key_probe, data + size - 8, 8);
+  if (size >= 16) {
+    std::memcpy(&key_probe, data + size - 8, 8);
+  }
 
   const size_t off = sec.off;
-  if (off + sec.len > base.size()) return 0;
+  if (off + sec.len > base.size()) {
+    return 0;
+  }
 
   switch (mode) {
     case 0: {
@@ -368,21 +446,22 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
       break;
     }
     case 1: {
-      static constexpr uint64_t kExtremes[] = {0,
-                                               1,
-                                               2,
-                                               0x7F,
-                                               0x80,
-                                               0xFF,
-                                               0x7FFFULL,
-                                               0x8000ULL,
-                                               0xFFFFULL,
-                                               0x7FFFFFFFULL,
-                                               0x80000000ULL,
-                                               0xFFFFFFFFULL,
-                                               0x7FFFFFFFFFFFFFFFULL,
-                                               0x8000000000000000ULL,
-                                               0xFFFFFFFFFFFFFFFFULL};
+      static constexpr std::array<uint64_t, 15> kExtremes = {
+          0,
+          1,
+          2,
+          0x7F,
+          0x80,
+          0xFF,
+          0x7FFFULL,
+          0x8000ULL,
+          0xFFFFULL,
+          0x7FFFFFFFULL,
+          0x80000000ULL,
+          0xFFFFFFFFULL,
+          0x7FFFFFFFFFFFFFFFULL,
+          0x8000000000000000ULL,
+          0xFFFFFFFFFFFFFFFFULL};
       constexpr size_t kMaxSitesPerWidth = 4;
       for (size_t w : {size_t{1}, size_t{2}, size_t{4}, size_t{8}}) {
         const size_t sites = sec.len / w;
@@ -395,10 +474,13 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
             std::vector<char> bytes = base;
             PokeExtreme(bytes, off + f, w, e);
             ResignChunkCrc(bytes);
-            char what[160];
-            std::snprintf(what, sizeof(what), "%s+%zu w=%zu e=%llx", sec.name,
-                          f, w, static_cast<unsigned long long>(e));
-            CheckCurrent(bytes, 0, sc, key_probe, what);
+            std::array<char, 160> what{};
+            if (std::snprintf(what.data(), what.size(), "%s+%zu w=%zu e=%llx",
+                              sec.name, f, w,
+                              static_cast<unsigned long long>(e)) < 0) {
+              std::abort();
+            }
+            CheckCurrent(bytes, 0, sc, key_probe, what.data());
           }
         }
       }
@@ -416,9 +498,12 @@ int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size) {
         std::vector<char> bytes = base;
         bytes[off] = static_cast<char>(v);
         ResignChunkCrc(bytes);
-        char what[160];
-        std::snprintf(what, sizeof(what), "%s flag=%02x", sec.name, v);
-        CheckCurrent(bytes, 0, sc, key_probe, what);
+        std::array<char, 160> what{};
+        if (std::snprintf(what.data(), what.size(), "%s flag=%02x", sec.name,
+                          v) < 0) {
+          std::abort();
+        }
+        CheckCurrent(bytes, 0, sc, key_probe, what.data());
       }
       break;
     }

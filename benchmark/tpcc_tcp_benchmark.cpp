@@ -37,8 +37,9 @@ using Clock = std::chrono::steady_clock;
 
 uint32_t U32(std::string_view s, size_t n) {
   uint32_t v = 0;
-  for (size_t i = 0; i < 4; ++i)
+  for (size_t i = 0; i < 4; ++i) {
     v = (v << 8U) | static_cast<unsigned char>(s[n + i]);
+  }
   return v;
 }
 uint16_t U16(std::string_view s, size_t n) {
@@ -46,18 +47,28 @@ uint16_t U16(std::string_view s, size_t n) {
                                static_cast<unsigned char>(s[n + 1]));
 }
 void Put32(std::string& s, uint32_t v) {
-  for (int shift = 24; shift >= 0; shift -= 8)
+  for (int shift = 24; shift >= 0; shift -= 8) {
     s.push_back(static_cast<char>((v >> shift) & 255U));
+  }
 }
 
 class Session final : public TpccSqlSession {
  public:
+  Session() = default;
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+  Session(Session&&) = delete;
+  Session& operator=(Session&&) = delete;
   ~Session() override {
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) {
+      close(fd_);
+    }
   }
   Status Connect(int port) {
     fd_ = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
-    if (fd_ < 0) return Status::kIOError;
+    if (fd_ < 0) {
+      return Status::kIOError;
+    }
     timeval timeout{.tv_sec = 15, .tv_usec = 0};
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -68,14 +79,17 @@ class Session final : public TpccSqlSession {
     address.sin_port = htons(static_cast<uint16_t>(port));
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
-        0)
+        0) {
       return Status::kIOError;
+    }
     std::string startup;
     Put32(startup, 8 + 11 + 15 + 1);
     Put32(startup, 196608);
     startup.append("user\0bench\0database\0bench\0\0", 27);
     std::vector<Row> ignored;
-    if (!Send(startup)) return Status::kIOError;
+    if (!Send(startup)) {
+      return Status::kIOError;
+    }
     return Receive(&ignored);
   }
   Status Begin(bool /*read_only*/) override {
@@ -84,7 +98,7 @@ class Session final : public TpccSqlSession {
   }
   Status Commit() override {
     std::vector<Row> ignored;
-    const Status status = Execute("COMMIT", &ignored);
+    Status status = Execute("COMMIT", &ignored);
     if (status == Status::kSuccess && tag_ != "COMMIT") {
       error_ = "commit did not commit: " + tag_;
       return Status::kConflicts;
@@ -95,7 +109,7 @@ class Session final : public TpccSqlSession {
     std::vector<Row> ignored;
     (void)Execute("ROLLBACK", &ignored);
   }
-  std::string_view LastError() const override { return error_; }
+  [[nodiscard]] std::string_view LastError() const override { return error_; }
   void TraceTransaction(uint64_t sequence, TpccTransactionType type) {
     trace_ = true;
     trace_sequence_ = sequence;
@@ -130,20 +144,28 @@ class Session final : public TpccSqlSession {
   }
 
  private:
-  bool Send(std::string_view bytes) {
+  [[nodiscard]] bool Send(std::string_view bytes) const {
     while (!bytes.empty()) {
       const ssize_t n = platform::SendNoSignal(fd_, bytes.data(), bytes.size());
-      if (n < 0 && errno == EINTR) continue;
-      if (n <= 0) return false;
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        return false;
+      }
       bytes.remove_prefix(static_cast<size_t>(n));
     }
     return true;
   }
-  bool Read(char* data, size_t size) {
-    while (size) {
+  bool Read(char* data, size_t size) const {
+    while (size != 0U) {
       const ssize_t n = recv(fd_, data, size, 0);
-      if (n < 0 && errno == EINTR) continue;
-      if (n <= 0) return false;
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        return false;
+      }
       data += n;
       size -= static_cast<size_t>(n);
     }
@@ -159,59 +181,79 @@ class Session final : public TpccSqlSession {
         return Status::kIOError;
       }
       const uint32_t length = U32(std::string_view(header.data(), 5), 1);
-      if (length < 4 || length > 16 * 1024 * 1024) return Status::kCorrupt;
+      if (length < 4 || length > 16 * 1024 * 1024) {
+        return Status::kCorrupt;
+      }
       std::string body(length - 4, '\0');
-      if (!Read(body.data(), body.size())) return Status::kIOError;
+      if (!Read(body.data(), body.size())) {
+        return Status::kIOError;
+      }
       if (header[0] == 'T') {
-        if (body.size() < 2) return Status::kCorrupt;
+        if (body.size() < 2) {
+          return Status::kCorrupt;
+        }
         size_t offset = 2;
         types.clear();
         for (size_t i = 0; i < U16(body, 0); ++i) {
           const size_t end = body.find('\0', offset);
-          if (end == std::string::npos || end + 19 > body.size())
+          if (end == std::string::npos || end + 19 > body.size()) {
             return Status::kCorrupt;
+          }
           types.push_back(U32(body, end + 7));
           offset = end + 19;
         }
-        if (offset != body.size()) return Status::kCorrupt;
-      } else if (header[0] == 'D') {
-        if (body.size() < 2 || U16(body, 0) != types.size())
+        if (offset != body.size()) {
           return Status::kCorrupt;
+        }
+      } else if (header[0] == 'D') {
+        if (body.size() < 2 || U16(body, 0) != types.size()) {
+          return Status::kCorrupt;
+        }
         size_t offset = 2;
         std::vector<Value> values;
         for (uint32_t type : types) {
-          if (offset + 4 > body.size()) return Status::kCorrupt;
+          if (offset + 4 > body.size()) {
+            return Status::kCorrupt;
+          }
           const uint32_t count = U32(body, offset);
           offset += 4;
           if (count == UINT32_MAX) {
             values.emplace_back();
             continue;
           }
-          if (count > body.size() - offset) return Status::kCorrupt;
+          if (count > body.size() - offset) {
+            return Status::kCorrupt;
+          }
           std::string_view text(body.data() + offset, count);
           offset += count;
           if (type == 20 || type == 21 || type == 23) {
             int64_t v = 0;
             const auto [end, ec] =
                 std::from_chars(text.data(), text.data() + text.size(), v);
-            if (ec != std::errc() || end != text.data() + text.size())
+            if (ec != std::errc() || end != text.data() + text.size()) {
               return Status::kCorrupt;
+            }
             values.emplace_back(v);
           } else if (type == 700 || type == 701 || type == 1700) {
             double v = 0;
             const auto [end, ec] =
                 std::from_chars(text.data(), text.data() + text.size(), v);
-            if (ec != std::errc() || end != text.data() + text.size())
+            if (ec != std::errc() || end != text.data() + text.size()) {
               return Status::kCorrupt;
+            }
             values.emplace_back(v);
           } else {
             values.emplace_back(std::string(text));
           }
         }
-        if (offset != body.size()) return Status::kCorrupt;
+        if (offset != body.size()) {
+          return Status::kCorrupt;
+        }
         rows->emplace_back(std::move(values));
       } else if (header[0] == 'C') {
-        if (body.empty() || body.back() != '\0') return Status::kCorrupt;
+        if (body.empty() || body.back() != '\0') {
+          return Status::kCorrupt;
+        }
         tag_ = body.substr(0, body.size() - 1);
         if (tag_.starts_with("INSERT ") || tag_.starts_with("UPDATE ") ||
             tag_.starts_with("DELETE ")) {
@@ -219,8 +261,9 @@ class Session final : public TpccSqlSession {
           int64_t n = 0;
           const auto [end, ec] =
               std::from_chars(count.data(), count.data() + count.size(), n);
-          if (ec != std::errc() || end != count.data() + count.size())
+          if (ec != std::errc() || end != count.data() + count.size()) {
             return Status::kCorrupt;
+          }
           rows->emplace_back(
               std::vector<Value>{Value(std::string("affected")), Value(n)});
         }
@@ -229,8 +272,9 @@ class Session final : public TpccSqlSession {
         error_ = body;
         std::replace(error_.begin(), error_.end(), '\0', ' ');
       } else if (header[0] == 'R') {
-        if (body.size() != 4 || U32(body, 0) != 0)
+        if (body.size() != 4 || U32(body, 0) != 0) {
           return Status::kInvalidArgument;
+        }
       } else if (header[0] == 'Z') {
         return failed ? Status::kConflicts : Status::kSuccess;
       }
@@ -261,30 +305,37 @@ int main(int argc, char** argv) {
     uint64_t n = 0;
     const auto [end, ec] =
         std::from_chars(value.data(), value.data() + value.size(), n);
-    if (ec != std::errc() || end != value.data() + value.size()) return 2;
-    if (key == "--port" && n <= 65535)
-      port = static_cast<int>(n);
-    else if (key == "--clients" && n <= 128)
-      clients = static_cast<int>(n);
-    else if (key == "--seconds" && n <= 3600)
-      seconds = static_cast<int>(n);
-    else if (key == "--warmup" && n <= 3600)
-      warmup = static_cast<int>(n);
-    else if (key == "--seed")
-      seed = n;
-    else if (key == "--trace-sql" && n <= 1)
-      trace_sql = n != 0;
-    else if (key == "--mysql" && n <= 1)
-      use_mysql = n != 0;
-    else if (key == "--transport-test" && n <= 1)
-      transport_test = n != 0;
-    else if (key == "--transaction" && n < 5)
-      transaction_only = static_cast<int>(n);
-    else
+    if (ec != std::errc() || end != value.data() + value.size()) {
       return 2;
+    }
+    if (key == "--port" && n <= 65535) {
+      port = static_cast<int>(n);
+    } else if (key == "--clients" && n <= 128) {
+      clients = static_cast<int>(n);
+    } else if (key == "--seconds" && n <= 3600) {
+      seconds = static_cast<int>(n);
+    } else if (key == "--warmup" && n <= 3600) {
+      warmup = static_cast<int>(n);
+    } else if (key == "--seed") {
+      seed = n;
+    } else if (key == "--trace-sql" && n <= 1) {
+      trace_sql = n != 0;
+    } else if (key == "--mysql" && n <= 1) {
+      use_mysql = n != 0;
+    } else if (key == "--transport-test" && n <= 1) {
+      transport_test = n != 0;
+    } else if (key == "--transaction" && n < 5) {
+      transaction_only = static_cast<int>(n);
+    } else {
+      return 2;
+    }
   }
-  if (!port || clients < 1 || seconds < 1 || argc % 2 == 0) return 2;
-  if (use_mysql && trace_sql) return 2;
+  if ((port == 0) || clients < 1 || seconds < 1 || argc % 2 == 0) {
+    return 2;
+  }
+  if (use_mysql && trace_sql) {
+    return 2;
+  }
 #ifdef TINYLAMB_TPCC_MYSQL
   if (use_mysql && mysql_library_init(0, nullptr, nullptr) != 0) return 1;
 #else
@@ -305,55 +356,74 @@ int main(int argc, char** argv) {
     }
 #endif
     auto session = std::make_unique<Session>();
-    if (session->Connect(port) != Status::kSuccess) return nullptr;
+    if (session->Connect(port) != Status::kSuccess) {
+      return nullptr;
+    }
     return session;
   };
   if (transport_test) {
     auto session = connect_session();
-    if (!session) return 1;
+    if (!session) {
+      return 1;
+    }
     std::vector<Row> rows;
     const auto execute = [&](std::string_view sql) {
       const auto status = session->Execute(sql, &rows);
-      if (status != Status::kSuccess) std::cerr << session->LastError() << '\n';
+      if (status != Status::kSuccess) {
+        std::cerr << session->LastError() << '\n';
+      }
       return status == Status::kSuccess;
     };
-    if (!execute("SELECT 9223372036854775807, 1.25, NULL, 'a,b'")) return 1;
+    if (!execute("SELECT 9223372036854775807, 1.25, NULL, 'a,b'")) {
+      return 1;
+    }
     const Row expected{Value(int64_t{9223372036854775807}), Value(1.25),
                        Value(), Value(std::string("a,b"))};
-    if (rows.size() != 1 || rows[0] != expected) return 1;
+    if (rows.size() != 1 || rows[0] != expected) {
+      return 1;
+    }
     if (!execute("CREATE TABLE tpcc_transport_probe (id BIGINT, v BIGINT)") ||
         !execute(
             "CREATE UNIQUE INDEX tpcc_probe_pk ON tpcc_transport_probe(id)") ||
-        !execute("INSERT INTO tpcc_transport_probe VALUES (1,10)"))
+        !execute("INSERT INTO tpcc_transport_probe VALUES (1,10)")) {
       return 1;
+    }
     if (rows.size() != 1 ||
-        rows[0] != Row{Value(std::string("affected")), Value(int64_t{1})})
+        rows[0] != Row{Value(std::string("affected")), Value(int64_t{1})}) {
       return 1;
+    }
     if (session->Begin(false) != Status::kSuccess ||
-        !execute("UPDATE tpcc_transport_probe SET v=20 WHERE id=1"))
+        !execute("UPDATE tpcc_transport_probe SET v=20 WHERE id=1")) {
       return 1;
+    }
     session->Abort();
     if (!execute("SELECT v FROM tpcc_transport_probe") ||
-        rows != std::vector<Row>{Row{Value(int64_t{10})}})
+        rows != std::vector<Row>{Row{Value(int64_t{10})}}) {
       return 1;
+    }
     if (session->Begin(false) != Status::kSuccess ||
         !execute("UPDATE tpcc_transport_probe SET v=30 WHERE id=1") ||
         session->Commit() != Status::kSuccess ||
         !execute("SELECT v FROM tpcc_transport_probe") ||
-        rows != std::vector<Row>{Row{Value(int64_t{30})}})
+        rows != std::vector<Row>{Row{Value(int64_t{30})}}) {
       return 1;
-    if (session->Begin(false) != Status::kSuccess) return 1;
+    }
+    if (session->Begin(false) != Status::kSuccess) {
+      return 1;
+    }
     if (session->Execute("INSERT INTO tpcc_transport_probe VALUES (1,99)",
-                         &rows) == Status::kSuccess)
+                         &rows) == Status::kSuccess) {
       return 1;
+    }
     session->Abort();
     if (!execute("SELECT v FROM tpcc_transport_probe") ||
         rows != std::vector<Row>{Row{Value(int64_t{30})}} ||
         !execute("UPDATE tpcc_transport_probe SET v=0 WHERE id=2") ||
         rows != std::vector<Row>{Row{Value(std::string("affected")),
                                      Value(int64_t{0})}} ||
-        !execute("DROP TABLE tpcc_transport_probe"))
+        !execute("DROP TABLE tpcc_transport_probe")) {
       return 1;
+    }
     std::cout << "transport_test=passed\n";
     return 0;
   }
@@ -361,7 +431,9 @@ int main(int argc, char** argv) {
   const TpccNurand nurand = TpccNurand::FromSeed(seed);
   {
     auto session = connect_session();
-    if (!session) return 1;
+    if (!session) {
+      return 1;
+    }
     TpccWorkload check(*session, scale, seed, 0, nurand);
     for (size_t i = 0; i < 5; ++i) {
       const auto result = check.Execute(static_cast<TpccTransactionType>(i));
@@ -376,13 +448,18 @@ int main(int argc, char** argv) {
   std::atomic<bool> failed{false};
   std::vector<std::array<Metrics, 5>> metrics(static_cast<size_t>(clients));
   std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(clients));
   for (int i = 0; i < clients; ++i) {
     workers.emplace_back([&, i] {
       auto session = connect_session();
-      if (!session) failed = true;
+      if (!session) {
+        failed = true;
+      }
       ready.count_down();
       start.wait();
-      if (failed) return;
+      if (failed) {
+        return;
+      }
       TpccWorkload workload(*session, scale,
                             seed + static_cast<uint64_t>(i) + 1,
                             (i * scale.Terminals()) / clients, nurand);
@@ -394,13 +471,16 @@ int main(int argc, char** argv) {
                            : static_cast<TpccTransactionType>(transaction_only);
         // One worker only, diagnostics only. Never use traced latency/TPS in
         // comparisons: trace formatting and output alter the generator's pace.
-        if (trace_sql && i == 0)
+        if (trace_sql && i == 0) {
           static_cast<Session*>(session.get())
               ->TraceTransaction(++trace_sequence, t);
+        }
         const auto before = Clock::now();
         const auto r = workload.Execute(t);
         const auto after = Clock::now();
-        if (!measured) continue;
+        if (!measured) {
+          continue;
+        }
         auto& m = metrics[static_cast<size_t>(i)][static_cast<size_t>(t)];
         ++m.attempted;
         m.sql += r.sql_statements;
@@ -411,8 +491,9 @@ int main(int argc, char** argv) {
                   .count());
         }
         m.user_rollback += r.user_rollback ? 1 : 0;
-        if (!r.committed && !r.user_rollback && m.error.empty())
+        if (!r.committed && !r.user_rollback && m.error.empty()) {
           m.error = r.error;
+        }
       }
     });
   }
@@ -420,8 +501,12 @@ int main(int argc, char** argv) {
   begin = Clock::now() + std::chrono::seconds(warmup);
   end = begin + std::chrono::seconds(seconds);
   start.count_down();
-  for (auto& thread : workers) thread.join();
-  if (failed) return 1;
+  for (auto& thread : workers) {
+    thread.join();
+  }
+  if (failed) {
+    return 1;
+  }
   uint64_t total = 0;
   for (size_t t = 0; t < 5; ++t) {
     Metrics merged;
@@ -433,7 +518,9 @@ int main(int argc, char** argv) {
       merged.sql += m.sql;
       merged.success_ms.insert(merged.success_ms.end(), m.success_ms.begin(),
                                m.success_ms.end());
-      if (merged.error.empty()) merged.error = m.error;
+      if (merged.error.empty()) {
+        merged.error = m.error;
+      }
     }
     std::sort(merged.success_ms.begin(), merged.success_ms.end());
     const auto quantile = [&](double p) {
@@ -460,8 +547,9 @@ int main(int argc, char** argv) {
               << prefix << "p50_ms=" << quantile(.5) << '\n'
               << prefix << "p95_ms=" << quantile(.95) << '\n'
               << prefix << "p99_ms=" << quantile(.99) << '\n';
-    if (!merged.error.empty())
+    if (!merged.error.empty()) {
       std::cout << prefix << "first_error=" << merged.error << '\n';
+    }
     total += merged.committed;
   }
   std::cout << "tps=" << static_cast<double>(total) / seconds << '\n';

@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <utility>
+
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -35,9 +40,9 @@ bool ParseRleBpRegion(const char* r, uint32_t n, uint32_t param,
   const uint64_t value_bits = static_cast<uint64_t>(runs) * value_width;
   const uint64_t length_bits = static_cast<uint64_t>(runs) * length_width;
   const size_t value_bytes =
-      value_bits / 8 + static_cast<size_t>(value_bits % 8 != 0);
+      (value_bits / 8) + static_cast<size_t>(value_bits % 8 != 0);
   const size_t length_bytes =
-      length_bits / 8 + static_cast<size_t>(length_bits % 8 != 0);
+      (length_bits / 8) + static_cast<size_t>(length_bits % 8 != 0);
   if (value_bytes > static_cast<size_t>(end - r) - 14 ||
       length_bytes > static_cast<size_t>(end - r) - 14 - value_bytes) {
     return false;
@@ -52,7 +57,7 @@ bool ParseRleBpRegion(const char* r, uint32_t n, uint32_t param,
   p.base = static_cast<int64_t>(ReadBE64(r));
   uint64_t covered = 0;
   for (uint32_t i = 0; i < runs; ++i) {
-    const uint32_t length = static_cast<uint32_t>(
+    const auto length = static_cast<uint32_t>(
         UnpackBitAt(p.lengths, static_cast<uint64_t>(i) * length_width,
                     static_cast<int>(length_width)));
     if (length == 0 || static_cast<uint64_t>(length) > n - covered) {
@@ -60,13 +65,17 @@ bool ParseRleBpRegion(const char* r, uint32_t n, uint32_t param,
     }
     covered += length;
   }
-  if (covered != n) return false;
+  if (covered != n) {
+    return false;
+  }
   *out = p;
   return true;
 }
 
 int64_t RleBpValueAt(const RleBpRegion& p, uint32_t run) {
-  if (run >= p.runs) return 0;
+  if (run >= p.runs) {
+    return 0;
+  }
   const uint64_t offset =
       UnpackBitAt(p.values, static_cast<uint64_t>(run) * p.value_width,
                   static_cast<int>(p.value_width));
@@ -74,7 +83,9 @@ int64_t RleBpValueAt(const RleBpRegion& p, uint32_t run) {
 }
 
 uint32_t RleBpLengthAt(const RleBpRegion& p, uint32_t run) {
-  if (run >= p.runs) return 0;
+  if (run >= p.runs) {
+    return 0;
+  }
   return static_cast<uint32_t>(
       UnpackBitAt(p.lengths, static_cast<uint64_t>(run) * p.length_width,
                   static_cast<int>(p.length_width)));
@@ -119,27 +130,41 @@ bool ParseRleIdxRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize || param == 0) {
     return false;
   }
-  if (static_cast<size_t>(end - r) < 8) return false;
+  if (static_cast<size_t>(end - r) < 8) {
+    return false;
+  }
   const uint32_t runs = ReadBE32(r);
   const uint32_t nidx = ReadBE32(r + 4);
-  if (runs == 0 || runs > n || runs != param || nidx == 0) return false;
+  if (runs == 0 || runs > n || runs != param || nidx == 0) {
+    return false;
+  }
   if (nidx != (runs + kRleIdxRestartStride - 1) / kRleIdxRestartStride) {
     return false;
   }
   // Both FOR-BA headers live at fixed offsets: values at +8, lengths right
   // after the value stream, whose extent is a function of `runs` and `bpv`.
   const char* vhead = r + 8;
-  if (vhead + 9 > end) return false;
+  if (vhead + 9 > end) {
+    return false;
+  }
   const uint32_t value_bpv = static_cast<uint8_t>(vhead[8]);
-  if (value_bpv == 0 || value_bpv > 8) return false;
+  if (value_bpv == 0 || value_bpv > 8) {
+    return false;
+  }
   const size_t value_bytes = static_cast<size_t>(runs) * value_bpv;
   const char* lhead = vhead + 9 + value_bytes;
-  if (lhead + 9 > end) return false;
+  if (lhead + 9 > end) {
+    return false;
+  }
   const uint32_t length_bpv = static_cast<uint8_t>(lhead[8]);
-  if (length_bpv == 0 || length_bpv > 8) return false;
+  if (length_bpv == 0 || length_bpv > 8) {
+    return false;
+  }
   const size_t length_bytes = static_cast<size_t>(runs) * length_bpv;
   const char* restart = lhead + 9 + length_bytes;
-  if (restart + static_cast<size_t>(nidx) * 4 > end) return false;
+  if (restart + (static_cast<size_t>(nidx) * 4) > end) {
+    return false;
+  }
 
   RleIdxRegion p;
   p.values = vhead;
@@ -157,27 +182,35 @@ bool ParseRleIdxRegion(const char* r, uint32_t n, uint32_t param,
   // so a hostile value here must not be able to move a walk's start.
   uint32_t previous = 0;
   for (uint32_t e = 0; e < nidx; ++e) {
-    const uint32_t row = ReadBE32(restart + static_cast<size_t>(e) * 4);
-    if (row < previous || row > n) return false;
+    const uint32_t row = ReadBE32(restart + (static_cast<size_t>(e) * 4));
+    if (row < previous || row > n) {
+      return false;
+    }
     previous = row;
   }
-  if (ReadBE32(restart) != 0) return false;
+  if (ReadBE32(restart) != 0) {
+    return false;
+  }
   *out = p;
   return true;
 }
 
 int64_t RleIdxValueAt(const RleIdxRegion& p, uint32_t run) {
-  if (run >= p.runs) return 0;
+  if (run >= p.runs) {
+    return 0;
+  }
   // FOR-BA payload starts one byte past the header (base 8B + bpv 1B).
   const uint64_t offset = RleIdxForBaOff(
-      p.values + 9 + static_cast<size_t>(run) * p.value_bpv, p.value_bpv);
+      p.values + 9 + (static_cast<size_t>(run) * p.value_bpv), p.value_bpv);
   return static_cast<int64_t>(static_cast<uint64_t>(p.value_base) + offset);
 }
 
 uint32_t RleIdxLengthAt(const RleIdxRegion& p, uint32_t run) {
-  if (run >= p.runs) return 0;
+  if (run >= p.runs) {
+    return 0;
+  }
   const uint64_t offset = RleIdxForBaOff(
-      p.lengths + 9 + static_cast<size_t>(run) * p.length_bpv, p.length_bpv);
+      p.lengths + 9 + (static_cast<size_t>(run) * p.length_bpv), p.length_bpv);
   return static_cast<uint32_t>(static_cast<uint64_t>(p.length_base) + offset);
 }
 
@@ -185,10 +218,14 @@ uint32_t RleIdxLengthAt(const RleIdxRegion& p, uint32_t run) {
 // of at most kRleIdxRestartStride - 1 lengths; the walk is clamped at n so a
 // malformed stream degrades to "no such run" instead of reading past n.
 uint32_t RleIdxRowBefore(const RleIdxRegion& p, uint32_t run) {
-  if (run == 0) return 0;
-  if (run >= p.runs) return p.n;
+  if (run == 0) {
+    return 0;
+  }
+  if (run >= p.runs) {
+    return p.n;
+  }
   const uint32_t entry = run / kRleIdxRestartStride;
-  uint64_t row = ReadBE32(p.restart + static_cast<size_t>(entry) * 4);
+  uint64_t row = ReadBE32(p.restart + (static_cast<size_t>(entry) * 4));
   for (uint32_t i = entry * kRleIdxRestartStride; i < run; ++i) {
     row += RleIdxLengthAt(p, i);
   }
@@ -198,23 +235,29 @@ uint32_t RleIdxRowBefore(const RleIdxRegion& p, uint32_t run) {
 // Run holding `row`: binary search over the restart table (O(log nidx)) plus a
 // bounded walk. Returns `runs` when the row falls past every run.
 uint32_t RleIdxRunAt(const RleIdxRegion& p, uint32_t row) {
-  if (row >= p.n) return p.runs;
+  if (row >= p.n) {
+    return p.runs;
+  }
   uint32_t lo = 0;
   uint32_t hi = p.nidx;  // first entry whose row > `row`
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
-    if (ReadBE32(p.restart + static_cast<size_t>(mid) * 4) <= row) {
+    const uint32_t mid = lo + ((hi - lo) / 2);
+    if (ReadBE32(p.restart + (static_cast<size_t>(mid) * 4)) <= row) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
-  if (lo == 0) return 0;
+  if (lo == 0) {
+    return 0;
+  }
   uint32_t run = (lo - 1) * kRleIdxRestartStride;
-  uint64_t at = ReadBE32(p.restart + static_cast<size_t>(lo - 1) * 4);
+  uint64_t at = ReadBE32(p.restart + (static_cast<size_t>(lo - 1) * 4));
   while (run < p.runs && at <= row) {
     at += RleIdxLengthAt(p, run);
-    if (at > row) break;
+    if (at > row) {
+      break;
+    }
     ++run;
   }
   return run;
@@ -229,7 +272,7 @@ uint32_t RleIdxLowerBound(const RleIdxRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.runs;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (RleIdxValueAt(p, mid) < key) {
       lo = mid + 1;
     } else {
@@ -244,7 +287,7 @@ uint32_t RleIdxUpperBound(const RleIdxRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.runs;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (RleIdxValueAt(p, mid) <= key) {
       lo = mid + 1;
     } else {
@@ -361,15 +404,19 @@ uint32_t StreamVByteOffset(const StreamVByteRegion& v, uint32_t i) {
   const size_t block = i / kStreamVByteBlock;
   const uint32_t first = static_cast<uint32_t>(block) * kStreamVByteBlock;
   uint32_t off = (static_cast<uint32_t>(v.block_off[block * 2]) << 8) |
-                 static_cast<uint32_t>(v.block_off[block * 2 + 1]);
-  for (uint32_t j = first; j < i; ++j) off += StreamVByteWidth(v, j);
+                 static_cast<uint32_t>(v.block_off[(block * 2) + 1]);
+  for (uint32_t j = first; j < i; ++j) {
+    off += StreamVByteWidth(v, j);
+  }
   return off;
 }
 
 int64_t StreamVByteValueAt(const StreamVByteRegion& v, uint32_t i) {
   const uint32_t w = StreamVByteWidth(v, i);
   const uint32_t off = StreamVByteOffset(v, i);
-  if (off + w > v.stream_len) return 0;  // fail closed
+  if (off + w > v.stream_len) {
+    return 0;  // fail closed
+  }
   return StreamVByteLoad(v, off, w);
 }
 
@@ -386,20 +433,30 @@ bool ParseStreamVByteRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  if (end - r < 6) return false;
+  if (end - r < 6) {
+    return false;
+  }
   const uint32_t stream_len = ReadBE32(r);
-  if (stream_len != param) return false;
+  if (stream_len != param) {
+    return false;
+  }
   // Selector 3 is the widest value, so the payload can never exceed 4n.
-  if (stream_len == 0 || stream_len > n * kStreamVByteMaxWidth) return false;
+  if (stream_len == 0 || stream_len > n * kStreamVByteMaxWidth) {
+    return false;
+  }
   const uint32_t nblk = (n + kStreamVByteBlock - 1) / kStreamVByteBlock;
   const uint32_t ctrl_len = (n + kStreamVBytePerCtrl - 1) / kStreamVBytePerCtrl;
   const uint64_t need =
-      6ULL + 2ULL * nblk + static_cast<uint64_t>(ctrl_len) + stream_len;
-  if (need > static_cast<uint64_t>(end - r)) return false;
-  const uint8_t* base = reinterpret_cast<const uint8_t*>(r);
+      6ULL + (2ULL * nblk) + static_cast<uint64_t>(ctrl_len) + stream_len;
+  if (std::cmp_greater(need, end - r)) {
+    return false;
+  }
+  const auto* base = reinterpret_cast<const uint8_t*>(r);
   const uint8_t* block_off = base + 6;
-  if (ReadBE16(r + 4) != nblk) return false;
-  const uint8_t* ctrl = block_off + 2ULL * nblk;
+  if (ReadBE16(r + 4) != nblk) {
+    return false;
+  }
+  const uint8_t* ctrl = block_off + (2ULL * nblk);
   const uint8_t* payload = ctrl + ctrl_len;
   // One width walk validates three things at once: every block_off equals the
   // walked prefix at its boundary, the total equals stream_len, and no value
@@ -410,16 +467,22 @@ bool ParseStreamVByteRegion(const char* r, uint32_t n, uint32_t param,
     if (i % kStreamVByteBlock == 0) {
       const size_t b = i / kStreamVByteBlock;
       const uint32_t stored = (static_cast<uint32_t>(block_off[b * 2]) << 8) |
-                              static_cast<uint32_t>(block_off[b * 2 + 1]);
-      if (stored != sum) return false;
+                              static_cast<uint32_t>(block_off[(b * 2) + 1]);
+      if (stored != sum) {
+        return false;
+      }
     }
     sum += ((static_cast<unsigned>(ctrl[i / kStreamVBytePerCtrl]) >>
              (6 - 2 * (i % kStreamVBytePerCtrl))) &
             0x3U) +
            1U;
-    if (sum > stream_len) return false;
+    if (sum > stream_len) {
+      return false;
+    }
   }
-  if (sum != stream_len) return false;
+  if (sum != stream_len) {
+    return false;
+  }
   out->block_off = block_off;
   out->ctrl = ctrl;
   out->payload = payload;
@@ -454,7 +517,7 @@ uint32_t StreamVByteLowerBound(const StreamVByteRegion& v, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = v.n;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (StreamVByteValueAt(v, mid) < key) {
       lo = mid + 1;
     } else {
@@ -470,39 +533,51 @@ bool ParseRle8Region(const char* r, uint32_t n, uint32_t param, const char* end,
       n > PaxChunk::kRowGroupSize || param < 8 || param > 8U * n) {
     return false;
   }
-  const size_t expected = 16U + 3U * static_cast<size_t>(param);
-  if (static_cast<size_t>(end - r) != expected) return false;
+  const size_t expected = 16U + (3U * static_cast<size_t>(param));
+  if (std::cmp_not_equal(end - r, expected)) {
+    return false;
+  }
 
   Rle8Region& parsed = *out;
   parsed.n = n;
   parsed.total_runs = 0;
   const char* cursor = r;
   for (uint32_t plane = 0; plane < 8; ++plane) {
-    if (static_cast<size_t>(end - cursor) < 2) return false;
+    if (static_cast<size_t>(end - cursor) < 2) {
+      return false;
+    }
     const uint16_t runs = ReadBE16(cursor);
     cursor += 2;
-    if (runs == 0 || runs > n) return false;
+    if (runs == 0 || runs > n) {
+      return false;
+    }
     parsed.plane_runs[plane] = runs;
     parsed.plane_offsets[plane] = parsed.total_runs;
     uint32_t covered = 0;
     uint8_t previous = 0;
     for (uint32_t run = 0; run < runs; ++run) {
-      if (static_cast<size_t>(end - cursor) < 3) return false;
-      const uint8_t value = static_cast<uint8_t>(cursor[0]);
+      if (static_cast<size_t>(end - cursor) < 3) {
+        return false;
+      }
+      const auto value = static_cast<uint8_t>(cursor[0]);
       const uint16_t length = ReadBE16(cursor + 1);
       cursor += 3;
       if (length == 0 || static_cast<uint32_t>(length) > n - covered) {
         return false;
       }
-      if (run != 0 && value == previous) return false;
-      parsed.runs[parsed.total_runs++] = Rle8Run{covered, length, value};
+      if (run != 0 && value == previous) {
+        return false;
+      }
+      parsed.runs[parsed.total_runs++] =
+          Rle8Run{.start = covered, .length = length, .value = value};
       covered += length;
       previous = value;
     }
-    if (covered != n) return false;
+    if (covered != n) {
+      return false;
+    }
   }
-  if (parsed.total_runs != param || cursor != end) return false;
-  return true;
+  return parsed.total_runs == param && cursor == end;
 }
 
 bool ValidateRle8Region(const char* r, uint32_t n, uint32_t param,
@@ -514,29 +589,37 @@ bool ValidateRle8Region(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize || param < 8 || param > 8U * n) {
     return false;
   }
-  const size_t expected = 16U + 3U * static_cast<size_t>(param);
-  if (static_cast<size_t>(end - r) != expected) return false;
+  const size_t expected = 16U + (3U * static_cast<size_t>(param));
+  if (std::cmp_not_equal(end - r, expected)) {
+    return false;
+  }
 
   const char* cursor = r;
   uint32_t total = 0;
   for (uint32_t plane = 0; plane < 8; ++plane) {
-    if (static_cast<size_t>(end - cursor) < 2) return false;
+    if (static_cast<size_t>(end - cursor) < 2) {
+      return false;
+    }
     const uint32_t runs = ReadBE16(cursor);
     cursor += 2;
-    if (runs == 0 || runs > n) return false;
+    if (runs == 0 || runs > n) {
+      return false;
+    }
     if (static_cast<size_t>(runs) > (static_cast<size_t>(end - cursor) / 3U)) {
       return false;
     }
     (*plane_counts)[plane] = runs;
     (*plane_data)[plane] = cursor;
-    const char* plane_end = cursor + 3U * static_cast<size_t>(runs);
-    uint8_t value = static_cast<uint8_t>(cursor[0]);
+    const char* plane_end = cursor + (3U * static_cast<size_t>(runs));
+    auto value = static_cast<uint8_t>(cursor[0]);
     uint32_t length = ReadBE16(cursor + 1);
-    if (length == 0 || length > n) return false;
+    if (length == 0 || length > n) {
+      return false;
+    }
     cursor += 3;
     uint32_t covered = length;
     for (uint32_t run = 1; run < runs; ++run) {
-      const uint8_t next_value = static_cast<uint8_t>(cursor[0]);
+      const auto next_value = static_cast<uint8_t>(cursor[0]);
       length = ReadBE16(cursor + 1);
       cursor += 3;
       if (length == 0 || length > n - covered || next_value == value) {
@@ -546,10 +629,14 @@ bool ValidateRle8Region(const char* r, uint32_t n, uint32_t param,
       value = next_value;
     }
     cursor = plane_end;
-    if (covered != n) return false;
+    if (covered != n) {
+      return false;
+    }
     total += runs;
   }
-  if (total != param || cursor != end) return false;
+  if (total != param || cursor != end) {
+    return false;
+  }
   *total_runs = total;
   return true;
 }
@@ -560,7 +647,9 @@ uint32_t ReadRle8Length(const char* run) {
 }
 
 int64_t Rle8ValueAt(const Rle8Region& p, uint32_t index) {
-  if (index >= p.n) return 0;
+  if (index >= p.n) {
+    return 0;
+  }
   uint64_t ordered = 0;
   for (uint32_t plane = 0; plane < 8; ++plane) {
     const uint32_t first = p.plane_offsets[plane];
@@ -568,16 +657,20 @@ int64_t Rle8ValueAt(const Rle8Region& p, uint32_t index) {
     uint32_t lo = 0;
     uint32_t hi = count;
     while (lo < hi) {
-      const uint32_t mid = lo + (hi - lo) / 2;
+      const uint32_t mid = lo + ((hi - lo) / 2);
       if (p.runs[first + mid].start <= index) {
         lo = mid + 1;
       } else {
         hi = mid;
       }
     }
-    if (lo == 0) return 0;
+    if (lo == 0) {
+      return 0;
+    }
     const Rle8Run& run = p.runs[first + lo - 1];
-    if (index >= run.start + run.length) return 0;
+    if (index >= run.start + run.length) {
+      return 0;
+    }
     ordered = (ordered << 8) | static_cast<uint64_t>(run.value);
   }
   return static_cast<int64_t>(ordered ^ (1ULL << 63));
@@ -595,7 +688,9 @@ __attribute__((noinline)) int64_t Rle8ValueAtParsed(const char* r, uint32_t n,
                                                     const char* region_end,
                                                     uint32_t idx) {
   Rle8Region p;
-  if (!ParseRle8Region(r, n, param, region_end, &p)) return 0;
+  if (!ParseRle8Region(r, n, param, region_end, &p)) {
+    return 0;
+  }
   return Rle8ValueAt(p, idx);
 }
 
@@ -613,7 +708,7 @@ __attribute__((noinline)) bool Rle8RegionLowerBound(const char* r, uint32_t n,
   uint32_t lo = 0;
   uint32_t hi = n;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (Rle8ValueAt(parsed, mid) < key) {
       lo = mid + 1;
     } else {
@@ -684,8 +779,10 @@ bool DecodeRle8All(const char* r, uint32_t n, uint32_t param, const char* end,
         }
         next_row = std::min(next_row, boundaries[plane]);
       }
-      if (next_row <= row) return false;
-      const int64_t value =
+      if (next_row <= row) {
+        return false;
+      }
+      const auto value =
           static_cast<int64_t>(Rle8Compose(values) ^ (1ULL << 63));
       std::fill(out + row, out + next_row, value);
       row = next_row;
@@ -751,17 +848,21 @@ bool DecodeByteSliceAll(const char* region, uint32_t n, const char* end,
   if (region == nullptr || end == nullptr || end < region || out == nullptr) {
     return false;
   }
-  if (n == 0) return true;
-  if (region + 1 > end) return false;
+  if (n == 0) {
+    return true;
+  }
+  if (region + 1 > end) {
+    return false;
+  }
   const uint32_t width = static_cast<uint8_t>(region[0]);
   const size_t stride = (static_cast<size_t>(n) + 7) / 8;
   if (width == 0 || width > 64 ||
-      region + 1 + static_cast<size_t>(width) * stride > end) {
+      region + 1 + (static_cast<size_t>(width) * stride) > end) {
     return false;
   }
   std::fill(out, out + n, int64_t{0});
   uint32_t row = 0;
-#if defined(__BMI2__)
+#ifdef __BMI2__
   constexpr uint64_t kLaneBits = 0x0101010101010101ULL;
   for (; row + 8 <= n; row += 8) {
     const size_t byte = row >> 3;
@@ -770,7 +871,7 @@ bool DecodeByteSliceAll(const char* region, uint32_t n, const char* end,
       const uint32_t lanes = std::min(8U, width - base);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const size_t offset =
-            1 + static_cast<size_t>(base + lane) * stride + byte;
+            1 + (static_cast<size_t>(base + lane) * stride) + byte;
         packed |= static_cast<uint64_t>(static_cast<uint8_t>(region[offset]))
                   << (lane * 8);
       }
@@ -785,8 +886,9 @@ bool DecodeByteSliceAll(const char* region, uint32_t n, const char* end,
   for (; row < n; ++row) {
     uint64_t value = 0;
     for (uint32_t bit = 0; bit < width; ++bit) {
-      const size_t offset = 1 + static_cast<size_t>(bit) * stride + (row >> 3);
-      const uint64_t set = static_cast<uint64_t>(
+      const size_t offset =
+          1 + (static_cast<size_t>(bit) * stride) + (row >> 3);
+      const auto set = static_cast<uint64_t>(
           (static_cast<uint8_t>(region[offset]) >> (7U - (row & 7U))) & 1U);
       value |= set << bit;
     }
@@ -824,7 +926,9 @@ bool ParseRleDeltaRegion(const char* r, uint32_t n, uint32_t param,
   const uint64_t value_bytes = (value_bits + 7) / 8;
   const uint64_t length_bytes = (length_bits + 7) / 8;
   const uint64_t expected = 14 + value_bytes + length_bytes;
-  if (static_cast<uint64_t>(end - r) != expected) return false;
+  if (std::cmp_not_equal(end - r, expected)) {
+    return false;
+  }
 
   RleDeltaRegion& parsed = *out;
   parsed.n = n;
@@ -836,44 +940,52 @@ bool ParseRleDeltaRegion(const char* r, uint32_t n, uint32_t param,
   uint64_t value = ReadBE64(r);
   uint32_t covered = 0;
   for (uint32_t run = 0; run < runs; ++run) {
-    const uint32_t length = static_cast<uint32_t>(
+    const auto length = static_cast<uint32_t>(
         UnpackBitAt(lengths, static_cast<uint64_t>(run) * length_width,
                     static_cast<int>(length_width)));
-    if (length == 0 || length > n - covered) return false;
+    if (length == 0 || length > n - covered) {
+      return false;
+    }
     if (run != 0) {
       const uint64_t delta =
           UnpackBitAt(values, static_cast<uint64_t>(run - 1) * value_width,
                       static_cast<int>(value_width));
       value += DecodeZigZag64(delta);
     }
-    parsed.runs[run] =
-        RleDeltaRun{covered, length, static_cast<int64_t>(value)};
+    parsed.runs[run] = RleDeltaRun{.start = covered,
+                                   .length = length,
+                                   .value = static_cast<int64_t>(value)};
     covered += length;
   }
-  if (covered != n) return false;
-  return true;
+  return covered == n;
 }
 
 int64_t RleDeltaValueAt(const RleDeltaRegion& region, uint32_t index) {
-  if (index >= region.n) return 0;
+  if (index >= region.n) {
+    return 0;
+  }
   uint32_t low = 0;
   uint32_t high = region.run_count;
   while (low < high) {
-    const uint32_t middle = low + (high - low) / 2;
+    const uint32_t middle = low + ((high - low) / 2);
     if (region.runs[middle].start <= index) {
       low = middle + 1;
     } else {
       high = middle;
     }
   }
-  if (low == 0) return 0;
+  if (low == 0) {
+    return 0;
+  }
   return region.runs[low - 1].value;
 }
 
 bool DecodeRleDeltaAll(const char* r, uint32_t n, uint32_t param,
                        const char* end, int64_t* out) {
   RleDeltaRegion parsed;
-  if (!ParseRleDeltaRegion(r, n, param, end, &parsed)) return false;
+  if (!ParseRleDeltaRegion(r, n, param, end, &parsed)) {
+    return false;
+  }
   for (uint32_t run = 0; run < parsed.run_count; ++run) {
     const RleDeltaRun& item = parsed.runs[run];
     std::fill(out + item.start, out + item.start + item.length, item.value);
@@ -917,9 +1029,11 @@ bool DecodeRleDeltaAll(const char* r, uint32_t n, uint32_t param,
 // of Int64RegionAt: base + (w-bit offset | exception patch).
 int64_t D2PforSecondDiff(const D2PforRegion& p, uint32_t k) {
   const char* r = p.inner;
-  if (p.n < 3 || k > p.n - 3) return 0;
+  if (p.n < 3 || k > p.n - 3) {
+    return 0;
+  }
   const uint32_t cnt = p.n - 2;
-  const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+  const auto base_v = static_cast<int64_t>(ReadBE64(r));
   const int w = static_cast<int>(static_cast<uint8_t>(r[8]));
   const uint32_t nexc = ReadBE16(r + 9);
   const char* packed = r + 11;
@@ -928,11 +1042,14 @@ int64_t D2PforSecondDiff(const D2PforRegion& p, uint32_t k) {
   const char* exc = packed + pack_bytes;
   // Exception list is sorted by position; nexc is tiny for a smooth series.
   for (uint32_t e = 0; e < nexc; ++e) {
-    const uint32_t pos = ReadBE16(exc + static_cast<size_t>(e) * 10);
-    if (pos == k)
+    const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(e) * 10));
+    if (pos == k) {
       return static_cast<int64_t>(
-          ReadBE64(exc + static_cast<size_t>(e) * 10 + 2));
-    if (pos > k) break;
+          ReadBE64(exc + (static_cast<size_t>(e) * 10) + 2));
+    }
+    if (pos > k) {
+      break;
+    }
   }
   if (w >= 64) {
     return static_cast<int64_t>(
@@ -954,25 +1071,35 @@ bool ParseD2PforRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize || param > 64) {
     return false;
   }
-  if (static_cast<size_t>(end - r) < 2) return false;
-  const uint32_t ncp = ReadBE16(r);
-  if (ncp != (n + kD2PforCheckpointEvery - 1) / kD2PforCheckpointEvery + 1) {
+  if (static_cast<size_t>(end - r) < 2) {
     return false;
   }
-  const size_t header = 2 + 16 * static_cast<size_t>(ncp);
-  if (static_cast<size_t>(end - r) < header) return false;
+  const uint32_t ncp = ReadBE16(r);
+  if (ncp != ((n + kD2PforCheckpointEvery - 1) / kD2PforCheckpointEvery) + 1) {
+    return false;
+  }
+  const size_t header = 2 + (16 * static_cast<size_t>(ncp));
+  if (std::cmp_less(end - r, header)) {
+    return false;
+  }
   // Inner = a kPfor region over n-2 values. Extent: 11 + ceil((n-2)*w/8) +
   // nexc*10, with the width byte echoed against `param`.
   const char* inner = r + header;
-  const size_t avail = static_cast<size_t>(end - inner);
-  if (avail < 11) return false;
+  const auto avail = static_cast<size_t>(end - inner);
+  if (avail < 11) {
+    return false;
+  }
   const int w = static_cast<int>(static_cast<uint8_t>(inner[8]));
-  if (w < 0 || static_cast<uint32_t>(w) != param) return false;
+  if (std::cmp_not_equal(w, param)) {
+    return false;
+  }
   const uint32_t nexc = ReadBE16(inner + 9);
   const size_t cnt = static_cast<size_t>(n) - 2;
-  const size_t need = 11 + (cnt * static_cast<size_t>(w) + 7) / 8 +
-                      static_cast<size_t>(nexc) * 10;
-  if (need > avail) return false;
+  const size_t need = 11 + ((cnt * static_cast<size_t>(w) + 7) / 8) +
+                      (static_cast<size_t>(nexc) * 10);
+  if (need > avail) {
+    return false;
+  }
   out->ckpt = r + 2;
   out->inner = inner;
   out->n = n;
@@ -981,14 +1108,20 @@ bool ParseD2PforRegion(const char* r, uint32_t n, uint32_t param,
 }
 
 int64_t D2PforValueAt(const D2PforRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   const uint32_t b = idx / kD2PforCheckpointEvery;
-  if (b >= p.ncp) return 0;
+  if (b >= p.ncp) {
+    return 0;
+  }
   // Unsigned-wrapping accumulators; see the long comment in DecodeD2PforAll.
-  uint64_t val = ReadBE64(p.ckpt + static_cast<size_t>(b) * 16);
-  uint64_t sd = ReadBE64(p.ckpt + static_cast<size_t>(b) * 16 + 8);
+  uint64_t val = ReadBE64(p.ckpt + (static_cast<size_t>(b) * 16));
+  uint64_t sd = ReadBE64(p.ckpt + (static_cast<size_t>(b) * 16) + 8);
   const uint32_t r = std::min<uint32_t>(b * kD2PforCheckpointEvery, p.n - 1);
-  if (idx <= r) return static_cast<int64_t>(val);
+  if (idx <= r) {
+    return static_cast<int64_t>(val);
+  }
   // Row 0's checkpoint stored sd[0] itself; every later one stored sd[r-1],
   // so the first step needs dd[r-1] to become sd[r].
   // Invariant while walking: (val, sd) == (v[m], sd[m]). One step is
@@ -1006,10 +1139,14 @@ int64_t D2PforValueAt(const D2PforRegion& p, uint32_t idx) {
   // liable to be "optimised" on the strength of no-overflow. This is the same
   // unsigned walk kDdRice and kDeltaFor already use; only the store back is a
   // reinterpretation, which is what the wraparound is for.
-  if (r != 0) sd += static_cast<uint64_t>(D2PforSecondDiff(p, r - 1));
+  if (r != 0) {
+    sd += static_cast<uint64_t>(D2PforSecondDiff(p, r - 1));
+  }
   for (uint32_t m = r; m < idx; ++m) {
     val += sd;
-    if (m + 2 < p.n) sd += static_cast<uint64_t>(D2PforSecondDiff(p, m));
+    if (m + 2 < p.n) {
+      sd += static_cast<uint64_t>(D2PforSecondDiff(p, m));
+    }
   }
   return static_cast<int64_t>(val);
 }
@@ -1033,11 +1170,15 @@ void DecodeD2PforAll(const D2PforRegion& p, int64_t* out) {
   uint64_t val = ReadBE64(p.ckpt);
   uint64_t sd = ReadBE64(p.ckpt + 8);
   out[0] = static_cast<int64_t>(val);
-  if (p.n == 1) return;
+  if (p.n == 1) {
+    return;
+  }
   for (uint32_t k = 0; k + 1 < p.n; ++k) {
     val += sd;
     out[k + 1] = static_cast<int64_t>(val);
-    if (k + 2 < p.n) sd += static_cast<uint64_t>(D2PforSecondDiff(p, k));
+    if (k + 2 < p.n) {
+      sd += static_cast<uint64_t>(D2PforSecondDiff(p, k));
+    }
   }
 }
 
@@ -1045,7 +1186,7 @@ uint32_t D2PforLowerBound(const D2PforRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.n;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (D2PforValueAt(p, mid) < key) {
       lo = mid + 1;
     } else {
@@ -1093,7 +1234,7 @@ uint64_t SimdForGroups(uint32_t n, uint32_t w) {
 }
 uint64_t SimdForExtent(uint32_t n, uint32_t w) {
   return kSimdForHeaderBytes +
-         static_cast<uint64_t>(kSimdForGroupBytes) * SimdForGroups(n, w);
+         (static_cast<uint64_t>(kSimdForGroupBytes) * SimdForGroups(n, w));
 }
 
 uint64_t SimdForMask(uint32_t w) {
@@ -1107,7 +1248,9 @@ uint64_t SimdForMask(uint32_t w) {
 // exactly like kBitWeave's, so there is no count field to under-state.
 bool ParseSimdForRegion(const char* r, uint32_t n, uint32_t param,
                         const char* end, SimdForRegion* out) {
-  if (param == 0 || param > 64 || !SimdForWidthOk(param)) return false;
+  if (param == 0 || param > 64 || !SimdForWidthOk(param)) {
+    return false;
+  }
   const uint64_t need = SimdForExtent(n, param);
   if (end == nullptr) {
     out->groups = r + kSimdForHeaderBytes;
@@ -1116,7 +1259,9 @@ bool ParseSimdForRegion(const char* r, uint32_t n, uint32_t param,
     out->n = n;
     return true;
   }
-  if (static_cast<uint64_t>(end - r) < need) return false;
+  if (std::cmp_less(end - r, need)) {
+    return false;
+  }
   out->groups = r + kSimdForHeaderBytes;
   out->base = static_cast<int64_t>(ReadBE64(r));
   out->w = param;
@@ -1127,12 +1272,14 @@ bool ParseSimdForRegion(const char* r, uint32_t n, uint32_t param,
 // One value. The four-lane shape means the read is: pick the group, pick the
 // lane, ONE aligned 8-byte load, then a shift by (i div 4) * w.
 int64_t SimdForValueAt(const SimdForRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   const uint32_t gv = SimdForGroupValues(p.w);
   const uint32_t g = idx / gv;
   const uint32_t r = idx % gv;
-  const char* lane = p.groups + static_cast<size_t>(g) * kSimdForGroupBytes +
-                     static_cast<size_t>(r & 3U) * 8U;
+  const char* lane = p.groups + (static_cast<size_t>(g) * kSimdForGroupBytes) +
+                     (static_cast<size_t>(r & 3U) * 8U);
   const uint64_t word = ReadBE64(lane);
   const unsigned shift = (r >> 2) * p.w;
   const uint64_t d = (word >> shift) & SimdForMask(p.w);
@@ -1142,13 +1289,14 @@ int64_t SimdForValueAt(const SimdForRegion& p, uint32_t idx) {
 void DecodeSimdForAll(const SimdForRegion& p, int64_t* out) {
   const uint32_t w = p.w;
   const uint64_t gv = SimdForGroupValues(w);
-  const uint64_t base_u = static_cast<uint64_t>(p.base);
+  const auto base_u = static_cast<uint64_t>(p.base);
   const uint64_t mask = SimdForMask(w);
   for (uint32_t idx = 0; idx < p.n; ++idx) {
-    const uint32_t g = static_cast<uint32_t>(idx / gv);
-    const uint32_t r = static_cast<uint32_t>(idx % gv);
-    const char* lane = p.groups + static_cast<size_t>(g) * kSimdForGroupBytes +
-                       static_cast<size_t>(r & 3U) * 8U;
+    const auto g = static_cast<uint32_t>(idx / gv);
+    const auto r = static_cast<uint32_t>(idx % gv);
+    const char* lane = p.groups +
+                       (static_cast<size_t>(g) * kSimdForGroupBytes) +
+                       (static_cast<size_t>(r & 3U) * 8U);
     const uint64_t word = ReadBE64(lane);
     out[idx] = static_cast<int64_t>(base_u + ((word >> ((r >> 2) * w)) & mask));
   }
@@ -1162,7 +1310,7 @@ uint32_t SimdForLowerBound(const SimdForRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.n;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (SimdForValueAt(p, mid) < key) {
       lo = mid + 1;
     } else {
@@ -1204,20 +1352,24 @@ bool ParseDeltaPForRegion(const char* region, uint32_t n, uint32_t param,
   const uint32_t width = static_cast<uint8_t>(region[8]);
   const uint32_t exception_count = ReadBE16(region + 9);
   const uint32_t blocks = (n + kDeltaPForBlockRows - 1) / kDeltaPForBlockRows;
-  if (width != param || exception_count > n - 1) return false;
+  if (width != param || exception_count > n - 1) {
+    return false;
+  }
   const size_t fixed =
-      11 + static_cast<size_t>(blocks) * kDeltaPForBracketBytes;
+      11 + (static_cast<size_t>(blocks) * kDeltaPForBracketBytes);
   const size_t packed_bytes = (static_cast<size_t>(n - 1) * width + 7) / 8;
   const size_t exception_bytes = static_cast<size_t>(exception_count) * 10;
-  if (fixed > static_cast<size_t>(end - region) ||
+  if (std::cmp_greater(fixed, end - region) ||
       packed_bytes > static_cast<size_t>(end - region) - fixed ||
       exception_bytes >
           static_cast<size_t>(end - region) - fixed - packed_bytes) {
     return false;
   }
 
-  const int64_t delta_min = static_cast<int64_t>(ReadBE64(region));
-  if (delta_min < 0) return false;
+  const auto delta_min = static_cast<int64_t>(ReadBE64(region));
+  if (delta_min < 0) {
+    return false;
+  }
   DeltaPForRegion parsed;
   parsed.brackets = region + 11;
   parsed.packed = parsed.brackets + fixed - 11;
@@ -1230,23 +1382,28 @@ bool ParseDeltaPForRegion(const char* region, uint32_t n, uint32_t param,
 
   for (uint32_t b = 0; b < blocks; ++b) {
     const char* bracket =
-        parsed.brackets + static_cast<size_t>(b) * kDeltaPForBracketBytes;
-    const int64_t first = static_cast<int64_t>(ReadBE64(bracket));
-    const int64_t last = static_cast<int64_t>(ReadBE64(bracket + 8));
-    if (last < first) return false;
-    if (b + 1 < blocks && static_cast<int64_t>(ReadBE64(
-                              bracket + kDeltaPForBracketBytes)) < last) {
+        parsed.brackets + (static_cast<size_t>(b) * kDeltaPForBracketBytes);
+    const auto first = static_cast<int64_t>(ReadBE64(bracket));
+    const auto last = static_cast<int64_t>(ReadBE64(bracket + 8));
+    if (last < first) {
       return false;
+    }
+    if (b + 1 < blocks) {
+      const auto next_first =
+          static_cast<int64_t>(ReadBE64(bracket + kDeltaPForBracketBytes));
+      if (next_first < last) {
+        return false;
+      }
     }
   }
 
   uint32_t previous = 0;
   for (uint32_t k = 0; k < exception_count; ++k) {
-    const char* entry = parsed.exceptions + static_cast<size_t>(k) * 10;
+    const char* entry = parsed.exceptions + (static_cast<size_t>(k) * 10);
     const uint32_t pos = ReadBE16(entry);
-    const int64_t delta = static_cast<int64_t>(ReadBE64(entry + 2));
+    const auto delta = static_cast<int64_t>(ReadBE64(entry + 2));
     if (pos == 0 || pos >= n || (k != 0 && pos <= previous) || delta < 0 ||
-        static_cast<uint64_t>(delta) < parsed.delta_min) {
+        std::cmp_less(delta, parsed.delta_min)) {
       return false;
     }
     const uint64_t offset = static_cast<uint64_t>(delta) - parsed.delta_min;
@@ -1266,9 +1423,9 @@ uint32_t DeltaPForExceptionAtOrAfter(const DeltaPForRegion& p, uint32_t pos) {
   uint32_t lo = 0;
   uint32_t hi = p.exceptions_count;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     const uint32_t candidate =
-        ReadBE16(p.exceptions + static_cast<size_t>(mid) * 10);
+        ReadBE16(p.exceptions + (static_cast<size_t>(mid) * 10));
     if (candidate < pos) {
       lo = mid + 1;
     } else {
@@ -1317,9 +1474,13 @@ uint32_t DeltaPForExceptionAtOrAfter(const DeltaPForRegion& p, uint32_t pos) {
 // family (12 B/run) before building the run table, so a run-saturated column
 // is rejected without materialising it.
 size_t CountRuns(const std::vector<int64_t>& vals) {
-  if (vals.empty()) return 0;
+  if (vals.empty()) {
+    return 0;
+  }
   size_t runs = 1;
-  for (size_t i = 1; i < vals.size(); ++i) runs += (vals[i] != vals[i - 1]);
+  for (size_t i = 1; i < vals.size(); ++i) {
+    runs += static_cast<size_t>(vals[i] != vals[i - 1]);
+  }
   return runs;
 }
 
@@ -1338,7 +1499,7 @@ uint64_t BitRev64(uint64_t x) {
 // position q sits at bit q, so one pdep+tzcnt names it; the portable
 // fallback clears the k highest set bits one at a time (same answer).
 uint64_t SelectFromWord(uint64_t word, uint64_t k) {
-#if defined(__BMI2__)
+#ifdef __BMI2__
   return static_cast<uint64_t>(
       __builtin_ctzll(_pdep_u64(1ULL << k, BitRev64(word))));
 #else
@@ -1359,18 +1520,22 @@ uint64_t SelectFromWord(uint64_t word, uint64_t k) {
 // for the span (avoids signed overflow UB when mn/mx straddle INT64_MIN/MAX)
 // and __uint128 for the bin multiply (avoids wrapping when diff*B > 2^64).
 uint64_t HistogramBin(int64_t v, int64_t mn, int64_t mx, uint64_t B) {
-  const uint64_t mn_u = static_cast<uint64_t>(mn);
-  const uint64_t mx_u = static_cast<uint64_t>(mx);
-  const uint64_t v_u = static_cast<uint64_t>(v);
+  const auto mn_u = static_cast<uint64_t>(mn);
+  const auto mx_u = static_cast<uint64_t>(mx);
+  const auto v_u = static_cast<uint64_t>(v);
   const uint64_t span = mx_u - mn_u;
-  if (span == 0) return 0;
+  if (span == 0) {
+    return 0;
+  }
   // Denominator widened to 128-bit: a column spanning the full i64 domain
   // ([INT64_MIN, INT64_MAX]) yields span == UINT64_MAX, so span + 1 would
   // wrap to 0 and divide by zero.
   const unsigned __int128 num = static_cast<unsigned __int128>(v_u - mn_u) * B;
-  uint64_t idx =
+  auto idx =
       static_cast<uint64_t>(num / (static_cast<unsigned __int128>(span) + 1));
-  if (idx >= B) idx = B - 1;
+  if (idx >= B) {
+    idx = B - 1;
+  }
   return idx;
 }
 
@@ -1378,17 +1543,19 @@ uint64_t HistogramBin(int64_t v, int64_t mn, int64_t mx, uint64_t B) {
 uint32_t PopcountBits(const char* b, uint32_t p) {
   const uint32_t full = p >> 3;
   uint32_t cnt = 0;
-  for (uint32_t i = 0; i < full; ++i)
+  for (uint32_t i = 0; i < full; ++i) {
     cnt += static_cast<uint32_t>(__builtin_popcount(
         static_cast<unsigned int>(static_cast<uint8_t>(b[i]))));
+  }
   const uint32_t rem = p & 7;
   // Only touch the partial byte when bits actually remain: when p is a
   // whole number of bytes AND equals the bitmap length, `b[full]` is one
   // byte past the bitmap (unconditional read = latent OOB).
   if (rem != 0) {
-    const uint8_t last = static_cast<uint8_t>(b[full]);
-    for (uint32_t i = 0; i < rem; ++i)
+    const auto last = static_cast<uint8_t>(b[full]);
+    for (uint32_t i = 0; i < rem; ++i) {
       cnt += static_cast<uint32_t>((last >> (7 - i)) & 1);
+    }
   }
   return cnt;
 }
@@ -1405,7 +1572,7 @@ uint32_t TopKSentinelCount(uint64_t w) {
 }
 
 uint32_t WaveletRRankCount(uint32_t n) {
-  return n / kWaveletRRankEvery + 1 + (n % kWaveletRRankEvery != 0 ? 1 : 0);
+  return (n / kWaveletRRankEvery) + 1 + (n % kWaveletRRankEvery != 0 ? 1 : 0);
 }
 
 bool ParseWaveletRRegion(const char* r, uint32_t n, uint32_t param,
@@ -1416,28 +1583,32 @@ bool ParseWaveletRRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t width = static_cast<uint8_t>(r[8]);
-  if (width == 0 || width > 64) return false;
+  if (width == 0 || width > 64) {
+    return false;
+  }
   const uint32_t stride = (n + 7) / 8;
   const uint32_t rank_count = WaveletRRankCount(n);
-  const uint64_t need = 9 + static_cast<uint64_t>(width) * stride +
-                        static_cast<uint64_t>(width) * rank_count * 2;
-  if (need > static_cast<uint64_t>(end - r)) return false;
+  const uint64_t need = 9 + (static_cast<uint64_t>(width) * stride) +
+                        (static_cast<uint64_t>(width) * rank_count * 2);
+  if (std::cmp_greater(need, end - r)) {
+    return false;
+  }
 
   WaveletRRegion p;
   p.bitmaps = r + 9;
-  p.ranks = p.bitmaps + static_cast<size_t>(width) * stride;
+  p.ranks = p.bitmaps + (static_cast<size_t>(width) * stride);
   p.minimum = static_cast<int64_t>(ReadBE64(r));
   p.n = n;
   p.width = width;
   p.stride = stride;
   p.rank_count = rank_count;
   for (uint32_t level = 0; level < width; ++level) {
-    const char* bitmap = p.bitmaps + static_cast<size_t>(level) * stride;
-    const char* table = p.ranks + static_cast<size_t>(level) * rank_count * 2;
+    const char* bitmap = p.bitmaps + (static_cast<size_t>(level) * stride);
+    const char* table = p.ranks + (static_cast<size_t>(level) * rank_count * 2);
     for (uint32_t block = 0; block < rank_count; ++block) {
       const uint32_t position =
           block * kWaveletRRankEvery >= n ? n : block * kWaveletRRankEvery;
-      if (ReadBE16(table + static_cast<size_t>(block) * 2) !=
+      if (ReadBE16(table + (static_cast<size_t>(block) * 2)) !=
           PopcountBits(bitmap, position)) {
         return false;
       }
@@ -1451,18 +1622,19 @@ uint32_t WaveletRRankOne(const WaveletRRegion& p, uint32_t level,
                          uint32_t position) {
   const uint32_t block = position / kWaveletRRankEvery;
   const uint32_t start = block * kWaveletRRankEvery;
-  const char* bitmap = p.bitmaps + static_cast<size_t>(level) * p.stride;
-  const char* table = p.ranks + static_cast<size_t>(level) * p.rank_count * 2;
-  uint32_t rank = ReadBE16(table + static_cast<size_t>(block) * 2);
+  const char* bitmap = p.bitmaps + (static_cast<size_t>(level) * p.stride);
+  const char* table = p.ranks + (static_cast<size_t>(level) * p.rank_count * 2);
+  uint32_t rank = ReadBE16(table + (static_cast<size_t>(block) * 2));
   const uint32_t offset = position - start;
   const uint32_t words = offset / 64;
   for (uint32_t i = 0; i < words; ++i) {
     rank += static_cast<uint32_t>(__builtin_popcountll(
-        ReadBE64(bitmap + start / 8 + static_cast<size_t>(i) * 8)));
+        ReadBE64(bitmap + (start / 8) + (static_cast<size_t>(i) * 8))));
   }
   const uint32_t bits = offset & 63U;
   if (bits != 0) {
-    const char* partial = bitmap + start / 8 + static_cast<size_t>(words) * 8;
+    const char* partial =
+        bitmap + (start / 8) + (static_cast<size_t>(words) * 8);
     for (uint32_t i = 0; i < bits; ++i) {
       rank += static_cast<uint8_t>(partial[i >> 3] >> (7U - (i & 7U))) & 1U;
     }
@@ -1474,7 +1646,7 @@ uint64_t WaveletRValueAt(const WaveletRRegion& p, uint32_t index) {
   uint64_t value = 0;
   uint32_t position = index;
   for (uint32_t level = 0; level < p.width; ++level) {
-    const char* bitmap = p.bitmaps + static_cast<size_t>(level) * p.stride;
+    const char* bitmap = p.bitmaps + (static_cast<size_t>(level) * p.stride);
     const uint32_t rank = WaveletRRankOne(p, level, position);
     const uint32_t bit =
         static_cast<uint8_t>(bitmap[position >> 3] >> (7U - (position & 7U))) &
@@ -1536,7 +1708,7 @@ uint64_t WaveletRPrefixCount(const WaveletRRegion& p, uint64_t bound,
   uint64_t count = 0;
   for (uint32_t level = 0; level < p.width && left < right; ++level) {
     const uint32_t shift = p.width - 1 - level;
-    const uint32_t bit = static_cast<uint32_t>((bound >> shift) & 1U);
+    const auto bit = static_cast<uint32_t>((bound >> shift) & 1U);
     const uint32_t left_rank = WaveletRRankOne(p, level, left);
     const uint32_t right_rank = WaveletRRankOne(p, level, right);
     const uint32_t zeros = p.n - WaveletRRankOne(p, level, p.n);
@@ -1549,13 +1721,17 @@ uint64_t WaveletRPrefixCount(const WaveletRRegion& p, uint64_t bound,
       right = zeros + right_rank;
     }
   }
-  if (inclusive && left < right) count += right - left;
+  if (inclusive && left < right) {
+    count += right - left;
+  }
   return count;
 }
 
 uint64_t WaveletRSumRange(const WaveletRRegion& p, uint32_t level,
                           uint32_t left, uint32_t right) {
-  if (left >= right || level == p.width) return 0;
+  if (left >= right || level == p.width) {
+    return 0;
+  }
   const uint32_t left_rank = WaveletRRankOne(p, level, left);
   const uint32_t right_rank = WaveletRRankOne(p, level, right);
   const uint32_t zeros = p.n - WaveletRRankOne(p, level, p.n);
@@ -1574,7 +1750,9 @@ uint64_t WaveletRSumRange(const WaveletRRegion& p, uint32_t level,
 uint64_t WaveletRRangeSum(const WaveletRRegion& p, uint32_t level,
                           uint32_t left, uint32_t right, uint64_t prefix,
                           uint32_t remaining, uint64_t low, uint64_t high) {
-  if (left >= right) return 0;
+  if (left >= right) {
+    return 0;
+  }
   if (remaining == 0) {
     return prefix >= low && prefix <= high
                ? static_cast<uint64_t>(right - left) * prefix
@@ -1582,9 +1760,11 @@ uint64_t WaveletRRangeSum(const WaveletRRegion& p, uint32_t level,
   }
   const uint64_t node_max =
       remaining == 64 ? UINT64_MAX : prefix | ((1ULL << remaining) - 1ULL);
-  if (node_max < low || prefix > high) return 0;
+  if (node_max < low || prefix > high) {
+    return 0;
+  }
   if (low <= prefix && node_max <= high) {
-    return static_cast<uint64_t>(right - left) * prefix +
+    return (static_cast<uint64_t>(right - left) * prefix) +
            WaveletRSumRange(p, level, left, right);
   }
   const uint32_t left_rank = WaveletRRankOne(p, level, left);
@@ -1607,21 +1787,31 @@ bool WaveletRRegionFold(const WaveletRRegion& p, PaxChunk::CompareOp op,
                         int64_t* sum_out) {
   uint64_t low = 0;
   uint64_t high = 0;
-  if (!WaveletRNormalizedRange(p, op, literal, &low, &high)) return false;
+  if (!WaveletRNormalizedRange(p, op, literal, &low, &high)) {
+    return false;
+  }
   if (low > high) {
-    if (count_out != nullptr) *count_out = 0;
-    if (sum_out != nullptr) *sum_out = 0;
+    if (count_out != nullptr) {
+      *count_out = 0;
+    }
+    if (sum_out != nullptr) {
+      *sum_out = 0;
+    }
     return true;
   }
   uint64_t count = WaveletRPrefixCount(p, high, true);
-  if (low != 0) count -= WaveletRPrefixCount(p, low, false);
+  if (low != 0) {
+    count -= WaveletRPrefixCount(p, low, false);
+  }
   uint64_t normalized = 0;
   if (sum_out != nullptr) {
     normalized = WaveletRRangeSum(p, 0, 0, p.n, 0, p.width, low, high);
   }
-  if (count_out != nullptr) *count_out = count;
+  if (count_out != nullptr) {
+    *count_out = count;
+  }
   if (sum_out != nullptr) {
-    *sum_out = static_cast<int64_t>(static_cast<uint64_t>(p.minimum) * count +
+    *sum_out = static_cast<int64_t>((static_cast<uint64_t>(p.minimum) * count) +
                                     normalized);
   }
   return true;
@@ -1629,8 +1819,8 @@ bool WaveletRRegionFold(const WaveletRRegion& p, PaxChunk::CompareOp op,
 
 __int128 QppModelValue(const QppPage& p, uint32_t index) {
   const __int128 i = index;
-  return static_cast<__int128>(p.a) + i * static_cast<__int128>(p.d1) +
-         (i * (i - 1) / 2) * static_cast<__int128>(p.d2);
+  return static_cast<__int128>(p.a) + (i * static_cast<__int128>(p.d1)) +
+         ((i * (i - 1) / 2) * static_cast<__int128>(p.d2));
 }
 
 bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
@@ -1641,7 +1831,9 @@ bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
   }
   const uint32_t pages = ReadBE16(region);
   const uint32_t want_pages = (n + kQppPageRows - 1) / kQppPageRows;
-  if (pages == 0 || pages != param || pages != want_pages) return false;
+  if (pages == 0 || pages != param || pages != want_pages) {
+    return false;
+  }
 
   const char* cursor = region + 2;
   QppRegion parsed;
@@ -1649,7 +1841,9 @@ bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
   parsed.pages = pages;
   parsed.end = end;
   for (uint32_t page_index = 0; page_index < pages; ++page_index) {
-    if (cursor + 26 > end) return false;
+    if (cursor + 26 > end) {
+      return false;
+    }
     const uint32_t start = page_index * kQppPageRows;
     const uint32_t rows = std::min<uint32_t>(kQppPageRows, n - start);
     QppPage page;
@@ -1659,42 +1853,50 @@ bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
     page.exception_count = ReadBE16(cursor + 24);
     page.rows = rows;
     cursor += 26;
-    if (page.exception_count > rows) return false;
+    if (page.exception_count > rows) {
+      return false;
+    }
     const size_t bitmap_bytes = page.exception_count == 0 ? 0 : (rows + 7) / 8;
-    if (bitmap_bytes > static_cast<size_t>(end - cursor)) return false;
+    if (std::cmp_greater(bitmap_bytes, end - cursor)) {
+      return false;
+    }
     if (page.exception_count != 0) {
       page.bitmap = reinterpret_cast<const uint8_t*>(cursor);
       page.exceptions = cursor + bitmap_bytes;
-      if (page.exceptions + static_cast<size_t>(page.exception_count) * 10 >
+      if (page.exceptions + (static_cast<size_t>(page.exception_count) * 10) >
           end) {
         return false;
       }
       uint32_t ones = 0;
       for (uint32_t byte_index = 0; byte_index < bitmap_bytes; ++byte_index) {
-        uint8_t byte = static_cast<uint8_t>(page.bitmap[byte_index]);
+        auto byte = static_cast<uint8_t>(page.bitmap[byte_index]);
         if (byte_index + 1 == bitmap_bytes && (rows & 7U) != 0) {
-          const uint8_t tail =
-              static_cast<uint8_t>(0xFFu << (8U - (rows & 7U)));
-          if ((byte & static_cast<uint8_t>(~tail)) != 0) return false;
+          const auto tail = static_cast<uint8_t>(0xFFU << (8U - (rows & 7U)));
+          if ((byte & static_cast<uint8_t>(~tail)) != 0) {
+            return false;
+          }
           byte = static_cast<uint8_t>(byte & tail);
         }
         ones += static_cast<uint32_t>(
             __builtin_popcount(static_cast<unsigned int>(byte)));
       }
-      if (ones != page.exception_count) return false;
+      if (ones != page.exception_count) {
+        return false;
+      }
       uint32_t previous = 0;
       for (uint32_t k = 0; k < page.exception_count; ++k) {
-        const char* entry = page.exceptions + static_cast<size_t>(k) * 10;
+        const char* entry = page.exceptions + (static_cast<size_t>(k) * 10);
         const uint32_t position = ReadBE16(entry);
-        const int64_t value = static_cast<int64_t>(ReadBE64(entry + 2));
+        const auto value = static_cast<int64_t>(ReadBE64(entry + 2));
         if (position >= rows || (k != 0 && position <= previous) ||
-            (page.bitmap[position >> 3] & (0x80u >> (position & 7U))) == 0 ||
+            (page.bitmap[position >> 3] & (0x80U >> (position & 7U))) == 0 ||
             QppModelValue(page, position) == value) {
           return false;
         }
         previous = position;
       }
-      cursor = page.exceptions + static_cast<size_t>(page.exception_count) * 10;
+      cursor =
+          page.exceptions + (static_cast<size_t>(page.exception_count) * 10);
     }
     for (uint32_t i = 0; i < rows; ++i) {
       const __int128 value = QppModelValue(page, i);
@@ -1705,24 +1907,28 @@ bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
     }
     parsed.page[page_index] = page;
   }
-  if (cursor != end) return false;
+  if (cursor != end) {
+    return false;
+  }
   *out = parsed;
   return true;
 }
 
 int64_t QppValueAt(const QppRegion& region, uint32_t index) {
-  if (index >= region.n) return 0;
+  if (index >= region.n) {
+    return 0;
+  }
   const uint32_t page_index = index / kQppPageRows;
   const uint32_t local = index % kQppPageRows;
   const QppPage& page = region.page[page_index];
   if (page.exception_count != 0 &&
-      (page.bitmap[local >> 3] & (0x80u >> (local & 7U))) != 0) {
+      (page.bitmap[local >> 3] & (0x80U >> (local & 7U))) != 0) {
     uint32_t low = 0;
     uint32_t high = page.exception_count;
     while (low < high) {
-      const uint32_t middle = low + (high - low) / 2;
+      const uint32_t middle = low + ((high - low) / 2);
       const uint32_t position =
-          ReadBE16(page.exceptions + static_cast<size_t>(middle) * 10);
+          ReadBE16(page.exceptions + (static_cast<size_t>(middle) * 10));
       if (position < local) {
         low = middle + 1;
       } else {
@@ -1730,7 +1936,7 @@ int64_t QppValueAt(const QppRegion& region, uint32_t index) {
       }
     }
     if (low < page.exception_count) {
-      const char* entry = page.exceptions + static_cast<size_t>(low) * 10;
+      const char* entry = page.exceptions + (static_cast<size_t>(low) * 10);
       if (ReadBE16(entry) == local) {
         return static_cast<int64_t>(ReadBE64(entry + 2));
       }
@@ -1757,16 +1963,19 @@ bool QppMatch(PaxChunk::CompareOp op, int64_t literal, int64_t value) {
 }
 
 size_t QppSegments(const QppPage& page, std::array<QppSegment, 2>& segments) {
-  if (page.rows == 0) return 0;
+  if (page.rows == 0) {
+    return 0;
+  }
   if (page.rows == 1 || page.d2 == 0) {
-    segments[0] = QppSegment{0, page.rows, page.d1 >= 0};
+    segments[0] =
+        QppSegment{.begin = 0, .end = page.rows, .increasing = page.d1 >= 0};
     return 1;
   }
   bool found = false;
   uint32_t turn = page.rows - 1;
   for (uint32_t i = 0; i + 1 < page.rows; ++i) {
     const __int128 delta =
-        static_cast<__int128>(page.d1) + static_cast<__int128>(i) * page.d2;
+        static_cast<__int128>(page.d1) + (static_cast<__int128>(i) * page.d2);
     if ((page.d2 > 0 && delta >= 0) || (page.d2 < 0 && delta <= 0)) {
       turn = i;
       found = true;
@@ -1774,31 +1983,40 @@ size_t QppSegments(const QppPage& page, std::array<QppSegment, 2>& segments) {
     }
   }
   if (!found) {
-    segments[0] = QppSegment{0, page.rows, page.d2 < 0};
+    segments[0] =
+        QppSegment{.begin = 0, .end = page.rows, .increasing = page.d2 < 0};
     return 1;
   }
   if (turn == 0) {
-    segments[0] = QppSegment{0, page.rows, page.d2 > 0};
+    segments[0] =
+        QppSegment{.begin = 0, .end = page.rows, .increasing = page.d2 > 0};
     return 1;
   }
-  segments[0] = QppSegment{0, turn, page.d2 < 0};
-  segments[1] = QppSegment{turn, page.rows, page.d2 > 0};
+  segments[0] = QppSegment{.begin = 0, .end = turn, .increasing = page.d2 < 0};
+  segments[1] =
+      QppSegment{.begin = turn, .end = page.rows, .increasing = page.d2 > 0};
   return 2;
 }
 
 uint32_t QppFirstGe(const QppPage& page, const QppSegment& segment,
                     __int128 target) {
-  if (segment.begin >= segment.end) return segment.begin;
+  if (segment.begin >= segment.end) {
+    return segment.begin;
+  }
   if (!segment.increasing) {
     return QppModelValue(page, segment.begin) >= target ? segment.begin
                                                         : segment.end;
   }
-  if (QppModelValue(page, segment.begin) >= target) return segment.begin;
-  if (QppModelValue(page, segment.end - 1) < target) return segment.end;
+  if (QppModelValue(page, segment.begin) >= target) {
+    return segment.begin;
+  }
+  if (QppModelValue(page, segment.end - 1) < target) {
+    return segment.end;
+  }
   uint32_t low = segment.begin;
   uint32_t high = segment.end;
   while (low < high) {
-    const uint32_t middle = low + (high - low) / 2;
+    const uint32_t middle = low + ((high - low) / 2);
     if (QppModelValue(page, middle) >= target) {
       high = middle;
     } else {
@@ -1810,17 +2028,23 @@ uint32_t QppFirstGe(const QppPage& page, const QppSegment& segment,
 
 uint32_t QppFirstGt(const QppPage& page, const QppSegment& segment,
                     __int128 target) {
-  if (segment.begin >= segment.end) return segment.begin;
+  if (segment.begin >= segment.end) {
+    return segment.begin;
+  }
   if (!segment.increasing) {
     return QppModelValue(page, segment.begin) > target ? segment.begin
                                                        : segment.end;
   }
-  if (QppModelValue(page, segment.begin) > target) return segment.begin;
-  if (QppModelValue(page, segment.end - 1) <= target) return segment.end;
+  if (QppModelValue(page, segment.begin) > target) {
+    return segment.begin;
+  }
+  if (QppModelValue(page, segment.end - 1) <= target) {
+    return segment.end;
+  }
   uint32_t low = segment.begin;
   uint32_t high = segment.end;
   while (low < high) {
-    const uint32_t middle = low + (high - low) / 2;
+    const uint32_t middle = low + ((high - low) / 2);
     if (QppModelValue(page, middle) > target) {
       high = middle;
     } else {
@@ -1831,31 +2055,41 @@ uint32_t QppFirstGt(const QppPage& page, const QppSegment& segment,
 }
 
 __int128 QppChoose3(uint32_t value) {
-  if (value < 3) return 0;
+  if (value < 3) {
+    return 0;
+  }
   const __int128 x = value;
   return x * (x - 1) * (x - 2) / 6;
 }
 
 __int128 QppModelSum(const QppPage& page, uint32_t begin, uint32_t end) {
-  if (begin >= end) return 0;
+  if (begin >= end) {
+    return 0;
+  }
   const __int128 count = end - begin;
   const __int128 first = begin;
   const __int128 last = end - 1;
   const __int128 index_sum = count * (first + last) / 2;
   const __int128 combination_sum = QppChoose3(end) - QppChoose3(begin);
-  return count * page.a + index_sum * page.d1 + combination_sum * page.d2;
+  return (count * page.a) + (index_sum * page.d1) + (combination_sum * page.d2);
 }
 
 uint32_t QppFirstLe(const QppPage& page, const QppSegment& segment,
                     __int128 target) {
-  if (segment.begin >= segment.end) return segment.begin;
+  if (segment.begin >= segment.end) {
+    return segment.begin;
+  }
   if (!segment.increasing) {
-    if (QppModelValue(page, segment.begin) <= target) return segment.begin;
-    if (QppModelValue(page, segment.end - 1) > target) return segment.end;
+    if (QppModelValue(page, segment.begin) <= target) {
+      return segment.begin;
+    }
+    if (QppModelValue(page, segment.end - 1) > target) {
+      return segment.end;
+    }
     uint32_t low = segment.begin;
     uint32_t high = segment.end;
     while (low < high) {
-      const uint32_t middle = low + (high - low) / 2;
+      const uint32_t middle = low + ((high - low) / 2);
       if (QppModelValue(page, middle) <= target) {
         high = middle;
       } else {
@@ -1869,14 +2103,20 @@ uint32_t QppFirstLe(const QppPage& page, const QppSegment& segment,
 
 uint32_t QppFirstLt(const QppPage& page, const QppSegment& segment,
                     __int128 target) {
-  if (segment.begin >= segment.end) return segment.begin;
+  if (segment.begin >= segment.end) {
+    return segment.begin;
+  }
   if (!segment.increasing) {
-    if (QppModelValue(page, segment.begin) < target) return segment.begin;
-    if (QppModelValue(page, segment.end - 1) >= target) return segment.end;
+    if (QppModelValue(page, segment.begin) < target) {
+      return segment.begin;
+    }
+    if (QppModelValue(page, segment.end - 1) >= target) {
+      return segment.end;
+    }
     uint32_t low = segment.begin;
     uint32_t high = segment.end;
     while (low < high) {
-      const uint32_t middle = low + (high - low) / 2;
+      const uint32_t middle = low + ((high - low) / 2);
       if (QppModelValue(page, middle) < target) {
         high = middle;
       } else {
@@ -1885,12 +2125,16 @@ uint32_t QppFirstLt(const QppPage& page, const QppSegment& segment,
     }
     return low;
   }
-  if (QppModelValue(page, segment.begin) < target) return segment.begin;
-  if (QppModelValue(page, segment.end - 1) >= target) return segment.end;
+  if (QppModelValue(page, segment.begin) < target) {
+    return segment.begin;
+  }
+  if (QppModelValue(page, segment.end - 1) >= target) {
+    return segment.end;
+  }
   uint32_t low = segment.begin;
   uint32_t high = segment.end;
   while (low < high) {
-    const uint32_t middle = low + (high - low) / 2;
+    const uint32_t middle = low + ((high - low) / 2);
     if (QppModelValue(page, middle) < target) {
       high = middle;
     } else {
@@ -1914,7 +2158,7 @@ size_t QppModelRanges(const QppPage& page, __int128 low, __int128 high,
     const uint32_t begin = std::max(left, segment.begin);
     const uint32_t end = std::min(right, segment.end);
     if (begin < end) {
-      ranges[range_count++] = QppRange{begin, end};
+      ranges[range_count++] = QppRange{.begin = begin, .end = end};
     }
   }
   return range_count;
@@ -1926,11 +2170,10 @@ void QppPatchExceptionCount(const QppRegion& region, PaxChunk::CompareOp op,
   for (uint32_t p = 0; p < region.pages; ++p) {
     const QppPage& page = region.page[p];
     for (uint32_t k = 0; k < page.exception_count; ++k) {
-      const char* entry = page.exceptions + static_cast<size_t>(k) * 10;
+      const char* entry = page.exceptions + (static_cast<size_t>(k) * 10);
       const uint32_t local = ReadBE16(entry);
-      const int64_t actual = static_cast<int64_t>(ReadBE64(entry + 2));
-      const int64_t predicted =
-          static_cast<int64_t>(QppModelValue(page, local));
+      const auto actual = static_cast<int64_t>(ReadBE64(entry + 2));
+      const auto predicted = static_cast<int64_t>(QppModelValue(page, local));
       const bool old_hit = predicted >= low && predicted <= high;
       const bool new_hit = QppMatch(op, literal, actual);
       if (old_hit) {
@@ -1962,7 +2205,9 @@ bool QppScanMatch(int64_t value, ScanOp op, int64_t literal) {
 }
 
 void QppSetMaskRange(uint64_t* out, uint32_t begin, uint32_t end) {
-  if (begin >= end) return;
+  if (begin >= end) {
+    return;
+  }
   const uint32_t first_word = begin >> 6;
   const uint32_t last_word = (end - 1) >> 6;
   const uint64_t first_mask = ~0ULL << (begin & 63U);
@@ -1984,9 +2229,9 @@ __int128 QppRegionSumAll(const QppRegion& region) {
     const QppPage& page = region.page[p];
     sum += QppModelSum(page, 0, page.rows);
     for (uint32_t k = 0; k < page.exception_count; ++k) {
-      const char* entry = page.exceptions + static_cast<size_t>(k) * 10;
+      const char* entry = page.exceptions + (static_cast<size_t>(k) * 10);
       const uint32_t local = ReadBE16(entry);
-      const int64_t actual = static_cast<int64_t>(ReadBE64(entry + 2));
+      const auto actual = static_cast<int64_t>(ReadBE64(entry + 2));
       sum += actual - QppModelValue(page, local);
     }
   }
@@ -2021,22 +2266,23 @@ void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
     std::array<QppRange, 2> ranges{};
     const size_t range_count = QppModelRanges(page, low, high, ranges);
     for (size_t i = 0; i < range_count; ++i) {
-      QppSetMaskRange(out, p * kQppPageRows + ranges[i].begin,
-                      p * kQppPageRows + ranges[i].end);
+      QppSetMaskRange(out, (p * kQppPageRows) + ranges[i].begin,
+                      (p * kQppPageRows) + ranges[i].end);
     }
   }
   for (uint32_t p = 0; p < region.pages; ++p) {
     const QppPage& page = region.page[p];
     for (uint32_t k = 0; k < page.exception_count; ++k) {
-      const char* entry = page.exceptions + static_cast<size_t>(k) * 10;
+      const char* entry = page.exceptions + (static_cast<size_t>(k) * 10);
       const uint32_t local = ReadBE16(entry);
-      const int64_t actual = static_cast<int64_t>(ReadBE64(entry + 2));
-      const int64_t predicted =
-          static_cast<int64_t>(QppModelValue(page, local));
+      const auto actual = static_cast<int64_t>(ReadBE64(entry + 2));
+      const auto predicted = static_cast<int64_t>(QppModelValue(page, local));
       const bool old_hit = predicted >= low && predicted <= high;
       const bool new_hit = QppScanMatch(actual, op, literal);
-      if (old_hit == new_hit) continue;
-      const uint32_t row = p * kQppPageRows + local;
+      if (old_hit == new_hit) {
+        continue;
+      }
+      const uint32_t row = (p * kQppPageRows) + local;
       if (new_hit) {
         out[row >> 6] |= 1ULL << (row & 63U);
       } else {
@@ -2047,7 +2293,9 @@ void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
 }
 
 void DecodeQppAll(const QppRegion& region, int64_t* out) {
-  for (uint32_t i = 0; i < region.n; ++i) out[i] = QppValueAt(region, i);
+  for (uint32_t i = 0; i < region.n; ++i) {
+    out[i] = QppValueAt(region, i);
+  }
 }
 
 // Bit-writer/reader used by the Gorilla XOR-stream. Bits are appended/consumed
@@ -2089,12 +2337,12 @@ uint32_t HuffDictLenAt(const HuffDictRegion& r, uint32_t s) {
 int64_t HuffDictDictAt(const HuffDictRegion& r, uint32_t s) {
   return static_cast<int64_t>(
       ReadBE64(reinterpret_cast<const char*>(r.dict) +
-               static_cast<size_t>(s) * sizeof(int64_t)));
+               (static_cast<size_t>(s) * sizeof(int64_t))));
 }
 
 uint32_t HuffDictFreqAt(const HuffDictRegion& r, uint32_t s) {
   return ReadBE16(reinterpret_cast<const char*>(r.freq) +
-                  static_cast<size_t>(s) * 2);
+                  (static_cast<size_t>(s) * 2));
 }
 
 // Canonical decode tables rebuilt from the nibble lengths: inflate's
@@ -2109,14 +2357,15 @@ void HuffDictBuildTables(const HuffDictRegion& r, HuffDictTables* t) {
     t->count[len] = 0;
     t->offset[len] = 0;
   }
-  for (uint32_t s = 0; s < r.d; ++s) ++t->count[HuffDictLenAt(r, s)];
+  for (uint32_t s = 0; s < r.d; ++s) {
+    ++t->count[HuffDictLenAt(r, s)];
+  }
   uint16_t running = 0;
   for (uint32_t len = 1; len <= kHuffDictMaxLen; ++len) {
     t->offset[len] = running;
     running = static_cast<uint16_t>(running + t->count[len]);
   }
-  uint16_t fill[kHuffDictMaxLen + 1];
-  for (uint32_t len = 0; len <= kHuffDictMaxLen; ++len) fill[len] = 0;
+  std::array<uint16_t, kHuffDictMaxLen + 1> fill{};
   for (uint32_t len = 1; len <= kHuffDictMaxLen; ++len) {
     fill[len] = t->offset[len];
   }
@@ -2124,11 +2373,11 @@ void HuffDictBuildTables(const HuffDictRegion& r, HuffDictTables* t) {
     t->sym_sorted[fill[HuffDictLenAt(r, s)]++] = static_cast<uint16_t>(s);
   }
   // Canonical code assignment (RFC 1951 3.2.2) replayed to populate the LUT.
-  uint32_t bl_count[kHuffDictMaxLen + 1] = {};
+  std::array<uint32_t, kHuffDictMaxLen + 1> bl_count{};
   for (uint32_t len = 1; len <= kHuffDictMaxLen; ++len) {
     bl_count[len] = t->count[len];
   }
-  uint32_t next_code[kHuffDictMaxLen + 1] = {};
+  std::array<uint32_t, kHuffDictMaxLen + 1> next_code{};
   uint32_t code = 0;
   for (uint32_t bits = 1; bits <= kHuffDictMaxLen; ++bits) {
     code = (code + bl_count[bits - 1]) << 1;
@@ -2156,7 +2405,9 @@ uint32_t HuffDictDecodeSym(const HuffDictTables& t, WordBitReader& br) {
   // Zero-pad the window when the stream ends mid-peek: get_slow returns the
   // collected bits WITHOUT shifting in the missing zero padding, and the LUT
   // indexes the code's true 8-bit projection.
-  if (br.bitpos < pos + 8) peek <<= (pos + 8) - br.bitpos;
+  if (br.bitpos < pos + 8) {
+    peek <<= (pos + 8) - br.bitpos;
+  }
   if (t.lut_len[peek] != 0) {
     br.bitpos = pos + t.lut_len[peek];  // net consumption = the code length
     return t.lut_sym[peek];
@@ -2193,37 +2444,51 @@ bool ParseHuffDictRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t d = ReadBE16(r);
-  if (d == 0 || d != param || d > kHuffDictMaxCodes) return false;
+  if (d == 0 || d != param || d > kHuffDictMaxCodes) {
+    return false;
+  }
   const uint64_t ncp_want =
       static_cast<uint64_t>(n + kHuffDictCheckpoint - 1) / kHuffDictCheckpoint;
-  const uint64_t lens_off = 2 + 8ULL * d;
-  const uint64_t freq_off = lens_off + (d + 1) / 2;
-  const uint64_t ncp_off = freq_off + 2ULL * d;
+  const uint64_t lens_off = 2 + (8ULL * d);
+  const uint64_t freq_off = lens_off + ((d + 1) / 2);
+  const uint64_t ncp_off = freq_off + (2ULL * d);
   const uint64_t ckpt_off = ncp_off + 2;
-  const uint64_t slen_off = ckpt_off + 4ULL * ncp_want;
+  const uint64_t slen_off = ckpt_off + (4ULL * ncp_want);
   const uint64_t have =
       (end != nullptr) ? static_cast<uint64_t>(end - r) : UINT64_MAX;
-  if (slen_off + 4 > have) return false;
+  if (slen_off + 4 > have) {
+    return false;
+  }
   const uint32_t ncp = ReadBE16(r + ncp_off);
-  if (ncp == 0 || ncp != ncp_want) return false;
+  if (ncp == 0 || ncp != ncp_want) {
+    return false;
+  }
   const uint32_t stream_len = ReadBE32(r + slen_off);
   // n >= 1 rows always emit >= 1 bit.
-  if (stream_len == 0 || slen_off + 4 + stream_len > have) return false;
-  const uint8_t* base = reinterpret_cast<const uint8_t*>(r);
+  if (stream_len == 0 || slen_off + 4 + stream_len > have) {
+    return false;
+  }
+  const auto* base = reinterpret_cast<const uint8_t*>(r);
   const uint8_t* lens = base + lens_off;
   uint64_t kraft = 0;
   for (uint32_t s = 0; s < d; ++s) {
     const uint32_t len = HuffDictLenAtRaw(lens, s);
-    if (len < 1 || len > kHuffDictMaxLen) return false;
+    if (len < 1 || len > kHuffDictMaxLen) {
+      return false;
+    }
     kraft += UINT64_C(1) << (kHuffDictMaxLen - len);
   }
-  if (kraft != (UINT64_C(1) << kHuffDictMaxLen)) return false;
+  if (kraft != (UINT64_C(1) << kHuffDictMaxLen)) {
+    return false;
+  }
   const uint8_t* ckpt = base + ckpt_off;
   uint64_t prev = 0;
   for (uint32_t k = 0; k < ncp; ++k) {
     const uint64_t bit = ReadBE32(reinterpret_cast<const char*>(ckpt) +
-                                  static_cast<size_t>(k) * 4);
-    if (k == 0 && bit != 0) return false;
+                                  (static_cast<size_t>(k) * 4));
+    if (k == 0 && bit != 0) {
+      return false;
+    }
     if (bit < prev || bit >= static_cast<uint64_t>(stream_len) * 8) {
       return false;
     }
@@ -2233,11 +2498,15 @@ bool ParseHuffDictRegion(const char* r, uint32_t n, uint32_t param,
   uint64_t fsum = 0;
   for (uint32_t s = 0; s < d; ++s) {
     const uint32_t f = ReadBE16(reinterpret_cast<const char*>(freq) +
-                                static_cast<size_t>(s) * 2);
-    if (f == 0 || f > n) return false;
+                                (static_cast<size_t>(s) * 2));
+    if (f == 0 || f > n) {
+      return false;
+    }
     fsum += f;
   }
-  if (fsum != n) return false;
+  if (fsum != n) {
+    return false;
+  }
   out->d = d;
   out->n = n;
   out->ncp = ncp;
@@ -2254,17 +2523,23 @@ bool ParseHuffDictRegion(const char* r, uint32_t n, uint32_t param,
 // symbols, take the last. The complete tree decodes every bit pattern to a
 // valid symbol, so a truncated hostile stream still stays in-bounds.
 int64_t HuffDictValueAt(const HuffDictRegion& v, uint32_t i) {
-  if (i >= v.n) return 0;
+  if (i >= v.n) {
+    return 0;
+  }
   HuffDictTables t;
   HuffDictBuildTables(v, &t);
   WordBitReader br(reinterpret_cast<const char*>(v.stream),
                    reinterpret_cast<const char*>(v.stream + v.stream_len));
   br.bitpos = ReadBE32(reinterpret_cast<const char*>(v.ckpt) +
-                       static_cast<size_t>(i / kHuffDictCheckpoint) * 4);
+                       (static_cast<size_t>(i / kHuffDictCheckpoint) * 4));
   const uint32_t replay = (i % kHuffDictCheckpoint) + 1;
   uint32_t sym = 0;
-  for (uint32_t k = 0; k < replay; ++k) sym = HuffDictDecodeSym(t, br);
-  if (sym >= v.d) return 0;  // unreachable on a Kraft-complete table
+  for (uint32_t k = 0; k < replay; ++k) {
+    sym = HuffDictDecodeSym(t, br);
+  }
+  if (sym >= v.d) {
+    return 0;  // unreachable on a Kraft-complete table
+  }
   return HuffDictDictAt(v, sym);
 }
 
@@ -2316,7 +2591,7 @@ void DecodeHuffDictAll(const HuffDictRegion& v, int64_t* out) {
 // reason kDeltaFp still wins on a clean ramp (328 vs 409 bytes measured).
 uint64_t S4HeaderBytes(uint32_t n) {
   const uint64_t nblk = (n + kS4Block - 1) / kS4Block;
-  return 9 + nblk + 8 * nblk + 8 * (nblk - 1);
+  return 9 + nblk + (8 * nblk) + (8 * (nblk - 1));
 }
 
 uint32_t S4BlockRows(const S4Region& p, uint32_t b) {
@@ -2331,7 +2606,7 @@ int S4Width(const S4Region& p, uint32_t b) {
 }
 
 int64_t S4Base(const S4Region& p, uint32_t b) {
-  return static_cast<int64_t>(ReadBE64(p.lows + 8 * static_cast<size_t>(b)));
+  return static_cast<int64_t>(ReadBE64(p.lows + (8 * static_cast<size_t>(b))));
 }
 
 // Byte offset of block b's payload. Blocks are byte-aligned, so this is pure
@@ -2359,7 +2634,7 @@ int64_t S4Checkpoint(const S4Region& p, uint32_t i) {
   const uint32_t b = i / kS4Block;
   return b == 0 ? p.base
                 : static_cast<int64_t>(
-                      ReadBE64(p.ckpt + 8 * static_cast<size_t>(b - 1)));
+                      ReadBE64(p.ckpt + (8 * static_cast<size_t>(b - 1))));
 }
 
 // Bounds-checked header parse. Mirrors ValidateWalk's case 55 and the WASM
@@ -2372,21 +2647,29 @@ bool ParseS4Region(const char* r, uint32_t n, uint32_t param, const char* end,
     return false;
   }
   const uint32_t nblk = (n + kS4Block - 1) / kS4Block;
-  if (S4HeaderBytes(n) > static_cast<uint64_t>(end - r)) return false;
-  if (static_cast<uint32_t>(static_cast<uint8_t>(r[8])) != nblk) return false;
+  if (S4HeaderBytes(n) > static_cast<uint64_t>(end - r)) {
+    return false;
+  }
+  if (static_cast<uint32_t>(static_cast<uint8_t>(r[8])) != nblk) {
+    return false;
+  }
   S4Region& p = *out;
   p.n = n;
   p.nblk = nblk;
   p.base = static_cast<int64_t>(ReadBE64(r));
   p.widths = r + 9;
   p.lows = p.widths + nblk;
-  p.ckpt = p.lows + 8 * static_cast<size_t>(nblk);
+  p.ckpt = p.lows + (8 * static_cast<size_t>(nblk));
   p.payload = r + S4HeaderBytes(n);
   for (uint32_t b = 0; b < nblk; ++b) {
     const int w = static_cast<uint8_t>(p.widths[b]);
-    if (w < 1 || w > 64) return false;
+    if (w < 1 || w > 64) {
+      return false;
+    }
   }
-  if (S4Extent(p) > static_cast<uint64_t>(end - r)) return false;
+  if (S4Extent(p) > static_cast<uint64_t>(end - r)) {
+    return false;
+  }
   // No single width parameterizes this scheme (the widths are per block and
   // live in the region), so the footer param is pinned to 0 rather than left
   // to carry a value no reader would agree on.
@@ -2405,7 +2688,9 @@ bool ParseS4Region(const char* r, uint32_t n, uint32_t param, const char* end,
 // within-block delta shrinks with the step size while an offset from the block
 // head does not. The bounded 63-row replay is the price paid for the size.
 int64_t S4ValueAt(const S4Region& p, uint32_t i) {
-  if (i >= p.n) return 0;
+  if (i >= p.n) {
+    return 0;
+  }
   const uint32_t b = i / kS4Block;
   const int w = S4Width(p, b);
   const int64_t lo = S4Base(p, b);
@@ -2416,13 +2701,13 @@ int64_t S4ValueAt(const S4Region& p, uint32_t i) {
   // shape). Every other cumulative scheme in this file does the same: the sum
   // is a fixed point of a mod-2^64 walk, so wrapping is the DEFINED behaviour
   // and two's-complement round-trips bit for bit.
-  uint64_t v = static_cast<uint64_t>(S4Checkpoint(p, i));
-  const uint64_t ulo = static_cast<uint64_t>(lo);
+  auto v = static_cast<uint64_t>(S4Checkpoint(p, i));
+  const auto ulo = static_cast<uint64_t>(lo);
   for (uint32_t t = 0; t <= i % kS4Block; ++t) {
-    v += ulo +
-         UnpackBitAt(p.payload,
-                     boff + static_cast<uint64_t>(t) * static_cast<uint64_t>(w),
-                     w);
+    v += ulo + UnpackBitAt(
+                   p.payload,
+                   boff + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)),
+                   w);
   }
   return static_cast<int64_t>(v);
 }
@@ -2433,20 +2718,20 @@ int64_t S4ValueAt(const S4Region& p, uint32_t i) {
 // a reader derives, O(log ng) row lookup, per-group byte-aligned payloads).
 
 uint64_t SforMsb(const SforRegion& p, uint32_t g) {
-  return ReadBE64(p.dir + static_cast<size_t>(g) * kSforDirEntry);
+  return ReadBE64(p.dir + (static_cast<size_t>(g) * kSforDirEntry));
 }
 
 uint64_t SforBase(const SforRegion& p, uint32_t g) {
-  return ReadBE64(p.dir + static_cast<size_t>(g) * kSforDirEntry + 8);
+  return ReadBE64(p.dir + (static_cast<size_t>(g) * kSforDirEntry) + 8);
 }
 
 uint32_t SforRowStart(const SforRegion& p, uint32_t g) {
-  return ReadBE16(p.dir + static_cast<size_t>(g) * kSforDirEntry + 16);
+  return ReadBE16(p.dir + (static_cast<size_t>(g) * kSforDirEntry) + 16);
 }
 
 uint32_t SforWidth(const SforRegion& p, uint32_t g) {
-  return static_cast<uint32_t>(
-      static_cast<uint8_t>(p.dir[static_cast<size_t>(g) * kSforDirEntry + 18]));
+  return static_cast<uint32_t>(static_cast<uint8_t>(
+      p.dir[(static_cast<size_t>(g) * kSforDirEntry) + 18]));
 }
 
 // Rows in group g: row_start[g+1] - row_start[g], n for the last group.
@@ -2478,19 +2763,27 @@ bool ParseSforRegion(const char* r, uint32_t n, uint32_t param, const char* end,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  if (static_cast<uint64_t>(end - r) < 3) return false;
-  const uint32_t s = static_cast<uint32_t>(static_cast<uint8_t>(r[0]));
+  if (static_cast<uint64_t>(end - r) < 3) {
+    return false;
+  }
+  const auto s = static_cast<uint32_t>(static_cast<uint8_t>(r[0]));
   const uint32_t ng = ReadBE16(r + 1);
-  if (s < 1 || s > 63 || param != s) return false;
-  if (ng == 0 || ng > n) return false;
-  if (3 + kSforDirEntry * ng > static_cast<uint64_t>(end - r)) return false;
+  if (s < 1 || s > 63 || param != s) {
+    return false;
+  }
+  if (ng == 0 || ng > n) {
+    return false;
+  }
+  if (3 + (kSforDirEntry * ng) > static_cast<uint64_t>(end - r)) {
+    return false;
+  }
   SforRegion& p = *out;
   p.n = n;
   p.s = s;
   p.ng = ng;
   p.dir = r + 3;
   p.end = end;
-  p.payload = p.dir + kSforDirEntry * ng;
+  p.payload = p.dir + (kSforDirEntry * ng);
   const uint64_t mask = (UINT64_C(1) << s) - 1;
   // One pass pins the directory AND accumulates the payload extent (calling
   // SforExtent here would be a second O(ng) sweep on every parse; the
@@ -2498,18 +2791,29 @@ bool ParseSforRegion(const char* r, uint32_t n, uint32_t param, const char* end,
   uint64_t payload_bytes = 0;
   for (uint32_t g = 0; g < ng; ++g) {
     const uint32_t w = SforWidth(p, g);
-    if (w > s) return false;
-    if (SforBase(p, g) > mask) return false;
+    if (w > s) {
+      return false;
+    }
+    if (SforBase(p, g) > mask) {
+      return false;
+    }
     const uint32_t rs = SforRowStart(p, g);
     if (g == 0) {
-      if (rs != 0) return false;
+      if (rs != 0) {
+        return false;
+      }
     } else {
-      if (rs <= SforRowStart(p, g - 1)) return false;
+      if (rs <= SforRowStart(p, g - 1)) {
+        return false;
+      }
     }
     payload_bytes += (static_cast<uint64_t>(SforGroupRows(p, g)) * w + 7) / 8;
   }
-  if (SforRowStart(p, ng - 1) >= n) return false;
-  if (3 + kSforDirEntry * ng + payload_bytes > static_cast<uint64_t>(end - r)) {
+  if (SforRowStart(p, ng - 1) >= n) {
+    return false;
+  }
+  if (3 + (kSforDirEntry * ng) + payload_bytes >
+      static_cast<uint64_t>(end - r)) {
     return false;
   }
   return true;
@@ -2518,9 +2822,11 @@ bool ParseSforRegion(const char* r, uint32_t n, uint32_t param, const char* end,
 uint64_t SforDeltaAt(const SforRegion& p, uint32_t g, uint32_t t,
                      uint64_t boff) {
   const uint32_t w = SforWidth(p, g);
-  if (w == 0) return 0;
+  if (w == 0) {
+    return 0;
+  }
   const uint64_t bits =
-      boff * 8 + static_cast<uint64_t>(t) * static_cast<uint64_t>(w);
+      (boff * 8) + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w));
   if (p.end != nullptr &&
       bits / 8 >= static_cast<uint64_t>(p.end - p.payload)) {
     return 0;
@@ -2538,7 +2844,7 @@ uint32_t SforGroupLowerBound(const SforRegion& p, uint32_t g, uint64_t boff,
   const uint64_t head = (SforMsb(p, g) << p.s) | SforBase(p, g);
   uint32_t lo = 0, hi = rows;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     const __int128 v = static_cast<__int128>(head) +
                        static_cast<__int128>(SforDeltaAt(p, g, mid, boff));
     if (v < x) {
@@ -2552,10 +2858,12 @@ uint32_t SforGroupLowerBound(const SforRegion& p, uint32_t g, uint64_t boff,
 
 // Row `i`: bisect the row_start table (O(log ng)), then unpack one delta.
 int64_t SforValueAt(const SforRegion& p, uint32_t i) {
-  if (i >= p.n) return 0;
+  if (i >= p.n) {
+    return 0;
+  }
   uint32_t lo = 0, hi = p.ng;
   while (lo + 1 < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (SforRowStart(p, mid) <= i) {
       lo = mid;
     } else {
@@ -2580,10 +2888,10 @@ void DecodeSforAll(const SforRegion& p, int64_t* out) {
     const uint32_t w = SforWidth(p, g);
     for (uint32_t t = 0; t < rows; ++t) {
       const uint64_t delta =
-          w == 0
-              ? 0
-              : UnpackBitAt(p.payload, boff * 8 + static_cast<uint64_t>(t) * w,
-                            static_cast<int>(w));
+          w == 0 ? 0
+                 : UnpackBitAt(p.payload,
+                               (boff * 8) + (static_cast<uint64_t>(t) * w),
+                               static_cast<int>(w));
       out[rs + t] = static_cast<int64_t>(head + delta);
     }
     boff += (static_cast<uint64_t>(rows) * w + 7) / 8;
@@ -2602,18 +2910,18 @@ void DecodeS4All(const S4Region& p, int64_t* out) {
   // column of 0,1,2,3. The point-access path accumulates correctly, so a
   // per-value probe never saw it; the native/WASM parity run did, which is
   // what a differential check is for.)
-  uint64_t v = static_cast<uint64_t>(p.base);  // unsigned: see S4ValueAt
+  auto v = static_cast<uint64_t>(p.base);  // unsigned: see S4ValueAt
   for (uint32_t b = 0; b < p.nblk; ++b) {
     const int w = S4Width(p, b);
-    const uint64_t ulo = static_cast<uint64_t>(S4Base(p, b));
+    const auto ulo = static_cast<uint64_t>(S4Base(p, b));
     const uint64_t boff = S4BlockOffset(p, b) * 8;
     const uint32_t rows = S4BlockRows(p, b);
     for (uint32_t t = 0; t < rows; ++t) {
-      v += ulo + UnpackBitAt(
-                     p.payload,
-                     boff + static_cast<uint64_t>(t) * static_cast<uint64_t>(w),
-                     w);
-      out[b * kS4Block + t] = static_cast<int64_t>(v);
+      v += ulo +
+           UnpackBitAt(
+               p.payload,
+               boff + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)), w);
+      out[(b * kS4Block) + t] = static_cast<int64_t>(v);
     }
   }
 }
@@ -2643,20 +2951,20 @@ uint64_t ExpForKeyToBits(uint64_t key) {
 }
 
 uint64_t ExpForGKey(const ExpForRegion& p, uint32_t g) {
-  return ReadBE16(p.dir + static_cast<size_t>(g) * kExpForDirEntry);
+  return ReadBE16(p.dir + (static_cast<size_t>(g) * kExpForDirEntry));
 }
 
 uint64_t ExpForBase(const ExpForRegion& p, uint32_t g) {
-  return ReadBE64(p.dir + static_cast<size_t>(g) * kExpForDirEntry + 2);
+  return ReadBE64(p.dir + (static_cast<size_t>(g) * kExpForDirEntry) + 2);
 }
 
 uint32_t ExpForRowStart(const ExpForRegion& p, uint32_t g) {
-  return ReadBE16(p.dir + static_cast<size_t>(g) * kExpForDirEntry + 10);
+  return ReadBE16(p.dir + (static_cast<size_t>(g) * kExpForDirEntry) + 10);
 }
 
 uint32_t ExpForWidth(const ExpForRegion& p, uint32_t g) {
   return static_cast<uint32_t>(static_cast<uint8_t>(
-      p.dir[static_cast<size_t>(g) * kExpForDirEntry + 12]));
+      p.dir[(static_cast<size_t>(g) * kExpForDirEntry) + 12]));
 }
 
 // Rows in group g: row_start[g+1] - row_start[g], n for the last group.
@@ -2690,17 +2998,25 @@ bool ParseExpForRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  if (static_cast<uint64_t>(end - r) < 2) return false;
+  if (static_cast<uint64_t>(end - r) < 2) {
+    return false;
+  }
   const uint32_t ng = ReadBE16(r);
-  if (param != 0) return false;
-  if (ng == 0 || ng > n) return false;
-  if (2 + kExpForDirEntry * ng > static_cast<uint64_t>(end - r)) return false;
+  if (param != 0) {
+    return false;
+  }
+  if (ng == 0 || ng > n) {
+    return false;
+  }
+  if (2 + (kExpForDirEntry * ng) > static_cast<uint64_t>(end - r)) {
+    return false;
+  }
   ExpForRegion& p = *out;
   p.n = n;
   p.ng = ng;
   p.dir = r + 2;
   p.end = end;
-  p.payload = p.dir + kExpForDirEntry * ng;
+  p.payload = p.dir + (kExpForDirEntry * ng);
   // One pass pins the directory AND accumulates the payload extent (the same
   // single-sweep shape as ParseSforRegion: the predicate kernel parses per
   // call, so the constant matters).
@@ -2708,20 +3024,31 @@ bool ParseExpForRegion(const char* r, uint32_t n, uint32_t param,
   for (uint32_t g = 0; g < ng; ++g) {
     const uint64_t gkey = ExpForGKey(p, g);
     const uint32_t w = ExpForWidth(p, g);
-    if (gkey > UINT64_C(0xffe))
+    if (gkey > UINT64_C(0xffe)) {
       return false;  // 0xfff = exponent 0x7ff: NaN/Inf
-    if (ExpForBase(p, g) > kExpForMantMask) return false;
-    if (w > 52) return false;
+    }
+    if (ExpForBase(p, g) > kExpForMantMask) {
+      return false;
+    }
+    if (w > 52) {
+      return false;
+    }
     const uint32_t rs = ExpForRowStart(p, g);
     if (g == 0) {
-      if (rs != 0) return false;
+      if (rs != 0) {
+        return false;
+      }
     } else {
-      if (rs <= ExpForRowStart(p, g - 1)) return false;
+      if (rs <= ExpForRowStart(p, g - 1)) {
+        return false;
+      }
     }
     payload_bytes += (static_cast<uint64_t>(ExpForGroupRows(p, g)) * w + 7) / 8;
   }
-  if (ExpForRowStart(p, ng - 1) >= n) return false;
-  if (2 + kExpForDirEntry * ng + payload_bytes >
+  if (ExpForRowStart(p, ng - 1) >= n) {
+    return false;
+  }
+  if (2 + (kExpForDirEntry * ng) + payload_bytes >
       static_cast<uint64_t>(end - r)) {
     return false;
   }
@@ -2731,9 +3058,11 @@ bool ParseExpForRegion(const char* r, uint32_t n, uint32_t param,
 uint64_t ExpForOffsetAt(const ExpForRegion& p, uint32_t g, uint32_t t,
                         uint64_t boff) {
   const uint32_t w = ExpForWidth(p, g);
-  if (w == 0) return 0;
+  if (w == 0) {
+    return 0;
+  }
   const uint64_t bits =
-      boff * 8 + static_cast<uint64_t>(t) * static_cast<uint64_t>(w);
+      (boff * 8) + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w));
   if (p.end != nullptr &&
       bits / 8 >= static_cast<uint64_t>(p.end - p.payload)) {
     return 0;
@@ -2745,10 +3074,12 @@ uint64_t ExpForOffsetAt(const ExpForRegion& p, uint32_t g, uint32_t t,
 // invert the total-order transform -- the returned cell is the RAW bitcast
 // bits, exactly what every other double codec hands the int64 machinery.
 int64_t ExpForValueAt(const ExpForRegion& p, uint32_t i) {
-  if (i >= p.n) return 0;
+  if (i >= p.n) {
+    return 0;
+  }
   uint32_t lo = 0, hi = p.ng;
   while (lo + 1 < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (ExpForRowStart(p, mid) <= i) {
       lo = mid;
     } else {
@@ -2773,10 +3104,10 @@ void DecodeExpForAll(const ExpForRegion& p, int64_t* out) {
     const uint32_t w = ExpForWidth(p, g);
     for (uint32_t t = 0; t < rows; ++t) {
       const uint64_t offset =
-          w == 0
-              ? 0
-              : UnpackBitAt(p.payload, boff * 8 + static_cast<uint64_t>(t) * w,
-                            static_cast<int>(w));
+          w == 0 ? 0
+                 : UnpackBitAt(p.payload,
+                               (boff * 8) + (static_cast<uint64_t>(t) * w),
+                               static_cast<int>(w));
       out[rs + t] = static_cast<int64_t>(ExpForKeyToBits(head + offset));
     }
     boff += (static_cast<uint64_t>(rows) * w + 7) / 8;
@@ -2800,7 +3131,7 @@ void DecodeExpForAll(const ExpForRegion& p, int64_t* out) {
 // table and the rank width.
 uint64_t SortDictHeaderBytes(uint32_t n) {
   const uint64_t nb = (n + kSortDictBlock - 1) / kSortDictBlock;
-  return 2 + nb * 9 + (nb + 1) * 8;
+  return 2 + (nb * 9) + ((nb + 1) * 8);
 }
 
 uint32_t SortDictBlockRows(const SortDictRegion& p, uint32_t blk) {
@@ -2817,11 +3148,11 @@ int SortDictWidth(const SortDictRegion& p, uint32_t blk) {
 
 int64_t SortDictFirst(const SortDictRegion& p, uint32_t blk) {
   return static_cast<int64_t>(
-      ReadBE64(p.firsts + 8 * static_cast<size_t>(blk)));
+      ReadBE64(p.firsts + (8 * static_cast<size_t>(blk))));
 }
 
 uint64_t SortDictPsum(const SortDictRegion& p, uint32_t blk) {
-  return ReadBE64(p.psums + 8 * static_cast<size_t>(blk));
+  return ReadBE64(p.psums + (8 * static_cast<size_t>(blk)));
 }
 
 // Byte offset of block `blk`'s gap plane. Blocks are byte-aligned (the kS4
@@ -2846,7 +3177,7 @@ uint64_t SortDictExtent(const SortDictRegion& p) {
             8;
   }
   return SortDictHeaderBytes(p.n) +
-         (static_cast<uint64_t>(p.n) * static_cast<uint64_t>(p.rw) + 7) / 8 +
+         ((static_cast<uint64_t>(p.n) * static_cast<uint64_t>(p.rw) + 7) / 8) +
          gaps;
 }
 
@@ -2861,12 +3192,17 @@ bool ParseSortDictRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t nb = (n + kSortDictBlock - 1) / kSortDictBlock;
-  if (SortDictHeaderBytes(n) > static_cast<uint64_t>(end - r)) return false;
-  if (static_cast<uint32_t>(static_cast<uint8_t>(r[0])) != nb) return false;
-  if (param != nb) return false;
+  if (SortDictHeaderBytes(n) > static_cast<uint64_t>(end - r)) {
+    return false;
+  }
+  if (static_cast<uint32_t>(static_cast<uint8_t>(r[0])) != nb) {
+    return false;
+  }
+  if (param != nb) {
+    return false;
+  }
   const int rw = BitsNeeded(static_cast<uint64_t>(n) - 1);
-  if (static_cast<uint32_t>(static_cast<uint8_t>(r[1])) !=
-      static_cast<uint32_t>(rw)) {
+  if (std::cmp_not_equal(static_cast<uint8_t>(r[1]), rw)) {
     return false;
   }
   SortDictRegion& p = *out;
@@ -2875,13 +3211,15 @@ bool ParseSortDictRegion(const char* r, uint32_t n, uint32_t param,
   p.rw = rw;
   p.widths = r + 2;
   p.firsts = p.widths + nb;
-  p.psums = p.firsts + 8 * static_cast<size_t>(nb);
-  p.rank = p.psums + 8 * (static_cast<size_t>(nb) + 1);
+  p.psums = p.firsts + (8 * static_cast<size_t>(nb));
+  p.rank = p.psums + (8 * (static_cast<size_t>(nb) + 1));
   p.gaps =
-      p.rank + (static_cast<uint64_t>(n) * static_cast<uint64_t>(rw) + 7) / 8;
+      p.rank + ((static_cast<uint64_t>(n) * static_cast<uint64_t>(rw) + 7) / 8);
   for (uint32_t b = 0; b < nb; ++b) {
     // 0 is legal: an all-equal block stores no gap bytes at all.
-    if (SortDictWidth(p, b) > 64) return false;
+    if (SortDictWidth(p, b) > 64) {
+      return false;
+    }
   }
   return SortDictExtent(p) <= static_cast<uint64_t>(end - r);
 }
@@ -2891,16 +3229,18 @@ bool ParseSortDictRegion(const char* r, uint32_t n, uint32_t param,
 // are non-negative by construction, but the running value may wrap through
 // both int64 extremes on a hostile image, and mod-2^64 is the defined walk.
 int64_t SortDictValueAtSorted(const SortDictRegion& p, uint32_t j) {
-  if (j >= p.n) return 0;
+  if (j >= p.n) {
+    return 0;
+  }
   const uint32_t blk = j / kSortDictBlock;
   const int w = SortDictWidth(p, blk);
-  uint64_t v = static_cast<uint64_t>(SortDictFirst(p, blk));
+  auto v = static_cast<uint64_t>(SortDictFirst(p, blk));
   if (w != 0) {
     const uint64_t boff = SortDictGapOffset(p, blk) * 8;
-    const uint32_t local = j - blk * kSortDictBlock;
+    const uint32_t local = j - (blk * kSortDictBlock);
     for (uint32_t t = 0; t < local; ++t) {
       v += UnpackBitAt(
-          p.gaps, boff + static_cast<uint64_t>(t) * static_cast<uint64_t>(w),
+          p.gaps, boff + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)),
           w);
     }
   }
@@ -2923,28 +3263,33 @@ uint32_t SortDictLowerBoundSorted(const SortDictRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.nb;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (SortDictFirst(p, mid) < key) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
-  if (lo == 0) return 0;  // key <= sorted[0]
+  if (lo == 0) {
+    return 0;  // key <= sorted[0]
+  }
   const uint32_t blk = lo - 1;
   const uint32_t rows = SortDictBlockRows(p, blk);
   const int w = SortDictWidth(p, blk);
   const uint64_t boff = SortDictGapOffset(p, blk) * 8;
-  uint64_t v = static_cast<uint64_t>(SortDictFirst(p, blk));
+  auto v = static_cast<uint64_t>(SortDictFirst(p, blk));
   for (uint32_t t = 0; t < rows; ++t) {
-    if (static_cast<int64_t>(v) >= key) return blk * kSortDictBlock + t;
+    const auto sv = static_cast<int64_t>(v);
+    if (sv >= key) {
+      return (blk * kSortDictBlock) + t;
+    }
     if (t + 1 < rows) {
       v += UnpackBitAt(
-          p.gaps, boff + static_cast<uint64_t>(t) * static_cast<uint64_t>(w),
+          p.gaps, boff + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)),
           w);
     }
   }
-  return blk * kSortDictBlock + rows;
+  return (blk * kSortDictBlock) + rows;
 }
 
 // upper_bound over the sorted view (the first sorted index strictly > key).
@@ -2952,28 +3297,33 @@ uint32_t SortDictUpperBoundSorted(const SortDictRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.nb;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (SortDictFirst(p, mid) <= key) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
-  if (lo == 0) return 0;  // sorted[0] > key
+  if (lo == 0) {
+    return 0;  // sorted[0] > key
+  }
   const uint32_t blk = lo - 1;
   const uint32_t rows = SortDictBlockRows(p, blk);
   const int w = SortDictWidth(p, blk);
   const uint64_t boff = SortDictGapOffset(p, blk) * 8;
-  uint64_t v = static_cast<uint64_t>(SortDictFirst(p, blk));
+  auto v = static_cast<uint64_t>(SortDictFirst(p, blk));
   for (uint32_t t = 0; t < rows; ++t) {
-    if (static_cast<int64_t>(v) > key) return blk * kSortDictBlock + t;
+    const auto sv = static_cast<int64_t>(v);
+    if (sv > key) {
+      return (blk * kSortDictBlock) + t;
+    }
     if (t + 1 < rows) {
       v += UnpackBitAt(
-          p.gaps, boff + static_cast<uint64_t>(t) * static_cast<uint64_t>(w),
+          p.gaps, boff + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)),
           w);
     }
   }
-  return blk * kSortDictBlock + rows;
+  return (blk * kSortDictBlock) + rows;
 }
 
 // Predicate -> passing sorted window [wlo, whi). Returns false for the ops
@@ -3021,30 +3371,30 @@ bool SortDictPredicateWindow(const SortDictRegion& p, PaxChunk::CompareOp op,
 // lists' gaps.
 
 uint64_t PostingsHeaderBytes(uint32_t d) {
-  return 2 + static_cast<uint64_t>(d) * 8 + static_cast<uint64_t>(d) * 2 +
-         (static_cast<uint64_t>(d) + 1) / 2 + static_cast<uint64_t>(d) * 4;
+  return 2 + (static_cast<uint64_t>(d) * 8) + (static_cast<uint64_t>(d) * 2) +
+         ((static_cast<uint64_t>(d) + 1) / 2) + (static_cast<uint64_t>(d) * 4);
 }
 
 uint32_t PostingsCountAt(const PostingsRegion& p, uint32_t c) {
-  return ReadBE16(p.counts + static_cast<size_t>(c) * 2);
+  return ReadBE16(p.counts + (static_cast<size_t>(c) * 2));
 }
 
 uint32_t PostingsFirstAt(const PostingsRegion& p, uint32_t c) {
-  return ReadBE16(p.firsts + static_cast<size_t>(c) * 2);
+  return ReadBE16(p.firsts + (static_cast<size_t>(c) * 2));
 }
 
 uint32_t PostingsBitOffAt(const PostingsRegion& p, uint32_t c) {
-  return ReadBE16(p.bitoffs + static_cast<size_t>(c) * 2);
+  return ReadBE16(p.bitoffs + (static_cast<size_t>(c) * 2));
 }
 
 uint32_t PostingsKAt(const PostingsRegion& p, uint32_t c) {
-  const uint8_t byte = static_cast<uint8_t>(p.ks[static_cast<size_t>(c) >> 1]);
+  const auto byte = static_cast<uint8_t>(p.ks[static_cast<size_t>(c) >> 1]);
   return (c & 1) == 0 ? (byte & 0x0F) : (byte >> 4);
 }
 
 int64_t PostingsDictAt(const PostingsRegion& p, uint32_t c) {
   return static_cast<int64_t>(
-      ReadBE64(p.dict + static_cast<size_t>(c) * sizeof(int64_t)));
+      ReadBE64(p.dict + (static_cast<size_t>(c) * sizeof(int64_t))));
 }
 
 // Bounds-checked structural parse. The cheap per-list invariants the closed
@@ -3061,33 +3411,45 @@ bool ParsePostingsRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  if (end != nullptr && static_cast<uint64_t>(end - r) < 2) return false;
+  if (end != nullptr && static_cast<uint64_t>(end - r) < 2) {
+    return false;
+  }
   const uint32_t d = ReadBE16(r);
   // d above the parse cap cannot amortize its tables under a row-group
   // ceiling of n <= 1024 rows (d <= n is checked next); the cap keeps every
   // per-list scratch bounded.
-  if (d == 0 || d > kPostingsMaxLists || d > n || param != d) return false;
+  if (d == 0 || d > kPostingsMaxLists || d > n || param != d) {
+    return false;
+  }
   const uint64_t have =
       (end != nullptr) ? static_cast<uint64_t>(end - r) : UINT64_MAX;
-  if (PostingsHeaderBytes(d) > have) return false;
+  if (PostingsHeaderBytes(d) > have) {
+    return false;
+  }
   PostingsRegion& p = *out;
   p.n = n;
   p.d = d;
   p.dict = r + 2;
-  p.counts = p.dict + static_cast<size_t>(d) * 8;
-  p.ks = p.counts + static_cast<size_t>(d) * 2;
-  p.firsts = p.ks + (static_cast<size_t>(d) + 1) / 2;
-  p.bitoffs = p.firsts + static_cast<size_t>(d) * 2;
-  p.stream = p.bitoffs + static_cast<size_t>(d) * 2;
+  p.counts = p.dict + (static_cast<size_t>(d) * 8);
+  p.ks = p.counts + (static_cast<size_t>(d) * 2);
+  p.firsts = p.ks + ((static_cast<size_t>(d) + 1) / 2);
+  p.bitoffs = p.firsts + (static_cast<size_t>(d) * 2);
+  p.stream = p.bitoffs + (static_cast<size_t>(d) * 2);
   p.region_end = end;
   uint64_t total = 0;
   for (uint32_t c = 0; c < d; ++c) {
     const uint32_t cnt = PostingsCountAt(p, c);
-    if (cnt == 0 || cnt > n) return false;
+    if (cnt == 0 || cnt > n) {
+      return false;
+    }
     total += cnt;
-    if (PostingsFirstAt(p, c) >= n) return false;
+    if (PostingsFirstAt(p, c) >= n) {
+      return false;
+    }
     if (c == 0) {
-      if (PostingsBitOffAt(p, 0) != 0) return false;
+      if (PostingsBitOffAt(p, 0) != 0) {
+        return false;
+      }
     } else {
       if (PostingsDictAt(p, c - 1) >= PostingsDictAt(p, c)) {
         return false;  // the code-window bisects need strict ascent
@@ -3111,9 +3473,13 @@ bool ParsePostingsRegion(const char* r, uint32_t n, uint32_t param,
 bool PostingsNextRow(const PostingsRegion& p, PostingsBitCursor* cur,
                      uint32_t c, uint32_t row, uint32_t* next) {
   uint64_t x = 0;
-  if (!cur->Rice(PostingsKAt(p, c), &x)) return false;
+  if (!cur->Rice(PostingsKAt(p, c), &x)) {
+    return false;
+  }
   const uint64_t gap = x + 1;  // gaps are >= 1: one row, one list
-  if (gap > p.n || row + gap >= p.n) return false;
+  if (gap > p.n || row + gap >= p.n) {
+    return false;
+  }
   *next = row + static_cast<uint32_t>(gap);
   return true;
 }
@@ -3129,8 +3495,10 @@ void DecodePostingsAll(const PostingsRegion& p, int64_t* out) {
     uint32_t row = PostingsFirstAt(p, c);
     out[row] = v;
     const uint32_t cnt = PostingsCountAt(p, c);
-    if (cnt == 1) continue;
-    cur.Init(p.stream + PostingsBitOffAt(p, c) / 8, p.region_end);
+    if (cnt == 1) {
+      continue;
+    }
+    cur.Init(p.stream + (PostingsBitOffAt(p, c) / 8), p.region_end);
     for (uint32_t i = 1; i < cnt; ++i) {
       uint32_t next = 0;
       if (!PostingsNextRow(p, &cur, c, row, &next)) {
@@ -3149,7 +3517,7 @@ uint32_t PostingsLowerBoundList(const PostingsRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.d;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (PostingsDictAt(p, mid) < key) {
       lo = mid + 1;
     } else {
@@ -3163,7 +3531,7 @@ uint32_t PostingsUpperBoundList(const PostingsRegion& p, int64_t key) {
   uint32_t lo = 0;
   uint32_t hi = p.d;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (PostingsDictAt(p, mid) <= key) {
       lo = mid + 1;
     } else {
@@ -3222,24 +3590,28 @@ bool PostingsRegionCountSum(const char* region, uint32_t n, uint32_t param,
     }
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
 double Chimp128Double(uint64_t bits) {
-  double value;
+  double value = NAN;
   std::memcpy(&value, &bits, sizeof(value));
   return value;
 }
 
 uint64_t Chimp128Bits(double value) {
-  uint64_t bits;
+  uint64_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
 }
 
 uint64_t Chimp128CanonicalBits(double value) {
-  if (std::isnan(value)) return UINT64_C(0x7ff8000000000000);
+  if (std::isnan(value)) {
+    return UINT64_C(0x7ff8000000000000);
+  }
   return Chimp128Bits(value);
 }
 
@@ -3261,13 +3633,13 @@ bool ParseChimp128Region(const char* region, uint32_t n, uint32_t param,
   parsed.n = n;
   parsed.block_count = blocks;
   for (uint32_t block_index = 0; block_index < blocks; ++block_index) {
-    if (static_cast<size_t>(end - cursor) < kChimp128BlockMetadataBytes) {
+    if (std::cmp_less(end - cursor, kChimp128BlockMetadataBytes)) {
       return false;
     }
     Chimp128Block& block = parsed.blocks[block_index];
     const uint32_t expected_rows =
-        std::min(kChimp128BlockRows, n - block_index * kChimp128BlockRows);
-    const uint8_t flags = static_cast<uint8_t>(cursor[1]);
+        std::min(kChimp128BlockRows, n - (block_index * kChimp128BlockRows));
+    const auto flags = static_cast<uint8_t>(cursor[1]);
     block.rows = static_cast<uint8_t>(cursor[0]);
     block.code_bits = ReadBE32(cursor + 2);
     block.first = ReadBE64(cursor + 6);
@@ -3288,7 +3660,9 @@ bool ParseChimp128Region(const char* region, uint32_t n, uint32_t param,
     block.stream = cursor + kChimp128BlockMetadataBytes;
     cursor = block.stream + stream_bytes;
   }
-  if (cursor != end) return false;
+  if (cursor != end) {
+    return false;
+  }
   parsed.encoded_size = static_cast<size_t>(cursor - region);
   *out = parsed;
   return true;
@@ -3311,12 +3685,18 @@ bool DecodeChimp128Block(const Chimp128Block& block, uint64_t* output) {
   int previous_tz = 64;
   bool window_valid = false;
   for (uint32_t local = 1; local < block.rows; ++local) {
-    if (reader.pos >= block.code_bits) return false;
+    if (reader.pos >= block.code_bits) {
+      return false;
+    }
     uint64_t current = previous;
     if (reader.get1() != 0) {
-      if (reader.pos >= block.code_bits) return false;
+      if (reader.pos >= block.code_bits) {
+        return false;
+      }
       if (reader.get1() == 0) {
-        if (!window_valid) return false;
+        if (!window_valid) {
+          return false;
+        }
         const int width = 64 - previous_lz - previous_tz;
         if (width <= 0 || width > 64 ||
             static_cast<uint64_t>(width) > block.code_bits - reader.pos) {
@@ -3325,19 +3705,29 @@ bool DecodeChimp128Block(const Chimp128Block& block, uint64_t* output) {
         const uint64_t center = reader.get(width);
         current ^= width == 64 ? center : center << previous_tz;
       } else {
-        if (reader.pos >= block.code_bits) return false;
+        if (reader.pos >= block.code_bits) {
+          return false;
+        }
         bool history_reference = reader.get1() != 0;
         uint64_t reference = previous;
         if (history_reference) {
-          if (7 > block.code_bits - reader.pos) return false;
-          const uint32_t age = static_cast<uint32_t>(reader.get(7));
-          if (age >= local) return false;
+          if (7 > block.code_bits - reader.pos) {
+            return false;
+          }
+          const auto age = static_cast<uint32_t>(reader.get(7));
+          if (age >= local) {
+            return false;
+          }
           reference = history[(head - 1 - age) & 127U];
         }
-        if (11 > block.code_bits - reader.pos) return false;
+        if (11 > block.code_bits - reader.pos) {
+          return false;
+        }
         const int lz = static_cast<int>(reader.get(5));
         const int tz = static_cast<int>(reader.get(6));
-        if (lz > 31 || tz > 63 || lz + tz >= 64) return false;
+        if (lz > 31 || tz > 63 || lz + tz >= 64) {
+          return false;
+        }
         const int width = 64 - lz - tz;
         if (static_cast<uint64_t>(width) > block.code_bits - reader.pos) {
           return false;
@@ -3356,10 +3746,12 @@ bool DecodeChimp128Block(const Chimp128Block& block, uint64_t* output) {
     output[local] = current;
     previous = current;
   }
-  if (reader.pos != block.code_bits) return false;
+  if (reader.pos != block.code_bits) {
+    return false;
+  }
   if (block.code_bits % 8 != 0) {
-    const uint32_t padding = 8 - block.code_bits % 8;
-    const uint8_t mask = static_cast<uint8_t>((1U << padding) - 1U);
+    const uint32_t padding = 8 - (block.code_bits % 8);
+    const auto mask = static_cast<uint8_t>((1U << padding) - 1U);
     if ((static_cast<uint8_t>(block.stream[stream_bytes - 1]) & mask) != 0) {
       return false;
     }
@@ -3372,7 +3764,9 @@ bool Chimp128MetadataMatches(const Chimp128Region& region) {
   for (uint32_t block_index = 0; block_index < region.block_count;
        ++block_index) {
     const Chimp128Block& block = region.blocks[block_index];
-    if (!DecodeChimp128Block(block, decoded.data())) return false;
+    if (!DecodeChimp128Block(block, decoded.data())) {
+      return false;
+    }
     double sum = Chimp128Double(block.first);
     bool has_numeric = false;
     bool numeric_metadata = true;
@@ -3390,8 +3784,12 @@ bool Chimp128MetadataMatches(const Chimp128Region& region) {
         maximum = decoded[row];
         has_numeric = true;
       } else {
-        if (value < Chimp128Double(minimum)) minimum = decoded[row];
-        if (value > Chimp128Double(maximum)) maximum = decoded[row];
+        if (value < Chimp128Double(minimum)) {
+          minimum = decoded[row];
+        }
+        if (value > Chimp128Double(maximum)) {
+          maximum = decoded[row];
+        }
       }
     }
     if (Chimp128CanonicalBits(sum) != block.sum ||
@@ -3405,19 +3803,21 @@ bool Chimp128MetadataMatches(const Chimp128Region& region) {
 }
 
 uint64_t AlpRdTansBits(double value) {
-  uint64_t bits;
+  uint64_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
 }
 
 double AlpRdTansDouble(uint64_t bits) {
-  double value;
+  double value = NAN;
   std::memcpy(&value, &bits, sizeof(value));
   return value;
 }
 
 uint64_t AlpRdTansCanonicalBits(double value) {
-  if (std::isnan(value)) return UINT64_C(0x7ff8000000000000);
+  if (std::isnan(value)) {
+    return UINT64_C(0x7ff8000000000000);
+  }
   return AlpRdTansBits(value);
 }
 
@@ -3446,8 +3846,12 @@ bool AlpRdTansComputeMetadata(const uint64_t* values, uint32_t rows,
       hi = values[row];
       has_numeric = true;
     } else {
-      if (value < AlpRdTansDouble(lo)) lo = values[row];
-      if (value > AlpRdTansDouble(hi)) hi = values[row];
+      if (value < AlpRdTansDouble(lo)) {
+        lo = values[row];
+      }
+      if (value > AlpRdTansDouble(hi)) {
+        hi = values[row];
+      }
     }
   }
   *sum = AlpRdTansCanonicalBits(total);
@@ -3475,7 +3879,9 @@ std::vector<char> AlpRdTansPackBits(const std::vector<uint8_t>& bits) {
 
 bool AlpRdTansBuildModel(const std::vector<std::vector<uint8_t>>& payloads,
                          AlpRdTansModel* model) {
-  if (model == nullptr || payloads.empty()) return false;
+  if (model == nullptr || payloads.empty()) {
+    return false;
+  }
   std::array<uint64_t, 256> counts{};
   uint64_t total = 0;
   for (const auto& payload : payloads) {
@@ -3484,7 +3890,9 @@ bool AlpRdTansBuildModel(const std::vector<std::vector<uint8_t>>& payloads,
       ++total;
     }
   }
-  if (total == 0) return false;
+  if (total == 0) {
+    return false;
+  }
   std::array<uint8_t, 256> used{};
   uint32_t used_count = 0;
   for (uint32_t sym = 0; sym < 256; ++sym) {
@@ -3493,51 +3901,69 @@ bool AlpRdTansBuildModel(const std::vector<std::vector<uint8_t>>& payloads,
       ++used_count;
     }
   }
-  if (used_count < 2 || used_count > kAlpRdTansM) return false;
+  if (used_count < 2 || used_count > kAlpRdTansM) {
+    return false;
+  }
   std::array<uint16_t, 256> frequencies{};
   uint32_t assigned = 0;
   for (uint32_t sym = 0; sym < 256; ++sym) {
-    if (used[sym] == 0) continue;
+    if (used[sym] == 0) {
+      continue;
+    }
     uint64_t value = counts[sym] * kAlpRdTansM / total;
-    if (value == 0) value = 1;
-    if (value > kAlpRdTansM) value = kAlpRdTansM;
+    if (value == 0) {
+      value = 1;
+    }
+    value = std::min<uint64_t>(value, kAlpRdTansM);
     frequencies[sym] = static_cast<uint16_t>(value);
     assigned += static_cast<uint32_t>(value);
   }
   while (assigned < kAlpRdTansM) {
     uint32_t best = 256;
     for (uint32_t sym = 0; sym < 256; ++sym) {
-      if (used[sym] == 0) continue;
+      if (used[sym] == 0) {
+        continue;
+      }
       if (best == 256 || counts[sym] > counts[best] ||
           (counts[sym] == counts[best] && sym < best)) {
         best = sym;
       }
     }
-    if (best == 256 || frequencies[best] == kAlpRdTansM) return false;
+    if (best == 256 || frequencies[best] == kAlpRdTansM) {
+      return false;
+    }
     ++frequencies[best];
     ++assigned;
   }
   while (assigned > kAlpRdTansM) {
     uint32_t best = 256;
     for (uint32_t sym = 0; sym < 256; ++sym) {
-      if (used[sym] == 0 || frequencies[sym] <= 1) continue;
+      if (used[sym] == 0 || frequencies[sym] <= 1) {
+        continue;
+      }
       if (best == 256 || frequencies[sym] > frequencies[best] ||
           (frequencies[sym] == frequencies[best] && sym < best)) {
         best = sym;
       }
     }
-    if (best == 256) return false;
+    if (best == 256) {
+      return false;
+    }
     --frequencies[best];
     --assigned;
   }
-  if (assigned != kAlpRdTansM) return false;
+  if (assigned != kAlpRdTansM) {
+    return false;
+  }
   model->symbols.fill(0);
   model->frequencies.fill(0);
   model->cumulative.fill(0);
   uint16_t cumulative = 0;
   uint16_t model_count = 0;
   for (uint32_t sym = 0; sym < 256; ++sym) {
-    if (frequencies[sym] == 0) continue;
+    if (frequencies[sym] == 0) {
+      continue;
+    }
     model->symbols[model_count] = static_cast<uint8_t>(sym);
     model->frequencies[model_count] = frequencies[sym];
     model->cumulative[model_count] = cumulative;
@@ -3558,7 +3984,9 @@ bool AlpRdTansEncode(const std::vector<uint8_t>& payload,
   std::array<uint32_t, 256> cumulative{};
   for (uint32_t i = 0; i < model.count; ++i) {
     const uint32_t sym = model.symbols[i];
-    if (sym >= 256 || model.frequencies[i] == 0) return false;
+    if (sym >= 256 || model.frequencies[i] == 0) {
+      return false;
+    }
     frequency[sym] = model.frequencies[i];
     cumulative[sym] = model.cumulative[i];
   }
@@ -3567,23 +3995,33 @@ bool AlpRdTansEncode(const std::vector<uint8_t>& payload,
   for (size_t i = payload.size(); i-- > 0;) {
     const uint32_t sym = payload[i];
     const uint32_t f = frequency[sym];
-    if (f == 0) return false;
+    if (f == 0) {
+      return false;
+    }
     while (current >= 2 * f) {
       spill.push_back(static_cast<uint8_t>(current & 1U));
       current >>= 1;
     }
-    if (current < f || current >= 2 * f) return false;
+    if (current < f || current >= 2 * f) {
+      return false;
+    }
     current = 256 + cumulative[sym] + (current - f);
-    if (current < 256 || current >= 512) return false;
+    if (current < 256 || current >= 512) {
+      return false;
+    }
   }
-  if (current < 256 || current >= 512) return false;
+  if (current < 256 || current >= 512) {
+    return false;
+  }
   std::vector<uint8_t> bits;
   bits.reserve(kAlpRdTansStateBits + spill.size());
   for (int bit = static_cast<int>(kAlpRdTansStateBits) - 1; bit >= 0; --bit) {
     bits.push_back(static_cast<uint8_t>((current >> bit) & 1U));
   }
   bits.insert(bits.end(), spill.begin(), spill.end());
-  if (bits.size() > UINT32_MAX) return false;
+  if (bits.size() > UINT32_MAX) {
+    return false;
+  }
   *stream_bits = static_cast<uint32_t>(bits.size());
   *stream = AlpRdTansPackBits(bits);
   return true;
@@ -3599,7 +4037,7 @@ bool AlpRdTansDecode(const char* stream, size_t stream_len,
   }
   const unsigned padding = stream_bits & 7U;
   if (padding != 0) {
-    const uint8_t mask = static_cast<uint8_t>((1U << (8U - padding)) - 1U);
+    const auto mask = static_cast<uint8_t>((1U << (8U - padding)) - 1U);
     if ((static_cast<uint8_t>(stream[stream_len - 1]) & mask) != 0) {
       return false;
     }
@@ -3623,7 +4061,9 @@ bool AlpRdTansDecode(const char* stream, size_t stream_len,
     }
     cumulative = static_cast<uint16_t>(cumulative + f);
   }
-  if (cumulative != kAlpRdTansM) return false;
+  if (cumulative != kAlpRdTansM) {
+    return false;
+  }
   uint32_t state = 0;
   for (uint32_t bit = 0; bit < kAlpRdTansStateBits; ++bit) {
     const uint32_t position = bit;
@@ -3632,23 +4072,31 @@ bool AlpRdTansDecode(const char* stream, size_t stream_len,
                            1U;
     state = (state << 1) | value;
   }
-  if (state < 256 || state >= 512) return false;
+  if (state < 256 || state >= 512) {
+    return false;
+  }
   int64_t next_bit = static_cast<int64_t>(stream_bits) - 1;
   output->clear();
   while (output->size() <= max_output) {
     const uint32_t slot = state - 256;
-    if (!state_valid[slot]) return false;
+    if (state_valid[slot] == 0U) {
+      return false;
+    }
     output->push_back(state_symbol[slot]);
     uint32_t previous = state_previous[slot];
     while (previous < 256) {
-      if (next_bit < static_cast<int64_t>(kAlpRdTansStateBits)) return false;
-      const uint32_t bit = static_cast<uint32_t>(next_bit);
+      if (std::cmp_less(next_bit, kAlpRdTansStateBits)) {
+        return false;
+      }
+      const auto bit = static_cast<uint32_t>(next_bit);
       const uint32_t value =
           (static_cast<uint8_t>(stream[bit >> 3]) >> (7U - (bit & 7U))) & 1U;
       previous = (previous << 1) | value;
       --next_bit;
     }
-    if (previous < 256 || previous >= 512) return false;
+    if (previous < 256 || previous >= 512) {
+      return false;
+    }
     state = previous;
     if (state == 256 &&
         next_bit == static_cast<int64_t>(kAlpRdTansStateBits) - 1) {
@@ -3665,12 +4113,16 @@ bool AlpRdTansDecodePfor(const char* leaf, size_t leaf_len, uint32_t raw_len,
     return false;
   }
   const uint32_t exceptions = ReadBE16(leaf + 9);
-  if (exceptions > raw_len) return false;
+  if (exceptions > raw_len) {
+    return false;
+  }
   const uint64_t packed_bytes =
       (static_cast<uint64_t>(raw_len) * width + 7U) / 8U;
   const uint64_t expected =
-      11U + packed_bytes + static_cast<uint64_t>(exceptions) * 10U;
-  if (expected != leaf_len) return false;
+      11U + packed_bytes + (static_cast<uint64_t>(exceptions) * 10U);
+  if (expected != leaf_len) {
+    return false;
+  }
   const uint64_t base = ReadBE64(leaf);
   values->assign(raw_len, 0);
   for (uint32_t i = 0; i < raw_len; ++i) {
@@ -3682,7 +4134,9 @@ bool AlpRdTansDecodePfor(const char* leaf, size_t leaf_len, uint32_t raw_len,
   uint32_t previous = 0;
   for (uint32_t i = 0; i < exceptions; ++i) {
     const uint32_t position = ReadBE16(exception);
-    if (position >= raw_len || (i != 0 && position <= previous)) return false;
+    if (position >= raw_len || (i != 0 && position <= previous)) {
+      return false;
+    }
     (*values)[position] = static_cast<int64_t>(ReadBE64(exception + 2));
     previous = position;
     exception += 10;
@@ -3698,7 +4152,9 @@ bool AlpRdTansDecodeBp128(const char* leaf, size_t leaf_len, uint32_t raw_len,
   }
   const uint32_t blocks =
       (raw_len + kAlpRdTansBlockRows - 1) / kAlpRdTansBlockRows;
-  if (blocks != leaf_param || blocks > kAlpRdTansMaxBlocks) return false;
+  if (blocks != leaf_param || blocks > kAlpRdTansMaxBlocks) {
+    return false;
+  }
   Bp128Region parsed;
   if (!ParseBp128Region(leaf, raw_len, blocks, leaf + leaf_len, &parsed) ||
       parsed.encoded_size != leaf_len || !Bp128MetadataMatches(parsed)) {
@@ -3711,7 +4167,9 @@ bool AlpRdTansDecodeBp128(const char* leaf, size_t leaf_len, uint32_t raw_len,
 
 bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
                           std::vector<uint64_t>* values) {
-  if (values == nullptr || block >= region.block_count) return false;
+  if (values == nullptr || block >= region.block_count) {
+    return false;
+  }
   const AlpRdTansBlock& descriptor = region.blocks[block];
   const uint32_t rows = descriptor.rows;
   if (rows == 0 || descriptor.raw_len < 2U * rows ||
@@ -3722,15 +4180,20 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
   const uint32_t exception_count = (descriptor.raw_len - 2U * rows) / 2U;
   size_t max_leaf = 0;
   if (descriptor.leaf_id == static_cast<uint8_t>(Scheme::kPfor)) {
-    if (descriptor.leaf_param == 0 || descriptor.leaf_param > 64) return false;
-    max_leaf = 11U + (static_cast<size_t>(descriptor.raw_len) * 64U + 7U) / 8U +
-               static_cast<size_t>(descriptor.raw_len) * 10U;
+    if (descriptor.leaf_param == 0 || descriptor.leaf_param > 64) {
+      return false;
+    }
+    max_leaf = 11U +
+               ((static_cast<size_t>(descriptor.raw_len) * 64U + 7U) / 8U) +
+               (static_cast<size_t>(descriptor.raw_len) * 10U);
   } else if (descriptor.leaf_id == static_cast<uint8_t>(Scheme::kBp128)) {
     const uint32_t blocks =
         (descriptor.raw_len + kAlpRdTansBlockRows - 1) / kAlpRdTansBlockRows;
-    if (descriptor.leaf_param != blocks) return false;
-    max_leaf = static_cast<size_t>(blocks) * kBp128MetadataBytes +
-               (static_cast<size_t>(descriptor.raw_len) * 64U + 7U) / 8U;
+    if (descriptor.leaf_param != blocks) {
+      return false;
+    }
+    max_leaf = (static_cast<size_t>(blocks) * kBp128MetadataBytes) +
+               ((static_cast<size_t>(descriptor.raw_len) * 64U + 7U) / 8U);
   } else {
     return false;
   }
@@ -3752,7 +4215,9 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
                                    descriptor.leaf_param, &integer_values)) {
     return false;
   }
-  if (integer_values.size() != descriptor.raw_len) return false;
+  if (integer_values.size() != descriptor.raw_len) {
+    return false;
+  }
   const uint32_t tail_base = rows;
   const uint32_t exception_pos_base = 2U * rows;
   const uint32_t exception_value_base = exception_pos_base + exception_count;
@@ -3763,12 +4228,14 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
   uint32_t previous = 0;
   for (uint32_t i = 0; i < exception_count; ++i) {
     const int64_t position = integer_values[exception_pos_base + i];
-    if (position < 0 || position >= rows ||
-        (i != 0 && position <= static_cast<int64_t>(previous))) {
+    if (position < 0 || std::cmp_greater_equal(position, rows) ||
+        (i != 0 && std::cmp_less_equal(position, previous))) {
       return false;
     }
     is_exception[static_cast<uint32_t>(position)] = 1;
-    if (integer_values[static_cast<uint32_t>(position)] != 0) return false;
+    if (integer_values[static_cast<uint32_t>(position)] != 0) {
+      return false;
+    }
     previous = static_cast<uint32_t>(position);
   }
   values->assign(rows, 0);
@@ -3782,13 +4249,14 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
     }
     const int64_t code = integer_values[row];
     const int64_t tail = integer_values[tail_base + row];
-    if (code < 0 || code >= static_cast<int64_t>(region.dict_count) ||
-        tail < 0 || static_cast<uint64_t>(tail) > mask) {
+    if (code < 0 || std::cmp_greater_equal(code, region.dict_count) ||
+        tail < 0 || std::cmp_greater(tail, mask)) {
       return false;
     }
     const uint64_t front = region.fronts[static_cast<uint32_t>(code)];
-    (*values)[row] =
-        (front << region.right_width) | static_cast<uint64_t>(tail);
+    const uint64_t shifted =
+        region.right_width >= 64 ? 0 : (front << region.right_width);
+    (*values)[row] = shifted | static_cast<uint64_t>(tail);
   }
   return exception_index == exception_count;
 }
@@ -3797,7 +4265,7 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
                           const char* end, AlpRdTansRegion* out) {
   if (region == nullptr || end == nullptr || end < region || out == nullptr ||
       n == 0 || n > PaxChunk::kRowGroupSize || param == 0 ||
-      static_cast<size_t>(end - region) < kAlpRdTansHeaderBytes) {
+      std::cmp_less(end - region, kAlpRdTansHeaderBytes)) {
     return false;
   }
   const uint32_t blocks = (n + kAlpRdTansBlockRows - 1) / kAlpRdTansBlockRows;
@@ -3816,16 +4284,20 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   const uint64_t fixed =
-      kAlpRdTansHeaderBytes + static_cast<uint64_t>(dict_count) * 2U +
-      static_cast<uint64_t>(model_count) * 3U +
-      static_cast<uint64_t>(blocks) * kAlpRdTansDescriptorBytes;
-  if (fixed > static_cast<uint64_t>(end - region)) return false;
+      kAlpRdTansHeaderBytes + (static_cast<uint64_t>(dict_count) * 2U) +
+      (static_cast<uint64_t>(model_count) * 3U) +
+      (static_cast<uint64_t>(blocks) * kAlpRdTansDescriptorBytes);
+  if (std::cmp_greater(fixed, end - region)) {
+    return false;
+  }
   const char* cursor = region + kAlpRdTansHeaderBytes;
   std::array<uint16_t, 8> fronts{};
   uint16_t previous_front = 0;
   for (uint32_t i = 0; i < dict_count; ++i) {
     fronts[i] = ReadBE16(cursor);
-    if (i != 0 && fronts[i] <= previous_front) return false;
+    if (i != 0 && fronts[i] <= previous_front) {
+      return false;
+    }
     previous_front = fronts[i];
     cursor += 2;
   }
@@ -3833,11 +4305,11 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
   uint16_t cumulative = 0;
   uint8_t previous_symbol = 0;
   for (uint32_t i = 0; i < model_count; ++i) {
-    const uint8_t sym = static_cast<uint8_t>(*cursor++);
+    const auto sym = static_cast<uint8_t>(*cursor++);
     const uint16_t frequency = ReadBE16(cursor);
     cursor += 2;
     if (frequency == 0 || (i != 0 && sym <= previous_symbol) ||
-        cumulative + frequency > kAlpRdTansM) {
+        std::cmp_greater(cumulative + frequency, kAlpRdTansM)) {
       return false;
     }
     model.symbols[i] = sym;
@@ -3846,23 +4318,25 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
     cumulative = static_cast<uint16_t>(cumulative + frequency);
     previous_symbol = sym;
   }
-  if (cumulative != kAlpRdTansM) return false;
+  if (cumulative != kAlpRdTansM) {
+    return false;
+  }
   model.count = static_cast<uint16_t>(model_count);
   const char* streams =
-      cursor + static_cast<size_t>(blocks) * kAlpRdTansDescriptorBytes;
+      cursor + (static_cast<size_t>(blocks) * kAlpRdTansDescriptorBytes);
   uint64_t stream_cursor = 0;
   for (uint32_t block = 0; block < blocks; ++block) {
     AlpRdTansBlock& item = out->blocks[block];
     const char* descriptor =
-        cursor + static_cast<size_t>(block) * kAlpRdTansDescriptorBytes;
-    if (static_cast<size_t>(end - descriptor) < kAlpRdTansDescriptorBytes) {
+        cursor + (static_cast<size_t>(block) * kAlpRdTansDescriptorBytes);
+    if (std::cmp_less(end - descriptor, kAlpRdTansDescriptorBytes)) {
       return false;
     }
     const uint32_t expected_rows =
-        std::min(kAlpRdTansBlockRows, n - block * kAlpRdTansBlockRows);
-    const uint8_t rows = static_cast<uint8_t>(descriptor[0]);
-    const uint8_t flags = static_cast<uint8_t>(descriptor[1]);
-    const uint8_t leaf_id = static_cast<uint8_t>(descriptor[4]);
+        std::min(kAlpRdTansBlockRows, n - (block * kAlpRdTansBlockRows));
+    const auto rows = static_cast<uint8_t>(descriptor[0]);
+    const auto flags = static_cast<uint8_t>(descriptor[1]);
+    const auto leaf_id = static_cast<uint8_t>(descriptor[4]);
     const uint32_t leaf_param = ReadBE32(descriptor + 8);
     const uint32_t raw_len = ReadBE32(descriptor + 12);
     const uint32_t stream_offset = ReadBE32(descriptor + 48);
@@ -3891,7 +4365,7 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
     }
     const uint64_t next_stream = stream_cursor + stream_len;
     if (next_stream < stream_cursor ||
-        next_stream > static_cast<uint64_t>(end - streams)) {
+        std::cmp_greater(next_stream, end - streams)) {
       return false;
     }
     item.descriptor = descriptor;
@@ -3909,7 +4383,9 @@ bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
     item.sum = ReadBE64(descriptor + 40);
     stream_cursor = next_stream;
   }
-  if (streams + stream_cursor != end) return false;
+  if (streams + stream_cursor != end) {
+    return false;
+  }
   out->n = n;
   out->block_count = blocks;
   out->right_width = right_width;
@@ -3951,14 +4427,16 @@ bool AlpRdTansMetadataMatches(const AlpRdTansRegion& region) {
 }
 
 double PatasDouble(uint64_t bits) {
-  double value;
+  double value = NAN;
   std::memcpy(&value, &bits, sizeof(value));
   return value;
 }
 
 uint64_t PatasCanonicalBits(double value) {
-  if (std::isnan(value)) return UINT64_C(0x7ff8000000000000);
-  uint64_t bits;
+  if (std::isnan(value)) {
+    return UINT64_C(0x7ff8000000000000);
+  }
+  uint64_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
 }
@@ -3968,7 +4446,9 @@ uint32_t PatasTrailingZeros(uint64_t value) {
 }
 
 uint32_t PatasPayloadBytes(uint64_t value) {
-  if (value == 0) return 0;
+  if (value == 0) {
+    return 0;
+  }
   const uint32_t span = 64U - static_cast<uint32_t>(__builtin_clzll(value)) -
                         PatasTrailingZeros(value);
   return (span + 7U) / 8U;
@@ -3999,8 +4479,12 @@ bool PatasComputeMetadata(const uint64_t* values, uint32_t rows,
       hi = values[row];
       has_numeric = true;
     } else {
-      if (value < PatasDouble(lo)) lo = values[row];
-      if (value > PatasDouble(hi)) hi = values[row];
+      if (value < PatasDouble(lo)) {
+        lo = values[row];
+      }
+      if (value > PatasDouble(hi)) {
+        hi = values[row];
+      }
     }
   }
   *sum = PatasCanonicalBits(total);
@@ -4018,11 +4502,10 @@ bool PatasComputeMetadata(const uint64_t* values, uint32_t rows,
 bool PatasReadXor(const char*& cursor, const char* end, uint32_t length,
                   uint32_t tz, uint64_t* out) {
   if (length == 0 || length > 8 || tz > 63 ||
-      static_cast<uint64_t>(length) * 8U + tz > kPatasMaxSpan) {
+      (static_cast<uint64_t>(length) * 8U) + tz > kPatasMaxSpan) {
     return false;
   }
-  if (end < cursor ||
-      static_cast<uint64_t>(end - cursor) < static_cast<uint64_t>(length)) {
+  if (end < cursor || std::cmp_less(end - cursor, length)) {
     return false;
   }
   uint64_t q = 0;
@@ -4031,9 +4514,13 @@ bool PatasReadXor(const char*& cursor, const char* end, uint32_t length,
          << (i * 8U);
   }
   cursor += length;
-  if ((q >> ((length - 1U) * 8U)) == 0) return false;
+  if ((q >> ((length - 1U) * 8U)) == 0) {
+    return false;
+  }
   const uint64_t x = q << tz;
-  if (x == 0) return false;
+  if (x == 0) {
+    return false;
+  }
   if (PatasPayloadBytes(x) != length || PatasTrailingZeros(x) != tz) {
     return false;
   }
@@ -4045,7 +4532,7 @@ bool ParsePatasRegion(const char* region, uint32_t n, uint32_t param,
                       const char* end, PatasRegion* out) {
   if (region == nullptr || end == nullptr || end < region || out == nullptr ||
       n == 0 || n > PaxChunk::kRowGroupSize ||
-      static_cast<size_t>(end - region) < kPatasHeaderBytes) {
+      std::cmp_less(end - region, kPatasHeaderBytes)) {
     return false;
   }
   const uint32_t blocks = (n + kPatasBlockRows - 1) / kPatasBlockRows;
@@ -4058,29 +4545,35 @@ bool ParsePatasRegion(const char* region, uint32_t n, uint32_t param,
       ReadBE16(region + 7) != blocks || ReadBE32(region + 9) != 0) {
     return false;
   }
-  const uint64_t region_len = static_cast<uint64_t>(end - region);
-  const uint64_t fixed = static_cast<uint64_t>(kPatasHeaderBytes) +
-                         static_cast<uint64_t>(blocks) * kPatasDescriptorBytes;
-  if (region_len < fixed) return false;
+  const auto region_len = static_cast<uint64_t>(end - region);
+  const uint64_t fixed =
+      static_cast<uint64_t>(kPatasHeaderBytes) +
+      (static_cast<uint64_t>(blocks) * kPatasDescriptorBytes);
+  if (region_len < fixed) {
+    return false;
+  }
   uint64_t meta_total = 0;
   for (uint32_t block = 0; block < blocks; ++block) {
     meta_total +=
         ReadBE32(region + kPatasHeaderBytes +
-                 static_cast<size_t>(block) * kPatasDescriptorBytes + 44);
+                 (static_cast<size_t>(block) * kPatasDescriptorBytes) + 44);
   }
-  if (fixed + meta_total > region_len) return false;
+  if (fixed + meta_total > region_len) {
+    return false;
+  }
   uint64_t meta_cursor = fixed;
   uint64_t payload_cursor = fixed + meta_total;
   PatasRegion parsed;
   parsed.n = n;
   parsed.block_count = blocks;
   for (uint32_t block = 0; block < blocks; ++block) {
-    const char* descriptor = region + kPatasHeaderBytes +
-                             static_cast<size_t>(block) * kPatasDescriptorBytes;
+    const char* descriptor =
+        region + kPatasHeaderBytes +
+        (static_cast<size_t>(block) * kPatasDescriptorBytes);
     const uint32_t expected_rows =
-        std::min(kPatasBlockRows, n - block * kPatasBlockRows);
-    const uint8_t rows = static_cast<unsigned char>(descriptor[0]);
-    const uint8_t flags = static_cast<unsigned char>(descriptor[1]);
+        std::min(kPatasBlockRows, n - (block * kPatasBlockRows));
+    const auto rows = static_cast<unsigned char>(descriptor[0]);
+    const auto flags = static_cast<unsigned char>(descriptor[1]);
     const uint64_t meta_offset = ReadBE32(descriptor + 40);
     const uint64_t meta_len = ReadBE32(descriptor + 44);
     const uint64_t payload_offset = ReadBE32(descriptor + 48);
@@ -4130,8 +4623,10 @@ bool DecodePatasBlock(const PatasBlock& block, uint64_t* output) {
   uint32_t window_length = 0;
   uint32_t window_tz = 0;
   for (uint32_t local = 1; local < block.rows; ++local) {
-    if (meta >= block.meta_end) return false;
-    const uint8_t control = static_cast<unsigned char>(*meta++);
+    if (meta >= block.meta_end) {
+      return false;
+    }
+    const auto control = static_cast<unsigned char>(*meta++);
     uint64_t reference = previous;
     uint64_t x = 0;
     uint32_t length = 0;
@@ -4142,20 +4637,26 @@ bool DecodePatasBlock(const PatasBlock& block, uint64_t* output) {
         output[local] = previous;
         continue;
       case kPatasWindow:
-        if (window_length == 0) return false;
+        if (window_length == 0) {
+          return false;
+        }
         length = window_length;
         tz = window_tz;
         break;
       case kPatasPrev:
       case kPatasHist: {
-        if (block.meta_end - meta < 2) return false;
-        const uint8_t length_byte = static_cast<unsigned char>(*meta++);
-        const uint8_t tz_byte = static_cast<unsigned char>(*meta++);
+        if (block.meta_end - meta < 2) {
+          return false;
+        }
+        const auto length_byte = static_cast<unsigned char>(*meta++);
+        const auto tz_byte = static_cast<unsigned char>(*meta++);
         length = static_cast<uint32_t>(length_byte) + 1U;
         tz = tz_byte;
         if (control == kPatasHist) {
-          if (meta >= block.meta_end) return false;
-          const uint8_t age = static_cast<unsigned char>(*meta++);
+          if (meta >= block.meta_end) {
+            return false;
+          }
+          const auto age = static_cast<unsigned char>(*meta++);
           if (age == 0 || static_cast<uint32_t>(age) > local ||
               static_cast<uint32_t>(age) > kPatasMaxAge) {
             return false;
@@ -4168,7 +4669,9 @@ bool DecodePatasBlock(const PatasBlock& block, uint64_t* output) {
       default:
         return false;
     }
-    if (!PatasReadXor(payload, payload_end, length, tz, &x)) return false;
+    if (!PatasReadXor(payload, payload_end, length, tz, &x)) {
+      return false;
+    }
     output[local] = reference ^ x;
     if (explicit_window) {
       window_length = length;
@@ -4176,15 +4679,16 @@ bool DecodePatasBlock(const PatasBlock& block, uint64_t* output) {
     }
     previous = output[local];
   }
-  if (meta != block.meta_end || payload != payload_end) return false;
-  return true;
+  return meta == block.meta_end && payload == payload_end;
 }
 
 bool PatasMetadataMatches(const PatasRegion& region) {
   std::array<uint64_t, kPatasBlockRows> decoded{};
   for (uint32_t block = 0; block < region.block_count; ++block) {
     const PatasBlock& descriptor = region.blocks[block];
-    if (!DecodePatasBlock(descriptor, decoded.data())) return false;
+    if (!DecodePatasBlock(descriptor, decoded.data())) {
+      return false;
+    }
     uint64_t first = 0;
     uint64_t minimum = 0;
     uint64_t maximum = 0;
@@ -4207,11 +4711,13 @@ bool PatasMetadataMatches(const PatasRegion& region) {
 }
 
 int64_t DeltaPForValueAt(const DeltaPForRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   const uint32_t block = idx / kDeltaPForBlockRows;
   const uint32_t start = block * kDeltaPForBlockRows;
   const char* bracket =
-      p.brackets + static_cast<size_t>(block) * kDeltaPForBracketBytes;
+      p.brackets + (static_cast<size_t>(block) * kDeltaPForBracketBytes);
   uint64_t value = ReadBE64(bracket);
   uint32_t exception = DeltaPForExceptionAtOrAfter(p, start + 1);
   const size_t packed_bytes = (static_cast<size_t>(p.n - 1) * p.width + 7) / 8;
@@ -4220,8 +4726,9 @@ int64_t DeltaPForValueAt(const DeltaPForRegion& p, uint32_t idx) {
   for (uint32_t pos = start + 1; pos <= idx; ++pos) {
     const uint64_t offset = reader.get(static_cast<int>(p.width));
     if (exception < p.exceptions_count &&
-        ReadBE16(p.exceptions + static_cast<size_t>(exception) * 10) == pos) {
-      value += ReadBE64(p.exceptions + static_cast<size_t>(exception) * 10 + 2);
+        ReadBE16(p.exceptions + (static_cast<size_t>(exception) * 10)) == pos) {
+      value +=
+          ReadBE64(p.exceptions + (static_cast<size_t>(exception) * 10) + 2);
       ++exception;
     } else {
       value += p.delta_min + offset;
@@ -4232,7 +4739,9 @@ int64_t DeltaPForValueAt(const DeltaPForRegion& p, uint32_t idx) {
 
 void DecodeDeltaPForBlock(const DeltaPForRegion& p, uint32_t block,
                           int64_t* out) {
-  if (block >= p.blocks) return;
+  if (block >= p.blocks) {
+    return;
+  }
   const size_t packed_bytes = (static_cast<size_t>(p.n - 1) * p.width + 7) / 8;
   WordBitReader reader(p.packed, p.packed + packed_bytes);
   const uint32_t start = block * kDeltaPForBlockRows;
@@ -4240,15 +4749,16 @@ void DecodeDeltaPForBlock(const DeltaPForRegion& p, uint32_t block,
   reader.bitpos = static_cast<uint64_t>(start) * p.width;
   uint32_t exception = DeltaPForExceptionAtOrAfter(p, start + 1);
   const char* bracket =
-      p.brackets + static_cast<size_t>(block) * kDeltaPForBracketBytes;
+      p.brackets + (static_cast<size_t>(block) * kDeltaPForBracketBytes);
   uint64_t value = ReadBE64(bracket);
   out[0] = static_cast<int64_t>(value);
   for (uint32_t local = 1; local < rows; ++local) {
     const uint32_t pos = start + local;
     const uint64_t offset = reader.get(static_cast<int>(p.width));
     if (exception < p.exceptions_count &&
-        ReadBE16(p.exceptions + static_cast<size_t>(exception) * 10) == pos) {
-      value += ReadBE64(p.exceptions + static_cast<size_t>(exception) * 10 + 2);
+        ReadBE16(p.exceptions + (static_cast<size_t>(exception) * 10)) == pos) {
+      value +=
+          ReadBE64(p.exceptions + (static_cast<size_t>(exception) * 10) + 2);
       ++exception;
     } else {
       value += p.delta_min + offset;
@@ -4260,7 +4770,7 @@ void DecodeDeltaPForBlock(const DeltaPForRegion& p, uint32_t block,
 void DecodeDeltaPForAll(const DeltaPForRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.blocks; ++b) {
     DecodeDeltaPForBlock(p, b,
-                         out + static_cast<size_t>(b) * kDeltaPForBlockRows);
+                         out + (static_cast<size_t>(b) * kDeltaPForBlockRows));
   }
 }
 
@@ -4269,7 +4779,7 @@ void DecodeDeltaPForAll(const DeltaPForRegion& p, int64_t* out) {
 // verify and the decode-side reconstruct division are deterministic IEEE754
 // ops that reproduce the original bits bit-for-bit.
 double AlpFactorOf(int exp) {
-  static constexpr double kFactor[19] = {
+  static constexpr std::array<double, 19> kFactor = {
       1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8, 1e9,
       1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
   return kFactor[exp];
@@ -4287,7 +4797,9 @@ double AlpFactorOf(int exp) {
 // validation.
 bool AnsForParse(const char* r, const char* region_end, uint32_t n,
                  uint32_t param, AnsForRegion* A) {
-  if (region_end == nullptr || r + 16 > region_end) return false;
+  if (region_end == nullptr || r + 16 > region_end) {
+    return false;
+  }
   A->base = static_cast<int64_t>(ReadBE64(r));
   A->bpv = static_cast<uint8_t>(r[8]);
   A->prec = static_cast<uint8_t>(r[9]);
@@ -4296,19 +4808,21 @@ bool AnsForParse(const char* r, const char* region_end, uint32_t n,
       A->prec > 15 || A->nsym == 0 || A->nsym > 256) {
     return false;
   }
-  A->M = 1u << A->prec;
-  if (r + 12 + static_cast<size_t>(A->nsym) * 3 + 2 > region_end) {
+  A->M = 1U << A->prec;
+  if (r + 12 + (static_cast<size_t>(A->nsym) * 3) + 2 > region_end) {
     return false;
   }
   const char* p = r + 12;
   uint32_t acc = 0;
   uint8_t prev = 0;
   for (uint32_t i = 0; i < A->nsym; ++i) {
-    const uint8_t sym = static_cast<uint8_t>(p[0]);
+    const auto sym = static_cast<uint8_t>(p[0]);
     const uint32_t fr = ReadBE16(p + 1);
     // Strictly ascending unique symbols (the encoder's emit order) and a
     // nonzero share; together they pin the cum[] walk to the M slots.
-    if (fr == 0 || (i > 0 && sym <= prev)) return false;
+    if (fr == 0 || (i > 0 && sym <= prev)) {
+      return false;
+    }
     prev = sym;
     A->f[sym] = fr;
     A->cum[sym] = acc;
@@ -4317,26 +4831,38 @@ bool AnsForParse(const char* r, const char* region_end, uint32_t n,
     acc += fr;
     p += 3;
   }
-  if (acc != A->M) return false;
+  if (acc != A->M) {
+    return false;
+  }
   const uint32_t ncp = (n + kAnsCkptRows - 1) / kAnsCkptRows;
   A->ncp = ReadBE16(p);
   p += 2;
-  if (A->ncp != ncp) return false;
-  if (p + static_cast<size_t>(ncp) * 8 + 4 > region_end) return false;
+  if (A->ncp != ncp) {
+    return false;
+  }
+  if (p + (static_cast<size_t>(ncp) * 8) + 4 > region_end) {
+    return false;
+  }
   A->ckpt = p;
   p += static_cast<size_t>(ncp) * 8;
   A->slen = ReadBE32(p);
   p += 4;
-  if (p + A->slen > region_end) return false;
+  if (p + A->slen > region_end) {
+    return false;
+  }
   A->stream = reinterpret_cast<const uint8_t*>(p);
   // Checkpoint sanity: states in [L, 256*L), cursors non-increasing (later
   // rows start deeper into the consumed stream) and ckpt[0] at stream end.
   uint32_t prev_pos = A->slen;
   for (uint32_t k = 0; k < ncp; ++k) {
-    const uint32_t st = ReadBE32(A->ckpt + static_cast<size_t>(k) * 8);
-    const uint32_t ps = ReadBE32(A->ckpt + static_cast<size_t>(k) * 8 + 4);
-    if (st < kAnsL || st >= (1u << 31) || ps > A->slen) return false;
-    if (k == 0 ? ps != A->slen : ps > prev_pos) return false;
+    const uint32_t st = ReadBE32(A->ckpt + (static_cast<size_t>(k) * 8));
+    const uint32_t ps = ReadBE32(A->ckpt + (static_cast<size_t>(k) * 8) + 4);
+    if (st < kAnsL || st >= (1U << 31) || ps > A->slen) {
+      return false;
+    }
+    if (k == 0 ? ps != A->slen : ps > prev_pos) {
+      return false;
+    }
     prev_pos = ps;
   }
   return true;
@@ -4351,7 +4877,7 @@ bool AnsForStep(const AnsForRegion& A, uint32_t* x, uint32_t* pos,
   // Binary search the slot ranges: largest entry with ck_sym <= slot.
   uint32_t lo = 0, hi = A.nsym;
   while (lo + 1 < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
+    const uint32_t mid = lo + ((hi - lo) / 2);
     if (A.ck_sym[mid] <= slot) {
       lo = mid;
     } else {
@@ -4359,9 +4885,11 @@ bool AnsForStep(const AnsForRegion& A, uint32_t* x, uint32_t* pos,
     }
   }
   const uint8_t sym = A.ck_id[lo];
-  *x = A.f[sym] * (*x >> A.prec) + slot - A.cum[sym];
+  *x = (A.f[sym] * (*x >> A.prec)) + slot - A.cum[sym];
   while (*x < kAnsL) {
-    if (*pos == 0) return false;
+    if (*pos == 0) {
+      return false;
+    }
     *x = (*x << 8) | A.stream[--(*pos)];
   }
   *sym_out = sym;
@@ -4402,14 +4930,20 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t block_count = (n + kBp128BlockRows - 1) / kBp128BlockRows;
-  if (param != block_count || block_count > kBp128MaxBlocks) return false;
+  if (param != block_count || block_count > kBp128MaxBlocks) {
+    return false;
+  }
   const size_t fixed = static_cast<size_t>(block_count) * kBp128MetadataBytes;
   size_t available = SIZE_MAX;
   if (end != nullptr) {
-    if (end < region) return false;
+    if (end < region) {
+      return false;
+    }
     available = static_cast<size_t>(end - region);
   }
-  if (fixed > available) return false;
+  if (fixed > available) {
+    return false;
+  }
 
   Bp128Region parsed{};
   parsed.n = n;
@@ -4417,7 +4951,7 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
   const char* payload = region + fixed;
   for (uint32_t block = 0; block < block_count; ++block) {
     const char* metadata =
-        region + static_cast<size_t>(block) * kBp128MetadataBytes;
+        region + (static_cast<size_t>(block) * kBp128MetadataBytes);
     const uint32_t start = block * kBp128BlockRows;
     Bp128Block& decoded = parsed.blocks[block];
     decoded.rows = std::min<uint32_t>(kBp128BlockRows, n - start);
@@ -4431,13 +4965,13 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
     const uint64_t range = static_cast<uint64_t>(decoded.maximum) -
                            static_cast<uint64_t>(decoded.minimum);
     if (decoded.minimum > decoded.maximum || decoded.width > 64 ||
-        static_cast<uint32_t>(BitsNeeded(range)) > decoded.width) {
+        std::cmp_greater(BitsNeeded(range), decoded.width)) {
       return false;
     }
     const size_t packed_bytes =
         (static_cast<size_t>(decoded.rows) * decoded.width + 7) / 8;
     if (packed_bytes > available ||
-        (end != nullptr && static_cast<size_t>(end - payload) < packed_bytes)) {
+        (end != nullptr && std::cmp_less(end - payload, packed_bytes))) {
       return false;
     }
     decoded.packed = payload;
@@ -4453,12 +4987,18 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
 __int128 Bp128BlockSum(const Bp128Block& block) { return block.sum; }
 
 int64_t Bp128ValueAt(const Bp128Region& region, uint32_t index) {
-  if (index >= region.n) return 0;
+  if (index >= region.n) {
+    return 0;
+  }
   const uint32_t block_index = index / kBp128BlockRows;
-  if (block_index >= region.block_count) return 0;
+  if (block_index >= region.block_count) {
+    return 0;
+  }
   const Bp128Block& block = region.blocks[block_index];
   const uint32_t local = index % kBp128BlockRows;
-  if (local >= block.rows || block.width == 0) return block.minimum;
+  if (local >= block.rows || block.width == 0) {
+    return block.minimum;
+  }
   const uint64_t offset =
       UnpackBitAt(block.packed, static_cast<uint64_t>(local) * block.width,
                   static_cast<int>(block.width));
@@ -4476,7 +5016,9 @@ void DecodeBp128Block64(const Bp128Block& decoded, int64_t* output) {
   const char* p = decoded.packed;
   const char* const end = decoded.packed_end;
   for (; row + 4 <= rows; row += 4) {
-    if (p + 32 > end) break;
+    if (p + 32 > end) {
+      break;
+    }
     __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
     // The lanes are big-endian in memory: the byte swap is the pshufb
     // pattern the plain decoder uses.
@@ -4499,7 +5041,9 @@ void DecodeBp128Block64(const Bp128Block& decoded, int64_t* output) {
 
 void DecodeBp128Block(const Bp128Region& region, uint32_t block,
                       int64_t* output) {
-  if (block >= region.block_count) return;
+  if (block >= region.block_count) {
+    return;
+  }
   const Bp128Block& decoded = region.blocks[block];
   uint32_t row = 0;
 #if defined(__AVX2__) && defined(__BMI2__)
@@ -4518,9 +5062,13 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
     const __m256i minimum = _mm256_set1_epi64x(decoded.minimum);
     while (lanes <= decoded.rows - row) {
       const uint64_t bit_offset = static_cast<uint64_t>(row) * width;
-      if (width > 16 && 2ULL * width + (bit_offset & 7) > 64) break;
+      if (width > 16 && (2ULL * width) + (bit_offset & 7) > 64) {
+        break;
+      }
       const char* const source = decoded.packed + (bit_offset >> 3);
-      if (source + 8 > decoded.packed_end) break;
+      if (source + 8 > decoded.packed_end) {
+        break;
+      }
       const uint64_t raw = ReadBE64(source);
       const uint64_t select = select_base >> (bit_offset & 7);
       if (width <= 16) {
@@ -4555,7 +5103,7 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
     }
   }
 #endif
-  const uint64_t minimum = static_cast<uint64_t>(decoded.minimum);
+  const auto minimum = static_cast<uint64_t>(decoded.minimum);
   if (decoded.width > 32) {
     // The WIDE frames (33..63 bits): the field spans two 64-bit words at an
     // arbitrary bit offset, so the extraction is one 8-byte load plus a
@@ -4564,20 +5112,22 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
     // boundary) comes from the 9th byte, combined through a 128-bit shift
     // so no shift-by-64 edge exists.
     const uint32_t w = decoded.width;
-    const uint64_t mask = (UINT64_C(1) << w) - 1u;
+    const uint64_t mask = (UINT64_C(1) << w) - 1U;
     while (row < decoded.rows) {
       const uint64_t bit_off = static_cast<uint64_t>(row) * w;
       const uint64_t byte_off = bit_off >> 3;
-      const unsigned sh = static_cast<unsigned>(bit_off & 7u);
+      const auto sh = static_cast<unsigned>(bit_off & 7U);
       // The 8-byte window must be inside the region; the tail rows fall
       // back to the byte-at-a-time walk below.
-      if (decoded.packed + byte_off + 8 > decoded.packed_end) break;
+      if (decoded.packed + byte_off + 8 > decoded.packed_end) {
+        break;
+      }
       uint64_t w0 = 0;
       std::memcpy(&w0, decoded.packed + byte_off, 8);
       w0 = be64toh(w0);
-      uint64_t value;
+      uint64_t value = 0;
       if (sh + w <= 64) {
-        value = (w0 >> (64u - sh - w)) & mask;
+        value = (w0 >> (64U - sh - w)) & mask;
       } else {
         // The field crosses into the 9th byte: the HIGH-order bits of the
         // value live in byte9's TOP bits and the low-order bits in w0's
@@ -4585,14 +5135,16 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
         // w-1+sh-j, so the value's bit f sits at w0's bit 64-w-sh+f --
         // the shift is a LEFT one once the field crosses the word
         // boundary, and the high part comes from byte9's top bits.)
-        if (decoded.packed + byte_off + 9 > decoded.packed_end) break;
-        const uint32_t h = sh + w - 64u;  // the bits that live in byte9
+        if (decoded.packed + byte_off + 9 > decoded.packed_end) {
+          break;
+        }
+        const uint32_t h = sh + w - 64U;  // the bits that live in byte9
         // The byte is read as UNSIGNED: the packed bytes are bit patterns,
         // so a signed char would sign-extend.
-        const uint64_t byte9 = static_cast<uint64_t>(
+        const auto byte9 = static_cast<uint64_t>(
             static_cast<unsigned char>(decoded.packed[byte_off + 8]));
-        const uint64_t high = (byte9 >> (8u - h)) & ((UINT64_C(1) << h) - 1u);
-        const uint64_t low = (w0 << h) & ~((UINT64_C(1) << h) - 1u);
+        const uint64_t high = (byte9 >> (8U - h)) & ((UINT64_C(1) << h) - 1U);
+        const uint64_t low = (w0 << h) & ~((UINT64_C(1) << h) - 1U);
         value = (high | low) & mask;
       }
       output[row] = static_cast<int64_t>(minimum + value);
@@ -4610,7 +5162,7 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
 void DecodeBp128All(const Bp128Region& region, int64_t* output) {
   for (uint32_t block = 0; block < region.block_count; ++block) {
     DecodeBp128Block(region, block,
-                     output + static_cast<size_t>(block) * kBp128BlockRows);
+                     output + (static_cast<size_t>(block) * kBp128BlockRows));
   }
 }
 
@@ -4623,7 +5175,7 @@ bool Bp128MetadataMatches(const Bp128Region& region) {
     __int128 sum = 0;
     for (uint32_t row = 0; row < block.rows; ++row) {
       const int64_t value =
-          Bp128ValueAt(region, block_index * kBp128BlockRows + row);
+          Bp128ValueAt(region, (block_index * kBp128BlockRows) + row);
       minimum = std::min(minimum, value);
       maximum = std::max(maximum, value);
       sum += value;
@@ -4686,11 +5238,13 @@ uint32_t FastPforExceptionRank(const FastPforBitmap& bmp, uint32_t t) {
 // the total encoded size, or UINT64_MAX on any violation.
 uint64_t FastPforWalk(const char* r, uint32_t n, uint32_t nblk, const char* end,
                       FastPforRegion* out) {
-  size_t avail = static_cast<size_t>(end - r);
-  if (avail < static_cast<size_t>(nblk) * kFastPforMetaBytes) return UINT64_MAX;
+  auto avail = static_cast<size_t>(end - r);
+  if (avail < static_cast<size_t>(nblk) * kFastPforMetaBytes) {
+    return UINT64_MAX;
+  }
   const char* meta = r;
-  const char* payload = r + static_cast<size_t>(nblk) * kFastPforMetaBytes;
-  size_t left = avail - static_cast<size_t>(nblk) * kFastPforMetaBytes;
+  const char* payload = r + (static_cast<size_t>(nblk) * kFastPforMetaBytes);
+  size_t left = avail - (static_cast<size_t>(nblk) * kFastPforMetaBytes);
   uint64_t total = static_cast<uint64_t>(nblk) * kFastPforMetaBytes;
   FastPforRegion& p = *out;
   p.n = n;
@@ -4714,8 +5268,10 @@ uint64_t FastPforWalk(const char* r, uint32_t n, uint32_t nblk, const char* end,
     const size_t bmp_bytes = (blk.rows + 7U) / 8U;
     const size_t packed_bytes = (static_cast<size_t>(blk.rows) * blk.w + 7) / 8;
     const size_t need =
-        bmp_bytes + packed_bytes + static_cast<size_t>(blk.nexc) * 8;
-    if (need > left) return UINT64_MAX;
+        bmp_bytes + packed_bytes + (static_cast<size_t>(blk.nexc) * 8);
+    if (need > left) {
+      return UINT64_MAX;
+    }
     blk.bmp = payload;
     blk.packed = payload + bmp_bytes;
     blk.exc = blk.packed + packed_bytes;
@@ -4723,8 +5279,9 @@ uint64_t FastPforWalk(const char* r, uint32_t n, uint32_t nblk, const char* end,
     // dereferences blk.bmp); on failure the whole region is rejected, so no
     // stale pointer is ever consumed.
     const FastPforBitmap bmp = FastPforBitmapLoad(blk);
-    if (static_cast<uint32_t>(__builtin_popcountll(bmp.w[0]) +
-                              __builtin_popcountll(bmp.w[1])) != blk.nexc) {
+    if (std::cmp_not_equal(
+            __builtin_popcountll(bmp.w[0]) + __builtin_popcountll(bmp.w[1]),
+            blk.nexc)) {
       return UINT64_MAX;
     }
     payload += need;
@@ -4743,19 +5300,23 @@ bool ParseFastPforRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t nblk = (n + kFastPforBlockRows - 1) / kFastPforBlockRows;
-  if (param != nblk || nblk > kFastPforMaxBlocks) return false;
+  if (param != nblk || nblk > kFastPforMaxBlocks) {
+    return false;
+  }
   return FastPforWalk(r, n, nblk, end, out) != UINT64_MAX;
 }
 
 int64_t FastPforValueAt(const FastPforRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   const uint32_t b = idx / kFastPforBlockRows;
   const FastPforBlock& blk = p.blocks[b];
-  const uint32_t t = idx - b * kFastPforBlockRows;
+  const uint32_t t = idx - (b * kFastPforBlockRows);
   const FastPforBitmap bmp = FastPforBitmapLoad(blk);
   if (FastPforBitIsException(bmp, t)) {
     return static_cast<int64_t>(ReadBE64(
-        blk.exc + static_cast<size_t>(FastPforExceptionRank(bmp, t)) * 8));
+        blk.exc + (static_cast<size_t>(FastPforExceptionRank(bmp, t)) * 8)));
   }
   const uint64_t off =
       blk.w == 0 ? 0
@@ -4770,14 +5331,16 @@ int64_t FastPforValueAt(const FastPforRegion& p, uint32_t idx) {
 void FastPforDecodeBlock(const FastPforBlock& blk, int64_t* dst) {
   if (blk.w == 0) {
     // Every regular offset is 0: the lanes carry no bits at all.
-    for (uint32_t t = 0; t < blk.rows; ++t) dst[t] = blk.minimum;
+    for (uint32_t t = 0; t < blk.rows; ++t) {
+      dst[t] = blk.minimum;
+    }
   } else {
     Bp128Region view;
     view.block_count = 1;
     Bp128Block& leaf = view.blocks[0];
     leaf.packed = blk.packed;
     leaf.packed_end =
-        blk.packed + (static_cast<size_t>(blk.rows) * blk.w + 7) / 8;
+        blk.packed + ((static_cast<size_t>(blk.rows) * blk.w + 7) / 8);
     leaf.rows = blk.rows;
     leaf.width = blk.w;
     leaf.minimum = blk.minimum;
@@ -4792,11 +5355,13 @@ void FastPforDecodeBlock(const FastPforBlock& blk, int64_t* dst) {
     uint64_t bits = bmp.w[word];
     while (bits != 0) {
       const uint32_t t =
-          word * 64U + static_cast<uint32_t>(__builtin_ctzll(bits));
+          (word * 64U) + static_cast<uint32_t>(__builtin_ctzll(bits));
       bits &= bits - 1;
-      if (t >= blk.rows) break;  // dead (the load masks the tail); defense
+      if (t >= blk.rows) {
+        break;  // dead (the load masks the tail); defense
+      }
       dst[t] = static_cast<int64_t>(
-          ReadBE64(blk.exc + static_cast<size_t>(rank) * 8));
+          ReadBE64(blk.exc + (static_cast<size_t>(rank) * 8)));
       ++rank;
     }
   }
@@ -4807,7 +5372,7 @@ void FastPforDecodeBlock(const FastPforBlock& blk, int64_t* dst) {
 void DecodeFastPforAll(const FastPforRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.block_count; ++b) {
     FastPforDecodeBlock(p.blocks[b],
-                        out + static_cast<size_t>(b) * kFastPforBlockRows);
+                        out + (static_cast<size_t>(b) * kFastPforBlockRows));
   }
 }
 
@@ -4828,10 +5393,10 @@ bool FastPforMetadataMatches(const FastPforRegion& p) {
     const FastPforBitmap bmp = FastPforBitmapLoad(blk);
     uint32_t rank = 0;
     for (uint32_t t = 0; t < blk.rows; ++t) {
-      int64_t v;
+      int64_t v = 0;
       if (FastPforBitIsException(bmp, t)) {
         v = static_cast<int64_t>(
-            ReadBE64(blk.exc + static_cast<size_t>(rank) * 8));
+            ReadBE64(blk.exc + (static_cast<size_t>(rank) * 8)));
         ++rank;
       } else {
         const uint64_t off =
@@ -4913,13 +5478,14 @@ uint32_t DeltaFastPforExceptionRank(const DeltaFastPforBitmap& bmp,
 // encoded size, or UINT64_MAX on any violation.
 uint64_t DeltaFastPforWalk(const char* r, uint32_t n, uint32_t nblk,
                            const char* end, DeltaFastPforRegion* out) {
-  size_t avail = static_cast<size_t>(end - r);
+  auto avail = static_cast<size_t>(end - r);
   if (avail < static_cast<size_t>(nblk) * kDeltaFastPforMetaBytes) {
     return UINT64_MAX;
   }
   const char* meta = r;
-  const char* payload = r + static_cast<size_t>(nblk) * kDeltaFastPforMetaBytes;
-  size_t left = avail - static_cast<size_t>(nblk) * kDeltaFastPforMetaBytes;
+  const char* payload =
+      r + (static_cast<size_t>(nblk) * kDeltaFastPforMetaBytes);
+  size_t left = avail - (static_cast<size_t>(nblk) * kDeltaFastPforMetaBytes);
   uint64_t total = static_cast<uint64_t>(nblk) * kDeltaFastPforMetaBytes;
   DeltaFastPforRegion& p = *out;
   p.n = n;
@@ -4928,7 +5494,9 @@ uint64_t DeltaFastPforWalk(const char* r, uint32_t n, uint32_t nblk,
     DeltaFastPforBlock& blk = p.blocks[b];
     const uint32_t start = b * kDeltaFastPforBlockRows;
     blk.rows = start >= n ? 0 : std::min(kDeltaFastPforBlockRows, n - start);
-    if (blk.rows == 0) return UINT64_MAX;
+    if (blk.rows == 0) {
+      return UINT64_MAX;
+    }
     blk.base = static_cast<int64_t>(ReadBE64(meta));
     blk.minimum = static_cast<int64_t>(ReadBE64(meta + 8));
     blk.maximum = static_cast<int64_t>(ReadBE64(meta + 16));
@@ -4948,12 +5516,16 @@ uint64_t DeltaFastPforWalk(const char* r, uint32_t n, uint32_t nblk,
       return UINT64_MAX;
     }
     const uint32_t deltas = blk.rows - 1;
-    if (blk.nexc > deltas) return UINT64_MAX;
+    if (blk.nexc > deltas) {
+      return UINT64_MAX;
+    }
     const size_t bmp_bytes = (deltas + 7U) / 8U;
     const size_t packed_bytes = (static_cast<size_t>(deltas) * blk.w + 7) / 8;
     const size_t need =
-        bmp_bytes + packed_bytes + static_cast<size_t>(blk.nexc) * 8;
-    if (need > left) return UINT64_MAX;
+        bmp_bytes + packed_bytes + (static_cast<size_t>(blk.nexc) * 8);
+    if (need > left) {
+      return UINT64_MAX;
+    }
     blk.bmp = payload;
     blk.packed = payload + bmp_bytes;
     blk.exc = blk.packed + packed_bytes;
@@ -4961,8 +5533,9 @@ uint64_t DeltaFastPforWalk(const char* r, uint32_t n, uint32_t nblk,
     // dereferences blk.bmp); on failure the whole region is rejected, so no
     // stale pointer is ever consumed.
     const DeltaFastPforBitmap bmp = DeltaFastPforBitmapLoad(blk);
-    if (static_cast<uint32_t>(__builtin_popcountll(bmp.w[0]) +
-                              __builtin_popcountll(bmp.w[1])) != blk.nexc) {
+    if (std::cmp_not_equal(
+            __builtin_popcountll(bmp.w[0]) + __builtin_popcountll(bmp.w[1]),
+            blk.nexc)) {
       return UINT64_MAX;
     }
     payload += need;
@@ -4982,7 +5555,9 @@ bool ParseDeltaFastPforRegion(const char* r, uint32_t n, uint32_t param,
   }
   const uint32_t nblk =
       (n + kDeltaFastPforBlockRows - 1) / kDeltaFastPforBlockRows;
-  if (param != nblk || nblk > kDeltaFastPforMaxBlocks) return false;
+  if (param != nblk || nblk > kDeltaFastPforMaxBlocks) {
+    return false;
+  }
   return DeltaFastPforWalk(r, n, nblk, end, out) != UINT64_MAX;
 }
 
@@ -4995,22 +5570,24 @@ bool ParseDeltaFastPforRegion(const char* r, uint32_t n, uint32_t param,
 // sequential chain -- the one thing a delta transform cannot vectorize away.
 void DeltaFastPforDecodeBlock(const DeltaFastPforBlock& blk, int64_t* dst) {
   const uint32_t deltas = blk.rows - 1;
-  int64_t delta[kDeltaFastPforBlockRows];
+  std::array<int64_t, kDeltaFastPforBlockRows> delta{};
   if (blk.w == 0) {
     // Every regular delta is dmin itself: the lanes carry no bits at all.
-    const int64_t dmin = static_cast<int64_t>(blk.dmin);
-    for (uint32_t t = 0; t < deltas; ++t) delta[t] = dmin;
+    const auto dmin = static_cast<int64_t>(blk.dmin);
+    for (uint32_t t = 0; t < deltas; ++t) {
+      delta[t] = dmin;
+    }
   } else {
     Bp128Region view;
     view.block_count = 1;
     Bp128Block& leaf = view.blocks[0];
     leaf.packed = blk.packed;
     leaf.packed_end =
-        blk.packed + (static_cast<size_t>(deltas) * blk.w + 7) / 8;
+        blk.packed + ((static_cast<size_t>(deltas) * blk.w + 7) / 8);
     leaf.rows = deltas;
     leaf.width = blk.w;
     leaf.minimum = static_cast<int64_t>(blk.dmin);
-    DecodeBp128Block(view, 0, delta);
+    DecodeBp128Block(view, 0, delta.data());
   }
   // Patch exception deltas over the lanes (their lane words hold low bits
   // only).
@@ -5020,15 +5597,17 @@ void DeltaFastPforDecodeBlock(const DeltaFastPforBlock& blk, int64_t* dst) {
     uint64_t bits = bmp.w[word];
     while (bits != 0) {
       const uint32_t t =
-          word * 64U + static_cast<uint32_t>(__builtin_ctzll(bits));
+          (word * 64U) + static_cast<uint32_t>(__builtin_ctzll(bits));
       bits &= bits - 1;
-      if (t >= deltas) break;  // dead (the load masks the tail); defense
+      if (t >= deltas) {
+        break;  // dead (the load masks the tail); defense
+      }
       delta[t] = static_cast<int64_t>(
-          ReadBE64(blk.exc + static_cast<size_t>(rank) * 8));
+          ReadBE64(blk.exc + (static_cast<size_t>(rank) * 8)));
       ++rank;
     }
   }
-  uint64_t v = static_cast<uint64_t>(blk.base);
+  auto v = static_cast<uint64_t>(blk.base);
   dst[0] = static_cast<int64_t>(v);
   for (uint32_t t = 0; t < deltas; ++t) {
     v += static_cast<uint64_t>(delta[t]);
@@ -5041,17 +5620,21 @@ void DeltaFastPforDecodeBlock(const DeltaFastPforBlock& blk, int64_t* dst) {
 void DecodeDeltaFastPforAll(const DeltaFastPforRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.block_count; ++b) {
     DeltaFastPforDecodeBlock(
-        p.blocks[b], out + static_cast<size_t>(b) * kDeltaFastPforBlockRows);
+        p.blocks[b], out + (static_cast<size_t>(b) * kDeltaFastPforBlockRows));
   }
 }
 
 int64_t DeltaFastPforValueAt(const DeltaFastPforRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   const uint32_t b = idx / kDeltaFastPforBlockRows;
   const DeltaFastPforBlock& blk = p.blocks[b];
-  const uint32_t t = idx - b * kDeltaFastPforBlockRows;
-  uint64_t v = static_cast<uint64_t>(blk.base);
-  if (t == 0) return static_cast<int64_t>(v);
+  const uint32_t t = idx - (b * kDeltaFastPforBlockRows);
+  auto v = static_cast<uint64_t>(blk.base);
+  if (t == 0) {
+    return static_cast<int64_t>(v);
+  }
   // Unpack the block's delta lanes ONCE (DecodeBp128Block's AVX2 kernels
   // where compiled in) and replay to t: per-delta byte-window extraction
   // measures ~3x the probe cost of one batched unpack plus the same
@@ -5059,28 +5642,30 @@ int64_t DeltaFastPforValueAt(const DeltaFastPforRegion& p, uint32_t idx) {
   // lanes (their low bits + dmin), so the replay takes them from the
   // exception list by popcount rank.
   const uint32_t deltas = blk.rows - 1;
-  int64_t delta[kDeltaFastPforBlockRows];
+  std::array<int64_t, kDeltaFastPforBlockRows> delta{};
   if (blk.w == 0) {
-    const int64_t dmin = static_cast<int64_t>(blk.dmin);
-    for (uint32_t d = 0; d < deltas; ++d) delta[d] = dmin;
+    const auto dmin = static_cast<int64_t>(blk.dmin);
+    for (uint32_t d = 0; d < deltas; ++d) {
+      delta[d] = dmin;
+    }
   } else {
     Bp128Region view;
     view.block_count = 1;
     Bp128Block& leaf = view.blocks[0];
     leaf.packed = blk.packed;
     leaf.packed_end =
-        blk.packed + (static_cast<size_t>(deltas) * blk.w + 7) / 8;
+        blk.packed + ((static_cast<size_t>(deltas) * blk.w + 7) / 8);
     leaf.rows = deltas;
     leaf.width = blk.w;
     leaf.minimum = static_cast<int64_t>(blk.dmin);
-    DecodeBp128Block(view, 0, delta);
+    DecodeBp128Block(view, 0, delta.data());
   }
   const DeltaFastPforBitmap bmp = DeltaFastPforBitmapLoad(blk);
   for (uint32_t d = 0; d < t; ++d) {
     if (DeltaFastPforBitIsException(bmp, d)) {
-      v +=
-          ReadBE64(blk.exc +
-                   static_cast<size_t>(DeltaFastPforExceptionRank(bmp, d)) * 8);
+      v += ReadBE64(
+          blk.exc +
+          (static_cast<size_t>(DeltaFastPforExceptionRank(bmp, d)) * 8));
     } else {
       v += static_cast<uint64_t>(delta[d]);
     }
@@ -5100,8 +5685,8 @@ int64_t DeltaFastPforValueAt(const DeltaFastPforRegion& p, uint32_t idx) {
 bool DeltaFastPforMetadataMatches(const DeltaFastPforRegion& p) {
   for (uint32_t b = 0; b < p.block_count; ++b) {
     const DeltaFastPforBlock& blk = p.blocks[b];
-    int64_t decoded[kDeltaFastPforBlockRows];
-    DeltaFastPforDecodeBlock(blk, decoded);
+    std::array<int64_t, kDeltaFastPforBlockRows> decoded{};
+    DeltaFastPforDecodeBlock(blk, decoded.data());
     int64_t mn = INT64_MAX;
     int64_t mx = INT64_MIN;
     __int128 sum = 0;

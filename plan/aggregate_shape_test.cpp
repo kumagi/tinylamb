@@ -368,6 +368,9 @@ TEST_F(AggregateShapeTest, ComputedGroupingDoesNotProveAtMostOneRow) {
     const auto best = search.Optimize(root, PhysicalProperties{},
                                       DefaultImplementationRules());
     ASSERT_TRUE(best.has_value());
+    if (!best.has_value()) {
+      return;
+    }
     auto context = database_->BeginContext();
     const auto executor = best->plan->EmitExecutor(context);
     std::vector<Row> rows;
@@ -438,6 +441,9 @@ TEST_F(AggregateShapeTest, CountOfNullSupplyingOuterColumnKeepsItsArgument) {
     const auto best = search.Optimize(root, PhysicalProperties{},
                                       DefaultImplementationRules());
     ASSERT_TRUE(best.has_value());
+    if (!best.has_value()) {
+      return;
+    }
     auto context = database_->BeginContext();
     const auto executor = best->plan->EmitExecutor(context);
     Row row;
@@ -483,6 +489,9 @@ TEST_F(AggregateShapeTest, ReplacingANotNullColumnWithNullDoesNotRewriteCount) {
   const auto best =
       search.Optimize(root, PhysicalProperties{}, DefaultImplementationRules());
   ASSERT_TRUE(best.has_value());
+  if (!best.has_value()) {
+    return;
+  }
   auto context = database_->BeginContext();
   const auto executor = best->plan->EmitExecutor(context);
   Row row;
@@ -536,6 +545,9 @@ TEST_F(AggregateShapeTest, JoinFanoutDoesNotPreserveBasePrimaryKeyUniqueness) {
   const auto best =
       search.Optimize(root, PhysicalProperties{}, DefaultImplementationRules());
   ASSERT_TRUE(best.has_value());
+  if (!best.has_value()) {
+    return;
+  }
   auto context = database_->BeginContext();
   const auto executor = best->plan->EmitExecutor(context);
   Row row;

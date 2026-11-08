@@ -1,0 +1,166 @@
+-- tinylamb-session-test v1
+-- seed: 11321685160750415786
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 INT64, c2 INT64, c3 INT64);
+-- stmt: CREATE TABLE tbl1 (u INT64, c1 INT64, c2 INT64);
+-- stmt: UPDATE tbl0 SET c3 = (CASE WHEN ((c3 != 2) OR (c2 IS NULL)) THEN c2 ELSE c1 END) WHERE (((u IS NOT NULL) AND (c3 = c1)) AND (NOT tbl0.c2 != ALL (SELECT u FROM tbl1)));
+-- stmt: UPDATE tbl0 SET c2 = -3 WHERE ((c1 != c2) OR (u IS NULL));
+-- stmt: ANALYZE tbl1;
+-- stmt: INSERT INTO tbl0 VALUES (0, NULL, -1, NULL);
+-- ddl: CREATE INDEX idx0 ON tbl1 KEY(1)
+-- stmt: UPDATE tbl0 SET c1 = 0 WHERE ((c1 IS NULL) OR (u IS NOT NULL));
+-- check: tbl1
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 0;
+-- stmt: ANALYZE tbl0;
+-- commit
+-- stmt: CREATE TABLE tbl2 (u INT64, c1 DOUBLE, c2 INT64);
+-- ddl: CREATE INDEX idx1 ON tbl2 KEY(2)
+-- stmt: INSERT INTO tbl2 VALUES (0, 3.0, -2);
+-- abort
+-- check: tbl0
+-- expect: [0, 0, -1, NULL]
+-- check: tbl1
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 0;
+-- ddl: CREATE UNIQUE INDEX idx2 ON tbl0 KEY(0)
+-- ddl: CREATE INDEX idx3 ON tbl0 KEY(0,3)
+-- stmt: INSERT INTO tbl1 VALUES (0, 2, -2);
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- check: tbl0
+-- expect: [0, 0, -1, NULL]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = -1;
+-- commit
+-- stmt: INSERT INTO tbl0 SELECT (u + 1), 1, c2, c1 FROM tbl0 WHERE (c1 >= u);
+-- stmt: INSERT INTO tbl1 (u, c1, c2) VALUES (1, 2, 3);
+-- stmt: DELETE FROM tbl1 WHERE (NOT (u = -2));
+-- checkpoint
+-- check: tbl0
+-- expect: [0, 0, -1, NULL]
+-- expect: [1, 1, -1, 0]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u <= 1;
+-- expect: [0, 0, -1, NULL]
+-- expect: [1, 1, -1, 0]
+-- check: tbl1
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 3;
+-- stmt: UPDATE tbl1 SET c2 = (u - c1) WHERE ((c2 <= 3) AND (c1 IS NOT NULL));
+-- stmt: INSERT INTO tbl1 VALUES (2, 0, 1);
+-- checkpoint
+-- check: tbl0
+-- expect: [0, 0, -1, NULL]
+-- expect: [1, 1, -1, 0]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 1;
+-- expect: [1, 1, -1, 0]
+-- check: tbl1
+-- expect: [2, 0, 1]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 <= 0;
+-- expect: [2, 0, 1]
+-- stmt: INSERT INTO tbl0 VALUES (3, NULL, 1, NULL);
+-- abort
+-- check: tbl0
+-- expect: [0, 0, -1, NULL]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 0;
+-- expect: [0, 0, -1, NULL]
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 2;
+-- expect: [0, 2, -2]
+-- stmt: INSERT INTO tbl1 VALUES (1, -1, -2);
+-- stmt: UPDATE tbl0 SET c3 = -3 WHERE (NOT ((c3 != 0) AND (u < u)));
+-- commit
+-- stmt: UPDATE tbl1 SET c2 = -2 WHERE ((c2 IS NOT NULL) AND (NOT EXISTS (SELECT 1 FROM tbl0 WHERE tbl0.u = tbl1.c1)));
+-- abort
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 0;
+-- expect: [0, 0, -1, -3]
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 4;
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 1;
+-- crash
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u < -3;
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 2;
+-- expect: [0, 2, -2]
+-- stmt: INSERT INTO tbl1 SELECT (u + 2), c2, (CASE WHEN ((u != c1) AND (u > 3)) THEN -3 ELSE -2 END) FROM tbl1 WHERE (u >= c1);
+-- checkpoint
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 0;
+-- expect: [0, 0, -1, -3]
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- expect: [3, -2, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = 1;
+-- stmt: UPDATE tbl1 SET c1 = c2 WHERE (NOT (c1 >= u));
+-- stmt: INSERT INTO tbl0 VALUES (1, -1, -2, -2);
+-- stmt: ANALYZE tbl0;
+-- abort
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 3;
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 >= -3;
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- stmt: UPDATE tbl0 SET c2 = 1, c3 = c2 WHERE ((c3 = u) AND (c2 >= c1));
+-- crash
+-- check: tbl0
+-- expect: [0, 0, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u = 0;
+-- expect: [0, 0, -1, -3]
+-- check: tbl1
+-- expect: [0, 2, -2]
+-- expect: [1, -1, -2]
+-- check: tbl1
+-- checksql: SELECT * FROM tbl1 WHERE c1 = -1;
+-- expect: [1, -1, -2]
+-- stmt: INSERT INTO tbl1 (u, c1, c2) VALUES (2, 1, 2);
+-- commit
+-- ddl: CREATE UNIQUE INDEX idx4 ON tbl1 KEY(0)
+-- stmt: UPDATE tbl0 SET c3 = 2 WHERE ((tbl0.u NOT IN (SELECT u FROM tbl1)) AND (EXISTS (SELECT 1 FROM tbl1 WHERE tbl1.c1 = tbl0.c3)));
+-- stmt: INSERT INTO tbl1 VALUES (3, -2, -1);
+-- stmt: UPDATE tbl1 SET c2 = COALESCE(u, u) WHERE (tbl1.u = ALL (SELECT c3 FROM tbl0));
+-- stmt: UPDATE tbl0 SET c1 = 1 WHERE (c3 != 0);
+-- stmt: UPDATE tbl1 SET c2 = c1 WHERE ((u IS NULL) OR (u >= -1));
+-- stmt: UPDATE tbl1 SET c1 = -3 WHERE ((EXISTS (SELECT 1 FROM tbl0 WHERE tbl0.c1 = tbl1.u)) AND (EXISTS (SELECT 1 FROM tbl0 WHERE tbl0.c3 = tbl1.u)));
+-- ddl: CREATE INDEX idx5 ON tbl1 KEY(2) INCLUDE(2)
+-- check: tbl0
+-- expect: [0, 1, -1, -3]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE u <= 0;
+-- expect: [0, 1, -1, -3]
+-- check: tbl1
+-- expect: [0, 2, 2]
+-- expect: [1, -1, -1]
+-- expect: [2, 1, 1]
+-- expect: [3, -2, -2]
+-- failure: auto-generated by sql_session_fuzzer | final state mismatch on tbl1 after step 50 | table tbl1: mirror has 4 rows, engine has 4 | expected: | [0, 2, 2] | [1, -1, -1] | [2, 1, 1] | [3, -2, -2] | actual: | [0, 2, 2] | [1, -3, -1] | [2, 1, 1] | [3, -2, -2] | first diff at 1: expected [1, -1, -1] vs actual [1, -3, -1]

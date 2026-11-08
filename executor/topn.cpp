@@ -135,41 +135,49 @@ Status TopNExecutor::Materialize() {
       // contains the global best prefix, including stable equal-key ties.
       // Charge the geometric heap capacities and decoded position batches
       // before consuming anything; a large LIMIT retains the regular path.
-      size_t candidate_bytes, heap_bytes, scan_bytes, bytes;
+      size_t candidate_bytes = 0, heap_bytes = 0, scan_bytes = 0, bytes = 0;
       const size_t payload =
           sizeof(Candidate) +
-          (schema_.ColumnCount() + keys_.size()) * sizeof(Value);
+          ((schema_.ColumnCount() + keys_.size()) * sizeof(Value));
       if (!__builtin_mul_overflow(capacity, payload * 2, &candidate_bytes) &&
           !__builtin_mul_overflow(scan->MorselCount() + 1, candidate_bytes,
                                   &heap_bytes) &&
           !__builtin_mul_overflow(
               scan->WorkerCount() * kDefaultVectorSize,
-              schema_.ColumnCount() * 9 + sizeof(RowPosition), &scan_bytes) &&
+              (static_cast<size_t>(schema_.ColumnCount()) * 9) +
+                  sizeof(RowPosition),
+              &scan_bytes) &&
           !__builtin_add_overflow(heap_bytes, scan_bytes, &bytes) &&
           QueryMemoryBudget::Global().CanReserve(bytes)) {
         QueryMemoryCharge charge(bytes);
         using Heap = decltype(heap);
         std::vector<Heap> partials;
         partials.reserve(scan->MorselCount());
-        for (size_t m = 0; m < scan->MorselCount(); ++m)
+        for (size_t m = 0; m < scan->MorselCount(); ++m) {
           partials.emplace_back(worse_first);
+        }
         std::vector<size_t> counts(scan->MorselCount(), 0);
         auto fold = scan->TryFoldTypedMorsels(
             [&](size_t m, const TypedCellBatch& batch) -> Status {
               if (batch.stride != schema_.ColumnCount() ||
-                  batch.positions.size() != batch.rows)
+                  batch.positions.size() != batch.rows) {
                 return StatusError(StatusCode::kRuntimeError,
                                    "typed TopN layout mismatch");
+              }
               const auto value_at = [&](size_t batch_row, size_t column) {
-                const size_t cell = batch_row * batch.stride + column;
-                if (batch.nulls[cell]) return Value();
+                const size_t cell = (batch_row * batch.stride) + column;
+                if (batch.nulls[cell]) {
+                  return Value();
+                }
                 Value value;
-                if (batch.slot_types[column] == ValueType::kDouble)
+                if (batch.slot_types[column] == ValueType::kDouble) {
                   value = Value(std::bit_cast<double>(batch.cells[cell]));
-                else {
+                } else {
                   value = Value(batch.cells[cell]);
                   value.type = batch.slot_types[column];
-                  if (batch.slot_unsigned[column]) value = value.WithUnsigned();
+                  if (batch.slot_unsigned[column]) {
+                    value = value.WithUnsigned();
+                  }
                 }
                 return value;
               };
@@ -179,17 +187,22 @@ Status TopNExecutor::Materialize() {
               for (size_t r = 0; r < batch.rows; ++r) {
                 candidate.sequence = counts[m]++;
                 candidate.keys.resize(keys_.size());
-                for (size_t k = 0; k < keys_.size(); ++k)
+                for (size_t k = 0; k < keys_.size(); ++k) {
                   candidate.keys[k] = value_at(r, direct_columns[k]);
+                }
                 if (local.size() < capacity ||
                     precedes(candidate, local.top())) {
                   candidate.row.values_.clear();
                   candidate.row.values_.reserve(batch.stride);
-                  for (size_t c = 0; c < batch.stride; ++c)
+                  for (size_t c = 0; c < batch.stride; ++c) {
                     candidate.row.values_.push_back(value_at(r, c));
+                  }
                   candidate.position = batch.positions[r];
-                  if (local.size() == capacity) local.pop();
+                  if (local.size() == capacity) {
+                    local.pop();
+                  }
                   local.push(std::move(candidate));
+                  candidate = Candidate{};
                 }
               }
               return Status::kSuccess;
@@ -209,17 +222,21 @@ Status TopNExecutor::Materialize() {
                   std::move(const_cast<Candidate&>(local.top()));
               local.pop();
               if (__builtin_add_overflow(candidate.sequence, prefix,
-                                         &candidate.sequence))
+                                         &candidate.sequence)) {
                 return StatusError(StatusCode::kTooBigData,
                                    "TopN input row count overflow");
+              }
               if (heap.size() < capacity || precedes(candidate, heap.top())) {
-                if (heap.size() == capacity) heap.pop();
+                if (heap.size() == capacity) {
+                  heap.pop();
+                }
                 heap.push(std::move(candidate));
               }
             }
-            if (__builtin_add_overflow(prefix, counts[m], &prefix))
+            if (__builtin_add_overflow(prefix, counts[m], &prefix)) {
               return StatusError(StatusCode::kTooBigData,
                                  "TopN input row count overflow");
+            }
           }
           input_rows_ = prefix;
           fused_scan_ = true;
@@ -248,6 +265,7 @@ Status TopNExecutor::Materialize() {
             heap.pop();
           }
           heap.push(std::move(candidate));
+          candidate = Candidate{};
         }
       }
     }

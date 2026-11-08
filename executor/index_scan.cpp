@@ -78,8 +78,9 @@ TransactionManager::IndexReadGuard AcquireScanIndexReadGuard(
 
 std::optional<IntegerPeekCompare> CompileIntegerPeek(
     const Expression& expression, const Schema& schema) {
-  if (!expression || expression->Type() != TypeTag::kBinaryExp)
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
     return std::nullopt;
+  }
   const auto& binary = expression->AsBinaryExpression();
   Expression column = binary.Left(), constant = binary.Right();
   auto op = binary.Op();
@@ -90,36 +91,49 @@ std::optional<IntegerPeekCompare> CompileIntegerPeek(
     flipped = true;
   }
   if (column->Type() != TypeTag::kColumnValue ||
-      constant->Type() != TypeTag::kConstantValue)
+      constant->Type() != TypeTag::kConstantValue) {
     return std::nullopt;
+  }
   const int offset = schema.Offset(column->AsColumnValue().GetColumnName());
   const Value& value = constant->AsConstantValue().GetValue();
-  if (offset < 0 || value.IsUnsigned()) return std::nullopt;
+  if (offset < 0 || value.IsUnsigned()) {
+    return std::nullopt;
+  }
   const Column& declared = schema.GetColumn(static_cast<size_t>(offset));
   if (declared.IsUnsigned() || declared.Type() != value.type ||
-      (value.type != ValueType::kInt64 && value.type != ValueType::kDate))
+      (value.type != ValueType::kInt64 && value.type != ValueType::kDate)) {
     return std::nullopt;
+  }
   switch (op) {
     case BinaryOperation::kEquals:
     case BinaryOperation::kNotEquals:
       break;
     case BinaryOperation::kLessThan:
-      if (flipped) op = BinaryOperation::kGreaterThan;
+      if (flipped) {
+        op = BinaryOperation::kGreaterThan;
+      }
       break;
     case BinaryOperation::kLessThanEquals:
-      if (flipped) op = BinaryOperation::kGreaterThanEquals;
+      if (flipped) {
+        op = BinaryOperation::kGreaterThanEquals;
+      }
       break;
     case BinaryOperation::kGreaterThan:
-      if (flipped) op = BinaryOperation::kLessThan;
+      if (flipped) {
+        op = BinaryOperation::kLessThan;
+      }
       break;
     case BinaryOperation::kGreaterThanEquals:
-      if (flipped) op = BinaryOperation::kLessThanEquals;
+      if (flipped) {
+        op = BinaryOperation::kLessThanEquals;
+      }
       break;
     default:
       return std::nullopt;
   }
-  return IntegerPeekCompare{static_cast<slot_t>(offset), op,
-                            value.value.int_value};
+  return IntegerPeekCompare{.column = static_cast<slot_t>(offset),
+                            .op = op,
+                            .constant = value.value.int_value};
 }
 
 }  // namespace
@@ -200,7 +214,9 @@ void IndexScan::CompileIntegerPeeks() {
   // Rebuild from the original predicate for each newly opened range. Locking
   // scans must reserve the row intent before testing its head image.
   cond_conjuncts_ = SplitConjuncts(cond_);
-  if (lock_rows_) return;
+  if (lock_rows_) {
+    return;
+  }
   std::vector<Expression> residual;
   for (const Expression& conjunct : cond_conjuncts_) {
     if (auto peek = CompileIntegerPeek(conjunct, schema_)) {
@@ -214,9 +230,9 @@ void IndexScan::CompileIntegerPeeks() {
 
 void IndexScan::OpenRange(const std::vector<Value>& begin_key,
                           const std::vector<Value>& end_key) {
-  iter_ = std::unique_ptr<IndexScanIterator>(
-      new IndexScanIterator(table_, index_, txn_, begin_key, end_key,
-                            ascending_, lock_rows_, &index_read_guard_));
+  iter_ = std::make_unique<IndexScanIterator>(table_, index_, txn_, begin_key,
+                                              end_key, ascending_, lock_rows_,
+                                              &index_read_guard_);
   CompileIntegerPeeks();
   iter_->projection_ = projection_;
   OpenPrefetch(begin_key, end_key);
@@ -360,16 +376,21 @@ size_t IndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
 }
 
 bool IndexScan::EnforcesIntegerPredicate(const Expression& predicate) const {
-  if (lock_rows_ || projection_) return false;
+  if (lock_rows_ || projection_) {
+    return false;
+  }
   for (const Expression& conjunct : SplitConjuncts(predicate)) {
     const auto peek = CompileIntegerPeek(conjunct, schema_);
-    if (!peek) return false;
+    if (!peek) {
+      return false;
+    }
     const auto& expected = *peek;
     if (std::ranges::none_of(iter_->integer_peeks_, [&](const auto& actual) {
           return actual.column == expected.column && actual.op == expected.op &&
                  actual.constant == expected.constant;
-        }))
+        })) {
       return false;
+    }
   }
   return true;
 }
@@ -377,16 +398,21 @@ bool IndexScan::EnforcesIntegerPredicate(const Expression& predicate) const {
 bool IndexScan::TrySetProjection(const std::vector<NamedExpression>& columns,
                                  const Schema& output_schema) {
   if (lock_rows_ || projection_ || !cond_conjuncts_.empty() ||
-      index_.RetainsDeletedEntries() || columns.empty())
+      index_.RetainsDeletedEntries() || columns.empty()) {
     return false;
+  }
   std::vector<slot_t> slots;
   for (const auto& column : columns) {
     if (!column.expression ||
-        column.expression->Type() != TypeTag::kColumnValue)
+        column.expression->Type() != TypeTag::kColumnValue) {
       return false;
+    }
     const int offset =
         schema_.Offset(column.expression->AsColumnValue().GetColumnName());
-    if (offset < 0 || (!slots.empty() && slots.back() >= offset)) return false;
+    if (offset < 0 ||
+        (!slots.empty() && std::cmp_greater_equal(slots.back(), offset))) {
+      return false;
+    }
     slots.push_back(static_cast<slot_t>(offset));
   }
   projection_ = std::move(slots);

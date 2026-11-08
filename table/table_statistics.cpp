@@ -107,7 +107,7 @@ size_t ScaleCount(size_t count, double multiplier) {
     return 0;
   }
   const long double scaled = static_cast<long double>(count) * multiplier;
-  if (scaled >= std::numeric_limits<size_t>::max()) {
+  if (scaled >= static_cast<long double>(std::numeric_limits<size_t>::max())) {
     return std::numeric_limits<size_t>::max();
   }
   return static_cast<size_t>(std::llround(scaled));
@@ -1461,10 +1461,11 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         int64_t minimum = 0;
         decoder >> maximum >> minimum >> count >> distinct;
         if (count > 0) {
-          column.histogram_.push_back(HistogramBucket{.lower = Value(minimum),
-                                                      .upper = Value(maximum),
-                                                      .count = count,
-                                                      .distinct = distinct});
+          column.histogram_.push_back(
+              HistogramBucket{.lower = Value(minimum),
+                              .upper = Value(maximum),
+                              .count = static_cast<size_t>(count),
+                              .distinct = static_cast<size_t>(distinct)});
         }
         break;
       }
@@ -1476,8 +1477,8 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
           column.histogram_.push_back(
               HistogramBucket{.lower = Value::DateFromDays(minimum),
                               .upper = Value::DateFromDays(maximum),
-                              .count = count,
-                              .distinct = distinct});
+                              .count = static_cast<size_t>(count),
+                              .distinct = static_cast<size_t>(distinct)});
         }
         break;
       }
@@ -1486,10 +1487,11 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
         double minimum = 0;
         decoder >> maximum >> minimum >> count >> distinct;
         if (count > 0) {
-          column.histogram_.push_back(HistogramBucket{.lower = Value(minimum),
-                                                      .upper = Value(maximum),
-                                                      .count = count,
-                                                      .distinct = distinct});
+          column.histogram_.push_back(
+              HistogramBucket{.lower = Value(minimum),
+                              .upper = Value(maximum),
+                              .count = static_cast<size_t>(count),
+                              .distinct = static_cast<size_t>(distinct)});
         }
         break;
       }

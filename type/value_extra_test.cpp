@@ -117,4 +117,21 @@ TEST(ValueExtraTest, VarcharLengthBoundariesRoundTrip) {
   ExpectMemcomparableOrder(sizes);
 }
 
+TEST(ValueExtraTest, CorruptMemcomparableArrayPresenceAndPaddingRejected) {
+  // Found by memcmp_fuzzer on oci-small: an array with presence byte 0x2f
+  // followed by a kNull tag (0x00) used to decode as [NULL] and re-encode to a
+  // shorter buffer.
+  const std::string corrupt_array(
+      "\x05\x00\x00\x00\x01\xff\xff\xff\xff\xe2\x05\x00\x2f\x00", 14);
+  Value out;
+  EXPECT_FALSE(out.TryDecodeMemcomparableFormat(corrupt_array).HasValue());
+
+  // Non-zero padding in a short VARCHAR group must also be rejected.
+  const std::string corrupt_varchar(
+      "\x02"
+      "a\x01\x00\x00\x00\x00\x00\x00\x01",
+      10);
+  EXPECT_FALSE(out.TryDecodeMemcomparableFormat(corrupt_varchar).HasValue());
+}
+
 }  // namespace tinylamb

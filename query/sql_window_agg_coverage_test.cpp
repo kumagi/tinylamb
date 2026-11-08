@@ -375,10 +375,10 @@ TEST_F(WindowSqlCov, RangeOffsetFramesOnFloatKeys) {
       "SELECT SUM(v) OVER (ORDER BY f RANGE BETWEEN 1.0 PRECEDING AND 1.0 "
       "FOLLOWING) FROM wx WHERE g = 1 ORDER BY f NULLS FIRST, v");
   ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
-  // Order: NULL(50), 1.5(10), 1.5(20), 2.5(30), NaN(40).
-  EXPECT_EQ(rows.Value(), (std::vector<Row>({Row({Value(50)}), Row({Value(60)}),
+  // Order: NULL(50), NaN(40), 1.5(10), 1.5(20), 2.5(30).
+  EXPECT_EQ(rows.Value(), (std::vector<Row>({Row({Value(50)}), Row({Value(40)}),
                                              Row({Value(60)}), Row({Value(60)}),
-                                             Row({Value(40)})})));
+                                             Row({Value(60)})})));
 }
 
 // INTERVAL boundaries turn RANGE frames into calendar-aware rolling windows

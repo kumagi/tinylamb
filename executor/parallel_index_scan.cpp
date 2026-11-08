@@ -147,7 +147,8 @@ void ParallelIndexScan::RunWorker(size_t batch_size, size_t worker_index) {
       }
       const Morsel& morsel = morsels_[morsel_index];
       IndexScan scan(*txn_, *table_, *index_, morsel.begin_key, morsel.end_key,
-                     ascending_, Expression(), schema_);
+                     ascending_, Expression(), schema_, false, true,
+                     TransactionManager::IndexReadGuard::Borrowed());
       DataChunk chunk;
       chunk.Initialize(table_->GetSchema(), batch_size);
       DataChunk batch;
@@ -282,8 +283,8 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
     if (next_out_morsel_ >= morsels_.size()) {
       return destination->Size();
     }
-    if (morsels_done_[next_out_morsel_] &&
-        !morsel_chunk_[next_out_morsel_].has_value()) {
+    auto& slot_opt = morsel_chunk_[next_out_morsel_];
+    if (!slot_opt.has_value()) {
       // The morsel finished with nothing queued (all rows filtered out or
       // the range was empty): advance past it instead of reporting a false
       // end-of-scan.
@@ -291,8 +292,8 @@ size_t ParallelIndexScan::NextBatch(DataChunk* destination, size_t max_rows) {
       space_cv_.notify_all();
       continue;
     }
-    DataChunk chunk = std::move(*morsel_chunk_[next_out_morsel_]);
-    morsel_chunk_[next_out_morsel_].reset();
+    DataChunk chunk = std::move(*slot_opt);
+    slot_opt.reset();
     lock.unlock();
     // Whichever producer is parked on this slot must observe the freed one;
     // one random wakeup cannot guarantee that.

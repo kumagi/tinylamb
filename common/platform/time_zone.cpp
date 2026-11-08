@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string>
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
 
@@ -38,12 +38,12 @@ int64_t LocalSeconds(int year, unsigned month, unsigned day, int hour,
   const std::chrono::sys_days days{std::chrono::year_month_day{
       std::chrono::year{year}, std::chrono::month{month},
       std::chrono::day{day}}};
-  return static_cast<int64_t>(days.time_since_epoch().count()) * 86400 +
-         static_cast<int64_t>(hour) * 3600 + static_cast<int64_t>(minute) * 60 +
-         second;
+  return (static_cast<int64_t>(days.time_since_epoch().count()) * 86400) +
+         (static_cast<int64_t>(hour) * 3600) +
+         (static_cast<int64_t>(minute) * 60) + second;
 }
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 
 struct CfRelease {
   void operator()(CFTypeRef ref) const {
@@ -122,7 +122,7 @@ int OffsetAtUtc(CFTimeZoneRef zone, int64_t unix_seconds) {
 
 }  // namespace
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 
 bool IsKnownTimeZone(std::string_view name) {
   return !name.empty() && FindZone(name) != nullptr;
@@ -153,7 +153,9 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
 #else
 
 bool IsKnownTimeZone(std::string_view name) {
-  if (name.empty()) return false;
+  if (name.empty()) {
+    return false;
+  }
   try {
     return std::chrono::locate_zone(name) != nullptr;
   } catch (...) {  // NOLINT(bugprone-empty-catch) runtime_error: unknown zone
@@ -164,10 +166,14 @@ bool IsKnownTimeZone(std::string_view name) {
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
                                              unsigned month, unsigned day,
                                              int hour, int minute, int second) {
-  if (name.empty()) return std::nullopt;
+  if (name.empty()) {
+    return std::nullopt;
+  }
   try {
     const std::chrono::time_zone* zone = std::chrono::locate_zone(name);
-    if (zone == nullptr) return std::nullopt;
+    if (zone == nullptr) {
+      return std::nullopt;
+    }
     const std::chrono::local_seconds local{std::chrono::seconds{
         LocalSeconds(year, month, day, hour, minute, second)}};
     return static_cast<int>(zone->get_info(local).first.offset.count());

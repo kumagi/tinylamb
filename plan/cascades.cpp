@@ -40,6 +40,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
@@ -466,7 +467,6 @@ int ConjunctCostClass(const Expression& conjunct) {
       return 4;
     }
     case TypeTag::kInExp:
-      return 3;
     case TypeTag::kCastExp:
       return 3;
     case TypeTag::kFunctionCallExp:
@@ -2203,7 +2203,7 @@ bool ReachableChildHasWindow(const Memo& memo, GroupId start) {
   while (!pending.empty()) {
     const GroupId next = pending.back();
     pending.pop_back();
-    if (static_cast<size_t>(next) >= seen.size() || seen[next]) {
+    if (static_cast<size_t>(next) >= seen.size() || (seen[next] != 0)) {
       continue;
     }
     seen[next] = 1;
@@ -3955,8 +3955,8 @@ const RuleSet& RuleSet::Default() {
           }
           const GroupId window_group_id = bindings.at("window");
           if (window_group_id == group ||
-              memo.Get(window_group_id).tag.rfind("window-prefix-window:", 0) ==
-                  0) {
+              memo.Get(window_group_id)
+                  .tag.starts_with("window-prefix-window:")) {
             return;
           }
           for (const LogicalExpression& window :
@@ -3968,7 +3968,7 @@ const RuleSet& RuleSet::Default() {
             const GroupId input_id = window.children[0];
             const auto gate = WindowPrefixGate(window);
             if (!gate.has_value() || !gate->stable || gate->order_terms != 0 ||
-                memo.Get(input_id).tag.rfind("window-prefix-limit:", 0) == 0 ||
+                memo.Get(input_id).tag.starts_with("window-prefix-limit:") ||
                 ReachableChildHasWindow(memo, input_id)) {
               continue;
             }
@@ -4021,14 +4021,13 @@ const RuleSet& RuleSet::Default() {
           }
           const GroupId sort_group_id = bindings.at("sort");
           if (sort_group_id == group ||
-              memo.Get(sort_group_id).tag.rfind("window-prefix-limit:", 0) ==
-                  0) {
+              memo.Get(sort_group_id).tag.starts_with("window-prefix-limit:")) {
             return;
           }
           const GroupId window_group_id = bindings.at("window");
           if (window_group_id == group ||
-              memo.Get(window_group_id).tag.rfind("window-prefix-window:", 0) ==
-                  0) {
+              memo.Get(window_group_id)
+                  .tag.starts_with("window-prefix-window:")) {
             return;
           }
           for (const LogicalExpression& window :
@@ -6667,6 +6666,12 @@ const RuleSet& RuleSet::Default() {
                   const Value constant = (left_col ? bin.Right() : bin.Left())
                                              ->AsConstantValue()
                                              .GetValue();
+                  if (constant.IsNull() ||
+                      (!in_values.empty() &&
+                       constant.type != in_values.front().type)) {
+                    collected_all_branches = false;
+                    return;
+                  }
                   if (!target_col) {
                     target_col = col;
                   }
@@ -6742,21 +6747,26 @@ const RuleSet& RuleSet::Default() {
           }
           std::unordered_map<std::string, Value> eq_constants;
           for (const auto& conj : conjuncts) {
-            if (conj && conj->Type() == TypeTag::kBinaryExp) {
+            if (conj && conj->Type() == TypeTag::kBinaryExp &&
+                !ContainsParameterSlot(conj)) {
               const auto& bin = conj->AsBinaryExpression();
               if (bin.Op() == BinaryOperation::kEquals) {
                 if (bin.Left()->Type() == TypeTag::kColumnValue &&
                     bin.Right()->Type() == TypeTag::kConstantValue) {
-                  eq_constants
-                      [bin.Left()->AsColumnValue().GetColumnName().ToString()] =
-                          bin.Right()->AsConstantValue().GetValue();
+                  const Value& val = bin.Right()->AsConstantValue().GetValue();
+                  if (!val.IsNull()) {
+                    eq_constants.try_emplace(
+                        bin.Left()->AsColumnValue().GetColumnName().ToString(),
+                        val);
+                  }
                 } else if (bin.Right()->Type() == TypeTag::kColumnValue &&
                            bin.Left()->Type() == TypeTag::kConstantValue) {
-                  eq_constants[bin.Right()
-                                   ->AsColumnValue()
-                                   .GetColumnName()
-                                   .ToString()] =
-                      bin.Left()->AsConstantValue().GetValue();
+                  const Value& val = bin.Left()->AsConstantValue().GetValue();
+                  if (!val.IsNull()) {
+                    eq_constants.try_emplace(
+                        bin.Right()->AsColumnValue().GetColumnName().ToString(),
+                        val);
+                  }
                 }
               }
             }
@@ -6767,9 +6777,13 @@ const RuleSet& RuleSet::Default() {
           std::vector<Expression> kept;
           bool reduced = false;
           for (const auto& conj : conjuncts) {
-            if (conj && conj->Type() == TypeTag::kBinaryExp) {
+            if (conj && conj->Type() == TypeTag::kBinaryExp &&
+                !ContainsParameterSlot(conj)) {
               const auto& bin = conj->AsBinaryExpression();
-              if (bin.Op() != BinaryOperation::kEquals) {
+              if (bin.Op() == BinaryOperation::kLessThanEquals ||
+                  bin.Op() == BinaryOperation::kGreaterThanEquals ||
+                  bin.Op() == BinaryOperation::kLessThan ||
+                  bin.Op() == BinaryOperation::kGreaterThan) {
                 if (bin.Left()->Type() == TypeTag::kColumnValue &&
                     bin.Right()->Type() == TypeTag::kConstantValue) {
                   const std::string col_str =
@@ -6779,15 +6793,15 @@ const RuleSet& RuleSet::Default() {
                     const Value& k = it->second;
                     const Value& bound =
                         bin.Right()->AsConstantValue().GetValue();
-                    if ((bin.Op() == BinaryOperation::kLessThanEquals &&
-                         k <= bound) ||
-                        (bin.Op() == BinaryOperation::kGreaterThanEquals &&
-                         k >= bound) ||
-                        (bin.Op() == BinaryOperation::kLessThan && k < bound) ||
-                        (bin.Op() == BinaryOperation::kGreaterThan &&
-                         k > bound)) {
-                      reduced = true;
-                      continue;
+                    if (!k.IsNull() && !bound.IsNull() &&
+                        k.type == bound.type) {
+                      const StatusOr<Value> eval =
+                          TryEvaluateBinary(bin.Op(), k, bound);
+                      if (eval.HasValue() && !eval.Value().IsNull() &&
+                          eval.Value().Truthy()) {
+                        reduced = true;
+                        continue;
+                      }
                     }
                   }
                 }

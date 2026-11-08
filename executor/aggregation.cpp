@@ -128,7 +128,9 @@ bool AggregationExecutor::Execute(Row* dst) {
     return false;
   }
   StatusOr<bool> folded = TryFoldScan(dst);
-  if (!folded.HasValue()) return FailWith(folded.GetStatus());
+  if (!folded.HasValue()) {
+    return FailWith(folded.GetStatus());
+  }
   if (folded.Value()) {
     executed_ = true;
     return true;
@@ -222,7 +224,9 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
             bool valid_bounds = true;
             bool any_non_null = false;
             for (const LSTablePageBlock& blk : store->blocks) {
-              if (blk.row_count == 0) continue;
+              if (blk.row_count == 0) {
+                continue;
+              }
               if (full_col >= blk.columns.size()) {
                 valid_bounds = false;
                 break;
@@ -251,7 +255,7 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
                                          static_cast<__int128_t>(global_min) +
                                          1;
               if (span128 > 0 && span128 <= 1048576) {
-                const size_t span = static_cast<size_t>(span128);
+                const auto span = static_cast<size_t>(span128);
                 const size_t workers = std::min<size_t>(8, scan->WorkerCount());
                 std::vector<std::vector<uint8_t>> worker_seen(
                     workers, std::vector<uint8_t>(span, 0));
@@ -315,11 +319,15 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
       }
     }
   }
-  if (!all_typed_ || (!scan && !serial)) return false;
+  if (!all_typed_ || (!scan && !serial)) {
+    return false;
+  }
   for (size_t i = 0; i < inputs_.size(); ++i) {
     const auto type =
         aggregates_[i].expression->AsAggregateExpression().GetType();
-    if (inputs_[i].kind == AggregateInputKind::kCountStar) continue;
+    if (inputs_[i].kind == AggregateInputKind::kCountStar) {
+      continue;
+    }
     if (inputs_[i].kind != AggregateInputKind::kTypedColumn ||
         inputs_[i].type != ValueType::kInt64 ||
         input_schema_.GetColumn(inputs_[i].column).IsUnsigned() ||
@@ -351,23 +359,33 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
   const size_t columns =
       scan ? scan->OutputColumnCount() : serial->OutputSchema().ColumnCount();
   const size_t maximum = std::numeric_limits<size_t>::max();
-  if (width > maximum / sizeof(Partial)) return false;
-  const size_t partial_bytes = width * sizeof(Partial);
-  if (morsel_count > maximum / partial_bytes) return false;
-  const size_t states_bytes = morsel_count * partial_bytes;
-  if (columns > maximum / (kDefaultVectorSize * 9)) return false;
-  const size_t batch_bytes = columns * kDefaultVectorSize * 9;
-  if (batch_bytes && worker_count > (maximum - states_bytes) / batch_bytes)
+  if (width > maximum / sizeof(Partial)) {
     return false;
-  const size_t bytes = states_bytes + worker_count * batch_bytes;
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) return false;
+  }
+  const size_t partial_bytes = width * sizeof(Partial);
+  if (morsel_count > maximum / partial_bytes) {
+    return false;
+  }
+  const size_t states_bytes = morsel_count * partial_bytes;
+  if (columns > maximum / (kDefaultVectorSize * 9)) {
+    return false;
+  }
+  const size_t batch_bytes = columns * kDefaultVectorSize * 9;
+  if ((batch_bytes != 0U) &&
+      worker_count > (maximum - states_bytes) / batch_bytes) {
+    return false;
+  }
+  const size_t bytes = states_bytes + (worker_count * batch_bytes);
+  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
+    return false;
+  }
   QueryMemoryCharge charge(bytes);
   std::vector<Partial> partials(morsel_count * width);
   const auto consume = [&](size_t morsel,
                            const TypedCellBatch& batch) -> Status {
     for (size_t i = 0; i < width; ++i) {
       const AggregateInput& input = inputs_[i];
-      Partial& partial = partials[morsel * width + i];
+      Partial& partial = partials[(morsel * width) + i];
       if (input.kind == AggregateInputKind::kCountStar) {
         partial.count += batch.rows;
         continue;
@@ -381,8 +399,10 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
       const auto type =
           aggregates_[i].expression->AsAggregateExpression().GetType();
       for (size_t row = 0; row < batch.rows; ++row) {
-        const size_t cell = row * batch.stride + input.column;
-        if (batch.nulls[cell]) continue;
+        const size_t cell = (row * batch.stride) + input.column;
+        if (batch.nulls[cell]) {
+          continue;
+        }
         const int64_t value = batch.cells[cell];
         ++partial.count;
         if (type == AggregationType::kSum) {
@@ -405,7 +425,7 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
                                      size_t count) -> Status {
       for (size_t i = 0; i < width; ++i) {
         const AggregateInput& input = inputs_[i];
-        Partial& partial = partials[worker * width + i];
+        Partial& partial = partials[(worker * width) + i];
         if (input.kind == AggregateInputKind::kCountStar) {
           partial.count += count;
           continue;
@@ -453,7 +473,9 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
         }
         for (size_t idx = 0; idx < count; ++idx) {
           const uint32_t r = rows ? rows[idx] : static_cast<uint32_t>(idx);
-          if (col.IsNull(r)) continue;
+          if (col.IsNull(r)) {
+            continue;
+          }
           const int64_t value = col.int_cells[r];
           ++partial.count;
           if (type == AggregationType::kSum) {
@@ -474,13 +496,17 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
     consumed = lstable_consumed;
   }
   if (!consumed) {
-    if (scan && scan->HasRowFilter()) return false;
+    if (scan && scan->HasRowFilter()) {
+      return false;
+    }
     ASSIGN_OR_RETURN(bool, typed_consumed,
                      scan ? scan->TryFoldTypedMorsels(consume)
                           : serial->TryFoldTypedBatches(consume));
     consumed = typed_consumed;
   }
-  if (!consumed) return false;
+  if (!consumed) {
+    return false;
+  }
   std::vector<Value> result;
   result.reserve(width);
   for (size_t i = 0; i < width; ++i) {
@@ -491,7 +517,7 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
     int64_t min = std::numeric_limits<int64_t>::max();
     int64_t max = std::numeric_limits<int64_t>::min();
     for (size_t m = 0; m < morsel_count; ++m) {
-      const Partial& partial = partials[m * width + i];
+      const Partial& partial = partials[(m * width) + i];
       if (type == AggregationType::kSum &&
           (total + partial.low < std::numeric_limits<int64_t>::min() ||
            total + partial.high > std::numeric_limits<int64_t>::max())) {

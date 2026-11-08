@@ -3,6 +3,7 @@
 // vectors, block-boundary inputs, incremental == one-shot) and ToHex.
 #include <gtest/gtest.h>
 
+#include <array>
 #include <string>
 #include <string_view>
 
@@ -14,7 +15,7 @@ namespace {
 
 // Classic RFC 1321 / 3174 / 4634 vectors plus a block-boundary input that
 // makes the streaming buffer hand off exactly one full block.
-constexpr std::string_view kInputs[] = {
+constexpr std::array<std::string_view, 4> kInputs = {
     "", "abc", "The quick brown fox jumps over the lazy dog",
     "0123456789012345678901234567890123456789012345678901234567890123"};
 

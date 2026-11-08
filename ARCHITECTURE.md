@@ -23,9 +23,11 @@ storage               page/ + recovery/(WAL) + transaction/
                         storage foundation")。page→recovery→transaction への
                         分離は将来課題 (V5)
   ↓
-index                 index/           (B+Tree, LSM)
+index                 index/           (LSM-Tree; BPlusTree は互換エイリアス)
   ↓
-table                 table/           (Table, FullScanIterator, 統計)
+table                 table/           (Table, FullScanIterator, 統計,
+                                        memtable/, sorted_run/, pax_chunk/,
+                                        fragment/, workload/, lstable_bridge)
   ↓
 database              database/        (カタログ, Database, TransactionContext)
   ↓
@@ -60,9 +62,9 @@ server                server/          (postgres wire protocol)
 |---|---|---|---|
 | common | `common/` | `status_or.hpp`, `log_message.hpp`, `vm_cache.hpp` | エラー型, ログ, 符号化, 仮想メモリキャッシュ |
 | type | `type/` | `value.hpp`, `row.hpp`, `schema.hpp`, `date.hpp` | 値・行・スキーマの表現 |
-| storage | `page/` `recovery/` `transaction/` | `page_pool.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | バッファ管理, 先書きログ, 分離レベル |
-| index | `index/` | `b_plus_tree.hpp`, `index.hpp`, `index_schema.hpp` | B+Tree インデックス |
-| table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp` | 行データアクセスと統計 |
+| storage | `page/` `recovery/` `transaction/` | `page_manager.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | メモリ内RowPageブロックとLSM管理, 先書きログ, MVCC分離レベル |
+| index | `index/` | `lsm_index.hpp`, `b_plus_tree.hpp`, `index.hpp`, `index_schema.hpp` | LSM-Tree インデックス (`BPlusTree` は `LsmIndex` の互換エイリアス) |
+| table | `table/` | `table.hpp`, `full_scan_iterator.hpp`, `table_statistics.hpp`, `lstable_bridge.hpp`, `pax_chunk/pax_chunk.hpp` | 行データアクセス, PAX カラムナチャンク (`memtable/`, `sorted_run/`, `pax_chunk/`, `fragment/`, `workload/`), 統計 |
 | database | `database/` | `database.hpp`, `catalog_reader.hpp`, `transaction_context.hpp` | カタログ, DDL, トランザクション文脈 |
 | expression | `expression/` | `expression.hpp`, `bytecode.hpp`, `jit.hpp` | 式評価 (AST 正本・bytecode はバッチ実行用 IR・JIT はその compiler, docs/expression_evaluation.md) |
 | relational | `executor/detail/` | `relation.hpp`, `scan_filter.hpp`, `subquery_runtime.hpp` | 物理中間表現と実行補助 |

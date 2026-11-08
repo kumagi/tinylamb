@@ -100,7 +100,7 @@ class IndexScanIteratorTest : public ::testing::Test {
   // Waits (bounded) for the background GC worker to drop every committed
   // version chain: a page without chains is the index-only visibility-map
   // condition, so tests that need the fast path to fire wait here first.
-  void WaitForChainFreePages() {
+  void WaitForChainFreePages() const {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (db_->TransactionStats().version_chains != 0) {
@@ -1037,7 +1037,7 @@ TEST_F(IndexScanIteratorTest, SnapshotDecodesDuplicateListsOncePerKey) {
     for (int group = 0; group < 5; ++group) {
       const int key = ascending ? group : 4 - group;
       for (int offset = 0; offset < 120; ++offset) {
-        const int id = key + 5 * (ascending ? offset : 119 - offset);
+        const int id = key + (5 * (ascending ? offset : 119 - offset));
         ASSERT_TRUE(scan.IsValid());
         EXPECT_EQ((*scan)[0], Value(id));
         EXPECT_EQ(scan.Include()[0], Value(id + .5));
@@ -1141,7 +1141,9 @@ TEST_F(IndexScanIteratorTest, ReadOnlyHeapImagesKeepBoundsHolesAndDirections) {
                            Value(588), ascending);
     for (int step = 0; step <= 571; ++step) {
       const int key = ascending ? 17 + step : 588 - step;
-      if (key % 11 == 0) continue;
+      if (key % 11 == 0) {
+        continue;
+      }
       ASSERT_TRUE(scan.IsValid());
       EXPECT_EQ((*scan), Row({Value(key), Value(std::string(128, 'x')),
                               Value(key + .5)}));
@@ -1259,7 +1261,8 @@ TEST_F(IndexScanIteratorTest, CompactPositionDecoderRejectsTruncatedPayloads) {
   for (const bool nonunique : {false, true}) {
     for (const size_t cut : {size_t{1}, position_bytes, position_bytes + 7}) {
       const std::string table_name =
-          "broken_" + std::to_string(nonunique) + "_" + std::to_string(cut);
+          "broken_" + std::to_string(static_cast<int>(nonunique)) + "_" +
+          std::to_string(cut);
       auto writer = db_->BeginContext();
       ASSIGN_OR_ASSERT_FAIL(
           Table, table,

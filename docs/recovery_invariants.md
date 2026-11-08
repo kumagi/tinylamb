@@ -15,9 +15,10 @@ After crash or `Database::EmulateCrash()` + reopen:
    committed data.
 2. **Page LSN** on disk ≤ **CommittedLSN** for durable commits.
 3. **Checksum** validates every page read from disk; corrupt pages fail closed.
-4. **Checkpoint** (`*.last_checkpoint`) points at a recoverable LSN; replay starts
-   from the minimum `rec_lsn` among active pages or the checkpoint, whichever is
-   earlier.
+4. **Compaction-driven `<dbname>.db` snapshot** stores `begin_lsn`, the dirty-page
+   table (DPT), and the active-transaction table (ATT); replay starts from
+   `min(begin_lsn, min_dpt_rec_lsn, min_att_first_lsn)` (or LSN 0 when no
+   `<dbname>.db` exists yet).
 5. **Catalog** table/index metadata matches row pages after redo completes.
 6. **Recycled WAL never holds a needed record**: after a durable checkpoint
     the log is truncated by whole segments (see `docs/wal_format.md`), and
@@ -156,15 +157,12 @@ retained WAL either way.
   `RecoveryManagerTest.RecycledLoserAllocationUndoRestoresBodyForImmediateReuse`,
   `RecoveryManagerTest.VersionSixCommittedAllocationSurvivesRecovery`.
 - Idempotence / destroy (D2/D3): `LoserUndoSurvivesRepeatedRecoveryPasses`,
-  `DestroyPageRedoInitializesFreePageAndRebuildsList`,
   `RowPageLinkRedoAndLoserUndo`,
   `Update_CommittedRelocationSurvivesCrashReplay`,
   `DestroyPageRedoTwiceOnSamePageIsIdempotent`,
   `DestroyPageUndoRestoresRowContent`, `DeleteRowReappliedIsIdempotent`,
-  `LeafPageTest.ImplOperationsAreIdempotent`,
-  `BranchPageTest.ImplOperationsAreIdempotent`,
   `CatalogTest.DropTableCrashRecoveryReclaimsPages`,
-  `BPlusTreeTest.NodeReclaimWALReplaysAfterCrash`.
+  `CheckpointManagerTest.CompactionPersistsStateAndTruncatesWalReplay`.
 - WAL CRC (D9): `MidRecordBitFlipStopsScanAtThatRecord`,
   `MixedLegacyAndCurrentVersionLogsScanCleanly`,
   `LegacyV1DestroyRecordStillParses`.

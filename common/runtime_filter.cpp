@@ -99,11 +99,11 @@ uint64_t BloomRuntimeFilter::Hash(int64_t key, unsigned probe) {
   // odd stride (double hashing), so the probes land on unrelated bit
   // positions while Reject pays for a single mix.  Reject inlines this
   // formula -- keep the two in sync.
-  uint64_t z = static_cast<uint64_t>(key);
+  auto z = static_cast<uint64_t>(key);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   z ^= z >> 31;
-  return z + (0x9E3779B97F4A7C15ULL | 1U) * probe;
+  return z + ((0x9E3779B97F4A7C15ULL | 1U) * probe);
 }
 
 size_t BloomRuntimeFilter::BitsForKeys(size_t distinct_keys) {
@@ -144,7 +144,7 @@ bool BloomRuntimeFilter::Reject(int64_t key) const {
   }
   // Inlined Hash(): both bit addresses derive from one mix, so the two probe
   // loads issue in parallel instead of serializing on a second splitmix.
-  uint64_t z = static_cast<uint64_t>(key);
+  auto z = static_cast<uint64_t>(key);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   z ^= z >> 31;
@@ -165,7 +165,9 @@ RuntimeFilterGroup::RuntimeFilterGroup(
     const std::vector<int64_t>* sorted_distinct_keys)
     : parts_(std::move(parts)) {
   for (const auto& part : parts_) {
-    if (!part) continue;
+    if (!part) {
+      continue;
+    }
     switch (part->Kind()) {
       case RuntimeFilterKind::kRejectAll:
         reject_all_ = true;
@@ -185,7 +187,7 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       case RuntimeFilterKind::kExactSet: {
         const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
         const auto& keys = exact.Keys();
-        if (!exact_keys_ || keys.size() < exact_keys_->size()) {
+        if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
           exact_keys_ = &keys;
         }
         if (keys.empty()) {
@@ -220,13 +222,15 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       const uint64_t span =
           static_cast<uint64_t>(hi_) - static_cast<uint64_t>(lo_);
       if (span <= kMaxDenseSpan) {
-        const size_t words = static_cast<size_t>((span >> 6) + 1);
+        const auto words = static_cast<size_t>((span >> 6) + 1);
         dense_bits_.assign(words, 0);
         const bool single_part =
             (parts_.size() <= 1) ||
             (sorted_distinct_keys != nullptr && parts_.size() == 2);
         for (const int64_t k : *candidate_keys) {
-          if (k < lo_ || k > hi_) continue;
+          if (k < lo_ || k > hi_) {
+            continue;
+          }
           if (!single_part) {
             bool keep = true;
             for (const auto& part : parts_) {
@@ -235,7 +239,9 @@ RuntimeFilterGroup::RuntimeFilterGroup(
                 break;
               }
             }
-            if (!keep) continue;
+            if (!keep) {
+              continue;
+            }
           }
           const uint64_t off =
               static_cast<uint64_t>(k) - static_cast<uint64_t>(lo_);
@@ -257,11 +263,13 @@ RuntimeFilterGroup::RuntimeFilterGroup(
       has_bounds_(true),
       has_dense_bits_(!dense_bits_.empty()) {
   for (const auto& part : parts_) {
-    if (!part) continue;
+    if (!part) {
+      continue;
+    }
     if (part->Kind() == RuntimeFilterKind::kExactSet) {
       const auto& exact = static_cast<const ExactSetRuntimeFilter&>(*part);
       const auto& keys = exact.Keys();
-      if (!exact_keys_ || keys.size() < exact_keys_->size()) {
+      if ((exact_keys_ == nullptr) || keys.size() < exact_keys_->size()) {
         exact_keys_ = &keys;
       }
     }
@@ -368,7 +376,7 @@ std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::Build(
     const uint64_t span =
         static_cast<uint64_t>(hi_) - static_cast<uint64_t>(lo_);
     if (span <= RuntimeFilterGroup::kMaxDenseSpan && keys_.size() > 64) {
-      const size_t words = static_cast<size_t>((span >> 6) + 1);
+      const auto words = static_cast<size_t>((span >> 6) + 1);
       std::vector<uint64_t> dense_bits(words, 0);
       size_t distinct_count = 0;
       const auto base_u = static_cast<uint64_t>(lo_);

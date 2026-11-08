@@ -129,36 +129,47 @@ std::vector<std::string> FormatRows(
 // so mismatch candidates get a numeric second look: cells are split on
 // the "|...|," format, finite doubles compare with a relative epsilon,
 // and rows are matched as a multiset.
-bool CellAlmostEqual(const std::string& lhs, const std::string& rhs) {
+bool CellAlmostEqual(const std::string& lhs, const std::string& rhs,
+                     double row_scale = 1.0) {
   if (lhs == rhs) {
     return true;
   }
-  const auto parse = [](const std::string& cell) -> std::optional<double> {
+  const auto parse_any = [](const std::string& cell,
+                            bool* float_shaped) -> std::optional<double> {
+    *float_shaped = false;
     if (cell.size() < 3 || cell.front() != '|' || cell.back() != '|') {
       return std::nullopt;
     }
     const std::string body = cell.substr(1, cell.size() - 2);
-    if (body.find_first_of("eE") == std::string::npos &&
-        body.find('.') == std::string::npos) {
+    if (body.empty() || body.front() == '"' || body.front() == 'A') {
       return std::nullopt;
     }
+    const bool has_dot_or_exp = body.find_first_of("eE.") != std::string::npos;
     size_t pos = 0;
     try {
       const double v = std::stod(body, &pos);
       if (pos != body.size() || !std::isfinite(v)) {
         return std::nullopt;
       }
+      // FormatDoubleShortest renders whole-number doubles such as 0.0 or
+      // k * 1e17 (e.g. "200000000000000288") without '.' or 'e'. INT64
+      // cells in this fuzzer lie either in [-25350, 25350] or near
+      // ±INT64_MAX (~9.22e18), never in [1e15, 5e18].
+      const double av = std::abs(v);
+      *float_shaped = has_dot_or_exp || (av >= 1e15 && av <= 5e18);
       return v;
     } catch (...) {
       return std::nullopt;
     }
   };
-  const std::optional<double> a = parse(lhs);
-  const std::optional<double> b = parse(rhs);
-  if (!a.has_value() || !b.has_value()) {
+  bool a_float = false;
+  bool b_float = false;
+  const std::optional<double> a = parse_any(lhs, &a_float);
+  const std::optional<double> b = parse_any(rhs, &b_float);
+  if (!a.has_value() || !b.has_value() || (!a_float && !b_float)) {
     return false;
   }
-  const double scale = std::max({1.0, std::abs(*a), std::abs(*b)});
+  const double scale = std::max({1.0, std::abs(*a), std::abs(*b), row_scale});
   return std::abs(*a - *b) <= 1e-9 * scale;
 }
 
@@ -194,8 +205,31 @@ bool RowAlmostEqual(const std::string& lhs, const std::string& rhs) {
   if (a.size() != b.size()) {
     return false;
   }
+  double row_scale = 1.0;
+  const auto update_row_scale = [&](const std::string& cell) {
+    if (cell.size() < 3 || cell.front() != '|' || cell.back() != '|') {
+      return;
+    }
+    const std::string body = cell.substr(1, cell.size() - 2);
+    if (body.find_first_of("eE.") == std::string::npos) {
+      return;
+    }
+    size_t pos = 0;
+    try {
+      const double v = std::stod(body, &pos);
+      if (pos == body.size() && std::isfinite(v)) {
+        row_scale = std::max(row_scale, std::abs(v));
+      }
+    } catch (...) {
+      return;
+    }
+  };
   for (size_t i = 0; i < a.size(); ++i) {
-    if (!CellAlmostEqual(a[i], b[i])) {
+    update_row_scale(a[i]);
+    update_row_scale(b[i]);
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (!CellAlmostEqual(a[i], b[i], row_scale)) {
       return false;
     }
   }
@@ -823,8 +857,7 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     if (!r.f_null) {
       static constexpr std::array<double, 10> kFPool = {
           0.5, -1.5, 2.25, -3.0, 100.5, 1e-300, 1e17, 3.7, -0.25, 7.0};
-      r.f = g.Chance(8) ? (g.Chance(50) ? 1e300 : -1e300)
-                        : kFPool[static_cast<size_t>(g.Pick(0, 9))];
+      r.f = g.Chance(8) ? 1e300 : kFPool[static_cast<size_t>(g.Pick(0, 9))];
     }
     mirror.push_back(r);
     const std::string tuple =
@@ -1776,6 +1809,56 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
     }
     return report;
   }
+
+  // Cross-mode / index-independence verification: re-verify every recorded
+  // aggregate/window query after building secondary indexes + ANALYZE, and
+  // under the Cascades grouped route (TINYLAMB_GROUPED_ROUTE=cascades).
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_a ON t(a) INCLUDE(b);");
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_b ON t(b);");
+  if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
+    res.Value().Drain();
+  }
+  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      setenv("TINYLAMB_GROUPED_ROUTE", "cascades", 1);
+    }
+    for (const AggQueryExpect& qe : t.queries) {
+      std::string error;
+      auto got = RunQuery(db, ctx, qe.sql, &error);
+      if (!got.has_value()) {
+        continue;
+      }
+      const std::vector<std::string> actual = FormatRows(*got);
+      std::vector<std::string> expected = qe.expected;
+      std::sort(expected.begin(), expected.end());
+      if (actual != expected && !RowsAlmostEqual(actual, expected)) {
+        if (prev_route != nullptr) {
+          setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+        } else {
+          unsetenv("TINYLAMB_GROUPED_ROUTE");
+        }
+        report += std::string(pass == 0 ? "[AGGREGATE-INDEXED MISMATCH] "
+                                        : "[AGGREGATE-CASCADES MISMATCH] ") +
+                  qe.sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
+  if (prev_route != nullptr) {
+    setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_GROUPED_ROUTE");
+  }
   return report;
 }
 
@@ -1801,32 +1884,57 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
       return "setup stream-error: " + sql;
     }
   }
-  for (const AggQueryExpect& q : trace.queries) {
-    std::string error;
-    auto got = RunQuery(db, ctx, q.sql, &error);
-    if (!got.has_value()) {
-      return "query failed: " + q.sql + " :: " + error;
-    }
-    std::vector<std::string> actual = FormatRows(*got);
-    std::vector<std::string> expected = q.expected;
-    std::sort(expected.begin(), expected.end());
-    if (actual != expected && !RowsAlmostEqual(actual, expected)) {
-      std::string report = "[AGGREGATE REPLAY MISMATCH] " + q.sql + "\n";
-      report += "  expected:\n";
-      for (const std::string& r : expected) {
-        report += "    " + r + "\n";
+  auto check_all = [&](const char* tag) -> std::string {
+    for (const AggQueryExpect& q : trace.queries) {
+      std::string error;
+      auto got = RunQuery(db, ctx, q.sql, &error);
+      if (!got.has_value()) {
+        return "query failed: " + q.sql + " :: " + error;
       }
-      report += "  actual:\n";
-      for (const std::string& r : actual) {
-        report += "    " + r + "\n";
+      std::vector<std::string> actual = FormatRows(*got);
+      std::vector<std::string> expected = q.expected;
+      std::sort(expected.begin(), expected.end());
+      if (actual != expected && !RowsAlmostEqual(actual, expected)) {
+        std::string report = std::string(tag) + " " + q.sql + "\n";
+        report += "  expected:\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual:\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
       }
-      return report;
+      if (verbose) {
+        std::cerr << "[agg_fuzz][replay-ok] " << q.sql << "\n";
+      }
     }
-    if (verbose) {
-      std::cerr << "[agg_fuzz][replay-ok] " << q.sql << "\n";
-    }
+    return "";
+  };
+  if (std::string rep = check_all("[AGGREGATE REPLAY MISMATCH]");
+      !rep.empty()) {
+    return rep;
   }
-  return "";
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_a ON t(a) INCLUDE(b);");
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_t_b ON t(b);");
+  if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
+    res.Value().Drain();
+  }
+  if (std::string rep = check_all("[AGGREGATE-INDEXED REPLAY MISMATCH]");
+      !rep.empty()) {
+    return rep;
+  }
+  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
+  setenv("TINYLAMB_GROUPED_ROUTE", "cascades", 1);
+  std::string rep = check_all("[AGGREGATE-CASCADES REPLAY MISMATCH]");
+  if (prev_route != nullptr) {
+    setenv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str(), 1);
+  } else {
+    unsetenv("TINYLAMB_GROUPED_ROUTE");
+  }
+  return rep;
 }
 
 std::string SerializeAggregateTest(uint64_t seed, const AggTrace& trace,

@@ -254,24 +254,34 @@ void TpccWorkload::InitializeTerminal(int terminal_id) {
 #ifdef TINYLAMB_TPCC_EXTERNAL_ONLY
 class TpccWorkload::Transaction {
  public:
-  Transaction(Database*, TpccSqlSession* session, bool read_only)
+  Transaction(Database* /*unused*/, TpccSqlSession* session, bool read_only)
       : session_(session), begin_status_(session->Begin(read_only)) {}
   ~Transaction() { Abort(); }
   Transaction(const Transaction&) = delete;
   Transaction& operator=(const Transaction&) = delete;
+  Transaction(Transaction&&) = delete;
+  Transaction& operator=(Transaction&&) = delete;
   Status PreCommit() {
-    if (!active_) return Status::kInvalidArgument;
-    if (begin_status_ != Status::kSuccess) return begin_status_;
+    if (!active_) {
+      return Status::kInvalidArgument;
+    }
+    if (begin_status_ != Status::kSuccess) {
+      return begin_status_;
+    }
     const auto status = session_->Commit();
-    if (status == Status::kSuccess) active_ = false;
+    if (status == Status::kSuccess) {
+      active_ = false;
+    }
     return status;
   }
   void Abort() {
-    if (active_) session_->Abort();
+    if (active_) {
+      session_->Abort();
+    }
     active_ = false;
   }
-  Status BeginStatus() const { return begin_status_; }
-  bool IsFinished() const { return !active_; }
+  [[nodiscard]] Status BeginStatus() const { return begin_status_; }
+  [[nodiscard]] bool IsFinished() const { return !active_; }
 
  private:
   TpccSqlSession* session_;
@@ -284,7 +294,7 @@ class TpccWorkload::Transaction {
  public:
   Transaction(Database* database, TpccSqlSession* session, bool read_only)
       : session_(session) {
-    if (session_) {
+    if (session_ != nullptr) {
       begin_status_ = session_->Begin(read_only);
     } else {
       native_.emplace(read_only ? database->BeginReadOnlyContext()
@@ -294,27 +304,47 @@ class TpccWorkload::Transaction {
   ~Transaction() { Abort(); }
   Transaction(const Transaction&) = delete;
   Transaction& operator=(const Transaction&) = delete;
+  Transaction(Transaction&&) = delete;
+  Transaction& operator=(Transaction&&) = delete;
 
   Status PreCommit() {
-    if (!active_) return Status::kInvalidArgument;
-    if (begin_status_ != Status::kSuccess) return begin_status_;
-    const Status status = session_ ? session_->Commit() : native_->PreCommit();
-    if (status == Status::kSuccess) active_ = false;
+    if (!active_) {
+      return Status::kInvalidArgument;
+    }
+    if (begin_status_ != Status::kSuccess) {
+      return begin_status_;
+    }
+    const Status status =
+        (session_ != nullptr)
+            ? session_->Commit()
+            : (native_.has_value() ? native_->PreCommit()
+                                   : Status::kInvalidArgument);
+    if (status == Status::kSuccess) {
+      active_ = false;
+    }
     return status;
   }
   void Abort() {
-    if (!active_) return;
-    if (session_)
+    if (!active_) {
+      return;
+    }
+    if (session_ != nullptr) {
       session_->Abort();
-    else
+    } else if (native_.has_value()) {
       native_->Abort();
+    }
     active_ = false;
   }
   Status BeginStatus() const { return begin_status_; }
   bool IsFinished() const {
     return !active_ || (native_ && native_->IsFinished());
   }
-  TransactionContext& Native() { return *native_; }
+  TransactionContext& Native() {
+    if (!native_.has_value()) {
+      std::abort();
+    }
+    return *native_;
+  }
 
  private:
   TpccSqlSession* session_;
@@ -326,7 +356,7 @@ class TpccWorkload::Transaction {
 #endif
 
 TpccWorkload::Transaction TpccWorkload::BeginTransaction(bool read_only) {
-  return Transaction(database_, external_session_, read_only);
+  return {database_, external_session_, read_only};
 }
 
 #ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
@@ -648,11 +678,12 @@ TpccTransactionType TpccWorkload::NextTransactionType() {
 Status TpccWorkload::RunSql(Transaction& context, std::string_view sql,
                             std::vector<Row>* rows,
                             TpccTransactionResult* result) {
-  if (external_session_) {
+  if (external_session_ != nullptr) {
     ++result->sql_statements;
     Status status = context.BeginStatus();
-    if (status == Status::kSuccess)
+    if (status == Status::kSuccess) {
       status = external_session_->Execute(sql, rows);
+    }
     if (status != Status::kSuccess) {
       result->error = std::string(ToString(result->type)) + ": " +
                       std::string(external_session_->LastError()) + " [" +

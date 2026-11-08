@@ -18,9 +18,9 @@
 // checked against a std::map reference.
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <string>
 #include <utility>
@@ -44,7 +44,7 @@ struct Lcg {
   uint64_t s;
   explicit Lcg(uint64_t seed) : s(seed | 1) {}
   uint64_t Next() {
-    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    s = (s * 6364136223846793005ULL) + 1442695040888963407ULL;
     return s >> 17;
   }
   uint32_t Below(uint32_t n) { return static_cast<uint32_t>(Next() % n); }
@@ -60,16 +60,18 @@ Schema MakeSchema() {
   return Schema{"mtmodel", std::move(cols), 0, 1};
 }
 
-#define FAIL(msg)                                     \
-  do {                                                \
-    std::fprintf(stderr, "MT-MODEL FAIL: %s\n", msg); \
-    std::abort();                                     \
+#define FAIL(msg)                                    \
+  do {                                               \
+    std::cerr << "MT-MODEL FAIL: " << (msg) << "\n"; \
+    std::abort();                                    \
   } while (0)
 
 }  // namespace
 
 int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
-  if (size < 32) return 0;
+  if (size < 32) {
+    return 0;
+  }
   Lcg rng([&] {
     uint64_t s = 0;
     std::memcpy(&s, data, 8);
@@ -96,41 +98,55 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
 
     const bool dbg = std::getenv("MTDBG") != nullptr;
     if (dbg) {
-      std::fprintf(stderr, "op=%d sel=%u id=%lld\n", op, sel,
-                   static_cast<long long>(id));
+      std::cerr << "op=" << op << " sel=" << sel << " id=" << id << "\n";
     }
     if (sel < 45) {
       const auto seq = static_cast<int64_t>(rng.Below(100000));
       if (dbg) {
-        std::fprintf(stderr, "  PUT id=%lld seq=%lld\n",
-                     static_cast<long long>(id), static_cast<long long>(seq));
+        std::cerr << "  PUT id=" << id << " seq=" << seq << "\n";
       }
-      if (mt.Put(row_of(id, seq)) != Status::kSuccess) FAIL("put failed");
+      if (mt.Put(row_of(id, seq)) != Status::kSuccess) {
+        FAIL("put failed");
+      }
       model[id] = seq;
     } else if (sel < 65) {
-      if (mt.Delete(key_of(id)) != Status::kSuccess) FAIL("delete failed");
+      if (mt.Delete(key_of(id)) != Status::kSuccess) {
+        FAIL("delete failed");
+      }
       model[id] = -1;
     } else if (sel < 90) {
       Row out;
       const Status st = mt.Lookup(key_of(id), &out);
       auto it = model.find(id);
       if (it == model.end()) {
-        if (st != Status::kNotExists) FAIL("absent key not kNotExists");
+        if (st != Status::kNotExists) {
+          FAIL("absent key not kNotExists");
+        }
       } else if (it->second == -1) {
-        if (st != Status::kDeleted) FAIL("tombstone not kDeleted");
+        if (st != Status::kDeleted) {
+          FAIL("tombstone not kDeleted");
+        }
       } else {
-        if (st != Status::kSuccess) FAIL("live key not kSuccess");
-        if (out[1].AsInt64() != it->second) FAIL("stale value returned");
+        if (st != Status::kSuccess) {
+          FAIL("live key not kSuccess");
+        }
+        if (out[1].AsInt64() != it->second) {
+          FAIL("stale value returned");
+        }
       }
     } else if (sel < 97) {
       auto snap = mt.Snapshot();
       std::vector<std::pair<std::string, int64_t>> want;
       for (const auto& [mid, mseq] : model) {
-        if (mseq >= 0) want.emplace_back(key_of(mid), mseq);
+        if (mseq >= 0) {
+          want.emplace_back(key_of(mid), mseq);
+        }
       }
       size_t wi = 0;
       for (const auto& [k, e] : snap) {
-        if (e.is_deleted) continue;
+        if (e.is_deleted) {
+          continue;
+        }
         if (wi >= want.size() || k != want[wi].first ||
             e.row[1].AsInt64() != want[wi].second) {
           FAIL("snapshot key order/content mismatch");
@@ -144,13 +160,18 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
       std::vector<char> blob;
       std::vector<uint32_t> kr, rr;
       size_t gen = 0;
-      if (mt.Sync(&blob, &kr, &rr, &gen) != Status::kSuccess)
+      if (mt.Sync(&blob, &kr, &rr, &gen) != Status::kSuccess) {
         FAIL("sync failed");
+      }
       blob.clear();
       kr.clear();
       rr.clear();
-      if (mt.Size() != 0) FAIL("Size() != 0 after flush");
-      if (!mt.Snapshot().empty()) FAIL("Snapshot not empty after flush");
+      if (mt.Size() != 0) {
+        FAIL("Size() != 0 after flush");
+      }
+      if (!mt.Snapshot().empty()) {
+        FAIL("Snapshot not empty after flush");
+      }
       model.clear();
       ++sync_count;
     }
@@ -159,8 +180,12 @@ int FuzzMemtableModelOneInput(const uint8_t* data, size_t size) {
   std::vector<char> blob;
   std::vector<uint32_t> kr, rr;
   size_t gen = 0;
-  if (mt.Sync(&blob, &kr, &rr, &gen) != Status::kSuccess) FAIL("final sync");
-  if (!blob.empty() && kr.empty()) FAIL("blob without index");
+  if (mt.Sync(&blob, &kr, &rr, &gen) != Status::kSuccess) {
+    FAIL("final sync");
+  }
+  if (!blob.empty() && kr.empty()) {
+    FAIL("blob without index");
+  }
   (void)sync_count;
   return 0;
 }

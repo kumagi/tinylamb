@@ -63,7 +63,7 @@ Schema WindowExecutor::InputSchema() const {
   for (size_t i = 0; i < input_width; ++i) {
     input_columns.push_back(schema_.GetColumn(i));
   }
-  return Schema(schema_.Name(), std::move(input_columns));
+  return {schema_.Name(), std::move(input_columns)};
 }
 
 const std::vector<Expression>* WindowExecutor::SharedPartitionKey() const {

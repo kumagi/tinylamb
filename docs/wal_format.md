@@ -32,18 +32,13 @@ Database storage rejects an effective or persisted segment geometry that
 cannot hold the serialized full-page-image record; a legacy database using a
 smaller geometry must be migrated before it can open.
 
-`CheckpointManager::WriteCheckpoint` recycles the log after every durable
-checkpoint. Every checkpoint also flushes resident dirty pages
-(oldest `RecoveryLSN` first) within a time budget
-(`TINYLAMB_CHECKPOINT_FLUSH_MS`, default 1000 ms, 0 disables) before
-re-snapshotting the dirty-page table: without that pass a continuously
-rewritten hot page keeps its oldest-since-last-flush recLSN forever and
-pins the floor below the oldest dirty page no matter how many checkpoints
-succeed — under sustained load the WAL then grows at the full write rate
-(~8.5 MB/s ≈ 700 GB/day observed on TPC-C). The allocator meta page is
-excluded from the bounded dirty-page pass but is synchronously flushed
-immediately after `kBeginCheckpoint`, even when that budget is zero; a
-failed meta flush stops checkpoint publication and WAL recycling.
+`CheckpointManager::WriteCheckpoint` persists the in-memory `RowPage` blocks,
+LSM-Tree runs, and active transaction table to `<dbname>.db` (`kFuzzyCheckpointMagic`,
+`TLCP`) when LSM compaction completes (or on clean shutdown / explicit request)
+and recycles old WAL segments. Because `<dbname>.db` is written atomically via
+`<dbname>.db.tmp` + `fsync` + `rename` after `Logger::WaitForDurable(durable_target)`,
+WAL replay on startup begins at `min(begin_lsn, min_rec_lsn, min_att_first_lsn)`
+stored directly in `<dbname>.db`.
 Segments are removed only when ALL of the following hold:
 
             1. The segment's records all sit below the recycle floor
@@ -187,54 +182,26 @@ covers all preceding record bytes |
 
 See `LogType` in `recovery/log_record.hpp` for the full list.
 
-- **kInsertRow / kUpdateRow / kDeleteRow** — row-level changes with table id
-  and row payload or position;
-kInsertLeaf / kInsertBranch(and the kUpdate* / kDelete * twins) are the B
-    + tree structural counterparts.-
-    **kSetLowFence / kSetHighFence / kSetFoster** — B
-         + tree navigation metadata updates; each has a kCompensate* twin for undo.
-- **kSetRowPageNext / kSetRowPagePrev** — persistent row-page chain-link
-  assignments; each has a matching kCompensate* CLR carrying the restored link.
-- **kCommit** — transaction commit. Recovery treats a transaction whose
-  newest LSN has no matching kCommit as a loser and undoes it. A runtime
-  `TransactionManager::Abort` that completed its undo walk also writes a
-  kCommit-typed marker: the marker reclassifies the aborted transaction as
-  committed so the next recovery neither redoes nor re-undoes it (the page
-  ops are idempotent; the marker just keeps the loser set exact). Since the
-  2026-10-02 ring-read undo, the compensations and the marker are NOT
-  necessarily durable when the marker is appended -- a crash that loses the
-  volatile suffix replays the identical rollback as restart loser cleanup
-  (the chain stays a loser, `UndoLoserChains` compensates it), so the
-  classification is exact in either case.
-- **kBeginCheckpoint / kEndCheckpoint** — fuzzy checkpoint bracket; recovery
-  truncates or replays from the last completed checkpoint (see
-  `docs/recovery_invariants.md`).
-- **kSystemAllocPage / kSystemDestroyPage** — page allocation/destruction.
-  Writers emit the v6 allocation payload on every fresh, recycled, and in-place
-  allocation. v1-v5 allocation records remain readable and retain the legacy
-  redo-only behavior: they initialize the target on REDO and do not fabricate
-  an undo image.
-- **kCompensateAllocPage** — CLR for a v6 allocation undo. It is appended
-  before the target or meta page is mutated and copies the original allocation's
-  fixed allocator snapshot plus its kind-specific undo payload. REDO validates
-  exact payload sizes and allocator/free-list invariants and is idempotent. The
-  original record supplies `prev_lsn` as undo-next; target and meta page LSNs
-  retain the original record start and advance to the CLR end.
-- **kCompensateDestroyPage** — CLR for a destroy undo. Carries the same
-  payload shape as `kSystemDestroyPage` (restored page type + full body
-  image); its REDO re-installs that image.  Without it a crash after an
-  aborted `DROP TABLE` would replay only the destroy and leave the
-  resurrected catalog entry pointing at a free page.
-- **kFullPageImage** — full-page write (FPW) protection, txn_id 0 (system
-  record, never undone). `PagePool::WriteBack` emits it before a dirty page
-  image whose on-disk copy is not known durable reaches the data file: the
-  record carries the page type plus the complete 32 KiB body, and REDO
-  restores that image verbatim. This is what keeps a torn (or partially
-  lost) data-file page rebuildable from the WAL alone once the WAL prefix
-  has been recycled: recovery replays the snapshot, then every delta above
-  it. The page's snapshot becomes stale when recycling (or the checkpoint's
-  data-file fdatasync watermark) moves past its record, and the next flush
-  of that page emits a fresh one.
+- **kBegin / kCommit / kAbort** — transaction lifecycle markers. Recovery
+  treats any transaction without a `kCommit` or `kAbort` terminator as a loser
+  and rolls back its mutations during `RecoverFrom`.
+- **kInsertRow / kUpdateRow / kDeleteRow** (`kCompensateInsert` /
+  `kCompensateUpdate` / `kCompensateDelete`) — row-level changes on `RowPage`
+  blocks with `(page_id, slot)` and row payload.
+- **kSetRowPageNext / kSetRowPagePrev** (`kCompensateRowPageNext` /
+  `kCompensateRowPagePrev`) — persistent `RowPage` doubly-linked chain-link
+  assignments and their compensation records.
+- **kLsmPut / kLsmDelete / kLsmDestroy** (`kCompensateLsmPut` /
+  `kCompensateLsmDelete` / `kCompensateLsmDestroy`) — LSM-Tree index key-value
+  inserts/updates, key deletions, and tree destruction, carrying previous value
+  information for runtime abort and crash undo.
+- **kSystemAllocPage / kSystemDestroyPage** (`kCompensateAllocPage` /
+  `kCompensateDestroyPage`) — `RowPage` block allocation and destruction.
+- **kBeginCheckpoint / kEndCheckpoint** — legacy WAL record enumerators retained
+  for backward-compatible log scanning; current LSM compaction persistence writes
+  the recovery anchor (`begin_lsn`, DPT, ATT) directly into `<dbname>.db`
+  without emitting checkpoint records into the WAL stream.
+- **kFullPageImage** — legacy full-page image enumerator retained in `LogType`.
 
 ## Durability
 

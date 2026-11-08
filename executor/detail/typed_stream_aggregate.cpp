@@ -542,6 +542,8 @@ struct TypedWorkerGroups {
   }
 };
 
+namespace {
+
 // One (group, aggregate) slim-state update for an already-resolved input
 // value.  Shared by the Row-based accumulate loop and the cached-arena fold
 // fast path so the two can never drift; false (with *error set) on a raise.
@@ -715,8 +717,9 @@ inline Value ArenaCellValue(const BaseRelationArena& arena,
   } else {
     value.value.int_value = cells[column];
   }
-  if (type == ValueType::kInt64 && schema.GetColumn(column).IsUnsigned())
+  if (type == ValueType::kInt64 && schema.GetColumn(column).IsUnsigned()) {
     value.SetUnsigned();
+  }
   return value;
 }
 
@@ -749,6 +752,8 @@ void AppendFillRow(RowLike&& row, MorselFillBuffer* fill, bool fill_copy) {
     fill->rows.push_back(std::forward<RowLike>(row));
   }
 }
+
+}  // namespace
 
 StatusOr<Relation> RunTypedParallelStreamAggregate(
     TransactionContext& context, const SelectStatement& stmt,
@@ -876,8 +881,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       std::ranges::all_of(plan.filter_compares, [&](const auto& compare) {
         if (!compare.constant_payload || compare.is_double ||
             compare.string_payload ||
-            compare.left >= qualified_schema.ColumnCount())
+            compare.left >= qualified_schema.ColumnCount()) {
           return false;
+        }
         const slot_t column =
             projection.empty() ? compare.left : projection[compare.left];
         return std::ranges::any_of(peek_compares, [&](const auto& peek) {
@@ -1194,8 +1200,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           value.value.int_value = batch.cells[base + c];
           break;
       }
-      if (value.type == ValueType::kInt64 && batch.slot_unsigned[c])
+      if (value.type == ValueType::kInt64 && batch.slot_unsigned[c]) {
         value.SetUnsigned();
+      }
       return value;
     };
     const auto is_null = [&](slot_t c) { return batch.nulls[base + c] != 0; };
@@ -2577,7 +2584,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                       arena->Varchar(index, varchar_ordinal[list.column]),
                       list);
                 } else if (list.is_double) {
-                  const double v = std::bit_cast<double>(cells[list.column]);
+                  const auto v = std::bit_cast<double>(cells[list.column]);
                   for (const double item : list.double_values) {
                     if (v == item) {
                       matched = true;
@@ -2856,9 +2863,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                    aggregate_expressions, &inserted);
             for (size_t agg = 0; agg < plan.aggregates.size(); ++agg) {
               auto& count = local.SlimCount(group, agg);
-              if (matching_rows >
-                  static_cast<size_t>(std::numeric_limits<int64_t>::max() -
-                                      count)) {
+              if (std::cmp_greater(
+                      matching_rows,
+                      std::numeric_limits<int64_t>::max() - count)) {
                 err = StatusError(StatusCode::kIsInfinity,
                                   "integer overflow in COUNT");
                 break;
@@ -3393,7 +3400,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 ++blk_group_counts[g];
                 const uint8_t dc = d_codes[r];
                 const double q = q_dict[q_codes[r]];
-                const double p = std::bit_cast<double>(p_cells[r]);
+                const auto p = std::bit_cast<double>(p_cells[r]);
                 const double disc_p = p * omd_dict[dc];
                 const double charge = disc_p * opt_dict[t_codes[r]];
                 const double d = d_dict[dc];
@@ -3533,7 +3540,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 } else {
                   for (uint32_t r = 0; r < nrows; ++r) {
                     if ((pass0[dc0[r]] & pass1[dc1[r]]) == 0 ||
-                        static_cast<uint64_t>(pcells[r] - plo) >= pspan) {
+                        std::cmp_greater_equal(pcells[r] - plo, pspan)) {
                       continue;
                     }
                     ++blk_matched;
@@ -4172,7 +4179,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                       const uint64_t next_off = static_cast<uint64_t>(key_val) -
                                                 static_cast<uint64_t>(rf_lo) +
                                                 1ULL;
-                      size_t w_idx = static_cast<size_t>(next_off >> 6);
+                      auto w_idx = static_cast<size_t>(next_off >> 6);
                       if (w_idx >= rf_dense_words) {
                         break;
                       }
@@ -4422,7 +4429,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 case TypedDoubleExprInput::Shape::kGeneric:
                   break;
               }
-              double stack[16];
+              std::array<double, 16> stack{};
               size_t sp = 0;
               for (const TypedDoubleExprOp& op : expr.ops) {
                 switch (op.kind) {
@@ -4467,7 +4474,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             const auto eval_int_expr = [&](const TypedIntExprInput& expr,
                                            int64_t* out,
                                            Status* error) -> bool {
-              int64_t stack[16];
+              std::array<int64_t, 16> stack{};
               size_t sp = 0;
               for (const TypedIntExprOp& op : expr.ops) {
                 switch (op.kind) {
@@ -5052,8 +5059,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             }
             scanned[worker] += decoded;
             iterator.DropPageLatch();
-            if (fill_cache)
+            if (fill_cache) {
               AppendBatchToArena(batch, 0, decoded, &fill_buffer.mirror);
+            }
             if (bulk_count) {
               bool inserted = false;
               const size_t group = workers[worker].FindOrInsert(
@@ -5062,9 +5070,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               for (size_t aggregate = 0; aggregate < plan.aggregates.size();
                    ++aggregate) {
                 auto& count = workers[worker].SlimCount(group, aggregate);
-                if (decoded >
-                    static_cast<size_t>(std::numeric_limits<int64_t>::max() -
-                                        count)) {
+                if (std::cmp_greater(
+                        decoded, std::numeric_limits<int64_t>::max() - count)) {
                   worker_errors[worker] = StatusError(
                       StatusCode::kIsInfinity, "integer overflow in COUNT");
                   break;
@@ -5073,7 +5080,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
               emitted[worker] += decoded;
               aggregate_updates[worker] += decoded;
-              if (!worker_errors[worker].ok()) break;
+              if (!worker_errors[worker].ok()) {
+                break;
+              }
               continue;
             }
             const bool direct_fold =
@@ -5087,27 +5096,32 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 size_t varchar_slot = 0;
                 for (size_t c = 0; c < batch.stride; ++c) {
                   Value value;
-                  if (!batch.nulls[r * batch.stride + c]) {
+                  if (!batch.nulls[(r * batch.stride) + c]) {
                     if (batch.slot_types[c] == ValueType::kVarChar) {
                       value =
                           Value(std::string(batch.Varchar(r, varchar_slot)));
                     } else if (batch.slot_types[c] == ValueType::kDouble) {
                       value = Value(std::bit_cast<double>(
-                          batch.cells[r * batch.stride + c]));
+                          batch.cells[(r * batch.stride) + c]));
                     } else {
-                      value = Value(batch.cells[r * batch.stride + c]);
+                      value = Value(batch.cells[(r * batch.stride) + c]);
                       value.type = batch.slot_types[c];
-                      if (batch.slot_unsigned[c]) value = value.WithUnsigned();
+                      if (batch.slot_unsigned[c]) {
+                        value = value.WithUnsigned();
+                      }
                     }
                   }
-                  if (batch.slot_types[c] == ValueType::kVarChar)
+                  if (batch.slot_types[c] == ValueType::kVarChar) {
                     ++varchar_slot;
+                  }
                   decoded_row.values_[c] = std::move(value);
                 }
                 accumulate_row(decoded_row, &workers[worker],
                                &worker_errors[worker], &emitted[worker],
                                &aggregate_updates[worker], nullptr, &scratch);
-                if (!worker_errors[worker].ok()) break;
+                if (!worker_errors[worker].ok()) {
+                  break;
+                }
                 continue;
               }
               // Warm the int-key group slot a few rows ahead; the probe in
@@ -5613,8 +5627,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       // worker's hit (the overwhelmingly common case: the same orderkey
       // appears in several workers' partials) then costs one map probe with
       // no Value copies at all.
-      const Value& local_key0 = local.GroupKey(group, 0);
-      if (merged.int_key && !local_key0.IsNull()) {
+      if (merged.int_key && !local.GroupKey(group, 0).IsNull()) {
+        const Value& local_key0 = local.GroupKey(group, 0);
         size_t* slot = merged.RawIntSlot(local_key0.value.int_value, &inserted);
         if (inserted) {
           canonical_keys.clear();

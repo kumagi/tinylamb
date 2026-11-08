@@ -398,7 +398,9 @@ bool IndexCoversUnchanged(const Index& idx,
 StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
                                     const Row& row) {
   const auto contextualize = [&](Status status, std::string_view phase) {
-    if (status == Status::kSuccess) return status;
+    if (status == Status::kSuccess) {
+      return status;
+    }
     return StatusError(status.GetCode(),
                        "table update " + std::string(phase) + " at " +
                            std::to_string(pos.page_id) + "/" +
@@ -897,6 +899,36 @@ StatusOr<Row> Table::Read(Transaction& txn, RowPosition pos) const {
   return result;
 }
 
+StatusOr<Row> Table::ReadLatest(Transaction& txn, RowPosition pos) const {
+  ASSIGN_OR_RETURN(TableLease, lease, AcquireLease(txn.ID()));
+  RETURN_IF_FAIL(txn.GetPageManager()->CheckTableTailPage(txn.ID(), first_pid_,
+                                                          pos.page_id));
+  ASSIGN_OR_RETURN(PageRef, page,
+                   txn.GetPageManager()->GetPage(pos.page_id, true));
+  if (page.IsNull()) {
+    return Status::kNotExists;
+  }
+  std::optional<std::string_view> physical;
+  if (page->body.row_page.IsSlotOccupied(pos.slot)) {
+    physical = page->body.row_page.GetRow(pos.slot);
+  }
+  ASSIGN_OR_RETURN(std::optional<std::string>, latest_version,
+                   txn.ReadLatestVersion(pos, physical));
+  std::string_view read_row;
+  if (latest_version.has_value()) {
+    read_row = *latest_version;
+  } else if (physical.has_value()) {
+    read_row = *physical;
+  } else {
+    return Status::kNotExists;
+  }
+  Row result;
+  result.Deserialize(
+      read_row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+      schema_);
+  return result;
+}
+
 // A NULL anywhere in the key columns; SQL unique semantics say NULL !=
 // NULL, so such keys never collide (they still occupy the 1-byte NULL
 // encoding in the B+Tree so scans can reach them).
@@ -934,9 +966,19 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
     if (txn.HasForeignIndexReservations()) {
       (void)txn.WaitAllIndexReservationsDrain(std::chrono::milliseconds(250));
     }
+    RowPosition wait_pos;
     auto index_write_guard = txn.AcquireIndexWriteGuard(idx.Root());
-    Status status = IndexInsertGuarded(txn, idx, new_row, pos, hint_leaf);
+    Status status =
+        IndexInsertGuarded(txn, idx, new_row, pos, hint_leaf, &wait_pos);
     index_write_guard.unlock();
+    if (status == Status::kDuplicates && wait_pos.IsValid()) {
+      const Status waited = txn.WaitForRowWriteIntent(wait_pos);
+      if (waited == Status::kSuccess) {
+        --escalation;
+        continue;
+      }
+      return waited == Status::kDuplicates ? Status::kDuplicates : waited;
+    }
     if (status == Status::kSuccess ||
         !txn.ConsumeIndexReservationDrainExhausted() ||
         escalation >= kMaxIndexEscalations) {
@@ -963,7 +1005,8 @@ Status Table::IndexInsert(Transaction& txn, const Index& idx,
 
 Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
                                  const Row& new_row, const RowPosition& pos,
-                                 page_id_t* hint_leaf) const {
+                                 page_id_t* hint_leaf,
+                                 RowPosition* wait_pos) const {
   BPlusTree bpt(idx.pid_);
   const std::string key = idx.GenerateKey(new_row);
   std::vector<Value> include_values;
@@ -986,7 +1029,37 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
     IndexValueType val;
     val.pos = pos;
     val.include = include;
-    RETURN_IF_FAIL(bpt.Insert(txn, key, Encode(val), &cursor));
+    const Status ins = bpt.Insert(txn, key, Encode(val), &cursor);
+    if (ins == Status::kDuplicates) {
+      StatusOr<std::string> existing_value = bpt.Read(txn, key, &cursor);
+      if (!existing_value.HasValue()) {
+        RETURN_IF_FAIL(bpt.Insert(txn, key, Encode(val), &cursor));
+      } else {
+        std::string_view existing_data = existing_value.Value();
+        ASSIGN_OR_RETURN(IndexValueType, existing,
+                         Decode<IndexValueType>(existing_data));
+        if (existing.pos == pos) {
+          if (existing.include != include) {
+            RETURN_IF_FAIL(bpt.Update(txn, key, Encode(val), &cursor));
+          }
+        } else {
+          if (txn.HasForeignWriteIntent(existing.pos)) {
+            if (wait_pos != nullptr) {
+              *wait_pos = existing.pos;
+            }
+            return Status::kDuplicates;
+          }
+          StatusOr<Row> conflicting = ReadLatest(txn, existing.pos);
+          if (conflicting.HasValue() &&
+              idx.GenerateKey(conflicting.Value()) == key) {
+            return Status::kDuplicates;
+          }
+          RETURN_IF_FAIL(bpt.Update(txn, key, Encode(val), &cursor));
+        }
+      }
+    } else {
+      RETURN_IF_FAIL(ins);
+    }
   } else {
     // BTree value is encoded vector<pair<RowPosition, vector<Value>>>.
     StatusOr<std::string> existing_value = bpt.Read(txn, key, &cursor);
@@ -1009,12 +1082,17 @@ Status Table::IndexInsertGuarded(Transaction& txn, const Index& idx,
             }
             return Status::kSuccess;
           }
+          if (txn.HasForeignWriteIntent(value.pos)) {
+            if (wait_pos != nullptr) {
+              *wait_pos = value.pos;
+            }
+            return Status::kDuplicates;
+          }
           // A retained entry only blocks this insert if the row it points
-          // at STILL owns this key: an UPDATE that moved the row to a
-          // different key leaves the old entry behind for old snapshots,
-          // and the key here is free (mirrors the scan-side recheck in
-          // IndexScanIterator::ResolveRow).
-          StatusOr<Row> conflicting = Read(txn, value.pos);
+          // at STILL owns this key at the latest committed head: an UPDATE
+          // that moved the row to a different key leaves the old entry behind
+          // for old snapshots, and the key here is free.
+          StatusOr<Row> conflicting = ReadLatest(txn, value.pos);
           if (conflicting.HasValue() &&
               idx.GenerateKey(conflicting.Value()) == key) {
             return Status::kDuplicates;
@@ -1258,27 +1336,33 @@ std::shared_ptr<const Table::IntegerKeyCounts> Table::ReadIntegerKeyCounts(
   // like FullScanIterator's physical path, every page must have no MVCC
   // chains while its content latch is held. A stable layout generation
   // rejects a mutation crossing the pass; page LSNs also cover runtime undo.
-  constexpr size_t kCacheBytes = 1024 * 1024;
+  constexpr size_t kCacheBytes = size_t{1024} * 1024;
   if (!txn.IsReadOnly() || txn.IsFailed() || !incarnation_state_ || span == 0 ||
       span > 65536 ||
       static_cast<__int128_t>(minimum) + span - 1 >
           std::numeric_limits<int64_t>::max() ||
       column >= schema_.ColumnCount() ||
       schema_.GetColumn(column).Type() != ValueType::kInt64 ||
-      schema_.GetColumn(column).IsUnsigned())
+      schema_.GetColumn(column).IsUnsigned()) {
     return nullptr;
+  }
   auto lease = AcquireLease(txn.ID());
-  if (!lease.HasValue()) return nullptr;
+  if (!lease.HasValue()) {
+    return nullptr;
+  }
   size_t pages = 0;
   for (const auto& morsel : morsels) {
     if (morsel.size() >
-        kCacheBytes / sizeof(std::pair<page_id_t, lsn_t>) - pages)
+        (kCacheBytes / sizeof(std::pair<page_id_t, lsn_t>)) - pages) {
       return nullptr;
+    }
     pages += morsel.size();
   }
-  if (pages * sizeof(std::pair<page_id_t, lsn_t>) + span * sizeof(uint64_t) >
-      kCacheBytes)
+  if ((pages * sizeof(std::pair<page_id_t, lsn_t>)) +
+          (span * sizeof(uint64_t)) >
+      kCacheBytes) {
     return nullptr;
+  }
   struct Cache {
     std::weak_ptr<TableIncarnation> owner;
     uint64_t generation{};
@@ -1298,30 +1382,40 @@ std::shared_ptr<const Table::IntegerKeyCounts> Table::ReadIntegerKeyCounts(
       cache.generation == generation && cache.head == first_pid_ &&
       cache.column == column && cache.minimum == minimum && cache.span == span;
   if (cached_pages_only) {
-    if (!matching) return nullptr;
+    if (!matching) {
+      return nullptr;
+    }
     page_id_t expected = first_pid_;
     for (const auto& [pid, lsn] : cache.stamps) {
-      if (pid != expected) return nullptr;
+      if (pid != expected) {
+        return nullptr;
+      }
       auto page = txn.GetPageManager()->GetPage(pid, true);
       if (!page.HasValue() || page.Value().IsNull() ||
           page.Value()->Type() != PageType::kRowPage ||
-          txn.HasPageVersionChains(pid))
+          txn.HasPageVersionChains(pid)) {
         return nullptr;
+      }
       if (page.Value()->PageLSN() != lsn) {
         cache.counts.reset();
         return nullptr;
       }
       expected = page.Value()->body.row_page.next_page_id_;
     }
-    if (expected != 0 || generation != LayoutGeneration() || txn.IsFailed())
+    if (expected != 0 || generation != LayoutGeneration() || txn.IsFailed()) {
       return nullptr;
+    }
     return cache.counts;
   }
   const bool hit = matching && cache.stamps.size() == pages;
   auto counts = hit ? nullptr : std::make_shared<IntegerKeyCounts>();
-  if (counts) counts->counts.assign(span, 0);
+  if (counts) {
+    counts->counts.assign(span, 0);
+  }
   std::vector<std::pair<page_id_t, lsn_t>> stamps;
-  if (!hit) stamps.reserve(pages);
+  if (!hit) {
+    stamps.reserve(pages);
+  }
   size_t index = 0;
   page_id_t expected_page = first_pid_;
   Row row;
@@ -1331,10 +1425,13 @@ std::shared_ptr<const Table::IntegerKeyCounts> Table::ReadIntegerKeyCounts(
       auto ref = txn.GetPageManager()->GetPage(pid, true);
       if (!ref.HasValue() || ref.Value().IsNull() ||
           ref.Value()->Type() != PageType::kRowPage ||
-          txn.HasPageVersionChains(pid))
+          txn.HasPageVersionChains(pid)) {
         return nullptr;
+      }
       const Page& page = *ref.Value();
-      if (pid != expected_page) return nullptr;
+      if (pid != expected_page) {
+        return nullptr;
+      }
       expected_page = page.body.row_page.next_page_id_;
       if (hit) {
         if (cache.stamps[index++] != std::pair{pid, page.PageLSN()}) {
@@ -1347,26 +1444,43 @@ std::shared_ptr<const Table::IntegerKeyCounts> Table::ReadIntegerKeyCounts(
       const RowPage& rows = page.body.row_page;
       for (slot_t slot = 0; slot < rows.RowMax(); ++slot) {
         const std::string_view image = rows.GetRow(slot);
-        if (image.empty()) continue;
-        const auto decoded =
-            row.TryDeserializeProjected(image.data(), schema_, projection);
+        if (image.empty()) {
+          continue;
+        }
+        const auto decoded = row.TryDeserializeProjected(
+            image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+            schema_, projection);
         if (!decoded.HasValue() || decoded.Value() > image.size() ||
-            row.Count() != 1)
+            row.Count() != 1) {
           return nullptr;
+        }
         ++counts->rows;
-        if (row[0].IsNull()) continue;
+        if (row[0].IsNull()) {
+          continue;
+        }
         const uint64_t offset = static_cast<uint64_t>(row[0].value.int_value) -
                                 static_cast<uint64_t>(minimum);
-        if (offset < span) ++counts->counts[offset];
+        if (offset < span) {
+          ++counts->counts[offset];
+        }
       }
     }
   }
   if (expected_page != 0 || generation == 0 ||
-      generation != LayoutGeneration() || txn.IsFailed())
+      generation != LayoutGeneration() || txn.IsFailed()) {
     return nullptr;
-  if (hit) return cache.counts;
-  cache = {incarnation_state_, generation, first_pid_, column, minimum, span,
-           std::move(stamps),  counts};
+  }
+  if (hit) {
+    return cache.counts;
+  }
+  cache = {.owner = incarnation_state_,
+           .generation = generation,
+           .head = first_pid_,
+           .column = column,
+           .minimum = minimum,
+           .span = span,
+           .stamps = std::move(stamps),
+           .counts = counts};
   return counts;
 }
 

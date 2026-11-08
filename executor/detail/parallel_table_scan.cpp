@@ -326,8 +326,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               (rc.Type() == ValueType::kInt64 ||
                rc.Type() == ValueType::kDate) &&
               !lc.IsUnsigned() && !rc.IsUnsigned()) {
-            lstable_col_compares.push_back(
-                LSTableIntColCompare{lfull, rfull, pred.op});
+            lstable_col_compares.push_back(LSTableIntColCompare{
+                .left_col = lfull, .right_col = rfull, .op = pred.op});
             simple_covered_by_dict[si] = 1;
           }
         }
@@ -342,8 +342,10 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       }
       if (pred.double_payload &&
           table.GetSchema().GetColumn(full_col).Type() == ValueType::kDouble) {
-        lstable_double_zones.push_back(LSTableDoubleZonePredicate{
-            full_col, pred.op, pred.double_constant});
+        lstable_double_zones.push_back(
+            LSTableDoubleZonePredicate{.column = full_col,
+                                       .op = pred.op,
+                                       .constant = pred.double_constant});
       }
       if (!pred.double_payload &&
           !table.GetSchema().GetColumn(full_col).IsUnsigned() &&
@@ -490,8 +492,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                 (col.Type() == ValueType::kInt64 ||
                  col.Type() == ValueType::kDate) &&
                 !col.IsUnsigned()) {
-              lstable_extra_rfs.push_back(
-                  LSTableExtraRf{full_col, pred.runtime_filter.get()});
+              lstable_extra_rfs.push_back(LSTableExtraRf{
+                  .column = full_col, .group = pred.runtime_filter.get()});
               prebuilt_membership_covered[mi] = 1;
             }
           }
@@ -1001,7 +1003,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                                          ? projection->size()
                                          : blk->columns.size();
             constexpr size_t kMaxFastProjCols = 16;
-            const LSTableColumnBlock* proj_cols_buf[kMaxFastProjCols];
+            std::array<const LSTableColumnBlock*, kMaxFastProjCols>
+                proj_cols_buf{};
             const LSTableColumnBlock* const* proj_cols_ptr = nullptr;
             if (col_count <= kMaxFastProjCols) {
               for (size_t k = 0; k < col_count; ++k) {
@@ -1010,7 +1013,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                                            : static_cast<slot_t>(k);
                 proj_cols_buf[k] = &blk->columns[col_idx];
               }
-              proj_cols_ptr = proj_cols_buf;
+              proj_cols_ptr = proj_cols_buf.data();
             }
             const LSTableColumnBlock* const rf_col =
                 (active_lstable_rf != nullptr && full_key_column.has_value())
@@ -1038,7 +1041,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               const RuntimeFilterGroup* group{nullptr};
             };
             constexpr size_t kMaxFastExtraRfs = 4;
-            BlockExtraRf block_extra_rfs[kMaxFastExtraRfs];
+            std::array<BlockExtraRf, kMaxFastExtraRfs> block_extra_rfs{};
             const size_t fast_extra_rf_count =
                 std::min(lstable_extra_rfs.size(), kMaxFastExtraRfs);
             for (size_t ei = 0; ei < fast_extra_rf_count; ++ei) {
@@ -1046,12 +1049,13 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               const LSTableColumnBlock* ecol = &blk->columns[erf.column];
               const bool has_dense = erf.group->has_dense_bits();
               block_extra_rfs[ei] = BlockExtraRf{
-                  ecol,
-                  has_dense ? erf.group->dense_bits_data() : nullptr,
-                  has_dense ? erf.group->Lo() : 0,
-                  has_dense ? erf.group->Hi() : 0,
-                  ecol->has_null,
-                  erf.group,
+                  .col = ecol,
+                  .dense_bits =
+                      has_dense ? erf.group->dense_bits_data() : nullptr,
+                  .lo = has_dense ? erf.group->Lo() : 0,
+                  .hi = has_dense ? erf.group->Hi() : 0,
+                  .has_null = ecol->has_null,
+                  .group = erf.group,
               };
             }
             for (uint32_t r = 0; r < blk->row_count; ++r) {
@@ -1078,7 +1082,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                         const uint64_t next_off = static_cast<uint64_t>(kv) -
                                                   static_cast<uint64_t>(rf_lo) +
                                                   1ULL;
-                        size_t w_idx = static_cast<size_t>(next_off >> 6);
+                        auto w_idx = static_cast<size_t>(next_off >> 6);
                         if (w_idx >= rf_dense_words) {
                           break;
                         }
@@ -1251,8 +1255,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                       break;
                     default:
                       deferred_rows[w].push_back(std::move(row));
-                      matches = false;
-                      break;
+                      continue;
                   }
                 } else if (filter_during_scan && scan_filter &&
                            !scan_filter->needs_unsigned_tagging) {
@@ -1351,7 +1354,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
         threads.emplace_back(scan_worker, w);
       } catch (...) {
         std::scoped_lock lock(error_mu);
-        if (!error_ex) error_ex = std::current_exception();
+        if (!error_ex) {
+          error_ex = std::current_exception();
+        }
         break;
       }
     }
@@ -1466,7 +1471,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     // and prefix tests have no residual AST, so copying only residual and
     // OR branches silently drops them (notably NOT IN in TPC-H Q16).
     CompiledScanFilter residual_only = *scan_filter;
-    if (!scan_filter->needs_unsigned_tagging) residual_only.simple.clear();
+    if (!scan_filter->needs_unsigned_tagging) {
+      residual_only.simple.clear();
+    }
     if (can_predecide_lstable) {
       residual_only.prefix_in.clear();
       residual_only.prebuilt_membership.clear();

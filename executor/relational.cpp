@@ -1780,7 +1780,7 @@ Status ApplyOrderBy(TransactionContext& context,
         all_direct_keys = false;
       }
     } else {
-      direct_key_cols.push_back(std::nullopt);
+      direct_key_cols.emplace_back(std::nullopt);
       all_direct_keys = false;
     }
   }
@@ -1809,7 +1809,7 @@ Status ApplyOrderBy(TransactionContext& context,
         uint32_t k2;
       };
       const auto can_encode_col = [&](size_t oi) noexcept {
-        if (oi >= order_specs.size() ||
+        if (oi >= order_specs.size() || !direct_key_cols[oi].has_value() ||
             order_specs[oi].KeyCollation() == Collation::kCaseInsensitive) {
           return false;
         }
@@ -1829,9 +1829,9 @@ Status ApplyOrderBy(TransactionContext& context,
         const bool has_k1 = order_specs.size() >= 2 && can_encode_col(1);
         const bool has_k2 =
             has_k1 && order_specs.size() >= 3 && can_encode_col(2);
-        const slot_t col0 = *direct_key_cols[0];
-        const slot_t col1 = has_k1 ? *direct_key_cols[1] : 0;
-        const slot_t col2 = has_k2 ? *direct_key_cols[2] : 0;
+        const slot_t col0 = direct_key_cols[0].value_or(0);
+        const slot_t col1 = has_k1 ? direct_key_cols[1].value_or(0) : 0;
+        const slot_t col2 = has_k2 ? direct_key_cols[2].value_or(0) : 0;
         bool exact0 = true;
         bool exact1 = has_k1;
         bool exact2 = has_k2 && order_specs.size() == 3;
@@ -3335,15 +3335,17 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   // the pushdown below is safe for either flavor.
   const bool is_union =
       !derived.UnionAll().empty() &&
+      (derived.GetSetOperationTree() == nullptr ||
+       !derived.GetSetOperationTree()->grouped) &&
       std::ranges::all_of(derived.SetOperationKinds(),
                           [](SetOperationKind kind) {
                             return kind == SetOperationKind::kUnionAll ||
                                    kind == SetOperationKind::kUnion;
                           });
   if (is_union) {
-    // UNION ALL has no row-changing boundary before the outer filter. Push a
-    // local predicate into every branch, then retain any non-local predicates
-    // above the set operation.
+    // UNION ALL / UNION DISTINCT have no row-changing boundary before the outer
+    // filter. Push a local predicate into every branch, then retain any
+    // non-local predicates above the set operation.
     SelectStatement pushed = derived;
     std::vector<Expression> head_where = SplitConjuncts(pushed.WhereClause());
     for (const Expression& predicate : pushable) {
@@ -3367,6 +3369,11 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
       std::vector<Expression> branch_where =
           SplitConjuncts(copied->WhereClause());
       for (const Expression& predicate : pushable) {
+        if (!PredicateCanEnterDerived(
+                predicate, *copied,
+                source.alias.empty() ? "u" : source.alias)) {
+          return nullptr;
+        }
         if (Expression rebound = RebindDerivedPredicate(
                 predicate, *copied,
                 source.alias.empty() ? "u" : source.alias)) {
@@ -3387,9 +3394,14 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
           return nullptr;
         }
       }
+      const std::vector<SetOperationKind> kinds = derived.SetOperationKinds();
+      const std::vector<SetOperationMatch> matches = derived.Matches();
       pushed.ClearUnionAll();
-      for (const auto& branch : branches) {
-        pushed.AddUnionAll(branch);
+      pushed.SetSetOperationTree(nullptr);
+      for (size_t i = 0; i < branches.size(); ++i) {
+        pushed.AddSetOperation(
+            i < kinds.size() ? kinds[i] : SetOperationKind::kUnionAll,
+            branches[i], i < matches.size() ? matches[i] : SetOperationMatch{});
       }
       SelectSource updated = source;
       updated.query = std::make_shared<SelectStatement>(std::move(pushed));
@@ -3425,7 +3437,11 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
   // LIMIT remains authoritative, including OFFSET semantics.
   if (is_union && statement.OrderBy().empty() && statement.HasLimit() &&
       statement.Limit() > 0 && statement.Offset() == 0 &&
-      !derived.UnionDistinct()) {
+      !derived.UnionDistinct() &&
+      std::ranges::all_of(derived.SetOperationKinds(),
+                          [](SetOperationKind kind) {
+                            return kind == SetOperationKind::kUnionAll;
+                          })) {
     const size_t cap = statement.Limit();
     const bool head_needs_cap = !derived.HasLimit();
     const bool branch_needs_cap = std::ranges::any_of(
@@ -3436,7 +3452,9 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
       return nullptr;
     }
     SelectStatement pushed = derived;
+    const std::vector<SetOperationMatch> matches = derived.Matches();
     pushed.ClearUnionAll();
+    pushed.SetSetOperationTree(nullptr);
     auto cap_branch = [cap](const std::shared_ptr<SelectStatement>& branch) {
       auto copied = std::make_shared<SelectStatement>(*branch);
       if (!copied->HasLimit() && copied->Offset() == 0) {
@@ -3447,9 +3465,12 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
     if (head_needs_cap) {
       pushed.SetLimit(cap);
     }
-    for (const auto& branch : derived.UnionAll()) {
+    for (size_t i = 0; i < derived.UnionAll().size(); ++i) {
+      const auto& branch = derived.UnionAll()[i];
       if (branch) {
-        pushed.AddUnionAll(cap_branch(branch));
+        pushed.AddSetOperation(
+            SetOperationKind::kUnionAll, cap_branch(branch),
+            i < matches.size() ? matches[i] : SetOperationMatch{});
       }
     }
     SelectSource updated = source;
@@ -3511,14 +3532,18 @@ StatusOr<std::vector<size_t>> ResolveNameAlignment(
         continue;
       }
       if (found != source.ColumnCount()) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           context + " produces duplicate column " + wanted);
+        std::string msg = context;
+        msg += " produces duplicate column ";
+        msg += wanted;
+        return StatusError(StatusCode::kInvalidArgument, std::move(msg));
       }
       found = index;
     }
     if (found == source.ColumnCount()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         context + " has no column named " + wanted);
+      std::string msg = context;
+      msg += " has no column named ";
+      msg += wanted;
+      return StatusError(StatusCode::kInvalidArgument, std::move(msg));
     }
     alignment.push_back(found);
   }
@@ -3526,9 +3551,11 @@ StatusOr<std::vector<size_t>> ResolveNameAlignment(
     for (slot_t index = 0; index < source.ColumnCount(); ++index) {
       const std::string& name = source.GetColumn(index).Name().name;
       if (!ContainsColumnName(targets, name)) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           context + " produces column " + name +
-                               " that the working table does not name");
+        std::string msg = context;
+        msg += " produces column ";
+        msg += name;
+        msg += " that the working table does not name";
+        return StatusError(StatusCode::kInvalidArgument, std::move(msg));
       }
     }
   }
@@ -3596,9 +3623,12 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
       }
       for (const std::string& listed : match.columns) {
         if (!ContainsColumnName(working_names, listed)) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "recursive CTE " + name + " has no column " +
-                                 listed + " to match by name");
+          std::string msg = "recursive CTE ";
+          msg += name;
+          msg += " has no column ";
+          msg += listed;
+          msg += " to match by name";
+          return StatusError(StatusCode::kInvalidArgument, std::move(msg));
         }
       }
       for (const std::string& wanted : working_names) {
@@ -3609,15 +3639,20 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
         }
         if (!match.columns.empty() &&
             !ContainsColumnName(match.columns, wanted)) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "recursive CTE " + name + " cannot drop column " +
-                                 wanted + " in a name-matched recursive term");
+          std::string msg = "recursive CTE ";
+          msg += name;
+          msg += " cannot drop column ";
+          msg += wanted;
+          msg += " in a name-matched recursive term";
+          return StatusError(StatusCode::kInvalidArgument, std::move(msg));
         }
         if (term_names.has_value() &&
             !ContainsColumnName(*term_names, wanted)) {
-          return StatusError(
-              StatusCode::kInvalidArgument,
-              "recursive CTE " + name + " term has no column " + wanted);
+          std::string msg = "recursive CTE ";
+          msg += name;
+          msg += " term has no column ";
+          msg += wanted;
+          return StatusError(StatusCode::kInvalidArgument, std::move(msg));
         }
       }
       if (match.by_name && term_names.has_value()) {
@@ -3698,7 +3733,7 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
       if (!branch_statement) {
         continue;
       }
-      const SetOperationMatch match = term_matches[term_index];
+      const SetOperationMatch& match = term_matches[term_index];
       ASSIGN_OR_RETURN(
           Relation, branch,
           (ExecuteQuery(context, *branch_statement, outer, loop_ctes)));
@@ -4023,14 +4058,18 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
        std::ranges::any_of(statement.SelectList(), [](const auto& item) {
          return ContainsAggregate(item.expression);
        }))) {
-    struct RestoreReuse {
+    struct RestoreReuse {  // NOLINT(cppcoreguidelines-special-member-functions)
       ExecutionRuntime* runtime;
       std::string table;
       bool was_reusable;
       ~RestoreReuse() {
-        if (was_reusable) runtime->reusable_base_relations.insert(table);
+        if (was_reusable) {
+          runtime->reusable_base_relations.insert(table);
+        }
       }
-    } restore{context.execution_runtime(), statement.Sources()[0].table, false};
+    } restore{.runtime = context.execution_runtime(),
+              .table = statement.Sources()[0].table,
+              .was_reusable = false};
     if (restore.runtime != nullptr) {
       restore.was_reusable =
           restore.runtime->reusable_base_relations.erase(restore.table) != 0;
@@ -4099,7 +4138,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           .context = &context,
           .outer = outer,
           .ctes = &ctes,
-          .input_rows = lst_store->total_rows,
+          .input_rows = static_cast<size_t>(lst_store->total_rows),
           .prebuild_only_exists = true,
       };
       CompiledScanFilter scan_filter =
@@ -4143,7 +4182,7 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
               projection, qualified_schema, table_schema, peek_compares,
               aggregate_expressions, ctes, std::move(typed_plan), nullptr,
               ValueType::kNull, std::nullopt,
-              &scan_filter.prebuilt_membership[0]);
+              scan_filter.prebuilt_membership.data());
           if (!typed.HasValue()) {
             return typed.GetStatus();
           }
@@ -4949,7 +4988,9 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
       int star_col_pos = -1;
       for (size_t si = 0; si < 2; ++si) {
         const Expression& e = statement.SelectList()[si].expression;
-        if (!e) break;
+        if (!e) {
+          break;
+        }
         if (e->Type() == TypeTag::kColumnValue &&
             IdentifierEquals(e->AsColumnValue().GetColumnName().name,
                              g_col.name)) {
@@ -5013,8 +5054,12 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
   PostFusionHavingFilter post_having;
   const auto same_expr = [](const Expression& a,
                             const Expression& b) noexcept -> bool {
-    if (!a && !b) return true;
-    if (!a || !b) return false;
+    if (!a && !b) {
+      return true;
+    }
+    if (!a || !b) {
+      return false;
+    }
     return a->ToString() == b->ToString();
   };
   if (statement.Having() && statement.Having()->Type() == TypeTag::kBinaryExp) {

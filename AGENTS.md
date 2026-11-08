@@ -2,7 +2,7 @@
 
 `tinylamb` is a C++20 RDBMS: GoogleSQL frontend, Cascades optimizer,
 three-tier expression engine (AST / Bytecode / LLVM JIT), hybrid
-row+PAX storage, ARIES WAL, MVCC, Foster B+Tree + WiscKey LSM,
+row+PAX storage, ARIES WAL, MVCC, LSM-Tree indexes,
 morsel-driven execution, PostgreSQL Simple-Query server.
 
 Each layer directory has its own `AGENTS.md`. **Before touching code in
@@ -40,22 +40,29 @@ plain `add_library` targets.
 
 ## 2. Project-Wide Invariants (must-know before reading code)
 
-1. **`StatusOr<T>` error handling** (`common/status_or.hpp`): no `throw`
-   in DB logic. Macro form is 3-arg:
+1. **`StatusOr<T>` error handling** (`common/status_or.hpp`): public storage,
+   catalog, executor, and query APIs return `Status` / `StatusOr<T>` and must
+   not let exceptions escape across `Status` boundaries (internal codec bounds
+   checks such as `Row::DeserializeBounded` are caught and translated to
+   `Status::kCorrupt` / `false` at boundary callers; legacy `exc_shim.hpp`
+   helpers are transitional). Macro form is 3-arg:
    `ASSIGN_OR_RETURN(type, value, expr)` (plus `ASSIGN_OR_ASSERT_FAIL`,
    `ASSIGN_OR_CRASH`, `COERCE`).
-2. **`PageRef` RAII** (`page/page_ref.hpp`): pins + latches on construct,
-   unpins/unlocks on destroy. Never hold a raw `Page*` across pool ops.
+2. **`PageRef` RAII** (`page/page_ref.hpp`): latches the in-memory `Page` on
+   construct and unlocks on destroy (`PageUnlock()` releases early). Never hold
+   a raw `Page*` across latch release (`PagePool` is retired; pages live in RAM
+   under `PageManager` and persist to `<db>.db` on LSM compaction / shutdown).
 3. **Expression ground truth**: AST `Expression::Evaluate` is the semantic
    reference. New operators go AST-first, then Bytecode; JIT only mirrors
    narrow INT64 kernels. `expression/differential_test.cpp` must pass.
-4. **WAL-before-data**: `PagePool` consults a durability gate before
-   write-back; never bypass it. ARIES invariants:
+4. **WAL-before-data**: `CheckpointManager::WriteCheckpoint` waits for
+   `Logger::WaitForDurable(durable_target)` before writing the `<db>.db`
+   snapshot and recycling WAL segments; never bypass it. ARIES invariants:
    [`docs/recovery_invariants.md`](docs/recovery_invariants.md),
    [`docs/wal_format.md`](docs/wal_format.md).
-5. **Lock ordering**: `docs/lock_order.md` is normative. Row latch
-   (`PagePool`) vs row lock (`LockManager`) vs MVCC write-intent are three
-   different things — do not conflate them.
+5. **Lock ordering**: `docs/lock_order.md` is normative. Page content latch
+   (`PageRef`) vs MVCC write-intent (`TransactionManager::AcquireWriteIntent`)
+   are two different things — do not conflate them (`LockManager` is retired).
 6. **Plan/executor split**: `plan/` holds logical info only; concrete
    `EmitExecutor` implementations live in `executor/relational_factory.cpp`.
 7. **SQL entry points**: `SqlEngine::Execute` / `Prepare`

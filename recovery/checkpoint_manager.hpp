@@ -48,23 +48,24 @@ class CheckpointManager {
   CheckpointManager& operator=(CheckpointManager&&) = delete;
 
   CheckpointManager(std::string_view path, TransactionManager* tm,
-                    PageManager* pm, size_t interval = 5)
-      : master_record_path(path),
-        tm_(tm),
-        pm_(pm),
-        interval_seconds_(interval),
-        checkpoint_worker_([this] { WorkerThreadTask(); }) {
-    RemoveStaleMasterTmp();
-  }
+                    PageManager* pm, size_t interval = 5);
   ~CheckpointManager();
 
   void Start() {
-    if (!stop_.load(std::memory_order_acquire)) {
-      start_.store(true, std::memory_order_release);
+    bool notify = false;
+    {
+      std::scoped_lock lk(worker_wait_mu_);
+      if (!stop_.load(std::memory_order_acquire)) {
+        start_.store(true, std::memory_order_release);
+        notify = true;
+      }
+    }
+    if (notify) {
       worker_wait_cv_.notify_all();
     }
   }
   void Stop();
+  void RequestCompaction();
 
   void WorkerThreadTask();
 
@@ -81,10 +82,9 @@ class CheckpointManager {
   }
 
  private:
-  void RemoveStaleMasterTmp() const;
-
   std::atomic<bool> start_{false};
   std::atomic<bool> stop_{false};
+  bool compaction_requested_{false};
   std::string master_record_path;
   TransactionManager* const tm_;
   PageManager* const pm_;

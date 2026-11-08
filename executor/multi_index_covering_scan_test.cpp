@@ -83,14 +83,14 @@ constexpr int64_t kQtyHi = 270;
 // admit rows they exclude, so the recheck on the covered columns is what
 // decides the answer (a predicate that is exactly the conjunction of the two
 // ranges would make the recheck a no-op and prove nothing).
-const char kRangePredicate[] =
+constexpr const char* kRangePredicate =
     "part >= 40 AND part < 320 AND qty >= 30 AND qty < 270 AND region >= 200 "
     "AND region < 260";
 
 // Just the two leading-key ranges -- i.e. what the participants' index ranges
 // encode on their own.  It is a strict superset of kRangePredicate, which is
 // exactly why the recheck is load-bearing.
-const char kWideRanges[] =
+constexpr const char* kWideRanges =
     "part >= 40 AND part < 320 AND qty >= 30 AND qty < 270";
 
 std::vector<Row> Drain(ExecutorBase* executor) {
@@ -142,12 +142,12 @@ class MultiIndexCoveringScanTest : public ::testing::Test {
                                    Column("qty", ValueType::kInt64),
                                    Column("region", ValueType::kInt64)})));
     for (size_t i = 0; i < kRows; ++i) {
-      const int64_t part = static_cast<int64_t>(i);
-      const int64_t qty = static_cast<int64_t>((i * 37) % kRows);
+      const auto part = static_cast<int64_t>(i);
+      const auto qty = static_cast<int64_t>((i * 37) % kRows);
       // `region` is a permutation of 0..kRows (53 is coprime with kRows), so a
       // unique index over it is buildable -- which is what the retaining-index
       // case needs to prove it is skipped on its MODE, not on its data.
-      const int64_t region = static_cast<int64_t>((i * 53) % kRows);
+      const auto region = static_cast<int64_t>((i * 53) % kRows);
       ASSERT_SUCCESS(
           parts
               .Insert(setup.txn_, Row({Value(part), Value(qty), Value(region)}))
@@ -345,7 +345,7 @@ TEST_F(MultiIndexCoveringScanTest, RetainingIndexIsNotAParticipant) {
   // needs except the one thing that disqualifies it: its entries are RETAINED
   // across delete, so they are not the committed image the covering read
   // serves.  The two non-retained indexes must answer without it.
-  const char kThreeWayPredicate[] =
+  constexpr const char* kThreeWayPredicate =
       "part >= 40 AND part < 320 AND qty >= 30 AND qty < 270 AND region >= 40 "
       "AND region < 320";
   const std::string plan = Explain("SELECT region FROM parts WHERE " +
@@ -420,13 +420,13 @@ TEST_F(MultiIndexCoveringScanTest, DirectExecutorMatchesTheFullScan) {
   std::vector<BitmapIndexRange> ranges;
   BitmapIndexRange by_part;
   by_part.index = &parts.GetIndex(0);  // IdxPart, key `part`
-  by_part.begin_key.push_back(Value(kPartLo));
-  by_part.end_key.push_back(Value(kPartHi));
+  by_part.begin_key.emplace_back(kPartLo);
+  by_part.end_key.emplace_back(kPartHi);
   ranges.push_back(std::move(by_part));
   BitmapIndexRange by_qty;
   by_qty.index = &parts.GetIndex(1);  // IdxQty, key `qty`
-  by_qty.begin_key.push_back(Value(kQtyLo));
-  by_qty.end_key.push_back(Value(kQtyHi));
+  by_qty.begin_key.emplace_back(kQtyLo);
+  by_qty.end_key.emplace_back(kQtyHi);
   ranges.push_back(std::move(by_qty));
 
   const auto cmp = [](std::string_view column, BinaryOperation op,

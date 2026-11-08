@@ -85,13 +85,19 @@ thread_local const IoCpuMasks* current_io_masks = nullptr;
 class ScopedIoCpuAffinity {
  public:
   ScopedIoCpuAffinity() {
-    if (std::getenv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) return;
+    if (std::getenv("TINYLAMB_DISABLE_IO_AFFINITY") != nullptr) {
+      return;
+    }
     const std::optional<platform::CpuSet> available =
         platform::CpuSet::CurrentThread();
-    if (!available.has_value() || available->Count() < 2) return;
+    if (!available.has_value() || available->Count() < 2) {
+      return;
+    }
     masks_.available = *available;
     const int cpu = masks_.available.First();
-    if (cpu < 0) return;
+    if (cpu < 0) {
+      return;
+    }
     masks_.io = platform::CpuSet::Single(cpu);
     if (masks_.io.ApplyToCurrentThread()) {
       previous_ = current_io_masks;
@@ -100,13 +106,17 @@ class ScopedIoCpuAffinity {
     }
   }
   ~ScopedIoCpuAffinity() {
-    if (cpu_ < 0) return;
+    if (cpu_ < 0) {
+      return;
+    }
     current_io_masks = previous_;
     (void)masks_.available.ApplyToCurrentThread();
   }
   ScopedIoCpuAffinity(const ScopedIoCpuAffinity&) = delete;
   ScopedIoCpuAffinity& operator=(const ScopedIoCpuAffinity&) = delete;
-  int Cpu() const { return cpu_; }
+  ScopedIoCpuAffinity(ScopedIoCpuAffinity&&) = delete;
+  ScopedIoCpuAffinity& operator=(ScopedIoCpuAffinity&&) = delete;
+  [[nodiscard]] int Cpu() const { return cpu_; }
 
  private:
   IoCpuMasks masks_{};
@@ -117,18 +127,23 @@ class ScopedIoCpuAffinity {
 class ScopedSqlCpuAffinity {
  public:
   ScopedSqlCpuAffinity() : masks_(current_io_masks) {
-    if (masks_ && masks_->available.ApplyToCurrentThread())
+    if ((masks_ != nullptr) && masks_->available.ApplyToCurrentThread()) {
       current_io_masks = nullptr;
-    else
+    } else {
       masks_ = nullptr;
+    }
   }
   ~ScopedSqlCpuAffinity() {
-    if (!masks_) return;
+    if (masks_ == nullptr) {
+      return;
+    }
     (void)masks_->io.ApplyToCurrentThread();
     current_io_masks = masks_;
   }
   ScopedSqlCpuAffinity(const ScopedSqlCpuAffinity&) = delete;
   ScopedSqlCpuAffinity& operator=(const ScopedSqlCpuAffinity&) = delete;
+  ScopedSqlCpuAffinity(ScopedSqlCpuAffinity&&) = delete;
+  ScopedSqlCpuAffinity& operator=(ScopedSqlCpuAffinity&&) = delete;
 
  private:
   const IoCpuMasks* masks_;
@@ -443,9 +458,13 @@ class PostgresServer::Impl {
   }
 
   void EmitMetrics() {
-    if (!metrics_enabled_) return;
+    if (!metrics_enabled_) {
+      return;
+    }
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_metrics_ < std::chrono::seconds(1)) return;
+    if (now - last_metrics_ < std::chrono::seconds(1)) {
+      return;
+    }
     last_metrics_ = now;
     const auto stats = database_->TransactionStats();
     std::cerr << "TINYLAMB_METRICS {\"time_ns\":"
@@ -507,10 +526,16 @@ class PostgresServer::Impl {
   // can never write to a recycled descriptor belonging to another client.
   struct ReplySocket {
     explicit ReplySocket(int socket) : fd(socket) {}
+    ReplySocket(const ReplySocket&) = delete;
+    ReplySocket& operator=(const ReplySocket&) = delete;
+    ReplySocket(ReplySocket&&) = delete;
+    ReplySocket& operator=(ReplySocket&&) = delete;
     ~ReplySocket() { Close(); }
     void Close() {
       std::scoped_lock lock(mutex);
-      if (fd >= 0) close(fd);
+      if (fd >= 0) {
+        close(fd);
+      }
       fd = -1;
     }
     ssize_t Send(std::string_view response, int* failure) {
@@ -519,7 +544,7 @@ class PostgresServer::Impl {
         *failure = EBADF;
         return -1;
       }
-      ssize_t sent;
+      ssize_t sent = 0;
       do {
         sent = platform::SendNoSignal(fd, response.data(), response.size(),
                                       MSG_DONTWAIT);
@@ -700,7 +725,9 @@ class PostgresServer::Impl {
       return;
     }
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_idle_sweep_ < std::chrono::milliseconds(100)) return;
+    if (now - last_idle_sweep_ < std::chrono::milliseconds(100)) {
+      return;
+    }
     last_idle_sweep_ = now;
     for (auto it = clients_.begin(); it != clients_.end();) {
       const Client& client = it->second;
@@ -729,7 +756,7 @@ class PostgresServer::Impl {
       return false;
     }
     Client& client = found->second;
-    std::array<char, 8192> buffer;
+    std::array<char, 8192> buffer{};
     bool eof_seen = false;
     size_t cached_packets = 0;
     while (true) {
@@ -742,8 +769,9 @@ class PostgresServer::Impl {
                 std::string_view(buffer.data(), static_cast<size_t>(size)))) {
           if (client.output_overflow ||
               static_cast<size_t>(size) < buffer.size() ||
-              ++cached_packets == 32)
+              ++cached_packets == 32) {
             break;
+          }
           // Consumed frames no longer contribute to the queued-input cap.
           // Yield after a bounded burst; level-triggered epoll retains any
           // remaining bytes so another client gets a turn too.
@@ -767,7 +795,9 @@ class PostgresServer::Impl {
         }
         // Level-triggered epoll will report any later bytes again. A short
         // read need not pay for a second recv just to discover EAGAIN.
-        if (static_cast<size_t>(size) < buffer.size()) break;
+        if (static_cast<size_t>(size) < buffer.size()) {
+          break;
+        }
         continue;
       }
       if (size == 0) {
@@ -786,19 +816,24 @@ class PostgresServer::Impl {
       }
       return false;
     }
-    if (!client.input.empty()) ProcessInput(client);
+    if (!client.input.empty()) {
+      ProcessInput(client);
+    }
     if (eof_seen) {
       client.peer_eof_seen = true;
     }
-    if (client.peer_eof_seen && !client.read_query_in_flight)
+    if (client.peer_eof_seen && !client.read_query_in_flight) {
       client.close_after_write = true;
+    }
     if (client.output_overflow) {
       // Queue() refuses to buffer past the per-connection output cap: drop
       // the connection instead of propagating into the event loop.
       CloseClient(fd);
       return false;
     }
-    if (client.output_offset < client.output.size()) return WriteClient(fd);
+    if (client.output_offset < client.output.size()) {
+      return WriteClient(fd);
+    }
     UpdateClientInterest(client);
     // A half-close (close_after_write) must not close the connection while a
     // read query is still running on a worker: its completion queues the
@@ -834,7 +869,9 @@ class PostgresServer::Impl {
       client.output.clear();
       // Retain only a small reusable wire buffer. Large responses still
       // release their high-water allocation when the socket drains.
-      if (client.output.capacity() > 4096) client.output.shrink_to_fit();
+      if (client.output.capacity() > 4096) {
+        client.output.shrink_to_fit();
+      }
       client.output_offset = 0;
       if (client.close_after_write && !client.read_query_in_flight) {
         return false;
@@ -853,9 +890,12 @@ class PostgresServer::Impl {
     if (client.output_offset < client.output.size()) {
       interest |= platform::kPollWritable;
     }
-    if (interest == client.registered_events) return;
-    if (poller_.Modify(client.fd, interest))
+    if (interest == client.registered_events) {
+      return;
+    }
+    if (poller_.Modify(client.fd, interest)) {
       client.registered_events = interest;
+    }
   }
 
   static void Queue(Client& client, const std::string& message) {
@@ -1031,17 +1071,20 @@ class PostgresServer::Impl {
     return true;
   }
 
-  void SendCachedLiteralReply(Client& client, const std::string& response) {
+  static void SendCachedLiteralReply(Client& client,
+                                     const std::string& response) {
     if (!client.output.empty()) {
       Queue(client, response);
       return;
     }
-    ssize_t sent;
+    ssize_t sent = 0;
     do {
       sent =
           platform::SendNoSignal(client.fd, response.data(), response.size());
     } while (sent < 0 && errno == EINTR);
-    if (sent == static_cast<ssize_t>(response.size())) return;
+    if (std::cmp_equal(sent, response.size())) {
+      return;
+    }
     if (sent > 0) {
       Queue(client, response.substr(static_cast<size_t>(sent)));
     } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -1056,16 +1099,20 @@ class PostgresServer::Impl {
     if (!client.startup_complete || client.close_after_write ||
         client.read_query_in_flight || client.transaction_status != 'I' ||
         client.session_has_temp_objects || packet.size() < 6 ||
-        packet[0] != 'Q' || packet.back() != '\0')
+        packet[0] != 'Q' || packet.back() != '\0') {
       return false;
+    }
     const auto length = pgwire::ReadUint32(packet, 1);
     if (!length.HasValue() || length.Value() < 5 ||
         length.Value() > options_.max_message_bytes ||
-        static_cast<size_t>(length.Value()) + 1 != packet.size())
+        static_cast<size_t>(length.Value()) + 1 != packet.size()) {
       return false;
+    }
     const auto found =
         literal_constant_replies_.find(packet.substr(5, packet.size() - 6));
-    if (found == literal_constant_replies_.end()) return false;
+    if (found == literal_constant_replies_.end()) {
+      return false;
+    }
     // The same exact-SQL, idle-state certificate as ExecuteSimpleQuery.
     // Partial frames and multiple frames in one recv keep the general path.
     cached_literal_reply_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1167,8 +1214,10 @@ class PostgresServer::Impl {
         client.reply_durability_target, context.txn_.DurabilityDependence());
   }
 
-  Status CommitForReply(Client& client, TransactionContext& context) {
-    if (!client.permit_deferred_commit) return context.PreCommit();
+  static Status CommitForReply(Client& client, TransactionContext& context) {
+    if (!client.permit_deferred_commit) {
+      return context.PreCommit();
+    }
     ASSIGN_OR_RETURN(lsn_t, target, context.PrepareCommitForDurableReply());
     client.reply_durability_target =
         std::max(client.reply_durability_target, target);
@@ -1208,9 +1257,12 @@ class PostgresServer::Impl {
       // A later statement can abort/reset the context after earlier SELECT
       // rows have been buffered. Keep their dependency outside that context.
       if (statements.size() > 1) {
-        if (client.transaction)
+        if (client.transaction) {
           RecordReplyDependency(client, *client.transaction);
-        if (implicit) RecordReplyDependency(client, *implicit);
+        }
+        if (implicit) {
+          RecordReplyDependency(client, *implicit);
+        }
       }
     }
     if (implicit != nullptr) {
@@ -1230,7 +1282,9 @@ class PostgresServer::Impl {
     }
     // Explicit blocks and partial results preceding a later error both
     // disclose observed versions before their final COMMIT (D4).
-    if (client.transaction) RecordReplyDependency(client, *client.transaction);
+    if (client.transaction) {
+      RecordReplyDependency(client, *client.transaction);
+    }
     if (!client.permit_deferred_commit && client.reply_durability_target != 0) {
       const Status durable =
           database_->WaitForCommitDurable(client.reply_durability_target);
@@ -1360,8 +1414,9 @@ class PostgresServer::Impl {
     try {
       ScopedSqlCpuAffinity sql_affinity;
       std::optional<SqlEngine> local_engine;
-      if (!pooled_engine) local_engine.emplace(*database_);
-      SqlEngine& engine = pooled_engine ? *pooled_engine : *local_engine;
+      SqlEngine& engine = (pooled_engine != nullptr)
+                              ? *pooled_engine
+                              : local_engine.emplace(*database_);
       StatusOr<QueryResult> executed = engine.Execute(*context, sql);
       if (!executed.HasValue()) {
         const std::string error = engine.LastError().empty()
@@ -1564,7 +1619,7 @@ class PostgresServer::Impl {
     {
       std::scoped_lock lock(read_task_mutex_);
       const size_t count = read_workers_.size();
-      const size_t preferred = static_cast<size_t>(task.client_id % count);
+      const auto preferred = static_cast<size_t>(task.client_id % count);
       chosen = preferred;
       if (read_worker_running_[preferred] || !read_tasks_[preferred].empty()) {
         size_t best = read_tasks_[preferred].size() +
@@ -1581,8 +1636,9 @@ class PostgresServer::Impl {
       const bool potential_commit = task.potential_commit;
       read_tasks_[chosen].push_back(std::move(task));
       pending_worker_tasks_.fetch_add(1);
-      if (potential_commit)
+      if (potential_commit) {
         potential_commit_tasks_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     // Quiet connections reuse a recently active worker. Busy workers steal
     // pending work after finishing, so a long query cannot pin an idle pool.
@@ -1610,10 +1666,14 @@ class PostgresServer::Impl {
       Queue(client, response);
       return;
     }
-    ReadTask task{client.fd, client.id, statements, nullptr};
+    ReadTask task{.client_fd = client.fd,
+                  .client_id = client.id,
+                  .statements = statements,
+                  .session = nullptr};
     task.plan_cache = std::move(client.plan_cache);
-    if (client.output.empty() && !client.output_overflow)
+    if (client.output.empty() && !client.output_overflow) {
       task.reply_socket = client.reply_socket;
+    }
     EnqueueSqlTask(std::move(task));
   }
 
@@ -1622,9 +1682,10 @@ class PostgresServer::Impl {
     // Only SQL state crosses threads. Socket/input/output buffers stay owned
     // by epoll, and at most one task per connection is ever in flight.
     auto session = std::move(client.worker_shell);
-    if (!session)
+    if (!session) {
       session =
           std::make_unique<Client>(client.fd, client.id, client.secret, false);
+    }
     session->output.clear();
     session->output_offset = 0;
     session->output_overflow = false;
@@ -1634,9 +1695,13 @@ class PostgresServer::Impl {
     session->plan_cache = std::move(client.plan_cache);
     client.read_query_in_flight = true;
     client.read_started_at = std::chrono::steady_clock::now();
-    ReadTask task{client.fd, client.id, statements, std::move(session)};
-    if (client.output.empty() && !client.output_overflow)
+    ReadTask task{.client_fd = client.fd,
+                  .client_id = client.id,
+                  .statements = statements,
+                  .session = std::move(session)};
+    if (client.output.empty() && !client.output_overflow) {
       task.reply_socket = client.reply_socket;
+    }
     EnqueueSqlTask(std::move(task));
   }
 
@@ -1644,7 +1709,11 @@ class PostgresServer::Impl {
     if (!session || !session->transaction) {
       return;
     }
-    EnqueueSqlTask({-1, 0, {}, std::move(session), true});
+    EnqueueSqlTask({.client_fd = -1,
+                    .client_id = 0,
+                    .statements = {},
+                    .session = std::move(session),
+                    .cleanup_only = true});
   }
 
   void StartReadWorkers() {
@@ -1690,7 +1759,9 @@ class PostgresServer::Impl {
       std::scoped_lock lock(read_task_mutex_);
       read_workers_stopping_ = true;
     }
-    for (auto& ready : read_task_ready_) ready.notify_all();
+    for (auto& ready : read_task_ready_) {
+      ready.notify_all();
+    }
     for (std::thread& worker : read_workers_) {
       if (worker.joinable()) {
         worker.join();
@@ -1702,7 +1773,9 @@ class PostgresServer::Impl {
       durability_stopping_ = true;
     }
     durability_ready_.notify_all();
-    if (durability_worker_.joinable()) durability_worker_.join();
+    if (durability_worker_.joinable()) {
+      durability_worker_.join();
+    }
   }
 
   void ReadWorkerLoop(size_t worker) {
@@ -1720,14 +1793,17 @@ class PostgresServer::Impl {
         };
         read_task_ready_[worker].wait(
             lock, [&] { return read_workers_stopping_ || pending(); });
-        if (read_workers_stopping_ && !pending()) return;
+        if (read_workers_stopping_ && !pending()) {
+          return;
+        }
         size_t owner = worker;
         if (read_tasks_[owner].empty()) {
-          for (size_t other = 0; other < read_tasks_.size(); ++other)
+          for (size_t other = 0; other < read_tasks_.size(); ++other) {
             if (!read_tasks_[other].empty()) {
               owner = other;
               break;
             }
+          }
         }
         task = std::move(read_tasks_[owner].front());
         read_tasks_[owner].pop_front();
@@ -1837,33 +1913,42 @@ class PostgresServer::Impl {
         task.session->reply_durability_target = read_target;
         task.session->plan_cache = std::move(task.plan_cache);
       }
-      ReadCompletion completion{task.client_fd,
-                                task.client_id,
-                                std::move(response),
-                                std::move(task.session),
-                                {}};
+      ReadCompletion completion{.client_fd = task.client_fd,
+                                .client_id = task.client_id,
+                                .response = std::move(response),
+                                .session = std::move(task.session),
+                                .literal_constant_sql = {}};
       completion.plan_cache = std::move(task.plan_cache);
       completion.reply_socket = std::move(task.reply_socket);
-      if (literal_constant && task.statements.size() == 1)
+      if (literal_constant && task.statements.size() == 1) {
         completion.literal_constant_sql = task.statements[0];
+      }
       const bool needs_durability =
           completion.session && completion.session->reply_durability_target >
                                     database_->DurableWALLSN();
-      if (needs_durability || task.potential_commit) {
+      if (needs_durability) {
         {
           std::scoped_lock lock(durability_mutex_);
-          if (needs_durability)
-            durability_tasks_.push_back(std::move(completion));
+          durability_tasks_.push_back(std::move(completion));
           // Publish the queue entry before retiring its candidate, under the
           // coordinator's lock. Its cohort never observes a missing commit.
-          if (task.potential_commit)
+          if (task.potential_commit) {
             potential_commit_tasks_.fetch_sub(1, std::memory_order_relaxed);
+          }
         }
-        // Also wake a batch when a candidate finishes without a new commit
-        // (zero-row DML, error, or an already-durable dependency).
         durability_ready_.notify_one();
+      } else {
+        if (task.potential_commit) {
+          {
+            std::scoped_lock lock(durability_mutex_);
+            potential_commit_tasks_.fetch_sub(1, std::memory_order_relaxed);
+          }
+          // Also wake a batch when a candidate finishes without a new commit
+          // (zero-row DML, error, or an already-durable dependency).
+          durability_ready_.notify_one();
+        }
+        PublishReadCompletion(std::move(completion));
       }
-      if (!needs_durability) PublishReadCompletion(std::move(completion));
     }
   }
 
@@ -1882,12 +1967,14 @@ class PostgresServer::Impl {
           completion.reply_socket->Send(completion.response, &failure);
       if (sent > 0) {
         completion.response.erase(0, static_cast<size_t>(sent));
-        if (completion.response.empty())
+        if (completion.response.empty()) {
           direct_reply_count_.fetch_add(1, std::memory_order_relaxed);
+        }
       } else if (sent == 0 || (failure != EAGAIN && failure != EWOULDBLOCK)) {
         completion.reply_send_failed = true;
       }
     }
+    std::unique_ptr<Client> aborted_session;
     bool completed_on_loop = false;
     bool wake_loop = false;
     {
@@ -1899,10 +1986,14 @@ class PostgresServer::Impl {
         wake_loop = read_completions_.empty();
         read_completions_.push_back(std::move(completion));
         completed_on_loop = true;
+      } else {
+        aborted_session = std::move(completion.session);
       }
     }
     if (!completed_on_loop) {
-      if (completion.session) AbortOpenTransaction(*completion.session);
+      if (aborted_session) {
+        AbortOpenTransaction(*aborted_session);
+      }
       pending_worker_tasks_.fetch_sub(1);
     }
     if (wake_loop) {
@@ -1919,7 +2010,9 @@ class PostgresServer::Impl {
         durability_ready_.wait(lock, [&] {
           return durability_stopping_ || !durability_tasks_.empty();
         });
-        if (durability_tasks_.empty() && durability_stopping_) return;
+        if (durability_tasks_.empty() && durability_stopping_) {
+          return;
+        }
         // Wait only for peer tasks that can create a commit now. Explicit
         // block SELECT/UPDATE steps cannot join this cohort with a future
         // COMMIT; their dependency targets retain the same durability gate.
@@ -1953,8 +2046,9 @@ class PostgresServer::Impl {
       // keeps the window short. This affects grouping, never the LSN proof.
       batch_window = std::chrono::microseconds(std::clamp<int64_t>(
           (batch_window.count() * 3 + sync_us) / 4, 100, 1000));
-      if (metrics_enabled_)
+      if (metrics_enabled_) {
         durability_batches_.fetch_add(1, std::memory_order_relaxed);
+      }
       for (auto& completion : batch) {
         if (durable != Status::kSuccess) {
           const bool block = completion.session->transaction_status == 'T';
@@ -1988,7 +2082,9 @@ class PostgresServer::Impl {
                               bool* literal_constant = nullptr,
                               SqlEngine* pooled_engine = nullptr) {
     ScopedSqlCpuAffinity sql_affinity;
-    if (literal_constant) *literal_constant = false;
+    if (literal_constant != nullptr) {
+      *literal_constant = false;
+    }
     bool literal_only = statements.size() == 1;
     std::string response;
     // One snapshot for the whole message so multi-statement reads observe a
@@ -2000,8 +2096,9 @@ class PostgresServer::Impl {
     for (const std::string& statement : statements) {
       try {
         std::optional<SqlEngine> local_engine;
-        if (!pooled_engine) local_engine.emplace(*database_);
-        SqlEngine& engine = pooled_engine ? *pooled_engine : *local_engine;
+        SqlEngine& engine = (pooled_engine != nullptr)
+                                ? *pooled_engine
+                                : local_engine.emplace(*database_);
         StatusOr<QueryResult> executed = engine.Execute(*context, statement);
         if (!executed.HasValue()) {
           const std::string error = engine.LastError().empty()
@@ -2039,12 +2136,13 @@ class PostgresServer::Impl {
     if (!context->IsFinished()) {
       if (ok) {
         Status commit = Status::kSuccess;
-        if (reply_target) {
+        if (reply_target != nullptr) {
           auto prepared = context->PrepareCommitForDurableReply();
-          if (prepared.HasValue())
+          if (prepared.HasValue()) {
             *reply_target = prepared.Value();
-          else
+          } else {
             commit = prepared.GetStatus();
+          }
         } else {
           commit = context->PreCommit();
         }
@@ -2059,7 +2157,7 @@ class PostgresServer::Impl {
       }
     }
     if (!ok && observed_dependency != 0) {
-      if (reply_target) {
+      if (reply_target != nullptr) {
         *reply_target = std::max(*reply_target, observed_dependency);
       } else {
         const Status durable =
@@ -2071,9 +2169,9 @@ class PostgresServer::Impl {
         }
       }
     }
-    if (literal_constant) {
+    if (literal_constant != nullptr) {
       *literal_constant = ok && literal_only && observed_dependency == 0 &&
-                          (!reply_target || *reply_target == 0);
+                          ((reply_target == nullptr) || *reply_target == 0);
     }
     response += pgwire::ReadyForQuery('I');
     return response;
@@ -2113,22 +2211,25 @@ class PostgresServer::Impl {
         if (literal_constant_replies_.size() >= 512 ||
             literal_constant_reply_bytes_ + completion.response.size() +
                     completion.literal_constant_sql.size() >
-                4 * 1024 * 1024) {
+                size_t{4} * 1024 * 1024) {
           literal_constant_replies_.clear();
           literal_constant_reply_bytes_ = 0;
         }
         const auto [entry, inserted] = literal_constant_replies_.emplace(
             completion.literal_constant_sql, completion.response);
-        if (inserted)
+        if (inserted) {
           literal_constant_reply_bytes_ +=
               entry->first.size() + entry->second.size();
+        }
       }
       Client& client = found->second;
-      if (completion.plan_cache)
+      if (completion.plan_cache) {
         client.plan_cache = std::move(completion.plan_cache);
+      }
       if (completion.session) {
-        if (completion.session->plan_cache)
+        if (completion.session->plan_cache) {
           client.plan_cache = std::move(completion.session->plan_cache);
+        }
         client.transaction = std::move(completion.session->transaction);
         client.transaction_status = completion.session->transaction_status;
         client.output_overflow |= completion.session->output_overflow;
@@ -2145,9 +2246,12 @@ class PostgresServer::Impl {
         continue;
       }
       ProcessInput(client);
-      if (client.peer_eof_seen && !client.read_query_in_flight)
+      if (client.peer_eof_seen && !client.read_query_in_flight) {
         client.close_after_write = true;
-      if (!WriteClient(completion.client_fd)) CloseClient(completion.client_fd);
+      }
+      if (!WriteClient(completion.client_fd)) {
+        CloseClient(completion.client_fd);
+      }
     }
   }
 

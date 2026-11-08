@@ -36,12 +36,12 @@ class IndexKeyHistoryTest : public ::testing::Test {
     ASSERT_NE(db_, nullptr);
   }
   void TearDown() override { db_->DeleteAll(); }
-  void Mark(Transaction& txn, page_id_t root, std::string_view key) {
+  static void Mark(Transaction& txn, page_id_t root, std::string_view key) {
     auto gate = txn.AcquireIndexWriteGuard(root);
     txn.MarkIndexKeysChanged(root, key);
   }
-  std::optional<std::vector<std::string>> Changes(Transaction& txn,
-                                                  page_id_t root) {
+  static std::optional<std::vector<std::string>> Changes(Transaction& txn,
+                                                         page_id_t root) {
     auto gate = txn.AcquireIndexReadGuard(root);
     return txn.IndexKeyChangesSinceSnapshot(root, gate);
   }
@@ -57,18 +57,17 @@ TEST_F(IndexKeyHistoryTest, PendingCommitAbortAndRootScope) {
   Mark(writer.txn_, 71, "other-root");
   auto pending = Changes(reader.txn_, 7);
   ASSERT_TRUE(pending);
-  EXPECT_EQ(*pending, (std::vector<std::string>{"key-a", "key-b"}));
-  EXPECT_EQ(*Changes(reader.txn_, 71),
-            (std::vector<std::string>{"other-root"}));
+  EXPECT_EQ(pending, (std::vector<std::string>{"key-a", "key-b"}));
+  EXPECT_EQ(Changes(reader.txn_, 71), (std::vector<std::string>{"other-root"}));
   ASSERT_SUCCESS(writer.PreCommit());
-  EXPECT_EQ(*Changes(reader.txn_, 7), *pending);
+  EXPECT_EQ(Changes(reader.txn_, 7), pending);
   auto fresh = db_->BeginContext();
-  EXPECT_TRUE(Changes(fresh.txn_, 7)->empty());
+  EXPECT_EQ(Changes(fresh.txn_, 7), std::vector<std::string>{});
   auto aborting = db_->BeginContext();
   Mark(aborting.txn_, 7, "aborted");
-  EXPECT_EQ(*Changes(fresh.txn_, 7), (std::vector<std::string>{"aborted"}));
+  EXPECT_EQ(Changes(fresh.txn_, 7), (std::vector<std::string>{"aborted"}));
   ASSERT_SUCCESS(aborting.txn_.Abort());
-  EXPECT_TRUE(Changes(fresh.txn_, 7)->empty());
+  EXPECT_EQ(Changes(fresh.txn_, 7), std::vector<std::string>{});
 }
 
 TEST_F(IndexKeyHistoryTest, GuardAndUnknownKeyCallsRemainConservative) {
@@ -99,13 +98,15 @@ TEST_F(IndexKeyHistoryTest, EvictedHistoryRejectsOldButNotFreshSnapshots) {
   EXPECT_FALSE(Changes(old.txn_, 7));
   auto fresh = db_->BeginContext();
   ASSERT_TRUE(Changes(fresh.txn_, 7));
-  EXPECT_TRUE(Changes(fresh.txn_, 7)->empty());
+  EXPECT_EQ(Changes(fresh.txn_, 7), std::vector<std::string>{});
 }
 
 TEST_F(IndexKeyHistoryTest, OversizedPendingSetRevokesRatherThanLosesKeys) {
   auto reader = db_->BeginContext();
   auto writer = db_->BeginContext();
-  for (int i = 0; i < 600; ++i) Mark(writer.txn_, 7, std::to_string(i));
+  for (int i = 0; i < 600; ++i) {
+    Mark(writer.txn_, 7, std::to_string(i));
+  }
   EXPECT_FALSE(Changes(reader.txn_, 7));
   EXPECT_TRUE(reader.txn_.IndexKeysMayBeStale(7));
   ASSERT_SUCCESS(writer.txn_.Abort());
@@ -118,9 +119,9 @@ TEST_F(IndexKeyHistoryTest, TransactionMovePreservesPendingIdentity) {
   auto context = db_->BeginContext();
   Mark(context.txn_, 7, "moved");
   Transaction moved(std::move(context.txn_));
-  EXPECT_EQ(*Changes(reader.txn_, 7), (std::vector<std::string>{"moved"}));
+  EXPECT_EQ(Changes(reader.txn_, 7), (std::vector<std::string>{"moved"}));
   ASSERT_SUCCESS(moved.Abort());
-  EXPECT_TRUE(Changes(reader.txn_, 7)->empty());
+  EXPECT_EQ(Changes(reader.txn_, 7), std::vector<std::string>{});
 }
 
 TEST_F(IndexKeyHistoryTest, BoundEncodingIsInclusivePrefixAndNullConservative) {
@@ -242,10 +243,12 @@ TEST_F(IndexKeyHistoryTest, PointRangesAvoidRedundantLookahead) {
     ranges.push_back({{Value(i * 13)}, {Value(i * 13)}});
     expected.emplace_back(Row({Value(i * 13), Value(i * 26)}));
   }
-  auto drain = [&](Executor executor) {
+  auto drain = [&](const Executor& executor) {
     std::vector<Row> rows;
     Row row;
-    while (executor->Next(&row, nullptr)) rows.push_back(row);
+    while (executor->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
     EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
     EXPECT_EQ(rows, expected);
   };

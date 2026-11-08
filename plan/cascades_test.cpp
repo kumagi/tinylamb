@@ -909,17 +909,15 @@ TEST(CascadesTest, BushyBipartitionsAppearWithAndWithoutEnumeration) {
          {relations[i], relations[i + 1]}});
   }
   const auto saw_bushy_split = [](const Memo& memo, GroupId root) {
-    for (const LogicalExpression& expression : memo.Get(root).expressions) {
-      if (expression.operation != LogicalOperator::kJoin ||
-          expression.children.size() != 2) {
-        continue;
-      }
-      if (memo.Get(expression.children[0]).relations.size() >= 2 &&
-          memo.Get(expression.children[1]).relations.size() >= 2) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(
+        memo.Get(root).expressions, [&](const LogicalExpression& expression) {
+          if (expression.operation != LogicalOperator::kJoin ||
+              expression.children.size() != 2) {
+            return false;
+          }
+          return memo.Get(expression.children[0]).relations.size() >= 2 &&
+                 memo.Get(expression.children[1]).relations.size() >= 2;
+        });
   };
 
   // Act + Assert: the full rule set, where join_enumeration claims the group
@@ -937,7 +935,7 @@ TEST(CascadesTest, BushyBipartitionsAppearWithAndWithoutEnumeration) {
   const GroupId rotated_root = rotated.Build(relations, conjuncts);
   RuleSet rules = RuleSet::Default();
   ASSERT_TRUE(rules.Remove("join_enumeration"));
-  SearchEngine rotated_search(std::move(rotated), std::move(rules));
+  SearchEngine rotated_search(std::move(rotated), rules);
   rotated_search.Explore(rotated_root);
   EXPECT_TRUE(saw_bushy_split(rotated_search.GetMemo(), rotated_root));
 }
@@ -2806,10 +2804,14 @@ TEST(CascadesTest, LimitPrefixThroughUnorderedWindowFires) {
   // non-trivial: the window only materializes the kept prefix. The rendered
   // tree nests the window BETWEEN two limits; the untransformed shape keeps
   // the window above the single limit.
-  SearchEngine costing(all, RuleSet());
+  const RuleSet empty_rules;
+  SearchEngine costing(all, empty_rules);
   const std::optional<BestPlan> best = costing.Optimize(
       limit_group, PhysicalProperties{}, DefaultImplementationRules());
   ASSERT_TRUE(best.has_value());
+  if (!best.has_value()) {
+    return;
+  }
   ASSERT_TRUE(best->plan);
   std::ostringstream rendered;
   rendered << best->plan;

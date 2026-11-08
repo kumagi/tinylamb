@@ -738,7 +738,7 @@ TEST(FunctionCallTest, GenerateArrayStopsBeforeSteppingOutsideIntegerRange) {
     ASSERT_TRUE(result.HasValue()) << result.GetStatus();
     std::vector<Value> expected{arguments[0]};
     if (arguments[2] == Value(INT64_MIN)) {
-      expected.push_back(Value(INT64_MIN));
+      expected.emplace_back(INT64_MIN);
     }
     EXPECT_EQ(result.Value().ArrayElements(), expected);
   }

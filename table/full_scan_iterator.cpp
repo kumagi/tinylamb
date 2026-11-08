@@ -342,8 +342,9 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
     // version chain meanwhile, but cannot change these bytes before we drop
     // the latch. Re-pinning invalidates this verdict before any newer image
     // is read. A cached false verdict only keeps the ordinary MVCC resolver.
-    if (!physical_read_eligible_.has_value())
+    if (!physical_read_eligible_.has_value()) {
       physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
+    }
     const bool physical_read = *physical_read_eligible_;
     // A locking scan may release and re-pin this page while waiting for an
     // intent, so no body reference may survive across that wait.
@@ -930,7 +931,9 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
       }
       ++kept_cursor;
     }
-    if (batch->capture_positions) batch->positions.push_back(pos_);
+    if (batch->capture_positions) {
+      batch->positions.push_back(pos_);
+    }
     ++count;
     // Iterator contract: NextVisibleImage left pos_ on the decoded row;
     // advance past it (operator++'s movement without the Row decode).
@@ -1358,7 +1361,7 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
     }
 
     if (!blk->has_any_null && !batch->capture_positions) {
-      uint32_t match_rows[2048];
+      std::array<uint32_t, 2048> match_rows{};
       const size_t max_take = std::min<size_t>(max_rows - count, 2048);
       size_t n_match = 0;
       for (; lstable_row_cursor_ < blk->row_count && n_match < max_take;

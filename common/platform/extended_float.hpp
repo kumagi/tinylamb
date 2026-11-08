@@ -39,6 +39,8 @@ namespace tinylamb::platform {
 // significand, nearest-even, exactly like x87 at its default precision, so
 // results match x86-64 Linux bit for bit.
 class SoftExtended {
+  __extension__ using uint128_t = unsigned __int128;
+
  public:
   constexpr SoftExtended() = default;
   // Implicit, like the arithmetic conversions to long double it replaces.
@@ -158,8 +160,8 @@ class SoftExtended {
 
   // Rounds `value` (an unsigned 128-bit significand scaled by 2^exponent,
   // with `sticky` marking nonzero bits already shifted out) to 64 bits.
-  static SoftExtended Round(bool negative, unsigned __int128 value,
-                            int exponent, bool sticky) {
+  static SoftExtended Round(bool negative, uint128_t value, int exponent,
+                            bool sticky) {
     if (value == 0) return Special(Kind::kZero, negative);
     const auto hi = static_cast<uint64_t>(value >> 64);
     const auto lo = static_cast<uint64_t>(value);
@@ -170,11 +172,9 @@ class SoftExtended {
     if (shift <= 0) {
       mantissa = static_cast<uint64_t>(value) << (-shift);
     } else {
-      const unsigned __int128 dropped_mask =
-          (static_cast<unsigned __int128>(1) << shift) - 1;
-      const unsigned __int128 dropped = value & dropped_mask;
-      const unsigned __int128 half = static_cast<unsigned __int128>(1)
-                                     << (shift - 1);
+      const uint128_t dropped_mask = (static_cast<uint128_t>(1) << shift) - 1;
+      const uint128_t dropped = value & dropped_mask;
+      const uint128_t half = static_cast<uint128_t>(1) << (shift - 1);
       mantissa = static_cast<uint64_t>(value >> shift);
       const bool above_half = dropped > half || (dropped == half && sticky);
       const bool exactly_half = dropped == half && !sticky;
@@ -216,16 +216,16 @@ class SoftExtended {
     if (b.kind_ == Kind::kZero) return a;
     if (a.exponent_ < b.exponent_) std::swap(a, b);
     // Keep 63 guard bits below the larger operand's significand.
-    unsigned __int128 big = static_cast<unsigned __int128>(a.mantissa_) << 63;
-    unsigned __int128 small = static_cast<unsigned __int128>(b.mantissa_) << 63;
+    uint128_t big = static_cast<uint128_t>(a.mantissa_) << 63;
+    uint128_t small = static_cast<uint128_t>(b.mantissa_) << 63;
     const int64_t distance = int64_t{a.exponent_} - b.exponent_;
     bool sticky = false;
     if (distance >= 127) {
       sticky = true;
       small = 0;
     } else if (distance > 0) {
-      const unsigned __int128 lost =
-          small & ((static_cast<unsigned __int128>(1) << distance) - 1);
+      const uint128_t lost =
+          small & ((static_cast<uint128_t>(1) << distance) - 1);
       sticky = lost != 0;
       small >>= distance;
     }
@@ -235,7 +235,7 @@ class SoftExtended {
     }
     // Opposite signs: a sticky bit below `small` borrows one unit.
     if (big > small || (big == small && sticky)) {
-      unsigned __int128 diff = big - small;
+      uint128_t diff = big - small;
       if (sticky) {
         diff -= 1;  // exact value is diff - epsilon: round from below
       }
@@ -259,8 +259,7 @@ class SoftExtended {
     if (a.kind_ == Kind::kZero || b.kind_ == Kind::kZero) {
       return Special(Kind::kZero, negative);
     }
-    const unsigned __int128 product =
-        static_cast<unsigned __int128>(a.mantissa_) * b.mantissa_;
+    const uint128_t product = static_cast<uint128_t>(a.mantissa_) * b.mantissa_;
     return Round(negative, product, a.exponent_ + b.exponent_, false);
   }
 
@@ -279,14 +278,13 @@ class SoftExtended {
                                     : Special(Kind::kInf, negative);
     }
     if (a.kind_ == Kind::kZero) return Special(Kind::kZero, negative);
-    const unsigned __int128 numerator =
-        static_cast<unsigned __int128>(a.mantissa_) << 64;
-    unsigned __int128 quotient = numerator / b.mantissa_;
-    unsigned __int128 remainder = numerator % b.mantissa_;
+    const uint128_t numerator = static_cast<uint128_t>(a.mantissa_) << 64;
+    uint128_t quotient = numerator / b.mantissa_;
+    uint128_t remainder = numerator % b.mantissa_;
     int exponent = a.exponent_ - b.exponent_ - 64;
     // quotient has 64 or 65 bits; make sure one guard bit exists.
     if ((quotient >> 64) == 0) {
-      const unsigned __int128 twice = remainder << 1;
+      const uint128_t twice = remainder << 1;
       quotient <<= 1;
       if (twice >= b.mantissa_) {
         quotient |= 1;
@@ -375,7 +373,8 @@ inline SoftExtended Sqrt(SoftExtended x) {
   if (x.kind_ == SoftExtended::Kind::kInf) return x;
   // radicand = mantissa * 2^e with e even, scaled into [2^126, 2^128) so the
   // integer root carries exactly 64 significant bits.
-  unsigned __int128 radicand = static_cast<unsigned __int128>(x.mantissa_);
+  __extension__ using uint128_t = unsigned __int128;
+  uint128_t radicand = static_cast<uint128_t>(x.mantissa_);
   int exponent = x.exponent_;
   if ((exponent & 1) != 0) {
     radicand <<= 63;
@@ -385,9 +384,9 @@ inline SoftExtended Sqrt(SoftExtended x) {
     exponent -= 64;
   }
   // Integer square root by bit-wise restoration (result < 2^64).
-  unsigned __int128 root = 0;
-  unsigned __int128 rem = radicand;
-  unsigned __int128 bit = static_cast<unsigned __int128>(1) << 126;
+  uint128_t root = 0;
+  uint128_t rem = radicand;
+  uint128_t bit = static_cast<uint128_t>(1) << 126;
   while (bit > rem) bit >>= 2;
   while (bit != 0) {
     if (rem >= root + bit) {

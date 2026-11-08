@@ -11,9 +11,9 @@ documented SQL semantics; flipping one must not change results, only speed
 
 | Variable | Meaning |
 | --- | --- |
-| `TINYLAMB_PAGE_POOL_BYTES` | Buffer-pool byte budget override (default derives from machine memory; `tpch_benchmark` only pins its default when this is unset). |
+| `TINYLAMB_PAGE_POOL_BYTES` | Retired no-op compatibility variable (kept so existing benchmark scripts that export it do not break; `PagePool` has been replaced by in-memory `RowPage` blocks and LSM runs). |
 | `TINYLAMB_LOG_SEGMENT_BYTES` | WAL segment file size override. |
-| `TINYLAMB_CHECKPOINT_SECONDS` | Fuzzy-checkpoint interval override. |
+| `TINYLAMB_CHECKPOINT_SECONDS` | Retired no-op compatibility variable (periodic timer checkpoints were replaced by LSM compaction-driven persistence). |
 | `TINYLAMB_CHECKPOINT_FLUSH_MS` | Pacing for the checkpoint flush phase. |
 | `TINYLAMB_DISABLE_EOR_CHECKPOINT` | Skip the end-of-recovery checkpoint. |
 | `TINYLAMB_WAL_RETENTION_WARN_BYTES` | Warn once WAL volume exceeds this many bytes. |

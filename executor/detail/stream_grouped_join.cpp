@@ -57,23 +57,27 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     const std::vector<std::vector<slot_t>>& projections,
     const std::vector<Relation>& schemas, GroupedJoinFusionSpec* fusion) {
   const auto decline = [] { return std::optional<Relation>{}; };
-  if (!fusion || !fusion->eligible || statement.Sources().size() != 2 ||
-      outer || !ctes.empty() || fusion->group_keys.size() > 1 ||
-      fusion->aggregates.empty() ||
-      std::getenv("TINYLAMB_DISABLE_STREAM_GROUPED_JOIN"))
+  if ((fusion == nullptr) || !fusion->eligible ||
+      statement.Sources().size() != 2 || (outer != nullptr) || !ctes.empty() ||
+      fusion->group_keys.size() > 1 || fusion->aggregates.empty() ||
+      (std::getenv("TINYLAMB_DISABLE_STREAM_GROUPED_JOIN") != nullptr)) {
     return decline();
+  }
   for (size_t i = 0; i < 2; ++i) {
     const auto& source = statement.Sources()[i];
     if (source.query || source.unnest || source.sample || source.is_lateral ||
-        source.from_nested_join || !source.using_columns.empty())
+        source.from_nested_join || !source.using_columns.empty()) {
       return decline();
+    }
     if (i == 0 && source.join_type != JoinType::kInner &&
-        source.join_type != JoinType::kCross)
+        source.join_type != JoinType::kCross) {
       return decline();
+    }
     if (i == 1 && source.join_type != JoinType::kInner &&
         source.join_type != JoinType::kCross &&
-        source.join_type != JoinType::kLeft)
+        source.join_type != JoinType::kLeft) {
       return decline();
+    }
   }
   const bool is_left_join = statement.Sources()[1].join_type == JoinType::kLeft;
   if (is_left_join &&
@@ -89,8 +93,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     return decline();
   }
   if (!fusion->group_keys.empty() &&
-      fusion->group_keys[0]->Type() != TypeTag::kColumnValue)
+      fusion->group_keys[0]->Type() != TypeTag::kColumnValue) {
     return decline();
+  }
   std::array<std::shared_ptr<Table>, 2> tables;
   std::array<size_t, 2> estimates{};
   for (size_t i = 0; i < 2; ++i) {
@@ -101,7 +106,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                      context.GetStats(statement.Sources()[i].table));
     estimates[i] = stats->Rows();
   }
-  if (is_left_join && estimates[0] > 500000) return decline();
+  if (is_left_join && estimates[0] > 500000) {
+    return decline();
+  }
   const size_t probe =
       is_left_join ? 1 : (estimates[0] >= estimates[1] ? 0 : 1);
   const size_t build = 1 - probe;
@@ -115,22 +122,29 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   if (!fusion->group_keys.empty()) {
     group_column = build_schema.Offset(
         fusion->group_keys[0]->AsColumnValue().GetColumnName());
-    if (group_column < 0) return decline();
+    if (group_column < 0) {
+      return decline();
+    }
     const auto& group_type =
         build_schema.GetColumn(static_cast<size_t>(group_column));
     if (group_type.IsUnsigned() || (group_type.Type() != ValueType::kInt64 &&
-                                    group_type.Type() != ValueType::kDate))
+                                    group_type.Type() != ValueType::kDate)) {
       return decline();
+    }
     group_val_type = group_type.Type();
   }
   auto all_predicates = SplitConjuncts(statement.Sources()[1].join_condition);
   if (statement.WhereClause()) {
-    if (is_left_join) return decline();
+    if (is_left_join) {
+      return decline();
+    }
     for (Expression& wpred : SplitConjuncts(statement.WhereClause())) {
       all_predicates.push_back(std::move(wpred));
     }
   }
-  if (all_predicates.empty()) return decline();
+  if (all_predicates.empty()) {
+    return decline();
+  }
   std::vector<Expression> predicates;
   std::vector<Expression> probe_local_predicates;
   std::vector<Expression> build_local_predicates;
@@ -151,7 +165,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       predicates.push_back(pred);
     }
   }
-  if (predicates.size() != 1) return decline();
+  if (predicates.size() != 1) {
+    return decline();
+  }
   struct BuildIntFilter {
     slot_t build_col{0};
     BinaryOperation op{BinaryOperation::kEquals};
@@ -223,16 +239,22 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     }
     std::optional<BytecodeProgram> prog = BytecodeCompiler::CompileRowCached(
         pred, probe_schema, BytecodeCompiler::Context::kFilter);
-    if (!prog.has_value()) return decline();
+    if (!prog.has_value()) {
+      return decline();
+    }
     const ProgramShape shape = ClassifyProgram(*prog);
-    if (shape.like_column < 0) return decline();
+    if (shape.like_column < 0) {
+      return decline();
+    }
     const auto pcol = static_cast<slot_t>(shape.like_column);
     if (pcol >= probe_schema.ColumnCount() ||
         probe_schema.GetColumn(pcol).Type() != ValueType::kVarChar) {
       return decline();
     }
     const Value& pat_val = prog->Constants()[prog->Instructions()[1].operand];
-    if (pat_val.IsCaseInsensitive()) return decline();
+    if (pat_val.IsCaseInsensitive()) {
+      return decline();
+    }
     size_t vc_slot = 0;
     for (size_t c = 0; c < pcol; ++c) {
       if (probe_schema.GetColumn(c).Type() == ValueType::kVarChar) {
@@ -282,77 +304,98 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   };
   const auto keys = EqualityKeys(probe_schema, build_schema, predicates);
   if (keys.size() != 1 || keys[0].null_safe || keys[0].left_offset != 0 ||
-      keys[0].right_offset != 0 || !IsColumnEqualityPredicate(predicates[0]))
+      keys[0].right_offset != 0 || !IsColumnEqualityPredicate(predicates[0])) {
     return decline();
+  }
   const auto& equality = predicates[0]->AsBinaryExpression();
   const auto unambiguous_col = [&](const ColumnName& col) {
-    if (!col.schema.empty()) return true;
+    if (!col.schema.empty()) {
+      return true;
+    }
     return (probe_schema.Offset(col) >= 0) != (build_schema.Offset(col) >= 0);
   };
   if (!unambiguous_col(equality.Left()->AsColumnValue().GetColumnName()) ||
-      !unambiguous_col(equality.Right()->AsColumnValue().GetColumnName()))
+      !unambiguous_col(equality.Right()->AsColumnValue().GetColumnName())) {
     return decline();
+  }
   const auto signed_int = [](const Column& column) {
     return column.Type() == ValueType::kInt64 && !column.IsUnsigned();
   };
   if (!signed_int(probe_schema.GetColumn(keys[0].left)) ||
-      !signed_int(build_schema.GetColumn(keys[0].right)))
+      !signed_int(build_schema.GetColumn(keys[0].right))) {
     return decline();
+  }
   // Fixed-width batches have a strict, reservable upper bound.
   for (size_t c = 0; c < probe_schema.ColumnCount(); ++c) {
     const auto type = probe_schema.GetColumn(c).Type();
     if (type != ValueType::kInt64 && type != ValueType::kDate &&
         type != ValueType::kDouble &&
-        !(type == ValueType::kVarChar && !probe_like_filters.empty()))
+        (type != ValueType::kVarChar || probe_like_filters.empty())) {
       return decline();
+    }
   }
   std::vector<int> arguments;
   for (const auto* aggregate : fusion->aggregates) {
     const auto type = aggregate->GetType();
     if ((type != AggregationType::kCount && type != AggregationType::kSum) ||
         aggregate->Distinct() || aggregate->HasWhereFilter() ||
-        aggregate->NeedsGroupContext())
+        aggregate->NeedsGroupContext()) {
       return decline();
-    if (is_left_join && type != AggregationType::kCount) return decline();
+    }
+    if (is_left_join && type != AggregationType::kCount) {
+      return decline();
+    }
     if (fusion->count_star[arguments.size()]) {
-      if (is_left_join) return decline();
+      if (is_left_join) {
+        return decline();
+      }
       arguments.push_back(-1);
       continue;
     }
     if (!aggregate->Child() ||
-        aggregate->Child()->Type() != TypeTag::kColumnValue)
+        aggregate->Child()->Type() != TypeTag::kColumnValue) {
       return decline();
+    }
     const int offset =
         joined.Offset(aggregate->Child()->AsColumnValue().GetColumnName());
     if (offset < 0 ||
-        !signed_int(joined.GetColumn(static_cast<size_t>(offset))))
+        !signed_int(joined.GetColumn(static_cast<size_t>(offset)))) {
       return decline();
+    }
     if (is_left_join &&
-        static_cast<size_t>(offset) >= probe_schema.ColumnCount())
+        std::cmp_greater_equal(offset, probe_schema.ColumnCount())) {
       return decline();
+    }
     arguments.push_back(offset);
   }
   // Outside an aggregate, only the grouping column may read a base cell.
   const auto safe_emit = [&](const auto& self,
                              const Expression& expression) -> bool {
-    if (!expression) return false;
+    if (!expression) {
+      return false;
+    }
     if (expression->Type() == TypeTag::kAggregateExp ||
-        expression->Type() == TypeTag::kConstantValue)
+        expression->Type() == TypeTag::kConstantValue) {
       return true;
+    }
     if (expression->Type() == TypeTag::kColumnValue) {
       return group_column >= 0 &&
              joined.Offset(expression->AsColumnValue().GetColumnName()) ==
                  static_cast<int>(probe_schema.ColumnCount()) + group_column;
     }
     if (expression->Type() != TypeTag::kBinaryExp &&
-        expression->Type() != TypeTag::kUnaryExp)
+        expression->Type() != TypeTag::kUnaryExp) {
       return false;
+    }
     return std::ranges::all_of(
         ExpressionChildren(expression),
         [&](const Expression& child) { return self(self, child); });
   };
-  for (const auto& expression : fusion->select_items)
-    if (!safe_emit(safe_emit, expression)) return decline();
+  for (const auto& expression : fusion->select_items) {
+    if (!safe_emit(safe_emit, expression)) {
+      return decline();
+    }
+  }
 
   ASSIGN_OR_RETURN(TableLease, lease,
                    tables[probe]->AcquireLease(context.txn_.ID()));
@@ -369,11 +412,11 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                       (column.Type() == ValueType::kInt64 ||
                        column.Type() == ValueType::kDate);
   }
-  constexpr size_t kDimensionBytes = 8 * 1024 * 1024;
+  constexpr size_t kDimensionBytes = size_t{8} * 1024 * 1024;
   auto dimension_charge =
-      typed_dimension
-          ? TryReserveQueryMemory(kDimensionBytes + 1024 * dimension_stride * 9)
-          : decltype(TryReserveQueryMemory(0)){};
+      typed_dimension ? TryReserveQueryMemory(kDimensionBytes +
+                                              (1024 * dimension_stride * 9))
+                      : decltype(TryReserveQueryMemory(0)){};
   typed_dimension = typed_dimension && dimension_charge;
   bool build_is_identity_1_to_n = false;
   size_t identity_dimension_rows = 0;
@@ -429,7 +472,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       for (;;) {
         const size_t rows = iterator.DecodeNextTypedBatch(&batch, 1024);
         iterator.DropPageLatch();
-        if (rows == 0) break;
+        if (rows == 0) {
+          break;
+        }
         const size_t cells = rows * dimension_stride;
         if (dimension_cells.size() + cells > kDimensionBytes / 9) {
           typed_dimension = false;
@@ -460,7 +505,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               break;
             }
           }
-          if (!ok) continue;
+          if (!ok) {
+            continue;
+          }
           if (out_r != r) {
             const size_t dst = out_r * dimension_stride;
             for (size_t c = 0; c < dimension_stride; ++c) {
@@ -500,7 +547,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     dimension = std::move(loaded);
     RETURN_IF_FAIL(dimension.FinishSpill());
     RETURN_IF_FAIL(dimension.GetStatus());
-    if (dimension.HasSpill()) return decline();
+    if (dimension.HasSpill()) {
+      return decline();
+    }
   }
   const size_t dimension_rows =
       build_is_identity_1_to_n
@@ -513,21 +562,26 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   };
   const auto dimension_cell = [&](size_t row, size_t column) -> IntegerCell {
     if (build_is_identity_1_to_n) {
-      return {static_cast<int64_t>(row + 1), false};
+      return {.value = static_cast<int64_t>(row + 1), .null = false};
     }
     if (typed_dimension) {
-      const size_t cell = row * dimension_stride + column;
-      return {dimension_cells[cell], dimension_nulls[cell] != 0};
+      const size_t cell = (row * dimension_stride) + column;
+      return {.value = dimension_cells[cell],
+              .null = dimension_nulls[cell] != 0};
     }
     const Value& cell = dimension.rows[row][column];
-    return {cell.IsNull() ? 0 : cell.value.int_value, cell.IsNull()};
+    return {.value = cell.IsNull() ? 0 : cell.value.int_value,
+            .null = cell.IsNull()};
   };
-  size_t index_bytes;
+  size_t index_bytes = 0;
   if (__builtin_mul_overflow(dimension_rows, size_t{128}, &index_bytes) ||
-      __builtin_add_overflow(index_bytes, size_t{65536}, &index_bytes))
+      __builtin_add_overflow(index_bytes, size_t{65536}, &index_bytes)) {
     return decline();
+  }
   auto index_charge = TryReserveQueryMemory(index_bytes);
-  if (!index_charge) return decline();
+  if (!index_charge) {
+    return decline();
+  }
   FlatJoinBuckets<int64_t> buckets;
   // Validate build-only nonnegative folds while forming groups and the
   // actual key domain; those three consumers need just one row pass.
@@ -535,9 +589,11 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   std::optional<size_t> count_probe_col;
   std::vector<size_t> sum_columns;
   for (size_t a = 0; a < arguments.size(); ++a) {
-    if (arguments[a] < 0) continue;
-    if (static_cast<size_t>(arguments[a]) < probe_schema.ColumnCount()) {
-      const size_t pcol = static_cast<size_t>(arguments[a]);
+    if (arguments[a] < 0) {
+      continue;
+    }
+    if (std::cmp_less(arguments[a], probe_schema.ColumnCount())) {
+      const auto pcol = static_cast<size_t>(arguments[a]);
       if (is_left_join &&
           fusion->aggregates[a]->GetType() == AggregationType::kCount &&
           (!count_probe_col.has_value() || *count_probe_col == pcol)) {
@@ -547,9 +603,10 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       frequency_fold = false;
       continue;
     }
-    if (fusion->aggregates[a]->GetType() == AggregationType::kSum)
+    if (fusion->aggregates[a]->GetType() == AggregationType::kSum) {
       sum_columns.push_back(static_cast<size_t>(arguments[a]) -
                             probe_schema.ColumnCount());
+    }
   }
   if ((is_left_join || !probe_like_filters.empty() ||
        !probe_int_filters.empty()) &&
@@ -558,7 +615,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   }
   std::optional<int64_t> minimum, maximum;
   bool identity_pk_groups =
-      group_column >= 0 && static_cast<size_t>(group_column) == keys[0].right &&
+      group_column >= 0 && std::cmp_equal(group_column, keys[0].right) &&
       (build_is_identity_1_to_n ||
        build_schema.GetColumn(keys[0].right).GetConstraint().ctype ==
            Constraint::kPrimaryKey);
@@ -570,7 +627,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       for (size_t i = 0; i < dimension_rows; ++i) {
         const auto join_key = dimension_cell(i, keys[0].right);
         if (join_key.null) {
-          if (is_left_join) return decline();
+          if (is_left_join) {
+            return decline();
+          }
           identity_pk_groups = false;
           minimum.reset();
           maximum.reset();
@@ -598,7 +657,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     row_groups.assign(dimension_rows, 0);
     for (size_t i = 0; i < dimension_rows; ++i) {
       const auto join_key = dimension_cell(i, keys[0].right);
-      if (join_key.null) continue;
+      if (join_key.null) {
+        continue;
+      }
       minimum = minimum ? std::min(*minimum, join_key.value) : join_key.value;
       maximum = maximum ? std::max(*maximum, join_key.value) : join_key.value;
       if (frequency_fold) {
@@ -618,12 +679,14 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     for (size_t i = 0; i < dimension_rows; ++i) {
       const auto join_key = dimension_cell(i, keys[0].right);
       if (join_key.null) {
-        if (is_left_join) return decline();
+        if (is_left_join) {
+          return decline();
+        }
         continue;
       }
       minimum = minimum ? std::min(*minimum, join_key.value) : join_key.value;
       maximum = maximum ? std::max(*maximum, join_key.value) : join_key.value;
-      if (frequency_fold)
+      if (frequency_fold) {
         for (size_t column : sum_columns) {
           const auto cell = dimension_cell(i, column);
           if (!cell.null && cell.value < 0) {
@@ -631,6 +694,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
             break;
           }
         }
+      }
       const auto key = dimension_cell(i, static_cast<size_t>(group_column));
       if (key.null) {
         if (!null_group) {
@@ -639,7 +703,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
         }
         row_groups[i] = *null_group;
       } else {
-        bool inserted;
+        bool inserted = false;
         size_t* entry = group_map.TryEmplace(key.value, &inserted);
         if (inserted) {
           *entry = groups.size();
@@ -656,14 +720,14 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                        : (identity_pk_groups ? dimension_rows : groups.size());
   const auto group_key_value = [&](size_t g) -> Value {
     if (group_column < 0) {
-      return Value();
+      return {};
     }
     if (!groups.empty()) {
       return groups[g];
     }
     const auto cell = dimension_cell(g, static_cast<size_t>(group_column));
     if (cell.null) {
-      return Value();
+      return {};
     }
     Value v(cell.value);
     v.type = group_val_type;
@@ -691,11 +755,13 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                                 probe_int_filters.empty() &&
                                 !count_probe_col.has_value();
   std::shared_ptr<const Table::IntegerKeyCounts> key_counts;
-  auto counts_charge = allow_key_counts ? TryReserveQueryMemory(1024 * 1024)
-                                        : decltype(TryReserveQueryMemory(0)){};
-  if (counts_charge)
+  auto counts_charge = allow_key_counts
+                           ? TryReserveQueryMemory(size_t{1024} * 1024)
+                           : decltype(TryReserveQueryMemory(0)){};
+  if (counts_charge) {
     key_counts = tables[probe]->FindCachedIntegerKeyCounts(
         context.txn_, projections[probe][keys[0].left], dense_min, domain_span);
+  }
   // An exact fact histogram can be folded once for each dimension row,
   // including duplicates. Only the ordinary scan needs a unique key->row map.
   const bool identity_dense_rows =
@@ -705,7 +771,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     dense_rows.assign(domain_span, kNoDenseRow);
     for (size_t i = 0; i < dimension_rows; ++i) {
       const auto key = dimension_cell(i, keys[0].right);
-      if (key.null) continue;
+      if (key.null) {
+        continue;
+      }
       const size_t slot =
           static_cast<uint64_t>(key.value) - static_cast<uint64_t>(dense_min);
       if (dense_rows[slot] != kNoDenseRow) {
@@ -767,20 +835,26 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       for (size_t c = 0; c < dimension_stride; ++c) {
         const auto cell = dimension_cell(i, c);
         Value value = cell.null ? Value() : Value(cell.value);
-        if (!cell.null) value.type = build_schema.GetColumn(c).Type();
+        if (!cell.null) {
+          value.type = build_schema.GetColumn(c).Type();
+        }
         row.values_.push_back(std::move(value));
       }
       dimension.AddRow(std::move(row));
     }
     RETURN_IF_FAIL(dimension.FinishSpill());
     RETURN_IF_FAIL(dimension.GetStatus());
-    if (dimension.HasSpill()) return decline();
+    if (dimension.HasSpill()) {
+      return decline();
+    }
   }
   if (!has_dense_rows && !key_counts) {
     buckets.reserve(dimension_rows);
-    for (const Row& row : dimension.rows)
-      if (!row[keys[0].right].IsNull())
+    for (const Row& row : dimension.rows) {
+      if (!row[keys[0].right].IsNull()) {
         buckets.emplace(row[keys[0].right].value.int_value, &row);
+      }
+    }
   }
   std::vector<size_t> dense_groups;
   std::vector<uint8_t> dense_match_mask;
@@ -846,7 +920,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       identity_pk_groups && frequency_fold && direct_emit && width == 1 &&
       fusion->aggregates[0]->GetType() == AggregationType::kCount &&
       (arguments[0] < 0 ||
-       static_cast<size_t>(arguments[0]) < probe_schema.ColumnCount());
+       std::cmp_less(arguments[0], probe_schema.ColumnCount()));
   // Frequency folding is order-independent and accumulates into a shared
   // atomic frequency table, then folds once into a single partial table.
   // Only the general signed fold needs a table per ordered morsel.
@@ -855,32 +929,39 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   if (!direct_freq_count_emit) {
     if (__builtin_mul_overflow(total_groups, width, &per_morsel) ||
         __builtin_mul_overflow(partial_slots, per_morsel, &partial_count) ||
-        __builtin_mul_overflow(partial_count, sizeof(Partial), &partial_bytes))
+        __builtin_mul_overflow(partial_count, sizeof(Partial),
+                               &partial_bytes)) {
       return decline();
+    }
   }
-  size_t scan_bytes, bytes;
+  size_t scan_bytes = 0, bytes = 0;
   if (__builtin_mul_overflow(workers * 1024 * 9, probe_schema.ColumnCount(),
                              &scan_bytes) ||
-      __builtin_add_overflow(partial_bytes, scan_bytes, &bytes))
+      __builtin_add_overflow(partial_bytes, scan_bytes, &bytes)) {
     return decline();
+  }
   if (frequency_fold) {
-    size_t frequency_bytes;
+    size_t frequency_bytes = 0;
     const size_t freq_per_row =
         (probe_lstable_store != nullptr && dimension_rows <= 500000)
             ? (workers * sizeof(uint32_t))
             : sizeof(uint64_t);
     if (__builtin_mul_overflow(dimension_rows, freq_per_row,
                                &frequency_bytes) ||
-        __builtin_add_overflow(bytes, frequency_bytes, &bytes))
+        __builtin_add_overflow(bytes, frequency_bytes, &bytes)) {
       return decline();
+    }
   }
   auto partial_charge = TryReserveQueryMemory(bytes);
-  if (!partial_charge) return decline();
+  if (!partial_charge) {
+    return decline();
+  }
   if (!key_counts && probe_lstable_store == nullptr && frequency_fold &&
-      counts_charge && !morsels.empty())
+      counts_charge && !morsels.empty()) {
     key_counts = tables[probe]->TryReadIntegerKeyCounts(
         context.txn_, morsels, projections[probe][keys[0].left], dense_min,
         domain_span);
+  }
   if (probe_lstable_store == nullptr &&
       (context.txn_.IsReadOnly() || context.txn_.WriteSetEmpty()) &&
       frequency_fold && !key_counts && has_dense_rows) {
@@ -899,7 +980,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               break;
             }
           }
-          if (!valid) break;
+          if (!valid) {
+            break;
+          }
         }
       }
       if (valid) {
@@ -958,7 +1041,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       }
       while (!failed.load()) {
         const size_t m = next.fetch_add(1);
-        if (m >= morsels.size()) break;
+        if (m >= morsels.size()) {
+          break;
+        }
         if (probe_lstable_store != nullptr) {
           const bool direct_block_index =
               !context.txn_.HasAnyPageVersionChains() &&
@@ -968,15 +1053,17 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               direct_block_index
                   ? std::min<size_t>(lstable_blocks_per_morsel,
                                      probe_lstable_store->blocks.size() -
-                                         m * lstable_blocks_per_morsel)
+                                         (m * lstable_blocks_per_morsel))
                   : morsels[m].size();
           for (size_t bi = 0; bi < block_count; ++bi) {
             const LSTablePageBlock* blk =
                 direct_block_index
                     ? &probe_lstable_store
-                           ->blocks[m * lstable_blocks_per_morsel + bi]
+                           ->blocks[(m * lstable_blocks_per_morsel) + bi]
                     : probe_lstable_store->FindBlock(morsels[m][bi]);
-            if (blk == nullptr || blk->row_count == 0) continue;
+            if (blk == nullptr || blk->row_count == 0) {
+              continue;
+            }
             visible[m] += blk->row_count;
             const LSTableColumnBlock& kcol = blk->columns[full_probe_key_col];
             if (!frequency_fold) {
@@ -984,8 +1071,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               if (!blk->has_any_null && total_groups == 1 &&
                   !dense_match_mask.empty() && width == 2 && arguments[0] < 0 &&
                   arguments[1] >= 0 &&
-                  static_cast<size_t>(arguments[1]) <
-                      probe_schema.ColumnCount() &&
+                  std::cmp_less(arguments[1], probe_schema.ColumnCount()) &&
                   fusion->aggregates[1]->GetType() == AggregationType::kSum) {
                 const slot_t full_val_col =
                     projections[probe][static_cast<size_t>(arguments[1])];
@@ -1017,8 +1103,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                 }
               }
               if (!blk->has_any_null && width == 1 && arguments[0] >= 0 &&
-                  static_cast<size_t>(arguments[0]) <
-                      probe_schema.ColumnCount() &&
+                  std::cmp_less(arguments[0], probe_schema.ColumnCount()) &&
                   fusion->aggregates[0]->GetType() == AggregationType::kSum) {
                 const slot_t full_val_col =
                     projections[probe][static_cast<size_t>(arguments[0])];
@@ -1034,9 +1119,13 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                   for (uint32_t r = 0; r < nrows; ++r) {
                     const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
                                             static_cast<uint64_t>(dense_min);
-                    if (offset >= dsize) continue;
+                    if (offset >= dsize) {
+                      continue;
+                    }
                     const size_t g = dgroups[offset];
-                    if (g == kNoDenseRow) continue;
+                    if (g == kNoDenseRow) {
+                      continue;
+                    }
                     ++blk_matched;
                     Partial& partial = morsel_partials[g];
                     ++partial.pairs;
@@ -1052,18 +1141,23 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                 }
               }
               for (uint32_t r = 0; r < blk->row_count; ++r) {
-                if (kcol.IsNull(r)) continue;
+                if (kcol.IsNull(r)) {
+                  continue;
+                }
                 const int64_t key = kcol.int_cells[r];
                 const uint64_t offset = static_cast<uint64_t>(key) -
                                         static_cast<uint64_t>(dense_min);
                 size_t target_row = 0;
                 if (identity_dense_rows) {
-                  if (offset >= dimension_rows) continue;
+                  if (offset >= dimension_rows) {
+                    continue;
+                  }
                   target_row = static_cast<size_t>(offset);
                 } else {
                   if (offset >= dense_rows.size() ||
-                      dense_rows[offset] == kNoDenseRow)
+                      dense_rows[offset] == kNoDenseRow) {
                     continue;
+                  }
                   target_row = dense_rows[offset];
                 }
                 ++comparisons[m];
@@ -1071,22 +1165,26 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                     identity_pk_groups ? target_row : row_groups[target_row];
                 ++morsel_partials[g * width].pairs;
                 for (size_t a = 0; a < width; ++a) {
-                  Partial& partial = morsel_partials[g * width + a];
+                  Partial& partial = morsel_partials[(g * width) + a];
                   if (arguments[a] < 0) {
                     ++partial.count;
                     continue;
                   }
-                  const size_t column = static_cast<size_t>(arguments[a]);
+                  const auto column = static_cast<size_t>(arguments[a]);
                   int64_t value = 0;
                   if (column < probe_schema.ColumnCount()) {
                     const LSTableColumnBlock& acol =
                         blk->columns[projections[probe][column]];
-                    if (acol.IsNull(r)) continue;
+                    if (acol.IsNull(r)) {
+                      continue;
+                    }
                     value = acol.int_cells[r];
                   } else {
                     const auto cell = dimension_cell(
                         target_row, column - probe_schema.ColumnCount());
-                    if (cell.null) continue;
+                    if (cell.null) {
+                      continue;
+                    }
                     value = cell.value;
                   }
                   ++partial.count;
@@ -1122,9 +1220,13 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                 }
                 const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
                                         static_cast<uint64_t>(dense_min);
-                if (offset >= dsize) continue;
+                if (offset >= dsize) {
+                  continue;
+                }
                 const size_t target_row = drows[offset];
-                if (target_row == kNoDenseRow) continue;
+                if (target_row == kNoDenseRow) {
+                  continue;
+                }
                 ++local_freq[target_row];
                 ++blk_matched;
               }
@@ -1132,23 +1234,29 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               continue;
             }
             for (uint32_t r = 0; r < blk->row_count; ++r) {
-              if (kcol.IsNull(r)) continue;
+              if (kcol.IsNull(r)) {
+                continue;
+              }
               const int64_t key = kcol.int_cells[r];
               const uint64_t offset =
                   static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min);
               size_t target_row = 0;
               if (identity_dense_rows) {
-                if (offset >= dimension_rows) continue;
+                if (offset >= dimension_rows) {
+                  continue;
+                }
                 target_row = static_cast<size_t>(offset);
               } else {
                 if (offset >= dense_rows.size() ||
-                    dense_rows[offset] == kNoDenseRow)
+                    dense_rows[offset] == kNoDenseRow) {
                   continue;
+                }
                 target_row = dense_rows[offset];
               }
               if (full_count_probe_col.has_value() &&
-                  blk->columns[*full_count_probe_col].IsNull(r))
+                  blk->columns[*full_count_probe_col].IsNull(r)) {
                 continue;
+              }
               if (!probe_int_filters.empty()) {
                 bool filter_ok = true;
                 for (const ProbeIntFilter& iflt : probe_int_filters) {
@@ -1160,7 +1268,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                     break;
                   }
                 }
-                if (!filter_ok) continue;
+                if (!filter_ok) {
+                  continue;
+                }
               }
               if (!probe_like_filters.empty()) {
                 bool filter_ok = true;
@@ -1171,12 +1281,14 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                     break;
                   }
                   const bool matched = match_probe_like(pcol.VarcharAt(r), lf);
-                  if ((lf.negated ? !matched : matched) == false) {
+                  if (lf.negated ? matched : !matched) {
                     filter_ok = false;
                     break;
                   }
                 }
-                if (!filter_ok) continue;
+                if (!filter_ok) {
+                  continue;
+                }
               }
               if (local_freq != nullptr) {
                 ++local_freq[target_row];
@@ -1197,14 +1309,19 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
         while (!failed.load()) {
           const size_t rows = iterator.DecodeNextTypedBatch(&batch, 1024);
           iterator.DropPageLatch();
-          if (rows == 0) break;
+          if (rows == 0) {
+            break;
+          }
           visible[m] += rows;
           for (size_t r = 0; r < rows; ++r) {
             const size_t base = r * batch.stride;
-            if (batch.nulls[base + keys[0].left]) continue;
-            if (count_probe_col.has_value() &&
-                batch.nulls[base + *count_probe_col])
+            if (batch.nulls[base + keys[0].left]) {
               continue;
+            }
+            if (count_probe_col.has_value() &&
+                batch.nulls[base + *count_probe_col]) {
+              continue;
+            }
             if (!probe_int_filters.empty()) {
               bool filter_ok = true;
               for (const ProbeIntFilter& iflt : probe_int_filters) {
@@ -1215,7 +1332,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                   break;
                 }
               }
-              if (!filter_ok) continue;
+              if (!filter_ok) {
+                continue;
+              }
             }
             if (!probe_like_filters.empty()) {
               bool filter_ok = true;
@@ -1226,35 +1345,41 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                 }
                 const bool matched =
                     match_probe_like(batch.Varchar(r, lf.varchar_slot), lf);
-                if ((lf.negated ? !matched : matched) == false) {
+                if (lf.negated ? matched : !matched) {
                   filter_ok = false;
                   break;
                 }
               }
-              if (!filter_ok) continue;
+              if (!filter_ok) {
+                continue;
+              }
             }
             const int64_t key = batch.cells[base + keys[0].left];
             const auto accumulate = [&](const Row& build_row) {
               ++comparisons[m];
-              const size_t row_idx =
+              const auto row_idx =
                   static_cast<size_t>(&build_row - dimension.rows.data());
               const size_t g =
                   identity_pk_groups ? row_idx : row_groups[row_idx];
-              ++partials[m * per_morsel + g * width].pairs;
+              ++partials[(m * per_morsel) + (g * width)].pairs;
               for (size_t a = 0; a < width; ++a) {
-                Partial& partial = partials[m * per_morsel + g * width + a];
+                Partial& partial = partials[(m * per_morsel) + (g * width) + a];
                 if (arguments[a] < 0) {
                   ++partial.count;
                   continue;
                 }
-                const size_t column = static_cast<size_t>(arguments[a]);
-                int64_t value;
+                const auto column = static_cast<size_t>(arguments[a]);
+                int64_t value = 0;
                 if (column < batch.stride) {
-                  if (batch.nulls[base + column]) continue;
+                  if (batch.nulls[base + column]) {
+                    continue;
+                  }
                   value = batch.cells[base + column];
                 } else {
                   const Value& cell = build_row[column - batch.stride];
-                  if (cell.IsNull()) continue;
+                  if (cell.IsNull()) {
+                    continue;
+                  }
                   value = cell.value.int_value;
                 }
                 ++partial.count;
@@ -1269,8 +1394,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               const uint64_t offset =
                   static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min);
               if (offset >= dense_rows.size() ||
-                  dense_rows[offset] == kNoDenseRow)
+                  dense_rows[offset] == kNoDenseRow) {
                 continue;
+              }
               const size_t index = dense_rows[offset];
               if (frequency_fold) {
                 std::atomic_ref<uint64_t>(shared_frequencies[index])
@@ -1281,16 +1407,18 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
               }
             } else {
               const auto [first, last] = buckets.equal_range(key);
-              for (auto found = first; found != last; ++found)
+              for (auto found = first; found != last; ++found) {
                 accumulate(*found->second);
+              }
             }
           }
         }
-        if (!iterator.GetStatus().ok())
+        if (!iterator.GetStatus().ok()) {
           fail(iterator.GetStatus());
-        else if (iterator.IsValid() && !failed.load())
+        } else if (iterator.IsValid() && !failed.load()) {
           fail(StatusError(StatusCode::kRuntimeError,
                            "typed join scan stopped before exhaustion"));
+        }
       }
     } catch (const std::exception& exception) {
       fail(StatusError(StatusCode::kRuntimeError, exception.what()));
@@ -1301,8 +1429,11 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   const auto started = std::chrono::steady_clock::now();
   std::vector<std::jthread> threads;
   try {
-    if (!key_counts)
-      for (size_t w = 1; w < workers; ++w) threads.emplace_back(run, w);
+    if (!key_counts) {
+      for (size_t w = 1; w < workers; ++w) {
+        threads.emplace_back(run, w);
+      }
+    }
     run(0);
   } catch (const std::exception& exception) {
     fail(StatusError(StatusCode::kRuntimeError, exception.what()));
@@ -1312,7 +1443,9 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   const auto total_freq_of = [&](size_t i) -> uint64_t {
     if (key_counts) {
       const auto key = dimension_cell(i, keys[0].right);
-      if (key.null) return 0;
+      if (key.null) {
+        return 0;
+      }
       const size_t offset =
           static_cast<uint64_t>(key.value) - static_cast<uint64_t>(dense_min);
       return key_counts->counts[offset];
@@ -1333,8 +1466,10 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
   };
   Relation result(context.execution_runtime());
   std::vector<Column> output_columns;
-  for (const std::string& name : fusion->select_names)
+  output_columns.reserve(fusion->select_names.size());
+  for (const std::string& name : fusion->select_names) {
     output_columns.emplace_back(name, ValueType::kNull);
+  }
   result.rows.reserve(total_groups);
   if (direct_freq_count_emit && fusion->rollup_count_distribution &&
       fusion->rollup_select_names.size() == 2) {
@@ -1345,9 +1480,12 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       if (key_counts) {
         comparisons[0] += count;
       }
-      if (!is_left_join && count == 0) continue;
-      if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      if (!is_left_join && count == 0) {
+        continue;
+      }
+      if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return StatusError(StatusCode::kIsInfinity, "integer count overflow");
+      }
       bool inserted = false;
       int64_t* slot =
           dist_map.TryEmplace(static_cast<int64_t>(count), &inserted);
@@ -1382,9 +1520,12 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       if (key_counts) {
         comparisons[0] += count;
       }
-      if (!is_left_join && count == 0) continue;
-      if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      if (!is_left_join && count == 0) {
+        continue;
+      }
+      if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return StatusError(StatusCode::kIsInfinity, "integer count overflow");
+      }
       Row output;
       output.values_.resize(n_select);
       const Value cnt_val(static_cast<int64_t>(count));
@@ -1405,19 +1546,23 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
         if (is_left_join) {
           partials[g * width].pairs = 1;
         }
-        if (count == 0) continue;
+        if (count == 0) {
+          continue;
+        }
         partials[g * width].pairs += count;
         for (size_t a = 0; a < width; ++a) {
-          Partial& partial = partials[g * width + a];
+          Partial& partial = partials[(g * width) + a];
           if (arguments[a] < 0 ||
-              static_cast<size_t>(arguments[a]) < probe_schema.ColumnCount()) {
+              std::cmp_less(arguments[a], probe_schema.ColumnCount())) {
             partial.count += count;
             continue;
           }
           const auto cell =
               dimension_cell(i, static_cast<size_t>(arguments[a]) -
                                     probe_schema.ColumnCount());
-          if (cell.null) continue;
+          if (cell.null) {
+            continue;
+          }
           partial.count += count;
           if (fusion->aggregates[a]->GetType() == AggregationType::kSum) {
             partial.sum += static_cast<__int128_t>(cell.value) * count;
@@ -1429,23 +1574,29 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     std::vector<Value> finished_aggs(width);
     for (size_t g = 0; g < total_groups; ++g) {
       bool has_pairs = is_left_join || group_column < 0;
-      for (size_t m = 0; m < partial_slots && !has_pairs; ++m)
-        has_pairs = partials[m * per_morsel + g * width].pairs != 0;
-      if (!has_pairs) continue;
+      for (size_t m = 0; m < partial_slots && !has_pairs; ++m) {
+        has_pairs = partials[(m * per_morsel) + (g * width)].pairs != 0;
+      }
+      if (!has_pairs) {
+        continue;
+      }
       for (size_t a = 0; a < width; ++a) {
         __int128_t sum = 0;
         uint64_t count = 0;
         for (size_t m = 0; m < partial_slots; ++m) {
-          const Partial& partial = partials[m * per_morsel + g * width + a];
+          const Partial& partial = partials[(m * per_morsel) + (g * width) + a];
           if (sum + partial.low < std::numeric_limits<int64_t>::min() ||
-              sum + partial.high > std::numeric_limits<int64_t>::max())
+              sum + partial.high > std::numeric_limits<int64_t>::max()) {
             return StatusError(StatusCode::kIsInfinity,
                                "integer overflow on '+'");
+          }
           sum += partial.sum;
           count += partial.count;
         }
-        if (count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        if (count >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
           return StatusError(StatusCode::kIsInfinity, "integer count overflow");
+        }
         finished_aggs[a] =
             fusion->aggregates[a]->GetType() == AggregationType::kCount
                 ? Value(static_cast<int64_t>(count))
@@ -1486,19 +1637,24 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       result.AddRow(std::move(output));
     }
   }
-  if (!result.rows.empty())
+  if (!result.rows.empty()) {
     for (size_t i = 0; i < output_columns.size(); ++i) {
       output_columns[i] =
           Column(output_columns[i].Name(), ValueTypeOf(result.rows[0][i]));
     }
+  }
   result.schema = Schema("", std::move(output_columns));
   result.hash_joins = result.in_memory_hash_joins = 1;
-  for (size_t count : comparisons) result.join_comparisons += count;
+  for (size_t count : comparisons) {
+    result.join_comparisons += count;
+  }
   if (auto* runtime = context.execution_runtime()) {
     runtime->join_ms += ElapsedMs(started);
     ++runtime->grouped_join_fusions;
     ++runtime->streamed_grouped_joins;
-    for (size_t count : visible) runtime->scan_rows += count;
+    for (size_t count : visible) {
+      runtime->scan_rows += count;
+    }
     runtime->scan_output_rows += result.join_comparisons;
   }
   fusion->fired = true;

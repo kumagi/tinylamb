@@ -741,7 +741,7 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
     auto old = tm_->Begin(true);
     std::vector<RowPosition> rows;
     for (int i = 0; i < 3; ++i) {
-      const RowPosition position(1000 + burst * 10 + i, 0);
+      const RowPosition position(1000 + (burst * 10) + i, 0);
       rows.push_back(position);
       auto writer = tm_->Begin();
       ASSERT_TRUE(writer.AddWriteSet(position, "before"));
@@ -759,8 +759,9 @@ TEST_F(TransactionTest, GcRearmsForSuccessiveQuietBursts) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (tm_->RuntimeStats().version_chains != 0 &&
-           std::chrono::steady_clock::now() < deadline)
+           std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     EXPECT_EQ(tm_->RuntimeStats().version_chains, 0U);
   }
 }

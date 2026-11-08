@@ -138,7 +138,7 @@ TEST_F(DatabaseExtraTest, DurableWalFrontierWaitsForSuccessfulSync) {
     bool released{false};
   };
   auto gate = std::make_shared<Gate>();
-  struct ResetHook {
+  struct ResetHook {  // NOLINT(cppcoreguidelines-special-member-functions)
     std::shared_ptr<Gate> gate;
     ~ResetHook() {
       Logger::SetBeforeSyncHookForTest({});

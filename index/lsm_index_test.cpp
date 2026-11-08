@@ -165,9 +165,9 @@ TEST_F(LsmIndexTest, MemTableFlushAndCompactionWithPartitionBoundaries) {
 
   // Insert 5000 keys to trigger MemTable flushes into immutable sorted runs.
   for (int i = 0; i < 5000; ++i) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "key_%05d", i);
-    ASSERT_SUCCESS(idx.Insert(txn, buf, "val_" + std::to_string(i)));
+    std::array<char, 16> buf{};
+    ASSERT_GT(std::snprintf(buf.data(), buf.size(), "key_%05d", i), 0);
+    ASSERT_SUCCESS(idx.Insert(txn, buf.data(), "val_" + std::to_string(i)));
   }
 
   ASSIGN_OR_ASSERT_FAIL(std::vector<std::string>, boundaries,

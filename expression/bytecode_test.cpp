@@ -29,6 +29,9 @@ TEST(BytecodeTest, FastNullSafeComparisonKeepsTextAndDateDomains) {
       const auto program =
           BytecodeCompiler::CompileRowCached(expression, schema);
       ASSERT_TRUE(program);
+      if (!program) {
+        return;
+      }
       const Value first =
           type == ValueType::kVarChar ? Value("alpha") : Value::DateFromDays(1);
       const Value second =
@@ -49,6 +52,9 @@ TEST(BytecodeTest, FastNullSafeComparisonKeepsTextAndDateDomains) {
         BinaryExpressionExp(ColumnValueExp("a"), op, ColumnValueExp("b"));
     const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
     ASSERT_TRUE(program);
+    if (!program) {
+      return;
+    }
     const Row row({Value::DateFromDays(5), Value(5)});
     const auto expected = expression->TryEvaluate(row, schema);
     const auto actual = TryEvaluateRowAuto(*program, row);
@@ -72,7 +78,7 @@ TEST(BytecodeTest, ScalarCacheKeySnapshotsCurrentBindingsAndDeclinesFunctions) {
   slot->Bind(Value(2));
   const auto second = ScalarExpressionCacheKey({expression}, schema);
   ASSERT_TRUE(second);
-  EXPECT_NE(*first, *second);
+  EXPECT_NE(first, second);
   EXPECT_EQ(frozen->Evaluate(Row({Value(1)}), schema), Value(true));
   EXPECT_EQ(expression->Evaluate(Row({Value(1)}), schema), Value(false));
   EXPECT_FALSE(ScalarExpressionCacheKey({FunctionCallExp("rand", {})}, schema));
@@ -96,6 +102,9 @@ TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
       auto program =
           BytecodeCompiler::CompileRowCached(predicate, schema, context);
       ASSERT_TRUE(program);
+      if (!program) {
+        return;
+      }
       auto value = program->TryEvaluateRow(Row({Value(5), Value(2.5)}));
       ASSERT_TRUE(value.HasValue());
       EXPECT_EQ(value.Value(), Value(5 > bound));
@@ -108,6 +117,9 @@ TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
   for (int repetition = 0; repetition < 2; ++repetition) {
     auto program = BytecodeCompiler::CompileRowCached(conditional, schema);
     ASSERT_TRUE(program);
+    if (!program) {
+      return;
+    }
     EXPECT_EQ(program->ResultType(), ValueType::kNull);
     for (const Row& row :
          {Row({Value(5), Value(2.5)}), Row({Value(0), Value(7.5)}),
@@ -125,6 +137,9 @@ TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
   auto reordered_program =
       BytecodeCompiler::CompileRowCached(predicate, reordered);
   ASSERT_TRUE(reordered_program);
+  if (!reordered_program) {
+    return;
+  }
   EXPECT_EQ(reordered_program->EvaluateRow(Row({Value(50.0), Value(0)})),
             Value(false));
   Value signed_value(int64_t{-1});
@@ -133,6 +148,9 @@ TEST(BytecodeTest, RowCompileCacheKeepsBindingsSchemasAndDynamicCaseTypes) {
     auto program =
         BytecodeCompiler::CompileRowCached(ConstantValueExp(constant), schema);
     ASSERT_TRUE(program);
+    if (!program) {
+      return;
+    }
     const auto actual = program->EvaluateRow(Row());
     EXPECT_EQ(actual.IsUnsigned(), constant.IsUnsigned());
     EXPECT_EQ(actual, constant);

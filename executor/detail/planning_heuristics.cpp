@@ -449,11 +449,11 @@ bool MapsToExactEqualityKey(const Schema& left, const Schema& right,
   std::optional<size_t> left_col;
   std::optional<size_t> right_col;
   if (lhs_left && rhs_right && !lhs_right && !rhs_left) {
-    left_col = *lhs_left;
-    right_col = *rhs_right;
+    left_col = lhs_left;
+    right_col = rhs_right;
   } else if (rhs_left && lhs_right && !rhs_right && !lhs_left) {
-    left_col = *rhs_left;
-    right_col = *lhs_right;
+    left_col = rhs_left;
+    right_col = lhs_right;
   } else {
     return false;
   }
@@ -2147,7 +2147,7 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
     } else if (!has_null_safe_key &&
                CompositeIntJoinKey(left.schema, left_columns, right.schema,
                                    right_columns)) {
-      constexpr int64_t kInvalidPacked2x32 = static_cast<int64_t>(
+      constexpr auto kInvalidPacked2x32 = static_cast<int64_t>(
           (static_cast<uint64_t>(0x80000000ULL) << 32) | 0x80000000ULL);
       auto fits_i32 = [](int64_t v) noexcept {
         return v >= static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&

@@ -349,11 +349,11 @@ TEST_F(WindowSqlTest, InterleavedPartitionsKeepTheirOwnFrames) {
   // ORDER BY g, v: row i is the (i%8)-th member of group i/8, and group g
   // holds v = g + 50*j for j in [0, 8), so sum = 8g + 50*(0+..+7).
   for (size_t i = 0; i < rows.size(); ++i) {
-    const int64_t g = static_cast<int64_t>(i / 8);
-    const int64_t member = static_cast<int64_t>(i % 8);
+    const auto g = static_cast<int64_t>(i / 8);
+    const auto member = static_cast<int64_t>(i % 8);
     EXPECT_EQ(rows[i][0], Value(g)) << "row " << i;
     EXPECT_EQ(rows[i][1], Value(int64_t{8})) << "row " << i;
-    EXPECT_EQ(rows[i][2], Value(8 * g + 1400)) << "row " << i;
+    EXPECT_EQ(rows[i][2], Value((8 * g) + 1400)) << "row " << i;
     EXPECT_EQ(rows[i][3], Value(member + 1)) << "row " << i;
   }
 }

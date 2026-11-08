@@ -20,7 +20,9 @@ bool LimitExecutor::NextInput(Row* dst, RowPosition* position,
     }
   }
   *dst = input_batch_.RowAt(input_offset_);
-  if (position) *position = input_batch_.PositionAt(input_offset_);
+  if (position != nullptr) {
+    *position = input_batch_.PositionAt(input_offset_);
+  }
   ++input_offset_;
   return true;
 }

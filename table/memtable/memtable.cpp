@@ -39,7 +39,8 @@ namespace tinylamb {
 MemTable::MemTable(const Schema& sc)
     : schema_(sc), shards_(static_cast<size_t>(kNumShards)), fixed_key_(false) {
   key_idx_ = sc.KeyColumnIndex();
-  key_type_ = sc.GetColumn(key_idx_).Type();
+  key_type_ = key_idx_ < sc.ColumnCount() ? sc.GetColumn(key_idx_).Type()
+                                          : ValueType::kNull;
   fixed_key_ =
       key_type_ == ValueType::kInt64 || key_type_ == ValueType::kDouble;
 }
@@ -47,8 +48,12 @@ MemTable::MemTable(const Schema& sc)
 StatusOr<Row> MemTable::Get(std::string_view key) const {
   Row row;
   Status st = Lookup(key, &row);
-  if (st == Status::kSuccess) return Row(std::move(row));
-  if (st == Status::kDeleted) return Status::kNotExists;
+  if (st == Status::kSuccess) {
+    return Row(std::move(row));
+  }
+  if (st == Status::kDeleted) {
+    return Status::kNotExists;
+  }
   return st;
 }
 
@@ -69,7 +74,9 @@ inline bool MemKeyLess(std::string_view a, std::string_view b) {
     std::memcpy(&y, b.data(), sizeof(y));
     x = htobe64(x);
     y = htobe64(y);
-    if (x != y) return x < y;
+    if (x != y) {
+      return x < y;
+    }
   }
   return a < b;
 }
@@ -80,7 +87,9 @@ inline bool MemKeyEq(std::string_view a, std::string_view b) {
     uint64_t y = 0;
     std::memcpy(&x, a.data(), sizeof(x));
     std::memcpy(&y, b.data(), sizeof(y));
-    if (x != y) return false;
+    if (x != y) {
+      return false;
+    }
     return static_cast<unsigned char>(a[8]) ==
            static_cast<unsigned char>(b[8]);  // tail byte
   }
@@ -92,7 +101,9 @@ Status MemTable::Lookup(std::string_view key, Row* row_out) const {
   const Shard& s = ShardFor(key);
   std::scoped_lock lk(s.lock);
   const RowEntry* e = s.active.Find(key);
-  if (e == nullptr && s.draining) e = s.sealed.Find(key);
+  if (e == nullptr && s.draining) {
+    e = s.sealed.Find(key);
+  }
   if (e == nullptr) {
     return Status::kNotExists;
   }
@@ -123,10 +134,16 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::SnapshotShard(
   while (ai.Valid() || si.Valid()) {
     // Invisible entries drop out before the ordering decision so the
     // newest-VISIBLE version wins the tie group.
-    while (ai.Valid() && invisible(ai)) ai.Next();
-    while (si.Valid() && invisible(si)) si.Next();
-    if (!ai.Valid() && !si.Valid()) break;
-    bool take_active;
+    while (ai.Valid() && invisible(ai)) {
+      ai.Next();
+    }
+    while (si.Valid() && invisible(si)) {
+      si.Next();
+    }
+    if (!ai.Valid() && !si.Valid()) {
+      break;
+    }
+    bool take_active = false;
     if (!ai.Valid()) {
       take_active = false;
     } else if (!si.Valid()) {
@@ -140,7 +157,9 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::SnapshotShard(
     const bool dupes_other = other.Valid() && MemKeyEq(other.Key(), it.Key());
     out.emplace_back(std::string(it.Key()), it.Entry());
     it.Next();
-    if (dupes_other) other.Next();
+    if (dupes_other) {
+      other.Next();
+    }
   }
   return out;
 }
@@ -169,13 +188,13 @@ std::vector<std::pair<std::string, RowEntry>> MemTable::Snapshot(
   struct Cursor {
     const std::pair<std::string, RowEntry>* begin;
     const std::pair<std::string, RowEntry>* end;
-    bool Valid() const { return begin != end; }
+    [[nodiscard]] bool Valid() const { return begin != end; }
   };
   std::vector<Cursor> cursors;
   cursors.reserve(static_cast<size_t>(kNumShards));
   for (auto& v : per_shard) {
     if (!v.empty()) {
-      cursors.push_back(Cursor{v.data(), v.data() + v.size()});
+      cursors.push_back(Cursor{.begin = v.data(), .end = v.data() + v.size()});
     }
   }
   // Heap ordering through the same word-prefix fast path Sync uses: the
@@ -204,7 +223,9 @@ bool MemTable::Contains(std::string_view key) const {
   const Shard& s = ShardFor(key);
   std::scoped_lock lk(s.lock);
   const RowEntry* e = s.active.Find(key);
-  if (e == nullptr && s.draining) e = s.sealed.Find(key);
+  if (e == nullptr && s.draining) {
+    e = s.sealed.Find(key);
+  }
   return e != nullptr && !e->is_deleted;
 }
 
@@ -278,14 +299,17 @@ Status MemTable::Put(const Row& r, bool sync) {
     // encode reduces to one inline call on the common type match (the gate
     // above already rejected a NULL key cell). Keeps the ingest loop off
     // both the heap and the encode call chain.
-    char kbuf[9];
+    std::array<char, 9> kbuf{};
     const Value& kv = r.values_[key_idx_];
-    size_t klen;
+    size_t klen = 0;
     if (kv.type == key_type_) {
-      klen =
-          key_type_ == ValueType::kInt64
-              ? EncodeMemcomparableFormatIntegerTo(kbuf, kv.value.int_value)
-              : EncodeMemcomparableFormatDoubleTo(kbuf, kv.value.double_value);
+      klen = key_type_ == ValueType::kInt64
+                 ? (kv.IsUnsigned() ? EncodeMemcomparableFormatUint64To(
+                                          kbuf.data(), kv.value.int_value)
+                                    : EncodeMemcomparableFormatIntegerTo(
+                                          kbuf.data(), kv.value.int_value))
+                 : EncodeMemcomparableFormatDoubleTo(kbuf.data(),
+                                                     kv.value.double_value);
     } else if (kv.type == ValueType::kVarChar) {
       // A varchar encodes to 9 bytes PER 8-char group: calling
       // EncodeMemcomparableFormatTo on the 9-byte stack buffer would smash
@@ -294,9 +318,9 @@ Status MemTable::Put(const Row& r, bool sync) {
     } else {
       // The remaining mismatch (kInt64 vs kDouble) still encodes to exactly
       // 9 bytes and matches the general path, which encodes by value type.
-      klen = kv.EncodeMemcomparableFormatTo(kbuf);
+      klen = kv.EncodeMemcomparableFormatTo(kbuf.data());
     }
-    put_entry(std::string_view(kbuf, klen));
+    put_entry(std::string_view(kbuf.data(), klen));
   } else {
     put_entry(r.EncodeKeyMemcomparableFormat(schema_));
   }
@@ -306,7 +330,9 @@ Status MemTable::Put(const Row& r, bool sync) {
     std::vector<uint32_t> rr;
     size_t gen = 0;
     Status st = Sync(&blob, &kr, &rr, &gen);
-    if (st != Status::kSuccess) return st;
+    if (st != Status::kSuccess) {
+      return st;
+    }
   }
   return Status::kSuccess;
 }
@@ -324,7 +350,9 @@ Status MemTable::Delete(std::string_view key, bool sync) {
     std::vector<uint32_t> rr;
     size_t gen = 0;
     Status st = Sync(&blob, &kr, &rr, &gen);
-    if (st != Status::kSuccess) return st;
+    if (st != Status::kSuccess) {
+      return st;
+    }
   }
   return Status::kSuccess;
 }
@@ -362,7 +390,9 @@ Status MemTable::Sync(std::vector<char>* blob_out,
     blob_out->clear();
     key_run_out->clear();
     row_run_out->clear();
-    if (deleted_out != nullptr) deleted_out->clear();
+    if (deleted_out != nullptr) {
+      deleted_out->clear();
+    }
     *generation_out = generation_;
     return Status::kSuccess;
   }
@@ -378,7 +408,7 @@ Status MemTable::Sync(std::vector<char>* blob_out,
   // without an O(n log n) sort pass.
   struct Cursor {
     SkipList::ConstIterator it;
-    bool Valid() const { return it.Valid(); }
+    [[nodiscard]] bool Valid() const { return it.Valid(); }
   };
   std::vector<Cursor> heap;
   heap.reserve(static_cast<size_t>(kNumShards));
@@ -392,8 +422,10 @@ Status MemTable::Sync(std::vector<char>* blob_out,
   blob_out->clear();
   key_run_out->clear();
   row_run_out->clear();
-  if (deleted_out != nullptr) deleted_out->clear();
-  blob_out->reserve(blob_out->size() + pending * 64);
+  if (deleted_out != nullptr) {
+    deleted_out->clear();
+  }
+  blob_out->reserve(blob_out->size() + (pending * 64));
   key_run_out->reserve(pending);
   row_run_out->reserve(pending);
   // Heap ordering by key. Memcomparable keys sort byte-lexicographically, so
@@ -411,7 +443,9 @@ Status MemTable::Sync(std::vector<char>* blob_out,
       std::memcpy(&y, bk.data(), sizeof(y));
       const uint64_t xb = htobe64(x);
       const uint64_t yb = htobe64(y);
-      if (xb != yb) return yb < xb;  // min-heap via greater-than
+      if (xb != yb) {
+        return yb < xb;  // min-heap via greater-than
+      }
     }
     return bk < ak;
   };
@@ -423,7 +457,9 @@ Status MemTable::Sync(std::vector<char>* blob_out,
     // read-only through paths that take the shard lock. Should a future
     // change let writers mutate sealed, these reads become a data race --
     // take s.lock first.
-    if (s.sealed.Empty()) continue;
+    if (s.sealed.Empty()) {
+      continue;
+    }
     heap.push_back(Cursor{s.sealed.Begin()});
     std::push_heap(heap.begin(), heap.end(), key_greater);
   }
@@ -456,10 +492,12 @@ Status MemTable::Sync(std::vector<char>* blob_out,
       blob_out->clear();
       key_run_out->clear();
       row_run_out->clear();
-      if (deleted_out != nullptr) deleted_out->clear();
+      if (deleted_out != nullptr) {
+        deleted_out->clear();
+      }
       return Status::kNoSpace;
     }
-    uint32_t key_off = static_cast<uint32_t>(blob_out->size());
+    auto key_off = static_cast<uint32_t>(blob_out->size());
     uint32_t be_len = htobe32(static_cast<uint32_t>(key.size()));
     const size_t key_start = blob_out->size();
     blob_out->resize(key_start + sizeof(uint32_t) + key.size());
@@ -468,7 +506,7 @@ Status MemTable::Sync(std::vector<char>* blob_out,
       std::memcpy(blob_out->data() + key_start + sizeof(be_len), key.data(),
                   key.size());
     }
-    uint32_t row_off = static_cast<uint32_t>(blob_out->size());
+    auto row_off = static_cast<uint32_t>(blob_out->size());
     if (!entry.is_deleted) {
       const size_t row_start = blob_out->size();
       blob_out->resize(row_start + row_size);

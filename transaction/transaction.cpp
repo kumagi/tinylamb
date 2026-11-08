@@ -688,9 +688,9 @@ StatusOr<lsn_t> Transaction::AllocatePageLog(page_id_t allocated_page_id,
       prev_lsn_, txn_id_, allocated_page_id, new_page_type));
 }
 
-StatusOr<lsn_t> Transaction::DestroyPageLog(page_id_t destroyed_page_id,
-                                            PageType /*old_page_type*/,
-                                            std::string /*old_page_body*/) {
+StatusOr<lsn_t> Transaction::DestroyPageLog(
+    page_id_t destroyed_page_id, PageType /*old_page_type*/,
+    std::string_view /*old_page_body*/) {
   return AppendLog(
       LogRecord::DestroyPageLogRecord(prev_lsn_, txn_id_, destroyed_page_id));
 }

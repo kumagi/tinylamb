@@ -85,15 +85,24 @@ struct LSTableColumnBlock {
   }
 
   [[nodiscard]] std::string_view VarcharAt(size_t row) const noexcept {
-    if (dict != nullptr && dict->active && row < dict_codes.size()) {
+    if (dict != nullptr && dict->active) {
+      if (row >= dict_codes.size()) {
+        return {};
+      }
       const uint8_t code = dict_codes[row];
       if (code < dict->entries.size()) {
         return dict->entries[code];
       }
       return {};
     }
+    if (row >= varchar_ends.size()) {
+      return {};
+    }
     const uint32_t begin = row == 0 ? 0U : varchar_ends[row - 1];
     const uint32_t end = varchar_ends[row];
+    if (end < begin || end > varchar_bytes.size()) {
+      return {};
+    }
     return {reinterpret_cast<const char*>(varchar_bytes.data()) + begin,
             end - begin};
   }

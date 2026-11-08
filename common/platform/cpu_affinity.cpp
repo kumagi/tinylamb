@@ -18,7 +18,7 @@
 
 namespace tinylamb::platform {
 
-#if defined(__linux__)
+#ifdef __linux__
 
 std::optional<CpuSet> CpuSet::CurrentThread() {
   CpuSet result;
@@ -31,7 +31,9 @@ std::optional<CpuSet> CpuSet::CurrentThread() {
 CpuSet CpuSet::Single(int cpu) {
   CpuSet result;
   CPU_ZERO(&result.set_);
-  if (cpu >= 0 && cpu < CPU_SETSIZE) CPU_SET(cpu, &result.set_);
+  if (cpu >= 0 && cpu < CPU_SETSIZE) {
+    CPU_SET(cpu, &result.set_);
+  }
   return result;
 }
 
@@ -43,7 +45,9 @@ int CpuSet::Count() const { return CPU_COUNT(&set_); }
 
 int CpuSet::First() const {
   for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (CPU_ISSET(cpu, &set_)) return cpu;
+    if (CPU_ISSET(cpu, &set_)) {
+      return cpu;
+    }
   }
   return -1;
 }

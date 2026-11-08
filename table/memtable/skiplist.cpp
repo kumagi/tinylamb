@@ -16,6 +16,7 @@
 
 #include "table/memtable/skiplist.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <stdexcept>
@@ -34,7 +35,7 @@ struct PreparedKey {
 };
 
 PreparedKey PrepareKey(std::string_view key) {
-  PreparedKey prepared{key, 0, 0, false};
+  PreparedKey prepared{.original = key, .word = 0, .tail = 0, .fixed9 = false};
   if (key.size() == 9) {
     uint64_t word = 0;
     std::memcpy(&word, key.data(), sizeof(word));
@@ -78,7 +79,7 @@ struct SkipList::Node {
     // No embedded pointer member: all `height` links live in the trailing
     // block, so key bytes start right after them.
     const char* kb = reinterpret_cast<const char*>(this) + sizeof(Node) +
-                     static_cast<size_t>(height) * sizeof(void*);
+                     (static_cast<size_t>(height) * sizeof(void*));
     return {kb, key_len};
   }
 };
@@ -86,8 +87,12 @@ struct SkipList::Node {
 int SkipList::CompareNodePrepared(const Node& n, std::string_view original,
                                   uint64_t word, uint8_t tail, bool fixed9) {
   if (fixed9 && n.key_len == 9) {
-    if (n.word0 != word) return n.word0 < word ? -1 : 1;
-    if (n.tail9 != tail) return n.tail9 < tail ? -1 : 1;
+    if (n.word0 != word) {
+      return n.word0 < word ? -1 : 1;
+    }
+    if (n.tail9 != tail) {
+      return n.tail9 < tail ? -1 : 1;
+    }
     return 0;
   }
   return n.Key().compare(original);
@@ -96,7 +101,9 @@ int SkipList::CompareNodePrepared(const Node& n, std::string_view original,
 // ---- Iterator --------------------------------------------------------------
 
 void SkipList::ConstIterator::Next() {
-  if (node == nullptr) return;
+  if (node == nullptr) {
+    return;
+  }
   auto* n = static_cast<Node*>(const_cast<void*>(node));
   node = n->next(0);
 }
@@ -121,7 +128,7 @@ SkipList::ConstIterator SkipList::Begin() const {
 
 void SkipList::InitHead() {
   auto* mem = static_cast<char*>(arena_.Allocate(
-      sizeof(Node) + static_cast<size_t>(kMaxLevel) * sizeof(void*)));
+      sizeof(Node) + (static_cast<size_t>(kMaxLevel) * sizeof(void*))));
   auto* h = reinterpret_cast<Node*>(mem);
   new (&h->entry) RowEntry();
   h->key_len = 0;
@@ -139,10 +146,10 @@ int SkipList::PickHeight() {
   // Geometric distribution with p = 1/4 (RocksDB-style): expected tower
   // height ~1.33 keeps level-0 traversal cache-friendly.
   uint32_t r = rng_;
-  rng_ = rng_ * 1664525u + 1013904223u;
+  rng_ = (rng_ * 1664525U) + 1013904223U;
   int h = 1;
   r >>= 2;  // drop low bits: least correlated with insertion patterns
-  while (h < kMaxLevel && (r & 3u) == 0) {
+  while (h < kMaxLevel && (r & 3U) == 0) {
     ++h;
     r >>= 2;
   }
@@ -157,13 +164,15 @@ SkipList::Node* SkipList::NewNode(std::string_view key, RowEntry&& entry,
     throw std::runtime_error("skiplist key exceeds uint32 range");
   }
   const size_t bytes =
-      sizeof(Node) + static_cast<size_t>(height) * sizeof(void*) + key.size();
+      sizeof(Node) + (static_cast<size_t>(height) * sizeof(void*)) + key.size();
   auto* mem = static_cast<char*>(arena_.Allocate(bytes));
   auto* n = reinterpret_cast<Node*>(mem);
   new (&n->entry) RowEntry(std::move(entry));
   n->key_len = static_cast<uint32_t>(key.size());
   n->height = static_cast<uint16_t>(height);
-  for (int i = 0; i < height; ++i) n->next(i) = nullptr;
+  for (int i = 0; i < height; ++i) {
+    n->next(i) = nullptr;
+  }
   if (key.size() == 9) {
     uint64_t word = 0;
     std::memcpy(&word, key.data(), sizeof(word));
@@ -191,7 +200,9 @@ void SkipList::Clear() {
   }
   // The sentinel was placement-new'd in InitHead like any other node:
   // destroy it too before FreeAll releases its chunk.
-  if (head_ != nullptr) head_->entry.~RowEntry();
+  if (head_ != nullptr) {
+    head_->entry.~RowEntry();
+  }
   arena_.FreeAll();
   // A fresh InitHead builds a brand-new sentinel (no destruction needed
   // for it here -- its object never existed yet).
@@ -223,17 +234,19 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
         previous->next(level) = n;
         tail_[level] = n;
       }
-      if (height > max_height_) max_height_ = height;
+      max_height_ = std::max(height, max_height_);
       ++size_;
       return true;
     }
   }
-  Node* update[kMaxLevel];
+  std::array<Node*, kMaxLevel> update{};
   Node* x = head_;
   for (int lvl = max_height_ - 1; lvl >= 0; --lvl) {
     while (true) {
       void* nxt = x->next(lvl);
-      if (nxt == nullptr) break;
+      if (nxt == nullptr) {
+        break;
+      }
       auto* nx = static_cast<Node*>(nxt);
       // The descent is a chain of dependent cache lines: the next level's
       // loop loads nx's pointer array while this level's compare reads nx's
@@ -241,11 +254,12 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
       // let it travel during the compare.
       __builtin_prefetch(reinterpret_cast<const char*>(nx) + sizeof(Node));
       if (CompareNodePrepared(*nx, prepared.original, prepared.word,
-                              prepared.tail, prepared.fixed9) >= 0)
+                              prepared.tail, prepared.fixed9) >= 0) {
         break;
+      }
       x = nx;
     }
-    update[lvl] = x;
+    update[static_cast<size_t>(lvl)] = x;
   }
   void* cand_v = x->next(0);
   if (cand_v != nullptr) {
@@ -262,8 +276,10 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
   const int height = PickHeight();
   Node* n = NewNode(key, std::move(entry), height);
   const int previous_max = max_height_;
-  if (height > max_height_) max_height_ = height;
-  for (int lvl = previous_max; lvl < height; ++lvl) update[lvl] = head_;
+  max_height_ = std::max(height, max_height_);
+  for (int lvl = previous_max; lvl < height; ++lvl) {
+    update[lvl] = head_;
+  }
   for (int lvl = 0; lvl < height; ++lvl) {
     n->next(lvl) = update[lvl]->next(lvl);
     update[lvl]->next(lvl) = n;
@@ -276,7 +292,9 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
     // the skipped levels. n->next(lvl) == nullptr exactly when n is the new
     // last node at that level (this also covers the empty-list insert,
     // where every update[lvl] is head).
-    if (n->next(lvl) == nullptr) tail_[lvl] = n;
+    if (n->next(lvl) == nullptr) {
+      tail_[lvl] = n;
+    }
   }
   ++size_;
   return true;
@@ -288,14 +306,17 @@ const RowEntry* SkipList::Find(std::string_view key) const {
   for (int lvl = max_height_ - 1; lvl >= 0; --lvl) {
     while (true) {
       void* const& nxt = x->next(lvl);
-      if (nxt == nullptr) break;
+      if (nxt == nullptr) {
+        break;
+      }
       const auto* nx = static_cast<const Node*>(nxt);
       // Same prefetch as Upsert's descent: the next level reads nx's
       // pointer array while this level compares nx's key.
       __builtin_prefetch(reinterpret_cast<const char*>(nx) + sizeof(Node));
       if (CompareNodePrepared(*nx, prepared.original, prepared.word,
-                              prepared.tail, prepared.fixed9) >= 0)
+                              prepared.tail, prepared.fixed9) >= 0) {
         break;
+      }
       x = nx;
     }
   }
@@ -303,8 +324,9 @@ const RowEntry* SkipList::Find(std::string_view key) const {
   if (cand_v != nullptr) {
     const auto* cand = static_cast<const Node*>(cand_v);
     if (CompareNodePrepared(*cand, prepared.original, prepared.word,
-                            prepared.tail, prepared.fixed9) == 0)
+                            prepared.tail, prepared.fixed9) == 0) {
       return &cand->entry;
+    }
   }
   return nullptr;
 }

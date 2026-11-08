@@ -87,34 +87,38 @@ void AppendMemComparableValue(const Value& v, std::string* out,
     case ValueType::kDouble: {
       out->push_back(static_cast<char>(ValueType::kDouble));
       double d = v.value.double_value;
-      // GoogleSQL treats every NaN as equal (they collapse under DISTINCT and
-      // group together in ORDER BY) and folds -0.0 into +0.0.  Canonicalize
-      // before the IEEE total-order transform so distinct NaN payloads and
-      // signed zeros encode identically and sort to the same position.
+      // GoogleSQL ordering: NULL < NaN < -inf < finite < +inf (matching
+      // CompareForOrderBy in type/value.cpp). Canonicalize every NaN to all-0
+      // bytes (0x0000000000000000 < -inf's 0x000fffffffffffff) and fold -0.0
+      // into +0.0 so SortExecutor and TopNExecutor / SortKeyOrder agree.
       if (std::isnan(d)) {
-        d = std::numeric_limits<double>::quiet_NaN();
-      } else if (d == 0.0) {
+        out->append(8, '\0');
+        break;
+      }
+      if (d == 0.0) {
         d = 0.0;
       }
       uint64_t bits = 0;
       std::memcpy(&bits, &d, sizeof(bits));
-      uint64_t be = BSwap64(bits);
-      // IEEE total-order transform. NaN fails every comparison, so classify
-      // by the sign bit directly; NaN keys then land above +inf, matching
-      // GoogleSQL ORDER BY.
       const bool negative = (bits >> 63) != 0;
-      if (!negative) {
-        be |= 0x80;
-      } else {
-        be = ~be;
-      }
+      const uint64_t code = negative ? ~bits : (bits | (uint64_t{1} << 63));
+      const uint64_t be = BSwap64(code);
       std::array<char, 8> buf{};
       std::memcpy(buf.data(), &be, buf.size());
       out->append(buf.data(), buf.size());
       break;
     }
     case ValueType::kArray:
-      out->append(v.EncodeMemcomparableFormat());
+      out->push_back(static_cast<char>(ValueType::kArray));
+      for (const Value& elem : v.ArrayElements()) {
+        if (elem.IsNull()) {
+          out->push_back('\x01');
+          continue;
+        }
+        out->push_back('\x02');
+        AppendMemComparableValue(elem, out);
+      }
+      out->push_back('\x00');
       break;
     case ValueType::kNull:
       CHECK_MSG(false, "Cannot encode unknown type.");

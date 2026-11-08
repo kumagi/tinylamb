@@ -592,6 +592,8 @@ Status Database::DropTable(TransactionContext& ctx,
   return Status::kSuccess;
 }
 
+namespace {
+
 std::string MaterializedViewKey(std::string_view name) {
   std::string key(Database::kMaterializedViewKeyPrefix);
   for (char c : name) {
@@ -601,12 +603,14 @@ std::string MaterializedViewKey(std::string_view name) {
   return key;
 }
 
+}  // namespace
+
 Status Database::PutMaterializedViewDefinition(TransactionContext& ctx,
                                                std::string_view name,
                                                std::string_view query_text) {
   std::scoped_lock lock(catalog_mu_);
   const std::string key = MaterializedViewKey(name);
-  const Status existing = functions_.Delete(ctx.txn_, key);
+  Status existing = functions_.Delete(ctx.txn_, key);
   if (existing != Status::kSuccess && existing != Status::kNotExists) {
     return existing;
   }
@@ -630,12 +634,14 @@ StatusOr<std::string> Database::GetMaterializedViewDefinition(
 Status Database::DeleteMaterializedViewDefinition(TransactionContext& ctx,
                                                   std::string_view name) {
   std::scoped_lock lock(catalog_mu_);
-  const Status deleted = functions_.Delete(ctx.txn_, MaterializedViewKey(name));
+  Status deleted = functions_.Delete(ctx.txn_, MaterializedViewKey(name));
   if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
     return deleted;
   }
   return Status::kSuccess;
 }
+
+namespace {
 
 std::string ViewKey(std::string_view name) {
   std::string key(Database::kViewKeyPrefix);
@@ -679,7 +685,7 @@ std::string EncodeViewIndex(const std::vector<std::string>& names) {
 
 Status WriteViewIndex(BPlusTree& functions, TransactionContext& ctx,
                       const std::vector<std::string>& names) {
-  const Status deleted =
+  Status deleted =
       functions.Delete(ctx.txn_, std::string(Database::kViewIndexKey));
   if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
     return deleted;
@@ -688,17 +694,18 @@ Status WriteViewIndex(BPlusTree& functions, TransactionContext& ctx,
                           EncodeViewIndex(names));
 }
 
+}  // namespace
+
 Status Database::PutViewDefinition(TransactionContext& ctx,
                                    std::string_view name,
                                    std::string_view query_text) {
   std::scoped_lock lock(catalog_mu_);
   const std::string key = ViewKey(name);
-  const Status existing = functions_.Delete(ctx.txn_, key);
+  Status existing = functions_.Delete(ctx.txn_, key);
   if (existing != Status::kSuccess && existing != Status::kNotExists) {
     return existing;
   }
-  const Status inserted =
-      functions_.Insert(ctx.txn_, key, std::string(query_text));
+  Status inserted = functions_.Insert(ctx.txn_, key, std::string(query_text));
   if (inserted != Status::kSuccess) {
     return inserted;
   }
@@ -737,7 +744,7 @@ StatusOr<std::string> Database::GetViewDefinition(TransactionContext& ctx,
 Status Database::DeleteViewDefinition(TransactionContext& ctx,
                                       std::string_view name) {
   std::scoped_lock lock(catalog_mu_);
-  const Status deleted = functions_.Delete(ctx.txn_, ViewKey(name));
+  Status deleted = functions_.Delete(ctx.txn_, ViewKey(name));
   if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
     return deleted;
   }

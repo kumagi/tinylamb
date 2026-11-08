@@ -19,14 +19,15 @@
 // -> validation -> row round-trip -> point lookups -> multi-run merge ->
 // memtable flush).
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -54,7 +55,7 @@ struct Lcg {
   uint64_t s;
   explicit Lcg(uint64_t seed) : s(seed) {}
   uint64_t Next() {
-    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    s = (s * 6364136223846793005ULL) + 1442695040888963407ULL;
     return s >> 17;
   }
   uint32_t Below(uint32_t n) { return static_cast<uint32_t>(Next() % n); }
@@ -76,8 +77,10 @@ std::string TrickyName(Lcg& rng, int idx) {
       return "";
     case 1:
       return "c" + std::to_string(idx);
-    case 2:
-      return std::string(300, 'L');
+    case 2: {
+      std::string s(300, 'L');
+      return s;
+    }
     case 3:
       return "\xE5\x88\x97" + std::to_string(idx);
     case 4:
@@ -85,7 +88,7 @@ std::string TrickyName(Lcg& rng, int idx) {
     case 5:
       return "x";
     case 6:
-      return std::string("nul\0inside", 10);
+      return {"nul\0inside", 10};
     default:
       return "col_" + std::to_string(idx);
   }
@@ -100,18 +103,18 @@ int64_t GenInt(Lcg& rng, int policy, int64_t i) {
     case 2:
       return static_cast<int64_t>(rng.Next()) % 251;
     case 3: {
-      constexpr int64_t ext[] = {INT64_MAX,     INT64_MIN,    0, -1, 1,
-                                 INT64_MAX - 1, INT64_MIN + 1};
+      constexpr std::array<int64_t, 7> ext = {
+          INT64_MAX, INT64_MIN, 0, -1, 1, INT64_MAX - 1, INT64_MIN + 1};
       return ext[rng.Below(7)];
     }
     case 4:
-      return static_cast<int64_t>(i) * 1000000007LL;
+      return i * 1000000007LL;
     case 5:
       return 42;
     default: {
       const auto hi = static_cast<int64_t>(INT64_MAX - (i % 4));
       const auto lo = static_cast<int64_t>(INT64_MIN + (i % 4));
-      return (i & 1) ? hi : lo;
+      return ((i & 1) != 0) ? hi : lo;
     }
   }
 }
@@ -127,17 +130,17 @@ double GenDouble(Lcg& rng, int policy, int64_t i) {
     case 1:
       return static_cast<double>(i % 13);
     case 2: {
-      constexpr double ext[] = {0.0, -0.0, 1.5, -1.5};
+      constexpr std::array<double, 4> ext = {0.0, -0.0, 1.5, -1.5};
       return ext[rng.Below(4)];
     }
     case 3: {
-      constexpr double ext[] = {static_cast<double>(NAN),
-                                static_cast<double>(INFINITY),
-                                -static_cast<double>(INFINITY),
-                                DBL_MIN,
-                                DBL_MAX,
-                                5e-324,
-                                123.456};
+      constexpr std::array<double, 7> ext = {static_cast<double>(NAN),
+                                             static_cast<double>(INFINITY),
+                                             -static_cast<double>(INFINITY),
+                                             DBL_MIN,
+                                             DBL_MAX,
+                                             5e-324,
+                                             123.456};
       return ext[rng.Below(7)];
     }
     default:
@@ -155,8 +158,8 @@ std::string GenString(Lcg& rng, int policy, int64_t i, size_t max_len) {
       const size_t span = max_len > 64 ? max_len - 64 : 0;
       const size_t n =
           64 + (span != 0 ? rng.Below(static_cast<uint32_t>(span)) : 0);
-      return std::string(std::min(n, max_len),
-                         static_cast<char>('a' + (i % 26)));
+      std::string s(std::min(n, max_len), static_cast<char>('a' + (i % 26)));
+      return s;
     }
     case 3: {
       std::string s = std::string("ab\0cd", 5) + "\x80\xFF" + "ef";
@@ -166,7 +169,8 @@ std::string GenString(Lcg& rng, int policy, int64_t i, size_t max_len) {
     case 4: {
       size_t n = static_cast<size_t>(8) * (1U + rng.Below(40));
       n = std::min(n, max_len & ~static_cast<size_t>(7));
-      return std::string(n == 0 ? std::min<size_t>(8, max_len) : n, 'm');
+      std::string s(n == 0 ? std::min<size_t>(8, max_len) : n, 'm');
+      return s;
     }
     default:
       return "s" + std::to_string(i);
@@ -174,13 +178,19 @@ std::string GenString(Lcg& rng, int policy, int64_t i, size_t max_len) {
 }
 
 Value MakeValue(Lcg& rng, const ColSpec& c, int64_t i, size_t max_len) {
-  if (c.type == ValueType::kInt64) return Value(GenInt(rng, c.policy, i));
-  if (c.type == ValueType::kDouble) return Value(GenDouble(rng, c.policy, i));
+  if (c.type == ValueType::kInt64) {
+    return Value(GenInt(rng, c.policy, i));
+  }
+  if (c.type == ValueType::kDouble) {
+    return Value(GenDouble(rng, c.policy, i));
+  }
   return Value(GenString(rng, c.policy, i, max_len));
 }
 
 bool SameField(const Value& a, const Value& b, ValueType t) {
-  if (a.type != b.type) return false;
+  if (a.type != b.type) {
+    return false;
+  }
   switch (t) {
     case ValueType::kInt64:
       return a.AsInt64() == b.AsInt64();
@@ -199,9 +209,13 @@ bool SameField(const Value& a, const Value& b, ValueType t) {
 }
 
 bool SameRow(const Row& a, const Row& b, const std::vector<ColSpec>& specs) {
-  if (a.Count() != b.Count()) return false;
+  if (a.Count() != b.Count()) {
+    return false;
+  }
   for (size_t i = 0; i < specs.size(); ++i) {
-    if (!SameField(a[i], b[i], specs[i].type)) return false;
+    if (!SameField(a[i], b[i], specs[i].type)) {
+      return false;
+    }
   }
   return true;
 }
@@ -222,19 +236,21 @@ SortedRun BuildRun(const std::vector<std::pair<std::string, Row>>& pairs,
     blob.insert(blob.end(), buf.begin(), buf.end());
     index.emplace_back(key_off, row_off, false);
   }
-  return SortedRun(std::move(blob), std::move(index), gen);
+  return {std::move(blob), std::move(index), gen};
 }
 
-#define FAIL(msg)                                        \
-  do {                                                   \
-    std::fprintf(stderr, "SCHEMA-FUZZ FAIL: %s\n", msg); \
-    std::abort();                                        \
+#define FAIL(msg)                                       \
+  do {                                                  \
+    std::cerr << "SCHEMA-FUZZ FAIL: " << (msg) << "\n"; \
+    std::abort();                                       \
   } while (0)
 
 }  // namespace
 
 int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
-  if (size < 64) return 0;
+  if (size < 64) {
+    return 0;
+  }
 
   try {
     Lcg rng([&] {
@@ -292,7 +308,9 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
     for (int i = 0; i < nrows; ++i) {
       std::vector<Value> vals;
       vals.reserve(specs.size());
-      for (const auto& c : specs) vals.push_back(MakeValue(rng, c, i, max_len));
+      for (const auto& c : specs) {
+        vals.push_back(MakeValue(rng, c, i, max_len));
+      }
       Row r(vals);
       std::string key = r.EncodeKeyMemcomparableFormat(sc);
       if (key_is_int64) {
@@ -306,19 +324,24 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
     std::stable_sort(
         pairs.begin(), pairs.end(),
         [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (size_t i = 0; i < pairs.size(); ++i) oracle[i] = pairs[i].second;
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      oracle[i] = pairs[i].second;
+    }
 
     const SortedRun run = BuildRun(pairs, sc, 1);
     const PaxChunk chunk = PaxChunk::BuildFromSortedRun(run, sc);
-    if (PaxChunk::ValidateChunkBytes(chunk.Data()) != Status::kSuccess)
+    if (PaxChunk::ValidateChunkBytes(chunk.Data()) != Status::kSuccess) {
       FAIL("writer emitted structurally invalid bytes");
-    if (chunk.TotalRowCount() != static_cast<size_t>(nrows))
+    }
+    if (chunk.TotalRowCount() != static_cast<size_t>(nrows)) {
       FAIL("total row count mismatch after build");
+    }
 
     for (int i = 0; i < nrows; ++i) {
       auto rr = chunk.ReadRow(static_cast<size_t>(i), sc);
-      if (rr.GetStatus() != Status::kSuccess)
+      if (rr.GetStatus() != Status::kSuccess) {
         FAIL("ReadRow failed on valid index");
+      }
       if (!SameRow(rr.Value(), oracle[static_cast<size_t>(i)], specs)) {
         FAIL("lossy round-trip");
       }
@@ -331,24 +354,28 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
                   [static_cast<size_t>(key_idx)]
                       .AsInt64();
         size_t idx = 0;
-        if (chunk.PointLookup(q, sc, &idx) != Status::kSuccess)
+        if (chunk.PointLookup(q, sc, &idx) != Status::kSuccess) {
           FAIL("PointLookup missed a present key");
+        }
         auto got = chunk.ReadRowByKey(q, sc);
         if (got.GetStatus() != Status::kSuccess ||
-            got.Value()[static_cast<size_t>(key_idx)].AsInt64() != q)
+            got.Value()[static_cast<size_t>(key_idx)].AsInt64() != q) {
           FAIL("ReadRowByKey returned wrong row");
+        }
       }
       size_t dummy = 0;
       if (min_key != INT64_MIN) {
         const int64_t below = min_key - 1;
         if (chunk.PointLookup(below, sc, &dummy) == Status::kSuccess &&
-            chunk.ReadRowByKey(below, sc).GetStatus() == Status::kSuccess)
+            chunk.ReadRowByKey(below, sc).GetStatus() == Status::kSuccess) {
           FAIL("phantom key below range");
+        }
       }
       if (max_key != INT64_MAX) {
         const int64_t above = max_key + 1;
-        if (chunk.ReadRowByKey(above, sc).GetStatus() == Status::kSuccess)
+        if (chunk.ReadRowByKey(above, sc).GetStatus() == Status::kSuccess) {
           FAIL("phantom key above range");
+        }
       }
     }
 
@@ -368,22 +395,27 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
       const SortedRun rb = BuildRun(b, sc, 3);
       std::vector<const SortedRun*> inputs = {&ra, &rb};
       auto merged = MergeAllSortedRuns(inputs, sc);
-      if (merged.GetStatus() != Status::kSuccess)
+      if (merged.GetStatus() != Status::kSuccess) {
         FAIL("MergeAllSortedRuns failed on legit input");
+      }
       if (PaxChunk::ValidateChunkBytes(merged.Value().Data()) !=
-          Status::kSuccess)
+          Status::kSuccess) {
         FAIL("merge output invalid");
+      }
       size_t distinct = 0;
       {
         std::vector<std::string> ks;
         ks.reserve(pairs.size());
-        for (auto& [k, r] : pairs) ks.push_back(k);
+        for (auto& [k, r] : pairs) {
+          ks.push_back(k);
+        }
         std::sort(ks.begin(), ks.end());
         distinct =
             static_cast<size_t>(std::unique(ks.begin(), ks.end()) - ks.begin());
       }
-      if (merged.Value().TotalRowCount() != distinct)
+      if (merged.Value().TotalRowCount() != distinct) {
         FAIL("merge row count != distinct keys");
+      }
     }
 
     {
@@ -398,28 +430,32 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
       std::vector<uint32_t> rr;
       std::vector<uint8_t> del;
       size_t gen = 0;
-      if (mt.Sync(&blob, &kr, &rr, &gen, &del) != Status::kSuccess)
+      if (mt.Sync(&blob, &kr, &rr, &gen, &del) != Status::kSuccess) {
         FAIL("memtable sync failed");
+      }
       SortedRun flushed = BuildRun({}, sc, 0);
       {
         std::vector<char> b2 = blob;
         std::vector<SortedRun::Entry> idx;
         idx.reserve(kr.size());
-        for (size_t i = 0; i < kr.size(); ++i)
+        for (size_t i = 0; i < kr.size(); ++i) {
           idx.emplace_back(kr[i], rr[i], del[i] != 0);
+        }
         flushed = SortedRun(std::move(b2), std::move(idx), gen);
       }
       std::vector<const SortedRun*> one = {&flushed};
       auto merged = MergeAllSortedRuns(one, sc);
       if (merged.GetStatus() != Status::kSuccess ||
           PaxChunk::ValidateChunkBytes(merged.Value().Data()) !=
-              Status::kSuccess)
+              Status::kSuccess) {
         FAIL("flushed-run merge invalid");
-      if (merged.Value().TotalRowCount() != unique.size())
+      }
+      if (merged.Value().TotalRowCount() != unique.size()) {
         FAIL("flushed row count != unique keys");
+      }
     }
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "SCHEMA-FUZZ exception: %s\n", e.what());
+    std::cerr << "SCHEMA-FUZZ exception: " << e.what() << "\n";
     std::abort();
   }
   return 0;

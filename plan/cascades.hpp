@@ -794,6 +794,7 @@ class SearchEngine {
 
   SearchEngine(Memo memo, const RuleSet& rules)
       : memo_(std::move(memo)), rules_(&rules) {}
+  SearchEngine(Memo memo, const RuleSet&&) = delete;
 
   void Explore(GroupId root);
   // Caps logical rule applications during Explore (0 = unlimited). See

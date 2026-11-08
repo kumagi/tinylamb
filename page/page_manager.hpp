@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,7 @@ struct LsmTreeState {
     std::string value;
     bool deleted{false};
     uint64_t generation{0};
+    txn_id_t uncommitted_txn{0};
   };
   struct CommittedEntry {
     std::string value;
@@ -83,6 +85,7 @@ struct LsmTreeState {
   uint64_t next_generation{1};
   size_t active_uncommitted_ops{0};
   bool destroyed{false};
+  txn_id_t destroyed_by_txn{0};
   bool committed_destroyed{false};
   lsn_t committed_destroy_lsn{0};
 
@@ -98,7 +101,7 @@ struct LsmTreeState {
 
   [[nodiscard]] bool LookupLiveLocked(std::string_view key,
                                       std::string* value_out) const;
-  void FlushAndCompactIfIdleLocked();
+  bool FlushAndCompactIfIdleLocked();
   [[nodiscard]] LsmSortedRun BuildCompactedCommittedRunLocked() const;
 };
 
@@ -157,7 +160,7 @@ class PageManager {
   StatusOr<std::string> LsmRead(page_id_t tree_id, std::string_view key) const;
   std::vector<std::pair<std::string, std::string>> LsmScanRange(
       page_id_t tree_id, std::string_view begin, std::string_view end,
-      bool ascending) const;
+      bool ascending, txn_id_t reader_txn_id = 0) const;
   Status LsmDestroy(Transaction& txn, page_id_t tree_id);
 
   // Transaction lifecycle hooks (commit baseline promotion & in-memory undo).
@@ -171,6 +174,10 @@ class PageManager {
   Status LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
                              bool* loaded_out = nullptr);
   Status ReplayCommittedRecord(lsn_t lsn, const LogRecord& record);
+  void SetCompactionCallback(std::function<void()> callback);
+  [[nodiscard]] txn_id_t MaxCommittedTxnId() const noexcept {
+    return max_committed_txn_id_.load(std::memory_order_acquire);
+  }
   void DropAllState();
   void DropAllPages() { DropAllState(); }
   Status FlushPageForTest(page_id_t /*pid*/) { return WriteFuzzyCheckpoint(0); }
@@ -222,6 +229,13 @@ class PageManager {
   mutable std::mutex trees_mu_;
   mutable std::unordered_map<page_id_t, std::unique_ptr<LsmTreeState>>
       lsm_trees_;
+
+  static constexpr size_t kCompactionPersistOpsThreshold = 1048576;
+
+  std::atomic<txn_id_t> max_committed_txn_id_{0};
+  std::atomic<size_t> unpersisted_committed_ops_{0};
+  mutable std::mutex compaction_cb_mu_;
+  std::function<void()> compaction_cb_;
 
   mutable std::atomic<uint64_t> cache_hits_{0};
   mutable std::atomic<uint64_t> cache_misses_{0};

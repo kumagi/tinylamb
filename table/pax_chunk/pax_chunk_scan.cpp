@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cmath>
+#include <ranges>
+
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -22,9 +26,13 @@ namespace tinylamb {
 bool QppRegionCountSum(const char* region, uint32_t n, uint32_t param,
                        const char* region_end, PaxChunk::CompareOp op,
                        int64_t literal, uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   QppRegion parsed;
-  if (!ParseQppRegion(region, n, param, region_end, &parsed)) return false;
+  if (!ParseQppRegion(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   __int128 low = INT64_MIN;
   __int128 high = INT64_MAX;
   switch (op) {
@@ -59,7 +67,9 @@ bool QppRegionCountSum(const char* region, uint32_t n, uint32_t param,
   }
   QppPatchExceptionCount(parsed, op, literal, low, high, &count, &sum);
   *count_out = static_cast<uint64_t>(count);
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -68,7 +78,9 @@ bool WaveletRRegionCountSum(const char* region, uint32_t n, uint32_t param,
                             int64_t literal, uint64_t* count_out,
                             int64_t* sum_out) {
   WaveletRRegion p;
-  if (!ParseWaveletRRegion(region, n, param, region_end, &p)) return false;
+  if (!ParseWaveletRRegion(region, n, param, region_end, &p)) {
+    return false;
+  }
   return WaveletRRegionFold(p, op, literal, count_out, sum_out);
 }
 
@@ -76,15 +88,20 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
                                     CompareOp op, int64_t lit,
                                     const uint8_t* null_bmp,
                                     uint64_t* out_bits) {
-  if (n == 0) return;
-  const uint8_t w = static_cast<uint8_t>(region[0]);
-  if (w == 0 || w > 64) return;
+  if (n == 0) {
+    return;
+  }
+  const auto w = static_cast<uint8_t>(region[0]);
+  if (w == 0 || w > 64) {
+    return;
+  }
   const auto set_all_non_null = [&] {
     for (uint32_t i = 0; i < n; ++i) {
       if (null_bmp != nullptr &&
           ((static_cast<unsigned>(null_bmp[i >> 3]) >> (7U - (i & 7U))) & 1U) !=
-              0U)
+              0U) {
         continue;
+      }
       out_bits[i >> 6] |= (1ULL << (i & 63));
     }
   };
@@ -93,28 +110,36 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
   if (w < 64) {
     const uint64_t dom = ((1ULL << w) - 1ULL);
     if (lit < 0) {
-      if (op == CompareOp::kGe || op == CompareOp::kGt) set_all_non_null();
+      if (op == CompareOp::kGe || op == CompareOp::kGt) {
+        set_all_non_null();
+      }
       return;
     }
-    if (static_cast<uint64_t>(lit) > dom) {
-      if (op == CompareOp::kLe || op == CompareOp::kLt) set_all_non_null();
+    if (std::cmp_greater(lit, dom)) {
+      if (op == CompareOp::kLe || op == CompareOp::kLt) {
+        set_all_non_null();
+      }
       return;
     }
   }
   const size_t stride = (static_cast<size_t>(n) + 7) / 8;
-  const unsigned char* r = reinterpret_cast<const unsigned char*>(region);
+  const auto* r = reinterpret_cast<const unsigned char*>(region);
   // Signed ordering for w == 64: flip the sign bit of literal and slice 63,
   // turning the signed compare into an unsigned slice walk.
   const bool flip_top = (w == 64);
   const uint64_t lu =
       static_cast<uint64_t>(lit) ^ (flip_top ? (1ULL << 63) : 0ULL);
   const auto sbyte = [&](uint32_t b, size_t i) -> uint8_t {
-    uint8_t v = r[1 + static_cast<size_t>(b) * stride + i];
-    if (flip_top && b == 63) v = static_cast<uint8_t>(~v);
+    uint8_t v = r[1 + (static_cast<size_t>(b) * stride) + i];
+    if (flip_top && b == 63) {
+      v = static_cast<uint8_t>(~v);
+    }
     return v;
   };
   uint8_t tail = 0xFF;
-  if ((n & 7U) != 0U) tail = static_cast<uint8_t>(0xFFu << (8 - (n & 7U)));
+  if ((n & 7U) != 0U) {
+    tail = static_cast<uint8_t>(0xFFU << (8 - (n & 7U)));
+  }
   constexpr size_t kStackStride = (PaxChunk::kRowGroupSize + 7U) / 8U;
   std::array<uint8_t, kStackStride> eq_stack{};
   std::array<uint8_t, kStackStride> res_stack{};
@@ -155,8 +180,9 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
     std::fill(eq, eq + stride, 0xFF);
     for (uint32_t b = 0; b < w; ++b) {
       const uint64_t bit = (lu >> b) & 1ULL;
-      for (size_t i = 0; i < stride; ++i)
+      for (size_t i = 0; i < stride; ++i) {
         eq[i] &= bit != 0U ? sbyte(b, i) : static_cast<uint8_t>(~sbyte(b, i));
+      }
     }
     eq[stride - 1] &= tail;
   }
@@ -165,11 +191,13 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
     std::fill(eq, eq + stride, 0xFF);
     eq[stride - 1] &= tail;
     for (int b = static_cast<int>(w) - 1; b >= 0; --b) {
-      const uint32_t bb = static_cast<uint32_t>(b);
+      const auto bb = static_cast<uint32_t>(b);
       const uint64_t bit = (lu >> bb) & 1ULL;
       if (want_gt) {
         if (bit != 0U) {
-          for (size_t i = 0; i < stride; ++i) eq[i] &= sbyte(bb, i);
+          for (size_t i = 0; i < stride; ++i) {
+            eq[i] &= sbyte(bb, i);
+          }
         } else {
           for (size_t i = 0; i < stride; ++i) {
             res[i] = static_cast<uint8_t>(res[i] | (eq[i] & sbyte(bb, i)));
@@ -184,8 +212,9 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
             eq[i] &= sbyte(bb, i);
           }
         } else {
-          for (size_t i = 0; i < stride; ++i)
+          for (size_t i = 0; i < stride; ++i) {
             eq[i] &= static_cast<uint8_t>(~sbyte(bb, i));
+          }
         }
       }
     }
@@ -196,22 +225,29 @@ void PaxChunk::ByteSliceCompareMask(const char* region, uint32_t n,
   for (uint32_t i = 0; i < n; ++i) {
     if (null_bmp != nullptr &&
         ((static_cast<unsigned>(null_bmp[i >> 3]) >> (7U - (i & 7U))) & 1U) !=
-            0U)
+            0U) {
       continue;
+    }
     const uint32_t hit =
         (static_cast<unsigned>(src[i >> 3]) >> (7U - (i & 7U))) & 1U;
-    if ((hit != 0U) != invert) out_bits[i >> 6] |= (1ULL << (i & 63));
+    if ((hit != 0U) != invert) {
+      out_bits[i >> 6] |= (1ULL << (i & 63));
+    }
   }
 }
 
 int64_t PaxChunk::ByteSliceFilteredSum(const char* region, uint32_t n,
                                        const uint8_t* null_bmp,
                                        const uint64_t* sel_bits) {
-  if (n == 0) return 0;
-  const uint8_t w = static_cast<uint8_t>(region[0]);
-  if (w == 0 || w > 64) return 0;
+  if (n == 0) {
+    return 0;
+  }
+  const auto w = static_cast<uint8_t>(region[0]);
+  if (w == 0 || w > 64) {
+    return 0;
+  }
   const size_t stride = (static_cast<size_t>(n) + 7) / 8;
-  const unsigned char* r = reinterpret_cast<const unsigned char*>(region);
+  const auto* r = reinterpret_cast<const unsigned char*>(region);
   // Combined mask in the slice (MSB-first) domain: selection AND NOT null.
   constexpr size_t kStackStride = (PaxChunk::kRowGroupSize + 7U) / 8U;
   std::array<uint8_t, kStackStride> m_stack{};
@@ -222,27 +258,33 @@ int64_t PaxChunk::ByteSliceFilteredSum(const char* region, uint32_t n,
     m = m_heap.data();
   }
   std::fill(m, m + stride, 0xFF);
-  if ((n & 7U) != 0U)
-    m[stride - 1] = static_cast<uint8_t>(0xFFu << (8 - (n & 7U)));
+  if ((n & 7U) != 0U) {
+    m[stride - 1] = static_cast<uint8_t>(0xFFU << (8 - (n & 7U)));
+  }
   if (sel_bits != nullptr) {
     std::fill(m, m + stride, 0);
-    for (uint32_t i = 0; i < n; ++i)
-      if (((sel_bits[i >> 6] >> (i & 63)) & 1ULL) != 0ULL)
+    for (uint32_t i = 0; i < n; ++i) {
+      if (((sel_bits[i >> 6] >> (i & 63)) & 1ULL) != 0ULL) {
         m[i >> 3] = static_cast<uint8_t>(m[i >> 3] | (0x80 >> (i & 7)));
+      }
+    }
   }
   if (null_bmp != nullptr) {
-    for (size_t i = 0; i < stride; ++i)
+    for (size_t i = 0; i < stride; ++i) {
       m[i] &= static_cast<uint8_t>(~null_bmp[i]);
-    if ((n & 7U) != 0U)
-      m[stride - 1] &= static_cast<uint8_t>(0xFFu << (8 - (n & 7U)));
+    }
+    if ((n & 7U) != 0U) {
+      m[stride - 1] &= static_cast<uint8_t>(0xFFU << (8 - (n & 7U)));
+    }
   }
   __int128 sum = 0;
   for (uint32_t b = 0; b < w; ++b) {
-    const unsigned char* sl = r + 1 + static_cast<size_t>(b) * stride;
+    const unsigned char* sl = r + 1 + (static_cast<size_t>(b) * stride);
     uint64_t cnt = 0;
-    for (size_t i = 0; i < stride; ++i)
+    for (size_t i = 0; i < stride; ++i) {
       cnt += static_cast<uint64_t>(
           __builtin_popcount(static_cast<unsigned int>(sl[i] & m[i])));
+    }
     // Unsigned weight: for w == 64 the sign bit weighs +2^63 mod 2^64,
     // which equals -2^63 under the final truncation (two's complement).
     sum += static_cast<__int128>(cnt) * (static_cast<__int128>(1) << b);
@@ -250,19 +292,23 @@ int64_t PaxChunk::ByteSliceFilteredSum(const char* region, uint32_t n,
   return static_cast<int64_t>(sum);
 }
 
+namespace {
+
 std::vector<uint8_t> PBitSActiveBytes(const PBitSRegion& p,
                                       const uint8_t* null_bmp,
                                       const uint64_t* sel_bits) {
   std::vector<uint8_t> active(p.stride, 0xFF);
   if ((p.n & 7U) != 0 && !active.empty()) {
-    active.back() = static_cast<uint8_t>(0xFFu << (8U - (p.n & 7U)));
+    active.back() = static_cast<uint8_t>(0xFFU << (8U - (p.n & 7U)));
   }
   if (sel_bits != nullptr) {
     std::fill(active.begin(), active.end(), 0);
     for (uint32_t i = 0; i < p.n; ++i) {
-      if ((sel_bits[i >> 6] & (1ULL << (i & 63U))) == 0) continue;
+      if ((sel_bits[i >> 6] & (1ULL << (i & 63U))) == 0) {
+        continue;
+      }
       active[i >> 3] =
-          static_cast<uint8_t>(active[i >> 3] | (0x80u >> (i & 7U)));
+          static_cast<uint8_t>(active[i >> 3] | (0x80U >> (i & 7U)));
     }
   }
   if (null_bmp != nullptr) {
@@ -279,25 +325,32 @@ std::vector<uint8_t> PBitSActiveBytes(const PBitSRegion& p,
   return active;
 }
 
+}  // namespace
+
 void PaxChunk::PBitSCompareMask(const char* region, uint32_t param, uint32_t n,
                                 const char* region_end, CompareOp op,
                                 int64_t lit, const uint8_t* null_bmp,
                                 uint64_t* out_bits) {
-  if (out_bits == nullptr) return;
+  if (out_bits == nullptr) {
+    return;
+  }
   PBitSRegion p;
-  if (!ParsePBitSRegion(region, n, param, region_end, &p)) return;
+  if (!ParsePBitSRegion(region, n, param, region_end, &p)) {
+    return;
+  }
   const uint64_t literal = PBitSOrderValue(lit);
   for (uint32_t i = 0; i < p.n; ++i) {
-    if (null_bmp != nullptr && (null_bmp[i >> 3] & (0x80u >> (i & 7U))) != 0) {
+    if (null_bmp != nullptr && (null_bmp[i >> 3] & (0x80U >> (i & 7U))) != 0) {
       continue;
     }
     if (p.exception_bmp != nullptr &&
-        (p.exception_bmp[i >> 3] & (0x80u >> (i & 7U))) != 0) {
+        (p.exception_bmp[i >> 3] & (0x80U >> (i & 7U))) != 0) {
       continue;
     }
     uint64_t q = 0;
     for (uint32_t b = 0; b < p.width; ++b) {
-      const unsigned char* plane = p.planes + static_cast<size_t>(b) * p.stride;
+      const unsigned char* plane =
+          p.planes + (static_cast<size_t>(b) * p.stride);
       q = (q << 1) |
           static_cast<uint64_t>(
               (static_cast<unsigned>(plane[i >> 3]) >> (7U - (i & 7U))) & 1U);
@@ -307,10 +360,10 @@ void PaxChunk::PBitSCompareMask(const char* region, uint32_t param, uint32_t n,
     }
   }
   for (uint32_t k = 0; k < p.exceptions; ++k) {
-    const char* entry = p.exception_values + static_cast<size_t>(k) * 10;
+    const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
     const uint32_t pos = ReadBE16(entry);
     if (pos >= p.n || (null_bmp != nullptr &&
-                       (null_bmp[pos >> 3] & (0x80u >> (pos & 7U))) != 0)) {
+                       (null_bmp[pos >> 3] & (0x80U >> (pos & 7U))) != 0)) {
       continue;
     }
     if (PBitSOrderedMatch(op, ReadBE64(entry + 2), literal)) {
@@ -323,7 +376,9 @@ uint32_t PaxChunk::PBitSNullAwareCount(const char* region, uint32_t param,
                                        uint32_t n, const char* region_end,
                                        const uint8_t* null_bmp, CompareOp op,
                                        int64_t lit) {
-  if (n == 0) return 0;
+  if (n == 0) {
+    return 0;
+  }
   std::vector<uint64_t> bits((static_cast<size_t>(n) + 63) / 64, 0);
   PBitSCompareMask(region, param, n, region_end, op, lit, null_bmp,
                    bits.data());
@@ -339,15 +394,20 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
                                    const uint8_t* null_bmp,
                                    const uint64_t* sel_bits) {
   PBitSRegion p;
-  if (!ParsePBitSRegion(region, n, param, region_end, &p)) return 0;
+  if (!ParsePBitSRegion(region, n, param, region_end, &p)) {
+    return 0;
+  }
   const std::vector<uint8_t> active = PBitSActiveBytes(p, null_bmp, sel_bits);
   uint64_t normal_count = 0;
   for (uint32_t i = 0; i < p.n; ++i) {
-    if ((active[i >> 3] & (0x80u >> (i & 7U))) == 0) continue;
+    if ((active[i >> 3] & (0x80U >> (i & 7U))) == 0) {
+      continue;
+    }
     ++normal_count;
     uint64_t q = 0;
     for (uint32_t b = 0; b < p.width; ++b) {
-      const unsigned char* plane = p.planes + static_cast<size_t>(b) * p.stride;
+      const unsigned char* plane =
+          p.planes + (static_cast<size_t>(b) * p.stride);
       q = (q << 1) |
           static_cast<uint64_t>(
               (static_cast<unsigned>(plane[i >> 3]) >> (7U - (i & 7U))) & 1U);
@@ -360,7 +420,7 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
           : static_cast<__int128>(p.base);
   __int128 ordered_sum = base_extended * static_cast<__int128>(normal_count);
   for (uint32_t b = 0; b < p.width; ++b) {
-    const unsigned char* plane = p.planes + static_cast<size_t>(b) * p.stride;
+    const unsigned char* plane = p.planes + (static_cast<size_t>(b) * p.stride);
     uint64_t count = 0;
     for (size_t i = 0; i < p.stride; ++i) {
       count += static_cast<uint64_t>(
@@ -371,10 +431,10 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
   }
   __int128 sum = ordered_sum - (static_cast<__int128>(normal_count) << 63);
   for (uint32_t k = 0; k < p.exceptions; ++k) {
-    const char* entry = p.exception_values + static_cast<size_t>(k) * 10;
+    const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
     const uint32_t pos = ReadBE16(entry);
     if (pos >= p.n || (null_bmp != nullptr &&
-                       (null_bmp[pos >> 3] & (0x80u >> (pos & 7U))) != 0)) {
+                       (null_bmp[pos >> 3] & (0x80U >> (pos & 7U))) != 0)) {
       continue;
     }
     if (sel_bits != nullptr &&
@@ -429,32 +489,34 @@ bool DictCodeHistogram(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   const uint16_t ncodes = ReadBE16(region);
-  if (ncodes == 0 || ncodes > 1024 || param != ncodes) return false;
+  if (ncodes == 0 || ncodes > 1024 || param != ncodes) {
+    return false;
+  }
   const int cw = BitsNeeded(ncodes - 1);
   const size_t dict_base =
-      2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
+      2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
   const char* dict = region + dict_base;
   // int64 dicts need 8B/entry (the validator floors at 4B/entry for the
   // varchar case); refuse rather than read into the footer.
-  if (dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > region_end) {
+  if (dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > region_end) {
     return false;
   }
   freq_out->assign(static_cast<size_t>(ncodes) + 1, 0);
-  const uint32_t cw32 = static_cast<uint32_t>(cw);
+  const auto cw32 = static_cast<uint32_t>(cw);
   if (DictPassByteExpandable(cw32)) {
     // Byte-split extraction: one byte load feeds per_byte codes, so the fold
     // costs ~1 op per row instead of an 8-byte load + bswap + shift + mask
     // per row, and the clamp is a table-sized compare against a value the
     // split already produced. Only widths that divide 8 qualify (a straddling
     // cw would desynchronize), so every other width keeps the reader loop.
-    const uint32_t per_byte = 8u / cw32;
-    const uint32_t code_mask = (1u << cw32) - 1u;
+    const uint32_t per_byte = 8U / cw32;
+    const uint32_t code_mask = (1U << cw32) - 1U;
     const uint8_t* src = reinterpret_cast<const uint8_t*>(region) + 2;
     const uint32_t whole = n / per_byte * per_byte;
     for (uint32_t i = 0; i < whole; i += per_byte) {
       const uint32_t byte = src[i / per_byte];
       for (uint32_t k = 0; k < per_byte; ++k) {
-        const uint32_t code = (byte >> (8u - cw32 * (k + 1u))) & code_mask;
+        const uint32_t code = (byte >> (8U - cw32 * (k + 1U))) & code_mask;
         ++(*freq_out)[code < ncodes ? code : ncodes];
       }
     }
@@ -462,8 +524,9 @@ bool DictCodeHistogram(const char* region, uint32_t n, uint32_t param,
     // partial slice, which the same shift expression yields correctly.
     if (whole < n) {
       const uint32_t byte = src[whole / per_byte];
-      for (uint32_t k = 0; k < n - whole; ++k) {
-        const uint32_t code = (byte >> (8u - cw32 * (k + 1u))) & code_mask;
+      const uint32_t tail = std::min(n - whole, per_byte);
+      for (uint32_t k = 0; k < tail; ++k) {
+        const uint32_t code = (byte >> (8U - cw32 * (k + 1U))) & code_mask;
         ++(*freq_out)[code < ncodes ? code : ncodes];
       }
     }
@@ -479,18 +542,24 @@ bool DictCodeHistogram(const char* region, uint32_t n, uint32_t param,
 
 bool DictColumnSum(const char* region, uint32_t n, uint32_t param,
                    const char* region_end, int64_t* sum_out) {
-  if (sum_out == nullptr) return false;
+  if (sum_out == nullptr) {
+    return false;
+  }
   std::vector<uint64_t> freq;
-  if (!DictCodeHistogram(region, n, param, region_end, &freq)) return false;
+  if (!DictCodeHistogram(region, n, param, region_end, &freq)) {
+    return false;
+  }
   const uint16_t ncodes = ReadBE16(region);
   const int cw = BitsNeeded(ncodes - 1);
   const char* dict =
-      region + 2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
+      region + 2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
   __int128 sum = 0;
   for (uint16_t d = 0; d < ncodes; ++d) {
-    if (freq[d] == 0) continue;
+    if (freq[d] == 0) {
+      continue;
+    }
     sum += static_cast<__int128>(static_cast<int64_t>(
-               ReadBE64(dict + static_cast<size_t>(d) * 8))) *
+               ReadBE64(dict + (static_cast<size_t>(d) * 8)))) *
            static_cast<__int128>(freq[d]);
   }
   // Clamped codes decode to raw 0: no contribution.
@@ -519,10 +588,10 @@ void OpDictWindowForValue(const char* region, uint32_t n, uint32_t param,
                           uint64_t* span, bool* clamp_pass) {
   const int cw = BitsNeeded(param > 0 ? param - 1 : 0);
   const char* dict =
-      region + 2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
+      region + 2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
   auto dict_at = [&](uint16_t d) {
     return static_cast<int64_t>(
-        ReadBE64(dict + static_cast<size_t>(d) * sizeof(int64_t)));
+        ReadBE64(dict + (static_cast<size_t>(d) * sizeof(int64_t))));
   };
   // lower_bound(lit): first entry >= lit; upper_bound(lit): first entry >
   // lit. Binary searches (<= 11 steps at the 1024-code cap) replace the
@@ -530,7 +599,7 @@ void OpDictWindowForValue(const char* region, uint32_t n, uint32_t param,
   auto lower_bound = [&](int64_t key) {
     uint16_t a = 0, b = static_cast<uint16_t>(param);
     while (a < b) {
-      const uint16_t m = static_cast<uint16_t>(a + (b - a) / 2);
+      const auto m = static_cast<uint16_t>(a + ((b - a) / 2));
       if (dict_at(m) < key) {
         a = static_cast<uint16_t>(m + 1);
       } else {
@@ -542,7 +611,7 @@ void OpDictWindowForValue(const char* region, uint32_t n, uint32_t param,
   auto upper_bound = [&](int64_t key) {
     uint16_t a = 0, b = static_cast<uint16_t>(param);
     while (a < b) {
-      const uint16_t m = static_cast<uint16_t>(a + (b - a) / 2);
+      const auto m = static_cast<uint16_t>(a + ((b - a) / 2));
       if (dict_at(m) <= key) {
         a = static_cast<uint16_t>(m + 1);
       } else {
@@ -589,14 +658,16 @@ bool OpDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;  // no [ncodes u16] header to read: fail closed
   }
   const uint16_t ncodes = ReadBE16(region);
-  if (ncodes == 0 || ncodes > 1024 || param != ncodes) return false;
+  if (ncodes == 0 || ncodes > 1024 || param != ncodes) {
+    return false;
+  }
   const int cw = BitsNeeded(ncodes - 1);
   const size_t dict_base =
-      2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
+      2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
   const char* dict = region + dict_base;
   // int64 dicts need 8B/entry; refuse rather than read into the footer
   // (mirrors DictCodeHistogram's extent gate).
-  if (dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > region_end) {
+  if (dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > region_end) {
     return false;
   }
   uint64_t lo = 0, span = 0;
@@ -613,7 +684,7 @@ bool OpDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
       const bool hit = code - lo < span;
       cnt += hit ? 1 : 0;
       if (hit && sum_out != nullptr) {
-        sum += ReadBE64(dict + code * sizeof(int64_t));
+        sum += ReadBE64(dict + (code * sizeof(int64_t)));
       }
     }
   } else {
@@ -624,12 +695,14 @@ bool OpDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
       const bool hit = code < ncodes ? (code - lo < span) : clamp_pass;
       cnt += hit ? 1 : 0;
       if (hit && code < ncodes && sum_out != nullptr) {
-        sum += ReadBE64(dict + code * sizeof(int64_t));
+        sum += ReadBE64(dict + (code * sizeof(int64_t)));
       }
     }
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -681,13 +754,19 @@ bool HuffDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
   uint64_t sum = 0;
   for (uint32_t s = 0; s < p.d; ++s) {
     const int64_t v = HuffDictDictAt(p, s);
-    if (!RleDictMatch(op, v, lit)) continue;
+    if (!RleDictMatch(op, v, lit)) {
+      continue;
+    }
     const uint64_t f = HuffDictFreqAt(p, s);
     cnt += f;
-    if (sum_out != nullptr) sum += static_cast<uint64_t>(v) * f;
+    if (sum_out != nullptr) {
+      sum += static_cast<uint64_t>(v) * f;
+    }
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -705,15 +784,17 @@ bool HuffDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
 bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
                         const char* region_end, PaxChunk::CompareOp op,
                         int64_t lit, uint64_t* count_out, int64_t* sum_out) {
-  constexpr size_t kTopkHeader = 2 + 2 + 15 * 8 + 15 * 2 + 1 + 4;  // 159
+  constexpr size_t kTopkHeader = 2 + 2 + (15 * 8) + (15 * 2) + 1 + 4;  // 159
   if (count_out == nullptr || region == nullptr || region_end == nullptr ||
       region_end - region < static_cast<std::ptrdiff_t>(kTopkHeader)) {
     return false;
   }
   const uint32_t d = ReadBE16(region);
   const uint32_t nexc = ReadBE16(region + 2);
-  if (d == 0 || d > 15 || nexc != param) return false;
-  const uint8_t ischeme = static_cast<uint8_t>(region[154]);
+  if (d == 0 || d > 15 || nexc != param) {
+    return false;
+  }
+  const auto ischeme = static_cast<uint8_t>(region[154]);
   const uint32_t iparam = ReadBE32(region + 155);
   const size_t nib_bytes = (static_cast<size_t>(n) + 1) / 2;
   if (region + kTopkHeader + nib_bytes > region_end ||
@@ -722,7 +803,7 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
   }
   const auto hot_at = [&](uint32_t c) {
     return static_cast<int64_t>(
-        ReadBE64(region + 4 + static_cast<size_t>(c) * 8));
+        ReadBE64(region + 4 + (static_cast<size_t>(c) * 8)));
   };
   // Tail fold, decoded lazily: the EQ-on-hot closed form must not pay for
   // it (stack-resident for the head-gate's typical tail sizes, one heap
@@ -732,14 +813,18 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
   uint64_t tail_cnt = 0;
   uint64_t tail_sum = 0;  // two's-complement u64 accumulator
   const auto eval_tail = [&]() {
-    if (tail_done) return;
+    if (tail_done) {
+      return;
+    }
     tail_done = true;
-    if (nexc == 0) return;
-    int64_t exc_stack[256];
+    if (nexc == 0) {
+      return;
+    }
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (nexc <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
     } else {
       exc_heap.resize(nexc);
       exc = exc_heap.data();
@@ -762,7 +847,7 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
     uint32_t lo = 0;
     uint32_t hi = d;
     while (lo < hi) {
-      const uint32_t mid = lo + (hi - lo) / 2;
+      const uint32_t mid = lo + ((hi - lo) / 2);
       if (hot_at(mid) < lit) {
         lo = mid + 1;
       } else {
@@ -770,7 +855,8 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
       }
     }
     if (lo < d && hot_at(lo) == lit) {
-      const uint64_t fq = ReadBE16(region + 124 + static_cast<size_t>(lo) * 2);
+      const uint64_t fq =
+          ReadBE16(region + 124 + (static_cast<size_t>(lo) * 2));
       cnt = fq;
       sum = static_cast<uint64_t>(hot_at(lo)) * fq;
     } else {
@@ -784,8 +870,10 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
     // already O(15), so no bisect is worth it.
     for (uint32_t c = 0; c < d; ++c) {
       const int64_t v = hot_at(c);
-      if (!RleDictMatch(op, v, lit)) continue;
-      const uint64_t fq = ReadBE16(region + 124 + static_cast<size_t>(c) * 2);
+      if (!RleDictMatch(op, v, lit)) {
+        continue;
+      }
+      const uint64_t fq = ReadBE16(region + 124 + (static_cast<size_t>(c) * 2));
       cnt += fq;
       sum += static_cast<uint64_t>(v) * fq;
     }
@@ -796,7 +884,9 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
     sum += tail_sum;
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -809,13 +899,14 @@ void TileDictWindowForValue(const TileDictCursor& c, PaxChunk::CompareOp op,
                             int64_t lit, uint64_t* lo, uint64_t* span,
                             bool* clamp_pass) {
   auto dict_at = [&](uint32_t i) {
-    return static_cast<int64_t>(ReadBE64(c.dict + static_cast<size_t>(i) * 8));
+    return static_cast<int64_t>(
+        ReadBE64(c.dict + (static_cast<size_t>(i) * 8)));
   };
   auto lower_bound = [&](int64_t key) {
     uint32_t a = 0;
     uint32_t b = c.d;
     while (a < b) {
-      const uint32_t m = a + (b - a) / 2;
+      const uint32_t m = a + ((b - a) / 2);
       if (dict_at(m) < key) {
         a = m + 1;
       } else {
@@ -828,7 +919,7 @@ void TileDictWindowForValue(const TileDictCursor& c, PaxChunk::CompareOp op,
     uint32_t a = 0;
     uint32_t b = c.d;
     while (a < b) {
-      const uint32_t m = a + (b - a) / 2;
+      const uint32_t m = a + ((b - a) / 2);
       if (dict_at(m) <= key) {
         a = m + 1;
       } else {
@@ -882,7 +973,9 @@ bool TileDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   TileDictCursor c;
-  if (!TileDictFirst(region, n, region_end, &c)) return false;
+  if (!TileDictFirst(region, n, region_end, &c)) {
+    return false;
+  }
   uint64_t cnt = 0;
   uint64_t sum = 0;  // two's-complement u64 accumulator
   for (;;) {
@@ -923,10 +1016,14 @@ bool TileDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
         }
       }
     }
-    if (!TileDictNext(&c)) break;
+    if (!TileDictNext(&c)) {
+      break;
+    }
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 // kRleIdx compressed-domain fold. Because the run values are sorted, the runs
@@ -939,15 +1036,23 @@ bool TileDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
 bool RleIdxRegionCountSum(const char* region, uint32_t n, uint32_t param,
                           const char* region_end, PaxChunk::CompareOp op,
                           int64_t lit, uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   RleIdxRegion p;
-  if (!ParseRleIdxRegion(region, n, param, region_end, &p)) return false;
+  if (!ParseRleIdxRegion(region, n, param, region_end, &p)) {
+    return false;
+  }
   uint32_t first = 0;
   uint32_t last = 0;
-  if (!RleIdxPassingWindow(p, op, lit, &first, &last)) return false;
+  if (!RleIdxPassingWindow(p, op, lit, &first, &last)) {
+    return false;
+  }
   if (first >= last) {
     *count_out = 0;
-    if (sum_out != nullptr) *sum_out = 0;
+    if (sum_out != nullptr) {
+      *sum_out = 0;
+    }
     return true;
   }
   // COUNT without touching the runs: the restart table holds the row index of
@@ -958,7 +1063,7 @@ bool RleIdxRegionCountSum(const char* region, uint32_t n, uint32_t param,
   if (sum_out != nullptr) {
     uint64_t sum = 0;  // two's-complement u64 accumulator
     for (uint32_t run = first; run < last; ++run) {
-      const uint64_t value = static_cast<uint64_t>(RleIdxValueAt(p, run));
+      const auto value = static_cast<uint64_t>(RleIdxValueAt(p, run));
       sum += value * RleIdxLengthAt(p, run);
     }
     *sum_out = static_cast<int64_t>(sum);
@@ -969,40 +1074,56 @@ bool RleIdxRegionCountSum(const char* region, uint32_t n, uint32_t param,
 bool Bp128RegionCountSumParsed(const Bp128Region& parsed,
                                PaxChunk::CompareOp op, int64_t literal,
                                uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   uint64_t count = 0;
   __int128 sum = 0;
   for (uint32_t block_index = 0; block_index < parsed.block_count;
        ++block_index) {
     const Bp128Block& block = parsed.blocks[block_index];
     if (op == PaxChunk::CompareOp::kEq && block.minimum == block.maximum) {
-      if (literal != block.minimum) continue;
+      if (literal != block.minimum) {
+        continue;
+      }
       count += block.rows;
-      if (sum_out != nullptr) sum += Bp128BlockSum(block);
+      if (sum_out != nullptr) {
+        sum += Bp128BlockSum(block);
+      }
       continue;
     }
     if (op != PaxChunk::CompareOp::kEq) {
       const bool minimum_hit = RleDictMatch(op, block.minimum, literal);
       const bool maximum_hit = RleDictMatch(op, block.maximum, literal);
-      if (!minimum_hit && !maximum_hit) continue;
+      if (!minimum_hit && !maximum_hit) {
+        continue;
+      }
       if (minimum_hit && maximum_hit) {
         count += block.rows;
-        if (sum_out != nullptr) sum += Bp128BlockSum(block);
+        if (sum_out != nullptr) {
+          sum += Bp128BlockSum(block);
+        }
         continue;
       }
     } else if (literal < block.minimum || literal > block.maximum) {
       continue;
     }
-    int64_t decoded[kBp128BlockRows];
-    DecodeBp128Block(parsed, block_index, decoded);
+    std::array<int64_t, kBp128BlockRows> decoded{};
+    DecodeBp128Block(parsed, block_index, decoded.data());
     for (uint32_t row = 0; row < block.rows; ++row) {
-      if (!RleDictMatch(op, decoded[row], literal)) continue;
+      if (!RleDictMatch(op, decoded[row], literal)) {
+        continue;
+      }
       ++count;
-      if (sum_out != nullptr) sum += decoded[row];
+      if (sum_out != nullptr) {
+        sum += decoded[row];
+      }
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1030,39 +1151,55 @@ bool Bp128RegionCountSum(const char* region, uint32_t n, uint32_t param,
 bool FastPforRegionCountSumParsed(const FastPforRegion& parsed,
                                   PaxChunk::CompareOp op, int64_t literal,
                                   uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   uint64_t count = 0;
   __int128 sum = 0;
   for (uint32_t b = 0; b < parsed.block_count; ++b) {
     const FastPforBlock& blk = parsed.blocks[b];
     if (op == PaxChunk::CompareOp::kEq && blk.minimum == blk.maximum) {
-      if (literal != blk.minimum) continue;
+      if (literal != blk.minimum) {
+        continue;
+      }
       count += blk.rows;
-      if (sum_out != nullptr) sum += blk.sum;
+      if (sum_out != nullptr) {
+        sum += blk.sum;
+      }
       continue;
     }
     if (op != PaxChunk::CompareOp::kEq) {
       const bool minimum_hit = RleDictMatch(op, blk.minimum, literal);
       const bool maximum_hit = RleDictMatch(op, blk.maximum, literal);
-      if (!minimum_hit && !maximum_hit) continue;
+      if (!minimum_hit && !maximum_hit) {
+        continue;
+      }
       if (minimum_hit && maximum_hit) {
         count += blk.rows;
-        if (sum_out != nullptr) sum += blk.sum;
+        if (sum_out != nullptr) {
+          sum += blk.sum;
+        }
         continue;
       }
     } else if (literal < blk.minimum || literal > blk.maximum) {
       continue;
     }
-    int64_t decoded[kFastPforBlockRows];
-    FastPforDecodeBlock(blk, decoded);
+    std::array<int64_t, kFastPforBlockRows> decoded{};
+    FastPforDecodeBlock(blk, decoded.data());
     for (uint32_t t = 0; t < blk.rows; ++t) {
-      if (!RleDictMatch(op, decoded[t], literal)) continue;
+      if (!RleDictMatch(op, decoded[t], literal)) {
+        continue;
+      }
       ++count;
-      if (sum_out != nullptr) sum += decoded[t];
+      if (sum_out != nullptr) {
+        sum += decoded[t];
+      }
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1090,39 +1227,55 @@ bool FastPforRegionCountSum(const char* region, uint32_t n, uint32_t param,
 bool DeltaFastPforRegionCountSumParsed(const DeltaFastPforRegion& parsed,
                                        PaxChunk::CompareOp op, int64_t literal,
                                        uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   uint64_t count = 0;
   __int128 sum = 0;
   for (uint32_t b = 0; b < parsed.block_count; ++b) {
     const DeltaFastPforBlock& blk = parsed.blocks[b];
     if (op == PaxChunk::CompareOp::kEq && blk.minimum == blk.maximum) {
-      if (literal != blk.minimum) continue;
+      if (literal != blk.minimum) {
+        continue;
+      }
       count += blk.rows;
-      if (sum_out != nullptr) sum += blk.sum;
+      if (sum_out != nullptr) {
+        sum += blk.sum;
+      }
       continue;
     }
     if (op != PaxChunk::CompareOp::kEq) {
       const bool minimum_hit = RleDictMatch(op, blk.minimum, literal);
       const bool maximum_hit = RleDictMatch(op, blk.maximum, literal);
-      if (!minimum_hit && !maximum_hit) continue;
+      if (!minimum_hit && !maximum_hit) {
+        continue;
+      }
       if (minimum_hit && maximum_hit) {
         count += blk.rows;
-        if (sum_out != nullptr) sum += blk.sum;
+        if (sum_out != nullptr) {
+          sum += blk.sum;
+        }
         continue;
       }
     } else if (literal < blk.minimum || literal > blk.maximum) {
       continue;
     }
-    int64_t decoded[kDeltaFastPforBlockRows];
-    DeltaFastPforDecodeBlock(blk, decoded);
+    std::array<int64_t, kDeltaFastPforBlockRows> decoded{};
+    DeltaFastPforDecodeBlock(blk, decoded.data());
     for (uint32_t t = 0; t < blk.rows; ++t) {
-      if (!RleDictMatch(op, decoded[t], literal)) continue;
+      if (!RleDictMatch(op, decoded[t], literal)) {
+        continue;
+      }
       ++count;
-      if (sum_out != nullptr) sum += decoded[t];
+      if (sum_out != nullptr) {
+        sum += decoded[t];
+      }
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1151,17 +1304,20 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;  // no [d u16] header to read: fail closed
   }
   const uint16_t d = ReadBE16(region);
-  if (d == 0 || param == 0) return false;
+  if (d == 0 || param == 0) {
+    return false;
+  }
   const int cb = (BitsNeeded(d - 1) + 7) / 8;
   const char* dict = region + 2;
-  const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+  const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
   // Header cross-check: the footer's param IS the region's run count
   // (mirrors OpDictRegionCountSum's `param != ncodes` gate).
   if (runs_hdr + 4 > region_end || ReadBE32(runs_hdr) != param) {
     return false;
   }
   const uint32_t runs = param;
-  if (runs_hdr + 4 + static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+  if (runs_hdr + 4 +
+          (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
       region_end) {
     return false;
   }
@@ -1172,7 +1328,7 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
     pass[e] =
         RleDictMatch(
             op,
-            static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(e) * 8)),
+            static_cast<int64_t>(ReadBE64(dict + (static_cast<size_t>(e) * 8))),
             lit)
             ? 1
             : 0;
@@ -1198,7 +1354,7 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
         cnt += end - acc;
         if (sum_out != nullptr && code < d) {
           sum += static_cast<__int128>(static_cast<int64_t>(
-                     ReadBE64(dict + static_cast<size_t>(code) * 8))) *
+                     ReadBE64(dict + (static_cast<size_t>(code) * 8)))) *
                  static_cast<__int128>(end - acc);
         }
       }
@@ -1208,31 +1364,43 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
   }
   // Rows past the run walk decode as raw 0; they hit exactly when the clamp
   // bucket passes (mirrors the kRle predicate arm's tail handling).
-  if (acc < n && pass[d] != 0) cnt += n - acc;
+  if (acc < n && pass[d] != 0) {
+    cnt += n - acc;
+  }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
 bool RleBpRegionCountSum(const char* region, uint32_t n, uint32_t param,
                          const char* region_end, PaxChunk::CompareOp op,
                          int64_t lit, uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   RleBpRegion p;
-  if (!ParseRleBpRegion(region, n, param, region_end, &p)) return false;
+  if (!ParseRleBpRegion(region, n, param, region_end, &p)) {
+    return false;
+  }
   uint64_t count = 0;
   __int128 sum = 0;
   for (uint32_t run = 0; run < p.runs; ++run) {
     const uint32_t length = RleBpLengthAt(p, run);
     const int64_t value = RleBpValueAt(p, run);
-    if (!RleDictMatch(op, value, lit)) continue;
+    if (!RleDictMatch(op, value, lit)) {
+      continue;
+    }
     count += length;
     if (sum_out != nullptr) {
       sum += static_cast<__int128>(value) * length;
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1240,9 +1408,11 @@ bool Simple8bRegionCountSum(const char* region, uint32_t n, uint32_t param,
                             const char* region_end, PaxChunk::CompareOp op,
                             int64_t lit, uint64_t* count_out,
                             int64_t* sum_out) {
-  if (count_out == nullptr || n == 0 || param == 0) return false;
+  if (count_out == nullptr || n == 0 || param == 0) {
+    return false;
+  }
   if (region_end != nullptr &&
-      region + 8 + static_cast<size_t>(param) * 8 > region_end) {
+      region + 8 + (static_cast<size_t>(param) * 8) > region_end) {
     return false;
   }
   const uint64_t base_u = ReadBE64(region);
@@ -1253,10 +1423,10 @@ bool Simple8bRegionCountSum(const char* region, uint32_t n, uint32_t param,
   const char* p = region + 8;
   for (uint32_t w = 0; w < param && remaining > 0; ++w, p += 8) {
     const uint64_t word = ReadBE64(p);
-    const uint32_t sel = static_cast<uint32_t>(word >> 60);
+    const auto sel = static_cast<uint32_t>(word >> 60);
     const uint32_t cnt = kSimple8bSelCount[sel];
     const uint32_t bits = kSimple8bSelBits[sel];
-    const uint32_t avail = static_cast<uint32_t>(remaining);
+    const auto avail = static_cast<uint32_t>(remaining);
     const uint32_t take = cnt < avail ? cnt : avail;
     // Word-level verdict from the [base, base+mask] value range: a word
     // that cannot match costs one endpoint compare instead of a decode.
@@ -1300,46 +1470,57 @@ bool Simple8bRegionCountSum(const char* region, uint32_t n, uint32_t param,
     count += remaining;
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
 bool Rle8RegionCountSum(const char* region, uint32_t n, uint32_t param,
                         const char* region_end, PaxChunk::CompareOp op,
                         int64_t lit, uint64_t* count_out, int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   Rle8Region parsed;
-  if (!ParseRle8Region(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRle8Region(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   std::array<uint64_t, 16> bits{};
   if (!Rle8FillPredicateMask(parsed, op, lit, nullptr, bits.data())) {
     return false;
   }
   *count_out = Rle8MaskRange(bits.data(), 0, n);
-  if (sum_out != nullptr && !Rle8SumMask(parsed, bits.data(), sum_out)) {
-    return false;
-  }
-  return true;
+  return sum_out == nullptr || Rle8SumMask(parsed, bits.data(), sum_out);
 }
 
 bool RleDeltaRegionCountSum(const char* region, uint32_t n, uint32_t param,
                             const char* region_end, PaxChunk::CompareOp op,
                             int64_t lit, uint64_t* count_out,
                             int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   RleDeltaRegion parsed;
-  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   uint64_t count = 0;
   __int128 sum = 0;
   for (uint32_t run = 0; run < parsed.run_count; ++run) {
     const RleDeltaRun& item = parsed.runs[run];
-    if (!RleDictMatch(op, item.value, lit)) continue;
+    if (!RleDictMatch(op, item.value, lit)) {
+      continue;
+    }
     count += item.length;
     if (sum_out != nullptr) {
       sum += static_cast<__int128>(item.value) * item.length;
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1357,27 +1538,30 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;  // no [d u16] header to read: fail closed
   }
   const uint16_t d = ReadBE16(region);
-  if (d == 0 || param == 0) return false;
+  if (d == 0 || param == 0) {
+    return false;
+  }
   const int cb = (BitsNeeded(d - 1) + 7) / 8;
   const char* dict = region + 2;
-  const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+  const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
   // Header cross-check: the footer's param IS the run count (mirrors the
   // kRleDict arm).
   if (runs_hdr + 4 > region_end || ReadBE32(runs_hdr) != param) {
     return false;
   }
   const uint32_t runs = param;
-  if (runs_hdr + 4 + static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+  if (runs_hdr + 4 +
+          (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
       region_end) {
     return false;
   }
   const auto dict_at = [&](uint32_t e) {
-    return static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(e) * 8));
+    return static_cast<int64_t>(ReadBE64(dict + (static_cast<size_t>(e) * 8)));
   };
   const auto lb = [&](int64_t key) {  // first e with dict[e] >= key
     uint32_t l = 0, h = d;
     while (l < h) {
-      const uint32_t mid = l + (h - l) / 2;
+      const uint32_t mid = l + ((h - l) / 2);
       if (dict_at(mid) < key) {
         l = mid + 1;
       } else {
@@ -1389,7 +1573,7 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
   const auto ub = [&](int64_t key) {  // first e with dict[e] > key
     uint32_t l = 0, h = d;
     while (l < h) {
-      const uint32_t mid = l + (h - l) / 2;
+      const uint32_t mid = l + ((h - l) / 2);
       if (key < dict_at(mid)) {
         h = mid;
       } else {
@@ -1449,9 +1633,13 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
     acc = next;
     q += static_cast<size_t>(cb) + 4;
   }
-  if (acc < n && zero_pass) cnt += n - acc;
+  if (acc < n && zero_pass) {
+    cnt += n - acc;
+  }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1463,23 +1651,29 @@ bool InterpRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   __int128 plo = 0, phi = 0;
-  if (!InterpWindowForValue(op, lit, &plo, &phi)) return false;
+  if (!InterpWindowForValue(op, lit, &plo, &phi)) {
+    return false;
+  }
   InterpRegion p;
-  if (!ParseInterpRegion(region, n, param, region_end, &p)) return false;
+  if (!ParseInterpRegion(region, n, param, region_end, &p)) {
+    return false;
+  }
   uint64_t cnt = 0;
   __int128 sum = 0;
   for (uint32_t b = 0; b < p.ncp; ++b) {
-    const char* ck = p.ckpts + static_cast<size_t>(b) * 16;
+    const char* ck = p.ckpts + (static_cast<size_t>(b) * 16);
     // SIGNED bracket domain: a sign-crossing block's u64 words sort
     // backwards (see ParseInterpRegion).
-    const __int128 first =
+    const auto first =
         static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck)));
-    const __int128 last =
+    const auto last =
         static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck + 8)));
     // The decoded values of block b provably lie inside [first, last] (the
     // tree bounds close on them), so the bracket alone decides "cannot
     // match" and -- when no sum is requested -- "all match" too.
-    if (last < plo || first > phi) continue;
+    if (last < plo || first > phi) {
+      continue;
+    }
     if (sum_out == nullptr && first >= plo && last <= phi) {
       const uint32_t s = b * kInterpBlockRows;
       const uint32_t t = std::min(p.n, (b + 1) * kInterpBlockRows);
@@ -1489,14 +1683,16 @@ bool InterpRegionCountSum(const char* region, uint32_t n, uint32_t param,
     InterpEvalBlock(p, b, plo, phi, nullptr, sum_out != nullptr, &cnt, &sum);
   }
   *count_out = cnt;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
 __int128 DeltaPForBracketSum(const char* bracket) {
   const __int128 high = static_cast<int64_t>(ReadBE64(bracket + 16));
   const uint64_t low_bits = ReadBE64(bracket + 24);
-  return high * (static_cast<__int128>(1) << 64) +
+  return (high * (static_cast<__int128>(1) << 64)) +
          static_cast<__int128>(low_bits);
 }
 
@@ -1504,10 +1700,14 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
                              const char* region_end, PaxChunk::CompareOp op,
                              int64_t lit, uint64_t* count_out,
                              int64_t* sum_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   __int128 low_value = 0;
   __int128 high_value = 0;
-  if (!InterpWindowForValue(op, lit, &low_value, &high_value)) return false;
+  if (!InterpWindowForValue(op, lit, &low_value, &high_value)) {
+    return false;
+  }
   DeltaPForRegion parsed;
   if (!ParseDeltaPForRegion(region, n, param, region_end, &parsed)) {
     return false;
@@ -1517,9 +1717,9 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
   __int128 sum = 0;
   for (uint32_t block = 0; block < parsed.blocks; ++block) {
     const char* bracket =
-        parsed.brackets + static_cast<size_t>(block) * kDeltaPForBracketBytes;
-    const int64_t first = static_cast<int64_t>(ReadBE64(bracket));
-    const int64_t last = static_cast<int64_t>(ReadBE64(bracket + 8));
+        parsed.brackets + (static_cast<size_t>(block) * kDeltaPForBracketBytes);
+    const auto first = static_cast<int64_t>(ReadBE64(bracket));
+    const auto last = static_cast<int64_t>(ReadBE64(bracket + 8));
     if (static_cast<__int128>(last) < low_value ||
         static_cast<__int128>(first) > high_value) {
       continue;
@@ -1530,20 +1730,28 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
     if (static_cast<__int128>(first) >= low_value &&
         static_cast<__int128>(last) <= high_value) {
       count += rows;
-      if (sum_out != nullptr) sum += DeltaPForBracketSum(bracket);
+      if (sum_out != nullptr) {
+        sum += DeltaPForBracketSum(bracket);
+      }
       continue;
     }
-    int64_t decoded[kDeltaPForBlockRows];
-    DecodeDeltaPForBlock(parsed, block, decoded);
+    std::array<int64_t, kDeltaPForBlockRows> decoded{};
+    DecodeDeltaPForBlock(parsed, block, decoded.data());
     for (uint32_t i = 0; i < rows; ++i) {
       const __int128 value = decoded[i];
-      if (value < low_value || value > high_value) continue;
+      if (value < low_value || value > high_value) {
+        continue;
+      }
       ++count;
-      if (sum_out != nullptr) sum += value;
+      if (sum_out != nullptr) {
+        sum += value;
+      }
     }
   }
   *count_out = count;
-  if (sum_out != nullptr) *sum_out = static_cast<int64_t>(sum);
+  if (sum_out != nullptr) {
+    *sum_out = static_cast<int64_t>(sum);
+  }
   return true;
 }
 
@@ -1562,14 +1770,18 @@ bool OpDictRangeFold(const EncodedBlock& block, int64_t low, int64_t high,
   const char* region = block.bytes.data();
   const char* region_end = region + block.bytes.size();
   const uint16_t ncodes = ReadBE16(region);
-  if (ncodes == 0 || ncodes > 1024 || block.param != ncodes) return false;
+  if (ncodes == 0 || ncodes > 1024 || block.param != ncodes) {
+    return false;
+  }
   const int code_width = BitsNeeded(ncodes - 1);
-  const size_t dictionary_offset = 2 + (static_cast<size_t>(block.row_count) *
-                                            static_cast<size_t>(code_width) +
-                                        7) /
-                                           8;
+  const size_t dictionary_offset =
+      2 +
+      ((static_cast<size_t>(block.row_count) * static_cast<size_t>(code_width) +
+        7) /
+       8);
   const char* dictionary = region + dictionary_offset;
-  if (dictionary + static_cast<size_t>(ncodes) * sizeof(int64_t) > region_end) {
+  if (dictionary + (static_cast<size_t>(ncodes) * sizeof(int64_t)) >
+      region_end) {
     return false;
   }
 
@@ -1593,7 +1805,9 @@ bool OpDictRangeFold(const EncodedBlock& block, int64_t low, int64_t high,
   for (uint32_t row = 0; row < block.row_count; ++row) {
     const uint64_t code = reader.get(code_width);
     const bool hit = code < ncodes ? code - lower_code < window : clamp_pass;
-    if (!hit) continue;
+    if (!hit) {
+      continue;
+    }
     ++count;
     if (!output_mask.empty()) {
       const uint64_t output_row = static_cast<uint64_t>(row_offset) + row;
@@ -1612,14 +1826,15 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
                                            CompareOp op, int64_t lit) {
   // BSI fast path: slice-parallel mask + popcount, no value materialization.
   if (s == Scheme::kByteSlice && n > 0 && n <= 1024) {
-    const uint8_t w = static_cast<uint8_t>(region[0]);
+    const auto w = static_cast<uint8_t>(region[0]);
     if (w != 0 && w <= 64 && w == static_cast<uint8_t>(param)) {
-      uint64_t bits[16] = {0};
-      ByteSliceCompareMask(region, n, op, lit, null_bmp, bits);
+      std::array<uint64_t, 16> bits{};
+      ByteSliceCompareMask(region, n, op, lit, null_bmp, bits.data());
       uint64_t cnt = 0;
       const size_t words = (static_cast<size_t>(n) + 63) / 64;
-      for (size_t k = 0; k < words; ++k)
+      for (size_t k = 0; k < words; ++k) {
         cnt += static_cast<uint64_t>(__builtin_popcountll(bits[k]));
+      }
       return static_cast<uint32_t>(cnt);
     }
   }
@@ -1670,7 +1885,9 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
       if (null_bmp != nullptr) {
         uint64_t nulls = 0;
         for (uint32_t i = 0; i < n; ++i) {
-          if ((null_bmp[i >> 3] >> (7 - (i & 7)) & 1) != 0) ++nulls;
+          if ((null_bmp[i >> 3] >> (7 - (i & 7)) & 1) != 0) {
+            ++nulls;
+          }
         }
         bool zero_matches = false;
         switch (op) {
@@ -1690,7 +1907,9 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
             zero_matches = lit < 0;
             break;
         }
-        if (zero_matches && cnt >= nulls) cnt -= nulls;
+        if (zero_matches && cnt >= nulls) {
+          cnt -= nulls;
+        }
       }
       return static_cast<uint32_t>(cnt);
     }
@@ -1708,7 +1927,7 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
   }
   uint32_t count = 0;
   for (uint32_t i = 0; i < n; ++i) {
-    if (null_bmp != nullptr && (null_bmp[i >> 3] >> (7 - (i & 7)) & 1)) {
+    if (null_bmp != nullptr && ((null_bmp[i >> 3] >> (7 - (i & 7)) & 1) != 0)) {
       continue;
     }
     const int64_t v = Int64RegionAt(region, s, param, n, i, nullptr);
@@ -1730,7 +1949,7 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
         hit = (v > lit);
         break;
     }
-    count += hit;
+    count += static_cast<uint32_t>(hit);
   }
   return count;
 }
@@ -1750,7 +1969,9 @@ struct LzDict {
   LzDict() : tbl(1 << 16, -1) {}
   uint32_t hash(const char* p) const {
     uint32_t h = 0;
-    for (int i = 0; i < 4; ++i) h = h * 31u + static_cast<uint8_t>(p[i]);
+    for (int i = 0; i < 4; ++i) {
+      h = (h * 31U) + static_cast<uint8_t>(p[i]);
+    }
     return h & static_cast<uint32_t>(tbl.size() - 1);
   }
 };
@@ -1759,7 +1980,9 @@ struct LzDict {
 std::vector<char> PaxChunk::CompressRegion(std::string_view in) {
   std::vector<char> out;
   const size_t n = in.size();
-  if (n == 0) return out;
+  if (n == 0) {
+    return out;
+  }
   const char* p = in.data();
   LzDict dict;
   size_t i = 0;
@@ -1770,7 +1993,9 @@ std::vector<char> PaxChunk::CompressRegion(std::string_view in) {
       // with the high bit CLEAR; values >=128 would collide with the match
       // token marker (high bit set).
       size_t run = std::min<size_t>(lit_end - lit_start, 127);
-      if (run == 0) break;
+      if (run == 0) {
+        break;
+      }
       out.push_back(static_cast<char>(run - 1));
       out.insert(out.end(), p + lit_start, p + lit_start + run);
       lit_start += run;
@@ -1783,13 +2008,13 @@ std::vector<char> PaxChunk::CompressRegion(std::string_view in) {
       uint32_t h = dict.hash(p + i);
       int32_t cand = dict.tbl[h];
       if (cand >= 0) {
-        size_t max_off = i;
-        if (max_off > LzDict::kMaxOff) max_off = LzDict::kMaxOff;
-        const size_t cu = static_cast<size_t>(cand);
+        const auto cu = static_cast<size_t>(cand);
         if (cu + LzDict::kMaxOff >= i) {
           size_t maxlen = std::min<size_t>(n - i, 130);
           size_t l = 0;
-          while (l < maxlen && p[cu + l] == p[i + l]) ++l;
+          while (l < maxlen && p[cu + l] == p[i + l]) {
+            ++l;
+          }
           if (l >= 4) {
             best_len = l;
             best_off = i - cu;
@@ -1821,7 +2046,7 @@ std::vector<char> PaxChunk::DecompressRegion(std::string_view in,
   const size_t n = in.size();
   size_t pos = 0;
   while (pos < n && out.size() < uncompressed_size) {
-    uint8_t ctrl = static_cast<uint8_t>(p[pos++]);
+    auto ctrl = static_cast<uint8_t>(p[pos++]);
     if ((ctrl & 0x80) == 0) {
       size_t run = ctrl + 1;
       // Inner bound on out.size(): a literal token carries up to 128 bytes
@@ -1834,14 +2059,18 @@ std::vector<char> PaxChunk::DecompressRegion(std::string_view in,
       }
     } else {
       size_t ml = (ctrl & 0x7F) + 3;
-      if (pos + 2 > n) break;  // truncated offset field
+      if (pos + 2 > n) {
+        break;  // truncated offset field
+      }
       size_t off = static_cast<uint8_t>(p[pos]) |
                    (static_cast<size_t>(static_cast<uint8_t>(p[pos + 1])) << 8);
       pos += 2;
       // A corrupt/hostile match token can carry off == 0 or off > bytes
       // already emitted; `out.size() - off` would underflow to a huge index
       // and out[src++] would read/write out of bounds. Stop on such input.
-      if (off == 0 || off > out.size()) break;
+      if (off == 0 || off > out.size()) {
+        break;
+      }
       size_t src = out.size() - off;
       for (size_t k = 0; k < ml && out.size() < uncompressed_size; ++k) {
         out.push_back(out[src++]);
@@ -1859,7 +2088,9 @@ StatusOr<std::vector<char>> PaxChunk::DecompressRegionExact(
   // (hash dominates at ~48B/row); 1 GiB covers even multi-million-row
   // standalone chunks with wide margin.
   constexpr size_t kMaxExactOutput = 1ULL * 1024 * 1024 * 1024;
-  if (uncompressed_size > kMaxExactOutput) return Status::kCorruption;
+  if (uncompressed_size > kMaxExactOutput) {
+    return Status::kCorruption;
+  }
   std::vector<char> out;
   if (uncompressed_size == 0) {
     return in.empty() ? StatusOr<std::vector<char>>(std::move(out))
@@ -1870,31 +2101,42 @@ StatusOr<std::vector<char>> PaxChunk::DecompressRegionExact(
   const size_t n = in.size();
   size_t pos = 0;
   while (pos < n && out.size() < uncompressed_size) {
-    uint8_t ctrl = static_cast<uint8_t>(p[pos++]);
+    auto ctrl = static_cast<uint8_t>(p[pos++]);
     if ((ctrl & 0x80) == 0) {
       size_t run = static_cast<size_t>(ctrl) + 1;
       // Exact size: a literal run must fit both the input remainder and the
       // output remainder, otherwise the stream is truncated or over-long.
-      if (run > n - pos || run > uncompressed_size - out.size())
+      if (run > n - pos || run > uncompressed_size - out.size()) {
         return Status::kCorruption;
+      }
       out.insert(out.end(), p + pos, p + pos + run);
       pos += run;
     } else {
       size_t ml = (static_cast<size_t>(ctrl & 0x7F)) + 3;
-      if (pos + 2 > n) return Status::kCorruption;  // truncated offset field
+      if (pos + 2 > n) {
+        return Status::kCorruption;  // truncated offset field
+      }
       size_t off = static_cast<uint8_t>(p[pos]) |
                    (static_cast<size_t>(static_cast<uint8_t>(p[pos + 1])) << 8);
       pos += 2;
-      if (off == 0 || off > out.size()) return Status::kCorruption;
-      if (ml > uncompressed_size - out.size()) return Status::kCorruption;
+      if (off == 0 || off > out.size()) {
+        return Status::kCorruption;
+      }
+      if (ml > uncompressed_size - out.size()) {
+        return Status::kCorruption;
+      }
       size_t src = out.size() - off;
-      for (size_t k = 0; k < ml; ++k) out.push_back(out[src++]);
+      for (size_t k = 0; k < ml; ++k) {
+        out.push_back(out[src++]);
+      }
     }
   }
   // Fail-closed: exact byte count AND full stream consumption. Trailing
   // garbage, truncation, and overshoot all land here.
-  if (out.size() != uncompressed_size || pos != n) return Status::kCorruption;
-  return StatusOr<std::vector<char>>(std::move(out));
+  if (out.size() != uncompressed_size || pos != n) {
+    return Status::kCorruption;
+  }
+  return {std::move(out)};
 }
 
 // Xor8 peel scratch records. Same math and update order as the original
@@ -1904,7 +2146,9 @@ StatusOr<std::vector<char>> PaxChunk::DecompressRegionExact(
 // recomputed only for the winning seed's table pass instead of being stored
 // per seed -- keeping the whole working set inside L1 matters more than the
 // 1024 extra hashes on ~8% of seed passes.
-#if defined(__x86_64__)
+namespace {
+
+#ifdef __x86_64__
 // AVX-512 form of the xor8 per-seed hash loop: 8 keys per iteration run the
 // two-round splitmix (vpmullq, AVX512DQ) and the three Barrett mods (the
 // high-64 products come from 32x32->64 partial products, since vpmuludq is
@@ -2002,16 +2246,18 @@ inline void Xor8HashBucketsAvx512(const uint64_t* keys, size_t n, uint32_t seed,
     if (hash_out != nullptr) {
       _mm512_storeu_si512(reinterpret_cast<__m512i*>(hash_out + k), h);
     }
-    uint32_t t0[16], t1[16], t2[16];  // 64B stores need the full register
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t0), b0);
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t1), b1);
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t2), b2);
+    std::array<uint32_t, 16> t0{};
+    std::array<uint32_t, 16> t1{};
+    std::array<uint32_t, 16> t2{};  // 64B stores need the full register
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t0.data()), b0);
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t1.data()), b1);
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(t2.data()), b2);
     for (size_t j = 0; j < 8; ++j) {
       // vpmuludq/vpmullq results live in the LOW 32 bits of each 64-bit lane.
       const uint32_t v0 = t0[j * 2], v1 = t1[j * 2], v2 = t2[j * 2];
       refs_out[(k + j) * 3U] = static_cast<uint16_t>(v0);
-      refs_out[(k + j) * 3U + 1] = static_cast<uint16_t>(v1);
-      refs_out[(k + j) * 3U + 2] = static_cast<uint16_t>(v2);
+      refs_out[((k + j) * 3U) + 1] = static_cast<uint16_t>(v1);
+      refs_out[((k + j) * 3U) + 2] = static_cast<uint16_t>(v2);
       ++buckets[v0];
       ++buckets[v1];
       ++buckets[v2];
@@ -2019,13 +2265,15 @@ inline void Xor8HashBucketsAvx512(const uint64_t* keys, size_t n, uint32_t seed,
   }
   for (; k < n; ++k) {
     const uint64_t h = XorHash64(static_cast<int64_t>(keys[k]), seed);
-    if (hash_out != nullptr) hash_out[k] = h;
+    if (hash_out != nullptr) {
+      hash_out[k] = h;
+    }
     const uint32_t b0 = FastMod64(m)(h);
     const uint32_t b1 = FastMod64(m)(XorRotL(h, 21));
     const uint32_t b2 = FastMod64(m)(XorRotL(h, 42));
-    refs_out[k * 3 + 0] = static_cast<uint16_t>(b0);
-    refs_out[k * 3 + 1] = static_cast<uint16_t>(b1);
-    refs_out[k * 3 + 2] = static_cast<uint16_t>(b2);
+    refs_out[(k * 3) + 0] = static_cast<uint16_t>(b0);
+    refs_out[(k * 3) + 1] = static_cast<uint16_t>(b1);
+    refs_out[(k * 3) + 2] = static_cast<uint16_t>(b2);
     ++buckets[b0];
     ++buckets[b1];
     ++buckets[b2];
@@ -2041,6 +2289,8 @@ struct XorKeyRef {
   uint16_t b1;
   uint16_t b2;
 };
+
+}  // namespace
 
 PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                                       bool compress) {
@@ -2068,9 +2318,11 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // cached in a function-local static, so setenv toggles in tests and
   // benchmarks take effect on the next build) and threaded into every row
   // group's EncodeColumnAdaptive without re-probing the environment.
-  const AdaptiveEnv env{ForcePlain(),
-                        std::getenv("TINYLAMB_NO_NEW_SCHEMES") != nullptr,
-                        kNoInvIdx, std::getenv("TINYLAMB_FORCE_SCHEME")};
+  const AdaptiveEnv env{
+      .force_plain = ForcePlain(),
+      .no_new_schemes = std::getenv("TINYLAMB_NO_NEW_SCHEMES") != nullptr,
+      .no_inv_idx = kNoInvIdx,
+      .forced_scheme = std::getenv("TINYLAMB_FORCE_SCHEME")};
 
   // Front-load the big allocations: the column region's PLAIN bound and the
   // serialized hash-index table dominate the final chunk size, and letting
@@ -2080,13 +2332,16 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // not resident pages; growth still works when the bound is beaten.
   {
     size_t reserve_bytes =
-        run.Size() * static_cast<size_t>(footer.column_count) * 8 + (64 << 10);
+        (run.Size() * static_cast<size_t>(footer.column_count) * 8) +
+        (64 << 10);
     if (footer.key_column_type == static_cast<uint8_t>(ValueType::kInt64) &&
         std::getenv("TINYLAMB_NO_HASH_IDX") == nullptr) {
       const size_t slots_per_row =
           std::getenv("TINYLAMB_SMALL_HASH_IDX") != nullptr ? 2 : 4;
       size_t slots = 1;
-      while (slots < run.Size() * slots_per_row) slots <<= 1;
+      while (slots < run.Size() * slots_per_row) {
+        slots <<= 1;
+      }
       reserve_bytes += slots * 12;
     }
     data.reserve(reserve_bytes);
@@ -2100,7 +2355,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   const bool use_soa = [sc]() {
     for (slot_t c = 0; c < sc.ColumnCount(); ++c) {
       const ValueType t = sc.GetColumn(c).Type();
-      if (t != ValueType::kInt64 && t != ValueType::kDouble) return false;
+      if (t != ValueType::kInt64 && t != ValueType::kDouble) {
+        return false;
+      }
     }
     return sc.ColumnCount() > 0;
   }();
@@ -2123,7 +2380,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // counts the live rows of the group being built; encoding below sees the
   // pool as a span of that length.
   std::vector<Row> group_rows;
-  if (!use_soa) group_rows.reserve(kRowGroupSize);
+  if (!use_soa) {
+    group_rows.reserve(kRowGroupSize);
+  }
   size_t group_fill = 0;
   size_t total_rows = 0;
   // PGM learned index (v15): raw key-column values in global row order.
@@ -2131,19 +2390,23 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // at finalize time.
   std::vector<int64_t> pgm_keys;
   bool pgm_usable =
+      sc.KeyColumnIndex() < sc.ColumnCount() &&
       (sc.GetColumn(sc.KeyColumnIndex()).Type() == ValueType::kInt64);
   // Front-loaded to the full key count: without it the key stream's
   // doublings repeat the data region's mmap/copy/fault churn.
   pgm_keys.reserve(kRowGroupSize);
-  if (pgm_usable && run.Size() > kRowGroupSize) pgm_keys.reserve(run.Size());
+  if (pgm_usable && run.Size() > kRowGroupSize) {
+    pgm_keys.reserve(run.Size());
+  }
   // Extended column stats (v12): per-column MIN/MAX / null count / value
   // frequency (bounded) accumulated across every row group, finalized into a
   // mode + histogram just before serialization. The profiler feeds it inline
   // during the fused row-group pass (kMaxModeKeys lives beside the profiler).
   std::vector<FlatMapI64> col_freq;
   col_freq.reserve(static_cast<size_t>(footer.column_count));
-  for (slot_t cf = 0; cf < footer.column_count; ++cf)
+  for (slot_t cf = 0; cf < footer.column_count; ++cf) {
     col_freq.emplace_back(kMaxModeKeys);
+  }
   // Per-column direct-mapped front cache for the mode map (see
   // ModeFrontEntry): created and reset with col_freq, whose counts it
   // mirrors lazily.
@@ -2181,14 +2444,20 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   while (it.IsValid()) {
     if (!it.IsDeleted()) {
       if (!use_soa) {
-        if (group_fill == group_rows.size()) group_rows.emplace_back();
-        it.GetEntry().BuildRowInto(run.Blob(), sc, &group_rows[group_fill]);
+        if (group_fill == group_rows.size()) {
+          group_rows.emplace_back();
+        }
+        if (it.GetEntry().BuildRowInto(run.Blob(), sc,
+                                       &group_rows[group_fill])) {
+          ++group_fill;
+          ++total_rows;
+        }
       } else {
         BuildCellsInto(it.GetEntry(), run.Blob(), sc, soa_col_types, group_fill,
                        &soa);
+        ++group_fill;
+        ++total_rows;
       }
-      ++group_fill;
-      ++total_rows;
     }
     ++it;
     if (group_fill == kRowGroupSize || !it.IsValid()) {
@@ -2217,7 +2486,7 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                         col_mode_cnt, pgm_keys, pgm_usable,
                         use_soa ? &soa : nullptr, mode_front);
         for (slot_t c = 0; c < footer.column_count; ++c) {
-          uint32_t col_off = static_cast<uint32_t>(data.size());
+          auto col_off = static_cast<uint32_t>(data.size());
           footer.column_offsets.push_back(col_off);
           EncodedCol enc = EncodeColumnAdaptive(c, sc, live_rows, prof[c], env,
                                                 use_soa ? &soa : nullptr);
@@ -2228,7 +2497,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         footer.row_counts.push_back(static_cast<uint16_t>(group_fill));
         // Per-(RG,col) null bitmap (byte-slice / null-aware scan support).
         for (slot_t c = 0; c < footer.column_count; ++c) {
-          if (prof[c].has_null) footer.null_present = true;
+          if (prof[c].has_null) {
+            footer.null_present = true;
+          }
           footer.null_bitmaps.insert(footer.null_bitmaps.end(),
                                      prof[c].null_bmp.begin(),
                                      prof[c].null_bmp.end());
@@ -2250,8 +2521,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         const size_t prev_sz = footer.rg_blooms.size();
         footer.rg_blooms.resize(prev_sz +
                                 static_cast<size_t>(footer.column_count));
-        for (size_t i = prev_sz; i < footer.rg_blooms.size(); ++i)
+        for (size_t i = prev_sz; i < footer.rg_blooms.size(); ++i) {
           footer.rg_blooms[i] = 0;
+        }
 
         footer.rg_sums_present = true;
         // Current 0-based row-group index (row_counts is pushed per group).
@@ -2261,19 +2533,24 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
           const bool is_i64 = P.is_i64;
           footer.col_sum_valid[c] = is_i64 ? 1 : 0;
           footer.col_counts[c] += P.count;
-          if (is_i64) footer.col_nulls[c] += P.null_count;
-          if (is_i64)
+          if (is_i64) {
+            footer.col_nulls[c] += P.null_count;
+          }
+          if (is_i64) {
             footer.col_sums[c] =
                 static_cast<int64_t>(static_cast<uint64_t>(footer.col_sums[c]) +
                                      static_cast<uint64_t>(P.sum));
+          }
           if (is_i64) {
-            if (P.cmin < footer.col_mins[c]) footer.col_mins[c] = P.cmin;
-            if (P.cmax > footer.col_maxs[c]) footer.col_maxs[c] = P.cmax;
+            footer.col_mins[c] = std::min(P.cmin, footer.col_mins[c]);
+            footer.col_maxs[c] = std::max(P.cmax, footer.col_maxs[c]);
           }
           footer.all_zone_mins.push_back(P.mn);
           footer.all_zone_maxs.push_back(P.mx);
-          const size_t bi = g_idx * footer.column_count + c;
-          if (bi < footer.rg_blooms.size()) footer.rg_blooms[bi] = P.bloom;
+          const size_t bi = (g_idx * footer.column_count) + c;
+          if (bi < footer.rg_blooms.size()) {
+            footer.rg_blooms[bi] = P.bloom;
+          }
           // Per-RG sums fold the profile accumulator directly (NULL cells
           // contribute nothing, matching the historical computation).
           footer.rg_sums.push_back(P.sum);
@@ -2289,37 +2566,45 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         const size_t hll_base =
             g_idx * static_cast<size_t>(footer.column_count) * 64;
         if (footer.hll_sketches.size() <
-            hll_base + static_cast<size_t>(footer.column_count) * 64)
+            hll_base + (static_cast<size_t>(footer.column_count) * 64)) {
           footer.hll_sketches.resize(
-              hll_base + static_cast<size_t>(footer.column_count) * 64, 0);
+              hll_base + (static_cast<size_t>(footer.column_count) * 64), 0);
+        }
         for (slot_t c = 0; c < footer.column_count; ++c) {
-          if (!prof[c].is_i64) continue;
+          if (!prof[c].is_i64) {
+            continue;
+          }
           uint8_t* regs =
-              &footer.hll_sketches[hll_base + static_cast<size_t>(c) * 64];
-          for (int r = 0; r < 64; ++r)
-            if (prof[c].hll[r] > regs[r]) regs[r] = prof[c].hll[r];
+              &footer.hll_sketches[hll_base + (static_cast<size_t>(c) * 64)];
+          for (int r = 0; r < 64; ++r) {
+            regs[r] = std::max(prof[c].hll[r], regs[r]);
+          }
         }
         // Inverted secondary index (v13): postings arrive fused in the
         // profile (same abort threshold); only the cell assembly (sort +
         // publish) remains here. TINYLAMB_NO_INV_IDX skips the whole section.
         {
-          const uint32_t rg_idx =
+          const auto rg_idx =
               static_cast<uint32_t>(footer.row_counts.size() - 1);
           for (slot_t c = 0; c < footer.column_count && !kNoInvIdx; ++c) {
-            if (!prof[c].is_i64) continue;
+            if (!prof[c].is_i64) {
+              continue;
+            }
             // A kPostings cell IS the inverted index: the codec carries the
             // posting lists compressed behind the exact count table, so the
             // raw footer copy would be dead weight (every query path this
             // index serves falls back to the scan kernels, which hit the
             // closed forms on these cells).
             const size_t ecell =
-                static_cast<size_t>(rg_idx) * footer.column_count + c;
+                (static_cast<size_t>(rg_idx) * footer.column_count) + c;
             if (static_cast<Scheme>(footer.encodings[ecell]) ==
                 Scheme::kPostings) {
               continue;
             }
             const auto& post = prof[c].postings;
-            if (prof[c].postings_big || post.key_count < 2) continue;
+            if (prof[c].postings_big || post.key_count < 2) {
+              continue;
+            }
             InvertedCell cell;
             cell.group = rg_idx;
             cell.column = c;
@@ -2348,7 +2633,7 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         // no-inv build routes low-cardinality cells into xor tables unless
         // both flags are set; the flags are orthogonal by design.
         {
-          const uint32_t rg_idx =
+          const auto rg_idx =
               static_cast<uint32_t>(footer.row_counts.size() - 1);
           // Scratch is chunk-scoped (declared beside `prof`): the peel
           // tables and the kidx map are reused by every (row group, column)
@@ -2356,22 +2641,27 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
           // of being malloc'd, filled cold, and freed ~3 times per row
           // group.
           for (slot_t c = 0; c < footer.column_count && !kNoXor8; ++c) {
-            if (!prof[c].is_i64) continue;
+            if (!prof[c].is_i64) {
+              continue;
+            }
             // Skip cells the inverted index already covers exactly. Cells
             // are pushed in ascending (group, column) order, so this group's
             // cells sit at the tail: scanning backwards reaches them in a
             // handful of steps where the forward scan walked every cell of
             // every earlier row group first.
             bool inv_covered = false;
-            for (auto rit = footer.inv_index.rbegin();
-                 rit != footer.inv_index.rend(); ++rit) {
-              if (rit->group < rg_idx) break;
-              if (rit->group == rg_idx && rit->column == c) {
+            for (auto& rit : std::ranges::reverse_view(footer.inv_index)) {
+              if (rit.group < rg_idx) {
+                break;
+              }
+              if (rit.group == rg_idx && rit.column == c) {
                 inv_covered = true;
                 break;
               }
             }
-            if (inv_covered) continue;
+            if (inv_covered) {
+              continue;
+            }
             // Distinct keys arrive fused in the profile (row-order
             // insertion, same content as the historical dedup pass).
             std::vector<uint64_t>& keys = xor_keys;
@@ -2379,7 +2669,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
             keys.reserve(prof[c].xorset.size());
             prof[c].xorset.ForEach(
                 [&keys](uint64_t k, uint64_t) { keys.push_back(k); });
-            if (keys.empty()) continue;
+            if (keys.empty()) {
+              continue;
+            }
             const size_t n = keys.size();
             // Every attempt runs at the wide load (m/n = 1.6). The
             // historical base load (m/n ~ 1.23) sits right at the 3-XOR
@@ -2390,7 +2682,7 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
             // Readers take m from cell.table.size(), so the wire stays
             // compatible; the peel and emitted bytes per (seed, m) are
             // unchanged, only the seed-0 load moved.
-            size_t m = 32 + (160 * n + 99) / 100;
+            size_t m = 32 + ((160 * n + 99) / 100);
             XorCell built;
             bool ok = false;
             auto& buckets = xor_buckets;
@@ -2409,8 +2701,10 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
               // used to run per popped bucket), and per-key hash/positions.
               buckets.assign(m, 0);
               refs.resize(n);
-              if (xor_hash.size() < n) xor_hash.resize(n);
-#if defined(__x86_64__)
+              if (xor_hash.size() < n) {
+                xor_hash.resize(n);
+              }
+#ifdef __x86_64__
               if (HasAvx512Dq()) {
                 Xor8HashBucketsAvx512(keys.data(), n, seed, m, ~0ULL / m,
                                       reinterpret_cast<uint16_t*>(refs.data()),
@@ -2425,9 +2719,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                   const uint32_t b0 = mod(h);
                   const uint32_t b1 = mod(XorRotL(h, 21));
                   const uint32_t b2 = mod(XorRotL(h, 42));
-                  refs[k] = {static_cast<uint16_t>(b0),
-                             static_cast<uint16_t>(b1),
-                             static_cast<uint16_t>(b2)};
+                  refs[k] = {.b0 = static_cast<uint16_t>(b0),
+                             .b1 = static_cast<uint16_t>(b1),
+                             .b2 = static_cast<uint16_t>(b2)};
                   ++buckets[b0];
                   ++buckets[b1];
                   ++buckets[b2];
@@ -2452,14 +2746,18 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
               for (uint32_t b = 0; b < m; ++b) {
                 start[b] = cursor;
                 cursor += buckets[b];
-                if (buckets[b] == 1) stk[sp++] = b;
+                if (buckets[b] == 1) {
+                  stk[sp++] = b;
+                }
               }
               start[m] = cursor;
               std::memcpy(fill.data(), start.data(), m * sizeof(uint32_t));
               // Grow-only: the scatter below rewrites exactly the 3n slots
               // it uses, so once the scratch holds a prior cell's larger
               // size, keeping it skips resize's zero-fill of the tail.
-              if (keylist.size() < n * 3) keylist.resize(n * 3);
+              if (keylist.size() < n * 3) {
+                keylist.resize(n * 3);
+              }
               for (size_t k = 0; k < n; ++k) {
                 const XorKeyRef& r = refs[k];
                 keylist[fill[r.b0]++] = static_cast<uint16_t>(k);
@@ -2480,8 +2778,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
               // peel_bucket for every key it orders before the size check
               // below reads it, and a failed attempt re-runs the whole
               // pass, so no slot is ever read before it is written.
-              if (peel_bucket.size() < keys.size())
+              if (peel_bucket.size() < keys.size()) {
                 peel_bucket.resize(keys.size());
+              }
               // done[] stays a parallel bitmap: key ids are consumed once but
               // appear in THREE adjacency lists, so stamping only the found
               // keylist slot leaves the other two lists still offering the
@@ -2490,27 +2789,39 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
               done.assign(keys.size(), 0);
               while (sp != 0) {
                 const uint32_t b = stk[--sp];
-                if (buckets[b] != 1) continue;
+                if (buckets[b] != 1) {
+                  continue;
+                }
                 // The count says one live placement sits at b; find it in
                 // the bucket's adjacency list.
                 uint32_t k = UINT32_MAX;
                 for (uint32_t idx = start[b]; idx < start[b + 1]; ++idx) {
                   const uint16_t cand = keylist[idx];
-                  if (!done[cand]) {
+                  if (done[cand] == 0) {
                     k = cand;
                     break;
                   }
                 }
-                if (k == UINT32_MAX) continue;  // stale bucket
+                if (k == UINT32_MAX) {
+                  continue;  // stale bucket
+                }
                 done[k] = 1;
                 peel_bucket[k] = b;
                 ord[osz++] = k;
                 const XorKeyRef& ref = refs[k];
-                if (--buckets[ref.b0] == 1) stk[sp++] = ref.b0;
-                if (--buckets[ref.b1] == 1) stk[sp++] = ref.b1;
-                if (--buckets[ref.b2] == 1) stk[sp++] = ref.b2;
+                if (--buckets[ref.b0] == 1) {
+                  stk[sp++] = ref.b0;
+                }
+                if (--buckets[ref.b1] == 1) {
+                  stk[sp++] = ref.b1;
+                }
+                if (--buckets[ref.b2] == 1) {
+                  stk[sp++] = ref.b2;
+                }
               }
-              if (osz != keys.size()) continue;  // cycle: new seed
+              if (osz != keys.size()) {
+                continue;  // cycle: new seed
+              }
               built.group = rg_idx;
               built.column = c;
               built.seed = seed;
@@ -2521,17 +2832,25 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                 // This seed's splitmix output, stashed by the hash pass
                 // above (the winning attempt IS the last attempt).
                 const uint64_t h = xor_hash[k];
-                const uint8_t fp = static_cast<uint8_t>(h & 0xFF);
+                const auto fp = static_cast<uint8_t>(h & 0xFF);
                 const uint32_t b0 = peel_bucket[k];
                 uint8_t v = fp;
-                if (ref.b0 != b0) v ^= built.table[ref.b0];
-                if (ref.b1 != b0) v ^= built.table[ref.b1];
-                if (ref.b2 != b0) v ^= built.table[ref.b2];
+                if (ref.b0 != b0) {
+                  v ^= built.table[ref.b0];
+                }
+                if (ref.b1 != b0) {
+                  v ^= built.table[ref.b1];
+                }
+                if (ref.b2 != b0) {
+                  v ^= built.table[ref.b2];
+                }
                 built.table[b0] = v;
               }
               ok = true;
             }
-            if (!ok) continue;
+            if (!ok) {
+              continue;
+            }
             footer.xor_present = true;
             footer.xor_cells.push_back(std::move(built));
           }
@@ -2553,15 +2872,19 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
           footer.hash_idx_present = true;
           const size_t kHashSlotsPerRow = kSmallHashIdx ? 2 : 4;
           size_t sz = 1;
-          while (sz < run.Size() * kHashSlotsPerRow) sz <<= 1;
+          while (sz < run.Size() * kHashSlotsPerRow) {
+            sz <<= 1;
+          }
           footer.hash_idx_log2 = 0;
-          while ((1ULL << footer.hash_idx_log2) < sz) ++footer.hash_idx_log2;
+          while ((1ULL << footer.hash_idx_log2) < sz) {
+            ++footer.hash_idx_log2;
+          }
           footer.hash_keys.assign(sz, INT64_MIN);
           footer.hash_rows.assign(sz, UINT32_MAX);
         }
         if (footer.hash_idx_present &&
             sc.GetColumn(sc.KeyColumnIndex()).Type() == ValueType::kInt64) {
-          const uint32_t mask =
+          const auto mask =
               static_cast<uint32_t>((1ULL << footer.hash_idx_log2) - 1);
           const size_t base_row = total_rows - group_fill;
           const RgColumnProfile& KP = prof[sc.KeyColumnIndex()];
@@ -2588,11 +2911,11 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
             for (size_t ri = 0; ri < nk; ++ri) {
               if (ri + kHashPfDist < nk) {
                 const int64_t kpf = KP.vals[ri + kHashPfDist];
-                uint64_t hpf = static_cast<uint64_t>(kpf);
+                auto hpf = static_cast<uint64_t>(kpf);
                 hpf ^= hpf >> 33;
                 hpf *= 0xFF51AFD7ED558CCDULL;
                 hpf ^= hpf >> 33;
-                const uint32_t spf = static_cast<uint32_t>(hpf & mask);
+                const auto spf = static_cast<uint32_t>(hpf & mask);
                 __builtin_prefetch(&footer.hash_rows[spf]);
                 __builtin_prefetch(&footer.hash_keys[spf]);
               }
@@ -2604,34 +2927,42 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                 continue;
               }
               const int64_t k = KP.vals[ri];
-              uint64_t h = static_cast<uint64_t>(k);
+              auto h = static_cast<uint64_t>(k);
               h ^= h >> 33;
               h *= 0xFF51AFD7ED558CCDULL;
               h ^= h >> 33;
-              uint32_t s = static_cast<uint32_t>(h & mask);
+              auto s = static_cast<uint32_t>(h & mask);
               while (footer.hash_rows[s] != UINT32_MAX &&
-                     footer.hash_keys[s] != k)
+                     footer.hash_keys[s] != k) {
                 s = (s + 1) & mask;
+              }
               // Duplicate keys within a chunk resolve to the FIRST row
               // (matching PointLookup's lower-bound semantics): keep the
               // earliest occurrence instead of overwriting with the later one.
-              if (footer.hash_rows[s] != UINT32_MAX) continue;
+              if (footer.hash_rows[s] != UINT32_MAX) {
+                continue;
+              }
               footer.hash_keys[s] = k;
               footer.hash_rows[s] = static_cast<uint32_t>(base_row + ri);
             }
           } else {
             for (size_t ri = 0; ri < group_fill; ++ri) {
-              if (group_rows[ri][sc.KeyColumnIndex()].IsNull()) continue;
+              if (group_rows[ri][sc.KeyColumnIndex()].IsNull()) {
+                continue;
+              }
               const int64_t k = group_rows[ri][sc.KeyColumnIndex()].AsInt64();
-              uint64_t h = static_cast<uint64_t>(k);
+              auto h = static_cast<uint64_t>(k);
               h ^= h >> 33;
               h *= 0xFF51AFD7ED558CCDULL;
               h ^= h >> 33;
-              uint32_t s = static_cast<uint32_t>(h & mask);
+              auto s = static_cast<uint32_t>(h & mask);
               while (footer.hash_rows[s] != UINT32_MAX &&
-                     footer.hash_keys[s] != k)
+                     footer.hash_keys[s] != k) {
                 s = (s + 1) & mask;
-              if (footer.hash_rows[s] != UINT32_MAX) continue;
+              }
+              if (footer.hash_rows[s] != UINT32_MAX) {
+                continue;
+              }
               footer.hash_keys[s] = k;
               footer.hash_rows[s] = static_cast<uint32_t>(base_row + ri);
             }
@@ -2677,7 +3008,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
     constexpr uint32_t kPgmEps = 16;
     bool ascending = pgm_usable && !pgm_keys.empty();
     for (size_t i = 1; ascending && i < pgm_keys.size(); ++i) {
-      if (pgm_keys[i] < pgm_keys[i - 1]) ascending = false;
+      if (pgm_keys[i] < pgm_keys[i - 1]) {
+        ascending = false;
+      }
     }
     if (ascending) {
       // Double, not long double: the cone arithmetic only feeds a slope
@@ -2704,28 +3037,30 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
           }
           continue;
         }
-        const double dx = static_cast<double>(
-            static_cast<uint64_t>(pgm_keys[i]) - static_cast<uint64_t>(key0));
-        const double rel = static_cast<double>(i - start);
+        const auto dx = static_cast<double>(static_cast<uint64_t>(pgm_keys[i]) -
+                                            static_cast<uint64_t>(key0));
+        const auto rel = static_cast<double>(i - start);
         const double slo = (rel - static_cast<double>(kPgmEps)) / dx;
         const double shi = (rel + static_cast<double>(kPgmEps)) / dx;
-        if (slo > low) low = slo;
-        if (shi < high) high = shi;
+        low = std::max(slo, low);
+        high = std::min(shi, high);
         if (low > high) {
           // Recompute the cone bound without point i (it starts the next
           // segment); the emitted slope fits [start, i).
           low = -std::numeric_limits<double>::infinity();
           high = std::numeric_limits<double>::infinity();
           for (size_t j = start + 1; j < i; ++j) {
-            if (pgm_keys[j] == key0) continue;
-            const double dx2 =
+            if (pgm_keys[j] == key0) {
+              continue;
+            }
+            const auto dx2 =
                 static_cast<double>(static_cast<uint64_t>(pgm_keys[j]) -
                                     static_cast<uint64_t>(key0));
-            const double rel2 = static_cast<double>(j - start);
+            const auto rel2 = static_cast<double>(j - start);
             const double s2 = (rel2 - static_cast<double>(kPgmEps)) / dx2;
             const double s3 = (rel2 + static_cast<double>(kPgmEps)) / dx2;
-            if (s2 > low) low = s2;
-            if (s3 < high) high = s3;
+            low = std::max(s2, low);
+            high = std::min(s3, high);
           }
           const double slope = (low + high) / 2;
           segs.push_back({key0, start, std::isfinite(slope) ? slope : 0.0});
@@ -2755,19 +3090,24 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   for (slot_t c = 0; c < footer.column_count; ++c) {
     auto& fm = col_freq[c];
     for (const ModeFrontEntry& fe : mode_front[c]) {
-      if (fe.count != fe.synced)
+      if (fe.count != fe.synced) {
         *fm.UpsertSlot(static_cast<uint64_t>(fe.key)) += fe.count - fe.synced;
+      }
     }
   }
   for (slot_t c = 0; c < footer.column_count; ++c) {
     const bool is_i64 = sc.GetColumn(c).Type() == ValueType::kInt64;
-    if (!is_i64) continue;
+    if (!is_i64) {
+      continue;
+    }
     const int64_t mn = footer.col_mins[c];
     const int64_t mx = footer.col_maxs[c];
     // mn > mx only for all-NULL columns (no values inserted); col_freq is
     // empty in that case and we skip to avoid the signed-overflow on
     // (mx - mn) and a meaningless binning.
-    if (mx < mn) continue;
+    if (mx < mn) {
+      continue;
+    }
     // Mode arrived from the profiler's incremental tracking: the first key
     // to reach the max count wins, which is deterministic (the historical
     // extraction read it off hash-bucket iteration order).
@@ -2776,7 +3116,7 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
     constexpr int B = Footer::ColumnStats::HIST_BINS;
     col_freq[c].ForEach([&](uint64_t key, uint64_t cnt) {
       const uint64_t idx = HistogramBin(static_cast<int64_t>(key), mn, mx, B);
-      footer.col_hists[static_cast<size_t>(c) * B + idx] += cnt;
+      footer.col_hists[(static_cast<size_t>(c) * B) + idx] += cnt;
     });
   }
   // Write inline footer at end of data (v4): schema_version(8) +
@@ -2790,7 +3130,7 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // Read per call (see kNoNewSchemes): a function-local static would latch
   // the first build's answer, silently ignoring later setenv toggles.
   const bool kNoCrc = std::getenv("TINYLAMB_NO_CRC") != nullptr;
-  footer.format_version = kNoCrc ? 1u : 2u;
+  footer.format_version = kNoCrc ? 1U : 2U;
   AppendBE64(data, footer.schema_version);
   AppendBE32(data, footer.format_version);
   AppendBE32(data, footer.row_group_count);
@@ -2801,16 +3141,26 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   data.push_back(static_cast<char>(footer.zone_map_present ? 1 : 0));
   footer.generation = run.Generation();
   AppendBE64(data, footer.generation);
-  for (uint16_t rc : footer.row_counts) AppendBE16(data, rc);
-  for (uint32_t off : footer.column_offsets) AppendBE32(data, off);
-  if (footer.zone_map_present) {
-    for (int64_t mn : footer.group_min_keys)
-      AppendBE64(data, static_cast<uint64_t>(mn));
-    for (int64_t mx : footer.group_max_keys)
-      AppendBE64(data, static_cast<uint64_t>(mx));
+  for (uint16_t rc : footer.row_counts) {
+    AppendBE16(data, rc);
   }
-  for (uint8_t enc : footer.encodings) data.push_back(static_cast<char>(enc));
-  for (uint32_t prm : footer.params) AppendBE32(data, prm);
+  for (uint32_t off : footer.column_offsets) {
+    AppendBE32(data, off);
+  }
+  if (footer.zone_map_present) {
+    for (int64_t mn : footer.group_min_keys) {
+      AppendBE64(data, static_cast<uint64_t>(mn));
+    }
+    for (int64_t mx : footer.group_max_keys) {
+      AppendBE64(data, static_cast<uint64_t>(mx));
+    }
+  }
+  for (uint8_t enc : footer.encodings) {
+    data.push_back(static_cast<char>(enc));
+  }
+  for (uint32_t prm : footer.params) {
+    AppendBE32(data, prm);
+  }
   data.push_back(static_cast<char>(footer.col_stats_present ? 1 : 0));
   if (footer.col_stats_present) {
     for (slot_t c = 0; c < footer.column_count; ++c) {
@@ -2830,7 +3180,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   // Bloom filters (v7): [present u8][rg*col × u64 BE].
   data.push_back(static_cast<char>(footer.bloom_present ? 1 : 0));
   if (footer.bloom_present) {
-    for (uint64_t bloom_bits : footer.rg_blooms) AppendBE64(data, bloom_bits);
+    for (uint64_t bloom_bits : footer.rg_blooms) {
+      AppendBE64(data, bloom_bits);
+    }
   }
   // Per-RG partial sums: [present u8][rg*col × i64 BE].
   data.push_back(static_cast<char>(footer.rg_sums_present ? 1 : 0));
@@ -2858,9 +3210,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
     // contiguous insert (values are byte-swapped identically per element).
     if constexpr (std::endian::native == std::endian::little) {
       const auto* k8 = reinterpret_cast<const char*>(footer.hash_keys.data());
-      data.insert(data.end(), k8, k8 + sz * sizeof(int64_t));
+      data.insert(data.end(), k8, k8 + (sz * sizeof(int64_t)));
       const auto* r4 = reinterpret_cast<const char*>(footer.hash_rows.data());
-      data.insert(data.end(), r4, r4 + sz * sizeof(uint32_t));
+      data.insert(data.end(), r4, r4 + (sz * sizeof(uint32_t)));
     } else {
       for (size_t i = 0; i < sz; ++i) {
         const uint64_t kle =
@@ -2895,11 +3247,12 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
       AppendBE64(data, footer.col_nulls[c]);
       AppendBE64(data, static_cast<uint64_t>(footer.col_modes[c]));
       AppendBE64(data, footer.col_mode_counts[c]);
-      for (int b = 0; b < B; ++b)
+      for (int b = 0; b < B; ++b) {
         AppendBE64(
             data,
-            footer.col_hists[static_cast<size_t>(c) * static_cast<size_t>(B) +
+            footer.col_hists[(static_cast<size_t>(c) * static_cast<size_t>(B)) +
                              static_cast<size_t>(b)]);
+      }
     }
   }
   // Inverted secondary index (v13): [present u8][ncell u32 BE] then per cell
@@ -2921,12 +3274,14 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         uint16_t nruns = 0;
         for (size_t k = 0; k < p.rows.size();) {
           size_t e = k + 1;
-          while (e < p.rows.size() && p.rows[e] == p.rows[e - 1] + 1) ++e;
+          while (e < p.rows.size() && p.rows[e] == p.rows[e - 1] + 1) {
+            ++e;
+          }
           ++nruns;
           k = e;
         }
-        const size_t run_bytes = 2 + static_cast<size_t>(nruns) * 4;
-        const size_t arr_bytes = 2 + p.rows.size() * 2;
+        const size_t run_bytes = 2 + (static_cast<size_t>(nruns) * 4);
+        const size_t arr_bytes = 2 + (p.rows.size() * 2);
         uint8_t ctype = 1;  // bitmap default
         if (run_bytes <= arr_bytes && run_bytes <= 128) {
           ctype = 2;
@@ -2936,20 +3291,28 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         data.push_back(static_cast<char>(ctype));
         if (ctype == 0) {
           AppendBE16(data, static_cast<uint16_t>(p.rows.size()));
-          for (uint16_t r : p.rows) AppendBE16(data, r);
+          for (uint16_t r : p.rows) {
+            AppendBE16(data, r);
+          }
         } else if (ctype == 2) {
           AppendBE16(data, nruns);
           for (size_t k = 0; k < p.rows.size();) {
             size_t e = k + 1;
-            while (e < p.rows.size() && p.rows[e] == p.rows[e - 1] + 1) ++e;
+            while (e < p.rows.size() && p.rows[e] == p.rows[e - 1] + 1) {
+              ++e;
+            }
             AppendBE16(data, p.rows[k]);
             AppendBE16(data, static_cast<uint16_t>(e - k));
             k = e;
           }
         } else {
-          uint64_t words[16] = {0};
-          for (uint16_t r : p.rows) words[r >> 6] |= (1ULL << (r & 63));
-          for (uint64_t w : words) AppendBE64(data, w);
+          std::array<uint64_t, 16> words{};
+          for (uint16_t r : p.rows) {
+            words[r >> 6] |= (1ULL << (r & 63));
+          }
+          for (uint64_t w : words) {
+            AppendBE64(data, w);
+          }
         }
       }
     }
@@ -3023,7 +3386,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
 
 void PaxChunk::BuildRowCountPrefix() {
   rg_prefix_.clear();
-  if (footer_.row_counts.size() < footer_.row_group_count) return;
+  if (footer_.row_counts.size() < footer_.row_group_count) {
+    return;
+  }
   rg_prefix_.reserve(static_cast<size_t>(footer_.row_group_count) + 1);
   rg_prefix_.push_back(0);
   uint64_t total = 0;
@@ -3042,7 +3407,9 @@ void PaxChunk::BuildNullBitmapSummary() {
     footer_.null_summary_valid = true;
     return;
   }
-  if (footer_.row_counts.size() < footer_.row_group_count) return;
+  if (footer_.row_counts.size() < footer_.row_group_count) {
+    return;
+  }
   uint64_t total = 0;
   uint64_t first_stride = 0;
   uint32_t uniform_groups = 0;
@@ -3060,7 +3427,9 @@ void PaxChunk::BuildNullBitmapSummary() {
       uniform_groups = 0;
     }
   }
-  if (total != footer_.null_bitmaps.size()) return;
+  if (total != footer_.null_bitmaps.size()) {
+    return;
+  }
   footer_.null_uniform_groups = uniform_groups;
   footer_.null_uniform_stride = first_stride;
   for (uint8_t byte : footer_.null_bitmaps) {
@@ -3087,7 +3456,9 @@ void PaxChunk::BuildEfSelectDirs() {
       footer_.encodings.size() < cells || footer_.params.size() < cells) {
     return;
   }
-  if (data_.size() <= static_cast<size_t>(footer_.footer_size) + 4) return;
+  if (data_.size() <= static_cast<size_t>(footer_.footer_size) + 4) {
+    return;
+  }
   const size_t data_end = data_.size() - footer_.footer_size - 4;
   ef_sel_off_.resize(cells + 1, 0);
   for (size_t i = 0; i < cells; ++i) {
@@ -3095,7 +3466,7 @@ void PaxChunk::BuildEfSelectDirs() {
     // u32 offsets: past ~4G samples (a multi-GB EF chunk), keep the entries
     // already built and shrink the offset table so later cells see no
     // directory (nullptr fallback) instead of a wrapping span.
-    if (ef_sel_flat_.size() > 0xFFFFFF00ull) {
+    if (ef_sel_flat_.size() > 0xFFFFFF00ULL) {
       ef_sel_off_.resize(i + 1);
       return;
     }
@@ -3103,32 +3474,44 @@ void PaxChunk::BuildEfSelectDirs() {
       continue;
     }
     const uint32_t rc = footer_.row_counts[i / footer_.column_count];
-    if (rc == 0) continue;
+    if (rc == 0) {
+      continue;
+    }
     const size_t off = footer_.column_offsets[i];
-    if (off > data_end) continue;
+    if (off > data_end) {
+      continue;
+    }
     const char* r = data_.data() + off;
     const char* region_end =
         (i + 1 < cells && footer_.column_offsets[i + 1] > off &&
          footer_.column_offsets[i + 1] <= data_end)
             ? data_.data() + footer_.column_offsets[i + 1]
             : data_.data() + data_end;
-    if (r + 17 > region_end) continue;
+    if (r + 17 > region_end) {
+      continue;
+    }
     const int l = static_cast<int>(static_cast<uint8_t>(r[16]));
     const uint64_t maxd = ReadBE64(r + 8);
     const uint64_t high_max = (l >= 64) ? 0 : (maxd >> l);
-    if (high_max > UINT64_MAX - static_cast<uint64_t>(rc) - 7) continue;
+    if (high_max > UINT64_MAX - static_cast<uint64_t>(rc) - 7) {
+      continue;
+    }
     const size_t hlen = rc + static_cast<size_t>(high_max);
     // Sample positions are stored as u32; skip absurd (hostile) extents.
-    if (hlen > 0xFFFFFFFFull) continue;
+    if (hlen > 0xFFFFFFFFULL) {
+      continue;
+    }
     const char* hbmp = r + 17;
-    if (hbmp + (hlen + 7) / 8 > region_end) continue;
+    if (hbmp + ((hlen + 7) / 8) > region_end) {
+      continue;
+    }
     // Walk the set bits in order; sample j is the position of the (8j)-th.
     const size_t nsamp = ((static_cast<size_t>(rc) - 1) >> 3) + 1;
     const size_t start = ef_sel_flat_.size();
     const size_t full_words = hlen >> 6;
     size_t seen = 0;
     for (size_t w = 0; w < full_words; ++w) {
-      uint64_t x = ReadBE64(hbmp + w * 8);
+      uint64_t x = ReadBE64(hbmp + (w * 8));
       while (x != 0) {
         // MSB-first position q lives at word-bit (63 - q), so clzll(x) IS
         // the set bit's position inside the word. The former form pushed
@@ -3139,7 +3522,7 @@ void PaxChunk::BuildEfSelectDirs() {
         const int q = __builtin_clzll(x);
         if ((seen & 7) == 0) {
           ef_sel_flat_.push_back(
-              static_cast<uint32_t>(w * 64 + static_cast<uint64_t>(q)));
+              static_cast<uint32_t>((w * 64) + static_cast<uint64_t>(q)));
         }
         ++seen;
         x &= (static_cast<uint64_t>(1) << (63 - q)) - 1;
@@ -3155,7 +3538,9 @@ void PaxChunk::BuildEfSelectDirs() {
     }
     // A corrupt bitmap (fewer set bits than rows) gets no directory: the
     // decode falls back to SelectBit, which already fail-closes there.
-    if (ef_sel_flat_.size() - start != nsamp) ef_sel_flat_.resize(start);
+    if (ef_sel_flat_.size() - start != nsamp) {
+      ef_sel_flat_.resize(start);
+    }
   }
   ef_sel_off_[cells] = static_cast<uint32_t>(ef_sel_flat_.size());
 }
@@ -3181,32 +3566,46 @@ void PaxChunk::BuildFsstDirs() {
       ++fsst_cells;
     }
   }
-  if (fsst_cells == 0) return;
+  if (fsst_cells == 0) {
+    return;
+  }
   fsst_meta_index_.assign(cells + 1, 0);
   fsst_meta_.reserve(fsst_cells);
   const size_t data_end =
       data_.size() > static_cast<size_t>(footer_.footer_size) + 4
           ? data_.size() - footer_.footer_size - 4
           : 0;
-  if (data_end == 0) return;
+  if (data_end == 0) {
+    return;
+  }
   for (size_t i = 0; i < cells; ++i) {
     fsst_meta_index_[i] = static_cast<uint32_t>(fsst_meta_.size());
     if (footer_.encodings[i] != static_cast<uint8_t>(Scheme::kFsst)) {
       continue;
     }
-    const uint32_t g = static_cast<uint32_t>(i / footer_.column_count);
-    const uint32_t c = static_cast<uint32_t>(i % footer_.column_count);
+    const auto g = static_cast<uint32_t>(i / footer_.column_count);
+    const auto c = static_cast<uint32_t>(i % footer_.column_count);
     const uint16_t n = footer_.row_counts[g];
-    if (n == 0) continue;
+    if (n == 0) {
+      continue;
+    }
     const size_t off = footer_.column_offsets[i];
-    if (off > data_end) continue;
+    if (off > data_end) {
+      continue;
+    }
     const char* region = data_.data() + off;
     const char* region_end = RegionEndAt(footer_, g, c, data_);
-    if (region_end == nullptr || region_end < region) continue;
-    const size_t region_len = static_cast<size_t>(region_end - region);
-    if (region_len < 6) continue;
+    if (region_end == nullptr || region_end < region) {
+      continue;
+    }
+    const auto region_len = static_cast<size_t>(region_end - region);
+    if (region_len < 6) {
+      continue;
+    }
     const uint16_t nsym = ReadBE16(region);
-    if (nsym > 256) continue;
+    if (nsym > 256) {
+      continue;
+    }
     const uint32_t tsl = ReadBE32(region + 2);
     const size_t symbol_start = fsst_symbol_offsets_.size();
     size_t p = 6;
@@ -3216,7 +3615,7 @@ void PaxChunk::BuildFsstDirs() {
         valid = false;
         break;
       }
-      const uint8_t slen = static_cast<uint8_t>(region[p++]);
+      const auto slen = static_cast<uint8_t>(region[p++]);
       if (slen > region_len - p) {
         valid = false;
         break;
@@ -3226,14 +3625,20 @@ void PaxChunk::BuildFsstDirs() {
       p += slen;
     }
     const size_t table_bytes = static_cast<size_t>(n) * 4;
-    if (valid && table_bytes > region_len - p) valid = false;
-    if (valid) p += table_bytes;
-    if (valid && tsl > region_len - p) valid = false;
+    if (valid && table_bytes > region_len - p) {
+      valid = false;
+    }
+    if (valid) {
+      p += table_bytes;
+    }
+    if (valid && tsl > region_len - p) {
+      valid = false;
+    }
     if (valid) {
       uint32_t previous = 0;
       for (uint16_t row = 0; row < n; ++row) {
         const uint32_t current =
-            ReadBE32(region + p - table_bytes + static_cast<size_t>(row) * 4);
+            ReadBE32(region + p - table_bytes + (static_cast<size_t>(row) * 4));
         if (current > tsl || (row != 0 && current < previous)) {
           valid = false;
           break;
@@ -3285,6 +3690,8 @@ void PaxChunk::BuildFsstDirs() {
 // with Int64AtFast's result, so caching them is consistent, not a new
 // semantic. The consumer additionally gates on the declared column type, so a
 // cell cached for a column the caller never reads as int64 is simply unused.
+namespace {
+
 bool DecodableIntCacheScheme(Scheme scheme) {
   switch (scheme) {
     case Scheme::kPlain:
@@ -3296,6 +3703,8 @@ bool DecodableIntCacheScheme(Scheme scheme) {
       return true;
   }
 }
+
+}  // namespace
 
 void PaxChunk::BuildDecodedIntCache() {
   decoded_int_cache_.clear();
@@ -3309,7 +3718,9 @@ void PaxChunk::BuildDecodedIntCache() {
     return;
   }
   constexpr size_t kMaxDecodedIntCells = size_t{1} << 20;
-  if (cells > kMaxDecodedIntCells) return;
+  if (cells > kMaxDecodedIntCells) {
+    return;
+  }
   constexpr size_t kMaxDecodedIntCacheValues = size_t{1} << 20;
   // The budget is spent CELL BY CELL rather than all-or-nothing. Widening the
   // eligible set made the old "one cell over the cap drops the whole cache"
@@ -3322,7 +3733,7 @@ void PaxChunk::BuildDecodedIntCache() {
   std::vector<uint8_t> cacheable(cells, 0);
   size_t cached_values = 0;
   for (size_t i = 0; i < cells; ++i) {
-    const Scheme scheme = static_cast<Scheme>(footer_.encodings[i]);
+    const auto scheme = static_cast<Scheme>(footer_.encodings[i]);
     if (!DecodableIntCacheScheme(scheme)) {
       continue;
     }
@@ -3338,8 +3749,8 @@ void PaxChunk::BuildDecodedIntCache() {
   std::vector<int64_t> decoded;
   for (size_t i = 0; i < cells; ++i) {
     decoded_int_offsets_[i] = decoded_int_cache_.size();
-    const uint32_t g = static_cast<uint32_t>(i / footer_.column_count);
-    const slot_t c = static_cast<slot_t>(i % footer_.column_count);
+    const auto g = static_cast<uint32_t>(i / footer_.column_count);
+    const auto c = static_cast<slot_t>(i % footer_.column_count);
     const uint16_t rows = footer_.row_counts[g];
     if (rows != 0 && cacheable[i] != 0) {
       decoded.resize(rows);
@@ -3360,8 +3771,12 @@ void PaxChunk::BuildDecodedIntCache() {
 
 int PaxChunk::ResolveRowGroup(size_t global_row_index, uint32_t* g_out,
                               uint32_t* local_out) const {
-  if (rg_prefix_.empty()) return 1;  // inconsistent footer: caller fails closed
-  if (global_row_index >= rg_prefix_.back()) return 2;
+  if (rg_prefix_.empty()) {
+    return 1;  // inconsistent footer: caller fails closed
+  }
+  if (global_row_index >= rg_prefix_.back()) {
+    return 2;
+  }
   // The row lives in the group whose [prefix[g], prefix[g+1]) contains it.
   // Small chunk counts walk linearly: this sits on the per-row read path,
   // where the linear scan beats binary search up to a few dozen groups.
@@ -3393,25 +3808,31 @@ namespace {
 bool DecodeVarcharColumnRgInto(const PaxChunk& chunk, uint32_t g, slot_t c,
                                std::vector<std::string>* out) {
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (g >= f.row_group_count || g >= f.row_counts.size()) return false;
+  if (g >= f.row_group_count || g >= f.row_counts.size()) {
+    return false;
+  }
   const size_t off_idx =
-      static_cast<size_t>(g) * static_cast<size_t>(f.column_count) + c;
+      (static_cast<size_t>(g) * static_cast<size_t>(f.column_count)) + c;
   if (off_idx >= f.column_offsets.size() || off_idx >= f.encodings.size() ||
       off_idx >= f.params.size()) {
     return false;
   }
   const char* region = RegionStartAt(f, g, c, chunk.Data(), 0);
-  if (region == nullptr) return false;
-  const char* region_end;
+  if (region == nullptr) {
+    return false;
+  }
+  const char* region_end = nullptr;
   if (off_idx + 1 < f.column_offsets.size()) {
     region_end = RegionEndAt(f, g, c, chunk.Data());
-    if (region_end == nullptr || region_end <= region) region_end = region;
+    if (region_end == nullptr || region_end <= region) {
+      region_end = region;
+    }
   } else if (chunk.Data().size() > f.footer_size + 4) {
     region_end = chunk.Data().data() + chunk.Data().size() - f.footer_size - 4;
   } else {
     region_end = region;
   }
-  const Scheme s = static_cast<Scheme>(f.encodings[off_idx]);
+  const auto s = static_cast<Scheme>(f.encodings[off_idx]);
   const uint32_t prm = f.params[off_idx];
   const uint16_t rc = f.row_counts[g];
   out->resize(rc);
@@ -3419,32 +3840,44 @@ bool DecodeVarcharColumnRgInto(const PaxChunk& chunk, uint32_t g, slot_t c,
   if (s == Scheme::kFrontCode) {
     // One sequential pass: the restart chain decodes every entry exactly
     // once (the per-row arm replays the block for each row instead).
-    const uint32_t re = prm & 0x7FFFu;
-    if (re == 0 || region + 6 > region_end) return false;
+    const uint32_t re = prm & 0x7FFFU;
+    if (re == 0 || region + 6 > region_end) {
+      return false;
+    }
     const uint32_t nrestart = ReadBE16(region);
     const uint32_t stream_len = ReadBE32(region + 2);
     const char* rtable = region + 6;
-    if (rtable + static_cast<size_t>(nrestart) * 4 > region_end) return false;
-    const char* stream = rtable + static_cast<size_t>(nrestart) * 4;
-    if (stream + stream_len > region_end) return false;
+    if (rtable + (static_cast<size_t>(nrestart) * 4) > region_end) {
+      return false;
+    }
+    const char* stream = rtable + (static_cast<size_t>(nrestart) * 4);
+    if (stream + stream_len > region_end) {
+      return false;
+    }
     const char* send = stream + stream_len;
     std::string cur;
-    uint32_t cur_block = static_cast<uint32_t>(-1);
+    auto cur_block = static_cast<uint32_t>(-1);
     const char* q = nullptr;
     for (uint32_t i = 0; i < rc; ++i) {
       const uint32_t b = i / re;
       if (b != cur_block) {
-        if (b >= nrestart) return false;
-        const uint32_t ro = ReadBE32(rtable + static_cast<size_t>(b) * 4);
-        if (ro > stream_len) return false;
+        if (b >= nrestart) {
+          return false;
+        }
+        const uint32_t ro = ReadBE32(rtable + (static_cast<size_t>(b) * 4));
+        if (ro > stream_len) {
+          return false;
+        }
         q = stream + ro;
         cur.clear();
         cur_block = b;
       }
-      if (q + 4 > send) return false;
+      if (q + 4 > send) {
+        return false;
+      }
       const uint32_t hdr = ReadBE32(q);
       const uint32_t plen = hdr >> 16;
-      const uint32_t slen = hdr & 0xFFFFu;
+      const uint32_t slen = hdr & 0xFFFFU;
       if (plen > cur.size() || slen > static_cast<uint64_t>(send - q) - 4U) {
         return false;
       }
@@ -3456,7 +3889,9 @@ bool DecodeVarcharColumnRgInto(const PaxChunk& chunk, uint32_t g, slot_t c,
     return true;
   }
   for (uint32_t i = 0; i < rc; ++i) {
-    if (CellIsNull(f, g, c, i)) continue;  // placeholder ""
+    if (CellIsNull(f, g, c, i)) {
+      continue;  // placeholder ""
+    }
     (*out)[i] =
         VarcharRegionAt(region, s, prm, rc, i, region_end, &fsst).MoveString();
   }
@@ -3477,14 +3912,24 @@ void FillVarcharGroupCache(uint32_t g, const Schema& sc,
   cache->valid = false;
   cache->group = g;
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (f.row_counts.size() < static_cast<size_t>(f.row_group_count)) return;
-  if (sc.ColumnCount() < f.column_count) return;
+  if (f.row_counts.size() < static_cast<size_t>(f.row_group_count)) {
+    return;
+  }
+  if (sc.ColumnCount() < f.column_count) {
+    return;
+  }
   cache->by_col.assign(f.column_count, {});
   for (slot_t c = 0; c < f.column_count; ++c) {
-    if (!cache->IsColumnSelected(c)) continue;
+    if (!cache->IsColumnSelected(c)) {
+      continue;
+    }
     const ValueType vt = sc.GetColumn(c).Type();
-    if (vt == ValueType::kInt64 || vt == ValueType::kDouble) continue;
-    if (!DecodeVarcharColumnRgInto(chunk, g, c, &cache->by_col[c])) return;
+    if (vt == ValueType::kInt64 || vt == ValueType::kDouble) {
+      continue;
+    }
+    if (!DecodeVarcharColumnRgInto(chunk, g, c, &cache->by_col[c])) {
+      return;
+    }
   }
   cache->valid = true;
 }
@@ -3502,11 +3947,15 @@ void FillIntSeqCursors(const PaxChunk& chunk,
   const PaxChunk::Footer& f = chunk.GetFooter();
   cache->int_by_col.resize(f.column_count);
   const uint16_t rc = cache->seq_rc;
-  if (rc == 0) return;
+  if (rc == 0) {
+    return;
+  }
   const size_t cols = std::min<size_t>(cache->seq_cols.size(), f.column_count);
   for (size_t c = 0; c < cols; ++c) {
     PaxChunk::VarcharGroupCache::SeqCol& cur = cache->seq_cols[c];
-    if (cur.kind != 2) continue;
+    if (cur.kind != 2) {
+      continue;
+    }
     std::vector<int64_t>& vals = cache->int_by_col[c];
     vals.resize(rc);
     bool decoded = true;
@@ -3516,7 +3965,9 @@ void FillIntSeqCursors(const PaxChunk& chunk,
     } catch (...) {
       decoded = false;  // hostile footer: keep the per-row decoder
     }
-    if (!decoded) continue;
+    if (!decoded) {
+      continue;
+    }
     cur.vals = vals.data();
     cur.span = rc;
     cur.kind = 1;
@@ -3539,17 +3990,21 @@ uint64_t D2PforValueAtArmed(const D2PforRegion& p, uint32_t loc, bool* armed,
     *armed = false;
     return 0;
   }
-  uint64_t val = ReadBE64(p.ckpt + static_cast<size_t>(b) * 16);
-  uint64_t sd = ReadBE64(p.ckpt + static_cast<size_t>(b) * 16 + 8);
+  uint64_t val = ReadBE64(p.ckpt + (static_cast<size_t>(b) * 16));
+  uint64_t sd = ReadBE64(p.ckpt + (static_cast<size_t>(b) * 16) + 8);
   const uint32_t r = std::min<uint32_t>(b * kD2PforCheckpointEvery, p.n - 1);
   if (loc <= r) {
     *armed = false;
     return val;
   }
-  if (r != 0) sd += static_cast<uint64_t>(D2PforSecondDiff(p, r - 1));
+  if (r != 0) {
+    sd += static_cast<uint64_t>(D2PforSecondDiff(p, r - 1));
+  }
   for (uint32_t m = r; m < loc; ++m) {
     val += sd;
-    if (m + 2 < p.n) sd += static_cast<uint64_t>(D2PforSecondDiff(p, m));
+    if (m + 2 < p.n) {
+      sd += static_cast<uint64_t>(D2PforSecondDiff(p, m));
+    }
   }
   // After the loop: (val, sd) == (v[loc], sd[loc]) whenever loc+1 < n (the
   // final iteration's guarded dd update produced sd[loc]); only that state
@@ -3576,11 +4031,15 @@ Status PaxChunk::ReadRowIntoCached(size_t global_row_index, const Schema& sc,
 
 Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
                                  VarcharGroupCache* cache, Row* row_out) const {
-  if (row_out == nullptr) return Status::kCorruption;
+  if (row_out == nullptr) {
+    return Status::kCorruption;
+  }
   // The decode loop indexes sc.GetColumn(c) for every footer column; a
   // schema shorter than the chunk would read out of bounds (version-skew
   // between chunk and schema). ReadColumnValue carries the same guard.
-  if (sc.ColumnCount() < footer_.column_count) return Status::kCorruption;
+  if (sc.ColumnCount() < footer_.column_count) {
+    return Status::kCorruption;
+  }
   // Sequential fast path: the group's per-column cursors are already
   // resolved, so the per-row work reduces to the null-bitmap test plus the
   // value store -- no per-row group resolution, data-area clamp, footer
@@ -3597,7 +4056,9 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     if (cache->seq_fill_pending && cache->rows_seen >= kVarcharCacheMinRows) {
       if (!cache->valid) {
         FillVarcharGroupCache(cache->seq_group, sc, cache, *this);
-        if (!cache->valid) cache->rows_seen = 0;
+        if (!cache->valid) {
+          cache->rows_seen = 0;
+        }
       }
       if (!cache->seq_int_filled) {
         FillIntSeqCursors(*this, cache);
@@ -3607,8 +4068,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
         cache->seq_fill_pending = false;
       }
     }
-    const uint32_t loc =
-        static_cast<uint32_t>(global_row_index - cache->seq_lo);
+    const auto loc = static_cast<uint32_t>(global_row_index - cache->seq_lo);
     row_out->values_.resize(footer_.column_count);
     for (slot_t c = 0; c < footer_.column_count; ++c) {
       // Non-const: the D2Pfor sequential cursor carries its (v, sd) state
@@ -3616,18 +4076,22 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       VarcharGroupCache::SeqCol& cur = cache->seq_cols[c];
       Value& slot = row_out->values_[c];
       if (cur.kind == 0) {
-        if (!slot.IsNull()) slot = Value();
+        if (!slot.IsNull()) {
+          slot = Value();
+        }
         continue;
       }
       if (cur.has_null_bits &&
           ((cur.null_bits[loc >> 3] >> (7U - (loc & 7U))) & 1U) != 0) {
-        if (!slot.IsNull()) slot = Value();
+        if (!slot.IsNull()) {
+          slot = Value();
+        }
         continue;
       }
       if (cur.kind == 1) {
         if (cur.is_double) {
-          double d;
-          const uint64_t bits = static_cast<uint64_t>(cur.vals[loc]);
+          double d = NAN;
+          const auto bits = static_cast<uint64_t>(cur.vals[loc]);
           memcpy(&d, &bits, sizeof(d));
           slot.SetDouble(d);
         } else {
@@ -3641,8 +4105,10 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
         // walk from the resolve-time parse (no per-row re-parse). Bits
         // match the generic Int64AtFast arm exactly (same replay contract).
         if (cur.d2p_ok) {
-          const D2PforRegion p{cur.d2p_ckpt, cur.d2p_inner, cur.d2p_n,
-                               cur.d2p_ncp};
+          const D2PforRegion p{.ckpt = cur.d2p_ckpt,
+                               .inner = cur.d2p_inner,
+                               .n = cur.d2p_n,
+                               .ncp = cur.d2p_ncp};
           uint64_t bits = 0;
           if (cur.d2p_armed && loc == cur.d2p_loc + 1) {
             const uint64_t v = cur.d2p_val + cur.d2p_sd;
@@ -3658,7 +4124,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
                                       &cur.d2p_val, &cur.d2p_sd);
           }
           if (cur.is_double) {
-            double d;
+            double d = NAN;
             memcpy(&d, &bits, sizeof(d));
             slot.SetDouble(d);
           } else {
@@ -3666,11 +4132,11 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
           }
           continue;
         }
-        const uint64_t bits = static_cast<uint64_t>(
+        const auto bits = static_cast<uint64_t>(
             Int64AtFast(cur.region, cur.scheme, cur.prm, cache->seq_rc, loc,
                         cur.region_end, cur.ef_dir));
         if (cur.is_double) {
-          double d;
+          double d = NAN;
           memcpy(&d, &bits, sizeof(d));
           slot.SetDouble(d);
         } else {
@@ -3696,7 +4162,9 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       }
       Value tv = VarcharRegionAt(cur.region, cur.scheme, cur.prm, cache->seq_rc,
                                  loc, cur.region_end, &cur.fsst);
-      if (!tv.IsNull()) slot.SetString(tv.MoveString());
+      if (!tv.IsNull()) {
+        slot.SetString(tv.MoveString());
+      }
     }
     return Status::kSuccess;
   }
@@ -3707,13 +4175,21 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
   uint32_t g = 0;
   uint32_t local = 0;
   if (footer_.row_group_count == 1) {
-    if (rg_prefix_.empty()) return Status::kCorruption;
-    if (global_row_index >= rg_prefix_.back()) return Status::kNotExists;
+    if (rg_prefix_.empty()) {
+      return Status::kCorruption;
+    }
+    if (global_row_index >= rg_prefix_.back()) {
+      return Status::kNotExists;
+    }
     local = static_cast<uint32_t>(global_row_index);
   } else {
     const int res = ResolveRowGroup(global_row_index, &g, &local);
-    if (res == 1) return Status::kCorruption;
-    if (res == 2) return Status::kNotExists;
+    if (res == 1) {
+      return Status::kCorruption;
+    }
+    if (res == 2) {
+      return Status::kNotExists;
+    }
   }
   const uint16_t rc = footer_.row_counts[g];
   // Hoisted per-call state: the data-area end (the span clamp needs it for
@@ -3737,9 +4213,10 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
           static_cast<size_t>(footer_.row_group_count)) {
     const uint32_t cc = footer_.column_count;
     size_t off = 0;
-    for (uint32_t gg = 0; gg < g; ++gg)
+    for (uint32_t gg = 0; gg < g; ++gg) {
       off += static_cast<size_t>(cc) *
              static_cast<size_t>((footer_.row_counts[gg] + 7U) / 8U);
+    }
     null_base = off;
     null_bytes = static_cast<size_t>((footer_.row_counts[g] + 7U) / 8U);
     null_ok = true;
@@ -3758,12 +4235,16 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     ++cache->rows_seen;
     if (!cache->seq_ready) {
       const Status seq_status = ResolveSeqCursors(g, sc, cache);
-      if (seq_status != Status::kSuccess) return seq_status;
+      if (seq_status != Status::kSuccess) {
+        return seq_status;
+      }
     }
     if (cache->seq_fill_pending && cache->rows_seen >= kVarcharCacheMinRows) {
       if (!cache->valid) {
         FillVarcharGroupCache(g, sc, cache, *this);
-        if (!cache->valid) cache->rows_seen = 0;
+        if (!cache->valid) {
+          cache->rows_seen = 0;
+        }
       }
       if (!cache->seq_int_filled) {
         FillIntSeqCursors(*this, cache);
@@ -3781,10 +4262,12 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
   for (slot_t c = 0; c < footer_.column_count; ++c) {
     Value& slot = row_out->values_[c];
     if (cache != nullptr && !cache->IsColumnSelected(c)) {
-      if (!slot.IsNull()) slot = Value();
+      if (!slot.IsNull()) {
+        slot = Value();
+      }
       continue;
     }
-    const size_t off_idx = g * footer_.column_count + c;
+    const size_t off_idx = (g * footer_.column_count) + c;
     const ValueType vt = sc.GetColumn(c).Type();
     if (decoded_int_cache_ready_ &&
         (vt == ValueType::kInt64 || vt == ValueType::kDouble) &&
@@ -3794,7 +4277,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
             decoded_int_offsets_[off_idx + 1] - decoded_int_offsets_[off_idx]) {
       const size_t index = decoded_int_offsets_[off_idx] + local;
       const size_t null_byte =
-          null_base + static_cast<size_t>(c) * null_bytes + (local >> 3);
+          null_base + (static_cast<size_t>(c) * null_bytes) + (local >> 3);
       const bool is_null =
           null_ok && null_byte < footer_.null_bitmaps.size() &&
           ((static_cast<unsigned>(footer_.null_bitmaps[null_byte]) >>
@@ -3806,8 +4289,8 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       } else if (vt == ValueType::kInt64) {
         cached_slot.SetInt64(decoded_int_cache_[index]);
       } else {
-        double value;
-        const uint64_t bits = static_cast<uint64_t>(decoded_int_cache_[index]);
+        double value = NAN;
+        const auto bits = static_cast<uint64_t>(decoded_int_cache_[index]);
         memcpy(&value, &bits, sizeof(value));
         cached_slot.SetDouble(value);
       }
@@ -3819,9 +4302,11 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       return Status::kCorruption;
     }
     const size_t off = footer_.column_offsets[off_idx];
-    if (off > data_end) return Status::kCorruption;
+    if (off > data_end) {
+      return Status::kCorruption;
+    }
     const char* region = data_.data() + off;
-    const char* region_end;
+    const char* region_end = nullptr;
     if (off_idx + 1 < footer_.column_offsets.size() &&
         footer_.column_offsets[off_idx + 1] <= data_end) {
       const size_t succ = footer_.column_offsets[off_idx + 1];
@@ -3829,14 +4314,15 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
     } else {
       region_end = (data_end > 0) ? data_.data() + data_end : region;
     }
-    const Scheme s = static_cast<Scheme>(footer_.encodings[off_idx]);
+    const auto s = static_cast<Scheme>(footer_.encodings[off_idx]);
     const uint32_t prm = footer_.params[off_idx];
     bool is_null = false;
     if (null_ok) {
-      const size_t null_off = null_base + static_cast<size_t>(c) * null_bytes;
-      const size_t byte_idx = null_off + (static_cast<uint32_t>(local) >> 3);
+      const size_t null_off = null_base + (static_cast<size_t>(c) * null_bytes);
+      const size_t byte_idx = null_off + (local >> 3);
       if (byte_idx < footer_.null_bitmaps.size()) {
-        is_null = (footer_.null_bitmaps[byte_idx] >> (7 - (local & 7))) & 1;
+        is_null =
+            (((footer_.null_bitmaps[byte_idx] >> (7 - (local & 7))) & 1) != 0);
       }
     }
     if (is_null) {
@@ -3844,14 +4330,12 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       continue;
     }
     if (vt == ValueType::kInt64) {
-      slot.SetInt64(Int64AtFast(region, s, prm, rc,
-                                static_cast<uint32_t>(local), region_end,
+      slot.SetInt64(Int64AtFast(region, s, prm, rc, local, region_end,
                                 EfSelectDirAt(off_idx)));
     } else if (vt == ValueType::kDouble) {
-      uint64_t bits = static_cast<uint64_t>(
-          Int64AtFast(region, s, prm, rc, static_cast<uint32_t>(local),
-                      region_end, EfSelectDirAt(off_idx)));
-      double d;
+      auto bits = static_cast<uint64_t>(Int64AtFast(
+          region, s, prm, rc, local, region_end, EfSelectDirAt(off_idx)));
+      double d = NAN;
       memcpy(&d, &bits, sizeof(double));
       slot.SetDouble(d);
     } else {  // varchar / null
@@ -3862,8 +4346,8 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
         continue;
       }
       if (s == Scheme::kFrontCode) {
-        if (DecodeFrontCodeAtInto(region, prm, rc, static_cast<uint32_t>(local),
-                                  region_end, &slot.owned_data)) {
+        if (DecodeFrontCodeAtInto(region, prm, rc, local, region_end,
+                                  &slot.owned_data)) {
           slot.type = ValueType::kVarChar;
           slot.value.varchar_value = slot.owned_data;
         } else {
@@ -3873,9 +4357,10 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       }
       const FsstDecodeView fsst_view = FsstViewAt(off_idx);
       Value tv =
-          VarcharRegionAt(region, s, prm, rc, static_cast<uint32_t>(local),
-                          region_end, &fsst_view);
-      if (!tv.IsNull()) slot.SetString(tv.MoveString());
+          VarcharRegionAt(region, s, prm, rc, local, region_end, &fsst_view);
+      if (!tv.IsNull()) {
+        slot.SetString(tv.MoveString());
+      }
     }
   }
   return Status::kSuccess;
@@ -3907,12 +4392,13 @@ Status PaxChunk::ResolveSeqCursors(uint32_t g, const Schema& sc,
   if (footer_.null_present &&
       footer_.row_counts.size() >=
           static_cast<size_t>(footer_.row_group_count)) {
-    for (uint32_t gg = 0; gg < g; ++gg)
+    for (uint32_t gg = 0; gg < g; ++gg) {
       null_base += static_cast<size_t>(cc) *
                    static_cast<size_t>((footer_.row_counts[gg] + 7U) / 8U);
+    }
     null_bytes = static_cast<size_t>((rc + 7U) / 8U);
     null_ok = true;
-    if (null_base + static_cast<size_t>(cc) * null_bytes >
+    if (null_base + (static_cast<size_t>(cc) * null_bytes) >
         footer_.null_bitmaps.size()) {
       return Status::kSuccess;  // unresolved: legacy path keeps the checks
     }
@@ -3930,9 +4416,11 @@ Status PaxChunk::ResolveSeqCursors(uint32_t g, const Schema& sc,
     // all-zero slice is pre-collapsed (null-free column).
     if (null_ok) {
       const uint8_t* bits = footer_.null_bitmaps.data() + null_base +
-                            static_cast<size_t>(c) * null_bytes;
+                            (static_cast<size_t>(c) * null_bytes);
       uint8_t any = 0;
-      for (size_t i = 0; i < null_bytes; ++i) any |= bits[i];
+      for (size_t i = 0; i < null_bytes; ++i) {
+        any |= bits[i];
+      }
       if (any != 0) {
         cur.has_null_bits = true;
         cur.null_bits = bits;
@@ -3945,26 +4433,28 @@ Status PaxChunk::ResolveSeqCursors(uint32_t g, const Schema& sc,
     // or not at all, see BuildDecodedIntCache), so a full-row span covers
     // every local index the legacy `local < span` check admitted.
     if (is_num && decoded_int_cache_ready_ &&
-        static_cast<size_t>(g) * cc + c + 1 < decoded_int_offsets_.size() &&
-        decoded_int_offsets_[static_cast<size_t>(g) * cc + c + 1] -
-                decoded_int_offsets_[static_cast<size_t>(g) * cc + c] ==
+        (static_cast<size_t>(g) * cc) + c + 1 < decoded_int_offsets_.size() &&
+        decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c + 1] -
+                decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c] ==
             static_cast<size_t>(rc) &&
         rc != 0) {
       cur.kind = 1;
       cur.vals = decoded_int_cache_.data() +
-                 decoded_int_offsets_[static_cast<size_t>(g) * cc + c];
+                 decoded_int_offsets_[(static_cast<size_t>(g) * cc) + c];
       cur.span = rc;
       continue;
     }
     // Region descriptors: same bounds and clamps as the legacy per-row path.
-    const size_t off_idx = static_cast<size_t>(g) * cc + c;
+    const size_t off_idx = (static_cast<size_t>(g) * cc) + c;
     if (off_idx >= footer_.column_offsets.size() ||
         off_idx >= footer_.encodings.size() ||
         off_idx >= footer_.params.size()) {
       return Status::kCorruption;
     }
     const size_t off = footer_.column_offsets[off_idx];
-    if (off > data_end) return Status::kCorruption;
+    if (off > data_end) {
+      return Status::kCorruption;
+    }
     cur.kind = is_num ? uint8_t{2} : uint8_t{3};
     cur.region = data_.data() + off;
     if (off_idx + 1 < footer_.column_offsets.size() &&
@@ -3978,7 +4468,9 @@ Status PaxChunk::ResolveSeqCursors(uint32_t g, const Schema& sc,
     cur.prm = footer_.params[off_idx];
     cur.off_idx = off_idx;
     cur.ef_dir = EfSelectDirAt(off_idx);
-    if (!is_num) cur.fsst = FsstViewAt(off_idx);
+    if (!is_num) {
+      cur.fsst = FsstViewAt(off_idx);
+    }
     // D2Pfor sequential cursor: hoist the region parse out of the per-row
     // path. On a parse failure the column keeps taking the generic
     // Int64AtFast arm (which re-parses and fail-closes the same way).
@@ -4005,7 +4497,9 @@ StatusOr<Row> PaxChunk::ReadRow(size_t global_row_index,
                                 const Schema& sc) const {
   Row row;
   const Status status = ReadRowInto(global_row_index, sc, &row);
-  if (status != Status::kSuccess) return status;
+  if (status != Status::kSuccess) {
+    return status;
+  }
   return row;
 }
 
@@ -4016,7 +4510,7 @@ StatusOr<Value> ReadColumnValueIn(const PaxChunk& chunk, uint32_t g,
                                   uint32_t local, uint16_t rc, slot_t col_idx,
                                   const Schema& sc) {
   const PaxChunk::Footer& footer = chunk.GetFooter();
-  const size_t off_idx = g * footer.column_count + col_idx;
+  const size_t off_idx = (g * footer.column_count) + col_idx;
   // Array-index validation, then offset-VALUE validation (see ReadRow:
   // a hostile offset value must not form a wild pointer).
   if (off_idx >= footer.column_offsets.size() ||
@@ -4029,7 +4523,7 @@ StatusOr<Value> ReadColumnValueIn(const PaxChunk& chunk, uint32_t g,
   }
   // A hostile successor offset must not enlarge the span past the data
   // area, which would defeat every `> region_end` decoder guard.
-  const char* region_end;
+  const char* region_end = nullptr;
   if (off_idx + 1 < footer.column_offsets.size()) {
     region_end = RegionEndAt(footer, g, col_idx, chunk.Data());
     if (region_end == nullptr || region_end <= region) {
@@ -4041,7 +4535,7 @@ StatusOr<Value> ReadColumnValueIn(const PaxChunk& chunk, uint32_t g,
   } else {
     region_end = region;
   }
-  const Scheme s = static_cast<Scheme>(footer.encodings[off_idx]);
+  const auto s = static_cast<Scheme>(footer.encodings[off_idx]);
   const uint32_t prm = footer.params[off_idx];
   if (CellIsNull(footer, g, col_idx, local)) {
     return Value();
@@ -4052,9 +4546,9 @@ StatusOr<Value> ReadColumnValueIn(const PaxChunk& chunk, uint32_t g,
                              chunk.EfSelectDirAt(off_idx)));
   }
   if (vt == ValueType::kDouble) {
-    uint64_t bits = static_cast<uint64_t>(Int64AtFast(
+    auto bits = static_cast<uint64_t>(Int64AtFast(
         region, s, prm, rc, local, region_end, chunk.EfSelectDirAt(off_idx)));
-    double d;
+    double d = NAN;
     memcpy(&d, &bits, sizeof(double));
     return Value(d);
   }
@@ -4071,11 +4565,13 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
   // Also guard the schema length: sc.GetColumn(col_idx) below reads the
   // column's declared type, and a schema shorter than the chunk (version
   // skew) would index out of bounds.
-  if (col_idx >= footer_.column_count || col_idx >= sc.ColumnCount())
+  if (col_idx >= footer_.column_count || col_idx >= sc.ColumnCount()) {
     return Status::kNotExists;
+  }
   // Hand-built footers can declare more row groups than row_counts entries.
-  if (footer_.row_counts.size() < footer_.row_group_count)
+  if (footer_.row_counts.size() < footer_.row_group_count) {
     return Status::kCorruption;
+  }
   // Decoded-int fast path for the single-group shape (the dominant stored
   // layout): a fully cached cell reads as one load plus the null test,
   // mirroring ReadRowIntoImpl's cached arm. Like the legacy paths, a NULL
@@ -4098,7 +4594,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
         if (footer_.null_present &&
             footer_.row_counts.size() >= footer_.row_group_count) {
           const size_t null_bytes = (static_cast<size_t>(rc) + 7) / 8;
-          const size_t null_byte = static_cast<size_t>(col_idx) * null_bytes +
+          const size_t null_byte = (static_cast<size_t>(col_idx) * null_bytes) +
                                    (global_row_index >> 3);
           if (null_byte < footer_.null_bitmaps.size() &&
               ((static_cast<unsigned>(footer_.null_bitmaps[null_byte]) >>
@@ -4110,9 +4606,11 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
         const int64_t cached =
             decoded_int_cache_[decoded_int_offsets_[col_idx] +
                                global_row_index];
-        if (vt == ValueType::kInt64) return Value(cached);
-        double d;
-        const uint64_t bits = static_cast<uint64_t>(cached);
+        if (vt == ValueType::kInt64) {
+          return Value(cached);
+        }
+        double d = NAN;
+        const auto bits = static_cast<uint64_t>(cached);
         memcpy(&d, &bits, sizeof(d));
         return Value(d);
       }
@@ -4126,7 +4624,9 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
     uint32_t g = 0;
     uint32_t local = 0;
     const int res = ResolveRowGroup(global_row_index, &g, &local);
-    if (res == 2) return Status::kNotExists;
+    if (res == 2) {
+      return Status::kNotExists;
+    }
     if (res == 0) {
       return ReadColumnValueIn(*this, g, local, footer_.row_counts[g], col_idx,
                                sc);
@@ -4138,7 +4638,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
     uint16_t rc = footer_.row_counts[g];
     if (global_row_index < cumulative + rc) {
       size_t local = global_row_index - cumulative;
-      const size_t off_idx = g * footer_.column_count + col_idx;
+      const size_t off_idx = (g * footer_.column_count) + col_idx;
       if (off_idx >= footer_.column_offsets.size() ||
           off_idx >= footer_.encodings.size() ||
           off_idx >= footer_.params.size()) {
@@ -4156,7 +4656,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
         return Status::kCorruption;
       }
       const char* region = data_.data() + off;
-      const char* region_end;
+      const char* region_end = nullptr;
       if (off_idx + 1 < footer_.column_offsets.size()) {
         const size_t succ = footer_.column_offsets[off_idx + 1];
         region_end =
@@ -4164,7 +4664,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
       } else {
         region_end = data_.data() + data_end;
       }
-      const Scheme s = static_cast<Scheme>(footer_.encodings[off_idx]);
+      const auto s = static_cast<Scheme>(footer_.encodings[off_idx]);
       const uint32_t prm = footer_.params[off_idx];
       // Inline the null-present early-out: chunks without null bitmaps (the
       // common case) skip the helper call on every row.
@@ -4218,8 +4718,10 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
             bits = D2PforValueAtArmed(cur.p, static_cast<uint32_t>(local),
                                       &cur.armed, &cur.loc, &cur.val, &cur.sd);
           }
-          if (vt == ValueType::kInt64) return Value(static_cast<int64_t>(bits));
-          double d;
+          if (vt == ValueType::kInt64) {
+            return Value(static_cast<int64_t>(bits));
+          }
+          double d = NAN;
           memcpy(&d, &bits, sizeof(d));
           return Value(d);
         }
@@ -4230,10 +4732,10 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
                                  EfSelectDirAt(off_idx)));
       }
       if (vt == ValueType::kDouble) {
-        uint64_t bits = static_cast<uint64_t>(
+        auto bits = static_cast<uint64_t>(
             Int64AtFast(region, s, prm, rc, static_cast<uint32_t>(local),
                         region_end, EfSelectDirAt(off_idx)));
-        double d;
+        double d = NAN;
         memcpy(&d, &bits, sizeof(double));
         return Value(d);
       }
@@ -4255,9 +4757,11 @@ bool PgmWindowLowerBound(const PaxChunk& chunk, slot_t kci, const Schema& sc,
                          int64_t target, size_t lo, size_t hi, size_t* pos) {
   size_t a = lo, b = hi + 1;
   while (a < b) {
-    const size_t mid = a + (b - a) / 2;
+    const size_t mid = a + ((b - a) / 2);
     auto v = chunk.ReadColumnValue(mid, kci, sc);
-    if (!v.HasValue() || v.Value().IsNull()) return false;
+    if (!v.HasValue() || v.Value().IsNull()) {
+      return false;
+    }
     if (v.Value().AsInt64() < target) {
       a = mid + 1;
     } else {
@@ -4278,7 +4782,9 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
       footer_.key_column_type != static_cast<uint8_t>(ValueType::kInt64)) {
     return Status::kNotImplemented;
   }
-  if (workload != nullptr) workload->RecordPointLookup(sc, kci);
+  if (workload != nullptr) {
+    workload->RecordPointLookup(sc, kci);
+  }
   // Fast path: hash index first (O(1), zone-map independent).
   {
     size_t hidx = 0;
@@ -4300,7 +4806,9 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
       const uint64_t slack = static_cast<uint64_t>(footer_.pgm_eps) + 1;
       const size_t lo = (pred > slack) ? pred - slack : 0;
       size_t hi = pred + slack;
-      if (hi >= total) hi = total - 1;
+      if (hi >= total) {
+        hi = total - 1;
+      }
       size_t found = 0;
       if (PgmWindowLowerBound(*this, kci, sc, key_value, lo, hi, &found) &&
           found <= hi) {
@@ -4345,12 +4853,14 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
     }
     for (uint32_t g = 0; g < footer_.row_group_count; ++g) {
       uint32_t rc = footer_.row_counts[g];
-      const size_t off_idx = g * footer_.column_count + kci;
+      const size_t off_idx = (g * footer_.column_count) + kci;
       // Offset-VALUE validation: the array checks above only prove the
       // entry exists; a hostile value must not form a wild pointer.
       const char* region = RegionStartAt(footer_, g, kci, data_, 0);
-      if (region == nullptr) return Status::kCorruption;
-      const Scheme s = static_cast<Scheme>(footer_.encodings[off_idx]);
+      if (region == nullptr) {
+        return Status::kCorruption;
+      }
+      const auto s = static_cast<Scheme>(footer_.encodings[off_idx]);
       const char* reg_end = RegionEndAt(footer_, g, kci, data_);
       uint32_t local = 0;
       if (!RegionLowerBound(region, s, footer_.params[off_idx], rc, key_value,
@@ -4375,9 +4885,13 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
                             reg_end, EfSelectDirAt(off_idx)) == key_value;
         break;
       }
-      if (!hit) continue;
+      if (!hit) {
+        continue;
+      }
       size_t cumulative = 0;
-      for (uint32_t i = 0; i < g; ++i) cumulative += footer_.row_counts[i];
+      for (uint32_t i = 0; i < g; ++i) {
+        cumulative += footer_.row_counts[i];
+      }
       *row_index_out = cumulative + local;
       return Status::kSuccess;
     }
@@ -4388,7 +4902,7 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
   {
     size_t lo = 0, hi = footer_.row_group_count;
     while (lo < hi) {
-      size_t mid = lo + (hi - lo) / 2;
+      size_t mid = lo + ((hi - lo) / 2);
       if (footer_.group_max_keys[mid] < key_value) {
         lo = mid + 1;
       } else {
@@ -4400,10 +4914,12 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
       candidate = static_cast<int64_t>(lo);
     }
   }
-  if (candidate < 0) return Status::kNotExists;
+  if (candidate < 0) {
+    return Status::kNotExists;
+  }
   // Lower-bound seek inside the candidate group's (possibly encoded) key
   // region, then require an exact match.
-  uint32_t g = static_cast<uint32_t>(candidate);
+  auto g = static_cast<uint32_t>(candidate);
   if (footer_.row_counts.size() < footer_.row_group_count ||
       footer_.column_offsets.size() <
           static_cast<size_t>(footer_.row_group_count) * footer_.column_count ||
@@ -4412,11 +4928,13 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
     return Status::kCorruption;
   }
   uint32_t rc = footer_.row_counts[g];
-  const size_t off_idx = g * footer_.column_count + kci;
+  const size_t off_idx = (g * footer_.column_count) + kci;
   // Offset-VALUE validation: see the no-zone-map path above.
   const char* region = RegionStartAt(footer_, g, kci, data_, 0);
-  if (region == nullptr) return Status::kCorruption;
-  const Scheme s = static_cast<Scheme>(footer_.encodings[off_idx]);
+  if (region == nullptr) {
+    return Status::kCorruption;
+  }
+  const auto s = static_cast<Scheme>(footer_.encodings[off_idx]);
   const char* reg_end = RegionEndAt(footer_, g, kci, data_);
   uint32_t local = 0;
   if (!RegionLowerBound(region, s, footer_.params[off_idx], rc, key_value,
@@ -4436,9 +4954,13 @@ Status PaxChunk::PointLookup(int64_t key_value, const Schema& sc,
                         EfSelectDirAt(off_idx)) == key_value;
     break;
   }
-  if (!hit) return Status::kNotExists;
+  if (!hit) {
+    return Status::kNotExists;
+  }
   size_t cumulative = 0;
-  for (uint32_t i = 0; i < g; ++i) cumulative += footer_.row_counts[i];
+  for (uint32_t i = 0; i < g; ++i) {
+    cumulative += footer_.row_counts[i];
+  }
   *row_index_out = cumulative + local;
   return Status::kSuccess;
 }
@@ -4447,13 +4969,15 @@ StatusOr<Row> PaxChunk::ReadRowByKey(int64_t key_value,
                                      const Schema& sc) const {
   size_t row_index = 0;
   Status st = PointLookup(key_value, sc, &row_index);
-  if (st != Status::kSuccess) return st;
+  if (st != Status::kSuccess) {
+    return st;
+  }
   return ReadRow(row_index, sc);
 }
 
 bool PaxChunk::RGOverlapsCol(int32_t g, slot_t col, int64_t lo,
                              int64_t hi) const {
-  const size_t zi = static_cast<size_t>(g) * footer_.column_count + col;
+  const size_t zi = (static_cast<size_t>(g) * footer_.column_count) + col;
   if (!footer_.all_zm_present || zi >= footer_.all_zone_mins.size() ||
       zi >= footer_.all_zone_maxs.size()) {
     return true;  // safe default when no zone info
@@ -4476,12 +5000,12 @@ Status PaxChunk::ColumnStats(slot_t col_idx, const Schema& sc,
   // hand-built footer can carry mismatched section lengths, and the former
   // col_counts-only gate left col_sum_valid / col_sums / the ext-stats
   // vectors unguarded.
-  const size_t ci = static_cast<size_t>(col_idx);
+  const auto ci = static_cast<size_t>(col_idx);
   if (!footer_.col_stats_present || col_idx >= footer_.column_count ||
       col_idx >= sc.ColumnCount() ||
       sc.GetColumn(col_idx).Type() != ValueType::kInt64 ||
       ci >= footer_.col_counts.size() || ci >= footer_.col_sum_valid.size() ||
-      ci >= footer_.col_sums.size() || !footer_.col_sum_valid[col_idx]) {
+      ci >= footer_.col_sums.size() || (footer_.col_sum_valid[col_idx] == 0U)) {
     return Status::kNotImplemented;
   }
   out->count = footer_.col_counts[col_idx];
@@ -4496,11 +5020,11 @@ Status PaxChunk::ColumnStats(slot_t col_idx, const Schema& sc,
     out->null_count = footer_.col_nulls[col_idx];
     out->mode_value = footer_.col_modes[col_idx];
     out->mode_count = footer_.col_mode_counts[col_idx];
-    for (int b = 0; b < B; ++b)
-      out->hist_counts[b] =
-          footer_
-              .col_hists[static_cast<size_t>(col_idx) * static_cast<size_t>(B) +
-                         static_cast<size_t>(b)];
+    for (int b = 0; b < B; ++b) {
+      out->hist_counts[b] = footer_.col_hists[(static_cast<size_t>(col_idx) *
+                                               static_cast<size_t>(B)) +
+                                              static_cast<size_t>(b)];
+    }
   }
   return Status::kSuccess;
 }
@@ -4514,15 +5038,16 @@ Status PaxChunk::CountNonNull(slot_t col_idx, const Schema& sc,
   if (!footer_.col_stats_present || col_idx >= footer_.column_count ||
       col_idx >= sc.ColumnCount() ||
       sc.GetColumn(col_idx).Type() != ValueType::kInt64 ||
-      static_cast<size_t>(col_idx) >= footer_.col_counts.size())
+      static_cast<size_t>(col_idx) >= footer_.col_counts.size()) {
     return Status::kNotImplemented;
+  }
   uint64_t nulls = (footer_.ext_stats_present &&
                     static_cast<size_t>(col_idx) < footer_.col_nulls.size())
                        ? footer_.col_nulls[col_idx]
                        : 0;
   // A hostile ext-stats section can carry a null count above the observed
   // row total; the unsigned subtraction used to wrap to a huge count.
-  if (nulls > footer_.col_counts[col_idx]) nulls = footer_.col_counts[col_idx];
+  nulls = std::min(nulls, footer_.col_counts[col_idx]);
   *out = footer_.col_counts[col_idx] - nulls;
   return Status::kSuccess;
 }
@@ -4535,7 +5060,7 @@ Status PaxChunk::CountEqualFromStats(slot_t col_idx, const Schema& sc,
                                      bool* exact_out) const {
   // Every array indexed below must cover col_idx (hand-built footers can
   // carry mismatched section lengths).
-  const size_t ci = static_cast<size_t>(col_idx);
+  const auto ci = static_cast<size_t>(col_idx);
   constexpr int B = Footer::ColumnStats::HIST_BINS;
   if (!footer_.ext_stats_present || col_idx >= footer_.column_count ||
       col_idx >= sc.ColumnCount() ||
@@ -4564,7 +5089,7 @@ Status PaxChunk::CountEqualFromStats(slot_t col_idx, const Schema& sc,
     return Status::kSuccess;
   }
   const uint64_t idx = HistogramBin(lit, mn, mx, B);
-  *count_out = footer_.col_hists[static_cast<size_t>(col_idx) * B + idx];
+  *count_out = footer_.col_hists[(static_cast<size_t>(col_idx) * B) + idx];
   *exact_out = false;
   return Status::kSuccess;
 }
@@ -4579,14 +5104,15 @@ Status PaxChunk::CountRangeFromStats(slot_t col_idx, const Schema& sc,
                                      uint64_t* count_out) const {
   // Every array indexed below must cover col_idx (hand-built footers can
   // carry mismatched section lengths).
-  const size_t ci = static_cast<size_t>(col_idx);
+  const auto ci = static_cast<size_t>(col_idx);
   constexpr int B = Footer::ColumnStats::HIST_BINS;
   if (!footer_.ext_stats_present || col_idx >= footer_.column_count ||
       col_idx >= sc.ColumnCount() ||
       sc.GetColumn(col_idx).Type() != ValueType::kInt64 ||
       ci >= footer_.col_mins.size() || ci >= footer_.col_maxs.size() ||
-      footer_.col_hists.size() < (ci + 1) * static_cast<size_t>(B) || lo > hi)
+      footer_.col_hists.size() < (ci + 1) * static_cast<size_t>(B) || lo > hi) {
     return Status::kNotImplemented;
+  }
   const int64_t mn = footer_.col_mins[col_idx];
   const int64_t mx = footer_.col_maxs[col_idx];
   if (mx < mn || hi < mn || lo > mx) {
@@ -4605,8 +5131,9 @@ Status PaxChunk::CountRangeFromStats(slot_t col_idx, const Schema& sc,
   };
   uint64_t bl = bin_of(clo), bh = bin_of(chi);
   uint64_t sum = 0;
-  for (uint64_t b = bl; b <= bh && b < static_cast<uint64_t>(B); ++b)
-    sum += footer_.col_hists[static_cast<size_t>(col_idx) * B + b];
+  for (uint64_t b = bl; b <= bh && b < static_cast<uint64_t>(B); ++b) {
+    sum += footer_.col_hists[(static_cast<size_t>(col_idx) * B) + b];
+  }
   *count_out = sum;
   return Status::kSuccess;
 }
@@ -4625,10 +5152,14 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
                             const Schema& sc, int64_t lo, int64_t hi,
                             slot_t col, int64_t* sum_out, uint64_t* count_out,
                             uint64_t max_gen) {
-  if (lo > hi) return false;
+  if (lo > hi) {
+    return false;
+  }
   // Public API guard: col indexes sc.GetColumn below and the per-chunk
   // column sums; an out-of-range col read out of bounds.
-  if (col >= sc.ColumnCount()) return false;
+  if (col >= sc.ColumnCount()) {
+    return false;
+  }
   const bool is_i64_col = sc.GetColumn(col).Type() == ValueType::kInt64;
   // (lo, hi) key range, per-chunk full range, per-chunk int64 column sum.
   struct Contrib {
@@ -4638,37 +5169,50 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
   };
   std::vector<Contrib> contribs;
   for (const PaxChunk* c : chunks) {
-    if (c == nullptr) continue;
+    if (c == nullptr) {
+      continue;
+    }
     // MVCC: a chunk flushed after the read version is invisible. The
     // documented contract is that MetadataRangeAggregate answers exactly
     // for the *visible* chunk set; callers combine this result with their
     // own memtable / older-run reads at the same version. Treating a hidden
     // chunk as "no intersecting chunk exists" is intentional, not a bug.
-    if (max_gen != UINT64_MAX && c->Generation() > max_gen) continue;
+    if (max_gen != UINT64_MAX && c->Generation() > max_gen) {
+      continue;
+    }
     const PaxChunk::Footer& f = c->GetFooter();
     // A hand-built footer can carry a key index past the schema; GetColumn
     // would throw std::out_of_range out of this bool API.
-    if (f.key_column_index >= sc.ColumnCount()) return false;
+    if (f.key_column_index >= sc.ColumnCount()) {
+      return false;
+    }
     // Consistency gate every sibling read path has (FastColumnSum,
     // ReduceColumn, VectorizedScanColumn, ...): a row_counts array shorter
     // than the declared row_group_count is a hostile/incomplete footer.
     // Answering from it would pair a partial count against a full-column
     // sum and report the mismatched pair as "exact".
-    if (f.row_counts.size() < f.row_group_count) return false;
+    if (f.row_counts.size() < f.row_group_count) {
+      return false;
+    }
     if (f.group_min_keys.size() < f.row_group_count ||
         f.group_max_keys.size() < f.row_group_count) {
       return false;
     }
     if (!f.zone_map_present || f.group_min_keys.empty() ||
         f.group_max_keys.size() != f.group_min_keys.size() ||
-        sc.GetColumn(f.key_column_index).Type() != ValueType::kInt64)
+        sc.GetColumn(f.key_column_index).Type() != ValueType::kInt64) {
       return false;  // cannot determine the chunk's key range
+    }
     const int64_t c_lo = f.group_min_keys.front();
     const int64_t c_hi = f.group_max_keys.back();
-    if (c_hi < lo || c_lo > hi) continue;  // no intersection with [lo,hi]
+    if (c_hi < lo || c_lo > hi) {
+      continue;  // no intersection with [lo,hi]
+    }
     // Partial boundary: the chunk straddles lo or hi, so its column sum cannot
     // be restricted to the query range from metadata alone.
-    if (c_lo < lo || c_hi > hi) return false;
+    if (c_lo < lo || c_hi > hi) {
+      return false;
+    }
     // Whole chunk in range: SUM and COUNT are exact from per-chunk stats.
     // Unsigned accumulate: per-group sums can each be near INT64_MAX on
     // adversarial data; a signed += here is UB (the cross-chunk fold below
@@ -4677,12 +5221,15 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
     const bool col_in_range = static_cast<size_t>(col) < f.column_count &&
                               static_cast<size_t>(col) < f.col_sum_valid.size();
     if (is_i64_col && col_in_range && f.col_stats_present &&
-        f.col_sum_valid[col] && static_cast<size_t>(col) < f.col_sums.size()) {
+        (f.col_sum_valid[col] != 0U) &&
+        static_cast<size_t>(col) < f.col_sums.size()) {
       s = static_cast<uint64_t>(f.col_sums[col]);
     } else if (is_i64_col && col_in_range && f.rg_sums_present) {
       for (size_t g = 0; g < f.row_group_count; ++g) {
-        const size_t zi = g * f.column_count + col;
-        if (zi >= f.rg_sums.size()) return false;
+        const size_t zi = (g * f.column_count) + col;
+        if (zi >= f.rg_sums.size()) {
+          return false;
+        }
         s += static_cast<uint64_t>(f.rg_sums[zi]);
       }
     } else {
@@ -4699,11 +5246,15 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
     }
     if (f.null_present) {
       for (uint32_t g = 0; g < f.row_group_count; ++g) {
-        if (RgColHasNull(f, g, f.key_column_index)) return false;
+        if (RgColHasNull(f, g, f.key_column_index)) {
+          return false;
+        }
       }
     }
     uint64_t cnt = 0;
-    for (uint16_t rc : f.row_counts) cnt += rc;
+    for (uint16_t rc : f.row_counts) {
+      cnt += rc;
+    }
     contribs.push_back({c_lo, c_hi, static_cast<int64_t>(s), cnt});
   }
   if (contribs.empty()) {
@@ -4715,7 +5266,9 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
   std::sort(contribs.begin(), contribs.end(),
             [](const Contrib& a, const Contrib& b) { return a.c_lo < b.c_lo; });
   for (size_t i = 1; i < contribs.size(); ++i) {
-    if (contribs[i - 1].c_hi >= contribs[i].c_lo) return false;  // overlap
+    if (contribs[i - 1].c_hi >= contribs[i].c_lo) {
+      return false;  // overlap
+    }
   }
   // Unsigned accumulate: per-chunk sums can each be near INT64_MAX; a
   // signed += across chunks is UB on adversarial data.
@@ -4731,31 +5284,37 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
 }
 
 Status PaxChunk::HashLookup(int64_t key_value, size_t* row_index_out) const {
-  if (!footer_.hash_idx_present || !footer_.hash_idx_log2 ||
-      footer_.hash_idx_log2 > 31 || footer_.hash_keys.empty())
+  if (!footer_.hash_idx_present || (footer_.hash_idx_log2 == 0U) ||
+      footer_.hash_idx_log2 > 31 || footer_.hash_keys.empty()) {
     return Status::kNotImplemented;
+  }
   // Reject a corrupt/hand-built footer whose table sizes disagree with the
   // declared log2 capacity (would make the probe below read out of bounds or
   // loop forever with no EMPTY slot reachable).
   const size_t cap = static_cast<size_t>(1U) << footer_.hash_idx_log2;
-  if (footer_.hash_keys.size() != cap || footer_.hash_rows.size() != cap)
+  if (footer_.hash_keys.size() != cap || footer_.hash_rows.size() != cap) {
     return Status::kNotImplemented;
+  }
 
-  uint64_t h = static_cast<uint64_t>(key_value);
+  auto h = static_cast<uint64_t>(key_value);
   h ^= h >> 33;
   h *= 0xFF51AFD7ED558CCDULL;
   h ^= h >> 33;
   const uint32_t mask = (1U << footer_.hash_idx_log2) - 1;
-  uint32_t slot = static_cast<uint32_t>(h & mask);
+  auto slot = static_cast<uint32_t>(h & mask);
 
   constexpr uint32_t EMPTY = UINT32_MAX;
   const size_t total = TotalRowCount();
   for (size_t probe = 0; probe < cap; ++probe) {
-    if (footer_.hash_rows[slot] == EMPTY) return Status::kNotExists;
+    if (footer_.hash_rows[slot] == EMPTY) {
+      return Status::kNotExists;
+    }
     if (footer_.hash_keys[slot] == key_value) {
       // A hand-built footer can store a row number past the chunk end.
       // Report corruption instead of a successful out-of-range index.
-      if (footer_.hash_rows[slot] >= total) return Status::kCorruption;
+      if (footer_.hash_rows[slot] >= total) {
+        return Status::kCorruption;
+      }
       *row_index_out = footer_.hash_rows[slot];
       return Status::kSuccess;
     }
@@ -4773,7 +5332,9 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
       footer_.key_column_type != static_cast<uint8_t>(ValueType::kInt64)) {
     return Status::kNotImplemented;
   }
-  if (workload != nullptr) workload->RecordSortKey(sc, kci);
+  if (workload != nullptr) {
+    workload->RecordSortKey(sc, kci);
+  }
   // Learned path: the PGM window is airtight on well-formed chunks (true
   // lower bound inside [pred-eps-1, pred+eps+1]), so a completed window
   // search IS the global lower bound with log(eps) probes. Anything
@@ -4785,7 +5346,9 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
       const uint64_t slack = static_cast<uint64_t>(footer_.pgm_eps) + 1;
       const size_t lo = (pred > slack) ? pred - slack : 0;
       size_t hi = pred + slack;
-      if (hi >= total) hi = total - 1;
+      if (hi >= total) {
+        hi = total - 1;
+      }
       size_t found = 0;
       if (PgmWindowLowerBound(*this, kci, sc, key_value, lo, hi, &found) &&
           found <= hi) {
@@ -4823,10 +5386,12 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
     }
     size_t cumulative = 0;
     for (uint32_t g = 0; g < footer_.row_group_count; ++g) {
-      const size_t off_idx = g * footer_.column_count + kci;
+      const size_t off_idx = (g * footer_.column_count) + kci;
       // Offset-VALUE validation: see PointLookup.
       const char* region = RegionStartAt(footer_, g, kci, data_, 0);
-      if (region == nullptr) return Status::kCorruption;
+      if (region == nullptr) {
+        return Status::kCorruption;
+      }
       uint32_t local = 0;
       if (RegionLowerBound(
               region, static_cast<Scheme>(footer_.encodings[off_idx]),
@@ -4851,20 +5416,20 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
     }
     return Status::kNotExists;
   }
-  uint32_t candidate = footer_.row_group_count;  // sentinel: no such group
-  {
-    size_t lo = 0, hi = footer_.row_group_count;
-    while (lo < hi) {
-      size_t mid = lo + (hi - lo) / 2;
-      if (footer_.group_max_keys[mid] < key_value) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
+  size_t lo = 0;
+  size_t hi = footer_.row_group_count;
+  while (lo < hi) {
+    size_t mid = lo + ((hi - lo) / 2);
+    if (footer_.group_max_keys[mid] < key_value) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
     }
-    candidate = static_cast<uint32_t>(lo);
   }
-  if (candidate >= footer_.row_group_count) return Status::kNotExists;
+  const auto candidate = static_cast<uint32_t>(lo);
+  if (candidate >= footer_.row_group_count) {
+    return Status::kNotExists;
+  }
   if (footer_.row_counts.size() < footer_.row_group_count ||
       footer_.column_offsets.size() <
           static_cast<size_t>(footer_.row_group_count) * footer_.column_count ||
@@ -4872,10 +5437,12 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
       footer_.params.size() < footer_.column_offsets.size()) {
     return Status::kCorruption;
   }
-  const size_t off_idx = candidate * footer_.column_count + kci;
+  const size_t off_idx = (candidate * footer_.column_count) + kci;
   // Offset-VALUE validation: see PointLookup.
   const char* region = RegionStartAt(footer_, candidate, kci, data_, 0);
-  if (region == nullptr) return Status::kCorruption;
+  if (region == nullptr) {
+    return Status::kCorruption;
+  }
   uint32_t local = 0;
   // Guaranteed to find: the group's max key >= key_value.
   if (!RegionLowerBound(region, static_cast<Scheme>(footer_.encodings[off_idx]),
@@ -4892,10 +5459,14 @@ Status PaxChunk::LowerBoundIndex(int64_t key_value, const Schema& sc,
            ((nulls[local >> 3] >> (7 - (local & 7))) & 1) != 0) {
       ++local;
     }
-    if (local >= footer_.row_counts[candidate]) return Status::kNotExists;
+    if (local >= footer_.row_counts[candidate]) {
+      return Status::kNotExists;
+    }
   }
   size_t cumulative = 0;
-  for (uint32_t i = 0; i < candidate; ++i) cumulative += footer_.row_counts[i];
+  for (uint32_t i = 0; i < candidate; ++i) {
+    cumulative += footer_.row_counts[i];
+  }
   *index_out = cumulative + local;
   return Status::kSuccess;
 }
@@ -4922,7 +5493,7 @@ namespace tinylamb {
 namespace {
 
 constexpr uint32_t kMaxSaneColumns = 1024;
-constexpr uint32_t kMaxSaneRowGroups = 1u << 20;
+constexpr uint32_t kMaxSaneRowGroups = 1U << 20;
 
 struct WalkResult {
   bool ok{false};
@@ -4934,9 +5505,9 @@ struct WalkResult {
 WalkResult ValidateWalk(const std::vector<char>& b) {
   const bool dbg = std::getenv("TINYLAMB_VALDBG") != nullptr;
   auto trace = [&](int stage, uint64_t v) {
-    if (dbg)
-      fprintf(stderr, "validate: FAIL stage=%d val=%llu\n", stage,
-              (unsigned long long)v);
+    if (dbg) {
+      std::cerr << "validate: FAIL stage=" << stage << " val=" << v << "\n";
+    }
   };
   WalkResult w;
   const size_t len = b.size();
@@ -4966,8 +5537,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
   };
   const auto rd = [&](size_t off, int n) -> uint64_t {  // big-endian, n<=8
     uint64_t v = 0;
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < n; ++i) {
       v = (v << 8) | rd8(off + static_cast<size_t>(i));
+    }
     return v;
   };
   const uint64_t fmtver = rd(footer_off + 8, 4);
@@ -4989,7 +5561,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     trace(999, 1775);
     return w;
   }
-  const uint64_t co_end = need + static_cast<uint64_t>(rg) * cc * 4;
+  const uint64_t co_end = need + (static_cast<uint64_t>(rg) * cc * 4);
   if (co_end > footer_size) {
     trace(999, 1882);
     return w;
@@ -5035,9 +5607,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
   // with the WASM parse_footer gates.
   {
     const uint64_t data_end = static_cast<uint64_t>(len) - footer_size - 4;
-    const uint64_t co_base = footer_off + 30 + rg * 2;
+    const uint64_t co_base = footer_off + 30 + (rg * 2);
     auto rc_of = [&](uint64_t g) -> uint64_t {
-      return rd(footer_off + 30 + static_cast<size_t>(g) * 2, 2);
+      return rd(footer_off + 30 + (static_cast<size_t>(g) * 2), 2);
     };
     // Minimum byte extent of a whitelisted leaf-scheme inner region holding
     // `cnt` entries at absolute offset `ioff` (`avail` = bytes remaining in
@@ -5052,13 +5624,19 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
         case 1:  // CONST: 8B
           return 8;
         case 2: {  // RLE: header run count must echo the stored param
-          if (iprm == 0 || iprm > cnt) return UINT64_MAX;
-          if (avail >= 4 && rd(ioff, 4) != iprm) return UINT64_MAX;
-          return 4 + 12 * iprm;
+          if (iprm == 0 || iprm > cnt) {
+            return UINT64_MAX;
+          }
+          if (avail >= 4 && rd(ioff, 4) != iprm) {
+            return UINT64_MAX;
+          }
+          return 4 + (12 * iprm);
         }
         case 3: {  // FOR-BA: [base 8B][cnt x bpv B]
-          if (iprm < 1 || iprm > 8) return UINT64_MAX;
-          return 8 + cnt * iprm;
+          if (iprm < 1 || iprm > 8) {
+            return UINT64_MAX;
+          }
+          return 8 + (cnt * iprm);
         }
         case 53: {  // SIMD-FOR: [base 8B][groups of 4 aligned lanes]
           if (iprm == 0 || iprm > 64 ||
@@ -5069,22 +5647,34 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                                static_cast<uint32_t>(iprm));
         }
         case 4: {  // DICT: header code count must echo the stored param
-          if (iprm == 0 || iprm > 65535) return UINT64_MAX;
-          if (avail >= 2 && rd(ioff, 2) != iprm) return UINT64_MAX;
-          const uint64_t cw = static_cast<uint64_t>(BitsNeeded(iprm - 1));
-          return 2 + (cnt * cw + 7) / 8 + 8 * iprm;
+          if (iprm == 0 || iprm > 65535) {
+            return UINT64_MAX;
+          }
+          if (avail >= 2 && rd(ioff, 2) != iprm) {
+            return UINT64_MAX;
+          }
+          const auto cw = static_cast<uint64_t>(BitsNeeded(iprm - 1));
+          return 2 + ((cnt * cw + 7) / 8) + (8 * iprm);
         }
         case 8: {  // BitWeave: header width byte must echo the stored param
-          if (iprm == 0 || iprm > 64) return UINT64_MAX;
-          if (avail >= 9 && rd8(ioff + 8) != iprm) return UINT64_MAX;
-          return 9 + (cnt * iprm + 7) / 8;
+          if (iprm == 0 || iprm > 64) {
+            return UINT64_MAX;
+          }
+          if (avail >= 9 && rd8(ioff + 8) != iprm) {
+            return UINT64_MAX;
+          }
+          return 9 + ((cnt * iprm + 7) / 8);
         }
         case 16: {  // PFOR: [base 8B][w u8][nexc u16][cnt x w bits][exc]
-          if (iprm == 0 || iprm > 64) return UINT64_MAX;
-          if (avail >= 11 && rd8(ioff + 8) != iprm) return UINT64_MAX;
+          if (iprm == 0 || iprm > 64) {
+            return UINT64_MAX;
+          }
+          if (avail >= 11 && rd8(ioff + 8) != iprm) {
+            return UINT64_MAX;
+          }
           if (avail >= 11) {
             const uint64_t nexc = rd(ioff + 9, 2);
-            return 11 + (cnt * iprm + 7) / 8 + nexc * 10;
+            return 11 + ((cnt * iprm + 7) / 8) + (nexc * 10);
           }
           return UINT64_MAX;
         }
@@ -5096,10 +5686,10 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     for (uint64_t cell = 0; cell < rg * cc; ++cell) {
       const uint64_t g = cell / cc;
       const uint64_t scheme = rd(footer_off + enc_pos + cell, 1);
-      const uint64_t prm = rd(footer_off + enc_pos + rg * cc + cell * 4, 4);
-      const uint64_t off = rd(co_base + cell * 4, 4);
+      const uint64_t prm = rd(footer_off + enc_pos + (rg * cc) + (cell * 4), 4);
+      const uint64_t off = rd(co_base + (cell * 4), 4);
       const uint64_t succ =
-          (cell + 1 < rg * cc) ? rd(co_base + (cell + 1) * 4, 4) : data_end;
+          (cell + 1 < rg * cc) ? rd(co_base + ((cell + 1) * 4), 4) : data_end;
       // Offsets must be non-decreasing and inside the data area.
       if (off < prev_off || off > succ || succ > data_end) {
         trace(80, off);
@@ -5137,14 +5727,14 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(81, rd(off, 4));
             return w;
           }
-          region_need = 4 + 12 * prm;
+          region_need = 4 + (12 * prm);
           break;
         case 3:  // FOR-BA: [base 8B][rc*bpv LE offsets]
           if (prm == 0 || prm > 8) {
             trace(82, prm);
             return w;
           }
-          region_need = 8 + n * prm;
+          region_need = 8 + (n * prm);
           break;
         case 53: {  // SIMD-FOR: [base 8B][group: 4 lanes x 8B BE]
           // The width must be one the four-lane layout can express, and the
@@ -5176,7 +5766,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           const int cw = BitsNeeded(prm - 1);
           // int64 dicts pay 8B/entry, varchar dicts 4B+len; floor at 4B.
-          region_need = 2 + (n * static_cast<uint64_t>(cw) + 7) / 8 + 4 * prm;
+          region_need =
+              2 + ((n * static_cast<uint64_t>(cw) + 7) / 8) + (4 * prm);
           break;
         }
         case 55: {  // S4: [base 8B][nblk u8][w x nblk][lo x nblk][ck x
@@ -5195,7 +5786,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(157, rd(off + 8, 1));
             return w;
           }
-          region_need = 9 + nblk + 8 * nblk + 8 * (nblk - 1);
+          region_need = 9 + nblk + (8 * nblk) + (8 * (nblk - 1));
           if (region_need > have) {
             trace(157, have);
             return w;
@@ -5208,7 +5799,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               return w;
             }
             const uint64_t rows =
-                std::min<uint64_t>(kS4Block, n - blk * kS4Block);
+                std::min<uint64_t>(kS4Block, n - (blk * kS4Block));
             payload += (rows * bw + 7) / 8;
           }
           region_need += payload;
@@ -5231,19 +5822,19 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // block really is.
           {
             const char* packed =
-                b.data() + off + 9 + nblk + 8 * nblk + 8 * (nblk - 1);
-            const int64_t base = static_cast<int64_t>(rd(off, 8));
+                b.data() + off + 9 + nblk + (8 * nblk) + (8 * (nblk - 1));
+            const auto base = static_cast<int64_t>(rd(off, 8));
             int64_t run = base;
             uint64_t boff = 0;  // BYTE offset into `packed`
             for (uint64_t blk = 0; blk < nblk; ++blk) {
               const int bwid = static_cast<int>(rd(off + 9 + blk, 1));
-              const int64_t lo =
-                  static_cast<int64_t>(rd(off + 9 + nblk + 8 * blk, 8));
+              const auto lo =
+                  static_cast<int64_t>(rd(off + 9 + nblk + (8 * blk), 8));
               const uint64_t rows =
-                  std::min<uint64_t>(kS4Block, n - blk * kS4Block);
+                  std::min<uint64_t>(kS4Block, n - (blk * kS4Block));
               if (blk != 0) {
-                const int64_t seek = static_cast<int64_t>(
-                    rd(off + 9 + nblk + 8 * nblk + 8 * (blk - 1), 8));
+                const auto seek = static_cast<int64_t>(
+                    rd(off + 9 + nblk + (8 * nblk) + (8 * (blk - 1)), 8));
                 if (seek != run) {
                   trace(157, static_cast<uint64_t>(seek));
                   return w;
@@ -5256,12 +5847,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               // Unsigned, like the decoders: a region that walks off both int64
               // ends must still replay deterministically here, or validation
               // would reject an image the encoder legitimately produced.
-              uint64_t prev = static_cast<uint64_t>(blk == 0 ? base : run);
-              const uint64_t ulo = static_cast<uint64_t>(lo);
+              auto prev = static_cast<uint64_t>(blk == 0 ? base : run);
+              const auto ulo = static_cast<uint64_t>(lo);
               for (uint64_t t = 0; t < rows; ++t) {
                 const uint64_t word = UnpackBitAt(
-                    packed, boff * 8 + t * static_cast<uint64_t>(bwid), bwid);
-                if (word > maxw) maxw = word;
+                    packed, (boff * 8) + (t * static_cast<uint64_t>(bwid)),
+                    bwid);
+                maxw = std::max(word, maxw);
                 prev += ulo + word;
               }
               run = static_cast<int64_t>(prev);
@@ -5269,7 +5861,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                   BitsNeeded(maxw) == 0
                       ? uint64_t{1}
                       : static_cast<uint64_t>(BitsNeeded(maxw));
-              if (want != static_cast<uint64_t>(bwid)) {
+              if (std::cmp_not_equal(want, bwid)) {
                 trace(157, static_cast<uint64_t>(bwid));
                 return w;
               }
@@ -5288,7 +5880,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // `freq`/`nexc` without deriving them from the stream.
           constexpr uint64_t kWalkHot = 15;
           constexpr uint64_t kWalkHeader =
-              2 + 2 + kWalkHot * 8 + kWalkHot * 2 + 1 + 4;  // 159
+              2 + 2 + (kWalkHot * 8) + (kWalkHot * 2) + 1 + 4;  // 159
           if (n == 0 || have < kWalkHeader) {
             trace(158, have);
             return w;
@@ -5310,21 +5902,24 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // rank convention is what makes range predicates a code window);
           // slots >= d are zero padding with a zero count.
           for (uint64_t c = 0; c < d; ++c) {
-            const int64_t v = static_cast<int64_t>(rd(off + 4 + c * 8, 8));
-            const uint64_t fq = rd(off + 124 + c * 2, 2);
+            const auto v = static_cast<int64_t>(rd(off + 4 + (c * 8), 8));
+            const uint64_t fq = rd(off + 124 + (c * 2), 2);
             if (fq == 0 || fq > n) {
               trace(158, fq);
               return w;
             }
-            if (c > 0 &&
-                v <= static_cast<int64_t>(rd(off + 4 + (c - 1) * 8, 8))) {
-              trace(158, static_cast<uint64_t>(v));
-              return w;
+            if (c > 0) {
+              const auto prev_v =
+                  static_cast<int64_t>(rd(off + 4 + ((c - 1) * 8), 8));
+              if (v <= prev_v) {
+                trace(158, static_cast<uint64_t>(v));
+                return w;
+              }
             }
           }
           uint64_t fsum = 0;
           for (uint64_t c = 0; c < kWalkHot; ++c) {
-            fsum += rd(off + 124 + c * 2, 2);
+            fsum += rd(off + 124 + (c * 2), 2);
           }
           if (fsum + nexc != n) {
             trace(158, fsum);
@@ -5358,7 +5953,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // rows, not nibble slots.)
           std::array<uint64_t, 16> hist{};
           for (uint64_t i = 0; i < n; ++i) {
-            const uint8_t byte =
+            const auto byte =
                 static_cast<uint8_t>(rd8(off + kWalkHeader + (i >> 1)));
             const uint64_t code = (i % 2 == 0)
                                       ? static_cast<uint64_t>(byte >> 4)
@@ -5374,7 +5969,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           for (uint64_t c = 0; c < d; ++c) {
-            if (hist[c] != rd(off + 124 + c * 2, 2)) {
+            if (hist[c] != rd(off + 124 + (c * 2), 2)) {
               trace(158, hist[c]);
               return w;
             }
@@ -5401,7 +5996,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(159, s);
             return w;
           }
-          if (3 + 19 * ng > have) {
+          if (3 + (19 * ng) > have) {
             trace(159, have);
             return w;
           }
@@ -5411,7 +6006,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           uint64_t prev_msb = 0;
           const uint64_t dirbase = off + 3;
           for (uint64_t gidx = 0; gidx < ng; ++gidx) {
-            const uint64_t ent = dirbase + gidx * 19;
+            const uint64_t ent = dirbase + (gidx * 19);
             const uint64_t msb = rd(ent, 8);
             const uint64_t base = rd(ent + 8, 8);
             const uint64_t rs = rd(ent + 16, 2);
@@ -5441,7 +6036,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(159, prev_rs);
             return w;
           }
-          region_need = 3 + 19 * ng + payload_bytes;
+          region_need = 3 + (19 * ng) + payload_bytes;
           if (region_need > have) {
             trace(159, have);
             return w;
@@ -5454,7 +6049,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           {
             uint64_t boff = 0;
             for (uint64_t gidx = 0; gidx < ng; ++gidx) {
-              const uint64_t ent = dirbase + gidx * 19;
+              const uint64_t ent = dirbase + (gidx * 19);
               const uint64_t base = rd(ent + 8, 8);
               const uint64_t gw = rd(ent + 18, 1);
               const uint64_t rs = rd(ent + 16, 2);
@@ -5464,11 +6059,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                 uint64_t maxd = 0;
                 for (uint64_t t = 0; t < rows; ++t) {
                   const uint64_t delta =
-                      UnpackBitAt(b.data() + off + 3 + 19 * ng,
-                                  boff * 8 + t * gw, static_cast<int>(gw));
-                  if (delta > maxd) maxd = delta;
+                      UnpackBitAt(b.data() + off + 3 + (19 * ng),
+                                  (boff * 8) + (t * gw), static_cast<int>(gw));
+                  maxd = std::max(delta, maxd);
                 }
-                if (static_cast<uint64_t>(BitsNeeded(maxd)) != gw) {
+                if (std::cmp_not_equal(BitsNeeded(maxd), gw)) {
                   trace(159, maxd);
                   return w;
                 }
@@ -5503,7 +6098,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(160, ng);
             return w;
           }
-          if (2 + 13 * ng > have) {
+          if (2 + (13 * ng) > have) {
             trace(160, have);
             return w;
           }
@@ -5511,7 +6106,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           uint64_t prev_rs = 0;
           const uint64_t dirbase = off + 2;
           for (uint64_t gidx = 0; gidx < ng; ++gidx) {
-            const uint64_t ent = dirbase + gidx * 13;
+            const uint64_t ent = dirbase + (gidx * 13);
             const uint64_t gkey = rd(ent, 2);
             const uint64_t base = rd(ent + 2, 8);
             const uint64_t rs = rd(ent + 10, 2);
@@ -5540,7 +6135,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(160, prev_rs);
             return w;
           }
-          region_need = 2 + 13 * ng + payload_bytes;
+          region_need = 2 + (13 * ng) + payload_bytes;
           if (region_need > have) {
             trace(160, have);
             return w;
@@ -5553,7 +6148,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           {
             uint64_t boff = 0;
             for (uint64_t gidx = 0; gidx < ng; ++gidx) {
-              const uint64_t ent = dirbase + gidx * 13;
+              const uint64_t ent = dirbase + (gidx * 13);
               const uint64_t base = rd(ent + 2, 8);
               const uint64_t gw = rd(ent + 12, 1);
               const uint64_t rs = rd(ent + 10, 2);
@@ -5563,11 +6158,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                 uint64_t maxd = 0;
                 for (uint64_t t = 0; t < rows; ++t) {
                   const uint64_t delta =
-                      UnpackBitAt(b.data() + off + 2 + 13 * ng,
-                                  boff * 8 + t * gw, static_cast<int>(gw));
-                  if (delta > maxd) maxd = delta;
+                      UnpackBitAt(b.data() + off + 2 + (13 * ng),
+                                  (boff * 8) + (t * gw), static_cast<int>(gw));
+                  maxd = std::max(delta, maxd);
                 }
-                if (static_cast<uint64_t>(BitsNeeded(maxd)) != gw) {
+                if (std::cmp_not_equal(BitsNeeded(maxd), gw)) {
                   trace(160, maxd);
                   return w;
                 }
@@ -5600,7 +6195,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(162, rd(off, 1));
             return w;
           }
-          const uint64_t wrw =
+          const auto wrw =
               static_cast<uint64_t>(BitsNeeded(static_cast<uint64_t>(n) - 1));
           if (rd(off + 1, 1) != wrw) {
             trace(162, rd(off + 1, 1));
@@ -5614,18 +6209,18 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               return w;
             }
             const uint64_t rows =
-                std::min<uint64_t>(kSortDictBlock, n - blk * kSortDictBlock);
+                std::min<uint64_t>(kSortDictBlock, n - (blk * kSortDictBlock));
             gap_bytes += ((rows - 1) * bw + 7) / 8;
           }
           region_need =
-              2 + wnb * 9 + (wnb + 1) * 8 + (n * wrw + 7) / 8 + gap_bytes;
+              2 + (wnb * 9) + ((wnb + 1) * 8) + ((n * wrw + 7) / 8) + gap_bytes;
           if (region_need > have) {
             trace(162, have);
             return w;
           }
           {
-            const uint64_t rank_base = off + 2 + wnb * 9 + (wnb + 1) * 8;
-            const uint64_t gap_base = rank_base + (n * wrw + 7) / 8;
+            const uint64_t rank_base = off + 2 + (wnb * 9) + ((wnb + 1) * 8);
+            const uint64_t gap_base = rank_base + ((n * wrw + 7) / 8);
             // Permutation check over the rank plane (n <= 1024, so a 16-word
             // seen bitmap bounds the walk).
             std::array<uint64_t, 16> seen{};
@@ -5645,12 +6240,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             for (uint64_t blk = 0; blk < wnb; ++blk) {
               const int bwid =
                   static_cast<int>(rd(off + 2 + blk, 1));  // widths plane
-              const int64_t first =
-                  static_cast<int64_t>(rd(off + 2 + wnb + blk * 8, 8));
+              const auto first =
+                  static_cast<int64_t>(rd(off + 2 + wnb + (blk * 8), 8));
               const uint64_t psum =
-                  rd(off + 2 + wnb * 9 + blk * 8, 8);  // psums plane
-              const uint64_t rows =
-                  std::min<uint64_t>(kSortDictBlock, n - blk * kSortDictBlock);
+                  rd(off + 2 + (wnb * 9) + (blk * 8), 8);  // psums plane
+              const uint64_t rows = std::min<uint64_t>(
+                  kSortDictBlock, n - (blk * kSortDictBlock));
               if (psum != running) {
                 trace(162, psum);
                 return w;
@@ -5662,19 +6257,20 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               // Unsigned accumulate: the defined mod-2^64 walk (the decoders
               // do the same), so a region that wraps through both int64
               // extremes still replays deterministically here.
-              uint64_t v = static_cast<uint64_t>(first);
+              auto v = static_cast<uint64_t>(first);
               uint64_t bsum = v;
               uint64_t maxgap = 0;
               for (uint64_t t = 1; t < rows; ++t) {
                 const uint64_t gap = UnpackBitAt(
                     b.data() + gap_base,
-                    gbyte * 8 + (t - 1) * static_cast<uint64_t>(bwid), bwid);
-                if (gap > maxgap) maxgap = gap;
+                    (gbyte * 8) + ((t - 1) * static_cast<uint64_t>(bwid)),
+                    bwid);
+                maxgap = std::max(gap, maxgap);
                 v += gap;
                 bsum += v;
               }
-              const uint64_t want = static_cast<uint64_t>(BitsNeeded(maxgap));
-              if (want != static_cast<uint64_t>(bwid)) {
+              const auto want = static_cast<uint64_t>(BitsNeeded(maxgap));
+              if (std::cmp_not_equal(want, bwid)) {
                 trace(162, static_cast<uint64_t>(bwid));
                 return w;
               }
@@ -5684,7 +6280,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
             // The total sentinel closes the table: this is the word the
             // closed-form SUM kernel loads.
-            if (rd(off + 2 + wnb * 9 + wnb * 8, 8) != running) {
+            if (rd(off + 2 + (wnb * 9) + (wnb * 8), 8) != running) {
               trace(162, running);
               return w;
             }
@@ -5723,14 +6319,14 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             const int cw = TileDictWidth(static_cast<uint32_t>(d));
             const uint64_t cb = (rows * static_cast<uint64_t>(cw) + 7) / 8;
             const uint64_t dict_at = tp + 1;
-            const uint64_t codes_at = dict_at + d * 8;
+            const uint64_t codes_at = dict_at + (d * 8);
             if (codes_at + cb > off + have) {
               trace(160, have);
               return w;
             }
             int64_t prev_v = 0;
             for (uint64_t c = 0; c < d; ++c) {
-              const int64_t v = static_cast<int64_t>(rd(dict_at + c * 8, 8));
+              const auto v = static_cast<int64_t>(rd(dict_at + (c * 8), 8));
               if (c > 0 && v <= prev_v) {
                 trace(160, static_cast<uint64_t>(v));
                 return w;
@@ -5747,9 +6343,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
                 }
               }
             }
-            tile_need += 1 + d * 8 + cb;
+            tile_need += 1 + (d * 8) + cb;
             tile_start += rows;
-            if (tile_start >= n) break;
+            if (tile_start >= n) {
+              break;
+            }
           }
           region_need = tile_need;
           if (region_need > have) {
@@ -5778,7 +6376,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(163, nd);
             return w;
           }
-          const uint64_t hdr = 8 + nd * 16;
+          const uint64_t hdr = 8 + (nd * 16);
           const uint64_t bmp = (n + 7) / 8;
           if (hdr + bmp > have) {
             trace(163, have);
@@ -5798,7 +6396,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t i = 0; i < bmp; ++i) {
             uint64_t byte = rd8(off + hdr + i);
             if (i + 1 == bmp && (n & 7) != 0) {
-              byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+              byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
             }
             ones += static_cast<uint64_t>(__builtin_popcountll(byte));
           }
@@ -5840,41 +6438,41 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(164, d);
             return w;
           }
-          const uint64_t hdr = 2 + d * 8 + d * 2 + (d + 1) / 2 + d * 4;
+          const uint64_t hdr = 2 + (d * 8) + (d * 2) + ((d + 1) / 2) + (d * 4);
           if (hdr > have) {
             trace(164, have);
             return w;
           }
-          const uint64_t counts_base = off + 2 + d * 8;
-          const uint64_t ks_base = counts_base + d * 2;
-          const uint64_t firsts_base = ks_base + (d + 1) / 2;
-          const uint64_t bitoffs_base = firsts_base + d * 2;
-          const uint64_t stream_base = bitoffs_base + d * 2;
+          const uint64_t counts_base = off + 2 + (d * 8);
+          const uint64_t ks_base = counts_base + (d * 2);
+          const uint64_t firsts_base = ks_base + ((d + 1) / 2);
+          const uint64_t bitoffs_base = firsts_base + (d * 2);
+          const uint64_t stream_base = bitoffs_base + (d * 2);
           // Tables: counts sum to n, each >= 1, firsts in range, dict
           // strictly ascending, bitoffs[0] == 0 and non-decreasing.
           uint64_t total = 0;
           for (uint64_t c = 0; c < d; ++c) {
-            const uint64_t cnt = rd(counts_base + c * 2, 2);
+            const uint64_t cnt = rd(counts_base + (c * 2), 2);
             if (cnt == 0 || cnt > n) {
               trace(164, cnt);
               return w;
             }
             total += cnt;
-            if (rd(firsts_base + c * 2, 2) >= n) {
-              trace(164, rd(firsts_base + c * 2, 2));
+            if (rd(firsts_base + (c * 2), 2) >= n) {
+              trace(164, rd(firsts_base + (c * 2), 2));
               return w;
             }
             if (c > 0) {
-              const int64_t prev =
-                  static_cast<int64_t>(rd(off + 2 + (c - 1) * 8, 8));
-              const int64_t cur = static_cast<int64_t>(rd(off + 2 + c * 8, 8));
+              const auto prev =
+                  static_cast<int64_t>(rd(off + 2 + ((c - 1) * 8), 8));
+              const auto cur = static_cast<int64_t>(rd(off + 2 + (c * 8), 8));
               if (prev >= cur) {
                 trace(164, static_cast<uint64_t>(cur));
                 return w;
               }
-              if (rd(bitoffs_base + c * 2, 2) <
-                  rd(bitoffs_base + (c - 1) * 2, 2)) {
-                trace(164, rd(bitoffs_base + c * 2, 2));
+              if (rd(bitoffs_base + (c * 2), 2) <
+                  rd(bitoffs_base + ((c - 1) * 2), 2)) {
+                trace(164, rd(bitoffs_base + (c * 2), 2));
                 return w;
               }
             } else if (rd(bitoffs_base, 2) != 0) {
@@ -5893,24 +6491,24 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             uint64_t bitpos = 0;
             uint64_t marked = 0;
             for (uint64_t c = 0; c < d; ++c) {
-              const uint32_t k =
-                  static_cast<uint32_t>(c % 2 == 0 ? rd8(ks_base + c / 2) & 0x0F
-                                                   : rd8(ks_base + c / 2) >> 4);
-              if (rd(bitoffs_base + c * 2, 2) != bitpos) {
+              const auto k = static_cast<uint32_t>(
+                  c % 2 == 0 ? rd8(ks_base + (c / 2)) & 0x0F
+                             : rd8(ks_base + (c / 2)) >> 4);
+              if (rd(bitoffs_base + (c * 2), 2) != bitpos) {
                 trace(164, bitpos);
                 return w;
               }
               PostingsBitCursor cur;
-              cur.Init(b.data() + stream_base + bitpos / 8,
+              cur.Init(b.data() + stream_base + (bitpos / 8),
                        b.data() + off + have);
-              uint64_t row = rd(firsts_base + c * 2, 2);
+              uint64_t row = rd(firsts_base + (c * 2), 2);
               if (((seen[row >> 6] >> (row & 63)) & 1) != 0) {
                 trace(164, row);
                 return w;
               }
               seen[row >> 6] |= UINT64_C(1) << (row & 63);
               ++marked;
-              const uint64_t cnt = rd(counts_base + c * 2, 2);
+              const uint64_t cnt = rd(counts_base + (c * 2), 2);
               // A count-1 list carries no codes: its sub-stream is empty and
               // its recorded offset legitimately sits at the end-of-stream
               // position (the tail of a zipf head is exactly this shape), so
@@ -5945,7 +6543,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               trace(164, marked);
               return w;
             }
-            region_need = (stream_base - off) + (bitpos + 7) / 8;
+            region_need = (stream_base - off) + ((bitpos + 7) / 8);
             if (region_need > have) {
               trace(164, have);
               return w;
@@ -6009,7 +6607,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             for (uint64_t i = 0; i < bmp_bytes; ++i) {
               uint64_t byte = rd8(off + tpos + i);
               if (i + 1 == bmp_bytes && (n & 7) != 0) {
-                byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+                byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
               }
               ones += static_cast<uint64_t>(__builtin_popcountll(byte));
             }
@@ -6111,7 +6709,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(166, ndir);
             return w;
           }
-          if (tpos + ndir * 4 > have) {
+          if (tpos + (ndir * 4) > have) {
             trace(166, have);
             return w;
           }
@@ -6140,7 +6738,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             for (uint64_t i = 0; i < bmp_bytes; ++i) {
               uint64_t byte = rd8(off + bmp_pos + i);
               if (i + 1 == bmp_bytes && (n & 7) != 0) {
-                byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+                byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
               }
               ones += static_cast<uint64_t>(__builtin_popcountll(byte));
             }
@@ -6156,7 +6754,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           {
             uint64_t left = nconf;
             for (uint64_t blk = 0; blk < ndir; ++blk) {
-              const uint64_t ro = rd(off + rdir + blk * 4, 4);
+              const uint64_t ro = rd(off + rdir + (blk * 4), 4);
               if (ro > stream_len) {
                 trace(166, ro);
                 return w;
@@ -6176,7 +6774,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               }
               const uint64_t end_off = q - stream_pos;
               if (blk + 1 < ndir) {
-                if (rd(off + rdir + (blk + 1) * 4, 4) != end_off) {
+                if (rd(off + rdir + ((blk + 1) * 4), 4) != end_off) {
                   trace(166, end_off);
                   return w;
                 }
@@ -6297,7 +6895,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t i = 0; i < bmp; ++i) {
             uint64_t byte = rd8(off + 31 + i);
             if (i + 1 == bmp && (n & 7) != 0) {
-              byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+              byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
             }
             ones += static_cast<uint64_t>(__builtin_popcountll(byte));
           }
@@ -6325,18 +6923,18 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           const uint64_t cks =
               (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery;
-          region_need = 8 + 8 * cks + ((n > 0 ? (n - 1) * prm : 0) + 7) / 8;
+          region_need = 8 + (8 * cks) + (((n > 0 ? (n - 1) * prm : 0) + 7) / 8);
           break;
         }
         case 6:  // BITMAP: [tv 8B][fv 8B][ceil(n/8) bitmap]
-          region_need = 16 + (n + 7) / 8;
+          region_need = 16 + ((n + 7) / 8);
           break;
         case 7:  // XOR-FOR: [first 8B][packed xors]
           if (prm == 0 || prm > 64) {
             trace(84, prm);
             return w;
           }
-          region_need = 8 + ((n > 0 ? (n - 1) * prm : 0) + 7) / 8;
+          region_need = 8 + (((n > 0 ? (n - 1) * prm : 0) + 7) / 8);
           break;
         case 8: {  // BitWeave: [base 8B][w u8][packed offsets]
           if (prm == 0 || prm > 64) {
@@ -6354,7 +6952,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(86, rd(off + 8, 1));
             return w;
           }
-          region_need = 9 + (n * prm + 7) / 8;
+          region_need = 9 + ((n * prm + 7) / 8);
           break;
         }
         case 9: {  // Elias-Fano: [base][maxd][l][high bitmap][low bits]
@@ -6382,7 +6980,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           const uint64_t hlen = n + high_max;
-          region_need = 17 + (hlen + 7) / 8 + (n * prm + 7) / 8;
+          region_need = 17 + ((hlen + 7) / 8) + ((n * prm + 7) / 8);
           break;
         }
         case 10: {  // Wavelet: [min 8B][W u8][W bitmaps of ceil(n/8)]
@@ -6399,7 +6997,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(88, W);
             return w;
           }
-          region_need = 9 + W * ((n + 7) / 8);
+          region_need = 9 + (W * ((n + 7) / 8));
           break;
         }
         case 11:  // Delta-For: [ncp u16][checkpoints][FOR-BA inner]
@@ -6417,12 +7015,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // index), and the decoders would read `base` out of the inner
           // payload for idx >= 128.
           if (rd(off, 2) !=
-              (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery + 1) {
+              ((n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery) + 1) {
             trace(89, rd(off, 2));
             return w;
           }
           region_need =
-              2 + 8 * rd(off, 2) + 8 + n * prm;  // inner = [base 8B][n*bpv]
+              2 + (8 * rd(off, 2)) + 8 + (n * prm);  // inner = [base 8B][n*bpv]
           break;
         case 12:  // Delta-BitWeave: [ncp u16][checkpoints][BitWeave inner]
           if (prm == 0 || prm > 64) {
@@ -6435,7 +7033,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           // Same checkpoint-count pin as case 11.
           if (rd(off, 2) !=
-              (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery + 1) {
+              ((n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery) + 1) {
             trace(90, rd(off, 2));
             return w;
           }
@@ -6444,13 +7042,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // so a mismatch over-reads the region; cf. cases 8/9/13).
           {
             const uint64_t ncp = rd(off, 2);
-            const uint64_t inner_off = off + 2 + ncp * 8 + 8;
+            const uint64_t inner_off = off + 2 + (ncp * 8) + 8;
             if (inner_off >= off + have || rd(inner_off, 1) != prm) {
               trace(90, inner_off);
               return w;
             }
           }
-          region_need = 2 + 8 * rd(off, 2) + 9 + (n * prm + 7) / 8;
+          region_need = 2 + (8 * rd(off, 2)) + 9 + ((n * prm + 7) / 8);
           break;
         case 54: {  // DELTA-SIMD: [ncp u16][ckpt ncp x 8B BE]
                     //         [inner: a complete kSimdFor region over the n
@@ -6472,11 +7070,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           if (rd(off, 2) !=
-              (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery + 1) {
+              ((n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery) + 1) {
             trace(158, rd(off, 2));
             return w;
           }
-          region_need = 2 + 8 * rd(off, 2) +
+          region_need = 2 + (8 * rd(off, 2)) +
                         SimdForExtent(static_cast<uint32_t>(n),
                                       static_cast<uint32_t>(prm));
           break;
@@ -6504,7 +7102,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(91, rd(off, 1));
             return w;
           }
-          region_need = 1 + prm * ((n + 7) / 8);
+          region_need = 1 + (prm * ((n + 7) / 8));
           break;
         }
         case 14:  // Gorilla: [first 8B][XOR bitstream]. The stream is
@@ -6554,7 +7152,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
           }
           const uint64_t tsl = rd(off + 2, 4);
-          region_need = sp + static_cast<uint64_t>(n) * 4 + tsl;
+          region_need = sp + (static_cast<uint64_t>(n) * 4) + tsl;
           break;
         }
         case 16: {  // PFOR: [base 8B][w u8][nexc u16][packed][pos+val x nexc]
@@ -6576,7 +7174,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               trace(96, nexc);
               return w;
             }
-            region_need = 11 + (n * prm + 7) / 8 + nexc * 10;
+            region_need = 11 + ((n * prm + 7) / 8) + (nexc * 10);
             // Exception positions must be in-range and sorted. Gate the
             // walk extent BEFORE it runs: the loop reads 10*nexc bytes at
             // off+11+pack_bytes, and `region_need > have` is only compared
@@ -6584,13 +7182,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             // the data end read ~18KB past the buffer. Lockstep with the
             // WASM parse_footer case 16 gate.
             const uint64_t pack_bytes = (n * prm + 7) / 8;
-            if (11 + pack_bytes + nexc * 10 > have) {
+            if (11 + pack_bytes + (nexc * 10) > have) {
               trace(96, have);
               return w;
             }
             uint64_t prev = 0;
             for (uint64_t k = 0; k < nexc; ++k) {
-              const uint64_t epos = rd(off + 11 + pack_bytes + k * 10, 2);
+              const uint64_t epos = rd(off + 11 + pack_bytes + (k * 10), 2);
               if (epos >= n || (k > 0 && epos <= prev)) {
                 trace(96, epos);
                 return w;
@@ -6610,18 +7208,18 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           // Checkpoint count is a pure function of n (C = 128 deltas).
-          const uint64_t ncp_want = (n == 0) ? 0 : (n - 1) / 128 + 1;
+          const uint64_t ncp_want = (n == 0) ? 0 : ((n - 1) / 128) + 1;
           const uint64_t ncp = rd(off, 2);
           if (ncp != ncp_want || ncp == 0 || ncp > 1024) {
             trace(97, ncp);
             return w;
           }
-          const uint64_t k_off = off + 2 + ncp * 20;
+          const uint64_t k_off = off + 2 + (ncp * 20);
           if (k_off >= off + have || rd(k_off, 1) != prm) {
             trace(97, k_off);
             return w;
           }
-          region_need = 2 + ncp * 20 + 1;
+          region_need = 2 + (ncp * 20) + 1;
           break;
         }
         case 18:  // Chimp: [first 8B][bitstream], self-delimiting like Gorilla
@@ -6636,13 +7234,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(98, have);
             return w;
           }
-          const uint64_t ncp_want = (n == 0) ? 0 : (n - 1) / 128 + 1;
+          const uint64_t ncp_want = (n == 0) ? 0 : ((n - 1) / 128) + 1;
           const uint64_t ncp = rd(off, 2);
           if (ncp != ncp_want || ncp == 0 || ncp > 1024) {
             trace(98, ncp);
             return w;
           }
-          region_need = 2 + ncp * 12;
+          region_need = 2 + (ncp * 12);
           break;
         }
         case 20: {  // ALP: [exp u8][backend u8][nexc u16][exc 10B x][inner]
@@ -6668,13 +7266,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // Gate the exception walk BEFORE it runs (cf. case 16): the loop
           // below reads 10*nexc bytes at off+4, and region_need is only
           // compared against `have` after the switch.
-          if (4 + nexc * 10 > have) {
+          if (4 + (nexc * 10) > have) {
             trace(99, have);
             return w;
           }
           uint64_t prev_epos = 0;
           for (uint64_t k = 0; k < nexc; ++k) {
-            const uint64_t epos = rd(off + 4 + k * 10, 2);
+            const uint64_t epos = rd(off + 4 + (k * 10), 2);
             if (epos >= n || (k > 0 && epos <= prev_epos)) {
               trace(99, epos);
               return w;
@@ -6683,7 +7281,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           // Inner region header walk per backend (the inner headers are
           // authoritative; the footer param is unused for scheme 20).
-          const uint64_t inner_off = off + 4 + nexc * 10;
+          const uint64_t inner_off = off + 4 + (nexc * 10);
           uint64_t inner_need = 0;
           if (backend == 8) {  // BitWeave: [base 8B][w u8][packed]
             if (inner_off + 9 > off + have) {
@@ -6695,7 +7293,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               trace(99, iw);
               return w;
             }
-            inner_need = 9 + (n * iw + 7) / 8;
+            inner_need = 9 + ((n * iw + 7) / 8);
           } else if (backend == 4) {  // DICT: [ncodes u16][codes][dict 8B/e]
             if (inner_off + 2 > off + have) {
               trace(99, have);
@@ -6707,9 +7305,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               return w;
             }
             const int cw = BitsNeeded((ncodes > 0 ? ncodes - 1 : 0));
-            inner_need = 2 + (n * static_cast<uint64_t>(cw) + 7) / 8 +
-                         8 * ncodes;  // int64 mantissa dict: 8B/entry
-          } else if (backend == 2) {  // RLE: [runs u32][12B x runs]
+            inner_need = 2 + ((n * static_cast<uint64_t>(cw) + 7) / 8) +
+                         (8 * ncodes);  // int64 mantissa dict: 8B/entry
+          } else if (backend == 2) {    // RLE: [runs u32][12B x runs]
             if (inner_off + 4 > off + have) {
               trace(99, have);
               return w;
@@ -6719,16 +7317,16 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               trace(99, runs);
               return w;
             }
-            inner_need = 4 + 12 * runs;
+            inner_need = 4 + (12 * runs);
           } else {  // CONST: [8B]
             inner_need = 8;
           }
-          region_need = 4 + nexc * 10 + inner_need;
+          region_need = 4 + (nexc * 10) + inner_need;
           break;
         }
         case 21: {  // FrontCode: [nrestart u16][stream_len u32]
                     // [restart u32 x nrestart][entry stream]
-          const uint64_t re = prm & 0x7FFFu;
+          const uint64_t re = prm & 0x7FFFU;
           if (re == 0 || re > 1024) {
             trace(100, prm);
             return w;
@@ -6746,18 +7344,18 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           const uint64_t stream_len = rd(off + 2, 4);
-          region_need = 6 + nrestart * 4 + stream_len;
+          region_need = 6 + (nrestart * 4) + stream_len;
           // Gate the restart-table walk BEFORE region_need is compared
           // against `have` (cf. cases 16/20): the loop below reads
           // 4*nrestart bytes at off+6. Lockstep with the WASM parse_footer
           // case 21 gate.
-          if (6 + nrestart * 4 > have) {
+          if (6 + (nrestart * 4) > have) {
             trace(100, have);
             return w;
           }
           uint64_t prev_ro = 0;
           for (uint64_t k = 0; k < nrestart; ++k) {
-            const uint64_t ro = rd(off + 6 + k * 4, 4);
+            const uint64_t ro = rd(off + 6 + (k * 4), 4);
             // restart[0] leads the first chain (plen must be 0 there, which
             // the clamped decoders enforce), offsets are non-decreasing and
             // stay inside the declared stream.
@@ -6784,7 +7382,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           const int cw = BitsNeeded(prm - 1);
           // int64 dicts pay 8B/entry, varchar dicts 4B+len; floor at 4B.
-          region_need = 2 + (n * static_cast<uint64_t>(cw) + 7) / 8 + 4 * prm;
+          region_need =
+              2 + ((n * static_cast<uint64_t>(cw) + 7) / 8) + (4 * prm);
           break;
         }
         case 23: {  // RLE-DICT: [d u16][dict d x 8B][runs u32]
@@ -6803,16 +7402,16 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(102, d);
             return w;
           }
-          const uint64_t cb =
+          const auto cb =
               static_cast<uint64_t>((BitsNeeded(d - 1) + 7) / 8);  // 1 or 2
           // Cross-check the region's run count against the footer param
           // (the run walk is bounded by it; a mismatch over-reads).
-          const uint64_t runs_off = off + 2 + d * 8;
+          const uint64_t runs_off = off + 2 + (d * 8);
           if (runs_off + 4 > off + have || rd(runs_off, 4) != prm) {
             trace(102, runs_off);
             return w;
           }
-          region_need = 2 + d * 8 + 4 + prm * (cb + 4);
+          region_need = 2 + (d * 8) + 4 + (prm * (cb + 4));
           break;
         }
         case 24: {  // FREQ: [top 8B][ischeme u8][iparam u32][nexc u16]
@@ -6842,7 +7441,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t i = 0; i < bmp; ++i) {
             uint64_t byte = rd8(off + 15 + i);
             if (i + 1 == bmp && (n & 7) != 0) {
-              byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+              byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
             }
             ones += static_cast<uint64_t>(__builtin_popcountll(byte));
           }
@@ -6936,7 +7535,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           const uint64_t ps = rd(poff, 1);
-          uint64_t pool_need;
+          uint64_t pool_need = 0;
           if (ps == 0) {
             // int64 dicts pay 8B/entry, varchar 4B+len: floor at 4B (same
             // convention as cases 4/22).
@@ -6970,7 +7569,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               }
             }
             const uint64_t tsl = rd(poff + 3, 4);
-            pool_need = sp + prm * 4 + tsl;
+            pool_need = sp + (prm * 4) + tsl;
           } else {
             trace(105, ps);
             return w;
@@ -7008,7 +7607,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t i = 0; i < bmp; ++i) {
             uint64_t byte = rd8(off + 23 + i);
             if (i + 1 == bmp && (n & 7) != 0) {
-              byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+              byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
             }
             ones += static_cast<uint64_t>(__builtin_popcountll(byte));
           }
@@ -7046,7 +7645,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(106, prm);
             return w;
           }
-          const uint64_t pos_need = 8 + prm * pbpv;
+          const uint64_t pos_need = 8 + (prm * pbpv);
           if (14 + pos_need > have) {
             trace(106, have);
             return w;
@@ -7059,7 +7658,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t i = 0; i < prm; ++i) {
             uint64_t offv = 0;
             for (uint64_t pb = 0; pb < pbpv; ++pb) {
-              offv |= rd8(off + 22 + i * pbpv + pb) << (pb * 8);
+              offv |= rd8(off + 22 + (i * pbpv) + pb) << (pb * 8);
             }
             const uint64_t p = pbase + offv;  // wrapping u64, like FOR-BA
             if (p >= n || (i > 0 && p <= prev)) {
@@ -7101,7 +7700,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(107, prm);
             return w;
           }
-          const uint64_t hdr = 12 + nsym * 3 + 2;
+          const uint64_t hdr = 12 + (nsym * 3) + 2;
           if (hdr > have) {
             trace(107, have);
             return w;
@@ -7112,8 +7711,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           uint64_t acc = 0;
           uint64_t prev = 0;
           for (uint64_t i = 0; i < nsym; ++i) {
-            const uint64_t sym = rd(off + 12 + i * 3, 1);
-            const uint64_t fr = rd(off + 12 + i * 3 + 1, 2);
+            const uint64_t sym = rd(off + 12 + (i * 3), 1);
+            const uint64_t fr = rd(off + 12 + (i * 3) + 1, 2);
             if (fr == 0 || (i > 0 && sym <= prev)) {
               trace(107, sym);
               return w;
@@ -7125,13 +7724,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(107, acc);
             return w;
           }
-          const uint64_t ncp = rd(off + 12 + nsym * 3, 2);
+          const uint64_t ncp = rd(off + 12 + (nsym * 3), 2);
           if (ncp != (n + 63) / 64) {
             trace(107, ncp);
             return w;
           }
-          const uint64_t ckoff = off + 12 + nsym * 3 + 2;
-          const uint64_t slen_off = ckoff + ncp * 8;
+          const uint64_t ckoff = off + 12 + (nsym * 3) + 2;
+          const uint64_t slen_off = ckoff + (ncp * 8);
           if (slen_off + 4 > off + have) {
             trace(107, have);
             return w;
@@ -7142,8 +7741,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // from the last pushed byte backwards).
           uint64_t prev_pos = slen;
           for (uint64_t k = 0; k < ncp; ++k) {
-            const uint64_t st = rd(ckoff + k * 8, 4);
-            const uint64_t ps = rd(ckoff + k * 8 + 4, 4);
+            const uint64_t st = rd(ckoff + (k * 8), 4);
+            const uint64_t ps = rd(ckoff + (k * 8) + 4, 4);
             if (st < (uint64_t{1} << 23) || st >= (uint64_t{1} << 31) ||
                 ps > slen || (k == 0 ? ps != slen : ps > prev_pos)) {
               trace(107, st);
@@ -7151,7 +7750,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
             prev_pos = ps;
           }
-          region_need = hdr + ncp * 8 + 4 + slen;
+          region_need = hdr + (ncp * 8) + 4 + slen;
           break;
         }
         case 30: {  // OP-RLE: kRleDict's byte layout ([d u16][dict d x 8B]
@@ -7173,14 +7772,14 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(108, d);
             return w;
           }
-          const uint64_t cb =
+          const auto cb =
               static_cast<uint64_t>((BitsNeeded(d - 1) + 7) / 8);  // 1 or 2
-          const uint64_t runs_off = off + 2 + d * 8;
+          const uint64_t runs_off = off + 2 + (d * 8);
           if (runs_off + 4 > off + have || rd(runs_off, 4) != prm) {
             trace(108, runs_off);
             return w;
           }
-          region_need = 2 + d * 8 + 4 + prm * (cb + 4);
+          region_need = 2 + (d * 8) + 4 + (prm * (cb + 4));
           break;
         }
         case 31: {  // XOR-FOR-C: [ncp u16][ckpts ncp x 8B][w u8][packed]
@@ -7203,11 +7802,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // Cross-check the region's width byte against the footer param:
           // the decoders walk (n-1)*prm bits from the packed area, so a
           // header/param disagreement over-reads the region (cf. case 8).
-          if (2 + ncp * 8 + 1 > have || rd(off + 2 + ncp * 8, 1) != prm) {
+          if (2 + (ncp * 8) + 1 > have || rd(off + 2 + (ncp * 8), 1) != prm) {
             trace(109, ncp);
             return w;
           }
-          region_need = 2 + ncp * 8 + 1 + ((n > 0 ? (n - 1) * prm : 0) + 7) / 8;
+          region_need =
+              2 + (ncp * 8) + 1 + (((n > 0 ? (n - 1) * prm : 0) + 7) / 8);
           break;
         }
         case 32:    // GORILLA-C: [ncp u16][ckpts ncp x 8B]
@@ -7226,7 +7826,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           const uint64_t ncp = rd(off, 2);
-          const uint64_t tbl = 2 + ncp * 12 + 8;
+          const uint64_t tbl = 2 + (ncp * 12) + 8;
           if (tbl > have) {
             trace(110, have);
             return w;
@@ -7234,11 +7834,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // Every resume bit offset must sit inside the bitstream and be
           // non-decreasing; bitoffs[0] is fixed at 0 by the builder.
           {
-            const uint64_t offs_off = off + 2 + ncp * 8;
+            const uint64_t offs_off = off + 2 + (ncp * 8);
             const uint64_t stream_bits = (have - tbl) * 8;
             uint64_t prev_bit = 0;
             for (uint64_t bi = 0; bi < ncp; ++bi) {
-              const uint64_t ob = rd(offs_off + bi * 4, 4);
+              const uint64_t ob = rd(offs_off + (bi * 4), 4);
               // ob == stream_bits is legitimate for a final block holding
               // only its checkpoint row (the offset is never consumed); the
               // bounded BitReader fails closed on any real over-seek.
@@ -7264,8 +7864,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           const uint64_t stride = (n + 7) / 8;
-          const uint64_t pbits_need =
-              11 + stride * pbits_width + (nexc == 0 ? 0 : stride + nexc * 10);
+          const uint64_t pbits_need = 11 + (stride * pbits_width) +
+                                      (nexc == 0 ? 0 : stride + (nexc * 10));
           if (pbits_need > have) {
             trace(113, pbits_need);
             return w;
@@ -7296,13 +7896,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             const uint64_t entries = off + 11 + stride;
             uint64_t previous = 0;
             for (uint64_t k = 0; k < nexc; ++k) {
-              const uint64_t pbits_pos = rd(entries + k * 10, 2);
+              const uint64_t pbits_pos = rd(entries + (k * 10), 2);
               if (pbits_pos >= n || (k != 0 && pbits_pos <= previous)) {
                 trace(117, pbits_pos);
                 return w;
               }
               if ((rd(off + 11 + (pbits_pos >> 3), 1) &
-                   (0x80u >> (pbits_pos & 7U))) == 0) {
+                   (0x80U >> (pbits_pos & 7U))) == 0) {
                 trace(117, pbits_pos);
                 return w;
               }
@@ -7329,7 +7929,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(118, prm);
             return w;
           }
-          const uint64_t fixed = 2 + prm * 20;
+          const uint64_t fixed = 2 + (prm * 20);
           if (have < fixed) {
             trace(119, have);
             return w;
@@ -7337,25 +7937,27 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t bi = 0; bi < prm; ++bi) {
             // SIGNED order: the u64 words of a sign-crossing block sort
             // backwards (see ParseInterpRegion).
-            const int64_t first =
-                static_cast<int64_t>(rd(off + 2 + bi * 16, 8));
-            const int64_t last =
-                static_cast<int64_t>(rd(off + 2 + bi * 16 + 8, 8));
+            const auto first = static_cast<int64_t>(rd(off + 2 + (bi * 16), 8));
+            const auto last =
+                static_cast<int64_t>(rd(off + 2 + (bi * 16) + 8, 8));
             if (last < first) {
               trace(120, static_cast<uint64_t>(last));
               return w;
             }
-            if (bi + 1 < prm &&
-                static_cast<int64_t>(rd(off + 2 + (bi + 1) * 16, 8)) < last) {
-              trace(121, static_cast<uint64_t>(first));
-              return w;
+            if (bi + 1 < prm) {
+              const auto next_first =
+                  static_cast<int64_t>(rd(off + 2 + ((bi + 1) * 16), 8));
+              if (next_first < last) {
+                trace(121, static_cast<uint64_t>(first));
+                return w;
+              }
             }
           }
           {
             const uint64_t stream_bits = (have - fixed) * 8;
             uint64_t prev_bit = 0;
             for (uint64_t bi = 0; bi < prm; ++bi) {
-              const uint64_t ob = rd(off + 2 + prm * 16 + bi * 4, 4);
+              const uint64_t ob = rd(off + 2 + (prm * 16) + (bi * 4), 4);
               if ((bi == 0 && ob != 0) || ob < prev_bit || ob > stream_bits) {
                 trace(122, ob);
                 return w;
@@ -7383,11 +7985,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               const uint32_t t = static_cast<uint32_t>(
                   std::min<uint64_t>(n, s + kDeltaCheckpointEvery));
               const uint64_t block_off = static_cast<uint64_t>(blk) * 16;
-              const uint64_t first = rd(off + 2 + block_off, 8);
-              const uint64_t last = rd(off + 2 + block_off + 8, 8);
-              if (static_cast<uint64_t>(block[0]) != first ||
-                  static_cast<uint64_t>(block[t - 1 - s]) != last) {
-                trace(124, first);
+              const auto first =
+                  static_cast<int64_t>(rd(off + 2 + block_off, 8));
+              const auto last =
+                  static_cast<int64_t>(rd(off + 2 + block_off + 8, 8));
+              if (block[0] != first || block[t - 1 - s] != last) {
+                trace(124, static_cast<uint64_t>(first));
                 return w;
               }
               for (uint32_t i = 1; i + s < t; ++i) {
@@ -7423,7 +8026,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               b.data() + off + 14 + static_cast<size_t>(value_bytes);
           uint64_t covered = 0;
           for (uint64_t i = 0; i < runs; ++i) {
-            const uint32_t length = static_cast<uint32_t>(
+            const auto length = static_cast<uint32_t>(
                 UnpackBitAt(lengths, i * lw, static_cast<int>(lw)));
             if (length == 0 || length > n - covered) {
               trace(129, length);
@@ -7447,8 +8050,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           const uint64_t blocks =
               (n + kDeltaPForBlockRows - 1) / kDeltaPForBlockRows;
           const uint64_t packed_bytes = ((n - 1) * prm + 7) / 8;
-          region_need =
-              11 + blocks * kDeltaPForBracketBytes + packed_bytes + nexc * 10;
+          region_need = 11 + (blocks * kDeltaPForBracketBytes) + packed_bytes +
+                        (nexc * 10);
           if (nexc > n - 1 || region_need > have) {
             trace(132, have);
             return w;
@@ -7478,14 +8081,17 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           for (uint32_t block = 0; block < parsed.blocks; ++block) {
-            const char* bracket = parsed.brackets + static_cast<size_t>(block) *
-                                                        kDeltaPForBracketBytes;
+            const char* bracket =
+                parsed.brackets +
+                (static_cast<size_t>(block) * kDeltaPForBracketBytes);
             const uint32_t start = block * kDeltaPForBlockRows;
             const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(
                 n, static_cast<uint64_t>(start) + kDeltaPForBlockRows));
             __int128 sum = 0;
-            for (uint32_t i = start; i < end; ++i) sum += decoded[i];
-            const unsigned __int128 bits = static_cast<unsigned __int128>(sum);
+            for (uint32_t i = start; i < end; ++i) {
+              sum += decoded[i];
+            }
+            const auto bits = static_cast<unsigned __int128>(sum);
             if (ReadBE64(bracket) != static_cast<uint64_t>(decoded[start]) ||
                 ReadBE64(bracket + 8) !=
                     static_cast<uint64_t>(decoded[end - 1]) ||
@@ -7510,7 +8116,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           const uint64_t stride = (n + 7) / 8;
           const uint32_t rank_count =
               WaveletRRankCount(static_cast<uint32_t>(n));
-          region_need = 9 + width * stride + width * rank_count * 2;
+          region_need = 9 + (width * stride) + (width * rank_count * 2);
           if (region_need > have) {
             trace(139, have);
             return w;
@@ -7555,7 +8161,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(143, have);
             return w;
           }
-          region_need = 16 + 3 * static_cast<uint64_t>(prm);
+          region_need = 16 + (3 * static_cast<uint64_t>(prm));
           break;
         }
         case 42: {
@@ -7610,7 +8216,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(148, prm);
             return w;
           }
-          region_need = 16 + 8 * prm;
+          region_need = 16 + (8 * prm);
           if (region_need > have) {
             // Gate the word walk before comparing region_need: the loop
             // below reads every word regardless of the outer extent check.
@@ -7619,7 +8225,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           uint64_t covered = 0;
           for (uint64_t k = 0; k < prm; ++k) {
-            const uint64_t word = rd(off + 16 + k * 8, 8);
+            const uint64_t word = rd(off + 16 + (k * 8), 8);
             if ((word >> 63) ==
                 0) {  // literal span of 63 rows (tail: n-covered)
               if (covered >= n) {
@@ -7655,7 +8261,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(149, nseg);
             return w;
           }
-          if (9 + 20 * nseg > have) {
+          if (9 + (20 * nseg) > have) {
             trace(149, have);
             return w;
           }
@@ -7664,7 +8270,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // too -- the bitmap decides on-line, not the table).
           uint64_t prev_end = 0;
           for (uint64_t j = 0; j < nseg; ++j) {
-            const uint64_t e = rd(off + 2 + j * 20 + 16, 4);
+            const uint64_t e = rd(off + 2 + (j * 20) + 16, 4);
             if (e <= prev_end || e > n) {
               trace(149, e);
               return w;
@@ -7675,9 +8281,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(149, prev_end);
             return w;
           }
-          const uint64_t nexc = rd(off + 9 + 20 * nseg - 2, 2);
+          const uint64_t nexc = rd(off + 9 + (20 * nseg) - 2, 2);
           const uint64_t bmp = (n + 7) / 8;
-          if (9 + 20 * nseg + bmp > have) {
+          if (9 + (20 * nseg) + bmp > have) {
             trace(149, have);
             return w;
           }
@@ -7685,9 +8291,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // masked), the same door check as case 27.
           uint64_t ones = 0;
           for (uint64_t i = 0; i < bmp; ++i) {
-            uint64_t byte = rd8(off + 9 + 20 * nseg + i);
+            uint64_t byte = rd8(off + 9 + (20 * nseg) + i);
             if (i + 1 == bmp && (n & 7) != 0) {
-              byte &= static_cast<uint64_t>(0xFFu << (8 - (n & 7))) & 0xFF;
+              byte &= static_cast<uint64_t>(0xFFU << (8 - (n & 7))) & 0xFF;
             }
             ones += static_cast<uint64_t>(__builtin_popcountll(byte));
           }
@@ -7697,9 +8303,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           }
           uint64_t ineed = 0;
           if (nexc > 0) {
-            const uint64_t ischeme = rd(off + 9 + 20 * nseg - 7, 1);
-            const uint64_t iprm = rd(off + 9 + 20 * nseg - 6, 4);
-            const uint64_t ioff = off + 9 + 20 * nseg + bmp;
+            const uint64_t ischeme = rd(off + 9 + (20 * nseg) - 7, 1);
+            const uint64_t iprm = rd(off + 9 + (20 * nseg) - 6, 4);
+            const uint64_t ioff = off + 9 + (20 * nseg) + bmp;
             const uint64_t iavail = off + have - ioff;
             ineed = inner_extent(ioff, iavail, ischeme, iprm, nexc);
             if (ineed == UINT64_MAX || ineed > iavail) {
@@ -7707,7 +8313,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               return w;
             }
           }
-          region_need = 9 + 20 * nseg + bmp + ineed;
+          region_need = 9 + (20 * nseg) + bmp + ineed;
           break;
         }
         case 48: {  // SIMPLE-8B: [base 8B][prm words x 8B BE]
@@ -7717,7 +8323,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(150, prm);
             return w;
           }
-          region_need = 8 + 8 * prm;
+          region_need = 8 + (8 * prm);
           if (region_need > have) {
             trace(150, have);
             return w;
@@ -7727,7 +8333,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // its selector's full count, exactly as the encoder emits it).
           uint64_t covered = 0;
           for (uint64_t k = 0; k < prm; ++k) {
-            const uint64_t word = rd(off + 8 + k * 8, 8);
+            const uint64_t word = rd(off + 8 + (k * 8), 8);
             const uint64_t cnt = kSimple8bSelCount[word >> 60];
             if (k + 1 < prm && covered + cnt > n) {
               trace(150, covered);
@@ -7773,7 +8379,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(151, vbpv);
             return w;
           }
-          const uint64_t loff = off + 8 + 9 + prm * vbpv;
+          const uint64_t loff = off + 8 + 9 + (prm * vbpv);
           if (loff + 9 > off + have) {
             trace(151, loff);
             return w;
@@ -7783,12 +8389,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(151, lbpv);
             return w;
           }
-          const uint64_t roff = loff + 9 + prm * lbpv;
-          if (roff + nidx * 4 > off + have) {
+          const uint64_t roff = loff + 9 + (prm * lbpv);
+          if (roff + (nidx * 4) > off + have) {
             trace(151, roff);
             return w;
           }
-          region_need = 8 + 9 + prm * vbpv + 9 + prm * lbpv + nidx * 4;
+          region_need = 8 + 9 + (prm * vbpv) + 9 + (prm * lbpv) + (nidx * 4);
           // Integrity walk (O(runs + nidx), the same order the encoder paid):
           // the lengths must be non-zero and tile n, and -- the invariant the
           // read paths binary search on -- the run values must be
@@ -7800,11 +8406,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           for (uint64_t k = 0; k < prm; ++k) {
             uint64_t voff = 0;
             for (uint64_t vb = 0; vb < vbpv; ++vb) {
-              voff |= rd8(off + 8 + 9 + k * vbpv + vb) << (vb * 8);
+              voff |= rd8(off + 8 + 9 + (k * vbpv) + vb) << (vb * 8);
             }
             uint64_t loff_v = 0;
             for (uint64_t lb = 0; lb < lbpv; ++lb) {
-              loff_v |= rd8(loff + 9 + k * lbpv + lb) << (lb * 8);
+              loff_v |= rd8(loff + 9 + (k * lbpv) + lb) << (lb * 8);
             }
             const uint64_t length = lbase + loff_v;
             if (length == 0 || length > n - covered) {
@@ -7814,7 +8420,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             // Wrapping add, exactly as the decoders assemble the value: the
             // signed comparison below is then the same one the binary search
             // performs at read time.
-            const int64_t value = static_cast<int64_t>(vbase + voff);
+            const auto value = static_cast<int64_t>(vbase + voff);
             if (k != 0 && value < previous_value) {
               trace(151, static_cast<uint64_t>(value));
               return w;
@@ -7827,8 +8433,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             return w;
           }
           for (uint64_t e = 0; e < nidx; ++e) {
-            const uint64_t row = rd(roff + e * 4, 4);
-            if (row > n || (e != 0 && row < rd(roff + (e - 1) * 4, 4))) {
+            const uint64_t row = rd(roff + (e * 4), 4);
+            if (row > n || (e != 0 && row < rd(roff + ((e - 1) * 4), 4))) {
               trace(151, row);
               return w;
             }
@@ -7849,12 +8455,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // could declare fewer checkpoints than the highest block index and
           // D2PforValueAt would read the inner region as a seek table.
           if (rd(off, 2) !=
-              (n + kD2PforCheckpointEvery - 1) / kD2PforCheckpointEvery + 1) {
+              ((n + kD2PforCheckpointEvery - 1) / kD2PforCheckpointEvery) + 1) {
             trace(154, rd(off, 2));
             return w;
           }
           const uint64_t ncp = rd(off, 2);
-          const uint64_t inner_off = off + 2 + 16 * ncp;
+          const uint64_t inner_off = off + 2 + (16 * ncp);
           if (inner_off > off + have) {
             trace(154, inner_off);
             return w;
@@ -7865,7 +8471,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(154, ineed);
             return w;
           }
-          region_need = 2 + 16 * ncp + ineed;
+          region_need = 2 + (16 * ncp) + ineed;
           break;
         }
         case 50: {  // STREAM-VBYTE: [stream_len u32 BE][nblk u16]
@@ -7896,7 +8502,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(152, rd(off + 4, 2));
             return w;
           }
-          if (6 + 2 * nblk + ctrl_len + slen > have) {
+          if (6 + (2 * nblk) + ctrl_len + slen > have) {
             trace(152, have);
             return w;
           }
@@ -7907,11 +8513,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           uint64_t sum = 0;
           for (uint64_t i = 0; i < n; ++i) {
             if (i % kStreamVByteBlock == 0 &&
-                rd(off + 6 + (i / kStreamVByteBlock) * 2, 2) != sum) {
+                rd(off + 6 + ((i / kStreamVByteBlock) * 2), 2) != sum) {
               trace(152, i);
               return w;
             }
-            sum += ((rd8(off + 6 + 2 * nblk + i / kStreamVBytePerCtrl) >>
+            sum += ((rd8(off + 6 + (2 * nblk) + (i / kStreamVBytePerCtrl)) >>
                      (6 - 2 * (i % kStreamVBytePerCtrl))) &
                     0x3) +
                    1;
@@ -7924,7 +8530,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(152, sum);
             return w;
           }
-          region_need = 6 + 2 * nblk + ctrl_len + slen;
+          region_need = 6 + (2 * nblk) + ctrl_len + slen;
           break;
         }
         case 51: {  // HUFF-DICT: [d u16][dict 8d][lens (d+1)/2][freq 2d]
@@ -7951,11 +8557,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           const uint64_t d = prm;
           const uint64_t ncp =
               (n + kHuffDictCheckpoint - 1) / kHuffDictCheckpoint;
-          const uint64_t lens_off = off + 2 + 8 * d;
-          const uint64_t freq_off = lens_off + (d + 1) / 2;
-          const uint64_t ncp_off = freq_off + 2 * d;
+          const uint64_t lens_off = off + 2 + (8 * d);
+          const uint64_t freq_off = lens_off + ((d + 1) / 2);
+          const uint64_t ncp_off = freq_off + (2 * d);
           const uint64_t ckpt_off = ncp_off + 2;
-          const uint64_t slen_off = ckpt_off + 4 * ncp;
+          const uint64_t slen_off = ckpt_off + (4 * ncp);
           if (slen_off + 4 > off + have) {
             trace(153, have);
             return w;
@@ -7974,7 +8580,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // tree, so completeness is what makes hostile streams safe.
           uint64_t kraft = 0;
           for (uint64_t s = 0; s < d; ++s) {
-            const uint8_t byte = static_cast<uint8_t>(rd8(lens_off + s / 2));
+            const auto byte = static_cast<uint8_t>(rd8(lens_off + (s / 2)));
             const uint64_t nlen = (s % 2 == 0) ? (byte >> 4) : (byte & 0xF);
             if (nlen < 1 || nlen > kHuffDictMaxLen) {
               trace(153, nlen);
@@ -7991,7 +8597,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // closed-form COUNT/SUM answers).
           uint64_t fsum = 0;
           for (uint64_t s = 0; s < d; ++s) {
-            const uint64_t fq = rd(freq_off + 2 * s, 2);
+            const uint64_t fq = rd(freq_off + (2 * s), 2);
             if (fq == 0 || fq > n) {
               trace(153, fq);
               return w;
@@ -8006,7 +8612,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           // position inside the stream.
           uint64_t prev = 0;
           for (uint64_t k = 0; k < ncp; ++k) {
-            const uint64_t bit = rd(ckpt_off + 4 * k, 4);
+            const uint64_t bit = rd(ckpt_off + (4 * k), 4);
             if ((k == 0 && bit != 0) || bit < prev ||
                 bit >= slen * 8) {  // u64 math: slen <= cell <= chunk size
               trace(153, bit);
@@ -8052,7 +8658,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
               ++hist[sym];
             }
             for (uint64_t s = 0; s < d; ++s) {
-              if (hist[static_cast<size_t>(s)] != rd(freq_off + 2 * s, 2)) {
+              if (hist[static_cast<size_t>(s)] != rd(freq_off + (2 * s), 2)) {
                 trace(153, s);
                 return w;
               }
@@ -8090,7 +8696,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
       pos += units * payload_per_unit;
       if (pos > footer_size) {
         trace(72, pos);
-        fprintf(stderr, "validate: overflow in %s\n", what);
+        std::cerr << "validate: overflow in " << what << "\n";
         return false;
       }
     }
@@ -8164,7 +8770,8 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     if (nb_flag != 0) {
       uint64_t total = 0;
       for (uint64_t g = 0; g < rg; ++g) {
-        const uint64_t rc = rd(footer_off + 30 + static_cast<size_t>(g) * 2, 2);
+        const uint64_t rc =
+            rd(footer_off + 30 + (static_cast<size_t>(g) * 2), 2);
         const uint64_t cell = (rc + 7) / 8;
         // Guard against overflow in total + ensure it fits.
         if (cell > (footer_size - pos) / cc) {
@@ -8194,7 +8801,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     ++pos;
     if (es_flag != 0) {
       const uint64_t per_col =
-          5 * 8 + PaxChunk::Footer::ColumnStats::HIST_BINS * 8;
+          (5 * 8) + (PaxChunk::Footer::ColumnStats::HIST_BINS * 8);
       pos += cc * per_col;
       if (pos > footer_size) {
         trace(999, 4860);
@@ -8237,7 +8844,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           return w;
         }
         const uint64_t rc =
-            rd(footer_off + 30 + static_cast<size_t>(gg) * 2, 2);
+            rd(footer_off + 30 + (static_cast<size_t>(gg) * 2), 2);
         for (uint64_t vi = 0; vi < nval; ++vi) {
           if (pos + 9 > footer_size) {
             trace(999, 4875);
@@ -8257,12 +8864,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
             const uint64_t k = rd(footer_off + static_cast<size_t>(pos), 2);
             pos += 2;
-            if (k > 1024 || pos + 2 * k > footer_size) {
+            if (k > 1024 || pos + (2 * k) > footer_size) {
               trace(999, 4878);
               return w;
             }
             for (uint64_t t = 0; t < k; ++t) {
-              if (rd(footer_off + static_cast<size_t>(pos) + t * 2, 2) >= rc) {
+              if (rd(footer_off + static_cast<size_t>(pos) + (t * 2), 2) >=
+                  rc) {
                 trace(999, 4879);
                 return w;
               }
@@ -8275,15 +8883,15 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
             const uint64_t nr = rd(footer_off + static_cast<size_t>(pos), 2);
             pos += 2;
-            if (nr > 1024 || pos + 4 * nr > footer_size) {
+            if (nr > 1024 || pos + (4 * nr) > footer_size) {
               trace(999, 4881);
               return w;
             }
             for (uint64_t t = 0; t < nr; ++t) {
               const uint64_t st =
-                  rd(footer_off + static_cast<size_t>(pos) + t * 4, 2);
+                  rd(footer_off + static_cast<size_t>(pos) + (t * 4), 2);
               const uint64_t ln =
-                  rd(footer_off + static_cast<size_t>(pos) + t * 4 + 2, 2);
+                  rd(footer_off + static_cast<size_t>(pos) + (t * 4) + 2, 2);
               if (ln == 0 || st >= rc || st + ln > rc) {
                 trace(999, 4882);
                 return w;
@@ -8300,11 +8908,12 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             // Array/run containers are range-checked above; gate the
             // bitmap's popcount the same way (cheap sufficient bound).
             uint64_t set_bits = 0;
-            for (int bw = 0; bw < 16; ++bw)
+            for (int bw = 0; bw < 16; ++bw) {
               set_bits += static_cast<uint64_t>(__builtin_popcountll(
                   rd(footer_off + static_cast<size_t>(pos) +
-                         static_cast<size_t>(bw) * 8,
+                         (static_cast<size_t>(bw) * 8),
                      8)));
+            }
             if (set_bits > rc) {
               trace(999, 4884);
               return w;
@@ -8379,20 +8988,21 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
         trace(999, 4902);
         return w;
       }
-      if (pos + nseg * 24 > footer_size) {
+      if (pos + (nseg * 24) > footer_size) {
         trace(999, 4903);
         return w;
       }
       uint64_t total = 0;
-      for (uint64_t g = 0; g < rg; ++g)
-        total += rd(footer_off + 30 + static_cast<size_t>(g) * 2, 2);
+      for (uint64_t g = 0; g < rg; ++g) {
+        total += rd(footer_off + 30 + (static_cast<size_t>(g) * 2), 2);
+      }
       int64_t prev_key = 0;
       uint64_t prev_pos = 0;
       for (uint64_t si = 0; si < nseg; ++si) {
-        const int64_t sk = static_cast<int64_t>(
-            rd(footer_off + static_cast<size_t>(pos) + si * 24, 8));
+        const auto sk = static_cast<int64_t>(
+            rd(footer_off + static_cast<size_t>(pos) + (si * 24), 8));
         const uint64_t sp =
-            rd(footer_off + static_cast<size_t>(pos) + si * 24 + 8, 8);
+            rd(footer_off + static_cast<size_t>(pos) + (si * 24) + 8, 8);
         if ((si > 0 && sk < prev_key) || sp < prev_pos ||
             (total > 0 && sp >= total)) {
           trace(999, 4904);
@@ -8449,7 +9059,9 @@ Status PaxChunk::ValidateChunkBytes(const std::vector<char>& bytes) {
 
 StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
   const WalkResult walk = ValidateWalk(bytes);
-  if (!walk.ok) return Status::kCorruption;
+  if (!walk.ok) {
+    return Status::kCorruption;
+  }
 
   Footer f;
   const size_t footer_begin = walk.footer_start;
@@ -8485,24 +9097,33 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
   f.generation = u64();
 
   f.row_counts.reserve(f.row_group_count);
-  for (uint32_t g = 0; g < f.row_group_count; ++g)
+  for (uint32_t g = 0; g < f.row_group_count; ++g) {
     f.row_counts.push_back(u16());
+  }
   const size_t cell_count =
       static_cast<size_t>(f.row_group_count) * f.column_count;
   f.column_offsets.reserve(cell_count);
-  for (size_t i = 0; i < cell_count; ++i) f.column_offsets.push_back(u32());
+  for (size_t i = 0; i < cell_count; ++i) {
+    f.column_offsets.push_back(u32());
+  }
   if (f.zone_map_present) {
     f.group_min_keys.reserve(f.row_group_count);
     f.group_max_keys.reserve(f.row_group_count);
-    for (uint32_t g = 0; g < f.row_group_count; ++g)
+    for (uint32_t g = 0; g < f.row_group_count; ++g) {
       f.group_min_keys.push_back(i64());
-    for (uint32_t g = 0; g < f.row_group_count; ++g)
+    }
+    for (uint32_t g = 0; g < f.row_group_count; ++g) {
       f.group_max_keys.push_back(i64());
+    }
   }
   f.encodings.reserve(cell_count);
-  for (size_t i = 0; i < cell_count; ++i) f.encodings.push_back(u8());
+  for (size_t i = 0; i < cell_count; ++i) {
+    f.encodings.push_back(u8());
+  }
   f.params.reserve(cell_count);
-  for (size_t i = 0; i < cell_count; ++i) f.params.push_back(u32());
+  for (size_t i = 0; i < cell_count; ++i) {
+    f.params.push_back(u32());
+  }
 
   f.col_stats_present = u8() != 0;
   if (f.col_stats_present) {
@@ -8527,17 +9148,23 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
   f.bloom_present = u8() != 0;
   if (f.bloom_present) {
     f.rg_blooms.reserve(cell_count);
-    for (size_t i = 0; i < cell_count; ++i) f.rg_blooms.push_back(u64());
+    for (size_t i = 0; i < cell_count; ++i) {
+      f.rg_blooms.push_back(u64());
+    }
   }
   f.rg_sums_present = u8() != 0;
   if (f.rg_sums_present) {
     f.rg_sums.reserve(cell_count);
-    for (size_t i = 0; i < cell_count; ++i) f.rg_sums.push_back(i64());
+    for (size_t i = 0; i < cell_count; ++i) {
+      f.rg_sums.push_back(i64());
+    }
   }
   f.hll_present = u8() != 0;
   if (f.hll_present) {
     f.hll_sketches.reserve(cell_count * 64);
-    for (size_t i = 0; i < cell_count * 64; ++i) f.hll_sketches.push_back(u8());
+    for (size_t i = 0; i < cell_count * 64; ++i) {
+      f.hll_sketches.push_back(u8());
+    }
   }
 
   f.hash_idx_present = u8() != 0;
@@ -8563,11 +9190,14 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
   f.null_present = u8() != 0;
   if (f.null_present) {
     size_t bitmap_bytes = 0;
-    for (uint16_t rc : f.row_counts)
+    for (uint16_t rc : f.row_counts) {
       bitmap_bytes += static_cast<size_t>(f.column_count) *
                       ((static_cast<size_t>(rc) + 7) / 8);
+    }
     f.null_bitmaps.reserve(bitmap_bytes);
-    for (size_t i = 0; i < bitmap_bytes; ++i) f.null_bitmaps.push_back(u8());
+    for (size_t i = 0; i < bitmap_bytes; ++i) {
+      f.null_bitmaps.push_back(u8());
+    }
   }
 
   f.ext_stats_present = u8() != 0;
@@ -8585,7 +9215,9 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
       f.col_nulls.push_back(u64());
       f.col_modes.push_back(i64());
       f.col_mode_counts.push_back(u64());
-      for (size_t b = 0; b < kBins; ++b) f.col_hists.push_back(u64());
+      for (size_t b = 0; b < kBins; ++b) {
+        f.col_hists.push_back(u64());
+      }
     }
   }
 
@@ -8612,23 +9244,26 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
           if (container == 0) {
             const uint16_t nrow = u16();
             posting.rows.reserve(nrow);
-            for (uint16_t ri = 0; ri < nrow; ++ri)
+            for (uint16_t ri = 0; ri < nrow; ++ri) {
               posting.rows.push_back(u16());
+            }
           } else if (container == 2) {
             const uint16_t nruns = u16();
             for (uint16_t ri = 0; ri < nruns; ++ri) {
               const uint16_t start = u16();
               const uint16_t length = u16();
-              for (uint16_t j = 0; j < length; ++j)
+              for (uint16_t j = 0; j < length; ++j) {
                 posting.rows.push_back(static_cast<uint16_t>(start + j));
+              }
             }
           } else {
             for (uint16_t word = 0; word < 16; ++word) {
               const uint64_t bits = u64();
               for (uint16_t bit = 0; bit < 64; ++bit) {
-                const uint16_t row = static_cast<uint16_t>(word * 64 + bit);
-                if (row < rc && ((bits >> bit) & 1ULL) != 0)
+                const auto row = static_cast<uint16_t>((word * 64) + bit);
+                if (row < rc && ((bits >> bit) & 1ULL) != 0) {
                   posting.rows.push_back(row);
+                }
               }
             }
           }
@@ -8650,7 +9285,9 @@ StatusOr<PaxChunk> PaxChunk::Deserialize(std::vector<char> bytes) {
         const uint32_t table_size = u32();
         cell.seed = u32();
         cell.table.reserve(table_size);
-        for (uint32_t i = 0; i < table_size; ++i) cell.table.push_back(u8());
+        for (uint32_t i = 0; i < table_size; ++i) {
+          cell.table.push_back(u8());
+        }
         f.xor_cells.push_back(std::move(cell));
       }
     }

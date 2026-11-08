@@ -668,7 +668,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         if (ctype == Constraint::kNotNull || ctype == Constraint::kPrimaryKey) {
           eligible_column = true;
         } else if (col_idx >= left_width) {
-          const slot_t right_col = static_cast<slot_t>(col_idx - left_width);
+          const auto right_col = static_cast<slot_t>(col_idx - left_width);
           if (!count_right_column.has_value() ||
               *count_right_column == right_col) {
             count_right_column = right_col;
@@ -737,7 +737,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                 }
               }
             } else {
-              const slot_t col = static_cast<slot_t>(inst.operand - left_width);
+              const auto col = static_cast<slot_t>(inst.operand - left_width);
               for (const Row& r : right.rows) {
                 if (col < r.Size() && r[col].type == ValueType::kDouble) {
                   child_has_mixed_double = true;
@@ -829,13 +829,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         continue;
       }
       if (key_shapes[k].direct_column >= 0) {
-        if (static_cast<size_t>(key_shapes[k].direct_column) < left_width) {
+        if (std::cmp_less(key_shapes[k].direct_column, left_width)) {
           non_join_keys_all_right = false;
         } else {
           has_non_join_right_key = true;
         }
       } else if (key_shapes[k].extract_date_col >= 0) {
-        if (static_cast<size_t>(key_shapes[k].extract_date_col) < left_width) {
+        if (std::cmp_less(key_shapes[k].extract_date_col, left_width)) {
           non_join_keys_all_right = false;
         } else {
           has_non_join_right_key = true;
@@ -859,7 +859,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     for (ProgramShape& kshape : key_shapes) {
       if (prefer_right_group_key) {
         if (kshape.direct_column >= 0 &&
-            static_cast<size_t>(kshape.direct_column) < left_width) {
+            std::cmp_less(kshape.direct_column, left_width)) {
           const auto lcol = static_cast<size_t>(kshape.direct_column);
           for (const EqualityKey& eq : equality_keys) {
             if (eq.left == lcol && eq.left_offset == 0 &&
@@ -877,7 +877,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             }
           }
         }
-      } else if (kshape.direct_column >= static_cast<int32_t>(left_width)) {
+      } else if (std::cmp_greater_equal(kshape.direct_column, left_width)) {
         const size_t rcol =
             static_cast<size_t>(kshape.direct_column) - left_width;
         for (const EqualityKey& eq : equality_keys) {
@@ -900,13 +900,13 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   bool right_only_group_keys = !right.HasSpill();
   for (size_t k = 0; k < key_programs.size(); ++k) {
     if (key_shapes[k].direct_column >= 0) {
-      if (static_cast<size_t>(key_shapes[k].direct_column) >= left_width) {
+      if (std::cmp_greater_equal(key_shapes[k].direct_column, left_width)) {
         left_only_group_keys = false;
       } else {
         right_only_group_keys = false;
       }
     } else if (key_shapes[k].extract_date_col >= 0) {
-      if (static_cast<size_t>(key_shapes[k].extract_date_col) >= left_width) {
+      if (std::cmp_greater_equal(key_shapes[k].extract_date_col, left_width)) {
         left_only_group_keys = false;
       } else {
         right_only_group_keys = false;
@@ -1417,15 +1417,15 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       right.rows.size() <= 262144) {
     for (size_t rk = 0; rk < 2; ++rk) {
       const size_t lk = 1 - rk;
-      if (key_shapes[rk].direct_column < static_cast<int32_t>(left_width)) {
+      if (std::cmp_less(key_shapes[rk].direct_column, left_width)) {
         continue;
       }
       const bool left_is_extract =
           key_shapes[lk].extract_date_col >= 0 &&
-          key_shapes[lk].extract_date_col < static_cast<int32_t>(left_width);
+          std::cmp_less(key_shapes[lk].extract_date_col, left_width);
       bool left_is_int_col = false;
       if (key_shapes[lk].direct_column >= 0 &&
-          key_shapes[lk].direct_column < static_cast<int32_t>(left_width)) {
+          std::cmp_less(key_shapes[lk].direct_column, left_width)) {
         const Column& lcol = left.schema.GetColumn(
             static_cast<size_t>(key_shapes[lk].direct_column));
         left_is_int_col = (lcol.Type() == ValueType::kInt64 ||
@@ -1583,7 +1583,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               lv.value.int_value >= kDateMinDays &&
               lv.value.int_value <= kDateMaxDays) [[likely]] {
             if (l_shape.extract_date_part == 0 && lv.value.int_value >= 0 &&
-                lv.value.int_value < static_cast<int64_t>(kFastYearLut.size()))
+                std::cmp_less(lv.value.int_value, kFastYearLut.size()))
                 [[likely]] {
               l_val = kFastYearLut[static_cast<size_t>(lv.value.int_value)];
             } else {
@@ -1736,8 +1736,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                          !kp->IsCaseInsensitive()) [[likely]] {
                 const std::string_view sv = kp->value.varchar_value;
                 if (sv.empty() ||
-                    !((sv[0] >= '0' && sv[0] <= '9') || sv[0] == '-' ||
-                      sv[0] == '+' || sv[0] == ' ')) [[likely]] {
+                    ((sv[0] < '0' || sv[0] > '9') && sv[0] != '-' &&
+                     sv[0] != '+' && sv[0] != ' ')) [[likely]] {
                   vh = std::hash<std::string_view>()(sv);
                 } else {
                   vh = std::hash<Value>()(*kp);
@@ -2179,7 +2179,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   bool use_dense_int_rows = false;
   bool build_int_keys_unique = true;
   bool packed_2x32_int_key = false;
-  constexpr int64_t kInvalidFusedPacked2x32 = static_cast<int64_t>(
+  constexpr auto kInvalidFusedPacked2x32 = static_cast<int64_t>(
       (static_cast<uint64_t>(0x80000000ULL) << 32) | 0x80000000ULL);
   auto fits_fused_i32 = [](int64_t v) noexcept {
     return v >= static_cast<int64_t>(std::numeric_limits<int32_t>::min()) &&
@@ -2210,7 +2210,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                 static_cast<uint64_t>(min_k) + 1ULL;
           if (span <= 2'000'000ULL &&
               span <=
-                  static_cast<uint64_t>(left.rows.size()) * 8ULL + 1024ULL) {
+                  (static_cast<uint64_t>(left.rows.size()) * 8ULL) + 1024ULL) {
             dense_bulk_min = min_k;
             dense_bulk_counts.resize(static_cast<size_t>(span));
             use_dense_bulk = true;
@@ -2394,7 +2394,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     if (key_programs.empty()) {
       right_row_gid.assign(right.rows.size(), kInvalidGid);
       FusedGroup g;
-      g.rep_left = left.rows.empty() ? nullptr : &left.rows[0];
+      g.rep_left = left.rows.empty() ? nullptr : left.rows.data();
       g.rep_right = build_rows[0];
       pre_groups.push_back(std::move(g));
       for (const Row* row_ptr : build_rows) {
@@ -2405,14 +2405,14 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     } else if (integer_key && build_int_keys_unique && all_direct_group_keys &&
                !has_count_distinct && right.rows.size() <= 524288 &&
                std::ranges::any_of(key_shapes, [&](const ProgramShape& ks) {
-                 return ks.direct_column ==
-                        static_cast<int32_t>(left_width + right_columns[0]);
+                 return std::cmp_equal(ks.direct_column,
+                                       left_width + right_columns[0]);
                })) {
       identity_right_gid = true;
     } else if (integer_key && build_int_keys_unique && all_direct_group_keys &&
                std::ranges::any_of(key_shapes, [&](const ProgramShape& ks) {
-                 return ks.direct_column ==
-                        static_cast<int32_t>(left_width + right_columns[0]);
+                 return std::cmp_equal(ks.direct_column,
+                                       left_width + right_columns[0]);
                })) {
       right_row_gid.assign(right.rows.size(), kInvalidGid);
       pre_groups.reserve(build_rows.size());
@@ -2577,7 +2577,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
       }
       if (!is_null) {
-        cd_worker_parts[w][gid % workers].push_back(GidValPair{gid, iv});
+        cd_worker_parts[w][gid % workers].push_back(
+            GidValPair{.gid = gid, .val = iv});
       }
       return Status::kSuccess;
     }
@@ -3343,7 +3344,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       const Value* single_int_cell = nullptr;
       if (int_group_key) {
         if (group.key.values_.size() == 1) {
-          single_int_cell = &group.key.values_[0];
+          single_int_cell = group.key.values_.data();
         } else if (all_direct_group_keys &&
                    (group.rep_left != nullptr || group.rep_right != nullptr)) {
           single_int_cell =
@@ -3661,7 +3662,9 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             break;
           }
         }
-        if (!can_topn) break;
+        if (!can_topn) {
+          break;
+        }
       }
     }
     for (const SelectStatement::OrderByTerm& term : fusion->output_order) {
@@ -3782,9 +3785,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     AggregateResultMap aggregate_results;
     aggregate_results.reserve(fusion->aggregates.size());
     if (raw_count_fusion) {
-      for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-        aggregate_results.emplace(fusion->aggregates[i],
-                                  Value(group.raw_count));
+      for (auto& aggregate : fusion->aggregates) {
+        aggregate_results.emplace(aggregate, Value(group.raw_count));
       }
     } else if (raw_sum_fusion) {
       for (size_t i = 0; i < fusion->aggregates.size(); ++i) {

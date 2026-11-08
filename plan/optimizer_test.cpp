@@ -5737,7 +5737,7 @@ TEST_F(OptimizerTest, OrderedOuterDiscountsTheIndexProbeIntoAWin) {
     EXPECT_SUCCESS(query.Rewrite(context));
     StatusOr<Plan> optimized = Optimizer::Optimize(query, context);
     EXPECT_TRUE(optimized.HasValue());
-    Plan plan = optimized.Value();
+    const Plan& plan = optimized.Value();
     std::ostringstream dump;
     plan->Dump(dump, 0);
     std::vector<std::pair<int64_t, int64_t>> rows;
@@ -5877,7 +5877,7 @@ TEST_F(OptimizerTest, FilteredOrderedLimitUsesIndexAfterLayoutRewrite) {
   Row row;
   for (int64_t i = 0; i < 3; ++i) {
     ASSERT_TRUE(executor->Next(&row, nullptr));
-    EXPECT_EQ(row, Row({Value(7 + i * 100), Value(10)}));
+    EXPECT_EQ(row, Row({Value(7 + (i * 100)), Value(10)}));
   }
   EXPECT_FALSE(executor->Next(&row, nullptr));
   ASSERT_SUCCESS(executor->GetStatus());
@@ -5889,8 +5889,9 @@ TEST_F(OptimizerTest, ReboundFirstKeyUpperRangeKeepsCurrentEndpoint) {
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, context.GetTable("Sc1"));
   const Index* index = nullptr;
   for (size_t i = 0; i < table->IndexCount(); ++i) {
-    if (table->GetIndex(i).sc_.key_ == std::vector<slot_t>{0})
+    if (table->GetIndex(i).sc_.key_ == std::vector<slot_t>{0}) {
       index = &table->GetIndex(i);
+    }
   }
   ASSERT_NE(index, nullptr);
   auto bound = std::make_shared<ParameterSlot>(0, Value(2));

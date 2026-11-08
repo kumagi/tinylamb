@@ -669,9 +669,10 @@ TEST_F(FullScanMvccFastPathTest, TypedProjectionEndsBeforeUnneededSuffix) {
   std::vector<RowPosition> positions;
   for (int i = 0; i < 73; ++i) {
     expected.emplace_back(
-        Row({i % 3 ? Value(i) : Value(), Value(std::string(i, 'b')),
-             i % 5 ? Value(100 + i) : Value(),
-             i % 2 ? Value(std::string(128, 'd')) : Value(), Value(i + 0.5)}));
+        Row({((i % 3) != 0) ? Value(i) : Value(), Value(std::string(i, 'b')),
+             ((i % 5) != 0) ? Value(100 + i) : Value(),
+             ((i % 2) != 0) ? Value(std::string(128, 'd')) : Value(),
+             Value(i + 0.5)}));
     ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
                           table.Insert(seed.txn_, expected.back()));
     positions.push_back(position);
@@ -704,7 +705,7 @@ TEST_F(FullScanMvccFastPathTest, TypedProjectionEndsBeforeUnneededSuffix) {
           EXPECT_EQ(batch.positions[row], positions[seen + row]);
           for (size_t c = 0; c < projection.size(); ++c) {
             const Value& value = expected[seen + row][projection[c]];
-            const size_t cell = row * batch.stride + c;
+            const size_t cell = (row * batch.stride) + c;
             EXPECT_EQ(batch.nulls[cell] != 0, value.IsNull());
             if (!value.IsNull()) {
               EXPECT_EQ(batch.cells[cell], value.value.int_value);
@@ -739,12 +740,14 @@ TEST_F(FullScanMvccFastPathTest,
   std::vector<RowPosition> positions;
   for (int i = 0; i < 97; ++i) {
     rows.emplace_back(
-        Row({Value(i), i % 7 ? Value(i + .5) : Value(),
-             i % 9 ? Value(std::string(i, 'c')) : Value(),
-             i % 11 ? Value(i % 13) : Value(),
-             i % 8 ? Value(std::string(i % 19, 'e')) : Value(),
-             i % 6 ? Value::Date(i % 2 ? "1996-01-02" : "1996-01-03") : Value(),
-             i % 5 ? Value(i % 17) : Value()}));
+        Row({Value(i), ((i % 7) != 0) ? Value(i + .5) : Value(),
+             ((i % 9) != 0) ? Value(std::string(i, 'c')) : Value(),
+             ((i % 11) != 0) ? Value(i % 13) : Value(),
+             ((i % 8) != 0) ? Value(std::string(i % 19, 'e')) : Value(),
+             ((i % 6) != 0)
+                 ? Value::Date(((i % 2) != 0) ? "1996-01-02" : "1996-01-03")
+                 : Value(),
+             ((i % 5) != 0) ? Value(i % 17) : Value()}));
     ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
                           table.Insert(seed.txn_, rows.back()));
     positions.push_back(position);
@@ -753,8 +756,9 @@ TEST_F(FullScanMvccFastPathTest,
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (db_->TransactionStats().version_chains != 0 &&
-         std::chrono::steady_clock::now() < deadline)
+         std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   ASSERT_EQ(db_->TransactionStats().version_chains, 0U);
   auto reader = db_->BeginReadOnlyContext();
   for (int phase = 0; phase < 2; ++phase) {
@@ -787,16 +791,20 @@ TEST_F(FullScanMvccFastPathTest,
         }
         std::vector<int64_t> expected;
         for (const auto& row : rows) {
-          if (row[column].IsNull()) continue;
+          if (row[column].IsNull()) {
+            continue;
+          }
           const int64_t value = row[column].value.int_value;
           if (low <= value && value <= high &&
-              (!use_key_filter || keys.contains(value)))
+              (!use_key_filter || keys.contains(value))) {
             expected.push_back(row[0].value.int_value);
+          }
         }
         std::vector<int64_t> actual;
         for (auto it = table.BeginFullScan(reader.txn_, options); it.IsValid();
-             ++it)
+             ++it) {
           actual.push_back((*it)[0].value.int_value);
+        }
         EXPECT_EQ(actual, expected)
             << "column=" << column << " phase=" << phase;
       }
@@ -816,12 +824,14 @@ TEST_F(FullScanMvccFastPathTest,
   std::vector<RowPosition> positions;
   std::vector<uint64_t> expected(7);
   for (int64_t i = 0; i < 1201; ++i) {
-    const Value key = i % 11 == 0 ? Value() : Value(i % 7 - 3);
+    const Value key = i % 11 == 0 ? Value() : Value((i % 7) - 3);
     ASSIGN_OR_ASSERT_FAIL(
         RowPosition, pos,
         table.Insert(setup.txn_, Row({key, Value(std::string(128, 'p'))})));
     positions.push_back(pos);
-    if (!key.IsNull()) ++expected[static_cast<size_t>(i % 7)];
+    if (!key.IsNull()) {
+      ++expected[static_cast<size_t>(i % 7)];
+    }
   }
   ASSERT_SUCCESS(setup.PreCommit());
   auto old = db_->BeginReadOnlyContext();
@@ -833,7 +843,9 @@ TEST_F(FullScanMvccFastPathTest,
         std::chrono::steady_clock::now() + std::chrono::seconds(3);
     do {
       counts = table.TryReadIntegerKeyCounts(txn, pages, 0, -3, 7);
-      if (counts) break;
+      if (counts) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < deadline);
     return counts;
@@ -877,9 +889,10 @@ TEST_F(FullScanMvccFastPathTest,
   // must not reuse a count produced for that old image.
   std::vector<uint64_t> old_counts(7);
   for (auto it = table.BeginFullScan(old.txn_); it.IsValid(); ++it) {
-    const auto row = *it;
-    if (!row[0].IsNull())
+    const auto& row = *it;
+    if (!row[0].IsNull()) {
       ++old_counts[static_cast<size_t>(row[0].value.int_value + 3)];
+    }
   }
   EXPECT_EQ(old_counts, expected);
   auto fresh = db_->BeginReadOnlyContext();

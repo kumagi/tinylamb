@@ -82,7 +82,9 @@ IndexOnlyScan::IndexOnlyScan(
                    cond_->AsConstantValue().GetValue().Truthy();
   key_only_condition_ = nonunique_keys_ && !cond_conjuncts_.empty();
   for (const auto& conjunct : cond_conjuncts_) {
-    if (!conjunct) continue;
+    if (!conjunct) {
+      continue;
+    }
     auto program = BytecodeEnabled() ? BytecodeCompiler::CompileRowCached(
                                            conjunct, output_schema_)
                                      : std::nullopt;
@@ -94,8 +96,9 @@ IndexOnlyScan::IndexOnlyScan(
     } else {
       for (const auto& instruction : program->Instructions()) {
         if (instruction.opcode == BytecodeOp::kLoadColumn &&
-            instruction.operand >= key_schema_.ColumnCount())
+            instruction.operand >= key_schema_.ColumnCount()) {
           key_only_condition_ = false;
+        }
       }
     }
     cond_programs_.push_back(std::move(program));
@@ -183,7 +186,9 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     if (cond_ && !constant_true_) {
       if (key_only_condition_ && condition_key_generation_ == key_generation) {
-        if (!condition_key_passed_) continue;
+        if (!condition_key_passed_) {
+          continue;
+        }
         destination->Append(std::move(dst));
         continue;
       }
@@ -191,7 +196,9 @@ size_t IndexOnlyScan::NextBatch(DataChunk* destination, size_t max_rows) {
       StatusOr<bool> pass = relational_detail::EvaluateConjunctsTolerant(
           cond_conjuncts_, [&](const Expression& conjunct) {
             const auto& program = cond_programs_[predicate_index++];
-            if (program) return TryEvaluateRowAuto(*program, dst);
+            if (program) {
+              return TryEvaluateRowAuto(*program, dst);
+            }
             return conjunct->TryEvaluate(dst, output_schema_);
           });
       if (!pass.HasValue()) {

@@ -902,7 +902,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
         if (slot.has_value() && (column_type == ValueType::kInt64 ||
                                  column_type == ValueType::kDate)) {
           const size_t reserve_members = stats.Value()->Rows();
-          const slot_t col_idx = static_cast<slot_t>(*slot);
+          const auto col_idx = static_cast<slot_t>(*slot);
           {
             std::vector<SimpleComparePredicate> local_simple;
             bool local_filter_ok = true;
@@ -969,29 +969,28 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                 const auto eval_local_simple =
                     [&](const LSTablePageBlock& blk,
                         uint32_t r) noexcept -> bool {
-                  for (const SimpleComparePredicate& sc : local_simple) {
-                    const LSTableColumnBlock& lc = blk.columns[sc.column];
-                    if (lc.IsNull(r)) return false;
-                    if (sc.column_payload) {
-                      const LSTableColumnBlock& rc =
-                          blk.columns[sc.right_column];
-                      if (rc.IsNull(r)) return false;
-                      if (!ComparePositional(sc.op, lc.int_cells[r],
-                                             rc.int_cells[r])) {
-                        return false;
-                      }
-                    } else {
-                      if (!ComparePositional(sc.op, lc.int_cells[r],
-                                             sc.int_constant)) {
-                        return false;
-                      }
-                    }
-                  }
-                  return true;
+                  return std::ranges::all_of(
+                      local_simple, [&](const SimpleComparePredicate& sc) {
+                        const LSTableColumnBlock& lc = blk.columns[sc.column];
+                        if (lc.IsNull(r)) {
+                          return false;
+                        }
+                        if (sc.column_payload) {
+                          const LSTableColumnBlock& rc =
+                              blk.columns[sc.right_column];
+                          if (rc.IsNull(r)) {
+                            return false;
+                          }
+                          return ComparePositional(sc.op, lc.int_cells[r],
+                                                   rc.int_cells[r]);
+                        }
+                        return ComparePositional(sc.op, lc.int_cells[r],
+                                                 sc.int_constant);
+                      });
                 };
                 if (values->IsDenseMode() && store->total_rows >= 32768 &&
                     store->blocks.size() >= 2) {
-                  const size_t nworkers = std::min<size_t>(
+                  const auto nworkers = std::min<size_t>(
                       {store->blocks.size(),
                        static_cast<size_t>(std::thread::hardware_concurrency()),
                        size_t{16}});
@@ -1010,7 +1009,9 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                           int64_t last_key = 0;
                           for (size_t bi = b_begin; bi < b_end; ++bi) {
                             const LSTablePageBlock& blk = store->blocks[bi];
-                            if (blk.row_count == 0) continue;
+                            if (blk.row_count == 0) {
+                              continue;
+                            }
                             const LSTableColumnBlock& col =
                                 blk.columns[col_idx];
                             const int64_t* __restrict cells =
@@ -1018,7 +1019,9 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                             if (!col.has_null && local_simple.empty()) {
                               for (uint32_t r = 0; r < blk.row_count; ++r) {
                                 const int64_t k = cells[r];
-                                if (have_last && k == last_key) continue;
+                                if (have_last && k == last_key) {
+                                  continue;
+                                }
                                 last_key = k;
                                 have_last = true;
                                 values->InsertDenseAtomic(k);
@@ -1030,7 +1033,9 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                                     k == last_key) {
                                   continue;
                                 }
-                                if (!eval_local_simple(blk, r)) continue;
+                                if (!eval_local_simple(blk, r)) {
+                                  continue;
+                                }
                                 if (col.IsNull(r)) {
                                   worker_saw_null[w] = 1;
                                 } else {
@@ -1226,6 +1231,18 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
   }
   const Relation* members = nullptr;
   if (!direct_filled) {
+    auto& retained = runtime->retained_statements;
+    bool already_retained = false;
+    for (size_t k = retained.size() > 8 ? retained.size() - 8 : 0;
+         k < retained.size(); ++k) {
+      if (retained[k] == query.Query()) {
+        already_retained = true;
+        break;
+      }
+    }
+    if (!already_retained) {
+      retained.push_back(query.Query());
+    }
     members = ExecuteCachedUncorrelated(context, statement, ctes, false);
     if (members == nullptr || members->schema.ColumnCount() != 1) {
       return mbail("exec");
@@ -1332,7 +1349,9 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
   const Value* equality = nullptr;
   for (size_t i = 0; i < table.IndexCount() && selected == nullptr; ++i) {
     const Index& index = table.GetIndex(i);
-    if (index.sc_.key_.empty()) continue;
+    if (index.sc_.key_.empty()) {
+      continue;
+    }
     for (size_t p = 0; p < comparisons.size(); ++p) {
       const auto& comparison = comparisons[p];
       const auto type = local_schema.GetColumn(comparison.column).Type();
@@ -1347,9 +1366,9 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
         const double prefix_rows =
             static_cast<double>(statistics.Rows()) *
             statistics.EstimateSelectivity(local_schema, predicates[p]);
-        if (!(prefix_rows >= 0 &&
-              prefix_rows <= static_cast<double>(env.input_rows) * 2.0 &&
-              prefix_rows <= static_cast<double>(statistics.Rows()) * 0.1)) {
+        if (prefix_rows < 0 ||
+            prefix_rows > static_cast<double>(env.input_rows) * 2.0 ||
+            prefix_rows > static_cast<double>(statistics.Rows()) * 0.1) {
           continue;
         }
         selected = &index;
@@ -1372,7 +1391,9 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
       std::ceil(build_rows * 2.0), 128.0, static_cast<double>(kMaxExistsKeys)));
   auto charge =
       TryReserveQueryMemory(FlatIntSet::ReservationBytes(reserve_keys));
-  if (charge == nullptr) return nullptr;
+  if (charge == nullptr) {
+    return nullptr;
+  }
   struct ChargedSet {
     std::shared_ptr<QueryMemoryCharge> charge;
     FlatIntSet values;
@@ -1407,7 +1428,9 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
       }
       ++iterator;
     }
-    if (!iterator.GetStatus().ok()) return nullptr;
+    if (!iterator.GetStatus().ok()) {
+      return nullptr;
+    }
   }
   if (auto* runtime = env.context->execution_runtime()) {
     ++runtime->prebuilt_exists_index_builds;
@@ -1417,7 +1440,7 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
     runtime->scan_values_available += visited * local_schema.ColumnCount();
     runtime->scan_values_decoded += visited * local_schema.ColumnCount();
   }
-  return std::shared_ptr<const FlatIntSet>(owner, &owner->values);
+  return {owner, &owner->values};
 }
 
 // A selective, single-key EXISTS can build one row-independent membership
@@ -1487,7 +1510,9 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
         const bool right_local =
             LocalColumnOffset(local_schema, right).has_value();
         if (left_local != right_local) {
-          if (local_key) return std::nullopt;
+          if (local_key) {
+            return std::nullopt;
+          }
           local_key = left_local ? binary.Left() : binary.Right();
           outer_key = left_local ? right : left;
           continue;
@@ -1905,7 +1930,9 @@ std::optional<Value> TryDecideConstantConjunct(const Expression& predicate) {
   return decided.MoveValue();
 }
 
-static CompiledScanFilter CompileScanFilterUncached(
+namespace {
+
+CompiledScanFilter CompileScanFilterUncached(
     const std::vector<Expression>& predicates, const Schema& schema,
     const FilterCompileEnv* env) {
   CompiledScanFilter compiled;
@@ -2061,10 +2088,11 @@ static CompiledScanFilter CompileScanFilterUncached(
       } else if (auto existence =
                      TryCompilePrebuiltExists(predicate, schema, *env)) {
         compiled.prebuilt_membership.push_back(std::move(*existence));
-      } else if (env->prebuild_only_exists) {
-        compiled.residual.push_back(predicate);
-      } else if (auto scalar = TryCompilePrebuiltScalarCompare(
-                     predicate, schema, *env->context, *env->ctes)) {
+      } else if (auto scalar =
+                     env->prebuild_only_exists
+                         ? std::optional<PrebuiltScalarComparePredicate>()
+                         : TryCompilePrebuiltScalarCompare(
+                               predicate, schema, *env->context, *env->ctes)) {
         compiled.prebuilt_scalar_compare.push_back(std::move(*scalar));
       } else {
         compiled.residual.push_back(predicate);
@@ -2117,41 +2145,53 @@ static CompiledScanFilter CompileScanFilterUncached(
   return compiled;
 }
 
+}  // namespace
+
 CompiledScanFilter CompileScanFilter(const std::vector<Expression>& predicates,
                                      const Schema& schema,
                                      const FilterCompileEnv* env) {
-  if (predicates.empty())
+  if (predicates.empty()) {
     return CompileScanFilterUncached(predicates, schema, env);
+  }
   auto key = ScalarExpressionCacheKey(predicates, schema);
-  if (!key) return CompileScanFilterUncached(predicates, schema, env);
+  if (!key) {
+    return CompileScanFilterUncached(predicates, schema, env);
+  }
   key->push_back(BytecodeEnabled() ? char{1} : char{0});
   struct Cache {
     size_t bytes{0};
     std::unordered_map<std::string, CompiledScanFilter> entries;
   };
   static thread_local Cache cache;
-  if (auto found = cache.entries.find(*key); found != cache.entries.end())
+  if (auto found = cache.entries.find(*key); found != cache.entries.end()) {
     return found->second;
+  }
   std::vector<Expression> frozen;
   frozen.reserve(predicates.size());
-  for (const auto& predicate : predicates)
+  for (const auto& predicate : predicates) {
     frozen.push_back(FreezeScalarBindings(predicate));
+  }
   auto filter = CompileScanFilterUncached(frozen, schema, env);
   // Overcharge AST ownership by the key size, then account the expanded OR
   // branches separately: their cross-product can exceed the input AST size.
-  size_t bytes = key->capacity() * 64 + sizeof(CompiledScanFilter);
+  size_t bytes = (key->capacity() * 64) + sizeof(CompiledScanFilter);
   const auto comparisons_bytes = [](const auto& comparisons) {
     size_t total = comparisons.capacity() * sizeof(SimpleComparePredicate);
-    for (const auto& comparison : comparisons)
-      if (comparison.constant.type == ValueType::kVarChar)
-        total += 2 * comparison.constant.value.varchar_value.size() + 32;
+    for (const auto& comparison : comparisons) {
+      if (comparison.constant.type == ValueType::kVarChar) {
+        total += (2 * comparison.constant.value.varchar_value.size()) + 32;
+      }
+    }
     return total;
   };
   bytes += comparisons_bytes(filter.simple);
-  for (const auto& branch : filter.disjunctive_branches)
+  for (const auto& branch : filter.disjunctive_branches) {
     bytes += sizeof(branch) + comparisons_bytes(branch.simple);
-  constexpr size_t kLimit = 2 * 1024 * 1024;
-  if (bytes > kLimit) return filter;
+  }
+  constexpr size_t kLimit = size_t{2} * 1024 * 1024;
+  if (bytes > kLimit) {
+    return filter;
+  }
   if (cache.entries.size() >= 256 || cache.bytes > kLimit - bytes) {
     cache.entries.clear();
     cache.bytes = 0;
@@ -3053,18 +3093,22 @@ StatusOr<bool> TrySelectiveIndexSource(
     const std::vector<slot_t>* projection, const CompiledScanFilter& filter,
     const ScanRuntimeFilter* runtime_filter, const Scope* outer,
     const CteMap& ctes, Relation* result) {
-  if (table.IndexCount() == 0 || statistics.Rows() < 1024) return false;
+  if (table.IndexCount() == 0 || statistics.Rows() < 1024) {
+    return false;
+  }
   const bool pure_range =
       !filter.simple.empty() && !filter.compile_decided_reject &&
       filter.prefix_in.empty() && filter.prebuilt_membership.empty() &&
       filter.prebuilt_scalar_compare.empty() &&
       filter.disjunctive_branches.empty() && !filter.needs_unsigned_tagging;
-  const auto* exact = runtime_filter && runtime_filter->enabled()
+  const auto* exact = (runtime_filter != nullptr) && runtime_filter->enabled()
                           ? runtime_filter->group->ExactKeys()
                           : nullptr;
   const auto local_expression = [&](const auto& self,
                                     const Expression& expression) -> bool {
-    if (!expression) return true;
+    if (!expression) {
+      return true;
+    }
     switch (expression->Type()) {
       case TypeTag::kColumnValue:
       case TypeTag::kConstantValue:
@@ -3090,14 +3134,16 @@ StatusOr<bool> TrySelectiveIndexSource(
   const bool safe_range =
       pure_range &&
       std::ranges::all_of(filter.residual, [&](const Expression& expression) {
-        if (!expression || expression->Type() != TypeTag::kBinaryExp)
+        if (!expression || expression->Type() != TypeTag::kBinaryExp) {
           return false;
+        }
         const auto& binary = expression->AsBinaryExpression();
         if ((binary.Op() != BinaryOperation::kLike &&
              binary.Op() != BinaryOperation::kNotLike) ||
             binary.Left()->Type() != TypeTag::kColumnValue ||
-            binary.Right()->Type() != TypeTag::kConstantValue)
+            binary.Right()->Type() != TypeTag::kConstantValue) {
           return false;
+        }
         const auto offset = LocalColumnOffset(
             filter_schema, binary.Left()->AsColumnValue().GetColumnName());
         return offset &&
@@ -3105,13 +3151,17 @@ StatusOr<bool> TrySelectiveIndexSource(
                binary.Right()->AsConstantValue().GetValue().type ==
                    ValueType::kVarChar;
       });
-  if (exact && (exact->size() > 1024 || !local_predicates(filter.residual) ||
-                !std::ranges::all_of(filter.disjunctive_branches,
-                                     [&](const auto& branch) {
-                                       return local_predicates(branch.residual);
-                                     })))
+  if ((exact != nullptr) &&
+      (exact->size() > 1024 || !local_predicates(filter.residual) ||
+       !std::ranges::all_of(filter.disjunctive_branches,
+                            [&](const auto& branch) {
+                              return local_predicates(branch.residual);
+                            }))) {
     exact = nullptr;
-  if (!safe_range && !exact) return false;
+  }
+  if (!safe_range && (exact == nullptr)) {
+    return false;
+  }
   const Index* selected = nullptr;
   std::vector<Value> begin, end;
   const std::vector<int64_t>* selected_keys = nullptr;
@@ -3119,21 +3169,29 @@ StatusOr<bool> TrySelectiveIndexSource(
   const Schema& schema = table.GetSchema();
   for (size_t i = 0; i < table.IndexCount(); ++i) {
     const Index& index = table.GetIndex(i);
-    if (index.sc_.key_.empty() || index.RetainsDeletedEntries()) continue;
+    if (index.sc_.key_.empty() || index.RetainsDeletedEntries()) {
+      continue;
+    }
     const slot_t key = index.sc_.key_.front();
     const Column& column = schema.GetColumn(key);
     if (column.IsUnsigned() || (column.Type() != ValueType::kInt64 &&
-                                column.Type() != ValueType::kDate))
+                                column.Type() != ValueType::kDate)) {
       continue;
-    if (key >= statistics.Columns()) continue;
-    if (exact && runtime_filter->column < filter_schema.ColumnCount()) {
-      const slot_t runtime_column = projection
+    }
+    if (key >= statistics.Columns()) {
+      continue;
+    }
+    if ((exact != nullptr) &&
+        runtime_filter->column < filter_schema.ColumnCount()) {
+      const slot_t runtime_column = (projection != nullptr)
                                         ? (*projection)[runtime_filter->column]
                                         : runtime_filter->column;
       if (runtime_column == key && runtime_filter->type == column.Type()) {
         double matches = 0;
         for (int64_t raw : *exact) {
-          if (runtime_filter->group->Reject(raw)) continue;
+          if (runtime_filter->group->Reject(raw)) {
+            continue;
+          }
           Value value(raw);
           value.type = column.Type();
           matches += statistics.Column(key).EstimateEqual(value);
@@ -3147,37 +3205,48 @@ StatusOr<bool> TrySelectiveIndexSource(
         }
       }
     }
-    if (!safe_range) continue;
+    if (!safe_range) {
+      continue;
+    }
     std::optional<Value> lower, upper;
     for (const auto& predicate : filter.simple) {
       if (predicate.column_payload ||
-          predicate.column >= filter_schema.ColumnCount())
+          predicate.column >= filter_schema.ColumnCount()) {
         continue;
-      const slot_t full_column =
-          projection ? (*projection)[predicate.column] : predicate.column;
+      }
+      const slot_t full_column = (projection != nullptr)
+                                     ? (*projection)[predicate.column]
+                                     : predicate.column;
       if (full_column != key || predicate.constant.IsNull() ||
           predicate.constant.type != column.Type() ||
-          predicate.constant.IsUnsigned())
+          predicate.constant.IsUnsigned()) {
         continue;
+      }
       const auto op = predicate.op;
       if (op == BinaryOperation::kEquals ||
           op == BinaryOperation::kGreaterThan ||
           op == BinaryOperation::kGreaterThanEquals) {
         if (!lower ||
-            predicate.constant.value.int_value > lower->value.int_value)
+            predicate.constant.value.int_value > lower->value.int_value) {
           lower = predicate.constant;
+        }
       }
       if (op == BinaryOperation::kEquals || op == BinaryOperation::kLessThan ||
           op == BinaryOperation::kLessThanEquals) {
         if (!upper ||
-            predicate.constant.value.int_value < upper->value.int_value)
+            predicate.constant.value.int_value < upper->value.int_value) {
           upper = predicate.constant;
+        }
       }
     }
-    if (!lower && !upper) continue;
+    if (!lower && !upper) {
+      continue;
+    }
     // Cost the enclosure itself; an unrelated predicate must not disguise
     // a broad index range as a selective lookup.
-    if (key >= statistics.Columns()) continue;
+    if (key >= statistics.Columns()) {
+      continue;
+    }
     const double fraction =
         statistics.Column(key).EstimateRange(lower, true, upper, true) /
         static_cast<double>(statistics.Rows());
@@ -3189,25 +3258,34 @@ StatusOr<bool> TrySelectiveIndexSource(
       best = fraction;
     }
   }
-  if (!selected || context.txn_.IndexKeysMayBeStale(selected->Root()))
+  if ((selected == nullptr) ||
+      context.txn_.IndexKeysMayBeStale(selected->Root())) {
     return false;
+  }
   constexpr size_t kMaxRows = 8192;
-  constexpr size_t kBytes = 4 * 1024 * 1024;
+  constexpr size_t kBytes = size_t{4} * 1024 * 1024;
   auto charge = TryReserveQueryMemory(kBytes);
-  if (!charge) return false;
+  if (!charge) {
+    return false;
+  }
   auto guard = context.txn_.AcquireIndexReadGuard(selected->Root());
-  if (context.txn_.IndexKeysMayBeStale(selected->Root())) return false;
+  if (context.txn_.IndexKeysMayBeStale(selected->Root())) {
+    return false;
+  }
   std::vector<Expression> early_memberships;
   if (!filter.needs_unsigned_tagging) {
     for (const auto& expression : filter.residual) {
-      if (!expression || expression->Type() != TypeTag::kInExp) continue;
+      if (!expression || expression->Type() != TypeTag::kInExp) {
+        continue;
+      }
       const auto& membership = expression->AsInExpression();
       if (membership.child_ &&
           membership.child_->Type() == TypeTag::kColumnValue &&
           std::ranges::all_of(membership.list_, [](const Expression& value) {
             return value && value->Type() == TypeTag::kConstantValue;
-          }))
+          })) {
         early_memberships.push_back(expression);
+      }
     }
   }
   struct SourceRow {
@@ -3217,29 +3295,35 @@ StatusOr<bool> TrySelectiveIndexSource(
   };
   std::vector<SourceRow> rows;
   size_t bytes = 0, visited = 0;
-  const size_t scans = selected_keys ? selected_keys->size() : 1;
+  const size_t scans = (selected_keys != nullptr) ? selected_keys->size() : 1;
   for (size_t seek = 0; seek < scans; ++seek) {
-    if (selected_keys) {
+    if (selected_keys != nullptr) {
       const int64_t raw = (*selected_keys)[seek];
-      if (runtime_filter->group->Reject(raw)) continue;
+      if (runtime_filter->group->Reject(raw)) {
+        continue;
+      }
       Value value(raw);
       value.type = schema.GetColumn(selected->sc_.key_.front()).Type();
       begin = end = std::vector<Value>{value};
     }
     IndexScanIterator iterator(table, *selected, context.txn_, begin, end, true,
                                false, &guard);
-    if (projection) RETURN_IF_FAIL(iterator.SetProjection(*projection));
+    if (projection != nullptr)
+      RETURN_IF_FAIL(iterator.SetProjection(*projection));
     while (iterator.IsValid()) {
-      if (++visited > kMaxRows) return false;
+      if (++visited > kMaxRows) {
+        return false;
+      }
       const Row& full_row = *iterator;
       RETURN_IF_FAIL(iterator.GetStatus());
       if (!full_row.IsValid()) {
         ++iterator;
         continue;
       }
-      if (full_row.Count() != filter_schema.ColumnCount())
+      if (full_row.Count() != filter_schema.ColumnCount()) {
         return StatusError(StatusCode::kCorrupt,
                            "indexed source row width mismatch");
+      }
       const Row& row = full_row;
       bool matches = true;
       if (!filter.needs_unsigned_tagging) {
@@ -3258,27 +3342,33 @@ StatusOr<bool> TrySelectiveIndexSource(
         }
       }
       for (const auto& membership : early_memberships) {
-        if (!matches) break;
+        if (!matches) {
+          break;
+        }
         const auto value = membership->TryEvaluate(row, filter_schema);
         // Errors stay on the ordered canonical path. Only a clean rejection
         // can discard a row before restoring physical order.
         if (value.HasValue() &&
-            (value.Value().IsNull() || !value.Value().Truthy()))
+            (value.Value().IsNull() || !value.Value().Truthy())) {
           matches = false;
+        }
       }
-      if (matches && runtime_filter && runtime_filter->enabled()) {
+      if (matches && (runtime_filter != nullptr) && runtime_filter->enabled()) {
         const Value& key = row[runtime_filter->column];
         matches = !runtime_filter->Reject(static_cast<int8_t>(key.type),
                                           key.IsNull(), key.value.int_value);
       }
       if (matches) {
-        bytes += row.values_.capacity() * sizeof(Value) +
-                 sizeof(RowPosition) * 4 + sizeof(Row) * 2;
+        bytes += (row.values_.capacity() * sizeof(Value)) +
+                 (sizeof(RowPosition) * 4) + (sizeof(Row) * 2);
         for (const Value& value : row.values_) {
-          if (value.type == ValueType::kVarChar)
-            bytes += 2 * value.value.varchar_value.size() + 32;
+          if (value.type == ValueType::kVarChar) {
+            bytes += (2 * value.value.varchar_value.size()) + 32;
+          }
         }
-        if (bytes > kBytes / 2) return false;
+        if (bytes > kBytes / 2) {
+          return false;
+        }
         rows.push_back({iterator.Position(), std::move(*iterator), 0});
       }
       ++iterator;
@@ -3289,14 +3379,19 @@ StatusOr<bool> TrySelectiveIndexSource(
     std::unordered_map<page_id_t, size_t> page_order;
     const auto morsels = table.BuildScanMorsels(context.txn_);
     size_t ordinal = 0;
-    for (const auto& morsel : morsels)
+    for (const auto& morsel : morsels) {
       for (page_id_t page : morsel) {
-        if (page_order.size() * 64 + bytes > kBytes) return false;
+        if ((page_order.size() * 64) + bytes > kBytes) {
+          return false;
+        }
         page_order.emplace(page, ordinal++);
       }
+    }
     for (auto& row : rows) {
       const auto found = page_order.find(row.position.page_id);
-      if (found == page_order.end()) return false;
+      if (found == page_order.end()) {
+        return false;
+      }
       row.page_ordinal = found->second;
     }
     std::stable_sort(rows.begin(), rows.end(),
@@ -3816,7 +3911,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                   return;
                 }
                 for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
-                  if (!ext.enabled() || ext.column >= row.Count()) continue;
+                  if (!ext.enabled() || ext.column >= row.Count()) {
+                    continue;
+                  }
                   const Value& ek = row[ext.column];
                   if (ext.Reject(static_cast<int8_t>(ek.type), ek.IsNull(),
                                  ek.value.int_value)) {
@@ -3895,7 +3992,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                   return;
                 }
                 for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
-                  if (!ext.enabled() || ext.column >= row.Count()) continue;
+                  if (!ext.enabled() || ext.column >= row.Count()) {
+                    continue;
+                  }
                   const Value& ek = row[ext.column];
                   if (ext.Reject(static_cast<int8_t>(ek.type), ek.IsNull(),
                                  ek.value.int_value)) {
@@ -4112,7 +4211,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
             const Row& r = result.rows[ri];
             bool keep = true;
             for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
-              if (!ext.enabled() || ext.column >= r.Count()) continue;
+              if (!ext.enabled() || ext.column >= r.Count()) {
+                continue;
+              }
               const Value& kv = r[ext.column];
               if (ext.Reject(static_cast<int8_t>(kv.type), kv.IsNull(),
                              kv.value.int_value)) {
@@ -4130,7 +4231,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           result.rows.resize(out_idx);
         } else {
           for (const ScanRuntimeFilter& ext : int_runtime_filter->extra) {
-            if (!ext.enabled()) continue;
+            if (!ext.enabled()) {
+              continue;
+            }
             PrebuiltMembershipPredicate pm;
             pm.column = ext.column;
             pm.negated = false;
@@ -4160,7 +4263,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                 ? BuildIntegerPeeks(scan_filter, projection, table_schema)
                 : std::vector<IntegerPeekCompare>{};
         TableScanOptions options;
-        if (projection != nullptr) options.projection = *projection;
+        if (projection != nullptr) {
+          options.projection = *projection;
+        }
         options.peek_compares =
             integer_peeks.empty() ? nullptr : &integer_peeks;
         if (iterator_handles_key_filter) {

@@ -69,9 +69,9 @@ class SortedRun final {
 
   class Iterator {
    public:
-    Iterator(const SortedRun* parent, const std::vector<char>& blob,
+    Iterator(const SortedRun* parent, const std::vector<char>& /*blob*/,
              const Schema& sc, size_t offset = 0)
-        : parent_(parent), blob_(&blob), schema_(&sc), offset_(offset) {}
+        : parent_(parent), schema_(&sc), offset_(offset) {}
     ~Iterator() = default;
     Iterator(Iterator&&) = default;
     Iterator(const Iterator&) = default;
@@ -97,7 +97,6 @@ class SortedRun final {
 
    private:
     const SortedRun* parent_;
-    const std::vector<char>* blob_;
     const Schema* schema_;
     size_t offset_;
   };

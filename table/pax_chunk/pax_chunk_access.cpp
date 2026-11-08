@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <array>
+#include <utility>
+
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -31,51 +35,59 @@ namespace tinylamb::pax_detail {
 // single-function codegen; the row-reassembly path goes through
 // Int64AtFast -> helpers instead. When changing an arm, change both.
 // Canonical Int64RegionAt kPlain arm, split out for the row path.
-int64_t Int64AtPlain(const char* r, uint32_t, uint32_t, uint32_t idx,
-                     const char* region_end, const uint32_t*) {
+int64_t Int64AtPlain(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                     uint32_t idx, const char* region_end,
+                     const uint32_t* /*unused*/) {
   // region_end may be null only for callers that validated the region
   // already; with a bound, reject a cell whose 8B payload extends past
   // it (a hand-built footer can claim a 4B varchar-floor region).
   if (region_end != nullptr &&
-      r + static_cast<size_t>(idx) * 8 + 8 > region_end) {
+      r + (static_cast<size_t>(idx) * 8) + 8 > region_end) {
     return 0;
   }
-  return static_cast<int64_t>(ReadBE64(r + static_cast<size_t>(idx) * 8));
+  return static_cast<int64_t>(ReadBE64(r + (static_cast<size_t>(idx) * 8)));
 }
 
 // Canonical Int64RegionAt kConst arm, split out for the row path.
-int64_t Int64AtConst(const char* r, uint32_t, uint32_t, uint32_t,
-                     const char* region_end, const uint32_t*) {
-  if (region_end != nullptr && r + 8 > region_end) return 0;
+int64_t Int64AtConst(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                     uint32_t /*unused*/, const char* region_end,
+                     const uint32_t* /*unused*/) {
+  if (region_end != nullptr && r + 8 > region_end) {
+    return 0;
+  }
   return static_cast<int64_t>(ReadBE64(r));
 }
 
 // Canonical Int64RegionAt kForBp arm, split out for the row path.
-int64_t Int64AtForBp(const char* r, uint32_t param, uint32_t, uint32_t idx,
-                     const char* region_end, const uint32_t*) {
+int64_t Int64AtForBp(const char* r, uint32_t param, uint32_t /*unused*/,
+                     uint32_t idx, const char* region_end,
+                     const uint32_t* /*unused*/) {
   // The offset assembly below shifts by b*8 for b < param: param past
   // 8 (the validator's [1,8] cap) is hostile-metadata-only territory
   // and shifts by >= 64 is UB. Fail closed (the generic decode treats
   // the cell as 0, matching other out-of-contract regions).
-  if (param == 0 || param > 8) return 0;
-  if (region_end != nullptr &&
-      r + 8 + (static_cast<size_t>(idx) + 1) * param > region_end) {
+  if (param == 0 || param > 8) {
     return 0;
   }
-  const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
-  const unsigned char* vp = reinterpret_cast<const unsigned char*>(
-      r + 8 + static_cast<size_t>(idx) * param);
+  if (region_end != nullptr &&
+      r + 8 + ((static_cast<size_t>(idx) + 1) * param) > region_end) {
+    return 0;
+  }
+  const auto base_v = static_cast<int64_t>(ReadBE64(r));
+  const auto* vp = reinterpret_cast<const unsigned char*>(
+      r + 8 + (static_cast<size_t>(idx) * param));
   uint64_t off = 0;
   if (region_end != nullptr &&
       vp + 8 <= reinterpret_cast<const unsigned char*>(region_end)) {
     // One masked u64 load replaces the byte-wise assembly; the window
     // provably stays inside the region (else the byte loop below runs).
-    uint64_t raw;
+    uint64_t raw = 0;
     std::memcpy(&raw, vp, 8);
     off = raw & (param >= 8 ? ~0ULL : ((1ULL << (8U * param)) - 1));
   } else {
-    for (uint32_t b = 0; b < param; ++b)
+    for (uint32_t b = 0; b < param; ++b) {
       off |= static_cast<uint64_t>(vp[b]) << (b * 8U);
+    }
   }
   // Two's-complement wrap: base + offset legitimately wraps for extreme
   // bases; signed + would be UB (UBSan traps on [INT64_MIN, x] data).
@@ -83,31 +95,36 @@ int64_t Int64AtForBp(const char* r, uint32_t param, uint32_t, uint32_t idx,
 }
 
 // Canonical Int64RegionAt kBitWeave arm, split out for the row path.
-int64_t Int64AtBitWeave(const char* r, uint32_t, uint32_t, uint32_t idx,
-                        const char* region_end, const uint32_t*) {
-  if (region_end != nullptr && r + 9 > region_end) return 0;
-  const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+int64_t Int64AtBitWeave(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                        uint32_t idx, const char* region_end,
+                        const uint32_t* /*unused*/) {
+  if (region_end != nullptr && r + 9 > region_end) {
+    return 0;
+  }
+  const auto base_v = static_cast<int64_t>(ReadBE64(r));
   const int w = static_cast<int>(static_cast<uint8_t>(r[8]));
   // A hostile region can carry w > 64: UnpackBitAt would walk idx*w + w
   // bits deep past the region (reads ~32 bytes per value OOB). The
   // footer gate caps prm at 64 for validated chunks; clamp the header
   // byte too so unvalidated decoders stay memory-safe.
-  if (w > 64) return 0;
+  if (w > 64) {
+    return 0;
+  }
   // Bound the packed-offset extent before UnpackBitAt: a hostile region
   // smaller than ceil((idx+1)*w/8) must not be read past.
   if (region_end != nullptr &&
       r + 9 +
-              (static_cast<size_t>(idx) * static_cast<size_t>(w) +
-               static_cast<size_t>(w) + 7) /
-                  8 >
+              ((static_cast<size_t>(idx) * static_cast<size_t>(w) +
+                static_cast<size_t>(w) + 7) /
+               8) >
           region_end) {
     return 0;
   }
   const uint64_t bit_off =
       static_cast<uint64_t>(idx) * static_cast<uint64_t>(w);
   const char* vp = r + 9 + (bit_off >> 3);
-  const uint32_t sh = static_cast<uint32_t>(bit_off & 7);
-  uint64_t off;
+  const auto sh = static_cast<uint32_t>(bit_off & 7);
+  uint64_t off = 0;
   if (sh + static_cast<uint32_t>(w) <= 64 && region_end != nullptr &&
       vp + 8 <= region_end) {
     // One aligned-window load replaces the byte-assembly: same MSB-first
@@ -122,10 +139,13 @@ int64_t Int64AtBitWeave(const char* r, uint32_t, uint32_t, uint32_t idx,
 }
 
 // Canonical Int64RegionAt kEliasFano arm, split out for the row path.
-int64_t Int64AtEliasFano(const char* r, uint32_t, uint32_t n, uint32_t idx,
-                         const char* region_end, const uint32_t* ef_dir) {
-  if (region_end != nullptr && r + 17 > region_end) return 0;
-  const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+int64_t Int64AtEliasFano(const char* r, uint32_t /*unused*/, uint32_t n,
+                         uint32_t idx, const char* region_end,
+                         const uint32_t* ef_dir) {
+  if (region_end != nullptr && r + 17 > region_end) {
+    return 0;
+  }
+  const auto base_v = static_cast<int64_t>(ReadBE64(r));
   const uint64_t maxd = ReadBE64(r + 8);
   const int l = static_cast<int>(static_cast<uint8_t>(r[16]));
   const uint64_t high_max = (l >= 64) ? 0 : (maxd >> l);
@@ -135,16 +155,18 @@ int64_t Int64AtEliasFano(const char* r, uint32_t, uint32_t n, uint32_t idx,
   // whose +7 wrapped the division to 0), aliasing lowbits onto hbmp and
   // sending SelectBit marching past the region. Reserve 7 bits of
   // headroom so the byte-ceil stays exact. Fail closed instead.
-  if (high_max > UINT64_MAX - static_cast<uint64_t>(n) - 7) return 0;
+  if (high_max > UINT64_MAX - static_cast<uint64_t>(n) - 7) {
+    return 0;
+  }
   const size_t hlen = n + static_cast<size_t>(high_max);
   const char* hbmp = r + 17;
   const char* lowbits = hbmp + ((hlen + 7) / 8);
   // Region clamp: a hostile header must not walk SelectBit / the
   // low-bit reader past the region.
   if (region_end != nullptr &&
-      lowbits + (static_cast<size_t>(idx) * static_cast<size_t>(l) +
-                 static_cast<size_t>(l) + 7) /
-                    8 >
+      lowbits + ((static_cast<size_t>(idx) * static_cast<size_t>(l) +
+                  static_cast<size_t>(l) + 7) /
+                 8) >
           region_end) {
     return 0;
   }
@@ -177,14 +199,16 @@ bool ParsePlaRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t nseg = ReadBE16(r);
-  if (nseg == 0 || nseg != param || nseg > n) return false;
+  if (nseg == 0 || nseg != param || nseg > n) {
+    return false;
+  }
   if (static_cast<size_t>(region_end - r) <
-      9U + static_cast<size_t>(nseg) * 20U) {
+      9U + (static_cast<size_t>(nseg) * 20U)) {
     return false;
   }
   out->nseg = nseg;
   out->segs = r + 2;
-  out->hdr = out->segs + static_cast<size_t>(nseg) * 20;
+  out->hdr = out->segs + (static_cast<size_t>(nseg) * 20);
   out->bmp = out->hdr + 7;
   const uint32_t nexc = ReadBE16(out->hdr + 5);
   if (nexc > n ||
@@ -197,8 +221,10 @@ bool ParsePlaRegion(const char* r, uint32_t n, uint32_t param,
   }
   uint32_t prev = 0;
   for (uint32_t j = 0; j < nseg; ++j) {
-    const uint32_t e = ReadBE32(out->segs + static_cast<size_t>(j) * 20 + 16);
-    if (e <= prev || e > n) return false;
+    const uint32_t e = ReadBE32(out->segs + (static_cast<size_t>(j) * 20) + 16);
+    if (e <= prev || e > n) {
+      return false;
+    }
     prev = e;
   }
   return prev == n;
@@ -208,9 +234,9 @@ bool ParsePlaRegion(const char* r, uint32_t n, uint32_t param,
 // (ParsePlaRegion) and that start <= idx < end.
 int64_t PlaSegmentValueAt(const PlaRegion& p, uint32_t j, uint32_t start,
                           uint32_t idx) {
-  const uint64_t first = ReadBE64(p.segs + static_cast<size_t>(j) * 20);
-  const uint64_t d = ReadBE64(p.segs + static_cast<size_t>(j) * 20 + 8);
-  return static_cast<int64_t>(first + static_cast<uint64_t>(idx - start) * d);
+  const uint64_t first = ReadBE64(p.segs + (static_cast<size_t>(j) * 20));
+  const uint64_t d = ReadBE64(p.segs + (static_cast<size_t>(j) * 20) + 8);
+  return static_cast<int64_t>(first + (static_cast<uint64_t>(idx - start) * d));
 }
 
 // ---- Simple-8b (scheme 48) shared helpers ----------------------------------
@@ -255,8 +281,8 @@ Simple8bVerdict Simple8bWordVerdict(uint32_t bits, uint64_t base_u, int64_t lit,
   const uint64_t mask = bits == 0 ? 0 : ((UINT64_C(1) << bits) - 1);
   const uint64_t lo_u = base_u;
   const uint64_t hi_u = base_u + mask;  // may wrap the u64 circle
-  int64_t smin;
-  int64_t smax;
+  int64_t smin = 0;
+  int64_t smax = 0;
   if (hi_u >= lo_u) {
     // Unwrapped interval [lo_u, hi_u]. The u64 -> signed projection
     // preserves order when the interval is entirely positive or entirely
@@ -278,8 +304,8 @@ Simple8bVerdict Simple8bWordVerdict(uint32_t bits, uint64_t base_u, int64_t lit,
   }
   if (bits == 0) {
     // All offsets are 0: the word's values are all exactly the base.
-    return static_cast<int64_t>(base_u) == lit ? Simple8bVerdict::kAll
-                                               : Simple8bVerdict::kNone;
+    const auto base_s = static_cast<int64_t>(base_u);
+    return base_s == lit ? Simple8bVerdict::kAll : Simple8bVerdict::kNone;
   }
   switch (op) {
     case ScanOp::kEq:
@@ -288,20 +314,36 @@ Simple8bVerdict Simple8bWordVerdict(uint32_t bits, uint64_t base_u, int64_t lit,
       return (lit >= smin && lit <= smax) ? Simple8bVerdict::kSome
                                           : Simple8bVerdict::kNone;
     case ScanOp::kLe:
-      if (smax <= lit) return Simple8bVerdict::kAll;
-      if (smin > lit) return Simple8bVerdict::kNone;
+      if (smax <= lit) {
+        return Simple8bVerdict::kAll;
+      }
+      if (smin > lit) {
+        return Simple8bVerdict::kNone;
+      }
       return Simple8bVerdict::kSome;
     case ScanOp::kLt:
-      if (smax < lit) return Simple8bVerdict::kAll;
-      if (smin >= lit) return Simple8bVerdict::kNone;
+      if (smax < lit) {
+        return Simple8bVerdict::kAll;
+      }
+      if (smin >= lit) {
+        return Simple8bVerdict::kNone;
+      }
       return Simple8bVerdict::kSome;
     case ScanOp::kGe:
-      if (smin >= lit) return Simple8bVerdict::kAll;
-      if (smax < lit) return Simple8bVerdict::kNone;
+      if (smin >= lit) {
+        return Simple8bVerdict::kAll;
+      }
+      if (smax < lit) {
+        return Simple8bVerdict::kNone;
+      }
       return Simple8bVerdict::kSome;
     case ScanOp::kGt:
-      if (smin > lit) return Simple8bVerdict::kAll;
-      if (smax <= lit) return Simple8bVerdict::kNone;
+      if (smin > lit) {
+        return Simple8bVerdict::kAll;
+      }
+      if (smax <= lit) {
+        return Simple8bVerdict::kNone;
+      }
       return Simple8bVerdict::kSome;
   }
   return Simple8bVerdict::kSome;
@@ -310,27 +352,33 @@ Simple8bVerdict Simple8bWordVerdict(uint32_t bits, uint64_t base_u, int64_t lit,
 // Canonical Int64RegionAt kArith arm, split out for the row path (lockstep
 // with the switch arm: exception rank + inner-region recursion included).
 int64_t Int64AtArith(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                     const char* region_end, const uint32_t*) {
+                     const char* region_end, const uint32_t* /*unused*/) {
   // [a i64][d i64][ischeme u8][iparam u32][nexc u16]
   // [bitmap ceil(n/8) B MSB-first][inner region of nexc exceptions].
-  if (region_end != nullptr && r + 23 > region_end) return 0;
+  if (region_end != nullptr && r + 23 > region_end) {
+    return 0;
+  }
   const uint64_t a = ReadBE64(r);
   const uint64_t d = ReadBE64(r + 8);
-  const uint8_t ischeme = static_cast<uint8_t>(r[16]);
+  const auto ischeme = static_cast<uint8_t>(r[16]);
   const uint32_t iparam = ReadBE32(r + 17);
   const uint32_t nexc = ReadBE16(r + 21);
   const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
   if (region_end != nullptr && r + 23 + bmp_bytes > region_end) {
     return 0;
   }
-  if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) return 0;
-  const uint8_t bit = static_cast<uint8_t>(
+  if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) {
+    return 0;
+  }
+  const auto bit = static_cast<uint8_t>(
       (static_cast<uint8_t>(r[23 + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
   if (bit != 0) {
-    return static_cast<int64_t>(a + static_cast<uint64_t>(idx) * d);
+    return static_cast<int64_t>(a + (static_cast<uint64_t>(idx) * d));
   }
-  if (nexc == 0) return 0;  // clear bit in a pure ramp is inconsistent
-  const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + 23);
+  if (nexc == 0) {
+    return 0;  // clear bit in a pure ramp is inconsistent
+  }
+  const auto* bmp = reinterpret_cast<const uint8_t*>(r + 23);
   uint32_t set_before = 0;
   const size_t bfull = idx / 8;
   for (size_t w = 0; w < bfull; ++w) {
@@ -340,7 +388,9 @@ int64_t Int64AtArith(const char* r, uint32_t param, uint32_t n, uint32_t idx,
     set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
   }
   const uint32_t eidx = idx - set_before;
-  if (eidx >= nexc) return 0;
+  if (eidx >= nexc) {
+    return 0;
+  }
   const char* inner = r + 23 + bmp_bytes;
   return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc, eidx,
                        region_end, nullptr);
@@ -350,50 +400,64 @@ int64_t Int64AtArith(const char* r, uint32_t param, uint32_t n, uint32_t idx,
 // with the switch arm: O(1) header bounds + segment binary search +
 // bitmap/exception handling included).
 int64_t Int64AtPla(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                   const char* region_end, const uint32_t*) {
+                   const char* region_end, const uint32_t* /*unused*/) {
   // [nseg u16][nseg x (first 8B, d 8B, end 4B)][ischeme u8][iparam u32]
   // [nexc u16][bitmap ceil(n/8)][inner region of nexc exceptions].
-  if (region_end != nullptr && r + 2 > region_end) return 0;
+  if (region_end != nullptr && r + 2 > region_end) {
+    return 0;
+  }
   const uint32_t nseg = ReadBE16(r);
-  if (nseg == 0 || nseg != param) return 0;
+  if (nseg == 0 || nseg != param) {
+    return 0;
+  }
   if (region_end != nullptr && static_cast<size_t>(region_end - r) <
-                                   9U + static_cast<size_t>(nseg) * 20U) {
+                                   9U + (static_cast<size_t>(nseg) * 20U)) {
     return 0;
   }
   const char* segs = r + 2;
-  const char* hdr = segs + static_cast<size_t>(nseg) * 20;
-  const uint8_t ischeme = static_cast<uint8_t>(hdr[0]);
+  const char* hdr = segs + (static_cast<size_t>(nseg) * 20);
+  const auto ischeme = static_cast<uint8_t>(hdr[0]);
   const uint32_t iparam = ReadBE32(hdr + 1);
   const uint32_t nexc = ReadBE16(hdr + 5);
-  if (nexc != 0 && !InnerSchemeOk(ischeme)) return 0;
+  if (nexc != 0 && !InnerSchemeOk(ischeme)) {
+    return 0;
+  }
   // First segment whose exclusive end is past idx.
   uint32_t lo = 0;
   uint32_t hi = nseg;
   while (lo < hi) {
-    const uint32_t mid = lo + (hi - lo) / 2;
-    if (ReadBE32(segs + static_cast<size_t>(mid) * 20 + 16) <= idx) {
+    const uint32_t mid = lo + ((hi - lo) / 2);
+    if (ReadBE32(segs + (static_cast<size_t>(mid) * 20) + 16) <= idx) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
-  if (lo >= nseg) return 0;
-  const uint32_t start =
-      lo == 0 ? 0 : ReadBE32(segs + static_cast<size_t>(lo - 1) * 20 + 16);
-  if (idx < start) return 0;  // hostile ends regression
-  const size_t bmp_off = 9U + static_cast<size_t>(nseg) * 20U;
-  if (region_end != nullptr &&
-      r + bmp_off + (static_cast<size_t>(n) + 7) / 8 > region_end) {
+  if (lo >= nseg) {
     return 0;
   }
-  const uint8_t bit = static_cast<uint8_t>(
+  const uint32_t start =
+      lo == 0 ? 0 : ReadBE32(segs + (static_cast<size_t>(lo - 1) * 20) + 16);
+  if (idx < start) {
+    return 0;  // hostile ends regression
+  }
+  const size_t bmp_off = 9U + (static_cast<size_t>(nseg) * 20U);
+  if (region_end != nullptr &&
+      r + bmp_off + ((static_cast<size_t>(n) + 7) / 8) > region_end) {
+    return 0;
+  }
+  const auto bit = static_cast<uint8_t>(
       (static_cast<uint8_t>(r[bmp_off + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
   if (bit != 0) {
-    return PlaSegmentValueAt({nseg, segs, hdr, r + bmp_off}, lo, start, idx);
+    return PlaSegmentValueAt(
+        {.nseg = nseg, .segs = segs, .hdr = hdr, .bmp = r + bmp_off}, lo, start,
+        idx);
   }
-  if (nexc == 0) return 0;  // clear bit in a pure model is inconsistent
+  if (nexc == 0) {
+    return 0;  // clear bit in a pure model is inconsistent
+  }
   // Exception rank = clear bits before idx (kArith's popcount walk).
-  const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + bmp_off);
+  const auto* bmp = reinterpret_cast<const uint8_t*>(r + bmp_off);
   uint32_t set_before = 0;
   const size_t bfull = idx / 8;
   for (size_t w = 0; w < bfull; ++w) {
@@ -403,8 +467,10 @@ int64_t Int64AtPla(const char* r, uint32_t param, uint32_t n, uint32_t idx,
     set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
   }
   const uint32_t eidx = idx - set_before;
-  if (eidx >= nexc) return 0;  // bitmap over-counts exceptions
-  const char* inner = r + bmp_off + (static_cast<size_t>(n) + 7) / 8;
+  if (eidx >= nexc) {
+    return 0;  // bitmap over-counts exceptions
+  }
+  const char* inner = r + bmp_off + ((static_cast<size_t>(n) + 7) / 8);
   return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc, eidx,
                        region_end, nullptr);
 }
@@ -477,8 +543,10 @@ unsigned __int128 ModFloorSum(unsigned __int128 n, unsigned __int128 a,
       a %= m;
     }
     // Now a < m and b < m: the largest numerator is b*(n-1) + a.
-    const unsigned __int128 y_max = b * n + a;
-    if (y_max < m) break;
+    const unsigned __int128 y_max = (b * n) + a;
+    if (y_max < m) {
+      break;
+    }
     n = y_max / m;    // rows past the first crossing keep contributing
     a = y_max % m;    // the new intercept
     std::swap(b, m);  // the new slope is the old modulus
@@ -499,17 +567,19 @@ uint64_t ModGcd(uint64_t x, uint64_t y) {
 // Modular inverse of u mod q (q >= 1, gcd(u, q) == 1), extended Euclid over
 // signed __int128 to dodge the u64 overflow in the coefficient products.
 uint64_t ModInv(uint64_t u, uint64_t q) {
-  if (q == 1) return 0;
+  if (q == 1) {
+    return 0;
+  }
   __int128 t = 0;
   __int128 newt = 1;
-  __int128 r = static_cast<__int128>(q);
-  __int128 newr = static_cast<__int128>(u % q);
+  auto r = static_cast<__int128>(q);
+  auto newr = static_cast<__int128>(u % q);
   while (newr != 0) {
     const __int128 quotient = r / newr;
-    const __int128 tmp = t - quotient * newt;
+    const __int128 tmp = t - (quotient * newt);
     t = newt;
     newt = tmp;
-    const __int128 rm = r - quotient * newr;
+    const __int128 rm = r - (quotient * newr);
     r = newr;
     newr = rm;
   }
@@ -521,10 +591,12 @@ uint64_t ModInv(uint64_t u, uint64_t q) {
 // with the switch arm: O(1) header bounds + one mulmod + bitmap/exception
 // handling included).
 int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                   const char* region_end, const uint32_t*) {
+                   const char* region_end, const uint32_t* /*unused*/) {
   // [a 8B][b 8B][m 8B][ischeme u8][iparam u32][nexc u16]
   // [bitmap ceil(n/8) B MSB-first][inner region of nexc exceptions].
-  if (region_end != nullptr && r + 31 > region_end) return 0;
+  if (region_end != nullptr && r + 31 > region_end) {
+    return 0;
+  }
   ModRegion p;
   p.a = ReadBE64(r);
   p.b = ReadBE64(r + 8);
@@ -533,21 +605,25 @@ int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
       p.b == 0) {
     return 0;
   }
-  const uint8_t ischeme = static_cast<uint8_t>(r[24]);
+  const auto ischeme = static_cast<uint8_t>(r[24]);
   const uint32_t iparam = ReadBE32(r + 25);
   const uint32_t nexc = ReadBE16(r + 29);
   const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
   if (region_end != nullptr && r + 31 + bmp_bytes > region_end) {
     return 0;
   }
-  if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) return 0;
-  const uint8_t bit = static_cast<uint8_t>(
+  if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) {
+    return 0;
+  }
+  const auto bit = static_cast<uint8_t>(
       (static_cast<uint8_t>(r[31 + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
   if (bit != 0) {
     return ModValueAt(p, idx);
   }
-  if (nexc == 0) return 0;  // clear bit in a pure model is inconsistent
-  const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + 31);
+  if (nexc == 0) {
+    return 0;  // clear bit in a pure model is inconsistent
+  }
+  const auto* bmp = reinterpret_cast<const uint8_t*>(r + 31);
   uint32_t set_before = 0;
   const size_t bfull = idx / 8;
   for (size_t w = 0; w < bfull; ++w) {
@@ -557,7 +633,9 @@ int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
     set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
   }
   const uint32_t eidx = idx - set_before;
-  if (eidx >= nexc) return 0;
+  if (eidx >= nexc) {
+    return 0;
+  }
   const char* inner = r + 31 + bmp_bytes;
   return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc, eidx,
                        region_end, nullptr);
@@ -570,7 +648,9 @@ int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
 // kMod: O(1) header bounds in the scalar path, full parse in the batch
 // paths, hostile-input clamps mirroring the kPla arm.
 
-size_t LaneHeaderBytes(uint32_t nd) { return 8 + static_cast<size_t>(nd) * 16; }
+size_t LaneHeaderBytes(uint32_t nd) {
+  return 8 + (static_cast<size_t>(nd) * 16);
+}
 
 // Full structural parse for the BATCH paths: extent bounds, footer param
 // agreement, the nd range, and the exception envelope. The scalar
@@ -583,7 +663,9 @@ bool ParseLaneRegion(const char* r, uint32_t n, uint32_t param,
     return false;
   }
   const uint32_t nd = static_cast<uint8_t>(r[0]);
-  if (nd < 2 || nd > 16) return false;
+  if (nd < 2 || nd > 16) {
+    return false;
+  }
   out->nd = nd;
   out->base = r + 1;
   const size_t hdr = LaneHeaderBytes(nd);
@@ -605,7 +687,7 @@ bool ParseLaneRegion(const char* r, uint32_t n, uint32_t param,
 int64_t LaneValueAt(const LaneRegion& p, uint32_t idx) {
   const size_t off = static_cast<size_t>(idx % p.nd) * 16;
   const uint64_t v =
-      ReadBE64(p.base + off) + ReadBE64(p.base + off + 8) * (idx / p.nd);
+      ReadBE64(p.base + off) + (ReadBE64(p.base + off + 8) * (idx / p.nd));
   return static_cast<int64_t>(v);
 }
 
@@ -613,13 +695,17 @@ int64_t LaneValueAt(const LaneRegion& p, uint32_t idx) {
 // with the switch arm: O(1) header bounds + one lane model eval on the
 // on-model bit + kArith's popcount exception rank otherwise).
 int64_t Int64AtLane(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                    const char* region_end, const uint32_t*) {
+                    const char* region_end, const uint32_t* /*unused*/) {
   // [nd u8][nd x (base 8B][step 8B)][ischeme u8][iparam u32][nexc u16]
   // [bitmap ceil(n/8) B MSB-first][inner region of nexc exceptions].
-  if (region_end != nullptr && r + 40 > region_end) return 0;
+  if (region_end != nullptr && r + 40 > region_end) {
+    return 0;
+  }
   LaneRegion p;
   p.nd = static_cast<uint8_t>(r[0]);
-  if (p.nd < 2 || p.nd > 16) return 0;
+  if (p.nd < 2 || p.nd > 16) {
+    return 0;
+  }
   p.base = r + 1;
   const size_t hdr = LaneHeaderBytes(p.nd);
   p.ischeme = static_cast<uint8_t>(r[hdr - 7]);
@@ -629,14 +715,18 @@ int64_t Int64AtLane(const char* r, uint32_t param, uint32_t n, uint32_t idx,
   if (region_end != nullptr && r + hdr + bmp_bytes > region_end) {
     return 0;
   }
-  if (p.nexc != param || (p.nexc > 0 && !InnerSchemeOk(p.ischeme))) return 0;
-  const uint8_t bit = static_cast<uint8_t>(
+  if (p.nexc != param || (p.nexc > 0 && !InnerSchemeOk(p.ischeme))) {
+    return 0;
+  }
+  const auto bit = static_cast<uint8_t>(
       (static_cast<uint8_t>(r[hdr + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
   if (bit != 0) {
     return LaneValueAt(p, idx);
   }
-  if (p.nexc == 0) return 0;  // clear bit in a pure model is inconsistent
-  const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + hdr);
+  if (p.nexc == 0) {
+    return 0;  // clear bit in a pure model is inconsistent
+  }
+  const auto* bmp = reinterpret_cast<const uint8_t*>(r + hdr);
   uint32_t set_before = 0;
   const size_t bfull = idx / 8;
   for (size_t w = 0; w < bfull; ++w) {
@@ -646,7 +736,9 @@ int64_t Int64AtLane(const char* r, uint32_t param, uint32_t n, uint32_t idx,
     set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
   }
   const uint32_t eidx = idx - set_before;
-  if (eidx >= p.nexc) return 0;
+  if (eidx >= p.nexc) {
+    return 0;
+  }
   const char* inner = r + hdr + bmp_bytes;
   return Int64RegionAt(inner, static_cast<Scheme>(p.ischeme), p.iparam, p.nexc,
                        eidx, region_end, nullptr);
@@ -667,18 +759,22 @@ bool TileDictParseTile(const char* p, const char* end, uint32_t n,
   // regions (ByteSliceNullAwareCount's fallback): the walk stays bounded by
   // n (tiles are non-empty, <= ceil(n/64) steps) and every READ is bounded
   // by the parsed d/rows, only the end-vs-region check is dropped.
-  if (end != nullptr && p + 1 > end) return false;
+  if (end != nullptr && p + 1 > end) {
+    return false;
+  }
   const uint32_t d = static_cast<uint8_t>(p[0]);
-  if (d == 0 || d > kTileDictMaxD) return false;
+  if (d == 0 || d > kTileDictMaxD) {
+    return false;
+  }
   const int w = TileDictWidth(d);
   const uint32_t rows =
       (n - tile_start < kTileDictRows) ? n - tile_start : kTileDictRows;
   const size_t codes_bytes =
       (static_cast<size_t>(rows) * static_cast<size_t>(w) + 7) / 8;
   const char* dict = p + 1;
-  const char* codes = dict + static_cast<size_t>(d) * 8;
+  const char* codes = dict + (static_cast<size_t>(d) * 8);
   if (end != nullptr &&
-      (codes > end || codes_bytes > static_cast<size_t>(end - codes))) {
+      (codes > end || std::cmp_greater(codes_bytes, end - codes))) {
     return false;
   }
   c->p = p;
@@ -696,13 +792,17 @@ bool TileDictParseTile(const char* p, const char* end, uint32_t n,
 
 bool TileDictFirst(const char* r, uint32_t n, const char* end,
                    TileDictCursor* c) {
-  if (n == 0) return false;
+  if (n == 0) {
+    return false;
+  }
   return TileDictParseTile(r, end, n, 0, c);
 }
 
 bool TileDictNext(TileDictCursor* c) {
   const uint32_t next_start = c->tile_start + c->rows;
-  if (next_start >= c->n) return false;
+  if (next_start >= c->n) {
+    return false;
+  }
   const char* p = c->codes + c->codes_bytes;
   return TileDictParseTile(p, c->end, c->n, next_start, c);
 }
@@ -710,9 +810,13 @@ bool TileDictNext(TileDictCursor* c) {
 // Places the cursor on the tile holding row `idx` (caller checked idx < n).
 bool TileDictSeek(const char* r, uint32_t n, const char* end, uint32_t idx,
                   TileDictCursor* c) {
-  if (!TileDictFirst(r, n, end, c)) return false;
+  if (!TileDictFirst(r, n, end, c)) {
+    return false;
+  }
   while (idx >= c->tile_start + c->rows) {
-    if (!TileDictNext(c)) return false;
+    if (!TileDictNext(c)) {
+      return false;
+    }
   }
   return true;
 }
@@ -724,8 +828,11 @@ int64_t TileDictValueAt(const TileDictCursor& c, uint32_t local_row) {
                                           static_cast<uint64_t>(local_row) *
                                               static_cast<uint64_t>(c.w),
                                           c.w);
-  if (code >= c.d) return 0;  // clamp bucket: hostile codes decode as raw 0
-  return static_cast<int64_t>(ReadBE64(c.dict + static_cast<size_t>(code) * 8));
+  if (code >= c.d) {
+    return 0;  // clamp bucket: hostile codes decode as raw 0
+  }
+  return static_cast<int64_t>(
+      ReadBE64(c.dict + (static_cast<size_t>(code) * 8)));
 }
 
 // Row-reassembly dispatch (ReadRowIntoImpl): a scan's per-column scheme is
@@ -734,7 +841,9 @@ int64_t TileDictValueAt(const TileDictCursor& c, uint32_t local_row) {
 int64_t Int64AtFast(const char* r, Scheme s, uint32_t param, uint32_t n,
                     uint32_t idx, const char* region_end,
                     const uint32_t* ef_dir) {
-  if (UNLIKELY(n == 0 || idx >= n)) return 0;  // canonical entry guard
+  if (UNLIKELY(n == 0 || idx >= n)) {
+    return 0;  // canonical entry guard
+  }
   switch (s) {
     case Scheme::kEliasFano:
       return Int64AtEliasFano(r, param, n, idx, region_end, ef_dir);
@@ -746,7 +855,9 @@ int64_t Int64AtFast(const char* r, Scheme s, uint32_t param, uint32_t n,
       // before either is touched, so a hostile n/param cannot walk off the
       // region.
       S4Region p;
-      if (!ParseS4Region(r, n, param, region_end, &p)) return 0;
+      if (!ParseS4Region(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return S4ValueAt(p, idx);
     }
     case Scheme::kPlain:
@@ -774,19 +885,23 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
   // Every scheme below indexes an n-row payload; an idx past the end is a
   // caller bug or hostile metadata. Fail closed instead of letting the
   // per-scheme extent checks be the only defense.
-  if (n == 0 || idx >= n) return 0;
+  if (n == 0 || idx >= n) {
+    return 0;
+  }
   switch (s) {
     case Scheme::kPlain:
       // region_end may be null only for callers that validated the region
       // already; with a bound, reject a cell whose 8B payload extends past
       // it (a hand-built footer can claim a 4B varchar-floor region).
       if (region_end != nullptr &&
-          r + static_cast<size_t>(idx) * 8 + 8 > region_end) {
+          r + (static_cast<size_t>(idx) * 8) + 8 > region_end) {
         return 0;
       }
-      return static_cast<int64_t>(ReadBE64(r + static_cast<size_t>(idx) * 8));
+      return static_cast<int64_t>(ReadBE64(r + (static_cast<size_t>(idx) * 8)));
     case Scheme::kConst:
-      if (region_end != nullptr && r + 8 > region_end) return 0;
+      if (region_end != nullptr && r + 8 > region_end) {
+        return 0;
+      }
       return static_cast<int64_t>(ReadBE64(r));
     case Scheme::kRle: {
       const uint32_t runs = param;
@@ -794,19 +909,21 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // used to march gigabytes past the region even though region_end was
       // in hand (callers relied on a clamp that did not exist).
       if (region_end != nullptr &&
-          r + 4 + static_cast<size_t>(runs) * 12 > region_end) {
+          r + 4 + (static_cast<size_t>(runs) * 12) > region_end) {
         return 0;
       }
       uint64_t acc = 0;
       const char* p = r + 4;
       for (uint32_t i = 0; i < runs; ++i) {
-        const int64_t v = static_cast<int64_t>(ReadBE64(p));
+        const auto v = static_cast<int64_t>(ReadBE64(p));
         // u64 extent math: a hostile len (e.g. 0xFFFFFFFF after a short
         // run) wrapped the uint32 accumulator, regressed the walk and
         // returned 0 instead of the run's value (fixed the same way in
         // ReduceColumn / TryFastPredicateMask / GroupBySumColumn).
         const uint64_t len = ReadBE32(p + 8);
-        if (static_cast<uint64_t>(idx) < acc + len) return v;
+        if (static_cast<uint64_t>(idx) < acc + len) {
+          return v;
+        }
         acc += len;
         p += 12;
       }
@@ -814,11 +931,15 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kRleBp: {
       RleBpRegion p;
-      if (!ParseRleBpRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseRleBpRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       uint64_t row = 0;
       for (uint32_t run = 0; run < p.runs; ++run) {
         const uint64_t length = RleBpLengthAt(p, run);
-        if (idx < row + length) return RleBpValueAt(p, run);
+        if (idx < row + length) {
+          return RleBpValueAt(p, run);
+        }
         row += length;
       }
       return 0;
@@ -828,9 +949,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // table plus a <= 15-length walk, so a probe costs O(log runs) instead
       // of the O(runs) walk every other run scheme pays.
       RleIdxRegion p;
-      if (!ParseRleIdxRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseRleIdxRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       const uint32_t run = RleIdxRunAt(p, idx);
-      if (run >= p.runs) return 0;
+      if (run >= p.runs) {
+        return 0;
+      }
       return RleIdxValueAt(p, run);
     }
     case Scheme::kStreamVByte: {
@@ -838,12 +963,16 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // most three width adds, so this is O(1) like kForBp / kEliasFano and
       // unlike the kSimple8b or run-family probes, which replay from the head.
       StreamVByteRegion p;
-      if (!ParseStreamVByteRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseStreamVByteRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return StreamVByteValueAt(p, idx);
     }
     case Scheme::kSimdFor: {
       SimdForRegion p{};
-      if (!ParseSimdForRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseSimdForRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return SimdForValueAt(p, idx);
     }
     case Scheme::kS4: {
@@ -852,7 +981,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // against region_end before either is touched, so a hostile n cannot
       // walk off the region (the same shape as the kS4 arm above).
       S4Region p;
-      if (!ParseS4Region(r, n, param, region_end, &p)) return 0;
+      if (!ParseS4Region(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return S4ValueAt(p, idx);
     }
     case Scheme::kSfor: {
@@ -861,7 +992,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // raw-bit order this scheme bisects is only value order under the
       // non-negative gate).
       SforRegion p;
-      if (!ParseSforRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseSforRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return SforValueAt(p, idx);
     }
     case Scheme::kExpFor: {
@@ -870,14 +1003,18 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // returned cell is the raw bitcast bits (the convention every double
       // codec hands the int64 machinery).
       ExpForRegion p;
-      if (!ParseExpForRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseExpForRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return ExpForValueAt(p, idx);
     }
     case Scheme::kD2Pfor: {
       // Checkpoint jump + at most kDeltaCheckpointEvery inner second-difference
       // reads, the same probe shape as kDeltaFor, priced at the same tier.
       D2PforRegion p;
-      if (!ParseD2PforRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseD2PforRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return D2PforValueAt(p, idx);
     }
     case Scheme::kHuffDict: {
@@ -885,7 +1022,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // probe rebuilds the (len, sym) tables per call -- d <= 1024 makes that
       // a few hundred ns, the price of leaving the region cache-free.
       HuffDictRegion p;
-      if (!ParseHuffDictRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseHuffDictRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return HuffDictValueAt(p, idx);
     }
     case Scheme::kRle8:
@@ -895,7 +1034,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return Rle8ValueAtParsed(r, n, param, region_end, idx);
     case Scheme::kRleDelta: {
       RleDeltaRegion p;
-      if (!ParseRleDeltaRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseRleDeltaRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return RleDeltaValueAt(p, idx);
     }
     case Scheme::kForBp: {
@@ -903,25 +1044,28 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // 8 (the validator's [1,8] cap) is hostile-metadata-only territory
       // and shifts by >= 64 is UB. Fail closed (the generic decode treats
       // the cell as 0, matching other out-of-contract regions).
-      if (param == 0 || param > 8) return 0;
-      if (region_end != nullptr &&
-          r + 8 + (static_cast<size_t>(idx) + 1) * param > region_end) {
+      if (param == 0 || param > 8) {
         return 0;
       }
-      const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
-      const unsigned char* vp = reinterpret_cast<const unsigned char*>(
-          r + 8 + static_cast<size_t>(idx) * param);
+      if (region_end != nullptr &&
+          r + 8 + ((static_cast<size_t>(idx) + 1) * param) > region_end) {
+        return 0;
+      }
+      const auto base_v = static_cast<int64_t>(ReadBE64(r));
+      const auto* vp = reinterpret_cast<const unsigned char*>(
+          r + 8 + (static_cast<size_t>(idx) * param));
       uint64_t off = 0;
       if (region_end != nullptr &&
           vp + 8 <= reinterpret_cast<const unsigned char*>(region_end)) {
         // One masked u64 load replaces the byte-wise assembly; the window
         // provably stays inside the region (else the byte loop below runs).
-        uint64_t raw;
+        uint64_t raw = 0;
         std::memcpy(&raw, vp, 8);
         off = raw & (param >= 8 ? ~0ULL : ((1ULL << (8U * param)) - 1));
       } else {
-        for (uint32_t b = 0; b < param; ++b)
+        for (uint32_t b = 0; b < param; ++b) {
           off |= static_cast<uint64_t>(vp[b]) << (b * 8U);
+        }
       }
       // Two's-complement wrap: base + offset legitimately wraps for extreme
       // bases; signed + would be UB (UBSan traps on [INT64_MIN, x] data).
@@ -936,27 +1080,31 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // cw up to 16 and read ~2KB of "codes" out of a 4-byte region. One
       // gate over the full layout ([count 2B][packed codes][dict n*8B]
       // sized from the caller's n) covers header, codes, and dictionary.
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint16_t ncodes = ReadBE16(r);
       const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
       // Layout: [count 2B][packed codes ceil(rows*cw/8) B][dict n x 8B].
       const size_t dict_base =
-          2 + (static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8;
+          2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
       const char* dict = r + dict_base;
       // The validator's region_need floors the dict at 4B/entry, but an
       // int64 dict consumes 8B/entry: a region built exactly at the floor
       // (or a hand-built footer) would read code*8 bytes past the region
       // into the footer. Refuse instead of reading foreign bytes.
       if (region_end != nullptr &&
-          dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > region_end) {
+          dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > region_end) {
         return 0;
       }
       const uint64_t code = UnpackBitAt(
           r + 2, static_cast<uint64_t>(idx) * static_cast<uint64_t>(cw), cw);
       // A cw-wide code can encode values past ncodes (cw rounds up): clamp.
-      if (ncodes == 0 || code >= ncodes) return 0;
+      if (ncodes == 0 || code >= ncodes) {
+        return 0;
+      }
       return static_cast<int64_t>(
-          ReadBE64(dict + static_cast<size_t>(code) * sizeof(int64_t)));
+          ReadBE64(dict + (static_cast<size_t>(code) * sizeof(int64_t))));
     }
     case Scheme::kRleDict:
     case Scheme::kOpRle: {  // kRleDict layout; OpRle adds a sorted dict,
@@ -964,16 +1112,22 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [d u16][dict d x 8B][runs u32][{code cb B}{len u32}] x runs. The run
       // walk reads cb+4 bytes per run; a hostile param (up to 2^32-1) must
       // not march past the region (mirrors the kRle arm's gate).
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t d = ReadBE16(r);
-      if (d == 0) return 0;
+      if (d == 0) {
+        return 0;
+      }
       const int cb = (BitsNeeded(d - 1) + 7) / 8;
-      const char* runs_hdr = r + 2 + static_cast<size_t>(d) * 8;
-      if (region_end != nullptr && runs_hdr + 4 > region_end) return 0;
+      const char* runs_hdr = r + 2 + (static_cast<size_t>(d) * 8);
+      if (region_end != nullptr && runs_hdr + 4 > region_end) {
+        return 0;
+      }
       const uint32_t runs = ReadBE32(runs_hdr);
       if (region_end != nullptr &&
           runs_hdr + 4 +
-                  static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+                  (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
               region_end) {
         return 0;
       }
@@ -989,9 +1143,11 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         const int64_t v =
             (code >= d) ? 0  // clamp bucket decodes as raw 0 (mirrors kDict)
                         : static_cast<int64_t>(
-                              ReadBE64(dict + static_cast<size_t>(code) * 8));
+                              ReadBE64(dict + (static_cast<size_t>(code) * 8)));
         const uint64_t len = ReadBE32(q + cb);
-        if (static_cast<uint64_t>(idx) < acc + len) return v;
+        if (static_cast<uint64_t>(idx) < acc + len) {
+          return v;
+        }
         acc += len;
         q += static_cast<size_t>(cb) + 4;
       }
@@ -1003,12 +1159,12 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       const uint32_t ci = idx / kDeltaCheckpointEvery;
       // Checkpoint table must be inside the region before any read.
       if (region_end != nullptr &&
-          r + 8 + static_cast<size_t>(cks) * 8 > region_end) {
+          r + 8 + (static_cast<size_t>(cks) * 8) > region_end) {
         return 0;
       }
-      uint64_t v = ReadBE64(r + 8 + static_cast<size_t>(ci) * 8);
+      uint64_t v = ReadBE64(r + 8 + (static_cast<size_t>(ci) * 8));
       const uint32_t start = ci * kDeltaCheckpointEvery;
-      const char* packed = r + 8 + static_cast<size_t>(cks) * 8;
+      const char* packed = r + 8 + (static_cast<size_t>(cks) * 8);
       // The walk reads bits [0, idx*param) past `packed` (deltas 1..idx,
       // deltas[0] is the checkpoint value), so the exact byte ceil of
       // idx*param bounds it. The former (idx+1)*param ceil rejected
@@ -1016,7 +1172,7 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // (always for prm=8): the final row of a full group silently decoded
       // as 0. Mirrors the kXorFor bound below.
       if (region_end != nullptr &&
-          packed + (static_cast<size_t>(idx) * param + 7) / 8 > region_end) {
+          packed + ((static_cast<size_t>(idx) * param + 7) / 8) > region_end) {
         return 0;
       }
       for (uint32_t t = start + 1; t <= idx; ++t) {
@@ -1030,7 +1186,7 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           r + 16 + (static_cast<size_t>(idx) >> 3) + 1 > region_end) {
         return 0;
       }
-      const int64_t tv = static_cast<int64_t>(ReadBE64(r));
+      const auto tv = static_cast<int64_t>(ReadBE64(r));
       const uint64_t bit = UnpackBitAt(r + 16, idx, 1);
       return bit != 0 ? tv : static_cast<int64_t>(ReadBE64(r + 8));
     }
@@ -1039,12 +1195,14 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // extent math is guarded for hostile regions: a fill length near 2^62
       // must not overflow 63*L before the coverage checks run.
       if (region_end != nullptr &&
-          r + 16 + static_cast<size_t>(param) * 8 > region_end) {
+          r + 16 + (static_cast<size_t>(param) * 8) > region_end) {
         return 0;
       }
-      if (param == 0) return 0;
-      const int64_t tv = static_cast<int64_t>(ReadBE64(r));
-      const int64_t fv = static_cast<int64_t>(ReadBE64(r + 8));
+      if (param == 0) {
+        return 0;
+      }
+      const auto tv = static_cast<int64_t>(ReadBE64(r));
+      const auto fv = static_cast<int64_t>(ReadBE64(r + 8));
       const char* wp = r + 16;
       uint64_t remaining = idx;
       for (uint32_t k = 0; k < param; ++k, wp += 8) {
@@ -1056,7 +1214,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           remaining -= kWahSpan;
         } else {
           const uint64_t len = w & kWahLenMask;
-          if (len > UINT64_MAX / kWahSpan) return 0;
+          if (len > UINT64_MAX / kWahSpan) {
+            return 0;
+          }
           const uint64_t rows = len * kWahSpan;
           if (remaining < rows) {
             return ((w >> 62) & 1ULL) != 0 ? tv : fv;
@@ -1067,13 +1227,15 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return 0;  // idx beyond the encoded coverage
     }
     case Scheme::kXorFor: {
-      if (region_end != nullptr && r + 8 > region_end) return 0;
+      if (region_end != nullptr && r + 8 > region_end) {
+        return 0;
+      }
       uint64_t x = ReadBE64(r);
       const char* packed = r + 8;
       // Bound the XOR-walk extent the same way as kDeltaFp above (exact
       // byte ceil of idx*param bits).
       if (region_end != nullptr &&
-          packed + (static_cast<size_t>(idx) * param + 7) / 8 > region_end) {
+          packed + ((static_cast<size_t>(idx) * param + 7) / 8) > region_end) {
         return 0;
       }
       for (uint32_t t = 1; t <= idx; ++t) {
@@ -1083,29 +1245,33 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return static_cast<int64_t>(x);
     }
     case Scheme::kBitWeave: {
-      if (region_end != nullptr && r + 9 > region_end) return 0;
-      const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+      if (region_end != nullptr && r + 9 > region_end) {
+        return 0;
+      }
+      const auto base_v = static_cast<int64_t>(ReadBE64(r));
       const int w = static_cast<int>(static_cast<uint8_t>(r[8]));
       // A hostile region can carry w > 64: UnpackBitAt would walk idx*w + w
       // bits deep past the region (reads ~32 bytes per value OOB). The
       // footer gate caps prm at 64 for validated chunks; clamp the header
       // byte too so unvalidated decoders stay memory-safe.
-      if (w > 64) return 0;
+      if (w > 64) {
+        return 0;
+      }
       // Bound the packed-offset extent before UnpackBitAt: a hostile region
       // smaller than ceil((idx+1)*w/8) must not be read past.
       if (region_end != nullptr &&
           r + 9 +
-                  (static_cast<size_t>(idx) * static_cast<size_t>(w) +
-                   static_cast<size_t>(w) + 7) /
-                      8 >
+                  ((static_cast<size_t>(idx) * static_cast<size_t>(w) +
+                    static_cast<size_t>(w) + 7) /
+                   8) >
               region_end) {
         return 0;
       }
       const uint64_t bit_off =
           static_cast<uint64_t>(idx) * static_cast<uint64_t>(w);
       const char* vp = r + 9 + (bit_off >> 3);
-      const uint32_t sh = static_cast<uint32_t>(bit_off & 7);
-      uint64_t off;
+      const auto sh = static_cast<uint32_t>(bit_off & 7);
+      uint64_t off = 0;
       if (sh + static_cast<uint32_t>(w) <= 64 && region_end != nullptr &&
           vp + 8 <= region_end) {
         // One aligned-window load replaces the byte-assembly: same MSB-first
@@ -1123,8 +1289,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // so random access replays words from the region head (like the kRle
       // run walk; O(param)). The full region_need (8 + 8*param) bounds the
       // walk before it starts.
-      if (param == 0 || (region_end != nullptr &&
-                         r + 8 + static_cast<size_t>(param) * 8 > region_end)) {
+      if (param == 0 ||
+          (region_end != nullptr &&
+           r + 8 + (static_cast<size_t>(param) * 8) > region_end)) {
         return 0;
       }
       const uint64_t base_u = ReadBE64(r);
@@ -1132,11 +1299,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       const char* p = r + 8;
       for (uint32_t w = 0; w < param; ++w, p += 8) {
         const uint64_t word = ReadBE64(p);
-        const uint32_t sel = static_cast<uint32_t>(word >> 60);
+        const auto sel = static_cast<uint32_t>(word >> 60);
         const uint32_t cnt = kSimple8bSelCount[sel];
         if (cnt >= remaining) {
           const uint32_t bits = kSimple8bSelBits[sel];
-          if (bits == 0) return static_cast<int64_t>(base_u);
+          if (bits == 0) {
+            return static_cast<int64_t>(base_u);
+          }
           const uint64_t off =
               (word >> (bits * (cnt - static_cast<uint32_t>(remaining)))) &
               ((UINT64_C(1) << bits) - 1);
@@ -1147,10 +1316,14 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return 0;  // words cover fewer rows than idx+1: fail closed
     }
     case Scheme::kPfor: {
-      if (region_end != nullptr && r + 11 > region_end) return 0;
-      const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+      if (region_end != nullptr && r + 11 > region_end) {
+        return 0;
+      }
+      const auto base_v = static_cast<int64_t>(ReadBE64(r));
       const int w = static_cast<int>(static_cast<uint8_t>(r[8]));
-      if (w < 0 || w > 64) return 0;
+      if (w < 0 || w > 64) {
+        return 0;
+      }
       const uint32_t nexc = ReadBE16(r + 9);
       const char* packed = r + 11;
       const size_t pack_bytes =
@@ -1159,16 +1332,19 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // The header-derived extent must stay inside the region: a hostile
       // nexc (up to 65535) would otherwise walk 10*nexc bytes past it.
       if (region_end != nullptr &&
-          exc + static_cast<size_t>(nexc) * 10 > region_end) {
+          exc + (static_cast<size_t>(nexc) * 10) > region_end) {
         return 0;
       }
       // Exception list is sorted by position: linear scan (nexc is tiny).
       for (uint32_t k = 0; k < nexc; ++k) {
-        const uint32_t pos = ReadBE16(exc + static_cast<size_t>(k) * 10);
-        if (pos == idx)
+        const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(k) * 10));
+        if (pos == idx) {
           return static_cast<int64_t>(
-              ReadBE64(exc + static_cast<size_t>(k) * 10 + 2));
-        if (pos > idx) break;
+              ReadBE64(exc + (static_cast<size_t>(k) * 10) + 2));
+        }
+        if (pos > idx) {
+          break;
+        }
       }
       if (w >= 64) {
         return static_cast<int64_t>(
@@ -1183,7 +1359,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // One metadata walk (<= 8 blocks per row group), one lane extraction,
       // and a popcount rank into the exception list when the row is one.
       FastPforRegion p;
-      if (!ParseFastPforRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseFastPforRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return FastPforValueAt(p, idx);
     }
     case Scheme::kDeltaFastPfor: {
@@ -1192,76 +1370,99 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // from the list, others dmin + lane) -- the delta chain's price for
       // random access, priced at FastPFOR's probe tier.
       DeltaFastPforRegion p;
-      if (!ParseDeltaFastPforRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseDeltaFastPforRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return DeltaFastPforValueAt(p, idx);
     }
     case Scheme::kDeltaPfor: {
       DeltaPForRegion p;
-      if (!ParseDeltaPForRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseDeltaPForRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return DeltaPForValueAt(p, idx);
     }
     case Scheme::kDdRice: {
       // Checkpoint jump + Rice walk over zigzagged second differences.
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t C = kDeltaCheckpointEvery;
       const uint32_t ncp = ReadBE16(r);
-      if (ncp == 0 || idx / C >= ncp) return 0;
+      if (ncp == 0 || idx / C >= ncp) {
+        return 0;
+      }
       // Full header extent before any read: [ncp u16][checkpoints ncp*16B]
       // [bit offsets ncp*4B][k u8]. The former ncp*16 gate left the offset
       // table and the k byte unbounded (hostile ncp read ~1.3MB past the
       // region).
       if (region_end != nullptr &&
-          r + 2 + static_cast<size_t>(ncp) * 20 + 1 > region_end) {
+          r + 2 + (static_cast<size_t>(ncp) * 20) + 1 > region_end) {
         return 0;
       }
       const uint32_t block = idx / C;
       const char* ck = r + 2;
-      uint64_t v = ReadBE64(ck + static_cast<size_t>(block) * 16);
-      uint64_t d1 = ReadBE64(ck + static_cast<size_t>(block) * 16 + 8);
-      if (idx == block * C) return static_cast<int64_t>(v);
-      const char* offs = r + 2 + static_cast<size_t>(ncp) * 16;
+      uint64_t v = ReadBE64(ck + (static_cast<size_t>(block) * 16));
+      uint64_t d1 = ReadBE64(ck + (static_cast<size_t>(block) * 16) + 8);
+      if (idx == block * C) {
+        return static_cast<int64_t>(v);
+      }
+      const char* offs = r + 2 + (static_cast<size_t>(ncp) * 16);
       const uint32_t start_bit =
-          ReadBE32(offs + static_cast<size_t>(block) * 4);
+          ReadBE32(offs + (static_cast<size_t>(block) * 4));
       const int k = static_cast<int>(
-          static_cast<uint8_t>(r[2 + static_cast<size_t>(ncp) * 20]));
-      if (k < 0 || k > 64) return 0;
-      const char* stream = r + 2 + static_cast<size_t>(ncp) * 20 + 1;
+          static_cast<uint8_t>(r[2 + (static_cast<size_t>(ncp) * 20)]));
+      if (k < 0 || k > 64) {
+        return 0;
+      }
+      const char* stream = r + 2 + (static_cast<size_t>(ncp) * 20) + 1;
       // A hostile start_bit must not form a reader past the region (the
       // BitReader would only stop at its first get1, but the pointer math
       // itself runs up to 512MB past `stream`).
       if (region_end != nullptr &&
-          start_bit / 8 > static_cast<size_t>(region_end - stream)) {
+          std::cmp_greater(start_bit / 8, region_end - stream)) {
         return 0;
       }
       // Unbounded reader (mirrors the Gorilla case): validated chunks size
       // the stream exactly; hostile streams terminate via the QMAX cap.
-      BitReader br(stream + start_bit / 8, region_end);
+      BitReader br(stream + (start_bit / 8), region_end);
       // Bit offset inside the first byte: consume leading bits MSB-first.
       uint32_t skip = start_bit % 8;
-      for (uint32_t t = 0; t < skip; ++t) br.get1();
-      const uint32_t first = (block == 0) ? 1 : block * C + 1;
+      for (uint32_t t = 0; t < skip; ++t) {
+        br.get1();
+      }
+      const uint32_t first = (block == 0) ? 1 : (block * C) + 1;
       for (uint32_t j = first; j <= idx; ++j) {
         uint64_t q = 0;
         while (br.get1() != 0) {
-          if (++q > kRiceQMax) return 0;
+          if (++q > kRiceQMax) {
+            return 0;
+          }
         }
         uint64_t rem = 0;
-        for (int t = 0; t < k; ++t)
+        for (int t = 0; t < k; ++t) {
           rem = (rem << 1) | static_cast<uint64_t>(br.get1());
+        }
         // k == 64 makes (q << k) UB; rem already holds all 64 bits then.
         const uint64_t zz = (k >= 64) ? rem : ((q << k) | rem);
         const uint64_t dd =
             (zz >> 1) ^ (0ULL - (zz & 1ULL));  // zigzag -> wrap pattern
         d1 += dd;
-        if (j > block * C) v += d1;
+        if (j > block * C) {
+          v += d1;
+        }
       }
       return static_cast<int64_t>(v);
     }
     case Scheme::kChimp128: {
       Chimp128Region parsed;
-      if (!ParseChimp128Region(r, n, param, region_end, &parsed)) return 0;
+      if (!ParseChimp128Region(r, n, param, region_end, &parsed)) {
+        return 0;
+      }
       const uint32_t block_index = idx / kChimp128BlockRows;
-      if (block_index >= parsed.block_count) return 0;
+      if (block_index >= parsed.block_count) {
+        return 0;
+      }
       std::array<uint64_t, kChimp128BlockRows> decoded{};
       if (!DecodeChimp128Block(parsed.blocks[block_index], decoded.data())) {
         return 0;
@@ -1270,9 +1471,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kAlpRdTans: {
       AlpRdTansRegion parsed;
-      if (!ParseAlpRdTansRegion(r, n, param, region_end, &parsed)) return 0;
+      if (!ParseAlpRdTansRegion(r, n, param, region_end, &parsed)) {
+        return 0;
+      }
       const uint32_t block_index = idx / kAlpRdTansBlockRows;
-      if (block_index >= parsed.block_count) return 0;
+      if (block_index >= parsed.block_count) {
+        return 0;
+      }
       std::vector<uint64_t> decoded;
       if (!AlpRdTansDecodeBlock(parsed, block_index, &decoded) ||
           decoded.size() <= idx % kAlpRdTansBlockRows) {
@@ -1282,9 +1487,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kPatas: {
       PatasRegion parsed;
-      if (!ParsePatasRegion(r, n, param, region_end, &parsed)) return 0;
+      if (!ParsePatasRegion(r, n, param, region_end, &parsed)) {
+        return 0;
+      }
       const uint32_t block_index = idx / kPatasBlockRows;
-      if (block_index >= parsed.block_count) return 0;
+      if (block_index >= parsed.block_count) {
+        return 0;
+      }
       std::array<uint64_t, kPatasBlockRows> decoded{};
       if (!DecodePatasBlock(parsed.blocks[block_index], decoded.data())) {
         return 0;
@@ -1292,13 +1501,19 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return static_cast<int64_t>(decoded[idx % kPatasBlockRows]);
     }
     case Scheme::kChimp: {
-      if (region_end != nullptr && r + 8 > region_end) return 0;
+      if (region_end != nullptr && r + 8 > region_end) {
+        return 0;
+      }
       uint64_t prev = ReadBE64(r);
-      if (idx == 0) return static_cast<int64_t>(prev);
+      if (idx == 0) {
+        return static_cast<int64_t>(prev);
+      }
       int prev_lz = 0, prev_tz = 64;
       BitReader br(r + 8, region_end);
       for (uint32_t i = 1; i <= idx; ++i) {
-        if (br.get1() == 0) continue;
+        if (br.get1() == 0) {
+          continue;
+        }
         if (br.get1() == 0) {  // reuse previous window
           const int width = 64 - prev_lz - prev_tz;
           // width <= 0 only on hostile streams (the encoder never emits
@@ -1306,16 +1521,17 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           // by >= 64 (UB).
           if (width > 0 && width <= 64) {
             uint64_t m = 0;
-            for (int t = 0; t < width; ++t)
+            for (int t = 0; t < width; ++t) {
               m = (m << 1) | static_cast<uint64_t>(br.get1());
+            }
             prev ^= (m << prev_tz);
           }
         } else {
           const int lz = static_cast<int>(br.get(5));
           const int tz = static_cast<int>(br.get(6));
           int mw = 64 - lz - tz;
-          if (mw < 1) mw = 1;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 1);
+          mw = std::min(mw, 64);
           uint64_t m = br.get(mw);
           prev ^= (mw >= 64 ? m : (m << tz));
           prev_lz = lz;
@@ -1328,23 +1544,27 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [ncp u16][ckpts ncp x u64][w u8][xors]. Jump to the block
       // checkpoint then XOR <= 127 deltas (mirrors the kDeltaVarint arm's
       // checkpoint-table extent gate).
-      if (region_end != nullptr && r + 2 > region_end) return 0;
-      const uint32_t ncp = ReadBE16(r);
-      const uint32_t block = idx / kDeltaCheckpointEvery;
-      if (ncp == 0 || block >= ncp) return 0;
-      if (region_end != nullptr &&
-          r + 3 + static_cast<size_t>(ncp) * 8 > region_end) {
+      if (region_end != nullptr && r + 2 > region_end) {
         return 0;
       }
-      uint64_t x = ReadBE64(r + 2 + static_cast<size_t>(block) * 8);
+      const uint32_t ncp = ReadBE16(r);
+      const uint32_t block = idx / kDeltaCheckpointEvery;
+      if (ncp == 0 || block >= ncp) {
+        return 0;
+      }
+      if (region_end != nullptr &&
+          r + 3 + (static_cast<size_t>(ncp) * 8) > region_end) {
+        return 0;
+      }
+      uint64_t x = ReadBE64(r + 2 + (static_cast<size_t>(block) * 8));
       if (idx == block * kDeltaCheckpointEvery) {
         return static_cast<int64_t>(x);
       }
-      const char* packed = r + 3 + static_cast<size_t>(ncp) * 8;
+      const char* packed = r + 3 + (static_cast<size_t>(ncp) * 8);
       const uint32_t start = block * kDeltaCheckpointEvery;
       // Bound the XOR-walk extent the same way as kXorFor above.
       if (region_end != nullptr &&
-          packed + (static_cast<size_t>(idx) * param + 7) / 8 > region_end) {
+          packed + ((static_cast<size_t>(idx) * param + 7) / 8) > region_end) {
         return 0;
       }
       for (uint32_t t = start + 1; t <= idx; ++t) {
@@ -1358,22 +1578,28 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [ncp u16][ckpts ncp x u64][bitoffs ncp x u32][first u64][stream].
       // Checkpoint jump to the block at-or-below idx, then a bounded
       // stream walk (mirrors the kChimp/kGorilla arms' control-bit decode).
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t ncp = ReadBE16(r);
       const uint32_t block = idx / kDeltaCheckpointEvery;
-      if (ncp == 0 || block >= ncp) return 0;
+      if (ncp == 0 || block >= ncp) {
+        return 0;
+      }
       if (region_end != nullptr &&
-          r + 2 + static_cast<size_t>(ncp) * 12 + 8 > region_end) {
+          r + 2 + (static_cast<size_t>(ncp) * 12) + 8 > region_end) {
         return 0;
       }
       const char* ck = r + 2;
-      const char* offs = ck + static_cast<size_t>(ncp) * 8;
-      const uint64_t bitoff = ReadBE32(offs + static_cast<size_t>(block) * 4);
+      const char* offs = ck + (static_cast<size_t>(ncp) * 8);
+      const uint64_t bitoff = ReadBE32(offs + (static_cast<size_t>(block) * 4));
       // +8 skips the redundant [first u64] word (checkpoints carry v[0]).
-      const char* stream = offs + static_cast<size_t>(ncp) * 4 + 8;
-      uint64_t prev = ReadBE64(ck + static_cast<size_t>(block) * 8);
+      const char* stream = offs + (static_cast<size_t>(ncp) * 4) + 8;
+      uint64_t prev = ReadBE64(ck + (static_cast<size_t>(block) * 8));
       const uint32_t start = block * kDeltaCheckpointEvery;
-      if (idx == start) return static_cast<int64_t>(prev);
+      if (idx == start) {
+        return static_cast<int64_t>(prev);
+      }
       // Seek to the resume bit offset: whole bytes + leading bits. Bound
       // bitoff before pointer math -- a hostile u32 offset must not form a
       // pointer past the region (the bounded reader then yields 0 bits).
@@ -1381,8 +1607,10 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           bitoff / 8 > static_cast<uint64_t>(region_end - stream)) {
         return 0;
       }
-      BitReader br(stream + bitoff / 8, region_end);
-      for (uint32_t t = 0; t < bitoff % 8; ++t) br.get1();
+      BitReader br(stream + (bitoff / 8), region_end);
+      for (uint32_t t = 0; t < bitoff % 8; ++t) {
+        br.get1();
+      }
       if (s == Scheme::kGorillaC) {
         for (uint32_t i = start + 1; i <= idx; ++i) {
           if (br.get1() == 0) {
@@ -1391,8 +1619,8 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
             const int lz = static_cast<int>(br.get(5));
             const int tz = static_cast<int>(br.get(6));
             int mw = 64 - lz - tz;
-            if (mw < 0) mw = 0;
-            if (mw > 64) mw = 64;
+            mw = std::max(mw, 0);
+            mw = std::min(mw, 64);
             const uint64_t m = br.get(mw);
             prev ^= (mw >= 64 ? m : (m << tz));
           }
@@ -1400,7 +1628,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       } else {  // kChimpC: '11' codes re-establish the window; '10' reuses.
         int prev_lz = 0, prev_tz = 64;  // forced-'11' contract at resumes
         for (uint32_t i = start + 1; i <= idx; ++i) {
-          if (br.get1() == 0) continue;
+          if (br.get1() == 0) {
+            continue;
+          }
           if (br.get1() == 0) {  // reuse previous window
             const int width = 64 - prev_lz - prev_tz;
             if (width > 0 && width <= 64) {
@@ -1414,8 +1644,8 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
             const int lz = static_cast<int>(br.get(5));
             const int tz = static_cast<int>(br.get(6));
             int mw = 64 - lz - tz;
-            if (mw < 1) mw = 1;
-            if (mw > 64) mw = 64;
+            mw = std::max(mw, 1);
+            mw = std::min(mw, 64);
             prev ^= (mw >= 64 ? br.get(mw) : (br.get(mw) << tz));
             prev_lz = lz;
             prev_tz = tz;
@@ -1425,50 +1655,58 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       return static_cast<int64_t>(prev);
     }
     case Scheme::kDeltaVarint: {
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t C = kDeltaCheckpointEvery;
       const uint32_t ncp = ReadBE16(r);
-      if (ncp == 0 || idx / C >= ncp) return 0;
+      if (ncp == 0 || idx / C >= ncp) {
+        return 0;
+      }
       // Checkpoint table + bit-offset table before any read: the offset
       // entry at offs+block*4 reaches r+2+ncp*12, so the former ncp*8 gate
       // left the last table reads unbounded (hostile ncp).
       if (region_end != nullptr &&
-          r + 2 + static_cast<size_t>(ncp) * 12 > region_end) {
+          r + 2 + (static_cast<size_t>(ncp) * 12) > region_end) {
         return 0;
       }
       const uint32_t block = idx / C;
       const char* ck = r + 2;
-      uint64_t v = ReadBE64(ck + static_cast<size_t>(block) * 8);
-      if (idx == block * C) return static_cast<int64_t>(v);
-      const char* offs = r + 2 + static_cast<size_t>(ncp) * 8;
-      const uint32_t start = ReadBE32(offs + static_cast<size_t>(block) * 4);
+      uint64_t v = ReadBE64(ck + (static_cast<size_t>(block) * 8));
+      if (idx == block * C) {
+        return static_cast<int64_t>(v);
+      }
+      const char* offs = r + 2 + (static_cast<size_t>(ncp) * 8);
+      const uint32_t start = ReadBE32(offs + (static_cast<size_t>(block) * 4));
       // A hostile start (up to 2^32-1) must not FORM a pointer ~4 GiB past
       // the region: the loop's per-byte guard only bounds dereferences, not
       // the pointer arithmetic itself (same pre-gate as the kDdRice
       // start_bit arm). Valid encoders pin start <= stream size, i.e. inside
       // [base, region_end]; the table-extent check above already proved
       // base <= region_end.
-      const char* base = r + 2 + static_cast<size_t>(ncp) * 12;
-      if (region_end != nullptr &&
-          static_cast<uint64_t>(start) >
-              static_cast<uint64_t>(region_end - base)) {
+      const char* base = r + 2 + (static_cast<size_t>(ncp) * 12);
+      if (region_end != nullptr && std::cmp_greater(start, region_end - base)) {
         return 0;
       }
       const char* p = base + start;
-      for (uint32_t j = block * C + 1; j <= idx; ++j) {
+      for (uint32_t j = (block * C) + 1; j <= idx; ++j) {
         uint64_t z = 0;
         for (int b = 0; b < 10; ++b) {
           // Bound the LEB128 walk: a hostile stream must not read past the
           // region (at most 10 bytes per delta, but the checkpoint block
           // replay walks up to C deltas unchecked).
-          if (region_end != nullptr && p + b >= region_end) return 0;
-          const uint8_t byte = static_cast<uint8_t>(p[b]);
+          if (region_end != nullptr && p + b >= region_end) {
+            return 0;
+          }
+          const auto byte = static_cast<uint8_t>(p[b]);
           z |= static_cast<uint64_t>(byte & 0x7F) << (7 * b);
           if ((byte & 0x80) == 0) {
             p += b + 1;
             break;
           }
-          if (b == 9) return 0;  // unterminated LEB128
+          if (b == 9) {
+            return 0;  // unterminated LEB128
+          }
         }
         const uint64_t d = (z >> 1) ^ (0ULL - (z & 1ULL));
         v += d;
@@ -1480,47 +1718,60 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [inner region]. The mantissa backend dispatches through the inner
       // scheme's ordinary Int64RegionAt arm; exception rows return their
       // stored full value.
-      if (region_end != nullptr && r + 4 > region_end) return 0;
+      if (region_end != nullptr && r + 4 > region_end) {
+        return 0;
+      }
       const int exp = static_cast<uint8_t>(r[0]);
-      if (exp > 18) return 0;
-      const Scheme backend = static_cast<Scheme>(static_cast<uint8_t>(r[1]));
+      if (exp > 18) {
+        return 0;
+      }
+      const auto backend = static_cast<Scheme>(static_cast<uint8_t>(r[1]));
       if (backend != Scheme::kConst && backend != Scheme::kRle &&
           backend != Scheme::kDict && backend != Scheme::kBitWeave) {
         return 0;
       }
       const uint32_t nexc = ReadBE16(r + 2);
-      if (nexc > n) return 0;
+      if (nexc > n) {
+        return 0;
+      }
       const char* exc = r + 4;
       // Full exception extent before the walk (mirrors kPfor).
       if (region_end != nullptr &&
-          exc + static_cast<size_t>(nexc) * 10 > region_end) {
+          exc + (static_cast<size_t>(nexc) * 10) > region_end) {
         return 0;
       }
       for (uint32_t k = 0; k < nexc; ++k) {
-        const uint32_t pos = ReadBE16(exc + static_cast<size_t>(k) * 10);
-        if (pos == idx)
+        const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(k) * 10));
+        if (pos == idx) {
           return static_cast<int64_t>(
-              ReadBE64(exc + static_cast<size_t>(k) * 10 + 2));
-        if (pos > idx) break;
+              ReadBE64(exc + (static_cast<size_t>(k) * 10) + 2));
+        }
+        if (pos > idx) {
+          break;
+        }
       }
-      const char* inner = exc + static_cast<size_t>(nexc) * 10;
+      const char* inner = exc + (static_cast<size_t>(nexc) * 10);
       // Inner param: RLE carries its run count in a u32 header; DICT and
       // BitWeave read their own headers (param unused); CONST has none.
       uint32_t inner_param = 0;
       if (backend == Scheme::kRle) {
-        if (region_end != nullptr && inner + 4 > region_end) return 0;
+        if (region_end != nullptr && inner + 4 > region_end) {
+          return 0;
+        }
         inner_param = ReadBE32(inner);
       }
       const int64_t m =
           Int64RegionAt(inner, backend, inner_param, n, idx, region_end);
       const double back = static_cast<double>(m) / AlpFactorOf(exp);
-      uint64_t b;
+      uint64_t b = 0;
       std::memcpy(&b, &back, sizeof(b));
       return static_cast<int64_t>(b);
     }
     case Scheme::kEliasFano: {
-      if (region_end != nullptr && r + 17 > region_end) return 0;
-      const int64_t base_v = static_cast<int64_t>(ReadBE64(r));
+      if (region_end != nullptr && r + 17 > region_end) {
+        return 0;
+      }
+      const auto base_v = static_cast<int64_t>(ReadBE64(r));
       const uint64_t maxd = ReadBE64(r + 8);
       const int l = static_cast<int>(static_cast<uint8_t>(r[16]));
       const uint64_t high_max = (l >= 64) ? 0 : (maxd >> l);
@@ -1530,16 +1781,18 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // whose +7 wrapped the division to 0), aliasing lowbits onto hbmp and
       // sending SelectBit marching past the region. Reserve 7 bits of
       // headroom so the byte-ceil stays exact. Fail closed instead.
-      if (high_max > UINT64_MAX - static_cast<uint64_t>(n) - 7) return 0;
+      if (high_max > UINT64_MAX - static_cast<uint64_t>(n) - 7) {
+        return 0;
+      }
       const size_t hlen = n + static_cast<size_t>(high_max);
       const char* hbmp = r + 17;
       const char* lowbits = hbmp + ((hlen + 7) / 8);
       // Region clamp: a hostile header must not walk SelectBit / the
       // low-bit reader past the region.
       if (region_end != nullptr &&
-          lowbits + (static_cast<size_t>(idx) * static_cast<size_t>(l) +
-                     static_cast<size_t>(l) + 7) /
-                        8 >
+          lowbits + ((static_cast<size_t>(idx) * static_cast<size_t>(l) +
+                      static_cast<size_t>(l) + 7) /
+                     8) >
               region_end) {
         return 0;
       }
@@ -1559,24 +1812,28 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
                                   (hpart | low));
     }
     case Scheme::kWavelet: {
-      if (region_end != nullptr && r + 9 > region_end) return 0;
-      const int64_t min_v = static_cast<int64_t>(ReadBE64(r));
+      if (region_end != nullptr && r + 9 > region_end) {
+        return 0;
+      }
+      const auto min_v = static_cast<int64_t>(ReadBE64(r));
       const int W = static_cast<int>(static_cast<uint8_t>(r[8]));
       // A hostile W byte walks W bitmaps of ceil(n/8) bytes each. The footer
       // gate caps prm at 1024 and the header at 64 for validated chunks;
       // clamp here so unvalidated regions stay memory-safe.
-      if (W <= 0 || W > 64) return 0;
+      if (W <= 0 || W > 64) {
+        return 0;
+      }
       const size_t bmp_bytes = (n + 7) / 8;
       const char* base_bmp = r + 9;
       // Region clamp: the W bitmap extent must stay inside the region.
       if (region_end != nullptr &&
-          base_bmp + static_cast<size_t>(W) * bmp_bytes > region_end) {
+          base_bmp + (static_cast<size_t>(W) * bmp_bytes) > region_end) {
         return 0;
       }
       uint64_t value = 0;
       uint64_t p = idx;
       for (int k = 0; k < W; ++k) {
-        const char* bmp = base_bmp + static_cast<size_t>(k) * bmp_bytes;
+        const char* bmp = base_bmp + (static_cast<size_t>(k) * bmp_bytes);
         const uint64_t rank1p = PopcountBits(bmp, static_cast<uint32_t>(p));
         const uint64_t r0 = p - rank1p;  // rank0 in [0,p)
         const uint64_t bit =
@@ -1585,8 +1842,7 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         if (bit == 0) {
           p = r0;
         } else {
-          const uint64_t total_ones =
-              PopcountBits(bmp, static_cast<uint32_t>(n));
+          const uint64_t total_ones = PopcountBits(bmp, n);
           const uint64_t ztot = static_cast<uint64_t>(n) - total_ones;
           p = ztot + rank1p;
         }
@@ -1595,31 +1851,37 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kWaveletR: {
       WaveletRRegion p;
-      if (!ParseWaveletRRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseWaveletRRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return static_cast<int64_t>(static_cast<uint64_t>(p.minimum) +
                                   WaveletRValueAt(p, idx));
     }
     case Scheme::kDeltaFor:
     case Scheme::kDeltaBitweave:
     case Scheme::kDeltaSimd: {
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t ncp = ReadBE16(r);
       const uint32_t C = kDeltaCheckpointEvery;
       const uint32_t block = idx / C;
       // Same checkpoint-count guard as kDdRice / kDeltaVarint: without it a
       // hostile ncp=0 region decodes `base` from inner-payload bytes (and
       // the bulk path below reads checkpoints past the table).
-      if (ncp == 0 || block >= ncp) return 0;
+      if (ncp == 0 || block >= ncp) {
+        return 0;
+      }
       // The checkpoint table must be inside the region before ReadBE64:
       // a hostile ncp used to walk the checkpoint read ~512KB past it.
       if (region_end != nullptr &&
-          r + 2 + static_cast<size_t>(ncp) * 8 > region_end) {
+          r + 2 + (static_cast<size_t>(ncp) * 8) > region_end) {
         return 0;
       }
       const char* ck = r + 2;
-      const int64_t base_val =
-          static_cast<int64_t>(ReadBE64(ck + static_cast<size_t>(block) * 8));
-      const char* ir = r + 2 + static_cast<size_t>(ncp) * 8;
+      const auto base_val =
+          static_cast<int64_t>(ReadBE64(ck + (static_cast<size_t>(block) * 8)));
+      const char* ir = r + 2 + (static_cast<size_t>(ncp) * 8);
       Scheme inner = Scheme::kSimdFor;
       if (s == Scheme::kDeltaFor) {
         inner = Scheme::kForBp;
@@ -1633,47 +1895,58 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         // kSimdFor derives its whole extent from (n, w), so there is no
         // idx-dependent prefix to size: bound the COMPLETE inner region
         // instead.
-        size_t ir_need = 9 + (static_cast<size_t>(idx) * param + param + 7) / 8;
+        size_t ir_need =
+            9 + ((static_cast<size_t>(idx) * param + param + 7) / 8);
         if (inner == Scheme::kForBp) {
-          ir_need = 8 + (static_cast<size_t>(idx) + 1) * param;
+          ir_need = 8 + ((static_cast<size_t>(idx) + 1) * param);
         } else if (inner == Scheme::kSimdFor) {
           ir_need = SimdForExtent(n, param);
         }
-        if (ir + ir_need > region_end) return 0;
+        if (ir + ir_need > region_end) {
+          return 0;
+        }
       }
       uint64_t sum = 0;
-      for (uint32_t j = block * C + 1; j <= idx; ++j) {
+      for (uint32_t j = (block * C) + 1; j <= idx; ++j) {
         sum += static_cast<uint64_t>(
             Int64RegionAt(ir, inner, param, n, j, region_end));
       }
       return static_cast<int64_t>(static_cast<uint64_t>(base_val) + sum);
     }
     case Scheme::kByteSlice: {
-      if (region_end != nullptr && r + 1 > region_end) return 0;
-      const uint8_t w = static_cast<uint8_t>(r[0]);
+      if (region_end != nullptr && r + 1 > region_end) {
+        return 0;
+      }
+      const auto w = static_cast<uint8_t>(r[0]);
       const size_t stride = (n + 7) / 8;
       // The one unclamped bit-width header: w up to 255 walked 255 slices
       // (~32KB) past the region on hostile input. Clamp like kBitWeave /
       // kPfor, then bound the slice extent outright.
-      if (w == 0 || w > 64) return 0;
+      if (w == 0 || w > 64) {
+        return 0;
+      }
       if (region_end != nullptr &&
-          r + 1 + static_cast<size_t>(w - 1) * stride + (idx >> 3) + 1 >
+          r + 1 + (static_cast<size_t>(w - 1) * stride) + (idx >> 3) + 1 >
               region_end) {
         return 0;
       }
       uint64_t value = 0;
       for (uint8_t b = 0; b < w; ++b) {
-        const char* sl = r + 1 + static_cast<size_t>(b) * stride;
-        const uint8_t byte = static_cast<uint8_t>(sl[idx >> 3]);
-        const uint8_t bit = static_cast<uint8_t>((byte >> (7 - (idx & 7))) & 1);
+        const char* sl = r + 1 + (static_cast<size_t>(b) * stride);
+        const auto byte = static_cast<uint8_t>(sl[idx >> 3]);
+        const auto bit = static_cast<uint8_t>((byte >> (7 - (idx & 7))) & 1);
         value |= static_cast<uint64_t>(bit) << b;
       }
       return static_cast<int64_t>(value);
     }
     case Scheme::kGorilla: {
-      if (region_end != nullptr && r + 8 > region_end) return 0;
+      if (region_end != nullptr && r + 8 > region_end) {
+        return 0;
+      }
       uint64_t prev = ReadBE64(r);
-      if (idx == 0) return static_cast<int64_t>(prev);
+      if (idx == 0) {
+        return static_cast<int64_t>(prev);
+      }
       BitReader br(r + 8, region_end);
       for (uint32_t i = 1; i <= idx; ++i) {
         if (br.get1() == 0) {
@@ -1686,8 +1959,8 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           // width (UB). Clamp to the full 64-bit window, matching the
           // O(n) decode path and the WASM decoder.
           int mw = 64 - lz - tz;
-          if (mw < 0) mw = 0;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 0);
+          mw = std::min(mw, 64);
           const uint64_t m = br.get(mw);
           const uint64_t xorv = mw >= 64 ? m : (m << tz);
           prev ^= xorv;
@@ -1699,16 +1972,22 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [top i64][inner_scheme u8][inner_param u32][nexc u16]
       // [bitmap ceil(n/8) B MSB-first][inner region of nexc exceptions].
       // bit i set -> value is `top`; clear -> next exception in row order.
-      if (region_end != nullptr && r + 15 > region_end) return 0;
-      const int64_t top = static_cast<int64_t>(ReadBE64(r));
-      const uint8_t ischeme = static_cast<uint8_t>(r[8]);
+      if (region_end != nullptr && r + 15 > region_end) {
+        return 0;
+      }
+      const auto top = static_cast<int64_t>(ReadBE64(r));
+      const auto ischeme = static_cast<uint8_t>(r[8]);
       const uint32_t iparam = ReadBE32(r + 9);
       const uint32_t nexc = ReadBE16(r + 13);
       const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
-      if (region_end != nullptr && r + 15 + bmp_bytes > region_end) return 0;
-      const uint8_t bit = static_cast<uint8_t>(
+      if (region_end != nullptr && r + 15 + bmp_bytes > region_end) {
+        return 0;
+      }
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(r[15 + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
-      if (bit != 0) return top;
+      if (bit != 0) {
+        return top;
+      }
       // Rank of this exception = number of clear bitmap bits before idx.
       uint32_t eidx = 0;
       for (uint32_t i = 0; i < idx; ++i) {
@@ -1717,9 +1996,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           ++eidx;
         }
       }
-      if (eidx >= nexc) return 0;  // bitmap over-counts exceptions
+      if (eidx >= nexc) {
+        return 0;  // bitmap over-counts exceptions
+      }
       const char* inner = r + 15 + bmp_bytes;
-      if (!InnerSchemeOk(ischeme)) return 0;
+      if (!InnerSchemeOk(ischeme)) {
+        return 0;
+      }
       return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc,
                            eidx, region_end);
     }
@@ -1728,24 +2011,31 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [ischeme u8][iparam u32][nibbles ceil(n/2) B][inner region].
       // Nibble at row i: < d -> hot[d] value; 15 -> next exception in row
       // order (rank = SWAR popcount of sentinel nibbles before i).
-      constexpr size_t kTopkHeader = 2 + 2 + 15 * 8 + 15 * 2 + 1 + 4;  // 159
-      if (region_end != nullptr && r + kTopkHeader > region_end) return 0;
+      constexpr size_t kTopkHeader =
+          2 + 2 + (15 * 8) + (15 * 2) + 1 + 4;  // 159
+      if (region_end != nullptr && r + kTopkHeader > region_end) {
+        return 0;
+      }
       const uint32_t d = ReadBE16(r);
       const uint32_t nexc = ReadBE16(r + 2);
-      if (d == 0 || d > 15 || nexc != param) return 0;
-      const uint8_t ischeme = static_cast<uint8_t>(r[154]);
+      if (d == 0 || d > 15 || nexc != param) {
+        return 0;
+      }
+      const auto ischeme = static_cast<uint8_t>(r[154]);
       const uint32_t iparam = ReadBE32(r + 155);
       const size_t nib_bytes = (static_cast<size_t>(n) + 1) / 2;
       if (region_end != nullptr && r + kTopkHeader + nib_bytes > region_end) {
         return 0;
       }
-      const uint8_t byte = static_cast<uint8_t>(r[kTopkHeader + (idx >> 1)]);
+      const auto byte = static_cast<uint8_t>(r[kTopkHeader + (idx >> 1)]);
       const uint32_t code = (idx & 1) == 0 ? (byte >> 4) : (byte & 0x0F);
       if (code < d) {
         return static_cast<int64_t>(
-            ReadBE64(r + 4 + static_cast<size_t>(code) * 8));
+            ReadBE64(r + 4 + (static_cast<size_t>(code) * 8)));
       }
-      if (code != 15) return 0;  // codes d..14 are never emitted
+      if (code != 15) {
+        return 0;  // codes d..14 are never emitted
+      }
       // Rank of this exception = number of sentinel nibbles before idx:
       // complete bytes popcounted word-wise, then the boundary byte's high
       // nibble when idx sits in a low nibble.
@@ -1754,7 +2044,7 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         const size_t full = idx >> 1;  // complete nibble bytes before idx
         size_t b = 0;
         for (; b + 8 <= full; b += 8) {
-          uint64_t w;
+          uint64_t w = 0;
           std::memcpy(&w, r + kTopkHeader + b, 8);
           eidx += TopKSentinelCount(w);
         }
@@ -1766,9 +2056,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
               static_cast<uint8_t>(r[kTopkHeader + full] & 0xF0));
         }
       }
-      if (eidx >= nexc) return 0;  // sentinel over-counts exceptions
+      if (eidx >= nexc) {
+        return 0;  // sentinel over-counts exceptions
+      }
       const char* inner = r + kTopkHeader + nib_bytes;
-      if (nexc > 0 && !InnerSchemeOk(ischeme)) return 0;
+      if (nexc > 0 && !InnerSchemeOk(ischeme)) {
+        return 0;
+      }
       return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc,
                            eidx, region_end);
     }
@@ -1777,7 +2071,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // one dictionary load. The cursor bounds every step against
       // region_end, so a truncated chain fails closed.
       TileDictCursor c;
-      if (!TileDictSeek(r, n, region_end, idx, &c)) return 0;
+      if (!TileDictSeek(r, n, region_end, idx, &c)) {
+        return 0;
+      }
       return TileDictValueAt(c, idx - c.tile_start);
     }
     case Scheme::kSortDict: {
@@ -1785,9 +2081,13 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // (the kS4 probe shape, on the sorted view instead of the row order).
       // The parse bounds every extent; a rank >= n is the clamp bucket.
       SortDictRegion p;
-      if (!ParseSortDictRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseSortDictRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       const uint32_t j = SortDictRankAt(p, idx);
-      if (j >= p.n) return 0;
+      if (j >= p.n) {
+        return 0;
+      }
       return SortDictValueAtSorted(p, j);
     }
     case Scheme::kPostings: {
@@ -1803,17 +2103,27 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // lists alone). The walk reads the Rice stream, which has no
       // self-described length: a null region_end (the pre-validated
       // convention) cannot bound the cursor, so it declines.
-      if (region_end == nullptr) return 0;
+      if (region_end == nullptr) {
+        return 0;
+      }
       PostingsRegion p;
-      if (!ParsePostingsRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParsePostingsRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       // (first, list) sorted by first: insertion into a small stack array.
-      std::pair<uint32_t, uint32_t> cand[kPostingsMaxLists];
+      std::array<std::pair<uint32_t, uint32_t>, kPostingsMaxLists> cand{};
       uint32_t ncand = 0;
       for (uint32_t c = 0; c < p.d; ++c) {
-        if (PostingsFirstAt(p, c) > idx) continue;  // first > idx: no hit
+        if (PostingsFirstAt(p, c) > idx) {
+          continue;  // first > idx: no hit
+        }
         uint32_t lo = 0;
-        while (lo < ncand && cand[lo].first <= PostingsFirstAt(p, c)) ++lo;
-        for (uint32_t t = ncand; t > lo; --t) cand[t] = cand[t - 1];
+        while (lo < ncand && cand[lo].first <= PostingsFirstAt(p, c)) {
+          ++lo;
+        }
+        for (uint32_t t = ncand; t > lo; --t) {
+          cand[t] = cand[t - 1];
+        }
         cand[lo] = {PostingsFirstAt(p, c), c};
         ++ncand;
       }
@@ -1821,16 +2131,26 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       for (uint32_t t = 0; t < ncand; ++t) {
         const uint32_t c = cand[t].second;
         uint32_t row = cand[t].first;
-        if (row == idx) return PostingsDictAt(p, c);
+        if (row == idx) {
+          return PostingsDictAt(p, c);
+        }
         const uint32_t cnt = PostingsCountAt(p, c);
-        if (cnt == 1) continue;
-        cur.Init(p.stream + PostingsBitOffAt(p, c) / 8, p.region_end);
+        if (cnt == 1) {
+          continue;
+        }
+        cur.Init(p.stream + (PostingsBitOffAt(p, c) / 8), p.region_end);
         for (uint32_t i = 1; i < cnt; ++i) {
           uint32_t next = 0;
-          if (!PostingsNextRow(p, &cur, c, row, &next)) return 0;
+          if (!PostingsNextRow(p, &cur, c, row, &next)) {
+            return 0;
+          }
           row = next;
-          if (row == idx) return PostingsDictAt(p, c);
-          if (row > idx) break;  // ascending postings: definitive miss
+          if (row == idx) {
+            return PostingsDictAt(p, c);
+          }
+          if (row > idx) {
+            break;  // ascending postings: definitive miss
+          }
         }
       }
       return 0;  // hostile over-counting table or truncated stream
@@ -1838,9 +2158,11 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     case Scheme::kRleX: {
       // [vscheme u8][cscheme u8][runs u32][vparam u32][cparam u32]
       // [vlen u32][values region: runs entries][counts region: runs entries]
-      if (region_end != nullptr && r + 18 > region_end) return 0;
-      const uint8_t vs = static_cast<uint8_t>(r[0]);
-      const uint8_t cs = static_cast<uint8_t>(r[1]);
+      if (region_end != nullptr && r + 18 > region_end) {
+        return 0;
+      }
+      const auto vs = static_cast<uint8_t>(r[0]);
+      const auto cs = static_cast<uint8_t>(r[1]);
       const uint32_t runs = ReadBE32(r + 2);
       const uint32_t vparam = ReadBE32(r + 6);
       const uint32_t cparam = ReadBE32(r + 10);
@@ -1848,17 +2170,21 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // Run-count sanity is a pure value check: apply it even when no
       // region_end was supplied (an unbounded run walk is O(runs) inner
       // decodes of a hostile length).
-      if (runs == 0 || runs > n) return 0;
+      if (runs == 0 || runs > n) {
+        return 0;
+      }
       if (region_end != nullptr &&
-          vlen > static_cast<uint64_t>(region_end - (r + 18))) {
+          std::cmp_greater(vlen, region_end - (r + 18))) {
         return 0;
       }
       const char* vreg = r + 18;
       const char* creg = vreg + vlen;
-      if (!InnerSchemeOk(vs) || !InnerSchemeOk(cs)) return 0;
+      if (!InnerSchemeOk(vs) || !InnerSchemeOk(cs)) {
+        return 0;
+      }
       uint64_t acc = 0;
       for (uint32_t i = 0; i < runs; ++i) {
-        const uint64_t len = static_cast<uint64_t>(Int64RegionAt(
+        const auto len = static_cast<uint64_t>(Int64RegionAt(
             creg, static_cast<Scheme>(cs), cparam, runs, i, region_end));
         if (static_cast<uint64_t>(idx) < acc + len) {
           // The values region is exactly vlen bytes: pass its own end so a
@@ -1867,38 +2193,49 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
                                creg);
         }
         acc += len;
-        if (acc >= n) break;  // tail rows decode as 0, matching kRle
+        if (acc >= n) {
+          break;  // tail rows decode as 0, matching kRle
+        }
       }
       return 0;
     }
     case Scheme::kDictX: {
       // [d u16][code_scheme u8][code_param u32][clen u32]
       // [codes region: n entries][pool_scheme u8][dict d x 8B]
-      if (region_end != nullptr && r + 11 > region_end) return 0;
+      if (region_end != nullptr && r + 11 > region_end) {
+        return 0;
+      }
       const uint16_t d = ReadBE16(r);
-      const uint8_t cs = static_cast<uint8_t>(r[2]);
+      const auto cs = static_cast<uint8_t>(r[2]);
       const uint32_t cparam = ReadBE32(r + 3);
       const uint64_t clen = ReadBE32(r + 7);
       const char* creg = r + 11;
-      if (region_end != nullptr &&
-          clen > static_cast<uint64_t>(region_end - creg)) {
+      if (region_end != nullptr && std::cmp_greater(clen, region_end - creg)) {
         return 0;
       }
       const char* pool_hdr = creg + clen;
-      if (region_end != nullptr && pool_hdr + 1 > region_end) return 0;
-      const uint8_t ps = static_cast<uint8_t>(pool_hdr[0]);
-      if (ps != 0 || d == 0) return 0;  // int64 pool is the flat entry list
-      const char* dict = pool_hdr + 1;
-      if (region_end != nullptr &&
-          dict + static_cast<size_t>(d) * sizeof(int64_t) > region_end) {
+      if (region_end != nullptr && pool_hdr + 1 > region_end) {
         return 0;
       }
-      if (!InnerSchemeOk(cs)) return 0;
-      const uint64_t code = static_cast<uint64_t>(Int64RegionAt(
+      const auto ps = static_cast<uint8_t>(pool_hdr[0]);
+      if (ps != 0 || d == 0) {
+        return 0;  // int64 pool is the flat entry list
+      }
+      const char* dict = pool_hdr + 1;
+      if (region_end != nullptr &&
+          dict + (static_cast<size_t>(d) * sizeof(int64_t)) > region_end) {
+        return 0;
+      }
+      if (!InnerSchemeOk(cs)) {
+        return 0;
+      }
+      const auto code = static_cast<uint64_t>(Int64RegionAt(
           creg, static_cast<Scheme>(cs), cparam, n, idx, pool_hdr));
-      if (code >= d) return 0;  // clamp bucket decodes as raw 0 (kDict rule)
+      if (code >= d) {
+        return 0;  // clamp bucket decodes as raw 0 (kDict rule)
+      }
       return static_cast<int64_t>(
-          ReadBE64(dict + static_cast<size_t>(code) * sizeof(int64_t)));
+          ReadBE64(dict + (static_cast<size_t>(code) * sizeof(int64_t))));
     }
     case Scheme::kArith: {
       // [a i64][d i64][ischeme u8][iparam u32][nexc u16]
@@ -1906,10 +2243,12 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // bit i set -> value is a + i*d (wrapping); clear -> next exception
       // in row order. The exception rank is popcounted by word instead of
       // per-bit (kFreq's walk): PointLookup binary-searches this arm.
-      if (region_end != nullptr && r + 23 > region_end) return 0;
+      if (region_end != nullptr && r + 23 > region_end) {
+        return 0;
+      }
       const uint64_t a = ReadBE64(r);
       const uint64_t d = ReadBE64(r + 8);
-      const uint8_t ischeme = static_cast<uint8_t>(r[16]);
+      const auto ischeme = static_cast<uint8_t>(r[16]);
       const uint32_t iparam = ReadBE32(r + 17);
       const uint32_t nexc = ReadBE16(r + 21);
       const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
@@ -1917,16 +2256,20 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         return 0;
       }
       // Header/footer agreement and the nexc == 0 layout (no inner bytes).
-      if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) return 0;
-      const uint8_t bit = static_cast<uint8_t>(
+      if (nexc != param || (nexc > 0 && !InnerSchemeOk(ischeme))) {
+        return 0;
+      }
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(r[23 + (idx >> 3)]) >> (7 - (idx & 7))) & 1);
       if (bit != 0) {
-        return static_cast<int64_t>(a + static_cast<uint64_t>(idx) * d);
+        return static_cast<int64_t>(a + (static_cast<uint64_t>(idx) * d));
       }
-      if (nexc == 0) return 0;  // clear bit in a pure ramp is inconsistent
+      if (nexc == 0) {
+        return 0;  // clear bit in a pure ramp is inconsistent
+      }
       // Rank of this exception = number of clear bits before idx =
       // idx - set bits before idx (full bytes popcounted + idx's tail).
-      const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + 23);
+      const auto* bmp = reinterpret_cast<const uint8_t*>(r + 23);
       uint32_t set_before = 0;
       const size_t bfull = idx / 8;  // bytes strictly below idx's byte
       for (size_t w = 0; w < bfull; ++w) {
@@ -1936,7 +2279,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
       }
       const uint32_t eidx = idx - set_before;
-      if (eidx >= nexc) return 0;  // bitmap over-counts exceptions
+      if (eidx >= nexc) {
+        return 0;  // bitmap over-counts exceptions
+      }
       const char* inner = r + 23 + bmp_bytes;
       return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc,
                            eidx, region_end);
@@ -1948,8 +2293,10 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // position list; its value is values[rank]. Binary search over the
       // FOR-BA positions (validator pins monotonicity); a hostile
       // duplicate/order violation just answers like an absent row.
-      if (region_end != nullptr && r + 14 > region_end) return 0;
-      const uint8_t vs = static_cast<uint8_t>(r[0]);
+      if (region_end != nullptr && r + 14 > region_end) {
+        return 0;
+      }
+      const auto vs = static_cast<uint8_t>(r[0]);
       const uint32_t vprm = ReadBE32(r + 1);
       const uint32_t pbpv = static_cast<uint8_t>(r[9]);
       const uint32_t nnz = ReadBE32(r + 10);
@@ -1957,24 +2304,26 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
           !InnerSchemeOk(vs)) {
         return 0;
       }
-      const size_t pos_bytes = 8 + static_cast<size_t>(nnz) * pbpv;
+      const size_t pos_bytes = 8 + (static_cast<size_t>(nnz) * pbpv);
       if (region_end != nullptr && r + 14 + pos_bytes > region_end) {
         return 0;
       }
       const char* posr = r + 14;
       uint32_t lo = 0, hi = nnz;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
+        const uint32_t mid = lo + ((hi - lo) / 2);
         const int64_t p =
             Int64RegionAt(posr, Scheme::kForBp, pbpv, nnz, mid, region_end);
-        if (p < static_cast<int64_t>(idx)) {
+        if (std::cmp_less(p, idx)) {
           lo = mid + 1;
         } else {
           hi = mid;
         }
       }
-      if (lo >= nnz || Int64RegionAt(posr, Scheme::kForBp, pbpv, nnz, lo,
-                                     region_end) != static_cast<int64_t>(idx)) {
+      if (lo >= nnz ||
+          std::cmp_not_equal(
+              Int64RegionAt(posr, Scheme::kForBp, pbpv, nnz, lo, region_end),
+              idx)) {
         return 0;  // unlisted row: null, decodes as raw 0
       }
       return Int64RegionAt(posr + pos_bytes, static_cast<Scheme>(vs), vprm, nnz,
@@ -1982,12 +2331,16 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kBp128: {
       Bp128Region p;
-      if (!ParseBp128Region(r, n, param, region_end, &p)) return 0;
+      if (!ParseBp128Region(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return Bp128ValueAt(p, idx);
     }
     case Scheme::kPBitS: {
       PBitSRegion p;
-      if (!ParsePBitSRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParsePBitSRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return PBitSValueAt(p, idx);
     }
     case Scheme::kInterp: {
@@ -1995,25 +2348,31 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // Checkpoint jump to the block at-or-below idx, then replay its
       // <= 128-row tree (mirrors the kGorillaC/kChimpC block-replay arms).
       InterpRegion p;
-      if (!ParseInterpRegion(r, n, param, region_end, &p)) return 0;
-      int64_t block[kInterpBlockRows];
-      InterpDecodeBlock(p, idx / kInterpBlockRows, block);
+      if (!ParseInterpRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
+      std::array<int64_t, kInterpBlockRows> block{};
+      InterpDecodeBlock(p, idx / kInterpBlockRows, block.data());
       return block[idx % kInterpBlockRows];
     }
     case Scheme::kAnsFor: {
       // Checkpoint jump: start at the row-64 boundary at-or-below idx and
       // decode forward, discarding symbols until idx's offset bytes.
       AnsForRegion A;
-      if (!AnsForParse(r, region_end, n, param, &A)) return 0;
+      if (!AnsForParse(r, region_end, n, param, &A)) {
+        return 0;
+      }
       const uint32_t k = idx / kAnsCkptRows;
-      uint32_t x = ReadBE32(A.ckpt + static_cast<size_t>(k) * 8);
-      uint32_t pos = ReadBE32(A.ckpt + static_cast<size_t>(k) * 8 + 4);
+      uint32_t x = ReadBE32(A.ckpt + (static_cast<size_t>(k) * 8));
+      uint32_t pos = ReadBE32(A.ckpt + (static_cast<size_t>(k) * 8) + 4);
       const uint32_t start = k * kAnsCkptRows * A.bpv;
-      const uint32_t stop = idx * A.bpv + A.bpv;
+      const uint32_t stop = (idx * A.bpv) + A.bpv;
       uint64_t off = 0;
       for (uint32_t j = start; j < stop; ++j) {
         uint8_t sym = 0;
-        if (!AnsForStep(A, &x, &pos, &sym)) return 0;
+        if (!AnsForStep(A, &x, &pos, &sym)) {
+          return 0;
+        }
         if (j >= idx * A.bpv) {
           off |= static_cast<uint64_t>(sym) << (8 * (j - idx * A.bpv));
         }
@@ -2022,7 +2381,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
     }
     case Scheme::kQpp: {
       QppRegion p;
-      if (!ParseQppRegion(r, n, param, region_end, &p)) return 0;
+      if (!ParseQppRegion(r, n, param, region_end, &p)) {
+        return 0;
+      }
       return QppValueAt(p, idx);
     }
     case Scheme::kPla: {
@@ -2032,49 +2393,63 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // ParsePlaRegion walk is replaced by O(1) header bounds + clamps:
       // the segment binary search only trusts `end`, and a hostile
       // non-increasing table collapses into the idx < start clamp.
-      if (region_end != nullptr && r + 2 > region_end) return 0;
+      if (region_end != nullptr && r + 2 > region_end) {
+        return 0;
+      }
       const uint32_t nseg = ReadBE16(r);
-      if (nseg == 0 || nseg != param) return 0;
+      if (nseg == 0 || nseg != param) {
+        return 0;
+      }
       if (region_end != nullptr && static_cast<size_t>(region_end - r) <
-                                       9U + static_cast<size_t>(nseg) * 20U) {
+                                       9U + (static_cast<size_t>(nseg) * 20U)) {
         return 0;
       }
       const char* segs = r + 2;
-      const char* hdr = segs + static_cast<size_t>(nseg) * 20;
-      const uint8_t ischeme = static_cast<uint8_t>(hdr[0]);
+      const char* hdr = segs + (static_cast<size_t>(nseg) * 20);
+      const auto ischeme = static_cast<uint8_t>(hdr[0]);
       const uint32_t iparam = ReadBE32(hdr + 1);
       const uint32_t nexc = ReadBE16(hdr + 5);
-      if (nexc != 0 && !InnerSchemeOk(ischeme)) return 0;
+      if (nexc != 0 && !InnerSchemeOk(ischeme)) {
+        return 0;
+      }
       // First segment whose exclusive end is past idx.
       uint32_t lo = 0;
       uint32_t hi = nseg;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
-        if (ReadBE32(segs + static_cast<size_t>(mid) * 20 + 16) <= idx) {
+        const uint32_t mid = lo + ((hi - lo) / 2);
+        if (ReadBE32(segs + (static_cast<size_t>(mid) * 20) + 16) <= idx) {
           lo = mid + 1;
         } else {
           hi = mid;
         }
       }
-      if (lo >= nseg) return 0;
-      const uint32_t start =
-          lo == 0 ? 0 : ReadBE32(segs + static_cast<size_t>(lo - 1) * 20 + 16);
-      if (idx < start) return 0;  // hostile ends regression
-      const size_t bmp_off = 9U + static_cast<size_t>(nseg) * 20U;
-      if (region_end != nullptr &&
-          r + bmp_off + (static_cast<size_t>(n) + 7) / 8 > region_end) {
+      if (lo >= nseg) {
         return 0;
       }
-      const uint8_t bit = static_cast<uint8_t>(
+      const uint32_t start =
+          lo == 0 ? 0
+                  : ReadBE32(segs + (static_cast<size_t>(lo - 1) * 20) + 16);
+      if (idx < start) {
+        return 0;  // hostile ends regression
+      }
+      const size_t bmp_off = 9U + (static_cast<size_t>(nseg) * 20U);
+      if (region_end != nullptr &&
+          r + bmp_off + ((static_cast<size_t>(n) + 7) / 8) > region_end) {
+        return 0;
+      }
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(r[bmp_off + (idx >> 3)]) >> (7 - (idx & 7))) &
           1);
       if (bit != 0) {
-        return PlaSegmentValueAt({nseg, segs, hdr, r + bmp_off}, lo, start,
-                                 idx);
+        return PlaSegmentValueAt(
+            {.nseg = nseg, .segs = segs, .hdr = hdr, .bmp = r + bmp_off}, lo,
+            start, idx);
       }
-      if (nexc == 0) return 0;  // clear bit in a pure model is inconsistent
+      if (nexc == 0) {
+        return 0;  // clear bit in a pure model is inconsistent
+      }
       // Exception rank = clear bits before idx (kArith's popcount walk).
-      const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + bmp_off);
+      const auto* bmp = reinterpret_cast<const uint8_t*>(r + bmp_off);
       uint32_t set_before = 0;
       const size_t bfull = idx / 8;
       for (size_t w = 0; w < bfull; ++w) {
@@ -2084,8 +2459,10 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         set_before += static_cast<uint32_t>((bmp[bfull] >> (7 - b)) & 1);
       }
       const uint32_t eidx = idx - set_before;
-      if (eidx >= nexc) return 0;  // bitmap over-counts exceptions
-      const char* inner = r + bmp_off + (static_cast<size_t>(n) + 7) / 8;
+      if (eidx >= nexc) {
+        return 0;  // bitmap over-counts exceptions
+      }
+      const char* inner = r + bmp_off + ((static_cast<size_t>(n) + 7) / 8);
       return Int64RegionAt(inner, static_cast<Scheme>(ischeme), iparam, nexc,
                            eidx, region_end);
     }
@@ -2122,9 +2499,11 @@ bool ParsePBitSRegion(const char* r, uint32_t n, uint32_t param,
   const size_t stride = (static_cast<size_t>(n) + 7) / 8;
   const size_t exception_bytes = exceptions == 0 ? 0 : stride;
   const size_t values_bytes = static_cast<size_t>(exceptions) * 10;
-  const size_t need =
-      11 + exception_bytes + values_bytes + static_cast<size_t>(width) * stride;
-  if (need > static_cast<size_t>(end - r)) return false;
+  const size_t need = 11 + exception_bytes + values_bytes +
+                      (static_cast<size_t>(width) * stride);
+  if (std::cmp_greater(need, end - r)) {
+    return false;
+  }
   PBitSRegion p;
   p.r = r;
   p.end = end;
@@ -2144,20 +2523,26 @@ bool ParsePBitSRegion(const char* r, uint32_t n, uint32_t param,
     for (size_t i = 0; i < stride; ++i) {
       uint8_t byte = p.exception_bmp[i];
       if (i + 1 == stride && (n & 7U) != 0) {
-        const uint8_t tail = static_cast<uint8_t>(0xFFu << (8U - (n & 7U)));
-        if ((byte & static_cast<uint8_t>(~tail)) != 0) return false;
+        const auto tail = static_cast<uint8_t>(0xFFU << (8U - (n & 7U)));
+        if ((byte & static_cast<uint8_t>(~tail)) != 0) {
+          return false;
+        }
         byte = static_cast<uint8_t>(byte & tail);
       }
       ones += static_cast<uint32_t>(
           __builtin_popcount(static_cast<unsigned int>(byte)));
     }
-    if (ones != exceptions) return false;
+    if (ones != exceptions) {
+      return false;
+    }
     uint32_t previous = 0;
     for (uint32_t k = 0; k < exceptions; ++k) {
-      const char* entry = p.exception_values + static_cast<size_t>(k) * 10;
+      const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
       const uint32_t pos = ReadBE16(entry);
-      if (pos >= n || (k != 0 && pos <= previous)) return false;
-      if ((p.exception_bmp[pos >> 3] & (0x80u >> (pos & 7U))) == 0) {
+      if (pos >= n || (k != 0 && pos <= previous)) {
+        return false;
+      }
+      if ((p.exception_bmp[pos >> 3] & (0x80U >> (pos & 7U))) == 0) {
         return false;
       }
       previous = pos;
@@ -2172,21 +2557,26 @@ uint64_t PBitSOrderValue(int64_t value) {
 }
 
 int64_t PBitSValueAt(const PBitSRegion& p, uint32_t idx) {
-  if (idx >= p.n) return 0;
+  if (idx >= p.n) {
+    return 0;
+  }
   if (p.exception_bmp != nullptr &&
-      (p.exception_bmp[idx >> 3] & (0x80u >> (idx & 7U))) != 0) {
+      (p.exception_bmp[idx >> 3] & (0x80U >> (idx & 7U))) != 0) {
     for (uint32_t k = 0; k < p.exceptions; ++k) {
-      const char* entry = p.exception_values + static_cast<size_t>(k) * 10;
+      const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
       if (ReadBE16(entry) == idx) {
         return static_cast<int64_t>(ReadBE64(entry + 2) ^ (1ULL << 63));
       }
-      if (ReadBE16(entry) > idx) break;
+      if (ReadBE16(entry) > idx) {
+        break;
+      }
     }
     return 0;
   }
   uint64_t q = 0;
   for (uint32_t bit = 0; bit < p.width; ++bit) {
-    const unsigned char* plane = p.planes + static_cast<size_t>(bit) * p.stride;
+    const unsigned char* plane =
+        p.planes + (static_cast<size_t>(bit) * p.stride);
     q = (q << 1) |
         static_cast<uint64_t>(
             (static_cast<unsigned>(plane[idx >> 3]) >> (7U - (idx & 7U))) & 1U);
@@ -2197,15 +2587,16 @@ int64_t PBitSValueAt(const PBitSRegion& p, uint32_t idx) {
 void DecodePBitSAll(const PBitSRegion& p, int64_t* out) {
   for (uint32_t i = 0; i < p.n; ++i) {
     out[i] = p.exception_bmp != nullptr &&
-                     (p.exception_bmp[i >> 3] & (0x80u >> (i & 7U))) != 0
+                     (p.exception_bmp[i >> 3] & (0x80U >> (i & 7U))) != 0
                  ? 0
                  : PBitSValueAt(p, i);
   }
   for (uint32_t k = 0; k < p.exceptions; ++k) {
-    const char* entry = p.exception_values + static_cast<size_t>(k) * 10;
+    const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
     const uint32_t pos = ReadBE16(entry);
-    if (pos < p.n)
+    if (pos < p.n) {
       out[pos] = static_cast<int64_t>(ReadBE64(entry + 2) ^ (1ULL << 63));
+    }
   }
 }
 
@@ -2227,29 +2618,38 @@ bool ParseInterpRegion(const char* r, uint32_t n, uint32_t param,
   }
   const uint32_t ncp = ReadBE16(r);
   const uint32_t want_ncp = (n + kInterpBlockRows - 1) / kInterpBlockRows;
-  if (ncp == 0 || ncp != param || ncp != want_ncp) return false;
+  if (ncp == 0 || ncp != param || ncp != want_ncp) {
+    return false;
+  }
   const size_t fixed =
-      2 + static_cast<size_t>(ncp) * 16 + static_cast<size_t>(ncp) * 4;
-  if (static_cast<size_t>(end - r) < fixed) return false;
+      2 + (static_cast<size_t>(ncp) * 16) + (static_cast<size_t>(ncp) * 4);
+  if (std::cmp_less(end - r, fixed)) {
+    return false;
+  }
   const char* ckpts = r + 2;
-  const char* bitoffs = ckpts + static_cast<size_t>(ncp) * 16;
+  const char* bitoffs = ckpts + (static_cast<size_t>(ncp) * 16);
   for (uint32_t b = 0; b < ncp; ++b) {
-    const char* ck = ckpts + static_cast<size_t>(b) * 16;
+    const char* ck = ckpts + (static_cast<size_t>(b) * 16);
     // Compare brackets in SIGNED order: the encoder's u64 wrap arithmetic
     // makes a sign-crossing block (e.g. [-816, INT64_MAX-88]) perfectly
     // representable, and its u64 words sort backwards.
-    const int64_t first = static_cast<int64_t>(ReadBE64(ck));
-    const int64_t last = static_cast<int64_t>(ReadBE64(ck + 8));
-    if (last < first) return false;
-    if (b + 1 < ncp && static_cast<int64_t>(ReadBE64(ck + 16)) < last) {
+    const auto first = static_cast<int64_t>(ReadBE64(ck));
+    const auto last = static_cast<int64_t>(ReadBE64(ck + 8));
+    if (last < first) {
       return false;
+    }
+    if (b + 1 < ncp) {
+      const auto next_first = static_cast<int64_t>(ReadBE64(ck + 16));
+      if (next_first < last) {
+        return false;
+      }
     }
   }
   const char* stream = r + fixed;
   const uint64_t stream_bits = static_cast<uint64_t>(end - stream) * 8;
   uint64_t prev_bit = 0;
   for (uint32_t b = 0; b < ncp; ++b) {
-    const uint64_t ob = ReadBE32(bitoffs + static_cast<size_t>(b) * 4);
+    const uint64_t ob = ReadBE32(bitoffs + (static_cast<size_t>(b) * 4));
     if ((b == 0 && ob != 0) || ob < prev_bit || ob > stream_bits) {
       return false;
     }
@@ -2275,41 +2675,55 @@ bool ParseInterpRegion(const char* r, uint32_t n, uint32_t param,
 void InterpDecodeBlock(const InterpRegion& p, uint32_t b, int64_t* out) {
   const uint32_t s = b * kInterpBlockRows;
   const uint32_t t = std::min(p.n, (b + 1) * kInterpBlockRows);
-  if (s >= t || b >= p.ncp) return;
-  const char* ck = p.ckpts + static_cast<size_t>(b) * 16;
+  if (s >= t || b >= p.ncp) {
+    return;
+  }
+  const char* ck = p.ckpts + (static_cast<size_t>(b) * 16);
   const uint64_t lo = ReadBE64(ck);
   const uint64_t hi = ReadBE64(ck + 8);
-  const uint64_t bitoff = ReadBE32(p.bitoffs + static_cast<size_t>(b) * 4);
+  const uint64_t bitoff = ReadBE32(p.bitoffs + (static_cast<size_t>(b) * 4));
   // Word-at-a-time reader: the block replay is the batch-decode hot path,
   // and the byte-at-a-time BitReader costs ~10x on narrow codes. Same
   // MSB-first get(w) contract; the initial partial byte is consumed as a
   // sub-byte field.
-  WordBitReader br(p.stream + bitoff / 8, p.stream_end);
-  if (bitoff % 8 != 0) br.get(static_cast<int>(bitoff % 8));
+  WordBitReader br(p.stream + (bitoff / 8), p.stream_end);
+  if (bitoff % 8 != 0) {
+    br.get(static_cast<int>(bitoff % 8));
+  }
   struct Frame {
     uint32_t i0, i1;
     uint64_t lo, hi;
   };
-  Frame stack[kInterpMaxDepth];
+  std::array<Frame, kInterpMaxDepth> stack{};
   int top = 0;
-  stack[top++] = {s, t, lo, hi};
+  stack[top++] = {.i0 = s, .i1 = t, .lo = lo, .hi = hi};
   while (top > 0) {
     const Frame f = stack[--top];
-    if (f.i0 >= f.i1) continue;
-    const uint32_t mid = f.i0 + (f.i1 - f.i0) / 2;
+    if (f.i0 >= f.i1) {
+      continue;
+    }
+    const uint32_t mid = f.i0 + ((f.i1 - f.i0) / 2);
     const int bits = BitsNeeded(f.hi - f.lo);
     const uint64_t code = bits > 0 ? br.get(bits) : 0;
     out[mid - s] = static_cast<int64_t>(f.lo + code);
-    if (top + 2 > kInterpMaxDepth) return;  // unreachable: depth <= 8
-    const uint64_t vm = static_cast<uint64_t>(out[mid - s]);
-    stack[top++] = {mid + 1, f.i1, vm, f.hi};  // right: values in [vm, hi]
-    stack[top++] = {f.i0, mid, f.lo, vm};      // left: values in [lo, vm]
+    if (top + 2 > kInterpMaxDepth) {
+      return;  // unreachable: depth <= 8
+    }
+    const auto vm = static_cast<uint64_t>(out[mid - s]);
+    stack[top++] = {.i0 = mid + 1,
+                    .i1 = f.i1,
+                    .lo = vm,
+                    .hi = f.hi};  // right: values in [vm, hi]
+    stack[top++] = {.i0 = f.i0,
+                    .i1 = mid,
+                    .lo = f.lo,
+                    .hi = vm};  // left: values in [lo, vm]
   }
 }
 
 void DecodeInterpAll(const InterpRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.ncp; ++b) {
-    InterpDecodeBlock(p, b, out + static_cast<size_t>(b) * kInterpBlockRows);
+    InterpDecodeBlock(p, b, out + (static_cast<size_t>(b) * kInterpBlockRows));
   }
 }
 
@@ -2355,45 +2769,59 @@ void InterpEvalBlock(const InterpRegion& p, uint32_t b, __int128 plo,
                      uint64_t* cnt_out, __int128* sum_out) {
   const uint32_t s = b * kInterpBlockRows;
   const uint32_t t = std::min(p.n, (b + 1) * kInterpBlockRows);
-  if (s >= t || b >= p.ncp) return;
-  const char* ck = p.ckpts + static_cast<size_t>(b) * 16;
+  if (s >= t || b >= p.ncp) {
+    return;
+  }
+  const char* ck = p.ckpts + (static_cast<size_t>(b) * 16);
   const uint64_t lo = ReadBE64(ck);
   const uint64_t hi = ReadBE64(ck + 8);
-  const uint64_t bitoff = ReadBE32(p.bitoffs + static_cast<size_t>(b) * 4);
+  const uint64_t bitoff = ReadBE32(p.bitoffs + (static_cast<size_t>(b) * 4));
   // Word-at-a-time reader: the block replay is the batch-decode hot path,
   // and the byte-at-a-time BitReader costs ~10x on narrow codes. Same
   // MSB-first get(w) contract; the initial partial byte is consumed as a
   // sub-byte field.
-  WordBitReader br(p.stream + bitoff / 8, p.stream_end);
-  if (bitoff % 8 != 0) br.get(static_cast<int>(bitoff % 8));
+  WordBitReader br(p.stream + (bitoff / 8), p.stream_end);
+  if (bitoff % 8 != 0) {
+    br.get(static_cast<int>(bitoff % 8));
+  }
   struct Frame {
     uint32_t i0, i1;
     uint64_t lo, hi;
   };
-  Frame stack[kInterpMaxDepth];
+  std::array<Frame, kInterpMaxDepth> stack{};
   int top = 0;
-  stack[top++] = {s, t, lo, hi};
+  stack[top++] = {.i0 = s, .i1 = t, .lo = lo, .hi = hi};
   uint64_t cnt = 0;
   __int128 sum = 0;
   while (top > 0) {
     const Frame f = stack[--top];
-    if (f.i0 >= f.i1) continue;
-    const uint32_t mid = f.i0 + (f.i1 - f.i0) / 2;
+    if (f.i0 >= f.i1) {
+      continue;
+    }
+    const uint32_t mid = f.i0 + ((f.i1 - f.i0) / 2);
     const int w = BitsNeeded(f.hi - f.lo);
     const uint64_t code = w > 0 ? br.get(w) : 0;
-    const int64_t v = static_cast<int64_t>(f.lo + code);
+    const auto v = static_cast<int64_t>(f.lo + code);
     if (static_cast<__int128>(v) >= plo && static_cast<__int128>(v) <= phi) {
       ++cnt;
-      if (want_sum) sum += v;
-      if (bits != nullptr) bits[mid >> 6] |= 1ULL << (mid & 63);
+      if (want_sum) {
+        sum += v;
+      }
+      if (bits != nullptr) {
+        bits[mid >> 6] |= 1ULL << (mid & 63);
+      }
     }
-    if (top + 2 > kInterpMaxDepth) return;  // unreachable: depth <= 8
-    const uint64_t vm = static_cast<uint64_t>(v);
-    stack[top++] = {mid + 1, f.i1, vm, f.hi};
-    stack[top++] = {f.i0, mid, f.lo, vm};
+    if (top + 2 > kInterpMaxDepth) {
+      return;  // unreachable: depth <= 8
+    }
+    const auto vm = static_cast<uint64_t>(v);
+    stack[top++] = {.i0 = mid + 1, .i1 = f.i1, .lo = vm, .hi = f.hi};
+    stack[top++] = {.i0 = f.i0, .i1 = mid, .lo = f.lo, .hi = vm};
   }
   *cnt_out += cnt;
-  if (sum_out != nullptr) *sum_out += sum;
+  if (sum_out != nullptr) {
+    *sum_out += sum;
+  }
 }
 
 bool PBitSOrderedMatch(PaxChunk::CompareOp op, uint64_t value,
@@ -2415,29 +2843,37 @@ bool PBitSOrderedMatch(PaxChunk::CompareOp op, uint64_t value,
 
 bool CellIsNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c,
                 uint32_t local) {
-  if (!f.null_present) return false;
-  if (f.null_summary_valid && !f.null_any) return false;
+  if (!f.null_present) {
+    return false;
+  }
+  if (f.null_summary_valid && !f.null_any) {
+    return false;
+  }
   // A hand-built footer whose row_counts/null_bitmaps are shorter than the
   // declared row_group_count would index OOB below: report "not null" (the
   // region itself is validated, so reading the raw value is memory-safe;
   // only the null claim is unavailable).
   if (g >= f.row_counts.size() ||
-      f.row_counts.size() < static_cast<size_t>(f.row_group_count))
+      f.row_counts.size() < static_cast<size_t>(f.row_group_count)) {
     return false;
+  }
   const uint32_t cc = f.column_count;
   size_t off = 0;
   if (f.null_summary_valid && g < f.null_uniform_groups) {
     off = static_cast<size_t>(g) * static_cast<size_t>(f.null_uniform_stride);
   } else {
-    for (uint32_t gg = 0; gg < g; ++gg)
+    for (uint32_t gg = 0; gg < g; ++gg) {
       off += static_cast<size_t>(cc) *
              static_cast<size_t>((f.row_counts[gg] + 7U) / 8U);
+    }
   }
   off +=
       static_cast<size_t>(c) * static_cast<size_t>((f.row_counts[g] + 7U) / 8U);
-  if (off + (local >> 3) >= f.null_bitmaps.size()) return false;  // truncated
+  if (off + (local >> 3) >= f.null_bitmaps.size()) {
+    return false;  // truncated
+  }
   const uint8_t b = f.null_bitmaps[off + (local >> 3)];
-  return (b >> (7 - (local & 7))) & 1;
+  return ((b >> (7 - (local & 7))) & 1) != 0;
 }
 
 // True if column c of row group g has any NULL cell. The all-column zone
@@ -2447,28 +2883,41 @@ bool CellIsNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c,
 // no nulls, otherwise it would count null rows the row-evaluation path (and
 // the WASM module) would reject.
 bool RgColHasNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c) {
-  if (!f.null_present) return false;
-  if (f.null_summary_valid && !f.null_any) return false;
+  if (!f.null_present) {
+    return false;
+  }
+  if (f.null_summary_valid && !f.null_any) {
+    return false;
+  }
   const uint32_t cc = f.column_count;
   // row_counts can be shorter than row_group_count in a hand-built footer:
   // the offset walk below indexes row_counts[gg] for gg < g.
-  if (c >= cc || g >= f.row_group_count || g >= f.row_counts.size())
+  if (c >= cc || g >= f.row_group_count || g >= f.row_counts.size()) {
     return true;  // be conservative
+  }
   const uint32_t rc = f.row_counts[g];
-  if (rc == 0) return false;
+  if (rc == 0) {
+    return false;
+  }
   size_t off = 0;
   if (f.null_summary_valid && g < f.null_uniform_groups) {
     off = static_cast<size_t>(g) * static_cast<size_t>(f.null_uniform_stride);
   } else {
-    for (uint32_t gg = 0; gg < g; ++gg)
+    for (uint32_t gg = 0; gg < g; ++gg) {
       off += static_cast<size_t>(cc) *
              static_cast<size_t>((f.row_counts[gg] + 7U) / 8U);
+    }
   }
   off += static_cast<size_t>(c) * static_cast<size_t>((rc + 7U) / 8U);
-  const size_t bytes = static_cast<size_t>((rc + 7U) / 8U);
-  if (off + bytes > f.null_bitmaps.size()) return true;  // defensive
-  for (size_t i = 0; i < bytes; ++i)
-    if (static_cast<uint8_t>(f.null_bitmaps[off + i]) != 0) return true;
+  const auto bytes = static_cast<size_t>((rc + 7U) / 8U);
+  if (off + bytes > f.null_bitmaps.size()) {
+    return true;  // defensive
+  }
+  for (size_t i = 0; i < bytes; ++i) {
+    if (static_cast<uint8_t>(f.null_bitmaps[off + i]) != 0) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -2480,22 +2929,28 @@ bool RgColHasNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c) {
 const uint8_t* RgColNullBits(const PaxChunk::Footer& f, uint32_t g,
                              uint32_t c) {
   if (!f.null_present || c >= f.column_count || g >= f.row_group_count ||
-      g >= f.row_counts.size())
+      g >= f.row_counts.size()) {
     return nullptr;
-  if (f.null_summary_valid && !f.null_any) return nullptr;
+  }
+  if (f.null_summary_valid && !f.null_any) {
+    return nullptr;
+  }
   const uint32_t cc = f.column_count;
   size_t off = 0;
   if (f.null_summary_valid && g < f.null_uniform_groups) {
     off = static_cast<size_t>(g) * static_cast<size_t>(f.null_uniform_stride);
   } else {
-    for (uint32_t gg = 0; gg < g; ++gg)
+    for (uint32_t gg = 0; gg < g; ++gg) {
       off += static_cast<size_t>(cc) *
              static_cast<size_t>((f.row_counts[gg] + 7U) / 8U);
+    }
   }
   off +=
       static_cast<size_t>(c) * static_cast<size_t>((f.row_counts[g] + 7U) / 8U);
-  const size_t bytes = static_cast<size_t>((f.row_counts[g] + 7U) / 8U);
-  if (off + bytes > f.null_bitmaps.size()) return nullptr;
+  const auto bytes = static_cast<size_t>((f.row_counts[g] + 7U) / 8U);
+  if (off + bytes > f.null_bitmaps.size()) {
+    return nullptr;
+  }
   return f.null_bitmaps.data() + off;
 }
 
@@ -2510,11 +2965,17 @@ const uint8_t* RgColNullBits(const PaxChunk::Footer& f, uint32_t g,
 // read hundreds of KB past the buffer.
 const char* RegionEndAt(const PaxChunk::Footer& f, uint32_t g, uint32_t col,
                         const std::vector<char>& data) {
-  if (col >= f.column_count) return nullptr;
+  if (col >= f.column_count) {
+    return nullptr;
+  }
   const size_t off_idx =
-      static_cast<size_t>(g) * static_cast<size_t>(f.column_count) + col;
-  if (off_idx >= f.column_offsets.size()) return nullptr;
-  if (data.size() <= static_cast<size_t>(f.footer_size) + 4) return nullptr;
+      (static_cast<size_t>(g) * static_cast<size_t>(f.column_count)) + col;
+  if (off_idx >= f.column_offsets.size()) {
+    return nullptr;
+  }
+  if (data.size() <= static_cast<size_t>(f.footer_size) + 4) {
+    return nullptr;
+  }
   const size_t data_end = data.size() - f.footer_size - 4;
   if (off_idx + 1 < f.column_offsets.size()) {
     if (f.column_offsets[off_idx + 1] > data_end) {
@@ -2533,17 +2994,19 @@ const char* RegionEndAt(const PaxChunk::Footer& f, uint32_t g, uint32_t col,
 // back to per-element Int64RegionAt, which fails closed identically.
 bool DecodeInnerI64All(const char* r, uint8_t scheme, uint32_t param,
                        uint32_t cnt, const char* end, int64_t* out) {
-  if (!InnerSchemeOk(scheme)) return false;
+  if (!InnerSchemeOk(scheme)) {
+    return false;
+  }
   if (static_cast<Scheme>(scheme) == Scheme::kRle) {
     // Single-pass run expansion; the per-element Int64RegionAt walk is
     // O(runs) per row.
-    if (r + 4 > end || r + 4 + static_cast<size_t>(param) * 12 > end) {
+    if (r + 4 > end || r + 4 + (static_cast<size_t>(param) * 12) > end) {
       return false;
     }
     uint32_t row = 0;
     const char* p = r + 4;
     for (uint32_t i = 0; i < param && row < cnt; ++i) {
-      const int64_t v = static_cast<int64_t>(ReadBE64(p));
+      const auto v = static_cast<int64_t>(ReadBE64(p));
       const uint64_t len = ReadBE32(p + 8);
       const uint32_t e =
           (row + len > cnt) ? cnt : static_cast<uint32_t>(row + len);
@@ -2578,7 +3041,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     return true;
   }
   if (s == Scheme::kByteSlice) {
-    if (!DecodeByteSliceAll(region, n, region_end, out)) zero();
+    if (!DecodeByteSliceAll(region, n, region_end, out)) {
+      zero();
+    }
     return true;
   }
   if (s == Scheme::kS4) {
@@ -2631,14 +3096,14 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       for (uint32_t b = 0; b < p.nb; ++b) {
         const int w = SortDictWidth(p, b);
         const uint64_t bit = SortDictGapOffset(p, b) * 8;
-        uint64_t v = static_cast<uint64_t>(SortDictFirst(p, b));
+        auto v = static_cast<uint64_t>(SortDictFirst(p, b));
         const uint32_t rows = SortDictBlockRows(p, b);
         for (uint32_t t = 0; t < rows; ++t) {
           sorted[j++] = static_cast<int64_t>(v);
           if (w != 0 && t + 1 < rows) {
             v += UnpackBitAt(
                 p.gaps,
-                bit + static_cast<uint64_t>(t) * static_cast<uint64_t>(w), w);
+                bit + (static_cast<uint64_t>(t) * static_cast<uint64_t>(w)), w);
           }
         }
       }
@@ -2713,7 +3178,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
   }
   if (s == Scheme::kSimple8b) {
     if (param == 0 || region_end == nullptr ||
-        region + 8 + static_cast<size_t>(param) * 8 > region_end) {
+        region + 8 + (static_cast<size_t>(param) * 8) > region_end) {
       zero();
       return true;
     }
@@ -2722,7 +3187,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     const char* p = region + 8;
     for (uint32_t w = 0; w < param && row < n; ++w, p += 8) {
       const uint64_t word = ReadBE64(p);
-      const uint32_t sel = static_cast<uint32_t>(word >> 60);
+      const auto sel = static_cast<uint32_t>(word >> 60);
       const uint32_t cnt = kSimple8bSelCount[sel];
       const uint32_t bits = kSimple8bSelBits[sel];
       const uint32_t avail = n - row;
@@ -2797,7 +3262,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       row = end;
       ++run;
     }
-    if (row < n) std::fill(out + row, out + n, 0);
+    if (row < n) {
+      std::fill(out + row, out + n, 0);
+    }
     return true;
   }
   if (s == Scheme::kStreamVByte) {
@@ -2887,8 +3354,8 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       zero();
       return true;
     }
-    const int64_t top = static_cast<int64_t>(ReadBE64(region));
-    const uint8_t ischeme = static_cast<uint8_t>(region[8]);
+    const auto top = static_cast<int64_t>(ReadBE64(region));
+    const auto ischeme = static_cast<uint8_t>(region[8]);
     const uint32_t iparam = ReadBE32(region + 9);
     const uint32_t nexc = ReadBE16(region + 13);
     const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
@@ -2904,7 +3371,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     // clamp), so the walk does NOT pre-fill with top.
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < n; ++i) {
-      const uint8_t bit = static_cast<uint8_t>(
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(bmp[i >> 3]) >> (7 - (i & 7))) & 1);
       if (bit != 0) {
         out[i] = top;
@@ -2920,14 +3387,14 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     // [nibbles ceil(n/2)][inner region]. Nibble < d -> hot[d]; 15 -> next
     // exception. Codes d..14 never appear from the encoder; a hostile one
     // decodes as 0 like the clamp arms.
-    constexpr size_t kTopkHeader = 2 + 2 + 15 * 8 + 15 * 2 + 1 + 4;  // 159
+    constexpr size_t kTopkHeader = 2 + 2 + (15 * 8) + (15 * 2) + 1 + 4;  // 159
     if (region_end == nullptr || region + kTopkHeader > region_end) {
       zero();
       return true;
     }
     const uint32_t d = ReadBE16(region);
     const uint32_t nexc = ReadBE16(region + 2);
-    const uint8_t ischeme = static_cast<uint8_t>(region[154]);
+    const auto ischeme = static_cast<uint8_t>(region[154]);
     const uint32_t iparam = ReadBE32(region + 155);
     const size_t nib_bytes = (static_cast<size_t>(n) + 1) / 2;
     if (d == 0 || d > 15 || region + kTopkHeader + nib_bytes > region_end ||
@@ -2942,11 +3409,11 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     }
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < n; ++i) {
-      const uint8_t byte = static_cast<uint8_t>(region[kTopkHeader + (i >> 1)]);
+      const auto byte = static_cast<uint8_t>(region[kTopkHeader + (i >> 1)]);
       const uint32_t code = (i & 1) == 0 ? (byte >> 4) : (byte & 0x0F);
       if (code < d) {
         out[i] = static_cast<int64_t>(
-            ReadBE64(region + 4 + static_cast<size_t>(code) * 8));
+            ReadBE64(region + 4 + (static_cast<size_t>(code) * 8)));
       } else if (code == 15 && eidx < nexc) {
         out[i] = exc[eidx++];
       } else {
@@ -2962,17 +3429,21 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     // every composite's hostile-header arm.
     std::fill(out, out + n, 0);
     TileDictCursor c;
-    if (!TileDictFirst(region, n, region_end, &c)) return true;
+    if (!TileDictFirst(region, n, region_end, &c)) {
+      return true;
+    }
     for (;;) {
       if (c.w == 0) {
-        const int64_t v = static_cast<int64_t>(ReadBE64(c.dict));
+        const auto v = static_cast<int64_t>(ReadBE64(c.dict));
         std::fill(out + c.tile_start, out + c.tile_start + c.rows, v);
       } else {
         for (uint32_t j = 0; j < c.rows; ++j) {
           out[c.tile_start + j] = TileDictValueAt(c, j);
         }
       }
-      if (!TileDictNext(&c)) break;
+      if (!TileDictNext(&c)) {
+        break;
+      }
     }
     return true;
   }
@@ -2981,13 +3452,13 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       zero();
       return true;
     }
-    const uint8_t vs = static_cast<uint8_t>(region[0]);
-    const uint8_t cs = static_cast<uint8_t>(region[1]);
+    const auto vs = static_cast<uint8_t>(region[0]);
+    const auto cs = static_cast<uint8_t>(region[1]);
     const uint32_t runs = ReadBE32(region + 2);
     const uint32_t vparam = ReadBE32(region + 6);
     const uint32_t cparam = ReadBE32(region + 10);
     const uint64_t vlen = ReadBE32(region + 14);
-    if (vlen > static_cast<uint64_t>(region_end - (region + 18)) || runs > n ||
+    if (std::cmp_greater(vlen, region_end - (region + 18)) || runs > n ||
         runs == 0 || !InnerSchemeOk(vs) || !InnerSchemeOk(cs)) {
       zero();
       return true;
@@ -2999,7 +3470,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     DecodeInnerI64All(creg, cs, cparam, runs, region_end, run_lens.data());
     uint64_t row = 0;
     for (uint32_t i = 0; i < runs && row < n; ++i) {
-      const uint64_t len = static_cast<uint64_t>(run_lens[i]);
+      const auto len = static_cast<uint64_t>(run_lens[i]);
       const uint32_t e = (row + len > n) ? n : static_cast<uint32_t>(row + len);
       std::fill(out + row, out + e, run_vals[i]);
       row = e;
@@ -3013,18 +3484,18 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       return true;
     }
     const uint16_t d = ReadBE16(region);
-    const uint8_t cs = static_cast<uint8_t>(region[2]);
+    const auto cs = static_cast<uint8_t>(region[2]);
     const uint32_t cparam = ReadBE32(region + 3);
     const uint64_t clen = ReadBE32(region + 7);
     const char* creg = region + 11;
-    if (d == 0 || clen > static_cast<uint64_t>(region_end - creg) ||
+    if (d == 0 || std::cmp_greater(clen, region_end - creg) ||
         !InnerSchemeOk(cs)) {
       zero();
       return true;
     }
     const char* pool_hdr = creg + clen;
     if (pool_hdr + 1 > region_end || static_cast<uint8_t>(pool_hdr[0]) != 0 ||
-        pool_hdr + 1 + static_cast<size_t>(d) * 8 > region_end) {
+        pool_hdr + 1 + (static_cast<size_t>(d) * 8) > region_end) {
       zero();
       return true;
     }
@@ -3032,10 +3503,10 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     std::vector<int64_t> codes(n, 0);
     DecodeInnerI64All(creg, cs, cparam, n, pool_hdr, codes.data());
     for (uint32_t i = 0; i < n; ++i) {
-      const uint64_t code = static_cast<uint64_t>(codes[i]);
+      const auto code = static_cast<uint64_t>(codes[i]);
       out[i] = (code >= d) ? 0
                            : static_cast<int64_t>(ReadBE64(
-                                 dict + static_cast<size_t>(code) * 8));
+                                 dict + (static_cast<size_t>(code) * 8)));
     }
     return true;
   }
@@ -3047,7 +3518,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     }
     const uint64_t a = ReadBE64(region);
     const uint64_t d = ReadBE64(region + 8);
-    const uint8_t ischeme = static_cast<uint8_t>(region[16]);
+    const auto ischeme = static_cast<uint8_t>(region[16]);
     const uint32_t iparam = ReadBE32(region + 17);
     const uint32_t nexc = ReadBE16(region + 21);
     const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
@@ -3056,7 +3527,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       zero();
       return true;
     }
-    const uint8_t* bmp = reinterpret_cast<const uint8_t*>(region + 23);
+    const auto* bmp = reinterpret_cast<const uint8_t*>(region + 23);
     std::vector<int64_t> exc(nexc, 0);
     if (nexc > 0) {
       DecodeInnerI64All(region + 23 + bmp_bytes, ischeme, iparam, nexc,
@@ -3066,16 +3537,17 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     // the walk does not read past the exception list.
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < n; ++i) {
-      const uint8_t bit =
-          static_cast<uint8_t>((bmp[i >> 3] >> (7 - (i & 7))) & 1);
+      const auto bit = static_cast<uint8_t>((bmp[i >> 3] >> (7 - (i & 7))) & 1);
       if (bit != 0) {
-        out[i] = static_cast<int64_t>(a + static_cast<uint64_t>(i) * d);
+        out[i] = static_cast<int64_t>(a + (static_cast<uint64_t>(i) * d));
       } else if (eidx < nexc) {
         out[i] = exc[eidx];
       } else {
         out[i] = 0;
       }
-      if (bit == 0) ++eidx;
+      if (bit == 0) {
+        ++eidx;
+      }
     }
     return true;
   }
@@ -3093,14 +3565,14 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     const uint32_t nexc = ReadBE16(p.hdr + 5);
     std::vector<int64_t> exc(static_cast<size_t>(nexc), 0);
     if (nexc > 0) {
-      DecodeInnerI64All(p.bmp + (static_cast<size_t>(n) + 7) / 8,
+      DecodeInnerI64All(p.bmp + ((static_cast<size_t>(n) + 7) / 8),
                         static_cast<uint8_t>(p.hdr[0]), ReadBE32(p.hdr + 1),
                         nexc, region_end, exc.data());
     }
     uint32_t eidx = 0;
     uint64_t cur = p.a;
     for (uint32_t i = 0; i < n; ++i) {
-      const uint8_t bit =
+      const auto bit =
           static_cast<uint8_t>((p.bmp[i >> 3] >> (7 - (i & 7))) & 1);
       if (bit != 0) {
         out[i] = static_cast<int64_t>(cur);
@@ -3111,7 +3583,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
         out[i] = 0;
       }
       cur += p.b;
-      if (cur >= p.m) cur -= p.m;
+      if (cur >= p.m) {
+        cur -= p.m;
+      }
     }
     return true;
   }
@@ -3129,19 +3603,19 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     }
     std::vector<int64_t> exc(static_cast<size_t>(p.nexc), 0);
     if (p.nexc > 0) {
-      DecodeInnerI64All(p.bmp + (static_cast<size_t>(n) + 7) / 8, p.ischeme,
+      DecodeInnerI64All(p.bmp + ((static_cast<size_t>(n) + 7) / 8), p.ischeme,
                         p.iparam, p.nexc, region_end, exc.data());
     }
-    uint64_t cur[16];
-    uint64_t step[16];
+    std::array<uint64_t, 16> cur{};
+    std::array<uint64_t, 16> step{};
     for (uint32_t l = 0; l < p.nd; ++l) {
-      cur[l] = ReadBE64(p.base + static_cast<size_t>(l) * 16);
-      step[l] = ReadBE64(p.base + static_cast<size_t>(l) * 16 + 8);
+      cur[l] = ReadBE64(p.base + (static_cast<size_t>(l) * 16));
+      step[l] = ReadBE64(p.base + (static_cast<size_t>(l) * 16) + 8);
     }
     uint32_t eidx = 0;
     uint32_t l = 0;
     for (uint32_t i = 0; i < n; ++i) {
-      const uint8_t bit =
+      const auto bit =
           static_cast<uint8_t>((p.bmp[i >> 3] >> (7 - (i & 7))) & 1);
       if (bit != 0) {
         out[i] = static_cast<int64_t>(cur[l]);
@@ -3152,7 +3626,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
         out[i] = 0;
       }
       cur[l] += step[l];  // the lane grid advances through exception rows too
-      if (++l == p.nd) l = 0;
+      if (++l == p.nd) {
+        l = 0;
+      }
     }
     return true;
   }
@@ -3170,7 +3646,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     const uint32_t nexc = ReadBE16(p.hdr + 5);
     std::vector<int64_t> exc(static_cast<size_t>(nexc), 0);
     if (nexc > 0) {
-      DecodeInnerI64All(p.bmp + (static_cast<size_t>(n) + 7) / 8,
+      DecodeInnerI64All(p.bmp + ((static_cast<size_t>(n) + 7) / 8),
                         static_cast<uint8_t>(p.hdr[0]), ReadBE32(p.hdr + 1),
                         nexc, region_end, exc.data());
     }
@@ -3178,11 +3654,11 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     uint32_t start = 0;
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < n; ++i) {
-      while (i >= ReadBE32(p.segs + static_cast<size_t>(j) * 20 + 16)) {
-        start = ReadBE32(p.segs + static_cast<size_t>(j) * 20 + 16);
+      while (i >= ReadBE32(p.segs + (static_cast<size_t>(j) * 20) + 16)) {
+        start = ReadBE32(p.segs + (static_cast<size_t>(j) * 20) + 16);
         ++j;
       }
-      const uint8_t bit = static_cast<uint8_t>(
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(p.bmp[i >> 3]) >> (7 - (i & 7))) & 1);
       if (bit != 0) {
         out[i] = PlaSegmentValueAt(p, j, start, i);
@@ -3204,7 +3680,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       zero();
       return true;
     }
-    const uint8_t vs = static_cast<uint8_t>(region[0]);
+    const auto vs = static_cast<uint8_t>(region[0]);
     const uint32_t vprm = ReadBE32(region + 1);
     const uint32_t pbpv = static_cast<uint8_t>(region[9]);
     const uint32_t nnz = ReadBE32(region + 10);
@@ -3212,7 +3688,7 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
       zero();
       return true;
     }
-    const size_t pos_bytes = 8 + static_cast<size_t>(nnz) * pbpv;
+    const size_t pos_bytes = 8 + (static_cast<size_t>(nnz) * pbpv);
     if (region + 14 + pos_bytes > region_end) {
       zero();
       return true;
@@ -3223,7 +3699,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     for (uint32_t r = 0; r < nnz; ++r) {
       const int64_t p =
           Int64RegionAt(posr, Scheme::kForBp, pbpv, nnz, r, region_end);
-      if (p < 0 || p >= static_cast<int64_t>(n)) continue;  // hostile pos
+      if (p < 0 || std::cmp_greater_equal(p, n)) {
+        continue;  // hostile pos
+      }
       out[p] = Int64RegionAt(vreg, static_cast<Scheme>(vs), vprm, nnz, r,
                              region_end);
     }
@@ -3286,21 +3764,21 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     }
     const uint32_t ncp = ReadBE16(region);
     if (ncp != (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery ||
-        region + 3 + static_cast<size_t>(ncp) * 8 > region_end) {
+        region + 3 + (static_cast<size_t>(ncp) * 8) > region_end) {
       zero();
       return true;
     }
-    const uint32_t w = static_cast<uint8_t>(region[2 + ncp * 8]);
+    const uint32_t w = static_cast<uint8_t>(region[2 + (ncp * 8)]);
     if (w < 1 || w > 64 ||
-        region + 3 + static_cast<size_t>(ncp) * 8 +
+        region + 3 + (static_cast<size_t>(ncp) * 8) +
                 ((static_cast<size_t>(n > 0 ? n - 1 : 0) * w + 7) / 8) >
             region_end) {
       zero();
       return true;
     }
-    const char* packed = region + 3 + static_cast<size_t>(ncp) * 8;
+    const char* packed = region + 3 + (static_cast<size_t>(ncp) * 8);
     out[0] = static_cast<int64_t>(ReadBE64(region + 2));
-    uint64_t x = static_cast<uint64_t>(out[0]);
+    auto x = static_cast<uint64_t>(out[0]);
     for (uint32_t i = 1; i < n; ++i) {
       x ^= UnpackBitAt(packed, static_cast<uint64_t>(i - 1) * w,
                        static_cast<int>(w));
@@ -3318,17 +3796,17 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     }
     const uint32_t ncp = ReadBE16(region);
     if (ncp != (n + kDeltaCheckpointEvery - 1) / kDeltaCheckpointEvery ||
-        region + 2 + static_cast<size_t>(ncp) * 12 + 8 > region_end) {
+        region + 2 + (static_cast<size_t>(ncp) * 12) + 8 > region_end) {
       zero();
       return true;
     }
-    const char* offs = region + 2 + static_cast<size_t>(ncp) * 8;
-    const char* firstp = offs + static_cast<size_t>(ncp) * 4;
+    const char* offs = region + 2 + (static_cast<size_t>(ncp) * 8);
+    const char* firstp = offs + (static_cast<size_t>(ncp) * 4);
     const char* stream = firstp + 8;
     const uint64_t stream_bits = static_cast<uint64_t>(region_end - stream) * 8;
     uint32_t prev_off = 0;
     for (uint32_t b = 0; b < ncp; ++b) {
-      const uint32_t o = ReadBE32(offs + static_cast<size_t>(b) * 4);
+      const uint32_t o = ReadBE32(offs + (static_cast<size_t>(b) * 4));
       if (o < prev_off || o > stream_bits || (b == 0 && o != 0)) {
         zero();
         return true;
@@ -3340,12 +3818,12 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     BitReader br(stream, region_end);
     if (s == Scheme::kGorillaC) {
       for (uint32_t i = 1; i < n; ++i) {
-        if (br.get1()) {
+        if (br.get1() != 0) {
           const int lz = static_cast<int>(br.get(5));
           const int tz = static_cast<int>(br.get(6));
           int mw = 64 - lz - tz;
-          if (mw < 0) mw = 0;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 0);
+          mw = std::min(mw, 64);
           const uint64_t m = br.get(mw);
           prev ^= (mw >= 64 ? m : (m << tz));
         }
@@ -3360,16 +3838,17 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
           const int width = 64 - prev_lz - prev_tz;
           if (width > 0 && width <= 64) {
             uint64_t m = 0;
-            for (int t = 0; t < width; ++t)
+            for (int t = 0; t < width; ++t) {
               m = (m << 1) | static_cast<uint64_t>(br.get1());
+            }
             prev ^= (m << prev_tz);
           }
         } else {
           const int lz = static_cast<int>(br.get(5));
           const int tz = static_cast<int>(br.get(6));
           int mw = 64 - lz - tz;
-          if (mw < 1) mw = 1;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 1);
+          mw = std::min(mw, 64);
           prev ^= (mw >= 64 ? br.get(mw) : (br.get(mw) << tz));
           prev_lz = lz;
           prev_tz = tz;
@@ -3383,12 +3862,12 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
     // [tv 8B][fv 8B][words x 8B]. One word walk expands every span; the
     // per-row fallback would re-walk the words for every row.
     if (region_end == nullptr || param == 0 ||
-        region + 16 + static_cast<size_t>(param) * 8 > region_end) {
+        region + 16 + (static_cast<size_t>(param) * 8) > region_end) {
       zero();
       return true;
     }
-    const int64_t tv = static_cast<int64_t>(ReadBE64(region));
-    const int64_t fv = static_cast<int64_t>(ReadBE64(region + 8));
+    const auto tv = static_cast<int64_t>(ReadBE64(region));
+    const auto fv = static_cast<int64_t>(ReadBE64(region + 8));
     const char* wp = region + 16;
     uint32_t pos = 0;
     for (uint32_t k = 0; k < param && pos < n; ++k, wp += 8) {
@@ -3407,7 +3886,9 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
           return true;
         }
         uint64_t rows = len * kWahSpan;
-        if (rows > static_cast<uint64_t>(n - pos)) rows = n - pos;
+        if (rows > static_cast<uint64_t>(n - pos)) {
+          rows = n - pos;
+        }
         const int64_t v = ((w >> 62) & 1ULL) != 0 ? tv : fv;
         std::fill(out + pos, out + pos + static_cast<size_t>(rows), v);
         pos += static_cast<uint32_t>(rows);
@@ -3429,14 +3910,22 @@ bool DecodeCascadeI64All(const char* region, Scheme s, uint32_t param,
 // rowcount-dependent (a 1-row ByteSlice cell is 2 bytes).
 const char* RegionStartAt(const PaxChunk::Footer& f, uint32_t g, uint32_t col,
                           const std::vector<char>& data, size_t need_bytes) {
-  if (col >= f.column_count) return nullptr;
+  if (col >= f.column_count) {
+    return nullptr;
+  }
   const size_t off_idx =
-      static_cast<size_t>(g) * static_cast<size_t>(f.column_count) + col;
-  if (off_idx >= f.column_offsets.size()) return nullptr;
-  if (data.size() <= static_cast<size_t>(f.footer_size) + 4) return nullptr;
+      (static_cast<size_t>(g) * static_cast<size_t>(f.column_count)) + col;
+  if (off_idx >= f.column_offsets.size()) {
+    return nullptr;
+  }
+  if (data.size() <= static_cast<size_t>(f.footer_size) + 4) {
+    return nullptr;
+  }
   const size_t data_end = data.size() - f.footer_size - 4;
   const size_t off = f.column_offsets[off_idx];
-  if (off > data_end || data_end - off < need_bytes) return nullptr;
+  if (off > data_end || data_end - off < need_bytes) {
+    return nullptr;
+  }
   return data.data() + off;
 }
 
@@ -3449,8 +3938,11 @@ uint64_t SelPopcountRange(const PaxSelectionVector& sel, uint32_t start,
     cnt += static_cast<uint64_t>(__builtin_popcountll(sel.bits[i >> 6]));
     i += 64;
   }
-  for (; i < end; ++i)
-    if ((sel.bits[i >> 6] >> (i & 63)) & 1ULL) ++cnt;
+  for (; i < end; ++i) {
+    if (((sel.bits[i >> 6] >> (i & 63)) & 1ULL) != 0U) {
+      ++cnt;
+    }
+  }
   return cnt;
 }
 
@@ -3458,14 +3950,17 @@ uint64_t SelPopcountRange(const PaxSelectionVector& sel, uint32_t start,
 // selected row is non-null (nulls are exactly the bitmap-set rows).
 uint64_t SelNonNullCount(const PaxSelectionVector& sel, const uint8_t* nulls,
                          uint32_t start, uint32_t end) {
-  if (nulls == nullptr) return SelPopcountRange(sel, start, end);
+  if (nulls == nullptr) {
+    return SelPopcountRange(sel, start, end);
+  }
   uint64_t cnt = 0;
   for (uint32_t i = start; i < end; ++i) {
     // static_cast: a bare uint8_t promotes to int, and -Wsign-conversion
     // flags the int -> unsigned conversion at the `& 1U` below.
     if (((sel.bits[i >> 6] >> (i & 63)) & 1ULL) != 0 &&
-        ((static_cast<unsigned>(nulls[i >> 3]) >> (7U - (i & 7U))) & 1U) == 0)
+        ((static_cast<unsigned>(nulls[i >> 3]) >> (7U - (i & 7U))) & 1U) == 0) {
       ++cnt;
+    }
   }
   return cnt;
 }
@@ -3475,41 +3970,58 @@ Value VarcharRegionAtFsstFallback(const char* r, uint32_t n, uint32_t idx,
   if (r == nullptr || region_end == nullptr || region_end < r || idx >= n) {
     return Value(std::string());
   }
-  const size_t region_len = static_cast<size_t>(region_end - r);
-  if (region_len < 6) return Value(std::string());
+  const auto region_len = static_cast<size_t>(region_end - r);
+  if (region_len < 6) {
+    return Value(std::string());
+  }
   const uint16_t nsym = ReadBE16(r);
   const uint32_t tsl = ReadBE32(r + 2);
-  if (nsym > 256) return Value(std::string());
-  std::string_view symbols[256];
+  if (nsym > 256) {
+    return Value(std::string());
+  }
+  std::array<std::string_view, 256> symbols{};
   size_t pos = 6;
   for (uint16_t c = 0; c < nsym; ++c) {
-    if (pos >= region_len) return Value(std::string());
-    const uint8_t slen = static_cast<uint8_t>(r[pos++]);
-    if (slen > region_len - pos) return Value(std::string());
+    if (pos >= region_len) {
+      return Value(std::string());
+    }
+    const auto slen = static_cast<uint8_t>(r[pos++]);
+    if (slen > region_len - pos) {
+      return Value(std::string());
+    }
     symbols[c] = std::string_view(r + pos, slen);
     pos += slen;
   }
   const size_t table_bytes = static_cast<size_t>(n) * 4;
-  if (table_bytes > region_len - pos) return Value(std::string());
+  if (table_bytes > region_len - pos) {
+    return Value(std::string());
+  }
   const char* otable = r + pos;
   pos += table_bytes;
-  if (tsl > region_len - pos) return Value(std::string());
+  if (tsl > region_len - pos) {
+    return Value(std::string());
+  }
   const char* stream = r + pos;
-  const uint32_t code_off = ReadBE32(otable + static_cast<size_t>(idx) * 4);
+  const uint32_t code_off = ReadBE32(otable + (static_cast<size_t>(idx) * 4));
   const uint32_t next_off =
-      (idx + 1 < n) ? ReadBE32(otable + static_cast<size_t>(idx + 1) * 4) : tsl;
-  if (code_off > next_off || next_off > tsl) return Value(std::string());
+      (idx + 1 < n) ? ReadBE32(otable + (static_cast<size_t>(idx + 1) * 4))
+                    : tsl;
+  if (code_off > next_off || next_off > tsl) {
+    return Value(std::string());
+  }
   std::string out;
-  const size_t encoded_len = static_cast<size_t>(next_off - code_off);
+  const auto encoded_len = static_cast<size_t>(next_off - code_off);
   if (encoded_len > out.capacity() && encoded_len <= 65536) {
     out.reserve(encoded_len);
   }
-  const uint8_t* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
-  const uint8_t* end = reinterpret_cast<const uint8_t*>(stream + next_off);
+  const auto* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
+  const auto* end = reinterpret_cast<const uint8_t*>(stream + next_off);
   while (cp < end) {
     const uint8_t code = *cp++;
     if (code == 0) {
-      if (cp >= end) break;
+      if (cp >= end) {
+        break;
+      }
       out.push_back(static_cast<char>(*cp++));
     } else if (code <= nsym) {
       out.append(symbols[code - 1].data(), symbols[code - 1].size());
@@ -3525,26 +4037,38 @@ bool DecodeFrontCodeAtInto(const char* r, uint32_t param, uint32_t n,
       out == nullptr || idx >= n) {
     return false;
   }
-  const uint32_t re = param & 0x7FFFu;
-  if (re == 0 || r + 6 > region_end) return false;
+  const uint32_t re = param & 0x7FFFU;
+  if (re == 0 || r + 6 > region_end) {
+    return false;
+  }
   const uint32_t nrestart = ReadBE16(r);
   const uint32_t stream_len = ReadBE32(r + 2);
   const char* rtable = r + 6;
-  if (rtable + static_cast<size_t>(nrestart) * 4 > region_end) return false;
-  const char* stream = rtable + static_cast<size_t>(nrestart) * 4;
-  if (stream + stream_len > region_end) return false;
+  if (rtable + (static_cast<size_t>(nrestart) * 4) > region_end) {
+    return false;
+  }
+  const char* stream = rtable + (static_cast<size_t>(nrestart) * 4);
+  if (stream + stream_len > region_end) {
+    return false;
+  }
   const uint32_t block = idx / re;
-  if (block >= nrestart) return false;
-  const uint32_t ro = ReadBE32(rtable + static_cast<size_t>(block) * 4);
-  if (ro > stream_len) return false;
+  if (block >= nrestart) {
+    return false;
+  }
+  const uint32_t ro = ReadBE32(rtable + (static_cast<size_t>(block) * 4));
+  if (ro > stream_len) {
+    return false;
+  }
   const char* send = stream + stream_len;
   const char* q = stream + ro;
   out->clear();
   for (uint32_t i = block * re; i <= idx; ++i) {
-    if (q + 4 > send) return false;
+    if (q + 4 > send) {
+      return false;
+    }
     const uint32_t hdr = ReadBE32(q);
     const uint32_t plen = hdr >> 16;
-    const uint32_t slen = hdr & 0xFFFFu;
+    const uint32_t slen = hdr & 0xFFFFU;
     if (plen > out->size() || slen > static_cast<uint64_t>(send - q) - 4U) {
       return false;
     }
@@ -3571,52 +4095,74 @@ bool ParseTemplateRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  const size_t have = static_cast<size_t>(region_end - r);
-  if (have < 3) return false;
+  const auto have = static_cast<size_t>(region_end - r);
+  if (have < 3) {
+    return false;
+  }
   const uint32_t nseg = static_cast<uint8_t>(r[0]);
   const uint32_t nexc = ReadBE16(r + 1);
-  if (nseg < 1 || nseg > kTemplateMaxSegments) return false;
-  if (nexc > n || nexc != param) return false;
+  if (nseg < 1 || nseg > kTemplateMaxSegments) {
+    return false;
+  }
+  if (nexc > n || nexc != param) {
+    return false;
+  }
   size_t pos = 3;
   // Digit widths.
-  if (pos + nseg > have) return false;
-  uint32_t widths[kTemplateMaxSegments];
+  if (pos + nseg > have) {
+    return false;
+  }
+  std::array<uint32_t, kTemplateMaxSegments> widths{};
   for (uint32_t s = 0; s < nseg; ++s) {
     widths[s] = static_cast<uint8_t>(r[pos + s]);
-    if (widths[s] < 1 || widths[s] > kTemplateMaxWidth) return false;
+    if (widths[s] < 1 || widths[s] > kTemplateMaxWidth) {
+      return false;
+    }
   }
   pos += nseg;
   // Literal skeleton: (nseg+1) length-prefixed pieces, stored once.
-  const char* lit[kTemplateMaxSegments + 1];
-  uint32_t lit_len[kTemplateMaxSegments + 1];
+  std::array<const char*, kTemplateMaxSegments + 1> lit{};
+  std::array<uint32_t, kTemplateMaxSegments + 1> lit_len{};
   for (uint32_t k = 0; k <= nseg; ++k) {
-    if (pos + 2 > have) return false;
+    if (pos + 2 > have) {
+      return false;
+    }
     const uint32_t len = ReadBE16(r + pos);
     pos += 2;
-    if (pos + len > have) return false;
+    if (pos + len > have) {
+      return false;
+    }
     lit[k] = r + pos;
     lit_len[k] = len;
     pos += len;
   }
   // Conformance bitmap (bit set = row conforms, the kArith convention).
   const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
-  if (pos + bmp_bytes > have) return false;
-  const uint8_t* bmp = reinterpret_cast<const uint8_t*>(r + pos);
+  if (pos + bmp_bytes > have) {
+    return false;
+  }
+  const auto* bmp = reinterpret_cast<const uint8_t*>(r + pos);
   pos += bmp_bytes;
   // Digit planes: nseg self-contained inner regions of nconf values.
   const uint32_t nconf = n - nexc;
-  const char* seg[kTemplateMaxSegments];
-  Scheme seg_scheme[kTemplateMaxSegments];
-  uint32_t seg_param[kTemplateMaxSegments];
-  const char* seg_end[kTemplateMaxSegments];
+  std::array<const char*, kTemplateMaxSegments> seg{};
+  std::array<Scheme, kTemplateMaxSegments> seg_scheme{};
+  std::array<uint32_t, kTemplateMaxSegments> seg_param{};
+  std::array<const char*, kTemplateMaxSegments> seg_end{};
   for (uint32_t s = 0; s < nseg; ++s) {
-    if (pos + 9 > have) return false;
-    const uint8_t ischeme = static_cast<uint8_t>(r[pos]);
-    if (!InnerSchemeOk(ischeme)) return false;
+    if (pos + 9 > have) {
+      return false;
+    }
+    const auto ischeme = static_cast<uint8_t>(r[pos]);
+    if (!InnerSchemeOk(ischeme)) {
+      return false;
+    }
     const uint32_t iparam = ReadBE32(r + pos + 1);
     const uint32_t vlen = ReadBE32(r + pos + 5);
     pos += 9;
-    if (pos + vlen > have) return false;
+    if (pos + vlen > have) {
+      return false;
+    }
     seg[s] = r + pos;
     seg_scheme[s] = static_cast<Scheme>(ischeme);
     seg_param[s] = iparam;
@@ -3626,12 +4172,18 @@ bool ParseTemplateRegion(const char* r, uint32_t n, uint32_t param,
   // Exception chain: nexc plain length-prefixed strings tiling the tail.
   const char* exc = r + pos;
   for (uint32_t e = 0; e < nexc; ++e) {
-    if (static_cast<size_t>(region_end - exc) < 4) return false;
+    if (static_cast<size_t>(region_end - exc) < 4) {
+      return false;
+    }
     const uint32_t len = ReadBE32(exc);
-    if (static_cast<size_t>(region_end - exc) - 4 < len) return false;
+    if (static_cast<size_t>(region_end - exc) - 4 < len) {
+      return false;
+    }
     exc += 4 + len;
   }
-  if (exc != region_end) return false;
+  if (exc != region_end) {
+    return false;
+  }
   out->n = n;
   out->nseg = nseg;
   out->nexc = nexc;
@@ -3656,7 +4208,7 @@ bool ParseTemplateRegion(const char* r, uint32_t n, uint32_t param,
 // Rank helpers over the conformance bitmap. Bitmap bits are MSB-first per
 // byte (the file-wide convention).
 bool TemplateConforms(const TemplateRegion& t, uint32_t idx) {
-  return (t.bmp[idx >> 3] >> (7 - (idx & 7))) & 1;
+  return ((t.bmp[idx >> 3] >> (7 - (idx & 7))) & 1) != 0;
 }
 
 // Number of set (conforming) bits strictly before idx. The rank is paid per
@@ -3668,7 +4220,7 @@ uint32_t TemplateSetBefore(const TemplateRegion& t, uint32_t idx) {
   const size_t words = idx >> 6;
   for (; w < words; ++w) {
     uint64_t word = 0;
-    std::memcpy(&word, t.bmp + w * 8, sizeof(word));
+    std::memcpy(&word, t.bmp + (w * 8), sizeof(word));
     set += static_cast<uint32_t>(__builtin_popcountll(word));
   }
   for (size_t b = w * 8; b < idx / 8; ++b) {
@@ -3690,28 +4242,33 @@ bool TemplateSegmentBulk(const char* r, Scheme s, uint32_t param, uint32_t cnt,
                          const char* end, int64_t* out) {
   switch (s) {
     case Scheme::kPlain: {
-      if (end != nullptr && r + static_cast<size_t>(cnt) * 8 > end) {
+      if (end != nullptr && r + (static_cast<size_t>(cnt) * 8) > end) {
         return false;
       }
       for (uint32_t i = 0; i < cnt; ++i) {
-        out[i] = static_cast<int64_t>(ReadBE64(r + static_cast<size_t>(i) * 8));
+        out[i] =
+            static_cast<int64_t>(ReadBE64(r + (static_cast<size_t>(i) * 8)));
       }
       return true;
     }
     case Scheme::kConst: {
-      if (end != nullptr && r + 8 > end) return false;
-      const int64_t v = static_cast<int64_t>(ReadBE64(r));
-      for (uint32_t i = 0; i < cnt; ++i) out[i] = v;
+      if (end != nullptr && r + 8 > end) {
+        return false;
+      }
+      const auto v = static_cast<int64_t>(ReadBE64(r));
+      for (uint32_t i = 0; i < cnt; ++i) {
+        out[i] = v;
+      }
       return true;
     }
     case Scheme::kRle: {
-      if (end != nullptr && r + 4 + static_cast<size_t>(param) * 12 > end) {
+      if (end != nullptr && r + 4 + (static_cast<size_t>(param) * 12) > end) {
         return false;
       }
       uint32_t row = 0;
       const char* p = r + 4;
       for (uint32_t i = 0; i < param && row < cnt; ++i) {
-        const int64_t v = static_cast<int64_t>(ReadBE64(p));
+        const auto v = static_cast<int64_t>(ReadBE64(p));
         const uint64_t len = ReadBE32(p + 8);
         const uint32_t e =
             (row + len > cnt) ? cnt : static_cast<uint32_t>(row + len);
@@ -3723,25 +4280,31 @@ bool TemplateSegmentBulk(const char* r, Scheme s, uint32_t param, uint32_t cnt,
       return true;
     }
     case Scheme::kForBp: {
-      if (param < 1 || param > 8) return false;
-      if (end != nullptr && r + 8 + static_cast<size_t>(cnt) * param > end) {
+      if (param < 1 || param > 8) {
         return false;
       }
-      const int64_t base = static_cast<int64_t>(ReadBE64(r));
+      if (end != nullptr && r + 8 + (static_cast<size_t>(cnt) * param) > end) {
+        return false;
+      }
+      const auto base = static_cast<int64_t>(ReadBE64(r));
       for (uint32_t i = 0; i < cnt; ++i) {
         uint64_t off = 0;
-        std::memcpy(&off, r + 8 + static_cast<size_t>(i) * param, param);
+        std::memcpy(&off, r + 8 + (static_cast<size_t>(i) * param), param);
         out[i] = base + static_cast<int64_t>(off);
       }
       return true;
     }
     case Scheme::kBitWeave: {
-      if (end != nullptr && r + 9 > end) return false;
-      const int64_t base = static_cast<int64_t>(ReadBE64(r));
+      if (end != nullptr && r + 9 > end) {
+        return false;
+      }
+      const auto base = static_cast<int64_t>(ReadBE64(r));
       const uint32_t w = static_cast<uint8_t>(r[8]);
-      if (w == 0 || w > 64) return false;
+      if (w == 0 || w > 64) {
+        return false;
+      }
       if (end != nullptr &&
-          r + 9 + (static_cast<size_t>(cnt) * w + 7) / 8 > end) {
+          r + 9 + ((static_cast<size_t>(cnt) * w + 7) / 8) > end) {
         return false;
       }
       const char* packed = r + 9;
@@ -3754,12 +4317,15 @@ bool TemplateSegmentBulk(const char* r, Scheme s, uint32_t param, uint32_t cnt,
       return true;
     }
     case Scheme::kDict: {
-      if (end != nullptr && r + 2 > end) return false;
+      if (end != nullptr && r + 2 > end) {
+        return false;
+      }
       const uint16_t d = ReadBE16(r);
       const int cw = BitsNeeded(d > 0 ? d - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(cnt) * static_cast<size_t>(cw) + 7) / 8;
-      if (end != nullptr && r + dict_base + static_cast<size_t>(d) * 8 > end) {
+          2 + ((static_cast<size_t>(cnt) * static_cast<size_t>(cw) + 7) / 8);
+      if (end != nullptr &&
+          r + dict_base + (static_cast<size_t>(d) * 8) > end) {
         return false;
       }
       const char* dict = r + dict_base;
@@ -3767,8 +4333,8 @@ bool TemplateSegmentBulk(const char* r, Scheme s, uint32_t param, uint32_t cnt,
       for (uint32_t i = 0; i < cnt; ++i) {
         const uint64_t code = UnpackBitAt(r + 2, bit, static_cast<int>(cw));
         bit += static_cast<uint64_t>(cw);
-        out[i] = code < d ? static_cast<int64_t>(
-                                ReadBE64(dict + static_cast<size_t>(code) * 8))
+        out[i] = code < d ? static_cast<int64_t>(ReadBE64(
+                                dict + (static_cast<size_t>(code) * 8)))
                           : 0;  // clamp bucket decodes as raw 0 (kDict rule)
       }
       return true;
@@ -3781,12 +4347,16 @@ bool TemplateSegmentBulk(const char* r, Scheme s, uint32_t param, uint32_t cnt,
 // Rebuild row idx's string from the template. Returns false on a structural
 // surprise; callers fail closed to "".
 bool TemplateValueAt(const TemplateRegion& t, uint32_t idx, std::string* out) {
-  if (idx >= t.n) return false;
+  if (idx >= t.n) {
+    return false;
+  }
   const uint32_t set_before = TemplateSetBefore(t, idx);
   if (!TemplateConforms(t, idx)) {
     // Rank among the exception strings = clear bits before idx.
     const uint32_t rank = idx - set_before;
-    if (rank >= t.nexc) return false;
+    if (rank >= t.nexc) {
+      return false;
+    }
     const char* q = t.exc;
     for (uint32_t e = 0; e < rank; ++e) {
       q += 4 + ReadBE32(q);
@@ -3796,7 +4366,9 @@ bool TemplateValueAt(const TemplateRegion& t, uint32_t idx, std::string* out) {
     return true;
   }
   const uint32_t rank = set_before;  // conforming rows ahead of idx
-  if (rank >= t.nconf) return false;
+  if (rank >= t.nconf) {
+    return false;
+  }
   out->clear();
   for (uint32_t s = 0; s < t.nseg; ++s) {
     out->append(t.lit[s], t.lit_len[s]);
@@ -3804,13 +4376,13 @@ bool TemplateValueAt(const TemplateRegion& t, uint32_t idx, std::string* out) {
                                     t.nconf, rank, t.seg_end[s]);
     // Zero-pad the segment back to its stored digit width (the width is
     // what preserves leading zeros bit-honestly).
-    uint64_t u = static_cast<uint64_t>(v);
-    char digits[kTemplateMaxWidth];
+    auto u = static_cast<uint64_t>(v);
+    std::array<char, kTemplateMaxWidth> digits{};
     for (uint32_t d = t.widths[s]; d > 0; --d) {
       digits[d - 1] = static_cast<char>('0' + (u % 10));
       u /= 10;
     }
-    out->append(digits, t.widths[s]);
+    out->append(digits.data(), t.widths[s]);
   }
   out->append(t.lit[t.nseg], t.lit_len[t.nseg]);
   return true;
@@ -3834,51 +4406,79 @@ bool ParseDStreamRegion(const char* r, uint32_t n, uint32_t param,
       n > PaxChunk::kRowGroupSize) {
     return false;
   }
-  const size_t have = static_cast<size_t>(region_end - r);
-  if (have < 7) return false;  // nsym + ndir + stream_len minimums
+  const auto have = static_cast<size_t>(region_end - r);
+  if (have < 7) {
+    return false;  // nsym + ndir + stream_len minimums
+  }
   const uint32_t nsym = static_cast<uint8_t>(r[0]);
-  if (nsym < 1 || nsym > kDStreamMaxSymbols) return false;
+  if (nsym < 1 || nsym > kDStreamMaxSymbols) {
+    return false;
+  }
   size_t pos = 1;
   for (uint32_t c = 0; c < nsym; ++c) {
-    if (pos + 1 > have) return false;
+    if (pos + 1 > have) {
+      return false;
+    }
     const uint32_t len = static_cast<uint8_t>(r[pos]);
-    if (len < 1 || len > kDStreamMaxSymbolLen) return false;
-    if (pos + 1 + len > have) return false;
+    if (len < 1 || len > kDStreamMaxSymbolLen) {
+      return false;
+    }
+    if (pos + 1 + len > have) {
+      return false;
+    }
     out->sym[c] = r + pos + 1;
     out->sym_len[c] = static_cast<uint8_t>(len);
     pos += 1 + len;
   }
-  if (pos + 6 > have) return false;
+  if (pos + 6 > have) {
+    return false;
+  }
   const uint32_t ndir = ReadBE16(r + pos);
   pos += 2;
   const uint32_t stream_len = ReadBE32(r + pos);
   pos += 4;
   const uint32_t nexc = param;
-  if (nexc > n) return false;
+  if (nexc > n) {
+    return false;
+  }
   const uint32_t nconf = n - nexc;
   // The encoder always emits one restart per kDStreamRestart conforming
   // rows (possibly one for zero). A region that disagrees with the derived
   // count has no owner among our encoders.
-  if (ndir != (nconf + kDStreamRestart - 1) / kDStreamRestart) return false;
-  if (pos + static_cast<size_t>(ndir) * 4 > have) return false;
+  if (ndir != (nconf + kDStreamRestart - 1) / kDStreamRestart) {
+    return false;
+  }
+  if (pos + (static_cast<size_t>(ndir) * 4) > have) {
+    return false;
+  }
   out->dir = r + pos;
   pos += static_cast<size_t>(ndir) * 4;
-  if (pos + stream_len > have) return false;
+  if (pos + stream_len > have) {
+    return false;
+  }
   out->stream = r + pos;
   pos += stream_len;
   const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
-  if (pos + bmp_bytes > have) return false;
+  if (pos + bmp_bytes > have) {
+    return false;
+  }
   out->bmp = reinterpret_cast<const uint8_t*>(r + pos);
   pos += bmp_bytes;
   // Exception chain: nexc plain length-prefixed strings tiling the tail.
   const char* exc = r + pos;
   for (uint32_t e = 0; e < nexc; ++e) {
-    if (static_cast<size_t>(region_end - exc) < 4) return false;
+    if (static_cast<size_t>(region_end - exc) < 4) {
+      return false;
+    }
     const uint32_t len = ReadBE32(exc);
-    if (static_cast<size_t>(region_end - exc) - 4 < len) return false;
+    if (static_cast<size_t>(region_end - exc) - 4 < len) {
+      return false;
+    }
     exc += 4 + len;
   }
-  if (exc != region_end) return false;
+  if (exc != region_end) {
+    return false;
+  }
   out->n = n;
   out->nexc = nexc;
   out->nconf = nconf;
@@ -3892,7 +4492,7 @@ bool ParseDStreamRegion(const char* r, uint32_t n, uint32_t param,
 // Bitmap helpers over the conformance bitmap, MSB-first per byte (the
 // file-wide convention); identical arithmetic to the Template pair.
 bool DStreamConforms(const DStreamRegion& t, uint32_t idx) {
-  return (t.bmp[idx >> 3] >> (7 - (idx & 7))) & 1;
+  return ((t.bmp[idx >> 3] >> (7 - (idx & 7))) & 1) != 0;
 }
 
 uint32_t DStreamSetBefore(const DStreamRegion& t, uint32_t idx) {
@@ -3901,7 +4501,7 @@ uint32_t DStreamSetBefore(const DStreamRegion& t, uint32_t idx) {
   const size_t words = idx >> 6;
   for (; w < words; ++w) {
     uint64_t word = 0;
-    std::memcpy(&word, t.bmp + w * 8, sizeof(word));
+    std::memcpy(&word, t.bmp + (w * 8), sizeof(word));
     set += static_cast<uint32_t>(__builtin_popcountll(word));
   }
   for (size_t b = w * 8; b < idx / 8; ++b) {
@@ -3918,17 +4518,27 @@ uint32_t DStreamSetBefore(const DStreamRegion& t, uint32_t idx) {
 // clen that runs past the stream fails closed.
 bool DStreamRecordAt(const DStreamRegion& t, uint32_t rank, const char** codes,
                      uint32_t* clen) {
-  if (rank >= t.nconf) return false;
+  if (rank >= t.nconf) {
+    return false;
+  }
   const uint32_t block = rank / kDStreamRestart;
-  if (block >= t.ndir) return false;
-  const uint32_t off = ReadBE32(t.dir + static_cast<size_t>(block) * 4);
-  if (off > t.stream_len) return false;
+  if (block >= t.ndir) {
+    return false;
+  }
+  const uint32_t off = ReadBE32(t.dir + (static_cast<size_t>(block) * 4));
+  if (off > t.stream_len) {
+    return false;
+  }
   const char* p = t.stream + off;
   const uint32_t in_block = rank % kDStreamRestart;
   for (uint32_t k = 0; k <= in_block; ++k) {
-    if (p + 1 > t.stream + t.stream_len) return false;
+    if (p + 1 > t.stream + t.stream_len) {
+      return false;
+    }
     const uint32_t len = static_cast<uint8_t>(*p++);
-    if (static_cast<size_t>(t.stream + t.stream_len - p) < len) return false;
+    if (std::cmp_less(t.stream + t.stream_len - p, len)) {
+      return false;
+    }
     if (k == in_block) {
       *codes = p;
       *clen = len;
@@ -3942,12 +4552,16 @@ bool DStreamRecordAt(const DStreamRegion& t, uint32_t rank, const char** codes,
 // Rebuild row idx's string. Returns false on a structural surprise; callers
 // fail closed to "".
 bool DStreamValueAt(const DStreamRegion& t, uint32_t idx, std::string* out) {
-  if (idx >= t.n) return false;
+  if (idx >= t.n) {
+    return false;
+  }
   const uint32_t set_before = DStreamSetBefore(t, idx);
   if (!DStreamConforms(t, idx)) {
     // Rank among the exception strings = clear bits before idx.
     const uint32_t rank = idx - set_before;
-    if (rank >= t.nexc) return false;
+    if (rank >= t.nexc) {
+      return false;
+    }
     const char* q = t.exc;
     for (uint32_t e = 0; e < rank; ++e) {
       q += 4 + ReadBE32(q);
@@ -3959,7 +4573,9 @@ bool DStreamValueAt(const DStreamRegion& t, uint32_t idx, std::string* out) {
   const uint32_t rank = set_before;  // conforming rows ahead of idx
   const char* codes = nullptr;
   uint32_t clen = 0;
-  if (!DStreamRecordAt(t, rank, &codes, &clen)) return false;
+  if (!DStreamRecordAt(t, rank, &codes, &clen)) {
+    return false;
+  }
   out->clear();
   out->reserve(clen);
   for (uint32_t i = 0; i < clen; ++i) {
@@ -3968,7 +4584,9 @@ bool DStreamValueAt(const DStreamRegion& t, uint32_t idx, std::string* out) {
       // Escape: the raw byte follows. A trailing escape with no byte is a
       // structural surprise -- the record walk proved the byte exists
       // inside the stream, but stay defensive.
-      if (i + 1 >= clen) return false;
+      if (i + 1 >= clen) {
+        return false;
+      }
       out->push_back(codes[++i]);
     } else if (c <= t.nsym) {
       out->append(t.sym[c - 1], t.sym_len[c - 1]);
@@ -4011,7 +4629,7 @@ bool DStreamEncodeNeedle(const DStreamRegion& t, std::string_view s,
       pos += 1;
     } else {
       out->push_back(static_cast<char>(static_cast<uint8_t>(hit_code)));
-      pos += static_cast<size_t>(hit);
+      pos += hit;
     }
   }
   return true;
@@ -4046,23 +4664,33 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // extent must be inside the region BEFORE UnpackBitAt. A hostile
       // ncodes (up to 2^16-1) derived cw up to 16 and made idx*cw reach
       // ~131KB past region_end for a trailing cell.
-      if (r + 2 > region_end) return Value(std::string());
+      if (r + 2 > region_end) {
+        return Value(std::string());
+      }
       const uint16_t ncodes = ReadBE16(r);
-      if (ncodes == 0) return Value(std::string());
+      if (ncodes == 0) {
+        return Value(std::string());
+      }
       const int cw = BitsNeeded(ncodes - 1);
       // Layout: [count 2B][packed codes ceil(rows*cw/8) B][dictionary].
       const size_t packed_bits =
           static_cast<size_t>(n) * static_cast<uint64_t>(cw);
-      const size_t dict_base = (packed_bits + 7u) / 8u;
-      if (r + 2 + dict_base > region_end) return Value(std::string());
+      const size_t dict_base = (packed_bits + 7U) / 8U;
+      if (r + 2 + dict_base > region_end) {
+        return Value(std::string());
+      }
       const uint64_t code = UnpackBitAt(
           r + 2, static_cast<uint64_t>(idx) * static_cast<uint64_t>(cw), cw);
       // A cw-wide code can encode values past ncodes (cw rounds up): clamp.
-      if (code >= ncodes) return Value(std::string());
+      if (code >= ncodes) {
+        return Value(std::string());
+      }
       const char* d = r + 2 + dict_base;
       for (uint16_t i = 0; i < code && d + 4 <= region_end; ++i) {
         const uint32_t l = ReadBE32(d);
-        if (d + 4 + l > region_end) return Value(std::string());
+        if (d + 4 + l > region_end) {
+          return Value(std::string());
+        }
         d += sizeof(uint32_t) + l;
       }
       p = d;
@@ -4072,7 +4700,7 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       if (r == nullptr || region_end == nullptr || region_end < r || idx >= n) {
         return Value(std::string());
       }
-      const size_t region_len = static_cast<size_t>(region_end - r);
+      const auto region_len = static_cast<size_t>(region_end - r);
       const FsstDecodeMeta* meta =
           fsst_view != nullptr ? fsst_view->meta : nullptr;
       if (meta == nullptr || !meta->valid || meta->row_count != n) {
@@ -4091,27 +4719,32 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       const uint32_t tsl = meta->stream_len;
       const char* otable = r + meta->offset_table;
       const char* stream = r + meta->stream;
-      const uint32_t code_off = ReadBE32(otable + static_cast<size_t>(idx) * 4);
+      const uint32_t code_off =
+          ReadBE32(otable + (static_cast<size_t>(idx) * 4));
       const uint32_t next_off =
-          (idx + 1 < n) ? ReadBE32(otable + static_cast<size_t>(idx + 1) * 4)
+          (idx + 1 < n) ? ReadBE32(otable + (static_cast<size_t>(idx + 1) * 4))
                         : tsl;
-      if (code_off > next_off || next_off > tsl) return Value(std::string());
+      if (code_off > next_off || next_off > tsl) {
+        return Value(std::string());
+      }
       std::string out;
-      const size_t encoded_len = static_cast<size_t>(next_off - code_off);
+      const auto encoded_len = static_cast<size_t>(next_off - code_off);
       if (encoded_len > out.capacity() && encoded_len <= 65536) {
         out.reserve(encoded_len);
       }
-      const uint8_t* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
-      const uint8_t* end = reinterpret_cast<const uint8_t*>(stream + next_off);
+      const auto* cp = reinterpret_cast<const uint8_t*>(stream + code_off);
+      const auto* end = reinterpret_cast<const uint8_t*>(stream + next_off);
       while (cp < end) {
         const uint8_t code = *cp++;
         if (code == 0) {
-          if (cp >= end) break;
+          if (cp >= end) {
+            break;
+          }
           out.push_back(static_cast<char>(*cp++));
         } else if (code <= nsym) {
           if (fsst_view->symbol_offsets == nullptr ||
               fsst_view->symbol_lengths == nullptr ||
-              static_cast<size_t>(code - 1) >= nsym) {
+              std::cmp_greater_equal(code - 1, nsym)) {
             return Value(std::string());
           }
           const uint32_t soff = fsst_view->symbol_offsets[code - 1];
@@ -4130,31 +4763,43 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // plen chain forward. Every extent is bounded by the region; a
       // hostile plen (past the chained prefix) or slen (past the stream)
       // fails closed to "" exactly like the other varchar clamps.
-      const uint32_t re = param & 0x7FFFu;
-      if (re == 0 || r + 6 > region_end) return Value(std::string());
+      const uint32_t re = param & 0x7FFFU;
+      if (re == 0 || r + 6 > region_end) {
+        return Value(std::string());
+      }
       const uint32_t nrestart = ReadBE16(r);
       const uint32_t stream_len = ReadBE32(r + 2);
       const char* rtable = r + 6;
-      if (rtable + static_cast<size_t>(nrestart) * 4 > region_end)
+      if (rtable + (static_cast<size_t>(nrestart) * 4) > region_end) {
         return Value(std::string());
-      const char* stream = rtable + static_cast<size_t>(nrestart) * 4;
-      if (stream + stream_len > region_end) return Value(std::string());
+      }
+      const char* stream = rtable + (static_cast<size_t>(nrestart) * 4);
+      if (stream + stream_len > region_end) {
+        return Value(std::string());
+      }
       const uint32_t block = idx / re;
-      if (block >= nrestart) return Value(std::string());
-      const uint32_t ro = ReadBE32(rtable + static_cast<size_t>(block) * 4);
-      if (ro > stream_len) return Value(std::string());
+      if (block >= nrestart) {
+        return Value(std::string());
+      }
+      const uint32_t ro = ReadBE32(rtable + (static_cast<size_t>(block) * 4));
+      if (ro > stream_len) {
+        return Value(std::string());
+      }
       const char* send = stream + stream_len;
       const char* q = stream + ro;
       std::string cur;
       for (uint32_t i = block * re; i <= idx; ++i) {
         // One 4B header load covers both halves ([plen u16][slen u16] BE);
         // its extent check subsumes the bare q+4 gate.
-        if (q + 4 > send) return Value(std::string());
+        if (q + 4 > send) {
+          return Value(std::string());
+        }
         const uint32_t hdr = ReadBE32(q);
         const uint32_t plen = hdr >> 16;
-        const uint32_t slen = hdr & 0xFFFFu;
-        if (plen > cur.size() || slen > static_cast<uint64_t>(send - q) - 4U)
+        const uint32_t slen = hdr & 0xFFFFU;
+        if (plen > cur.size() || slen > static_cast<uint64_t>(send - q) - 4U) {
           return Value(std::string());
+        }
         cur.resize(plen);
         cur.append(q + 4, slen);
         q += 4 + slen;
@@ -4166,36 +4811,52 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       // [pool_scheme u8][pool]. Codes come from the inner region; pool 0 is
       // the flat entry list (same walk as kDict), pool 15 is an FSST region
       // whose "rows" are the dictionary entries.
-      if (r + 11 > region_end) return Value(std::string());
+      if (r + 11 > region_end) {
+        return Value(std::string());
+      }
       const uint16_t dx_d = ReadBE16(r);
-      if (dx_d == 0) return Value(std::string());
-      const uint8_t dx_cs = static_cast<uint8_t>(r[2]);
+      if (dx_d == 0) {
+        return Value(std::string());
+      }
+      const auto dx_cs = static_cast<uint8_t>(r[2]);
       const uint32_t dx_cparam = ReadBE32(r + 3);
       const uint64_t dx_clen = ReadBE32(r + 7);
       const char* dx_creg = r + 11;
-      if (dx_clen > static_cast<uint64_t>(region_end - dx_creg)) {
+      if (std::cmp_greater(dx_clen, region_end - dx_creg)) {
         return Value(std::string());
       }
       const char* dx_pool_hdr = dx_creg + dx_clen;
-      if (dx_pool_hdr + 1 > region_end) return Value(std::string());
-      if (!InnerSchemeOk(dx_cs)) return Value(std::string());
-      const uint64_t dx_code = static_cast<uint64_t>(Int64RegionAt(
+      if (dx_pool_hdr + 1 > region_end) {
+        return Value(std::string());
+      }
+      if (!InnerSchemeOk(dx_cs)) {
+        return Value(std::string());
+      }
+      const auto dx_code = static_cast<uint64_t>(Int64RegionAt(
           dx_creg, static_cast<Scheme>(dx_cs), dx_cparam, n, idx, dx_pool_hdr));
-      if (dx_code >= dx_d) return Value(std::string());
-      const uint8_t dx_ps = static_cast<uint8_t>(dx_pool_hdr[0]);
+      if (dx_code >= dx_d) {
+        return Value(std::string());
+      }
+      const auto dx_ps = static_cast<uint8_t>(dx_pool_hdr[0]);
       const char* dx_pool = dx_pool_hdr + 1;
       if (dx_ps == static_cast<uint8_t>(Scheme::kFsst)) {
         // Ordinary FSST region over the dictionary entries (kFsst is a
         // leaf, so this recursion is depth-1 bounded).
-        if (dx_pool + 2 > region_end) return Value(std::string());
+        if (dx_pool + 2 > region_end) {
+          return Value(std::string());
+        }
         return VarcharRegionAt(dx_pool, Scheme::kFsst, ReadBE16(dx_pool), dx_d,
                                static_cast<uint32_t>(dx_code), region_end);
       }
-      if (dx_ps != 0) return Value(std::string());
+      if (dx_ps != 0) {
+        return Value(std::string());
+      }
       const char* dd = dx_pool;
       for (uint64_t i = 0; i < dx_code && dd + 4 <= region_end; ++i) {
         const uint32_t l = ReadBE32(dd);
-        if (dd + 4 + l > region_end) return Value(std::string());
+        if (dd + 4 + l > region_end) {
+          return Value(std::string());
+        }
         dd += sizeof(uint32_t) + l;
       }
       p = dd;
@@ -4209,7 +4870,9 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         return Value(std::string());
       }
       std::string out;
-      if (!TemplateValueAt(t, idx, &out)) return Value(std::string());
+      if (!TemplateValueAt(t, idx, &out)) {
+        return Value(std::string());
+      }
       return Value(std::move(out));
     }
     case Scheme::kDStream: {
@@ -4220,18 +4883,26 @@ Value VarcharRegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
         return Value(std::string());
       }
       std::string out;
-      if (!DStreamValueAt(t, idx, &out)) return Value(std::string());
+      if (!DStreamValueAt(t, idx, &out)) {
+        return Value(std::string());
+      }
       return Value(std::move(out));
     }
     default:
-      return Value();
+      return {};
   }
-  if (p + 4 > region_end) return Value(std::string());
+  if (p + 4 > region_end) {
+    return Value(std::string());
+  }
   const uint32_t len = ReadBE32(p);
-  if (p + 4 + len > region_end) return Value(std::string());
+  if (p + 4 + len > region_end) {
+    return Value(std::string());
+  }
   // Empty varchars must decode as empty kVarChar values, not as nulls --
   // all-empty columns (CONST) and embedded empties (PLAIN/DICT) hit this.
-  if (len == 0) return Value(std::string());
+  if (len == 0) {
+    return Value(std::string());
+  }
   return Value(std::string(p + sizeof(uint32_t), len));
 }
 
@@ -4322,7 +4993,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       // probe on this ~log2(n)-iteration loop.
       uint32_t lo = 0, hi = n;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
+        const uint32_t mid = lo + ((hi - lo) / 2);
         if (Int64AtFast(r, s, param, n, mid, region_end, ef_dir) < key) {
           lo = mid + 1;
         } else {
@@ -4345,7 +5016,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       uint32_t lo = 0;
       uint32_t hi = n;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
+        const uint32_t mid = lo + ((hi - lo) / 2);
         if (RleDeltaValueAt(parsed, mid) < key) {
           lo = mid + 1;
         } else {
@@ -4364,7 +5035,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       uint32_t lo = 0;
       uint32_t hi = n;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
+        const uint32_t mid = lo + ((hi - lo) / 2);
         if (Bp128ValueAt(parsed, mid) < key) {
           lo = mid + 1;
         } else {
@@ -4397,10 +5068,10 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       uint32_t low = 0;
       uint32_t high = p.blocks;
       while (low < high) {
-        const uint32_t mid = low + (high - low) / 2;
-        const int64_t last = static_cast<int64_t>(
+        const uint32_t mid = low + ((high - low) / 2);
+        const auto last = static_cast<int64_t>(
             ReadBE64(p.brackets +
-                     static_cast<size_t>(mid) * kDeltaPForBracketBytes + 8));
+                     (static_cast<size_t>(mid) * kDeltaPForBracketBytes) + 8));
         if (last < key) {
           low = mid + 1;
         } else {
@@ -4414,12 +5085,12 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       const uint32_t start = low * kDeltaPForBlockRows;
       const uint32_t rows =
           std::min<uint32_t>(kDeltaPForBlockRows, p.n - start);
-      int64_t decoded[kDeltaPForBlockRows];
-      DecodeDeltaPForBlock(p, low, decoded);
+      std::array<int64_t, kDeltaPForBlockRows> decoded{};
+      DecodeDeltaPForBlock(p, low, decoded.data());
       uint32_t lo = 0;
       uint32_t hi = rows;
       while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
+        const uint32_t mid = lo + ((hi - lo) / 2);
         if (decoded[mid] < key) {
           lo = mid + 1;
         } else {
@@ -4522,8 +5193,10 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         // The run walk reads 12B per run; a hostile param used to march
         // gigabytes past the region (the region_end the caller supplied
         // was ignored on this path). Mirror Int64RegionAt's gate.
-        if (region_end != nullptr && p + 12 > region_end) break;
-        const int64_t v = static_cast<int64_t>(ReadBE64(p));
+        if (region_end != nullptr && p + 12 > region_end) {
+          break;
+        }
+        const auto v = static_cast<int64_t>(ReadBE64(p));
         const uint64_t len = ReadBE32(p + 8);
         if (v >= key) {
           // A prior hostile run length can push acc past n: "found at n" is
@@ -4563,7 +5236,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         return false;
       }
       const int cb = (BitsNeeded(d - 1) + 7) / 8;
-      const char* runs_hdr = r + 2 + static_cast<size_t>(d) * 8;
+      const char* runs_hdr = r + 2 + (static_cast<size_t>(d) * 8);
       if (region_end != nullptr && runs_hdr + 4 > region_end) {
         *pos = n;
         return false;
@@ -4571,7 +5244,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       const uint32_t runs = ReadBE32(runs_hdr);
       if (region_end != nullptr &&
           runs_hdr + 4 +
-                  static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+                  (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
               region_end) {
         *pos = n;
         return false;
@@ -4581,8 +5254,9 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       uint64_t acc = 0;
       for (uint32_t i = 0; i < runs; ++i) {
         if (region_end != nullptr &&
-            q + static_cast<size_t>(cb) + 4 > region_end)
+            q + static_cast<size_t>(cb) + 4 > region_end) {
           break;
+        }
         uint64_t code = 0;
         for (int b = 0; b < cb; ++b) {
           code =
@@ -4591,7 +5265,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         const int64_t v =
             (code >= d) ? 0
                         : static_cast<int64_t>(
-                              ReadBE64(dict + static_cast<size_t>(code) * 8));
+                              ReadBE64(dict + (static_cast<size_t>(code) * 8)));
         const uint64_t len = ReadBE32(q + cb);
         if (v >= key) {
           if (acc >= n) {
@@ -4619,13 +5293,13 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         *pos = n;
         return false;
       }
-      const uint8_t vs = static_cast<uint8_t>(r[0]);
-      const uint8_t cs = static_cast<uint8_t>(r[1]);
+      const auto vs = static_cast<uint8_t>(r[0]);
+      const auto cs = static_cast<uint8_t>(r[1]);
       const uint32_t runs = ReadBE32(r + 2);
       const uint32_t vparam = ReadBE32(r + 6);
       const uint32_t cparam = ReadBE32(r + 10);
       const uint64_t vlen = ReadBE32(r + 14);
-      if (vlen > static_cast<uint64_t>(region_end - (r + 18)) || runs > n ||
+      if (std::cmp_greater(vlen, region_end - (r + 18)) || runs > n ||
           runs == 0) {
         *pos = n;
         return false;
@@ -4648,7 +5322,7 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
           *pos = static_cast<uint32_t>(acc);
           return true;
         }
-        const uint64_t len = static_cast<uint64_t>(Int64RegionAt(
+        const auto len = static_cast<uint64_t>(Int64RegionAt(
             creg, static_cast<Scheme>(cs), cparam, runs, i, region_end));
         acc += len;
       }
@@ -4673,30 +5347,35 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       // walk bound: this path used to ignore region_end entirely (hostile
       // n/param walked the reads far past the region).
       if (region_end != nullptr &&
-          (r + 8 + static_cast<size_t>(cks) * 8 > region_end ||
-           r + 8 + static_cast<size_t>(cks) * 8 +
+          (r + 8 + (static_cast<size_t>(cks) * 8) > region_end ||
+           r + 8 + (static_cast<size_t>(cks) * 8) +
                    ((static_cast<size_t>(n - 1) * param + 7) / 8) >
                region_end)) {
         *pos = n;
         return false;
       }
       uint32_t ci = 0;
-      while (ci + 1 < cks &&
-             static_cast<int64_t>(
-                 ReadBE64(r + 8 + static_cast<size_t>(ci + 1) * 8)) < key) {
+      while (ci + 1 < cks) {
+        const auto next_ck = static_cast<int64_t>(
+            ReadBE64(r + 8 + (static_cast<size_t>(ci + 1) * 8)));
+        if (next_ck >= key) {
+          break;
+        }
         ++ci;
       }
-      uint64_t v = ReadBE64(r + 8 + static_cast<size_t>(ci) * 8);
+      uint64_t v = ReadBE64(r + 8 + (static_cast<size_t>(ci) * 8));
       uint32_t start = ci * kDeltaCheckpointEvery;
-      if (static_cast<int64_t>(v) >= key) {
+      const auto sv0 = static_cast<int64_t>(v);
+      if (sv0 >= key) {
         *pos = start;
         return true;
       }
-      const char* packed = r + 8 + static_cast<size_t>(cks) * 8;
+      const char* packed = r + 8 + (static_cast<size_t>(cks) * 8);
       for (uint32_t t = start + 1; t < n; ++t) {
         v += UnpackBitAt(packed, static_cast<uint64_t>(t - 1) * param,
                          static_cast<int>(param));
-        if (static_cast<int64_t>(v) >= key) {
+        const auto sv = static_cast<int64_t>(v);
+        if (sv >= key) {
           *pos = t;
           return true;
         }
@@ -4724,9 +5403,10 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       uint32_t lo_b = 1, hi_b = p.nblk;
       if (p.nblk > 1) {
         while (lo_b < hi_b) {
-          const uint32_t mid = lo_b + (hi_b - lo_b) / 2;
-          if (static_cast<int64_t>(
-                  ReadBE64(p.ckpt + 8 * static_cast<size_t>(mid - 1))) < key) {
+          const uint32_t mid = lo_b + ((hi_b - lo_b) / 2);
+          const auto ck_val = static_cast<int64_t>(
+              ReadBE64(p.ckpt + (8 * static_cast<size_t>(mid - 1))));
+          if (ck_val < key) {
             lo_b = mid + 1;
           } else {
             hi_b = mid;
@@ -4763,14 +5443,16 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       }
       uint64_t x = ReadBE64(r);
       const char* packed = r + 8;
-      if (static_cast<int64_t>(x) >= key) {
+      const auto sx0 = static_cast<int64_t>(x);
+      if (sx0 >= key) {
         *pos = 0;
         return true;
       }
       for (uint32_t t = 1; t < n; ++t) {
         x ^= UnpackBitAt(packed, static_cast<uint64_t>(t - 1) * param,
                          static_cast<int>(param));
-        if (static_cast<int64_t>(x) >= key) {
+        const auto sx = static_cast<int64_t>(x);
+        if (sx >= key) {
           *pos = t;
           return true;
         }
@@ -4787,7 +5469,8 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       }
       // Sequential Chimp walk (mirrors the kGorilla case below).
       uint64_t prev = ReadBE64(r);
-      if (static_cast<int64_t>(prev) >= key) {
+      const auto sp0 = static_cast<int64_t>(prev);
+      if (sp0 >= key) {
         *pos = 0;
         return true;
       }
@@ -4800,21 +5483,23 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
           const int width = 64 - pl_z - pt_z;
           if (width > 0 && width <= 64) {
             uint64_t m = 0;
-            for (int k = 0; k < width; ++k)
+            for (int k = 0; k < width; ++k) {
               m = (m << 1) | static_cast<uint64_t>(br.get1());
+            }
             prev ^= (m << pt_z);
           }
         } else {
           const int lz = static_cast<int>(br.get(5));
           const int tz = static_cast<int>(br.get(6));
           int mw = 64 - lz - tz;
-          if (mw < 1) mw = 1;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 1);
+          mw = std::min(mw, 64);
           prev ^= (mw >= 64 ? br.get(mw) : (br.get(mw) << tz));
           pl_z = lz;
           pt_z = tz;
         }
-        if (static_cast<int64_t>(prev) >= key) {
+        const auto sp = static_cast<int64_t>(prev);
+        if (sp >= key) {
           *pos = t;
           return true;
         }
@@ -4830,23 +5515,25 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         return false;
       }
       uint64_t prev = ReadBE64(r);
-      if (static_cast<int64_t>(prev) >= key) {
+      const auto sp0 = static_cast<int64_t>(prev);
+      if (sp0 >= key) {
         *pos = 0;
         return true;
       }
       BitReader br(r + 8, region_end);
       for (uint32_t t = 1; t < n; ++t) {
-        if (br.get1()) {
+        if (br.get1() != 0) {
           const int lz = static_cast<int>(br.get(5));
           const int tz = static_cast<int>(br.get(6));
           // Same corrupt-stream clamp as Int64RegionAt (mw >= 0).
           int mw = 64 - lz - tz;
-          if (mw < 0) mw = 0;
-          if (mw > 64) mw = 64;
+          mw = std::max(mw, 0);
+          mw = std::min(mw, 64);
           const uint64_t m = br.get(mw);
           prev ^= (mw >= 64 ? m : (m << tz));
         }
-        if (static_cast<int64_t>(prev) >= key) {
+        const auto sp = static_cast<int64_t>(prev);
+        if (sp >= key) {
           *pos = t;
           return true;
         }
@@ -4868,11 +5555,11 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       }
       const uint32_t ncp = ReadBE16(r);
       if (ncp == 0 || (region_end != nullptr &&
-                       r + 3 + static_cast<size_t>(ncp) * 8 > region_end)) {
+                       r + 3 + (static_cast<size_t>(ncp) * 8) > region_end)) {
         *pos = n;
         return false;
       }
-      const char* packed = r + 3 + static_cast<size_t>(ncp) * 8;
+      const char* packed = r + 3 + (static_cast<size_t>(ncp) * 8);
       if (region_end != nullptr &&
           packed + ((static_cast<size_t>(n - 1) * param + 7) / 8) >
               region_end) {
@@ -4880,19 +5567,21 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         return false;
       }
       uint64_t x = ReadBE64(r + 2);
-      if (static_cast<int64_t>(x) >= key) {
+      const auto sx0 = static_cast<int64_t>(x);
+      if (sx0 >= key) {
         *pos = 0;
         return true;
       }
       for (uint32_t t = 1; t < n; ++t) {
         if (t % kDeltaCheckpointEvery == 0 && t / kDeltaCheckpointEvery < ncp) {
           x = ReadBE64(r + 2 +
-                       static_cast<size_t>(t / kDeltaCheckpointEvery) * 8);
+                       (static_cast<size_t>(t / kDeltaCheckpointEvery) * 8));
         } else {
           x ^= UnpackBitAt(packed, static_cast<uint64_t>(t - 1) * param,
                            static_cast<int>(param));
         }
-        if (static_cast<int64_t>(x) >= key) {
+        const auto sx = static_cast<int64_t>(x);
+        if (sx >= key) {
           *pos = t;
           return true;
         }
@@ -4916,15 +5605,16 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       const uint32_t ncp = ReadBE16(r);
       if (ncp == 0 ||
           (region_end != nullptr &&
-           r + 2 + static_cast<size_t>(ncp) * 12 + 8 > region_end)) {
+           r + 2 + (static_cast<size_t>(ncp) * 12) + 8 > region_end)) {
         *pos = n;
         return false;
       }
       const char* ck = r + 2;
       // +8 skips the redundant [first u64] word after the offset table.
-      const char* stream = ck + static_cast<size_t>(ncp) * 12 + 8;
+      const char* stream = ck + (static_cast<size_t>(ncp) * 12) + 8;
       uint64_t prev = ReadBE64(ck);
-      if (static_cast<int64_t>(prev) >= key) {
+      const auto sp0 = static_cast<int64_t>(prev);
+      if (sp0 >= key) {
         *pos = 0;
         return true;
       }
@@ -4935,12 +5625,12 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       // consumes them all; the tables serve random access only.
       for (uint32_t t = 1; t < n; ++t) {
         if (s == Scheme::kGorillaC) {
-          if (br.get1()) {
+          if (br.get1() != 0) {
             const int lz = static_cast<int>(br.get(5));
             const int tz = static_cast<int>(br.get(6));
             int mw = 64 - lz - tz;
-            if (mw < 0) mw = 0;
-            if (mw > 64) mw = 64;
+            mw = std::max(mw, 0);
+            mw = std::min(mw, 64);
             const uint64_t m = br.get(mw);
             prev ^= (mw >= 64 ? m : (m << tz));
           }
@@ -4950,23 +5640,25 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
               const int width = 64 - pl_z - pt_z;
               if (width > 0 && width <= 64) {
                 uint64_t m = 0;
-                for (int k = 0; k < width; ++k)
+                for (int k = 0; k < width; ++k) {
                   m = (m << 1) | static_cast<uint64_t>(br.get1());
+                }
                 prev ^= (m << pt_z);
               }
             } else {
               const int lz = static_cast<int>(br.get(5));
               const int tz = static_cast<int>(br.get(6));
               int mw = 64 - lz - tz;
-              if (mw < 1) mw = 1;
-              if (mw > 64) mw = 64;
+              mw = std::max(mw, 1);
+              mw = std::min(mw, 64);
               prev ^= (mw >= 64 ? br.get(mw) : (br.get(mw) << tz));
               pl_z = lz;
               pt_z = tz;
             }
           }
         }
-        if (static_cast<int64_t>(prev) >= key) {
+        const auto sp = static_cast<int64_t>(prev);
+        if (sp >= key) {
           *pos = t;
           return true;
         }

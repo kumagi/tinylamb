@@ -1876,11 +1876,16 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     const auto& select = static_cast<const SelectStatement&>(*statement);
     const auto literal = [&](const auto& self,
                              const Expression& expression) -> bool {
-      if (!expression) return false;
-      if (expression->Type() == TypeTag::kConstantValue) return true;
-      if (expression->Type() != TypeTag::kBinaryExp &&
-          expression->Type() != TypeTag::kUnaryExp)
+      if (!expression) {
         return false;
+      }
+      if (expression->Type() == TypeTag::kConstantValue) {
+        return true;
+      }
+      if (expression->Type() != TypeTag::kBinaryExp &&
+          expression->Type() != TypeTag::kUnaryExp) {
+        return false;
+      }
       return std::ranges::all_of(
           ExpressionChildren(expression),
           [&](const Expression& child) { return self(self, child); });
@@ -3717,7 +3722,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
   // LEFT-join row loss with residual-rejected pairs, was root-fixed in
   // TryFusedGroupedJoin).  TINYLAMB_GROUPED_ROUTE=cascades restores the
   // old Cascades-first order.
-  static const bool grouped_route_relational = [] {
+  const bool grouped_route_relational = [] {
     const char* route = std::getenv("TINYLAMB_GROUPED_ROUTE");
     return route == nullptr || std::string_view(route) != "cascades";
   }();
@@ -4812,7 +4817,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         if (column.GetConstraint().ctype == Constraint::kDefault) {
           return column.GetConstraint().value;
         }
-        return Value();
+        return {};
       };
       if (insert.Query() != nullptr) {
         // INSERT ... SELECT: materialize the source query, then feed its
@@ -5554,8 +5559,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           !select->ForUpdate() && BytecodeEnabled() &&
           std::ranges::all_of(select->SelectList(), [](const auto& item) {
             if (!item.expression ||
-                item.expression->Type() != TypeTag::kAggregateExp)
+                item.expression->Type() != TypeTag::kAggregateExp) {
               return false;
+            }
             const auto& aggregate = item.expression->AsAggregateExpression();
             const auto type = aggregate.GetType();
             return !aggregate.Distinct() && !aggregate.HasWhereFilter() &&
@@ -5589,8 +5595,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                        (!select->WhereClause() ||
                         program->ResultType() == ValueType::kInt64 ||
                         large_lstable);
-              }))
+              })) {
             return emit_relational();
+          }
         }
       }
 
@@ -6332,7 +6339,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         // only the immutable plan is shared, never an aggregate result.
         const auto scalar_read_expression =
             [&](auto&& self, const Expression& expression) -> bool {
-          if (!expression) return true;
+          if (!expression) {
+            return true;
+          }
           switch (expression->Type()) {
             case TypeTag::kColumnValue:
             case TypeTag::kConstantValue:
@@ -6342,15 +6351,17 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
             case TypeTag::kAggregateExp: {
               const auto& aggregate = expression->AsAggregateExpression();
               if (aggregate.HasWhereFilter() || aggregate.NeedsGroupContext() ||
-                  aggregate.HasInnerGroupBy())
+                  aggregate.HasInnerGroupBy()) {
                 return false;
+              }
               const auto kind = aggregate.GetType();
               if (kind != AggregationType::kCount &&
                   kind != AggregationType::kSum &&
                   kind != AggregationType::kMin &&
                   kind != AggregationType::kMax &&
-                  kind != AggregationType::kAvg)
+                  kind != AggregationType::kAvg) {
                 return false;
+              }
               break;
             }
             default:

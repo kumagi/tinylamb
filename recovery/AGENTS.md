@@ -19,11 +19,12 @@ commit-filtered fuzzy crash recovery.
   identifies committed transactions (`kCommit`) and replays only committed
   records in LSN order (`PageManager::ReplayCommittedRecord`). Uncommitted
   loser transactions are naturally ignored without undo passes or CLRs.
-- `checkpoint_manager.{hpp,cpp}` — lock-free fuzzy checkpoint: captures
-  `oldest_active_first_lsn`, appends `BeginCheckpointLogRecord`, snapshots
-  committed block/LSM state via `PageManager::WriteFuzzyCheckpoint`, writes
-  `.last_checkpoint` atomically, and recycles WAL segments below
-  `replay_start_lsn`.
+- `checkpoint_manager.{hpp,cpp}` — compaction-driven persistence: triggered by
+  LSM-Tree flush/compaction or committed mutation threshold (no idle periodic
+  WAL writes or `.last_checkpoint` sidecar), captures `oldest_active_first_lsn`,
+  persists compacted committed block/LSM state and `replay_start_lsn` to
+  `<db>.db` via `PageManager::WriteFuzzyCheckpoint`, and recycles WAL segments
+  below `replay_start_lsn`.
 
 Test: `./build/logger_test`, `logger_segment_test`, `recovery_manager_test`,
 `checkpoint_manager_test`.

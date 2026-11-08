@@ -189,17 +189,17 @@ std::string FormatCivilTime(const CivilTime& ct) {
       // NOLINTNEXTLINE(cert-err33-c)
       snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
                ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos / 1000000);
+               static_cast<long>(ct.subsecond_nanos / 1000000));
     } else if (ct.subsecond_nanos % 1000 == 0) {
       // NOLINTNEXTLINE(cert-err33-c)
       snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
                ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos / 1000);
+               static_cast<long>(ct.subsecond_nanos / 1000));
     } else {
       // NOLINTNEXTLINE(cert-err33-c)
       snprintf(buf.data(), buf.size(), "%04d-%02d-%02d %02d:%02d:%02d.%09ld",
                ct.year, ct.month, ct.day, ct.hour, ct.minute, ct.second,
-               ct.subsecond_nanos);
+               static_cast<long>(ct.subsecond_nanos));
     }
   } else {
     // NOLINTNEXTLINE(cert-err33-c)
@@ -1537,16 +1537,17 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                   // NOLINTNEXTLINE(cert-err33-c)
                   snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
                            ct.hour, ct.minute, ct.second,
-                           ct.subsecond_nanos / 1000000);
+                           static_cast<long>(ct.subsecond_nanos / 1000000));
                 } else if (ct.subsecond_nanos % 1000 == 0) {
                   // NOLINTNEXTLINE(cert-err33-c)
                   snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
                            ct.hour, ct.minute, ct.second,
-                           ct.subsecond_nanos / 1000);
+                           static_cast<long>(ct.subsecond_nanos / 1000));
                 } else {
                   // NOLINTNEXTLINE(cert-err33-c)
                   snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
-                           ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+                           ct.hour, ct.minute, ct.second,
+                           static_cast<long>(ct.subsecond_nanos));
                 }
               } else {
                 // NOLINTNEXTLINE(cert-err33-c)
@@ -1568,16 +1569,17 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                 // NOLINTNEXTLINE(cert-err33-c)
                 snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%03ld",
                          ct.hour, ct.minute, ct.second,
-                         ct.subsecond_nanos / 1000000);
+                         static_cast<long>(ct.subsecond_nanos / 1000000));
               } else if (ct.subsecond_nanos % 1000 == 0) {
                 // NOLINTNEXTLINE(cert-err33-c)
                 snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%06ld",
                          ct.hour, ct.minute, ct.second,
-                         ct.subsecond_nanos / 1000);
+                         static_cast<long>(ct.subsecond_nanos / 1000));
               } else {
                 // NOLINTNEXTLINE(cert-err33-c)
                 snprintf(buf.data(), buf.size(), "%02d:%02d:%02d.%09ld",
-                         ct.hour, ct.minute, ct.second, ct.subsecond_nanos);
+                         ct.hour, ct.minute, ct.second,
+                         static_cast<long>(ct.subsecond_nanos));
               }
             } else {
               // NOLINTNEXTLINE(cert-err33-c)

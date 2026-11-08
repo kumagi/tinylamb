@@ -1483,10 +1483,12 @@ SearchEngine::OptimizeGroup(  // NOLINT(misc-no-recursion) // Cascades
         --prefix;
         auto partial = child_properties;
         partial[0].ordering.resize(prefix);
-        if (!partial[0].sort_ascending.empty())
+        if (!partial[0].sort_ascending.empty()) {
           partial[0].sort_ascending.resize(prefix);
-        if (!partial[0].sort_nulls_first.empty())
+        }
+        if (!partial[0].sort_nulls_first.empty()) {
           partial[0].sort_nulls_first.resize(prefix);
+        }
         property_sets.push_back(std::move(partial));
       }
     }

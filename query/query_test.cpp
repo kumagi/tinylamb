@@ -863,7 +863,7 @@ TEST_F(QueryTest, SqlEngineForUpdateRejectsUnlockableShapes) {
   RunSql(ctx, *db_, "CREATE TABLE fu_bad (k INT64, v INT64);");
   RunSql(ctx, *db_, "INSERT INTO fu_bad VALUES (1, 10), (2, 20);");
   SqlEngine engine(*db_);
-  for (const std::string& sql :
+  for (const char* sql :
        {"SELECT COUNT(*) FROM fu_bad FOR UPDATE;",
         "SELECT k FROM fu_bad GROUP BY k FOR UPDATE;",
         "SELECT DISTINCT k FROM fu_bad FOR UPDATE;",

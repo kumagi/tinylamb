@@ -95,10 +95,10 @@ Crc32CRawHardwareChained(uint32_t crc, const uint8_t* p, size_t n) {
 // P[i] = P[i-1] squared covers any k with at most popcount(k) applies and no
 // per-size state (page checksum spans vary per page fill; a size-keyed cache
 // rebuilt 32-chain CRCs per unseen span and stormed on diverse fills).
-[[nodiscard]] inline const std::array<AdvanceMatrix, 24>& AdvancePowers() {
-  static const std::array<AdvanceMatrix, 24> powers = [] {
+[[nodiscard]] inline const std::array<AdvanceMatrix, 64>& AdvancePowers() {
+  static const std::array<AdvanceMatrix, 64> powers = [] {
     std::vector<uint8_t> one_zero(1, 0);
-    std::array<AdvanceMatrix, 24> p{};
+    std::array<AdvanceMatrix, 64> p{};
     for (uint32_t j = 0; j < 32; ++j) {
       p[0].col[j] =
           Crc32CRawHardwareChained(1U << j, one_zero.data(), one_zero.size());

@@ -17,6 +17,7 @@
 #include "recovery/checkpoint_manager.hpp"
 
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -158,6 +159,54 @@ TEST_F(CheckpointManagerTest,
   EXPECT_EQ(idx.Read(check, "k_post").MoveValue(), "v_post");
   EXPECT_EQ(idx.Read(check, "k_inflight_lose").GetStatus(), Status::kNotExists);
   ASSERT_SUCCESS(check.PreCommit());
+}
+
+TEST_F(CheckpointManagerTest,
+       CompactionShortensWalReplayWithoutCheckpointSidecar) {
+  page_id_t lsm_root = 0;
+  {
+    Transaction t1 = tm_->Begin();
+    ASSIGN_OR_ASSERT_FAIL(LsmIndex, idx, LsmIndex::Open(t1));
+    lsm_root = idx.Root();
+    for (int i = 0; i < 32; ++i) {
+      ASSERT_SUCCESS(
+          idx.Insert(t1, "k" + std::to_string(i), "v" + std::to_string(i)));
+    }
+    ASSERT_SUCCESS(t1.PreCommit());
+  }
+
+  const lsn_t wal_before_ckpt = logger_->BufferedLSN();
+  ASSIGN_OR_ASSERT_FAIL(lsn_t, replay_start, cm_->WriteCheckpoint());
+  // Compaction persistence does not append a kBeginCheckpoint record to WAL
+  // and does not create a .last_checkpoint sidecar file.
+  EXPECT_EQ(logger_->BufferedLSN(), wal_before_ckpt);
+  EXPECT_EQ(replay_start, wal_before_ckpt);
+  EXPECT_FALSE(std::filesystem::exists(prefix_ + ".last_checkpoint"));
+
+  // Simulate crash and recover with checkpoint_lsn = 0 (loaded from .db).
+  ASSERT_SUCCESS(logger_->WaitForDurable(logger_->BufferedLSN()));
+  pm_->DropAllPages();
+  Open(0);
+
+  // Next transaction ID must advance past pre-compaction transactions even
+  // though Pass 1 started at replay_start == LogEnd().
+  Transaction check = tm_->Begin();
+  EXPECT_GT(check.ID(), 1U);
+  LsmIndex idx(lsm_root);
+  for (int i = 0; i < 32; ++i) {
+    EXPECT_EQ(idx.Read(check, "k" + std::to_string(i)).MoveValue(),
+              "v" + std::to_string(i));
+  }
+  ASSERT_SUCCESS(check.PreCommit());
+}
+
+TEST_F(CheckpointManagerTest, RapidConstructAndStopDoesNotLoseWakeup) {
+  for (int i = 0; i < 64; ++i) {
+    CheckpointManager transient(prefix_ + "_transient.db", tm_.get(), pm_.get(),
+                                5);
+    transient.Start();
+    transient.Stop();
+  }
 }
 
 }  // namespace

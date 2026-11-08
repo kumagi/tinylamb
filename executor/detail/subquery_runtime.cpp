@@ -576,14 +576,16 @@ std::optional<ScanRuntimeFilter> CorrelationDomainFilter(
 // one runtime, so rebuilding the AST walk per probe (Q22: ~61K) is waste.
 bool CacheEntryIsCurrent(const SelectStatement& statement,
                          ExecutionRuntime& runtime) {
-  const auto memo = runtime.fingerprint_memo.find(&statement);
-  const std::string* fresh_ptr =
-      memo != runtime.fingerprint_memo.end()
-          ? &memo->second
-          : &runtime.fingerprint_memo
-                 .emplace(&statement, statement.Fingerprint())
-                 .first->second;
-  const std::string& fresh = *fresh_ptr;
+  const uint64_t id = statement.RuntimeId();
+  auto memo = runtime.fingerprint_memo.find(&statement);
+  if (memo != runtime.fingerprint_memo.end() && memo->second.first != id) {
+    memo->second = {id, statement.Fingerprint()};
+  } else if (memo == runtime.fingerprint_memo.end()) {
+    memo = runtime.fingerprint_memo
+               .emplace(&statement, std::make_pair(id, statement.Fingerprint()))
+               .first;
+  }
+  const std::string& fresh = memo->second.second;
   const auto [it, inserted] =
       runtime.cache_fingerprints.try_emplace(&statement, fresh);
   if (!inserted && it->second != fresh) {
@@ -595,6 +597,11 @@ bool CacheEntryIsCurrent(const SelectStatement& statement,
 
 void DropCacheEntry(ExecutionRuntime& runtime, const SelectStatement* key) {
   runtime.cache_fingerprints.erase(key);
+  runtime.fingerprint_memo.erase(key);
+  runtime.uncorrelated_key_memo.erase(key);
+  runtime.volatile_memo.erase(key);
+  runtime.noncacheable_queries.erase(key);
+  runtime.unindexable_queries.erase(key);
 }
 
 namespace {
@@ -2282,7 +2289,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     const Value& probe = outer_value.Value();
     if (probe.IsNull()) {
       index->null_parameter_seen = true;
-      if (exists_only && exists_answer) {
+      if (exists_only && (exists_answer != nullptr)) {
         *exists_answer = false;
         return Relation{};
       }
@@ -2297,7 +2304,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
     index->parameter_int_keys_seen.insert(probe.value.int_value);
     const bool found = index->exists_keys.contains(probe.value.int_value);
-    if (exists_only && exists_answer) {
+    if (exists_only && (exists_answer != nullptr)) {
       *exists_answer = found;
       return Relation{};
     }
@@ -2733,12 +2740,13 @@ bool StatementContainsVolatileFunctionCached(ExecutionRuntime* runtime,
   if (runtime == nullptr) {
     return StatementContainsVolatileFunction(statement);
   }
-  const auto [it, inserted] =
-      runtime->volatile_memo.try_emplace(&statement, false);
-  if (inserted) {
-    it->second = StatementContainsVolatileFunction(statement);
+  const uint64_t id = statement.RuntimeId();
+  auto [it, inserted] =
+      runtime->volatile_memo.try_emplace(&statement, id, false);
+  if (inserted || it->second.first != id) {
+    it->second = {id, StatementContainsVolatileFunction(statement)};
   }
-  return it->second;
+  return it->second.second;
 }
 
 std::string UncorrelatedCacheKey(const SelectStatement& statement,
@@ -2913,17 +2921,25 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
     DropCacheEntry(*context.execution_runtime(), &statement);
     context.execution_runtime()->uncorrelated_results.erase(cached);
   }
-  const auto key_memo =
+  const uint64_t stmt_id = statement.RuntimeId();
+  auto key_memo =
       context.execution_runtime()->uncorrelated_key_memo.find(&statement);
-  const std::string* key_ptr =
-      key_memo != context.execution_runtime()->uncorrelated_key_memo.end()
-          ? &key_memo->second
-          : &context.execution_runtime()
-                 ->uncorrelated_key_memo
-                 .emplace(&statement,
-                          UncorrelatedCacheKey(statement, ctes, exists_only))
-                 .first->second;
-  const std::string& structural_key = *key_ptr;
+  if (key_memo != context.execution_runtime()->uncorrelated_key_memo.end() &&
+      key_memo->second.first != stmt_id) {
+    key_memo->second = {stmt_id,
+                        UncorrelatedCacheKey(statement, ctes, exists_only)};
+  } else if (key_memo ==
+             context.execution_runtime()->uncorrelated_key_memo.end()) {
+    key_memo =
+        context.execution_runtime()
+            ->uncorrelated_key_memo
+            .emplace(&statement,
+                     std::make_pair(
+                         stmt_id,
+                         UncorrelatedCacheKey(statement, ctes, exists_only)))
+            .first;
+  }
+  const std::string& structural_key = key_memo->second.second;
   if (const auto structural =
           context.execution_runtime()->uncorrelated_results_by_fingerprint.find(
               structural_key);
@@ -3025,8 +3041,10 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
       execution_statement = capped.get();
     }
   }
-  if (capped_by_limit) {
+  if (capped) {
     context.execution_runtime()->retained_statements.push_back(capped);
+  }
+  if (capped_by_limit) {
     ++context.execution_runtime()->exists_short_circuit_queries;
   }
   StatusOr<Relation> executed =

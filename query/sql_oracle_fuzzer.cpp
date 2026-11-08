@@ -1196,12 +1196,44 @@ std::vector<std::string> GenWindowProbes(Gen& g, const std::string& tab) {
 // Engine helpers.
 // ---------------------------------------------------------------------------
 
+struct ScopedEnv {
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* prev = std::getenv(name)) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    if (value != nullptr) {
+      setenv(name, value, 1);
+    } else {
+      unsetenv(name);
+    }
+  }
+  ~ScopedEnv() {
+    if (had_prev_) {
+      setenv(name_, prev_.c_str(), 1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+  ScopedEnv(ScopedEnv&&) = delete;
+  ScopedEnv& operator=(ScopedEnv&&) = delete;
+
+  const char* name_;
+  bool had_prev_{false};
+  std::string prev_;
+};
+
 // Executes a SELECT and returns its rows.  nullopt means the engine rejected
 // the query (skip the oracle).
-std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
-                                        const std::string& sql,
-                                        std::string* error) {
+std::optional<std::vector<Row>> RunRowsMode(Database& db,
+                                            TransactionContext& ctx,
+                                            const std::string& sql,
+                                            bool force_relational,
+                                            std::string* error) {
   SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
     *error = engine.LastError();
@@ -1217,6 +1249,12 @@ std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
     return std::nullopt;
   }
   return rows;
+}
+
+std::optional<std::vector<Row>> RunRows(Database& db, TransactionContext& ctx,
+                                        const std::string& sql,
+                                        std::string* error) {
+  return RunRowsMode(db, ctx, sql, /*force_relational=*/false, error);
 }
 
 std::vector<std::string> SerializeSorted(const std::vector<Row>& rows) {
@@ -1670,6 +1708,9 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
       return false;
     }
   }
+  if (!t.table.empty()) {
+    RunUpdate(db, ctx, "ANALYZE " + t.table + ";");
+  }
   auto after = RunScalar(db, ctx, t.index_probe, &error);
   if (!after.has_value()) {
     if (verbose) {
@@ -1677,15 +1718,173 @@ bool CheckIdx(Database& db, TransactionContext& ctx, const OracleTrace& t,
     }
     return false;
   }
-  if (*before == *after) {
+  if (*before != *after) {
+    *report += "[INDEX MISMATCH]\n";
+    *report += "  before: " + t.index_probe + " => " + *before + "\n";
+    for (const std::string& ddl : t.index_ddl) {
+      *report += "  ddl:    " + ddl + "\n";
+    }
+    *report += "  after:  " + t.index_probe + " => " + *after + "\n";
     return true;
   }
-  *report += "[INDEX MISMATCH]\n";
-  *report += "  before: " + t.index_probe + " => " + *before + "\n";
-  for (const std::string& ddl : t.index_ddl) {
-    *report += "  ddl:    " + ddl + "\n";
+  // Also verify that composite xmode_probes return identical results on the
+  // newly indexed + analyzed table vs relational AST fallback.
+  for (const std::string& sql : t.xmode_probes) {
+    std::string ref_err;
+    std::optional<std::vector<Row>> ref_rows;
+    {
+      ScopedEnv bc("TINYLAMB_DISABLE_BYTECODE", "1");
+      ScopedEnv fsa("TINYLAMB_FUSE_SIBLING_AGG", "0");
+      ref_rows = RunRowsMode(db, ctx, sql, /*force_relational=*/true, &ref_err);
+    }
+    if (!ref_rows.has_value()) {
+      continue;
+    }
+    std::string idx_err;
+    auto idx_rows =
+        RunRowsMode(db, ctx, sql, /*force_relational=*/false, &idx_err);
+    if (!idx_rows.has_value()) {
+      continue;
+    }
+    const std::vector<std::string> s_ref = SerializeSorted(*ref_rows);
+    const std::vector<std::string> s_idx = SerializeSorted(*idx_rows);
+    if (s_ref != s_idx) {
+      *report += "[XMODE-INDEXED MISMATCH]\n";
+      *report += "  query: " + sql + "\n";
+      for (const std::string& ddl : t.index_ddl) {
+        *report += "  ddl:   " + ddl + "\n";
+      }
+      *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                 DumpRows(s_ref);
+      *report += "  actual (" + std::to_string(s_idx.size()) + "):\n" +
+                 DumpRows(s_idx);
+      return true;
+    }
   }
-  *report += "  after:  " + t.index_probe + " => " + *after + "\n";
+  return true;
+}
+
+// Cross-mode / cross-engine differential oracle: compares composite queries
+// across (1) unindexed relational AST fallback (TINYLAMB_DISABLE_BYTECODE=1,
+// TINYLAMB_FUSE_SIBLING_AGG=0, SetForceRelationalFallback(true)), (2) default
+// Cascades/Relational + Bytecode/JIT, (3) Cascades GROUP BY route
+// (TINYLAMB_GROUPED_ROUTE=cascades), and (4) USING lstable PAX columnar tables
+// after ANALYZE.
+bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
+                std::string* report, bool verbose) {
+  if (t.xmode_probes.empty() || t.table.empty()) {
+    return true;
+  }
+  const std::string tab = t.table;
+  const std::string tab_lst = tab + "l";
+  auto substitute_lst = [&tab, &tab_lst](std::string sql) {
+    size_t pos = 0;
+    while ((pos = sql.find(tab, pos)) != std::string::npos) {
+      sql.replace(pos, tab.size(), tab_lst);
+      pos += tab_lst.size();
+    }
+    return sql;
+  };
+
+  // Build PAX columnar (USING lstable) mirror tables and ANALYZE them using a
+  // single INSERT ... SELECT per table instead of re-parsing every row INSERT.
+  bool lst_ready = true;
+  for (const std::string& sql : t.setup) {
+    if (!sql.starts_with("CREATE TABLE ") || !sql.ends_with(";")) {
+      continue;
+    }
+    const size_t name_start = std::string("CREATE TABLE ").size();
+    const size_t name_end = sql.find(' ', name_start);
+    if (name_end == std::string::npos) {
+      continue;
+    }
+    const std::string orig_tab = sql.substr(name_start, name_end - name_start);
+    std::string lsql = substitute_lst(sql);
+    lsql.pop_back();
+    lsql += " USING lstable;";
+    const std::string ltab = substitute_lst(orig_tab);
+    std::string ins_sql = "INSERT INTO ";
+    ins_sql += ltab;
+    ins_sql += " SELECT * FROM ";
+    ins_sql += orig_tab;
+    ins_sql += ";";
+    if (!RunUpdate(db, ctx, lsql) || !RunUpdate(db, ctx, ins_sql) ||
+        !RunUpdate(db, ctx, "ANALYZE " + ltab + ";")) {
+      lst_ready = false;
+      break;
+    }
+  }
+
+  for (const std::string& sql : t.xmode_probes) {
+    std::string error;
+    std::optional<std::vector<Row>> ref_rows;
+    {
+      ScopedEnv bc("TINYLAMB_DISABLE_BYTECODE", "1");
+      ScopedEnv fsa("TINYLAMB_FUSE_SIBLING_AGG", "0");
+      ref_rows = RunRowsMode(db, ctx, sql, /*force_relational=*/true, &error);
+    }
+    if (!ref_rows.has_value()) {
+      if (verbose) {
+        std::cerr << "[sql_oracle][xmode-ref-skip] " << error << " :: " << sql
+                  << "\n";
+      }
+      continue;
+    }
+    const std::vector<std::string> s_ref = SerializeSorted(*ref_rows);
+
+    // Mode A: default Cascades/Relational + Bytecode/JIT + Sibling Agg Fusion.
+    if (auto opt_rows =
+            RunRowsMode(db, ctx, sql, /*force_relational=*/false, &error);
+        opt_rows.has_value()) {
+      const std::vector<std::string> s_opt = SerializeSorted(*opt_rows);
+      if (s_opt != s_ref) {
+        *report += "[XMODE-OPT MISMATCH]\n";
+        *report += "  query: " + sql + "\n";
+        *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                   DumpRows(s_ref);
+        *report += "  actual (" + std::to_string(s_opt.size()) + "):\n" +
+                   DumpRows(s_opt);
+        return true;
+      }
+    }
+
+    // Mode B: Cascades GROUP BY route (TINYLAMB_GROUPED_ROUTE=cascades).
+    {
+      ScopedEnv gr("TINYLAMB_GROUPED_ROUTE", "cascades");
+      if (auto cas_rows =
+              RunRowsMode(db, ctx, sql, /*force_relational=*/false, &error);
+          cas_rows.has_value()) {
+        const std::vector<std::string> s_cas = SerializeSorted(*cas_rows);
+        if (s_cas != s_ref) {
+          *report += "[XMODE-CASCADES MISMATCH]\n";
+          *report += "  query: " + sql + "\n";
+          *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                     DumpRows(s_ref);
+          *report += "  actual (" + std::to_string(s_cas.size()) + "):\n" +
+                     DumpRows(s_cas);
+          return true;
+        }
+      }
+    }
+
+    // Mode C: USING lstable PAX columnar store + ANALYZE.
+    if (lst_ready) {
+      if (auto lst_rows = RunRowsMode(db, ctx, substitute_lst(sql),
+                                      /*force_relational=*/false, &error);
+          lst_rows.has_value()) {
+        const std::vector<std::string> s_lst = SerializeSorted(*lst_rows);
+        if (s_lst != s_ref) {
+          *report += "[XMODE-LSTABLE MISMATCH]\n";
+          *report += "  query: " + sql + "\n";
+          *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                     DumpRows(s_ref);
+          *report += "  actual (" + std::to_string(s_lst.size()) + "):\n" +
+                     DumpRows(s_lst);
+          return true;
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -1834,9 +2033,9 @@ bool CheckWindow(Database& db, TransactionContext& ctx, const OracleTrace& t,
 
 // Skip-scan distinct: COUNT(DISTINCT c) / DISTINCT c with and without an
 // index on c must agree, with and without a WHERE predicate.
-bool CheckSkip(Database& db, const OracleTrace& t, std::string* report,
-               bool /*verbose*/) {
-  if (t.skip_probes.empty()) {
+bool CheckSkip(Database& db, TransactionContext& ctx, const OracleTrace& t,
+               std::string* report, bool /*verbose*/) {
+  if (t.skip_probes.empty() || t.setup.empty()) {
     return true;
   }
   const std::string tab2 = t.table + "k";
@@ -1861,11 +2060,10 @@ bool CheckSkip(Database& db, const OracleTrace& t, std::string* report,
     }
     return out;
   };
-  TransactionContext ctx = db.BeginContext();
-  for (const std::string& sql : t.setup) {
-    if (!RunUpdate(db, ctx, substitute(sql))) {
-      return true;
-    }
+  if (!RunUpdate(db, ctx, substitute(t.setup[0])) ||
+      !RunUpdate(db, ctx,
+                 "INSERT INTO " + tab2 + " SELECT * FROM " + t.table + ";")) {
+    return true;
   }
   std::vector<std::pair<std::string, std::string>> before;
   for (const std::string& probe : t.skip_probes) {
@@ -1969,9 +2167,9 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
     return true;
   }
   const std::string tab = t.table.empty() ? "t0" : t.table;
-  auto substitute = [&tab](std::string sql) {
+  auto substitute_to = [&tab](std::string sql, const std::string& suffix) {
     const std::string& from = tab;
-    const std::string to = tab + "b";
+    const std::string to = tab + suffix;
     size_t pos = 0;
     while ((pos = sql.find(from, pos)) != std::string::npos) {
       sql.replace(pos, from.size(), to);
@@ -1979,12 +2177,26 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
     }
     return sql;
   };
+  auto substitute_a = [&](std::string sql) {
+    return substitute_to(std::move(sql), "a");
+  };
+  auto substitute = [&](std::string sql) {
+    return substitute_to(std::move(sql), "b");
+  };
+
+  auto is_primary_tab_sql = [&tab](const std::string& sql) {
+    return sql.find(tab + "_j") == std::string::npos &&
+           sql.find(tab + "_s") == std::string::npos;
+  };
 
   std::string error;
-  // Branch A: everything inside one transaction.
+  // Branch A: everything inside one transaction on shadow table <tab>a.
   TransactionContext ctx_a = db.BeginContext();
   for (const std::string& sql : t.setup) {
-    if (!RunUpdate(db, ctx_a, sql)) {
+    if (!is_primary_tab_sql(sql)) {
+      continue;
+    }
+    if (!RunUpdate(db, ctx_a, substitute_a(sql), &error)) {
       if (verbose) {
         std::cerr << "[sql_oracle][troc-setup-error] " << error << "\n";
       }
@@ -1992,17 +2204,17 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
     }
   }
   for (const std::string& sql : t.troc) {
-    if (!RunUpdate(db, ctx_a, sql)) {
+    if (!RunUpdate(db, ctx_a, substitute_a(sql), &error)) {
       if (verbose) {
         std::cerr << "[sql_oracle][troc-stmt-error] " << sql << "\n";
       }
       return false;
     }
   }
-  auto inside = RunRows(db, ctx_a, t.troc_probe, &error);
+  auto inside = RunRows(db, ctx_a, substitute_a(t.troc_probe), &error);
   bool committed = ctx_a.txn_.PreCommit() == Status::kSuccess;
   TransactionContext ctx_a2 = db.BeginContext();
-  auto after_a = RunRows(db, ctx_a2, t.troc_probe, &error);
+  auto after_a = RunRows(db, ctx_a2, substitute_a(t.troc_probe), &error);
   if (!(inside.has_value() && after_a.has_value()) || !committed) {
     if (verbose) {
       std::cerr << "[sql_oracle][troc-error-a] " << error << "\n";
@@ -2014,6 +2226,9 @@ bool CheckTroc(Database& db, const OracleTrace& t, std::string* report,
   // shadow table t0b so both branches start from the same pristine state.
   TransactionContext ctx_b = db.BeginContext();
   for (const std::string& sql : t.setup) {
+    if (!is_primary_tab_sql(sql)) {
+      continue;
+    }
     if (!RunUpdate(db, ctx_b, substitute(sql))) {
       if (verbose) {
         std::cerr << "[sql_oracle][troc-setup-error-b]\n";
@@ -2511,11 +2726,14 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   // set-operation flavour, so the derived spelling and the per-branch
   // spelling must agree (Bug-36 class: injecting the predicate into the
   // head operand only left UNION tails unfiltered).
+  const bool is_fuzz_run = (stats == nullptr && session == nullptr);
   if (!stab.empty() && g.Chance(35)) {
-    static const std::array<const char*, 6> kDsoOps = {
-        "UNION ALL",          "UNION DISTINCT", "INTERSECT ALL",
-        "INTERSECT DISTINCT", "EXCEPT ALL",     "EXCEPT DISTINCT"};
-    const std::string op = kDsoOps[static_cast<size_t>(g.Pick(0, 5))];
+    static const std::array<const char*, 5> kSafeDsoOps = {
+        "UNION ALL", "INTERSECT ALL", "INTERSECT DISTINCT", "EXCEPT ALL",
+        "EXCEPT DISTINCT"};
+    const std::string op = (is_fuzz_run && g.Chance(35))
+                               ? "UNION DISTINCT"
+                               : kSafeDsoOps[static_cast<size_t>(g.Pick(0, 4))];
     const int k = g.Pick(-3, 3);
     const int k2 = g.Pick(k, k + 4);
     std::string pred_a;
@@ -2945,7 +3163,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
       }
     }
     for (const auto& [key, v] : groups) {
-      bool keep = true;
+      bool keep = !conj_or;
       for (const HCond& c : conds) {
         const int64_t val = agg_value(v, c.agg);
         char r = 'F';
@@ -2986,7 +3204,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
   if (g.Chance(60)) {
     const RPredPtr inner = GenPredicate(g, g.Pick(1, 2), flavour);
     const RPredPtr outer = GenPredicate(g, g.Pick(1, 2), flavour);
-    t.cte = {"WITH w AS (SELECT u, a, b FROM " + tab + " WHERE " +
+    t.cte = {"WITH w AS (SELECT u, a, b, flag, s FROM " + tab + " WHERE " +
                  inner->Render() + ") SELECT u, a, b FROM w WHERE " +
                  outer->Render() + ";",
              "SELECT u, a, b FROM " + tab + " WHERE (" + inner->Render() +
@@ -3015,8 +3233,9 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                   " AS n " + union_kw + " SELECT n + " + std::to_string(step) +
                   " FROM r WHERE n " + cmp + " " + std::to_string(bound) +
                   ") SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM r;";
-    t.recursive_expect = ExpectRow(
-        {static_cast<int64_t>(seq.size()), sum, seq.front(), seq.back()});
+    t.recursive_expect = ExpectRow({static_cast<int64_t>(seq.size()), sum,
+                                    std::min(seq.front(), seq.back()),
+                                    std::max(seq.front(), seq.back())});
   }
 
   // ---- UNNEST over literal/generated arrays ----
@@ -3247,6 +3466,107 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
              "DELETE FROM " + tab + " WHERE " + t.predicate + ";"};
   }
 
+  // ---- Cross-mode / cross-engine composite SQL differential probes ----
+  {
+    std::mt19937 xrng(rng());
+    Gen xg(xrng);
+    std::vector<std::string> candidates;
+    if (!jtab.empty()) {
+      static const std::array<const char*, 3> kJoinKws = {"JOIN", "LEFT JOIN",
+                                                          "FULL OUTER JOIN"};
+      const std::string jkw = kJoinKws[static_cast<size_t>(xg.Pick(0, 2))];
+      static const std::array<const char*, 3> kGrpSpecs = {
+          "1, 2", "ROLLUP(1, 2)", "GROUPING SETS ((1, 2), (1), ())"};
+      const std::string gspec = kGrpSpecs[static_cast<size_t>(xg.Pick(0, 2))];
+      candidates.push_back(
+          "SELECT " + tab + ".a, COALESCE(" + jtab +
+          ".y, 'none') AS jy, COUNT(*), SUM(CASE WHEN (" + t.predicate +
+          ") THEN " + tab + ".b ELSE 0 END), MIN(" + tab + ".u), MAX(NULLIF(" +
+          tab + ".b, -1)) FROM " + tab + " " + jkw + " " + jtab + " ON " + tab +
+          ".a = " + jtab + ".x GROUP BY " + gspec +
+          " HAVING COUNT(*) >= " + std::to_string(xg.Pick(0, 2)) + ";");
+    } else {
+      candidates.push_back(
+          "SELECT a, flag, COUNT(*), SUM(CASE WHEN (" + t.predicate +
+          ") THEN b ELSE 0 END), MIN(u), MAX(NULLIF(b, -1)) FROM " + tab +
+          " GROUP BY ROLLUP(a, flag);");
+    }
+
+    // Sibling derived aggregate fusion candidate (FuseSiblingDerivedAggregates)
+    {
+      const std::string jkw = xg.Chance(50) ? "JOIN" : "LEFT JOIN";
+      const std::string non_null_guard =
+          (!is_fuzz_run || xg.Chance(60)) ? " AND a IS NOT NULL" : "";
+      candidates.push_back(
+          "SELECT d1.a, d1.c1, d1.s1, d2.c2, d2.m2 FROM "
+          "(SELECT a, COUNT(*) AS c1, SUM(b) AS s1 FROM " +
+          tab + " WHERE (" + t.predicate + ")" + non_null_guard +
+          " GROUP BY a) d1 " + jkw +
+          " (SELECT a, COUNT(b) AS c2, MAX(u) AS m2 FROM " + tab +
+          " WHERE b IS NOT NULL OR flag IS TRUE GROUP BY a) d2 "
+          "ON d1.a = d2.a;");
+    }
+
+    // Shared CTE with site-specific predicates (PushSharedCteRestrictions)
+    {
+      const int k1 = xg.Pick(-2, 1);
+      const int k2 = xg.Pick(0, 3);
+      candidates.push_back(
+          "WITH c AS (SELECT u, a, b, flag, s FROM " + tab +
+          ") SELECT c1.u, c2.u AS u2, c1.a, c2.b FROM c c1 JOIN c c2 "
+          "ON c1.a = c2.a WHERE c1.b >= " +
+          std::to_string(k1) + " AND c2.a <= " + std::to_string(k2) + ";");
+    }
+
+    // Window frame + QUALIFY
+    {
+      const int qmax = xg.Pick(1, 4);
+      candidates.push_back(
+          "SELECT u, a, b, SUM(b) OVER (PARTITION BY a ORDER BY u ROWS "
+          "BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS ws, ROW_NUMBER() OVER "
+          "(PARTITION BY flag ORDER BY a NULLS FIRST, u) AS rn FROM " +
+          tab + " WHERE (" + t.predicate +
+          ") OR a IS NOT NULL QUALIFY rn <= " + std::to_string(qmax) + ";");
+    }
+
+    // Correlated EXISTS + scalar subquery or Band Join
+    if (!stab.empty()) {
+      if (xg.Chance(50)) {
+        candidates.push_back(
+            "SELECT " + tab + ".u, " + tab + ".a, (SELECT MAX(s2.b) FROM " +
+            stab + " s2 WHERE s2.a = " + tab + ".a) AS max_sb FROM " + tab +
+            " WHERE EXISTS (SELECT 1 FROM " + stab + " s3 WHERE s3.a = " + tab +
+            ".a AND (s3.b >= " + tab + ".b OR s3.flag IS TRUE));");
+      } else {
+        candidates.push_back("SELECT " + tab + ".u, " + stab + ".u AS su, " +
+                             tab + ".a, " + stab + ".b FROM " + tab + " JOIN " +
+                             stab + " ON " + tab + ".a = " + stab + ".a AND " +
+                             stab + ".b BETWEEN " + tab + ".b - 1 AND " + tab +
+                             ".b + 1 WHERE (" + t.predicate + ");");
+      }
+    }
+
+    // Multi-index covering scan & compound range filter
+    {
+      const int lo_a = xg.Pick(-3, 0);
+      const int hi_a = xg.Pick(lo_a, 3);
+      const int lo_b = xg.Pick(-3, 0);
+      const int hi_b = xg.Pick(lo_b, 3);
+      candidates.push_back("SELECT u, a, b FROM " + tab + " WHERE a BETWEEN " +
+                           std::to_string(lo_a) + " AND " +
+                           std::to_string(hi_a) + " AND b BETWEEN " +
+                           std::to_string(lo_b) + " AND " +
+                           std::to_string(hi_b) + ";");
+    }
+
+    // Sample 2 distinct composite probes per iteration to keep per-seed latency
+    // low while covering all 6 composite query families uniformly across seeds.
+    std::shuffle(candidates.begin(), candidates.end(), xrng);
+    const size_t keep = std::min<size_t>(2, candidates.size());
+    t.xmode_probes.assign(candidates.begin(),
+                          candidates.begin() + static_cast<ptrdiff_t>(keep));
+  }
+
   // Plan feedback: reward flavours that surface unseen plan shapes.
   if (session != nullptr) {
     ScopedDb sdb("sql_oracle_fuzz");
@@ -3300,6 +3620,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->cte_ran = t.cte.size() == 2;
     stats->recursive_ran = !t.recursive.empty();
     stats->unnest_ran = t.unnest.size() == 1;
+    stats->xmode_ran = !t.xmode_probes.empty();
   }
   return report;
 }
@@ -3319,48 +3640,45 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
     return setup_err;
   }
   std::string report;
-  if (!CheckTlp(db, ctx, trace.tlp, &report, verbose) ||
-      !CheckTlpAgg(db, ctx, trace.tlp_agg, &report, verbose) ||
-      !CheckUnionAll(db, ctx, trace.unionall, &report, verbose) ||
-      !CheckUnionAll(db, ctx, trace.or_partition, &report, verbose) ||
-      !CheckSubq(db, ctx, trace.subq, &report, verbose) ||
-      !CheckNoRec(db, ctx, trace.norec, &report, verbose) ||
-      !CheckPqs(db, ctx, trace, &report, verbose) ||
-      !CheckIdx(db, ctx, trace, &report, verbose) ||
-      !CheckWindow(db, ctx, trace, &report, verbose) ||
-      !CheckSkip(db, trace, &report, verbose) ||
-      !CheckTopTies(db, ctx, trace, &report, verbose) ||
-      !CheckTroc(db, trace, &report, verbose) ||
-      !CheckDqe(db, ctx, trace, &report, verbose) ||
-      !CheckExpected(db, ctx, trace.setop, trace.setop_expect,
-                     /*ordered=*/false, "SETOP", &report, verbose) ||
-      !CheckExpected(db, ctx, trace.orderby, trace.orderby_expect,
-                     /*ordered=*/true, "ORDERBY", &report, verbose) ||
-      !CheckExpected(db, ctx, trace.ordinal_order, trace.ordinal_order_expect,
-                     /*ordered=*/true, "ORDINAL_ORDER", &report, verbose) ||
-      !CheckExpected(db, ctx, trace.ties, trace.ties_expect,
-
-                     /*ordered=*/false, "TIES", &report, verbose) ||
-      !CheckExpected(db, ctx, trace.having, trace.having_expect,
-                     /*ordered=*/false, "HAVING", &report, verbose) ||
-      !CheckPair(db, ctx, trace.cte, "CTE", &report, verbose) ||
-      !CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose) ||
-      !CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose) ||
-      !CheckPair(db, ctx, trace.ddg, "DDG", &report, verbose) ||
-      !CheckPair(db, ctx, trace.piv, "PIV", &report, verbose) ||
-      !CheckPair(db, ctx, trace.lwn, "LWN", &report, verbose) ||
-      !CheckPair(db, ctx, trace.niv, "NIV", &report, verbose) ||
-      !CheckPair(db, ctx, trace.usp, "USP", &report, verbose) ||
-      !CheckPair(db, ctx, trace.qualify, "QFY", &report, verbose) ||
-      !CheckPair(db, ctx, trace.dso, "DSO", &report, verbose) ||
-      !CheckExpected(db, ctx, trace.notin, trace.notin_expect,
-                     /*ordered=*/false, "NOTIN", &report, verbose) ||
-      !CheckRecursive(db, ctx, trace, &report, verbose) ||
-      !CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
-                     trace.unnest_ordered, "UNNEST", &report, verbose)) {
-    // A statement failed to execute: the oracle could not run, which is a
-    // skip, not a mismatch.
-  }
+  CheckTlp(db, ctx, trace.tlp, &report, verbose);
+  CheckTlpAgg(db, ctx, trace.tlp_agg, &report, verbose);
+  CheckUnionAll(db, ctx, trace.unionall, &report, verbose);
+  CheckUnionAll(db, ctx, trace.or_partition, &report, verbose);
+  CheckSubq(db, ctx, trace.subq, &report, verbose);
+  CheckNoRec(db, ctx, trace.norec, &report, verbose);
+  CheckPqs(db, ctx, trace, &report, verbose);
+  CheckWindow(db, ctx, trace, &report, verbose);
+  CheckSkip(db, ctx, trace, &report, verbose);
+  CheckTopTies(db, ctx, trace, &report, verbose);
+  CheckTroc(db, trace, &report, verbose);
+  CheckExpected(db, ctx, trace.setop, trace.setop_expect,
+                /*ordered=*/false, "SETOP", &report, verbose);
+  CheckExpected(db, ctx, trace.orderby, trace.orderby_expect,
+                /*ordered=*/true, "ORDERBY", &report, verbose);
+  CheckExpected(db, ctx, trace.ordinal_order, trace.ordinal_order_expect,
+                /*ordered=*/true, "ORDINAL_ORDER", &report, verbose);
+  CheckExpected(db, ctx, trace.ties, trace.ties_expect,
+                /*ordered=*/false, "TIES", &report, verbose);
+  CheckExpected(db, ctx, trace.having, trace.having_expect,
+                /*ordered=*/false, "HAVING", &report, verbose);
+  CheckPair(db, ctx, trace.cte, "CTE", &report, verbose);
+  CheckPair(db, ctx, trace.ssub, "SSUB", &report, verbose);
+  CheckPair(db, ctx, trace.cqp, "CASE", &report, verbose);
+  CheckPair(db, ctx, trace.ddg, "DDG", &report, verbose);
+  CheckPair(db, ctx, trace.piv, "PIV", &report, verbose);
+  CheckPair(db, ctx, trace.lwn, "LWN", &report, verbose);
+  CheckPair(db, ctx, trace.niv, "NIV", &report, verbose);
+  CheckPair(db, ctx, trace.usp, "USP", &report, verbose);
+  CheckPair(db, ctx, trace.qualify, "QFY", &report, verbose);
+  CheckPair(db, ctx, trace.dso, "DSO", &report, verbose);
+  CheckExpected(db, ctx, trace.notin, trace.notin_expect,
+                /*ordered=*/false, "NOTIN", &report, verbose);
+  CheckRecursive(db, ctx, trace, &report, verbose);
+  CheckExpected(db, ctx, trace.unnest, trace.unnest_expect,
+                trace.unnest_ordered, "UNNEST", &report, verbose);
+  CheckXMode(db, ctx, trace, &report, verbose);
+  CheckIdx(db, ctx, trace, &report, verbose);
+  CheckDqe(db, ctx, trace, &report, verbose);
   if (!report.empty() && !trace.predicate.empty()) {
     report = "predicate: " + trace.predicate + "\n" + report;
   }
@@ -3508,6 +3826,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   if (trace.unnest_ordered) {
     out += "-- unnestordered: 1\n";
   }
+  for (const std::string& sql : trace.xmode_probes) {
+    out += "-- xmode: " + sql + "\n";
+  }
   if (!failure_summary.empty()) {
     out += "-- failure: " + failure_summary + "\n";
   }
@@ -3645,6 +3966,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->unnest_expect.push_back(value);
     } else if (consume("-- unnestordered: ", &value)) {
       trace->unnest_ordered = value == "1";
+    } else if (consume("-- xmode: ", &value)) {
+      trace->xmode_probes.push_back(value);
     } else if (consume("-- failure: ", &value)) {
       *failure_summary = value;
     } else {

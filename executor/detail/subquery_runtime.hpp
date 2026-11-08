@@ -321,10 +321,11 @@ struct ExecutionRuntime {
   // single-table equality index.
   std::unordered_map<std::string, RelationPtr> correlated_apply_results;
   std::unordered_set<const SelectStatement*> noncacheable_queries;
-  // StatementContainsVolatileFunctionCached memo.  AST nodes probed through
-  // this map are all pinned by retained_statements (see its comment), so
-  // address keys cannot be recycled mid-execution.
-  std::unordered_map<const SelectStatement*, bool> volatile_memo;
+  // StatementContainsVolatileFunctionCached memo, tagged with the statement's
+  // RuntimeId() so a recycled address or in-place mutation never reuses a
+  // stale verdict.
+  std::unordered_map<const SelectStatement*, std::pair<uint64_t, bool>>
+      volatile_memo;
   // Keep-alives for every subquery statement whose address keys the caches
   // above.  Prepared executors are freed between statements, and a later
   // allocation could otherwise reuse a dead statement's address, silently
@@ -341,11 +342,12 @@ struct ExecutionRuntime {
   //    one cached subquery; Q4: ~57K correlated probes).
   //  - UncorrelatedCacheKey() likewise walks the AST per probe of the
   //    uncorrelated fingerprint cache.
-  // Every statement reaching these probes is retained for this runtime via
-  // retained_statements and the AST is immutable while one execution runs,
-  // so the pointer keys a stable value.
-  std::unordered_map<const SelectStatement*, std::string> fingerprint_memo;
-  std::unordered_map<const SelectStatement*, std::string> uncorrelated_key_memo;
+  // Tagged with SelectStatement::RuntimeId() so a recycled pointer or
+  // mutated statement invalidates its memo entry automatically.
+  std::unordered_map<const SelectStatement*, std::pair<uint64_t, std::string>>
+      fingerprint_memo;
+  std::unordered_map<const SelectStatement*, std::pair<uint64_t, std::string>>
+      uncorrelated_key_memo;
   size_t correlated_index_builds{0};
   size_t prebuilt_exists_index_builds{0};
   size_t prebuilt_exists_index_rows{0};

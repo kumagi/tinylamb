@@ -1253,11 +1253,6 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
     return "";
   }
   Database* db = sdb.get();
-  std::optional<SqlEngine> engine;
-  engine.emplace(*db);
-  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-    engine->SetForceRelationalFallback(true);
-  }
 
   // ---- setup phase: schema + seed rows under one committed txn ----
   TransactionContext setup_ctx = db->BeginContext();
@@ -1285,9 +1280,15 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       }
     }
     const std::string sql = "CREATE TABLE " + m.name + " (" + cols + ");";
-    if (!RunSql(*db, setup_ctx, sql)) {
-      return "dual setup CREATE TABLE rejected: " + sql +
-             " :: " + engine->LastError() + "\n";
+    std::string why;
+    if (!RunSqlWhy(*db, setup_ctx, sql, /*force_relational=*/false, &why)) {
+      t.steps.push_back({.sql = sql});
+      std::string err = "dual setup CREATE TABLE rejected: ";
+      err += sql;
+      err += " :: ";
+      err += why;
+      err += "\n";
+      return err;
     }
     t.steps.push_back({.sql = sql});
     next_u[m.name] = 0;
@@ -1303,9 +1304,14 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       tuple += ")";
       const std::string ins =
           "INSERT INTO " + m.name + " VALUES " + tuple + ";";
-      if (!RunSql(*db, setup_ctx, ins)) {
-        return "dual setup INSERT rejected: " + ins +
-               " :: " + engine->LastError() + "\n";
+      if (!RunSqlWhy(*db, setup_ctx, ins, /*force_relational=*/false, &why)) {
+        t.steps.push_back({.sql = ins});
+        std::string err = "dual setup INSERT rejected: ";
+        err += ins;
+        err += " :: ";
+        err += why;
+        err += "\n";
+        return err;
       }
       t.steps.push_back({.sql = ins});
       m.rows.push_back(BuildRow(next_u[m.name] - 1, values));
@@ -1414,10 +1420,6 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
                std::to_string(step) + "\n";
       }
       db = sdb.get();
-      engine.emplace(*db);
-      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-        engine->SetForceRelationalFallback(true);
-      }
       ctxs[static_cast<size_t>(0)] = db->BeginContext();
       ctxs[static_cast<size_t>(1)] = db->BeginContext();
       owner.clear();
@@ -1655,11 +1657,6 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
   // Held as a pointer so a crash step can rebind to the reopened Database.
   Database* db = sdb.get();
   TransactionContext ctx = db->BeginContext();
-  std::optional<SqlEngine> engine;
-  engine.emplace(*db);
-  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-    engine->SetForceRelationalFallback(true);
-  }
 
   std::vector<MirrorTable> tables;
   // Committed mirror snapshot: an abort rolls the engine AND the mirror back
@@ -1695,9 +1692,10 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
     if (verbose) {
       std::cerr << "[session][stmt] " << sql << "\n";
     }
-    if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
-      report =
-          "CREATE TABLE rejected: " + sql + " :: " + engine->LastError() + "\n";
+    std::string why;
+    if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
+      t.steps.push_back({.sql = sql});
+      report = "CREATE TABLE rejected: " + sql + " :: " + why + "\n";
       return false;
     }
     t.steps.push_back({.sql = sql});
@@ -1802,10 +1800,6 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
                std::to_string(step) + "\n";
       }
       db = sdb.get();
-      engine.emplace(*db);
-      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-        engine->SetForceRelationalFallback(true);
-      }
       ctx = db->BeginContext();
       tables = committed_tables;
       t.steps.push_back({.is_ddl = false,
@@ -1967,9 +1961,12 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           if (verbose) {
             std::cerr << "[session][stmt] " << sql << "\n";
           }
-          const bool ok = RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()));
+          std::string why;
+          const bool ok =
+              RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
           if (expect_dup) {
             if (ok) {
+              t.steps.push_back({.must_fail = true, .sql = sql});
               return "unique-violating INSERT SELECT unexpectedly accepted "
                      "at step " +
                      std::to_string(step) + ": " + sql + "\n";
@@ -1978,8 +1975,13 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             break;
           }
           if (!ok) {
-            return "INSERT SELECT rejected: " + sql +
-                   " :: " + engine->LastError() + "\n";
+            t.steps.push_back({.sql = sql});
+            std::string err = "INSERT SELECT rejected: ";
+            err += sql;
+            err += " :: ";
+            err += why;
+            err += "\n";
+            return err;
           }
           t.steps.push_back({.sql = sql});
           for (Row& r : added) {
@@ -2059,6 +2061,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
         if (expect_dup) {
           if (ok) {
+            t.steps.push_back({.must_fail = true, .sql = sql});
             return "unique-violating INSERT unexpectedly accepted at step " +
                    std::to_string(step) + ": " + sql + "\n";
           }
@@ -2066,6 +2069,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           break;
         }
         if (!ok) {
+          t.steps.push_back({.sql = sql});
           std::string message;
           message += "INSERT rejected: ";
           message += sql;
@@ -2223,9 +2227,12 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         if (verbose) {
           std::cerr << "[session][stmt] " << sql << "\n";
         }
-        const bool ok = RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()));
+        std::string why;
+        const bool ok =
+            RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why);
         if (expect_dup) {
           if (ok) {
+            t.steps.push_back({.must_fail = true, .sql = sql});
             return "unique-violating UPDATE unexpectedly accepted at step " +
                    std::to_string(step) + ": " + sql + "\n";
           }
@@ -2233,8 +2240,13 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           break;
         }
         if (!ok) {
-          return "UPDATE rejected: " + sql + " :: " + engine->LastError() +
-                 "\n";
+          t.steps.push_back({.sql = sql});
+          std::string err = "UPDATE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
         }
         t.steps.push_back({.sql = sql});
         for (Row& row : target->rows) {
@@ -2272,9 +2284,15 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const std::string sql = pred ? "DELETE FROM " + target->name +
                                            " WHERE " + pred->Render() + ";"
                                      : "DELETE FROM " + target->name + ";";
-        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
-          return "DELETE rejected: " + sql + " :: " + engine->LastError() +
-                 "\n";
+        std::string why;
+        if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
+          t.steps.push_back({.sql = sql});
+          std::string err = "DELETE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
         }
         t.steps.push_back({.sql = sql});
         std::vector<Row> kept;
@@ -2333,6 +2351,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         const bool ok = ApplyDdl(*db, ctx, ddl, &error, &rejected_dup);
         if (make_unique && dup) {
           if (ok) {
+            t.steps.push_back({.is_ddl = true, .must_fail = true, .sql = ddl});
             std::string dup_report =
                 "unique index on duplicate key unexpectedly created at step ";
             dup_report += std::to_string(step);
@@ -2342,6 +2361,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             return dup_report;
           }
           if (!rejected_dup) {
+            t.steps.push_back({.is_ddl = true, .must_fail = true, .sql = ddl});
             std::string message =
                 "unique index creation failed for a non-duplicate reason "
                 "at step ";
@@ -2357,6 +2377,7 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           break;
         }
         if (!ok) {
+          t.steps.push_back({.is_ddl = true, .sql = ddl});
           std::string msg = "index DDL failed at step ";
           msg += std::to_string(step);
           msg += ": ";
@@ -2379,9 +2400,15 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       case Op::kDropTable: {
         const std::string sql = "DROP TABLE " + target->name + ";";
-        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
-          return "DROP TABLE rejected: " + sql + " :: " + engine->LastError() +
-                 "\n";
+        std::string why;
+        if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
+          t.steps.push_back({.sql = sql});
+          std::string err = "DROP TABLE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
         }
         t.steps.push_back({.sql = sql});
         tables.erase(std::remove_if(tables.begin(), tables.end(),
@@ -2402,9 +2429,15 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
       }
       case Op::kAnalyze: {
         const std::string sql = "ANALYZE " + target->name + ";";
-        if (!RunSql(*db, ctx, sql, RouteFlipFor(t.steps.size()))) {
-          return "ANALYZE rejected: " + sql + " :: " + engine->LastError() +
-                 "\n";
+        std::string why;
+        if (!RunSqlWhy(*db, ctx, sql, RouteFlipFor(t.steps.size()), &why)) {
+          t.steps.push_back({.sql = sql});
+          std::string err = "ANALYZE rejected: ";
+          err += sql;
+          err += " :: ";
+          err += why;
+          err += "\n";
+          return err;
         }
         t.steps.push_back({.sql = sql});
         break;
@@ -2488,11 +2521,6 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
   // snapshot timestamp matches generation exactly.
   std::array<std::optional<TransactionContext>, 2> ctxs;
   ctxs[static_cast<size_t>(0)].emplace(db->BeginContext());
-  std::optional<SqlEngine> engine;
-  engine.emplace(*db);
-  if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-    engine->SetForceRelationalFallback(true);
-  }
   // Rebuild the mirror from the executed statements (CREATE TABLE shapes the
   // columns; INSERT/UPDATE/DELETE effects are re-derived by re-execution).
   // The expected dumps in the trace carry the ground truth, so the replay
@@ -2530,10 +2558,6 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         return "replay crash reopen failed at step " + std::to_string(i) + "\n";
       }
       db = sdb.get();
-      engine.emplace(*db);
-      if (std::getenv("TINYLAMB_SESSION_FORCE_RELATIONAL") != nullptr) {
-        engine->SetForceRelationalFallback(true);
-      }
       ctxs[static_cast<size_t>(0)].emplace(db->BeginContext());
       if (ctxs[static_cast<size_t>(1)].has_value()) {
         ctxs[static_cast<size_t>(1)].emplace(db->BeginContext());
@@ -2559,8 +2583,9 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
                step.sql + " :: " + error + "\n";
       }
     } else {
-      const bool ok = RunSql(*db, *ctxs[static_cast<size_t>(step.txn)],
-                             step.sql, RouteFlipFor(i));
+      std::string why;
+      const bool ok = RunSqlWhy(*db, *ctxs[static_cast<size_t>(step.txn)],
+                                step.sql, RouteFlipFor(i), &why);
       if (step.must_fail) {
         if (ok) {
           return "replay statement unexpectedly succeeded at step " +
@@ -2569,7 +2594,7 @@ std::string ReplaySessionTrace(const SessionTrace& trace, bool verbose) {
         }
       } else if (!ok) {
         return "replay statement failed at step " + std::to_string(i) + ": " +
-               step.sql + " :: " + engine->LastError() + "\n";
+               step.sql + " :: " + why + "\n";
       }
     }
     while (check_index < trace.checks.size() &&

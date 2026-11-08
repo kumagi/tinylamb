@@ -86,8 +86,10 @@ std::string FormatEngineValue(const Value& v) {
 std::optional<std::vector<EngineRow>> RunQuery(Database& db,
                                                TransactionContext& ctx,
                                                const std::string& sql,
-                                               std::string* error) {
+                                               std::string* error,
+                                               bool force_relational = false) {
   SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
     *error = engine.LastError();
@@ -951,8 +953,54 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     }
     return report;  // first mismatch is enough; keep the session short
   }
-  QueryExpect last;
-  (void)last;
+
+  // Cross-mode / index-independence verification: build secondary covering
+  // indexes on fact and dim, run ANALYZE, and re-verify every recorded query
+  // under both the default optimizer and the Cascades grouped route /
+  // relational fallback.
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
+  ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
+  for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
+    if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
+      res.Value().Drain();
+    }
+  }
+  for (const QueryExpect& qe : t.queries) {
+    for (int mode = 0; mode < 2; ++mode) {
+      std::string error;
+      auto got =
+          RunQuery(db, ctx, qe.sql, &error, /*force_relational=*/mode == 1);
+      if (!got.has_value()) {
+        continue;
+      }
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      std::sort(actual.begin(), actual.end());
+      std::vector<std::string> expected = qe.expected;
+      std::sort(expected.begin(), expected.end());
+      if (actual != expected) {
+        report += std::string(mode == 0 ? "[JOIN-INDEXED MISMATCH] "
+                                        : "[JOIN-RELATIONAL MISMATCH] ") +
+                  qe.sql + "\n";
+        report += "  expected (" + std::to_string(expected.size()) + "):\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
   return report;
 }
 
@@ -975,40 +1023,60 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
     }
     result.Value().Drain();
   }
-  for (const QueryExpect& q : trace.queries) {
-    std::string error;
-    auto got = RunQuery(db, ctx, q.sql, &error);
-    if (!got.has_value()) {
-      return "query failed: " + q.sql + " :: " + error;
-    }
-    std::vector<std::string> actual;
-    for (const EngineRow& r : *got) {
-      std::string row;
-      for (const Value& v : r.cells) {
-        row += FormatEngineValue(v) + ",";
+  auto check_queries = [&](bool force_relational,
+                           const char* tag) -> std::string {
+    for (const QueryExpect& q : trace.queries) {
+      std::string error;
+      auto got = RunQuery(db, ctx, q.sql, &error, force_relational);
+      if (!got.has_value()) {
+        return "query failed: " + q.sql + " :: " + error;
       }
-      actual.push_back(row);
-    }
-    std::sort(actual.begin(), actual.end());
-    std::vector<std::string> expected = q.expected;
-    std::sort(expected.begin(), expected.end());
-    if (actual != expected) {
-      std::string report = "[JOIN REPLAY MISMATCH] " + q.sql + "\n";
-      report += "  expected:\n";
-      for (const std::string& r : expected) {
-        report += "    " + r + "\n";
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
       }
-      report += "  actual:\n";
-      for (const std::string& r : actual) {
-        report += "    " + r + "\n";
+      std::sort(actual.begin(), actual.end());
+      std::vector<std::string> expected = q.expected;
+      std::sort(expected.begin(), expected.end());
+      if (actual != expected) {
+        std::string report = std::string(tag) + " " + q.sql + "\n";
+        report += "  expected:\n";
+        for (const std::string& r : expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual:\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
       }
-      return report;
+      if (verbose) {
+        std::cerr << "[join_fuzz][replay-ok] " << q.sql << "\n";
+      }
     }
-    if (verbose) {
-      std::cerr << "[join_fuzz][replay-ok] " << q.sql << "\n";
+    return "";
+  };
+  if (std::string rep = check_queries(false, "[JOIN REPLAY MISMATCH]");
+      !rep.empty()) {
+    return rep;
+  }
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
+  ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
+  for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
+    if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
+      res.Value().Drain();
     }
   }
-  return "";
+  if (std::string rep = check_queries(false, "[JOIN-INDEXED REPLAY MISMATCH]");
+      !rep.empty()) {
+    return rep;
+  }
+  return check_queries(true, "[JOIN-RELATIONAL REPLAY MISMATCH]");
 }
 
 std::string SerializeJoinTest(uint64_t seed, const JoinTrace& trace,

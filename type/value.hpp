@@ -42,17 +42,21 @@ inline size_t EncodeMemcomparableFormatIntegerTo(char* dst, int64_t in) {
   return 9;
 }
 
+inline size_t EncodeMemcomparableFormatUint64To(char* dst, int64_t in) {
+  dst[0] = static_cast<char>(6);
+  const uint64_t be = htobe64(static_cast<uint64_t>(in));
+  std::memcpy(dst + 1, &be, 8);
+  return 9;
+}
+
 inline size_t EncodeMemcomparableFormatDoubleTo(char* dst, double in) {
   dst[0] = static_cast<char>(ValueType::kDouble);
-  uint64_t bits;
-  std::memcpy(&bits, &in, sizeof(bits));
-  uint64_t code;
   if (std::isnan(in)) {
-    code = ~0ULL;
-  } else {
-    if (bits == (1ULL << 63)) bits = 0;
-    code = (bits >> 63) != 0 ? ~bits : (bits | (1ULL << 63));
+    in = std::numeric_limits<double>::quiet_NaN();
   }
+  uint64_t bits = 0;
+  std::memcpy(&bits, &in, sizeof(bits));
+  const uint64_t code = (in < 0) ? ~bits : (bits | (1ULL << 63));
   const uint64_t be = htobe64(code);
   std::memcpy(dst + 1, &be, 8);
   return 9;

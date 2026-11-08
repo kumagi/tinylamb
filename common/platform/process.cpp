@@ -26,7 +26,7 @@
 #include <string>
 #include <system_error>
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #else
@@ -38,7 +38,7 @@ extern char** environ;  // NOLINT(readability-redundant-declaration)
 namespace tinylamb::platform {
 
 std::filesystem::path CurrentExecutablePath() {
-#if defined(__APPLE__)
+#ifdef __APPLE__
   uint32_t size = 0;
   (void)::_NSGetExecutablePath(nullptr, &size);
   std::string buffer(size, '\0');
@@ -53,13 +53,15 @@ std::filesystem::path CurrentExecutablePath() {
   std::array<char, 4096> self{};
   const ssize_t len =
       ::readlink("/proc/self/exe", self.data(), self.size() - 1);
-  if (len <= 0) return {};
+  if (len <= 0) {
+    return {};
+  }
   return {std::string(self.data(), static_cast<size_t>(len))};
 #endif
 }
 
 char** Environment() {
-#if defined(__APPLE__)
+#ifdef __APPLE__
   return *::_NSGetEnviron();
 #else
   return environ;
@@ -67,7 +69,7 @@ char** Environment() {
 }
 
 int OpenWriteFailingDescriptor() {
-#if defined(__linux__)
+#ifdef __linux__
   return ::open("/dev/full", O_WRONLY | O_CLOEXEC);
 #else
   // No /dev/full: a read-only descriptor on a scratch file rejects every

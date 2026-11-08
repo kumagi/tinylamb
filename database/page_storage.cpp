@@ -20,21 +20,16 @@
 
 #include "page_storage.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <ios>
 #include <ostream>
 #include <string>
 #include <string_view>
 #include <system_error>
 
 #include "common/constants.hpp"
-#include "common/crc32c.hpp"
 #include "common/log_message.hpp"
-#include "common/serdes.hpp"
 #include "recovery/log_record.hpp"
 #include "transaction/transaction.hpp"
 
@@ -64,43 +59,6 @@ size_t LogSegmentSizeFromEnv() {
     return Logger::kDefaultLogSegmentSize;
   }
   return static_cast<size_t>(bytes);
-}
-
-// Reads the checkpoint LSN from the master record written by
-// CheckpointManager. Missing/truncated files resolve to 0; callers
-// additionally verify the value against the WAL itself.
-lsn_t ReadMasterRecordLsn(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return 0;
-  }
-  std::array<char, kCheckpointMasterRecordSize> buffer{};
-  in.read(buffer.data(), buffer.size());
-  const auto bytes = in.gcount();
-  if (std::cmp_equal(bytes, static_cast<std::streamsize>(sizeof(lsn_t)))) {
-    lsn_t lsn = 0;
-    DeserializeU64(buffer.data(), &lsn);
-    return lsn;
-  }
-  if (std::cmp_not_equal(
-          bytes, static_cast<std::streamsize>(kCheckpointMasterRecordSize))) {
-    return 0;
-  }
-  uint32_t magic = 0;
-  uint32_t version = 0;
-  lsn_t lsn = 0;
-  uint32_t stored_crc = 0;
-  DeserializeU32(buffer.data(), &magic);
-  DeserializeU32(buffer.data() + sizeof(uint32_t), &version);
-  DeserializeU64(buffer.data() + (sizeof(uint32_t) * 2), &lsn);
-  DeserializeU32(buffer.data() + kCheckpointMasterRecordSize - sizeof(uint32_t),
-                 &stored_crc);
-  if (magic != kCheckpointMasterMagic || version != kCheckpointMasterVersion) {
-    return 0;
-  }
-  const uint32_t computed =
-      Crc32C(buffer.data(), kCheckpointMasterRecordSize - sizeof(uint32_t));
-  return stored_crc == computed ? lsn : 0;
 }
 }  // namespace
 
@@ -154,18 +112,7 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     return StatusError(StatusCode::kCorrupt,
                        "database file is nonempty but WAL is empty");
   }
-  lsn_t checkpoint = ReadMasterRecordLsn(storage->MasterRecordName());
-  if (checkpoint != 0) {
-    LogRecord probe;
-    if (!storage->rm_->ReadLog(checkpoint, &probe) ||
-        probe.type != LogType::kBeginCheckpoint) {
-      LOG(WARN) << "Ignoring invalid master record at " << checkpoint << " for "
-                << dbname;
-      checkpoint = 0;
-    }
-  }
-  const Status recovered =
-      storage->rm_->RecoverFrom(checkpoint, storage->tm_.get());
+  const Status recovered = storage->rm_->RecoverFrom(0, storage->tm_.get());
   if (recovered != Status::kSuccess) {
     storage->pm_->GetPool()->DropAllPages();
     return recovered;

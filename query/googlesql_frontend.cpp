@@ -234,16 +234,17 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
                                                        STDERR_FILENO);
         }
         if (spawn_err == 0) {
-          char arg0[] = TINYLAMB_GOOGLESQL_EXECUTABLE;
-          char arg1[] = "--mode=parse";
-          char arg2[] = "-";
-          char* const argv[] = {arg0, arg1, arg2, nullptr};
+          std::string arg0(TINYLAMB_GOOGLESQL_EXECUTABLE);
+          std::string arg1("--mode=parse");
+          std::string arg2("-");
+          std::array<char*, 4> argv = {arg0.data(), arg1.data(), arg2.data(),
+                                       nullptr};
           posix_spawnattr_t attributes{};
           spawn_err = platform::InitSpawnAttributes(&attributes);
           if (spawn_err == 0) {
             spawn_err =
                 posix_spawn(&child, TINYLAMB_GOOGLESQL_EXECUTABLE, &actions,
-                            &attributes, argv, platform::Environment());
+                            &attributes, argv.data(), platform::Environment());
             posix_spawnattr_destroy(&attributes);
           }
         }

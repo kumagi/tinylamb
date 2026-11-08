@@ -158,6 +158,10 @@ class StopGuard {
 // including ASSERT failures. Shared state keeps an already-copied hook safe.
 class SyncGate {
  public:
+  SyncGate(const SyncGate&) = delete;
+  SyncGate& operator=(const SyncGate&) = delete;
+  SyncGate(SyncGate&&) = delete;
+  SyncGate& operator=(SyncGate&&) = delete;
   struct State {
     std::mutex mutex;
     std::condition_variable cv;
@@ -366,7 +370,9 @@ TEST(PostgresServerExtraTest,
   const std::array<int, 2> readers{ConnectClient(server.BoundPort()),
                                    ConnectClient(server.BoundPort())};
   ASSERT_GE(writer, 0);
-  for (int fd : readers) ASSERT_GE(fd, 0);
+  for (int fd : readers) {
+    ASSERT_GE(fd, 0);
+  }
   const auto execute = [](int fd, const std::string& sql) {
     EXPECT_TRUE(SendAll(fd, QueryMessage(sql)));
     const auto reply = ReadUntilReady(fd);
@@ -509,11 +515,11 @@ TEST(PostgresServerExtraTest, DistinctKeyChurnKeepsOtherSessionsIndependent) {
     };
     execute(clients[0], "CREATE TABLE churn (id BIGINT PRIMARY KEY, v BIGINT)",
             'I');
-    for (int round = 0; round < 2; ++round) {
+    for (size_t round = 0; round < 2; ++round) {
       for (size_t i = 0; i < clients.size(); ++i) {
         execute(clients[i],
                 "BEGIN; INSERT INTO churn VALUES (" +
-                    std::to_string(i + 100 * round) + ", 1)",
+                    std::to_string(i + (100 * round)) + ", 1)",
                 'T');
       }
       // Every owner is still open when the next session deletes. The first
@@ -521,7 +527,7 @@ TEST(PostgresServerExtraTest, DistinctKeyChurnKeepsOtherSessionsIndependent) {
       for (size_t i = 0; i < clients.size(); ++i) {
         EXPECT_NE(execute(clients[i],
                           "DELETE FROM churn WHERE id = " +
-                              std::to_string(i + 100 * round),
+                              std::to_string(i + (100 * round)),
                           'T')
                       .find("DELETE 1"),
                   std::string::npos);
@@ -683,15 +689,18 @@ TEST(PostgresServerExtraTest, CachedPacketsKeepLargeSplitAndPipelinedMessages) {
   EXPECT_NE(ReadUntilReady(fd).find("unterminated"), std::string::npos);
   EXPECT_EQ(server.CachedLiteralReplyCount(), valid_count);
   std::string burst;
-  for (int i = 0; i < 50; ++i) burst += large;
+  for (int i = 0; i < 50; ++i) {
+    burst += large;
+  }
   ASSERT_TRUE(SendAll(fd, burst));
   ASSERT_EQ(shutdown(fd, SHUT_WR), 0);
   const auto drained = ReadUntilReady(fd, 50);
   size_t rows = 0;
   for (size_t offset = 0;
        (offset = drained.find(row, offset)) != std::string::npos;
-       offset += row.size())
+       offset += row.size()) {
     ++rows;
+  }
   EXPECT_EQ(rows, 50U);
   EXPECT_EQ(server.CachedLiteralReplyCount(), valid_count + 50);
   close(fd);
@@ -814,8 +823,9 @@ TEST(PostgresServerExtraTest,
        {"SELECT id FROM direct_rows", "BEGIN",
         "UPDATE direct_rows SET id = 202", "SELECT id FROM direct_rows",
         "SELECT no_such_column", "ROLLBACK", "SELECT id FROM direct_rows",
-        "SELECT 303"})
+        "SELECT 303"}) {
     messages += QueryMessage(sql);
+  }
   ASSERT_TRUE(SendAll(fd, messages));
   ASSERT_EQ(shutdown(fd, SHUT_WR), 0);
   const auto wire = ReadUntilReady(fd, 8);
@@ -834,8 +844,9 @@ TEST(PostgresServerExtraTest,
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
   while (server.DirectReplyCount() <= before &&
-         std::chrono::steady_clock::now() < deadline)
+         std::chrono::steady_clock::now() < deadline) {
     std::this_thread::yield();
+  }
   EXPECT_GT(server.DirectReplyCount(), before);
   close(fd);
 }
@@ -955,20 +966,22 @@ TEST(PostgresServerExtraTest,
   EXPECT_NE(query(admin, "CREATE VIEW pooled_view AS SELECT v FROM pooled_base")
                 .find("CREATE VIEW"),
             std::string::npos);
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < 4; ++i) {
     EXPECT_NE(query(reader, "SELECT v FROM pooled_view")
                   .find(pgwire::DataRow(Row({Value(7)}))),
               std::string::npos);
+  }
   EXPECT_NE(query(admin, "DROP VIEW pooled_view").find("DROP VIEW"),
             std::string::npos);
   EXPECT_NE(query(admin,
                   "CREATE VIEW pooled_view AS SELECT v+1 AS v FROM pooled_base")
                 .find("CREATE VIEW"),
             std::string::npos);
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < 4; ++i) {
     EXPECT_NE(query(reader, "SELECT v FROM pooled_view")
                   .find(pgwire::DataRow(Row({Value(8)}))),
               std::string::npos);
+  }
   close(reader);
   close(admin);
 }
@@ -1033,8 +1046,9 @@ TEST(PostgresServerExtraTest, CompletionBurstsKeepEveryReplyAndCommitBarrier) {
     ASSERT_GE(clients.back(), 0);
   }
   const auto burst = [&](const auto& sql, char status, char first = 'C') {
-    for (size_t i = 0; i < clients.size(); ++i)
+    for (size_t i = 0; i < clients.size(); ++i) {
       EXPECT_TRUE(SendAll(clients[i], QueryMessage(sql(i))));
+    }
     for (int fd : clients) {
       const auto response = ReadUntilReady(fd);
       EXPECT_EQ(ReadyForQueryStatus(response), status);

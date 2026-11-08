@@ -132,6 +132,8 @@ bool ContainsAggregate(const Expression& expression) {
 // ORDER BY / LIMIT.
 // ---------------------------------------------------------------------------
 
+namespace {
+
 // Returns true when `expression` is a GROUPING(...) or GROUPING_ID(...) call,
 // filling `args` and `is_grouping_id`.
 bool IsGroupingFunctionCall(const Expression& expression,
@@ -150,6 +152,8 @@ bool IsGroupingFunctionCall(const Expression& expression,
   *args = call.Args();
   return true;
 }
+
+}  // namespace
 
 bool ContainsGroupingCall(const Expression& expression) {
   if (!expression) {
@@ -251,6 +255,8 @@ StatusOr<Expression> RewriteGroupingSetBranch(
   }
   return WithExpressionChildren(expression, std::move(children));
 }
+
+namespace {
 
 // Collects window calls from a select-entry expression.  Window
 // specifications own their scope: windows never nest inside aggregates,
@@ -380,6 +386,8 @@ StatusOr<Expression> RewireWindowInputs(
   }
   return WithExpressionChildren(expression, std::move(children));
 }
+
+}  // namespace
 
 // Expands GROUPING SETS / ROLLUP / CUBE for statements that also carry window
 // functions.  A window function sees the *combined* result of every grouping
@@ -995,6 +1003,8 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
   return result;
 }
 
+namespace {
+
 struct ColumnTypeInfo {
   ValueType type{ValueType::kNull};
   bool is_unsigned{false};
@@ -1177,6 +1187,8 @@ Status ValidateCreateTableOptions(const GoogleSqlAstNode& root) {
   }
   return Status::kSuccess;
 }
+
+}  // namespace
 
 StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
   const GoogleSqlAstNode* path = root.Child("PathExpression");
@@ -1369,6 +1381,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
   return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad CREATE");
 }
 
+namespace {
+
 InsertMode InsertModeFromDetail(const std::string& detail) {
   if (detail.find("insert_mode=IGNORE") != std::string::npos) {
     return InsertMode::kIgnore;
@@ -1390,6 +1404,8 @@ StatusOr<int64_t> AssertRowsModifiedValue(const GoogleSqlAstNode& node) {
   }
   return ParseIntLiteral(*literal);
 }
+
+}  // namespace
 
 StatusOr<std::unique_ptr<Statement>> VisitInsert(const GoogleSqlAstNode& root) {
   const GoogleSqlAstNode* path = root.Child("PathExpression");

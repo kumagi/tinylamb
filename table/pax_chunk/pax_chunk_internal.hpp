@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <ostream>
@@ -150,7 +151,7 @@ inline int BitsNeeded(uint64_t maxv) {
 // nearly every candidate on every row group of every column.
 inline void AppendPackBits(std::vector<char>& out,
                            const std::vector<uint64_t>& vals, int w) {
-  if (w == 0 || vals.empty()) return;
+  if (w <= 0 || w > 64 || vals.empty()) return;
   const uint32_t width = static_cast<uint32_t>(w);
   const size_t total_bits = vals.size() * static_cast<size_t>(width);
   // Same MSB-first bit stream as the old __int128 shift register, but the
@@ -170,12 +171,12 @@ inline void AppendPackBits(std::vector<char>& out,
     // Word boundary: fill the top `room` bits, flush 8 bytes, keep the
     // leftover bits of this value as the new left-aligned accumulator.
     const uint32_t room = 64 - fill;
-    acc |= room != 0 ? (v >> (width - room)) : 0;
+    acc |= (room != 0 && room < width) ? (v >> (width - room)) : 0;
     const uint64_t be = htobe64(acc);
     std::memcpy(base, &be, sizeof(be));
     base += sizeof(be);
     const uint32_t rem = width - room;
-    acc = rem != 0 ? (v << (64 - rem)) : 0;
+    acc = (rem != 0) ? (v << (64 - rem)) : 0;
     fill = rem;
   }
   // Tail: up to 7 bits (or a whole w==64 word) left in the accumulator.
@@ -859,6 +860,7 @@ struct PostingsBitCursor {
     while (got < k) {
       if (held == 0 && !Refill()) return false;
       const uint32_t take = held < (k - got) ? held : (k - got);
+      if (take == 0 || take >= 64) return false;
       rem = (rem << take) | (window >> (64 - take));
       window <<= take;
       held -= take;

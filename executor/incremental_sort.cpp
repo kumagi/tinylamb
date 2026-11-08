@@ -82,7 +82,9 @@ class PrefixRun final : public ExecutorBase {
     }
     return destination->Size();
   }
-  void Dump(std::ostream& out, int) const override { out << "PrefixRun"; }
+  void Dump(std::ostream& out, int /*indent*/) const override {
+    out << "PrefixRun";
+  }
 
  private:
   Executor source_;
@@ -133,21 +135,31 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
 }
 
 bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
-  if (GetStatus() != Status::kSuccess) return false;
-  if (sort_error_ != Status::kSuccess) return FailWith(sort_error_);
+  if (GetStatus() != Status::kSuccess) {
+    return false;
+  }
+  if (sort_error_ != Status::kSuccess) {
+    return FailWith(sort_error_);
+  }
   for (;;) {
     if (group_sort_) {
       DataChunk group_chunk;
       if (group_sort_->NextBatch(&group_chunk, 1) != 0) {
         *dst = group_chunk.RowAt(0);
-        if (rp) *rp = group_chunk.PositionAt(0);
+        if (rp != nullptr) {
+          *rp = group_chunk.PositionAt(0);
+        }
         return true;
       }
-      if (FailWithChildOf(*group_sort_)) return false;
+      if (FailWithChildOf(*group_sort_)) {
+        return false;
+      }
       group_sort_.reset();
     }
     if (!has_pending_) {
-      if (input_exhausted_ || !source_) return false;
+      if (input_exhausted_ || !source_) {
+        return false;
+      }
       DataChunk pending_chunk;
       if (source_->NextBatch(&pending_chunk, 1) == 0) {
         input_exhausted_ = true;
@@ -166,22 +178,30 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
       DataChunk candidate_chunk;
       if (source_->NextBatch(&candidate_chunk, 1) == 0) {
         input_exhausted_ = true;
-        if (FailWithChildOf(*source_)) return false;
+        if (FailWithChildOf(*source_)) {
+          return false;
+        }
         *dst = std::move(first);
-        if (rp) *rp = first_position;
+        if (rp != nullptr) {
+          *rp = first_position;
+        }
         ++singleton_runs_;
         return true;
       }
       Row candidate = candidate_chunk.RowAt(0);
       const RowPosition candidate_position = candidate_chunk.PositionAt(0);
       const bool equal = ArePrefixEqual(first, candidate);
-      if (sort_error_ != Status::kSuccess) return FailWith(sort_error_);
+      if (sort_error_ != Status::kSuccess) {
+        return FailWith(sort_error_);
+      }
       if (!equal) {
         pending_row_ = std::move(candidate);
         pending_position_ = candidate_position;
         has_pending_ = true;
         *dst = std::move(first);
-        if (rp) *rp = first_position;
+        if (rp != nullptr) {
+          *rp = first_position;
+        }
         ++singleton_runs_;
         return true;
       }
@@ -193,7 +213,9 @@ bool IncrementalSortExecutor::NextStreaming(Row* dst, RowPosition* rp) {
         source_, std::move(pending_row_), pending_position_, std::move(second),
         [this](const Row& a, const Row& b) -> StatusOr<bool> {
           const bool equal = ArePrefixEqual(a, b);
-          if (sort_error_ != Status::kSuccess) return sort_error_;
+          if (sort_error_ != Status::kSuccess) {
+            return sort_error_;
+          }
           return equal;
         },
         [this](Row next, RowPosition position) {
@@ -233,7 +255,9 @@ size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
     return 0;
   }
   destination->Reset();
-  if (GetStatus() != Status::kSuccess) return 0;
+  if (GetStatus() != Status::kSuccess) {
+    return 0;
+  }
   if (!materialized_) {
     Row row;
     RowPosition position;
@@ -256,7 +280,9 @@ size_t IncrementalSortExecutor::NextBatch(DataChunk* destination,
 
 void IncrementalSortExecutor::Dump(std::ostream& o, int indent) const {
   o << "IncrementalSort";
-  if (singleton_runs_ != 0) o << " singleton_runs=" << singleton_runs_;
+  if (singleton_runs_ != 0) {
+    o << " singleton_runs=" << singleton_runs_;
+  }
   if (!prefix_keys_.empty() && prefix_keys_.front().expression) {
     const Expression& prefix = prefix_keys_.front().expression;
     if (prefix->Type() == TypeTag::kColumnValue) {

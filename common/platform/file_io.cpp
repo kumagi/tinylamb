@@ -25,7 +25,7 @@ namespace tinylamb::platform {
 
 int DataSync(int fd) {
   int rc = 0;
-#if defined(__APPLE__)
+#ifdef __APPLE__
   do {
     rc = ::fcntl(fd, F_FULLFSYNC);
   } while (rc < 0 && errno == EINTR);
@@ -45,7 +45,7 @@ int DataSync(int fd) {
 }
 
 void AdviseDontNeed(int fd, off_t offset, off_t length) {
-#if defined(__linux__)
+#ifdef __linux__
   (void)::posix_fadvise(fd, offset, length, POSIX_FADV_DONTNEED);
 #else
   (void)fd;
@@ -55,7 +55,7 @@ void AdviseDontNeed(int fd, off_t offset, off_t length) {
 }
 
 int Preallocate(int fd, off_t size) {
-#if defined(__linux__)
+#ifdef __linux__
   int allocated = 0;
   do {
     allocated = ::posix_fallocate(fd, 0, size);

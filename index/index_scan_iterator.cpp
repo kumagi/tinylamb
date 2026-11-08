@@ -91,18 +91,25 @@ TransactionManager::IndexReadGuard AcquireIteratorIndexReadGuard(
 // with INCLUDE values (and malformed/truncated records).
 bool DecodePositionOnly(std::string_view encoded, IndexValueType* value) {
   constexpr size_t kSize = RowPosition::Size() + sizeof(uint64_t);
-  if (encoded.size() != kSize) return false;
+  if (encoded.size() != kSize) {
+    return false;
+  }
   uint64_t columns = 0;
   DeserializeU64(encoded.data() + RowPosition::Size(), &columns);
-  if (columns != 0) return false;
-  value->pos.Deserialize(encoded.data());
+  if (columns != 0) {
+    return false;
+  }
+  value->pos.Deserialize(
+      encoded.data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
   value->include.Clear();
   return true;
 }
 
 StatusOr<IndexValueType> DecodeIndexValue(std::string_view encoded) {
   IndexValueType value;
-  if (DecodePositionOnly(encoded, &value)) return value;
+  if (DecodePositionOnly(encoded, &value)) {
+    return value;
+  }
   return Decode<IndexValueType>(encoded);
 }
 
@@ -111,7 +118,9 @@ StatusOr<std::vector<IndexValueType>> DecodeIndexValues(
   constexpr size_t kSize = RowPosition::Size() + sizeof(uint64_t);
   if (encoded.size() >= sizeof(uint64_t)) {
     uint64_t count = 0;
-    DeserializeU64(encoded.data(), &count);
+    DeserializeU64(
+        encoded.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+        &count);
     const std::string_view entries = encoded.substr(sizeof(uint64_t));
     if (count <= (1 << 20) && count == entries.size() / kSize &&
         entries.size() % kSize == 0) {
@@ -123,7 +132,9 @@ StatusOr<std::vector<IndexValueType>> DecodeIndexValues(
           break;
         }
       }
-      if (positions_only) return values;
+      if (positions_only) {
+        return values;
+      }
     }
   }
   return Decode<std::vector<IndexValueType>>(encoded);
@@ -179,7 +190,7 @@ IndexScanIterator::IndexScanIterator(
       begin_key.size() == index.sc_.key_.size() && begin_key == end_key;
   if (!resolve_head_ && !exact_point &&
       (index_read_lock_.HoldsLock() ||
-       (index_read_guard && index_read_guard->HoldsLock()))) {
+       ((index_read_guard != nullptr) && index_read_guard->HoldsLock()))) {
     iter_.EnableStableLeafCache();
     cache_heap_images_ = txn_.IsReadOnly();
   }
@@ -232,11 +243,14 @@ bool IndexScanIterator::EncodedKeyMayOverlap(
 }
 
 Status IndexScanIterator::SetProjection(const std::vector<slot_t>& columns) {
-  if (resolve_head_ || index_.RetainsDeletedEntries())
+  if (resolve_head_ || index_.RetainsDeletedEntries()) {
     return Status::kInvalidArgument;
-  for (slot_t column : columns)
-    if (column >= table_.GetSchema().ColumnCount())
+  }
+  for (slot_t column : columns) {
+    if (column >= table_.GetSchema().ColumnCount()) {
       return Status::kInvalidArgument;
+    }
+  }
   projection_ = columns;
   current_row_resolved_ = false;
   current_row_.Clear();
@@ -257,7 +271,9 @@ void IndexScanIterator::Clear() {
 
 void IndexScanIterator::UpdateIteratorState() {
   if (!iter_.IsValid()) {
-    if (iter_.GetStatus() != Status::kSuccess) status_ = iter_.GetStatus();
+    if (iter_.GetStatus() != Status::kSuccess) {
+      status_ = iter_.GetStatus();
+    }
     Clear();
     return;
   }
@@ -307,7 +323,10 @@ void IndexScanIterator::UpdateIteratorState() {
           !index_.RetainsDeletedEntries() &&
           encoded_value.size() >= sizeof(uint64_t) + kSize) {
         uint64_t count = 0;
-        DeserializeU64(encoded_value.data(), &count);
+        DeserializeU64(
+            encoded_value
+                .data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+            &count);
         const std::string_view entries = encoded_value.substr(sizeof(uint64_t));
         if (count > 0 && count <= (1 << 20) &&
             count == entries.size() / kSize && entries.size() % kSize == 0) {
@@ -442,8 +461,9 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
     image = visible.Value();
   }
   for (const IntegerPeekCompare& peek : integer_peeks_) {
-    const auto value =
-        Row::TryPeekInteger(image.data(), table_.schema_, peek.column);
+    const auto value = Row::TryPeekInteger(
+        image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+        table_.schema_, peek.column);
     if (!value || !MatchIntegerCompare(*value, peek.op, peek.constant)) {
       current_row_.Clear();
       return;
@@ -453,8 +473,9 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
   txn_.AddReadSet(pos_);
   // Length-prefixed page images: decoded by offsets, never as C strings.
   if (projection_) {
-    current_row_.DeserializeProjected(image.data(), table_.schema_,
-                                      *projection_);
+    current_row_.DeserializeProjected(
+        image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+        table_.schema_, *projection_);
   } else {
     current_row_.Deserialize(
         image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)

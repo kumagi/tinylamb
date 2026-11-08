@@ -170,7 +170,7 @@ int InitializeFixedFile(int fd, uint64_t index, size_t size, size_t end,
   if (ClearAppend(fd) != 0) {
     return -1;
   }
-  const off_t physical_size = static_cast<off_t>(size + kTailBytes);
+  const auto physical_size = static_cast<off_t>(size + kTailBytes);
   if (platform::Preallocate(fd, physical_size) != 0) {
     return -1;
   }
@@ -184,7 +184,7 @@ int InitializeFixedFile(int fd, uint64_t index, size_t size, size_t end,
     // need extent-conversion metadata at commit. Materialize new data blocks
     // once, before any records/ACKs exist. Forced repair and truncation must
     // preserve all existing data bytes and never take this branch.
-    const std::array<char, 64 * 1024> zeros{};
+    const std::array<char, size_t{64} * 1024> zeros{};
     for (size_t offset = 0; offset < size; offset += zeros.size()) {
       const size_t count = std::min(zeros.size(), size - offset);
       if (PwriteAll(fd, zeros.data(), count, static_cast<off_t>(offset)) != 0) {
@@ -219,7 +219,7 @@ StatusOr<FixedTail> ReadFixedTail(int fd, uint64_t index, size_t size,
     ssize_t count = 0;
     do {
       count = ::pread(fd, bytes.data(), bytes.size(),
-                      static_cast<off_t>(size + slot * kTailSlotBytes));
+                      static_cast<off_t>(size + (slot * kTailSlotBytes)));
     } while (count < 0 && errno == EINTR);
     if (count < 0) {
       return StatusError(StatusCode::kIOError,
@@ -235,10 +235,10 @@ StatusOr<FixedTail> ReadFixedTail(int fd, uint64_t index, size_t size,
     DeserializeU64(bytes.data() + 12, &generation);
     DeserializeU64(bytes.data() + 20, &end);
     DeserializeU32(bytes.data() + 28, &crc);
-    valid = count == static_cast<ssize_t>(bytes.size()) &&
-            magic == kTailMagic && stored_index == index && end <= size &&
+    valid = std::cmp_equal(count, bytes.size()) && magic == kTailMagic &&
+            stored_index == index && end <= size &&
             crc == Crc32C(bytes.data(), 28);
-    tails[slot] = {generation, static_cast<size_t>(end)};
+    tails[slot] = {.generation = generation, .end = static_cast<size_t>(end)};
   }
   if (valid) {
     const auto& a = tails[0];
@@ -260,10 +260,12 @@ StatusOr<FixedTail> ReadFixedTail(int fd, uint64_t index, size_t size,
     // --force must inspect all available record bytes, not silently trust an
     // older slot which might precede an acknowledged commit. Recovery finds
     // the CRC-valid prefix and performs the actual logical truncation later.
-    latest = {0, stat_buffer.st_size <= 0
-                     ? 0
-                     : static_cast<size_t>(std::min<uint64_t>(
-                           static_cast<uint64_t>(stat_buffer.st_size), size))};
+    latest = {
+        .generation = 0,
+        .end = stat_buffer.st_size <= 0
+                   ? 0
+                   : static_cast<size_t>(std::min<uint64_t>(
+                         static_cast<uint64_t>(stat_buffer.st_size), size))};
   }
   return latest;
 }
@@ -717,7 +719,7 @@ StatusOr<std::unique_ptr<Logger>> Logger::Create(
     bool framed = false;
     if (base_fd >= 0) {
       if (::fstat(base_fd, &base_stat) == 0 &&
-          base_stat.st_size > static_cast<off_t>(kTailBytes)) {
+          std::cmp_greater(base_stat.st_size, kTailBytes)) {
         const auto candidate_size =
             static_cast<size_t>(base_stat.st_size) - kTailBytes;
         framed = ReadFixedTail(base_fd, 0, candidate_size, false).HasValue();
@@ -976,7 +978,7 @@ int Logger::WriteFixedTail(size_t logical_end) {
   const auto bytes = EncodeTail(current_segment_, generation, logical_end);
   if (PwriteAll(dst_, bytes.data(), bytes.size(),
                 static_cast<off_t>(segment_size_ +
-                                   (generation % 2) * kTailSlotBytes)) != 0) {
+                                   ((generation % 2) * kTailSlotBytes))) != 0) {
     return -1;
   }
   footer_generation_ = generation;
@@ -985,7 +987,7 @@ int Logger::WriteFixedTail(size_t logical_end) {
 
 int Logger::SyncSegment(size_t logical_end) {
   if (fixed_size_segments_) {
-    if (logical_end == static_cast<size_t>(-1)) {
+    if (logical_end == std::numeric_limits<size_t>::max()) {
       const lsn_t start = current_segment_ * static_cast<lsn_t>(segment_size_);
       const lsn_t written = flushed_lsn_.load(std::memory_order_relaxed);
       logical_end = static_cast<size_t>(std::min<lsn_t>(
@@ -1095,9 +1097,9 @@ Status Logger::RollToLocked(uint64_t index) {
     // The old segment will never be fsynced through the new fd: flush it
     // here, or records already reported durable via the new segment's
     // barriers could sit unsynced in the closed file forever.
-    if (!(fixed_size_segments_ &&
-          durable_lsn_.load(std::memory_order_acquire) >=
-              flushed_lsn_.load(std::memory_order_relaxed)) &&
+    if ((!fixed_size_segments_ ||
+         durable_lsn_.load(std::memory_order_acquire) <
+             flushed_lsn_.load(std::memory_order_relaxed)) &&
         SyncSegment() != 0) {
       const int saved = errno;
       ::close(dst_);
@@ -1749,7 +1751,7 @@ void Logger::LoggerWork() {
         (fixed_size_segments_ &&
          WriteFixedTail(static_cast<size_t>(
              flushed_lsn_.load() -
-             current_segment_ * static_cast<lsn_t>(segment_size_))) != 0) ||
+             (current_segment_ * static_cast<lsn_t>(segment_size_)))) != 0) ||
         ::fsync(dst_) != 0) {
       const int saved = errno == 0 ? EIO : errno;
       SetFailed(saved);

@@ -109,18 +109,25 @@ StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
            type == ValueType::kDouble;
   };
   if (projection_) {
-    if (projection_->empty()) return false;
+    if (projection_->empty()) {
+      return false;
+    }
     for (slot_t slot : *projection_) {
       if (slot >= table_->GetSchema().ColumnCount() ||
-          !supported(table_->GetSchema().GetColumn(slot).Type()))
+          !supported(table_->GetSchema().GetColumn(slot).Type())) {
         return false;
+      }
     }
   } else {
     for (size_t slot = 0; slot < table_->GetSchema().ColumnCount(); ++slot) {
-      if (!supported(table_->GetSchema().GetColumn(slot).Type())) return false;
+      if (!supported(table_->GetSchema().GetColumn(slot).Type())) {
+        return false;
+      }
     }
   }
-  if (worker_status_ != Status::kSuccess) return worker_status_;
+  if (worker_status_ != Status::kSuccess) {
+    return worker_status_;
+  }
   started_ = true;
   typed_folded_ = true;
   std::atomic<size_t> next{0};
@@ -140,7 +147,9 @@ StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
       batch.capture_positions = capture_positions;
       while (!failed.load(std::memory_order_acquire)) {
         const size_t index = next.fetch_add(1, std::memory_order_relaxed);
-        if (index >= morsels_.size()) break;
+        if (index >= morsels_.size()) {
+          break;
+        }
         Iterator iterator = table_->BeginMorselScan(
             *txn_, morsels_[index], projection_, nullptr, std::nullopt,
             peek_compares_.empty() ? nullptr : &peek_compares_);
@@ -179,7 +188,9 @@ StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
     // The SQL worker already supplies parallelism across concurrent queries.
     const size_t fold_workers = morsels_.size() <= 4 ? 1 : worker_count_;
     workers.reserve(fold_workers - 1);
-    for (size_t i = 1; i < fold_workers; ++i) workers.emplace_back(run);
+    for (size_t i = 1; i < fold_workers; ++i) {
+      workers.emplace_back(run);
+    }
     run();
   } catch (const std::exception& exception) {
     fail(StatusError(StatusCode::kRuntimeError, exception.what()));
@@ -623,7 +634,9 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
 
 bool ParallelScan::HasSignedIntegerColumn(size_t offset) const {
   if (projection_) {
-    if (offset >= projection_->size()) return false;
+    if (offset >= projection_->size()) {
+      return false;
+    }
     offset = (*projection_)[offset];
   }
   return offset < table_->GetSchema().ColumnCount() &&
@@ -1323,7 +1336,9 @@ void ParallelScan::Dump(std::ostream& out, int /*indent*/) const {
   if (row_filter_ != nullptr) {
     out << " worker-filter";
   }
-  if (typed_folded_) out << " fused-typed-fold";
+  if (typed_folded_) {
+    out << " fused-typed-fold";
+  }
 }
 
 }  // namespace tinylamb

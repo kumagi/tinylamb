@@ -62,25 +62,37 @@ class TestSqlSession final : public TpccSqlSession {
       : database_(database), engine_(database) {}
   Status Begin(bool read_only) override {
     read_modes.push_back(read_only);
-    if (fail_begin) return Status::kIOError;
+    if (fail_begin) {
+      return Status::kIOError;
+    }
     context_.emplace(read_only ? database_.BeginReadOnlyContext()
                                : database_.BeginContext());
     return Status::kSuccess;
   }
   Status Execute(std::string_view sql, std::vector<Row>* rows) override {
     ++statements;
+    if (!context_.has_value()) {
+      return Status::kInvalidArgument;
+    }
     auto result = engine_.Execute(*context_, sql);
-    if (!result.HasValue()) return result.GetStatus();
+    if (!result.HasValue()) {
+      return result.GetStatus();
+    }
     *rows = result.Value().Collect();
     return result.Value().GetStatus();
   }
   Status Commit() override {
     ++commits;
+    if (!context_.has_value()) {
+      return Status::kInvalidArgument;
+    }
     return context_->PreCommit();
   }
   void Abort() override {
     ++aborts;
-    if (context_) context_->Abort();
+    if (context_) {
+      context_->Abort();
+    }
   }
   std::string_view LastError() const override { return "session failure"; }
 

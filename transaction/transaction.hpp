@@ -423,6 +423,26 @@ class Transaction final {
   StatusOr<std::string_view> ReadVersion(
       const RowPosition& rp, std::optional<std::string_view> physical,
       bool resolve_head = true);
+  [[nodiscard]] StatusOr<std::optional<std::string>> ReadLatestVersion(
+      const RowPosition& rp, std::optional<std::string_view> physical) const {
+    if (transaction_manager_ == nullptr) {
+      if (!physical) {
+        return Status::kNotExists;
+      }
+      return std::optional<std::string>();
+    }
+    return transaction_manager_->ReadLatestVersion(*this, rp, physical);
+  }
+  [[nodiscard]] bool HasForeignWriteIntent(const RowPosition& rp) const {
+    return transaction_manager_ != nullptr &&
+           transaction_manager_->HasForeignWriteIntent(*this, rp);
+  }
+  Status WaitForRowWriteIntent(const RowPosition& rp) {
+    if (transaction_manager_ == nullptr) {
+      return Status::kSuccess;
+    }
+    return transaction_manager_->WaitForRowWriteIntent(*this, rp);
+  }
   void RegisterVersionWrite(const RowPosition& rp,
                             std::optional<std::string_view> before,
                             std::optional<std::string_view> after);
@@ -672,7 +692,7 @@ class Transaction final {
   StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type);
   StatusOr<lsn_t> DestroyPageLog(page_id_t page_id,
                                  PageType old_page_type = PageType::kUnknown,
-                                 std::string old_page_body = {});
+                                 std::string_view old_page_body = {});
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.

@@ -84,20 +84,19 @@ namespace {
 // UnwindInfoManager::deregisterSectionsImpl). The OS reclaims the JIT memory
 // at exit anyway.
 using KernelImplPtr = std::shared_ptr<JitInt64Kernels::Impl>;
-std::mutex& jit_cache_mutex =
-    *new std::mutex;  // NOLINT(cppcoreguidelines-owning-memory)
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+std::mutex& jit_cache_mutex = *new std::mutex;
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
 std::unordered_map<BinaryOperation, KernelImplPtr>& filter_kernel_cache =
-    *new std::unordered_map<
-        BinaryOperation,
-        KernelImplPtr>;  // NOLINT(cppcoreguidelines-owning-memory)
-KernelImplPtr& projection_kernel_cache =
-    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
-KernelImplPtr& sum_kernel_cache =
-    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
-KernelImplPtr& projection_checked_kernel_cache =
-    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
-KernelImplPtr& sum_checked_kernel_cache =
-    *new KernelImplPtr;  // NOLINT(cppcoreguidelines-owning-memory)
+    *new std::unordered_map<BinaryOperation, KernelImplPtr>;
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+KernelImplPtr& projection_kernel_cache = *new KernelImplPtr;
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+KernelImplPtr& sum_kernel_cache = *new KernelImplPtr;
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+KernelImplPtr& projection_checked_kernel_cache = *new KernelImplPtr;
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory,cert-err58-cpp)
+KernelImplPtr& sum_checked_kernel_cache = *new KernelImplPtr;
 
 void InitializeLlvm() {
   static std::once_flag initialized;

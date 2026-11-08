@@ -180,7 +180,7 @@ TEST_F(SqlAstFunctionSweepTest, JsonDocumentFamily) {
                {Value(std::string("array")), Value(std::string("array")),
                 Value(std::string("array"))});
   ExpectColumn("json_type('{\"a\": 1}', '$.zz')", {Value(), Value(), Value()});
-  ExpectColumn("json_keys('{\"b\": 1, \"a\": 2}')",
+  ExpectColumn(R"(json_keys('{"b": 1, "a": 2}'))",
                {Value::Array({Value(std::string("b")), Value(std::string("a"))},
                              "STRING"),
                 Value::Array({Value(std::string("b")), Value(std::string("a"))},

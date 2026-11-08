@@ -36,10 +36,10 @@ struct JVal {
   enum Type : std::uint8_t { kNull, kBool, kNum, kStr, kArr, kObj } type{kNull};
   bool b{false};
   double num{0.0};
-  std::string str;
-  std::string_view raw;
-  std::vector<std::shared_ptr<JVal>> arr;
-  std::vector<std::pair<std::string, std::shared_ptr<JVal>>> obj;
+  std::string str{};
+  std::string_view raw{};
+  std::vector<std::shared_ptr<JVal>> arr{};
+  std::vector<std::pair<std::string, std::shared_ptr<JVal>>> obj{};
 
   [[nodiscard]] std::string canonical() const {
     switch (type) {
@@ -345,7 +345,7 @@ enum class OpStatus {
 // One parsed path hop: either an object member name or an array position.
 struct PathSegment {
   bool is_index{false};
-  std::string key;
+  std::string key{};
   int64_t index{0};
 };
 

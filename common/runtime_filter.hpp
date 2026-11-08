@@ -398,14 +398,14 @@ class RuntimeFilterBuilder {
 //     filter built over INT64 can never prune a DATE probe column (or an
 //     unexpected type change) by comparing incomparable bit patterns.
 struct ScanRuntimeFilter {
-  std::shared_ptr<const RuntimeFilterGroup> group;
+  std::shared_ptr<const RuntimeFilterGroup> group{};
   slot_t column{0};
   ValueType type{ValueType::kInt64};
   // Additional selective runtime filters on other columns of the same table
   // discovered by BuildInput when multiple selective join partners are already
   // loaded (e.g. lineitem joined with both filtered orders and filtered
   // supplier/part).
-  std::vector<ScanRuntimeFilter> extra;
+  std::vector<ScanRuntimeFilter> extra{};
 
   [[nodiscard]] bool enabled() const {
     return group != nullptr && !group->empty();

@@ -289,6 +289,9 @@ class TransactionManager {
   bool AcquireWriteIntent(
       Transaction& txn, const RowPosition& rp, bool wait,
       std::optional<std::string_view> before = std::nullopt);
+  [[nodiscard]] bool HasForeignWriteIntent(const Transaction& txn,
+                                           const RowPosition& rp) const;
+  Status WaitForRowWriteIntent(Transaction& txn, const RowPosition& rp);
 
   [[nodiscard]] uint64_t CurrentCommitTimestamp() const {
     return commit_timestamp_.load();
@@ -314,6 +317,9 @@ class TransactionManager {
   StatusOr<std::optional<std::string>> ReadVersion(
       const Transaction& txn, const RowPosition& rp,
       std::optional<std::string_view> physical, bool resolve_head = true) const;
+  StatusOr<std::optional<std::string>> ReadLatestVersion(
+      const Transaction& txn, const RowPosition& rp,
+      std::optional<std::string_view> physical) const;
   // True when any version chain entry exists for the row.  Without one, the
   // physical row image is the only version and is visible to every snapshot,
   // letting readers skip the copy/cache slow path in Transaction::ReadVersion.
@@ -453,17 +459,26 @@ class TransactionManager {
   class IndexReadGuard {
    public:
     IndexReadGuard() = default;
-    explicit IndexReadGuard(std::shared_mutex& mutex) : lock_(mutex) {}
-    IndexReadGuard(IndexReadGuard&&) noexcept = default;
-    IndexReadGuard& operator=(IndexReadGuard&&) noexcept = default;
+    explicit IndexReadGuard(std::shared_mutex& mutex);
+    static IndexReadGuard Borrowed() noexcept {
+      IndexReadGuard g;
+      g.borrowed_ = true;
+      return g;
+    }
+    IndexReadGuard(IndexReadGuard&& other) noexcept;
+    IndexReadGuard& operator=(IndexReadGuard&& other) noexcept;
     IndexReadGuard(const IndexReadGuard&) = delete;
     IndexReadGuard& operator=(const IndexReadGuard&) = delete;
-    ~IndexReadGuard() = default;
-    [[nodiscard]] bool HoldsLock() const noexcept { return lock_.owns_lock(); }
+    ~IndexReadGuard();
+    [[nodiscard]] bool HoldsLock() const noexcept {
+      return lock_.owns_lock() || borrowed_;
+    }
 
    private:
     friend class TransactionManager;
     std::shared_lock<std::shared_mutex> lock_;
+    std::shared_mutex* tracked_mutex_{nullptr};
+    bool borrowed_{false};
   };
   // Opaque encoded keys only: the index layer owns range semantics. The
   // caller must hold this root's read gate. nullopt keeps the coarse fallback.
@@ -517,6 +532,7 @@ class TransactionManager {
   };
   struct PendingVersion {
     txn_id_t owner{0};
+    std::thread::id owner_thread{};
     std::optional<std::string> value;
     bool staged{false};
   };

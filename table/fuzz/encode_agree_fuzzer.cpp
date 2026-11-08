@@ -17,12 +17,13 @@
 // Encoder / validator AGREEMENT fuzzing: whatever EncodeColumnAdaptive emits
 // must be a chunk ValidateChunkBytes and Deserialize accept, and reopen
 // losslessly.
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,7 +43,7 @@
 namespace tinylamb::fuzz {
 namespace {
 
-const char* const kForceNames[] = {
+constexpr std::array<const char*, 68> kForceNames = {
     "ARITH",     "SPARSE",      "ANSFOR",        "OPRLE",         "XORFORC",
     "GORILLAC",  "CHIMPC",      "PLA",           "INTERP",        "RLEIDX",
     "DELTAPFOR", "ELIASFANO",   "RLEBP",         "WAH",           "BITMAP",
@@ -58,7 +59,7 @@ const char* const kForceNames[] = {
     "EXPFOR",    "SORTDICT",    "LANES",         "POSTINGS",      "TEMPLATE",
     "DSTREAM",   "FASTPFOR",    "DELTAFASTPFOR",
 };
-constexpr size_t kForceCount = sizeof(kForceNames) / sizeof(kForceNames[0]);
+constexpr size_t kForceCount = kForceNames.size();
 
 class ForceGuard {
  public:
@@ -72,6 +73,8 @@ class ForceGuard {
   ~ForceGuard() { unsetenv("TINYLAMB_FORCE_SCHEME"); }
   ForceGuard(const ForceGuard&) = delete;
   ForceGuard& operator=(const ForceGuard&) = delete;
+  ForceGuard(ForceGuard&&) = delete;
+  ForceGuard& operator=(ForceGuard&&) = delete;
 };
 
 std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
@@ -95,7 +98,7 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
           break;
         }
         case ValueType::kDouble: {
-          vals.emplace_back(100.25 + static_cast<double>(i % 13) * 0.5);
+          vals.emplace_back(100.25 + (static_cast<double>(i % 13) * 0.5));
           break;
         }
         case ValueType::kInt64:
@@ -107,8 +110,8 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
                 (static_cast<uint64_t>(i) * 2654435761ULL + tile * 40503ULL) %
                 kLocalD;
             vals.emplace_back(INT64_C(1000000000000) +
-                              static_cast<int64_t>(tile) * INT64_C(1048576) +
-                              static_cast<int64_t>(slot) * 7919);
+                              (static_cast<int64_t>(tile) * INT64_C(1048576)) +
+                              (static_cast<int64_t>(slot) * 7919));
           } else if (skewed) {
             constexpr int64_t kSkewD = 64;
             static const std::vector<double> weights = [] {
@@ -119,7 +122,9 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
                     1.0 / std::pow(static_cast<double>(k), 1.5);
                 t += v[static_cast<size_t>(k - 1)];
               }
-              for (double& x : v) x /= t;
+              for (double& x : v) {
+                x /= t;
+              }
               return v;
             }();
             double acc = 0.0;
@@ -130,7 +135,7 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
             for (int64_t k = 0; k < kSkewD; ++k) {
               acc += weights[static_cast<size_t>(k)];
               if (acc >= target) {
-                vals.emplace_back(INT64_C(1000000000000) + k * 7919);
+                vals.emplace_back(INT64_C(1000000000000) + (k * 7919));
                 break;
               }
             }
@@ -141,9 +146,9 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
           } else if (narrow) {
             vals.emplace_back(static_cast<int64_t>(2000 + (i % 9)));
           } else if (ramp) {
-            vals.emplace_back(static_cast<int64_t>(i) * 3 + 1);
+            vals.emplace_back((static_cast<int64_t>(i) * 3) + 1);
           } else {
-            vals.emplace_back(static_cast<int64_t>(i) * 7919 + 13);
+            vals.emplace_back((static_cast<int64_t>(i) * 7919) + 13);
           }
           break;
         }
@@ -155,7 +160,9 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
   }
   if (keep_nulls) {
     for (uint32_t i = 1; i < n; i += 7) {
-      if (rows[i].Count() > 1) rows[i][1] = Value();
+      if (rows[i].Count() > 1) {
+        rows[i][1] = Value();
+      }
     }
   }
   return rows;
@@ -164,16 +171,18 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
 }  // namespace
 
 int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
-  if (size < 24) return 0;
+  if (size < 24) {
+    return 0;
+  }
 
   const size_t force_idx = data[0] % (kForceCount + 1);
   const bool adaptive = force_idx == kForceCount;
   const char* force = adaptive ? nullptr : kForceNames[force_idx];
   const auto shape = static_cast<uint8_t>(data[1] & 127);
-  static constexpr uint32_t kCounts[] = {1,   2,   7,    8,    9,   63,
-                                         64,  65,  127,  128,  129, 255,
-                                         256, 257, 1023, 1024, 1025};
-  const uint32_t n = kCounts[data[2] % (sizeof(kCounts) / sizeof(uint32_t))];
+  static constexpr std::array<uint32_t, 17> kCounts = {
+      1,   2,   7,   8,   9,   63,   64,   65,  127,
+      128, 129, 255, 256, 257, 1023, 1024, 1025};
+  const uint32_t n = kCounts[data[2] % kCounts.size()];
 
   const Schema sc = MakeStorageSchema();
   const std::vector<Row> rows = MakeRows(sc, shape, n);
@@ -186,28 +195,27 @@ int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
   const Status v = PaxChunk::ValidateChunkBytes(chunk.Data());
   if (v != Status::kSuccess) {
     std::string schemes;
-    for (size_t i = 0; i < chunk.GetFooter().encodings.size(); ++i) {
-      schemes += " " + std::to_string(chunk.GetFooter().encodings[i]);
+    for (unsigned char encoding : chunk.GetFooter().encodings) {
+      schemes += " " + std::to_string(encoding);
     }
-    std::fprintf(stderr,
-                 "ENCODE/VALIDATE DISAGREEMENT: force=%s shape=%u n=%u "
-                 "validate=%d schemes:%s\n",
-                 adaptive ? "(adaptive)" : force, shape, n,
-                 static_cast<int>(v.GetCode()), schemes.c_str());
+    std::cerr << "ENCODE/VALIDATE DISAGREEMENT: force="
+              << (adaptive ? "(adaptive)" : force)
+              << " shape=" << static_cast<unsigned>(shape) << " n=" << n
+              << " validate=" << static_cast<int>(v.GetCode())
+              << " schemes:" << schemes << "\n";
     std::abort();
   }
 
   const StatusOr<PaxChunk> reopened = PaxChunk::Deserialize(chunk.Data());
   if (!reopened.HasValue()) {
-    std::fprintf(stderr,
-                 "ENCODE/VALIDATE DISAGREEMENT: accepted but Deserialize "
-                 "rejected (force=%s n=%u)\n",
-                 adaptive ? "(adaptive)" : force, n);
+    std::cerr << "ENCODE/VALIDATE DISAGREEMENT: accepted but Deserialize "
+                 "rejected (force="
+              << (adaptive ? "(adaptive)" : force) << " n=" << n << ")\n";
     std::abort();
   }
   if (reopened.Value().TotalRowCount() != n) {
-    std::fprintf(stderr, "row count lost across a reopen: %zu != %u\n",
-                 reopened.Value().TotalRowCount(), n);
+    std::cerr << "row count lost across a reopen: "
+              << reopened.Value().TotalRowCount() << " != " << n << "\n";
     std::abort();
   }
   for (size_t i = 0; i < n; ++i) {
@@ -215,9 +223,8 @@ int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
       const StatusOr<Value> a = chunk.ReadColumnValue(i, c, sc);
       const StatusOr<Value> b = reopened.Value().ReadColumnValue(i, c, sc);
       if (!a.HasValue() || !b.HasValue() || a.Value() != b.Value()) {
-        std::fprintf(
-            stderr, "value mismatch across a reopen: row=%zu col=%u force=%s\n",
-            i, c, adaptive ? "(adaptive)" : force);
+        std::cerr << "value mismatch across a reopen: row=" << i << " col=" << c
+                  << " force=" << (adaptive ? "(adaptive)" : force) << "\n";
         std::abort();
       }
     }

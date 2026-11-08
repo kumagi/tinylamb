@@ -91,8 +91,9 @@ TEST_F(LoggerTest, CommitDrivenSyncStillHasBoundedBackgroundProgress) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (l_->DurableLSN() < target &&
-         std::chrono::steady_clock::now() < deadline)
+         std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
   EXPECT_GE(l_->DurableLSN(), target);
 }
 

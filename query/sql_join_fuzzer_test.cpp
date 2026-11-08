@@ -121,7 +121,7 @@ TEST(SqlJoinFuzzer, SixAggregateFusedJoinAndCrashSeedsRegression) {
   };
   EXPECT_EQ(ReplayJoinTrace(trace), "");
 
-  static constexpr uint8_t kCrashSeeds[][16] = {
+  static constexpr std::array<std::array<uint8_t, 16>, 8> kCrashSeeds = {{
       {174, 25, 68, 105, 115, 116, 105, 110, 99, 116, 79, 110, 107, 137, 243,
        208},
       {174, 25, 137, 24, 162, 142, 99, 188, 19, 69, 65, 112, 99, 137, 243, 208},
@@ -136,10 +136,11 @@ TEST(SqlJoinFuzzer, SixAggregateFusedJoinAndCrashSeedsRegression) {
       {162, 174, 24, 99, 137, 243, 69, 65, 99, 137, 243, 69, 65, 208, 208, 0},
       {162, 25, 142, 174, 75, 231, 156, 118, 12, 178, 190, 81, 188, 193, 188,
        208},
-  };
-  static constexpr size_t kCrashSeedSizes[] = {16, 16, 16, 16, 16, 16, 15, 16};
+  }};
+  static constexpr std::array<size_t, 8> kCrashSeedSizes = {16, 16, 16, 16,
+                                                            16, 16, 15, 16};
   for (size_t i = 0; i < 8; ++i) {
-    JoinFuzzTry(kCrashSeeds[i], kCrashSeedSizes[i], false);
+    JoinFuzzTry(kCrashSeeds[i].data(), kCrashSeedSizes[i], false);
   }
 }
 

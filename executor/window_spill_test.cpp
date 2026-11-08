@@ -89,15 +89,15 @@ Schema WindowSchema(size_t output_count) {
   std::vector<Column> columns = {Column("g", ValueType::kInt64),
                                  Column("k", ValueType::kInt64)};
   for (size_t i = 0; i < output_count; ++i) {
-    columns.emplace_back(Column("$win" + std::to_string(i), ValueType::kNull));
+    columns.emplace_back("$win" + std::to_string(i), ValueType::kNull);
   }
-  return Schema("w", std::move(columns));
+  return {"w", std::move(columns)};
 }
 
 // SUM(k) over each g: k runs g, g+3, ... so the sum is per_group*g plus
 // kGroups*(0+..+per_group-1).
 int64_t ExpectedGroupSum(int64_t g) {
-  return kPerGroup * g + kGroups * ((kPerGroup - 1) * kPerGroup / 2);
+  return (kPerGroup * g) + (kGroups * ((kPerGroup - 1) * kPerGroup / 2));
 }
 
 }  // namespace
@@ -177,7 +177,7 @@ TEST_F(WindowSpillTest, PartitionedSpillMatchesTheBufferedShape) {
     ASSERT_NE(found, got.end()) << "missing row for g=" << g << " k=" << k;
     // Within a partition the order key is k, so the rank is the row's index
     // in its group.
-    EXPECT_EQ(found->second.first, (k - g) / kGroups + 1) << "k=" << k;
+    EXPECT_EQ(found->second.first, ((k - g) / kGroups) + 1) << "k=" << k;
     EXPECT_EQ(found->second.second, ExpectedGroupSum(g)) << "k=" << k;
   }
   EXPECT_EQ(buffered_rows.size(), spilled_rows.size());
@@ -230,7 +230,7 @@ TEST_F(WindowSpillTest, BatchedEmissionCrossesSpillFilesWithoutLosingRows) {
     const int64_t g = k % kGroups;
     const auto found = got.find(std::make_pair(g, k));
     ASSERT_NE(found, got.end()) << "missing row for g=" << g << " k=" << k;
-    EXPECT_EQ(found->second.first, (k - g) / kGroups + 1);
+    EXPECT_EQ(found->second.first, ((k - g) / kGroups) + 1);
     EXPECT_EQ(found->second.second, ExpectedGroupSum(g));
   }
 }

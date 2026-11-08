@@ -43,8 +43,8 @@ LsmIndexIterator::LsmIndexIterator(LsmIndex* tree, Transaction* txn,
     valid_ = false;
     return;
   }
-  entries_ =
-      txn_->GetPageManager()->LsmScanRange(tree_->Root(), begin, end, true);
+  entries_ = txn_->GetPageManager()->LsmScanRange(tree_->Root(), begin, end,
+                                                  true, txn_->ID());
   if (entries_.empty()) {
     valid_ = false;
     return;
@@ -72,7 +72,7 @@ std::string LsmIndexIterator::Value() const {
       return live.MoveValue();
     }
     if (live.GetStatus() == Status::kNotExists) {
-      return std::string(sizeof(uint64_t), '\0');
+      return {sizeof(uint64_t), '\0'};
     }
   }
   return entries_[idx_].second;
@@ -121,7 +121,7 @@ StatusOr<LsmIndex> LsmIndex::Open(Transaction& txn, page_id_t root) {
 }
 
 Status LsmIndex::Insert(Transaction& txn, std::string_view key,
-                        std::string_view value, page_id_t* hint_leaf) {
+                        std::string_view value, page_id_t* hint_leaf) const {
   if (hint_leaf != nullptr) {
     *hint_leaf = root_;
   }
@@ -129,14 +129,14 @@ Status LsmIndex::Insert(Transaction& txn, std::string_view key,
 }
 
 Status LsmIndex::Update(Transaction& txn, std::string_view key,
-                        std::string_view value, page_id_t* hint_leaf) {
+                        std::string_view value, page_id_t* hint_leaf) const {
   if (hint_leaf != nullptr) {
     *hint_leaf = root_;
   }
   return txn.GetPageManager()->LsmUpdate(txn, root_, key, value);
 }
 
-Status LsmIndex::Delete(Transaction& txn, std::string_view key) {
+Status LsmIndex::Delete(Transaction& txn, std::string_view key) const {
   return txn.GetPageManager()->LsmDelete(txn, root_, key);
 }
 
@@ -150,14 +150,14 @@ StatusOr<std::string> LsmIndex::Read(Transaction& txn, std::string_view key,
 
 LsmIndexIterator LsmIndex::Begin(Transaction& txn, std::string_view begin,
                                  std::string_view end, bool ascending) {
-  return LsmIndexIterator(this, &txn, begin, end, ascending);
+  return {this, &txn, begin, end, ascending};
 }
 
 StatusOr<std::vector<std::string>> LsmIndex::ScanPartitionBoundaries(
     Transaction& txn, std::string_view begin, std::string_view end,
     size_t leaves_per_partition) const {
   const std::vector<std::pair<std::string, std::string>> entries =
-      txn.GetPageManager()->LsmScanRange(root_, begin, end, true);
+      txn.GetPageManager()->LsmScanRange(root_, begin, end, true, txn.ID());
   constexpr size_t kKeysPerVirtualLeaf = 128;
   const size_t step =
       std::max<size_t>(1, leaves_per_partition) * kKeysPerVirtualLeaf;
@@ -172,7 +172,7 @@ StatusOr<std::vector<std::string>> LsmIndex::ScanPartitionBoundaries(
   return boundaries;
 }
 
-Status LsmIndex::Destroy(Transaction& txn) {
+Status LsmIndex::Destroy(Transaction& txn) const {
   return txn.GetPageManager()->LsmDestroy(txn, root_);
 }
 

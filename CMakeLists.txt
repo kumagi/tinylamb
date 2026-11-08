@@ -47,7 +47,11 @@ set(TINYLAMB_ARCH "" CACHE STRING
     "Architecture flag: empty (portable baseline) | native | <raw -march value>")
 if(NOT TINYLAMB_ARCH STREQUAL "")
     if(TINYLAMB_ARCH STREQUAL "native")
-        add_compile_options(-march=native)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+            add_compile_options(-mcpu=native)
+        else()
+            add_compile_options(-march=native)
+        endif()
     else()
         add_compile_options(-march=${TINYLAMB_ARCH})
     endif()
@@ -118,7 +122,14 @@ set(TINYLAMB_GOOGLESQL_VERSION "2026.7.2" CACHE STRING
 if(TINYLAMB_ENABLE_GOOGLESQL)
     set(_googlesql_download_dir "${CMAKE_BINARY_DIR}/_deps/googlesql")
     set(_googlesql_executable "${_googlesql_download_dir}/execute_query")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    if(EXISTS "$ENV{HOME}/.local/share/googlesql-zygote/execute_query_parse")
+        file(MAKE_DIRECTORY "${_googlesql_download_dir}")
+        file(COPY_FILE "$ENV{HOME}/.local/share/googlesql-zygote/execute_query_parse"
+             "${_googlesql_executable}")
+        file(CHMOD "${_googlesql_executable}"
+             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                         GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
         set(_googlesql_asset "execute_query_linux")
         set(_googlesql_sha256
@@ -127,9 +138,10 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
         set(_googlesql_asset "execute_query_macos")
         set(_googlesql_sha256
             "f0e9532a6a6285f97fc684461825fb481c07879f08dd28c25e2322d52f99ac29")
-    elseif(EXISTS "/tmp/eq_client")
+    elseif(EXISTS "$ENV{HOME}/.local/share/googlesql-zygote/execute_query.real")
         file(MAKE_DIRECTORY "${_googlesql_download_dir}")
-        file(COPY_FILE "/tmp/eq_client" "${_googlesql_executable}")
+        file(COPY_FILE "$ENV{HOME}/.local/share/googlesql-zygote/execute_query.real"
+             "${_googlesql_executable}")
         file(CHMOD "${_googlesql_executable}"
              PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
                          GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
@@ -171,7 +183,9 @@ endif()
 
 find_package(Threads REQUIRED)
 if(TINYLAMB_ENABLE_LLVM_JIT)
-    find_package(LLVM CONFIG QUIET)
+    find_package(LLVM CONFIG QUIET
+                 HINTS /opt/homebrew/opt/llvm/lib/cmake/llvm
+                       /usr/local/opt/llvm/lib/cmake/llvm)
 endif()
 
 if(TINYLAMB_ENABLE_SANITIZERS)
@@ -276,6 +290,7 @@ tinylamb_add_layer(tinylamb_common
         common/platform/cpu_affinity.cpp
         common/platform/event_poller.cpp
         common/platform/file_io.cpp
+        common/platform/int128_rt.cpp
         common/platform/process.cpp
         common/platform/socket.cpp
         common/platform/time_format.cpp
@@ -566,8 +581,14 @@ target_compile_features(tinylamb_sql PUBLIC cxx_std_20)
 tinylamb_apply_options(tinylamb_sql)
 target_link_libraries(tinylamb_sql PUBLIC tinylamb::core)
 if(TINYLAMB_ENABLE_GOOGLESQL)
+    # Runtime path embedded into the frontend. Defaults to the build-tree
+    # copy; override it when cross-compiling and the target machine keeps the
+    # helper somewhere else (e.g. /tmp/tinylamb-execute-query on a Pi).
+    set(TINYLAMB_GOOGLESQL_EXECUTABLE_PATH "${_googlesql_executable}"
+        CACHE STRING
+        "Runtime path of the execute_query helper embedded into tinylamb_sql")
     target_compile_definitions(tinylamb_sql PRIVATE
-            TINYLAMB_GOOGLESQL_EXECUTABLE="${_googlesql_executable}")
+            TINYLAMB_GOOGLESQL_EXECUTABLE="${TINYLAMB_GOOGLESQL_EXECUTABLE_PATH}")
 endif()
 
 add_library(tinylamb_postgres_server
@@ -622,10 +643,10 @@ tinylamb_apply_options(tinylamb)
 target_link_libraries(
         tinylamb
         PRIVATE
-        tinylamb::sql
         # Shares pgwire::SplitSqlStatements with the server so the CLI does
         # not keep a diverged (comment/backslash-unaware) copy of the
-        # statement splitter.
+        # statement splitter; tinylamb::postgres_server transitively links
+        # tinylamb::sql PUBLIC.
         tinylamb::postgres_server
 )
 target_include_directories(
@@ -763,7 +784,7 @@ if(BUILD_TESTING)
         # TIMEOUT (seconds) overrides ctest's default 1500s for heavy
         # stateful-session / crash-recovery sweeps whose wall time explodes
         # when several suites run concurrently on one machine.
-        cmake_parse_arguments(SIMPLE_TEST "" "TIMEOUT" "" ${ARGN})
+        cmake_parse_arguments(SIMPLE_TEST "" "TIMEOUT" "LIBS" ${ARGN})
         get_filename_component(filename ${file_path} NAME)
         get_filename_component(target_name ${filename} NAME_WE)
         # The workspace-cleanup environment (database/test_workspace_cleanup_env
@@ -774,10 +795,15 @@ if(BUILD_TESTING)
         add_executable(${target_name} ${file_path}
                 "${CMAKE_CURRENT_SOURCE_DIR}/database/test_workspace_cleanup_env.cpp")
         tinylamb_apply_options(${target_name})
+        if(SIMPLE_TEST_LIBS)
+            set(_test_libs ${SIMPLE_TEST_LIBS})
+        else()
+            set(_test_libs tinylamb::sql)
+        endif()
         target_link_libraries(${target_name}
                 PRIVATE
                 GTest::gtest_main
-                tinylamb::sql
+                ${_test_libs}
                 tinylamb::test_util
         )
         if(TINYLAMB_ENABLE_TSAN)
@@ -936,19 +962,14 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
     target_compile_definitions(googlesql_compliance_test PRIVATE
             TINYLAMB_GOOGLESQL_COMPLIANCE_RUN=1)
 endif()
-add_simple_test(server/postgres_protocol_test.cpp)
-target_link_libraries(postgres_protocol_test PRIVATE tinylamb::postgres_server)
-add_simple_test(server/postgres_server_test.cpp)
-target_link_libraries(postgres_server_test PRIVATE tinylamb::postgres_server)
-add_simple_test(benchmark/tpcc_workload_test.cpp)
-target_link_libraries(tpcc_workload_test PRIVATE tinylamb::tpcc)
+add_simple_test(server/postgres_protocol_test.cpp LIBS tinylamb::postgres_server)
+add_simple_test(server/postgres_server_test.cpp LIBS tinylamb::postgres_server)
+add_simple_test(benchmark/tpcc_workload_test.cpp LIBS tinylamb::tpcc)
 
 # Coverage-focused tests.
 add_simple_test(executor/relational_extra_test.cpp)
-add_simple_test(benchmark/tpcc_workload_extra_test.cpp)
-target_link_libraries(tpcc_workload_extra_test PRIVATE tinylamb::tpcc)
-add_simple_test(server/postgres_server_extra_test.cpp)
-target_link_libraries(postgres_server_extra_test PRIVATE tinylamb::postgres_server)
+add_simple_test(benchmark/tpcc_workload_extra_test.cpp LIBS tinylamb::tpcc)
+add_simple_test(server/postgres_server_extra_test.cpp LIBS tinylamb::postgres_server)
 add_simple_test(table/table_statistics_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
 add_simple_test(query/sql_bugfix_regression_test.cpp)
@@ -1141,7 +1162,7 @@ add_replay_test(server/postgres_protocol_fuzzer_replay.cpp DIRECTORY
         tinylamb::postgres_server)
 add_replay_test(query/googlesql_ast_fuzzer_replay.cpp DIRECTORY
         tinylamb::sql)
-endif()
+
 add_executable(postgres_session_fuzzer_replay_test
                server/postgres_session_fuzzer_replay_test.cpp
                server/postgres_session_fuzzer.cpp
@@ -1151,3 +1172,4 @@ target_link_libraries(postgres_session_fuzzer_replay_test PRIVATE
         GTest::gtest_main tinylamb::postgres_server tinylamb::test_util)
 add_test(NAME postgres_session_fuzzer_replay_test
          COMMAND postgres_session_fuzzer_replay_test)
+endif()

@@ -92,10 +92,10 @@ class LsmIndex {
   [[nodiscard]] page_id_t Root() const { return root_; }
 
   Status Insert(Transaction& txn, std::string_view key, std::string_view value,
-                page_id_t* hint_leaf = nullptr);
+                page_id_t* hint_leaf = nullptr) const;
   Status Update(Transaction& txn, std::string_view key, std::string_view value,
-                page_id_t* hint_leaf = nullptr);
-  Status Delete(Transaction& txn, std::string_view key);
+                page_id_t* hint_leaf = nullptr) const;
+  Status Delete(Transaction& txn, std::string_view key) const;
   [[nodiscard]] StatusOr<std::string> Read(
       Transaction& txn, std::string_view key,
       page_id_t* hint_leaf = nullptr) const;
@@ -109,7 +109,7 @@ class LsmIndex {
       Transaction& txn, std::string_view begin = "", std::string_view end = "",
       size_t leaves_per_partition = 4) const;
 
-  Status Destroy(Transaction& txn);
+  Status Destroy(Transaction& txn) const;
 
   void Dump(std::ostream& o, int indent = 0) const;
   [[nodiscard]] bool CheckSanity(Transaction& /*txn*/) const { return true; }

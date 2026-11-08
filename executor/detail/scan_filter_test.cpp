@@ -38,8 +38,6 @@ using relational_detail::MatchPrefixIn;
 using relational_detail::MatchSimpleCompare;
 using relational_detail::PrebuiltMembershipPredicate;
 using relational_detail::PrebuiltScalarComparePredicate;
-using relational_detail::PrefixInPredicate;
-using relational_detail::SimpleComparePredicate;
 using relational_detail::TryCompilePrefixIn;
 using relational_detail::TryCompileSimpleCompare;
 using relational_detail::TryDecideConstantConjunct;
@@ -73,6 +71,9 @@ TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
   const Expression true_const = ConstantValueExp(Value(true));
   auto decided_true = TryDecideConstantConjunct(true_const);
   ASSERT_TRUE(decided_true.has_value());
+  if (!decided_true.has_value()) {
+    return;
+  }
   EXPECT_TRUE(decided_true->Truthy());
 
   const Expression false_math =
@@ -80,6 +81,9 @@ TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
                           ConstantValueExp(Value(20)));
   auto decided_false = TryDecideConstantConjunct(false_math);
   ASSERT_TRUE(decided_false.has_value());
+  if (!decided_false.has_value()) {
+    return;
+  }
   EXPECT_FALSE(decided_false->Truthy());
 
   // Column reference cannot be decided at compile time.
@@ -99,6 +103,9 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
   EXPECT_TRUE(IsNonThrowingScanComparison(eq_int, schema));
   auto compiled_int = TryCompileSimpleCompare(eq_int, schema);
   ASSERT_TRUE(compiled_int.has_value());
+  if (!compiled_int.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_int->column, 0U);
   EXPECT_TRUE(compiled_int->int_payload);
   EXPECT_EQ(compiled_int->int_constant, 42);
@@ -116,6 +123,9 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       ColumnValueExp(ColumnName("price")));
   auto compiled_dbl = TryCompileSimpleCompare(lt_double, schema);
   ASSERT_TRUE(compiled_dbl.has_value());
+  if (!compiled_dbl.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_dbl->column, 1U);
   EXPECT_EQ(compiled_dbl->op, BinaryOperation::kGreaterThan);
   EXPECT_TRUE(compiled_dbl->double_payload);
@@ -130,6 +140,9 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       ColumnValueExp(ColumnName("alt_id")));
   auto compiled_col = TryCompileSimpleCompare(col_vs_col, schema);
   ASSERT_TRUE(compiled_col.has_value());
+  if (!compiled_col.has_value()) {
+    return;
+  }
   EXPECT_TRUE(compiled_col->column_payload);
   EXPECT_EQ(compiled_col->column, 0U);
   EXPECT_EQ(compiled_col->right_column, 3U);
@@ -151,6 +164,9 @@ TEST(ScanFilterTest, TryCompileAndMatchPrefixIn) {
 
   auto prefix_in = TryCompilePrefixIn(in_expr, schema);
   ASSERT_TRUE(prefix_in.has_value());
+  if (!prefix_in.has_value()) {
+    return;
+  }
   EXPECT_EQ(prefix_in->column, 2U);
   ASSERT_EQ(prefix_in->prefixes.size(), 3U);
 

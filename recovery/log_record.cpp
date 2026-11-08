@@ -364,7 +364,7 @@ size_t LogRecord::Deserialize(const char* src, size_t max_bytes) {
       break;
     case LogType::kSetRowPageNext:
     case LogType::kSetRowPagePrev:
-      if (off + sizeof(page_id_t) * 3 > body_end) {
+      if (off + (sizeof(page_id_t) * 3) > body_end) {
         return 0;
       }
       off += DeserializePID(src + off, &pid);

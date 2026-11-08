@@ -371,7 +371,7 @@ TEST_F(SqlEngineExtraTest,
       const auto rows = RunSql(&engine, &reader, query + std::to_string(limit));
       ASSERT_EQ(rows.size(), static_cast<size_t>(limit));
       for (int i = 0; i < limit; ++i) {
-        EXPECT_EQ(rows[static_cast<size_t>(i)], Row({Value(9 + i * 10)}));
+        EXPECT_EQ(rows[static_cast<size_t>(i)], Row({Value(9 + (i * 10))}));
       }
     }
     ASSERT_SUCCESS(reader.PreCommit());
@@ -450,8 +450,9 @@ TEST_F(SqlEngineExtraTest, ImmutableScalarAggregatePlanSharesButNotItsResult) {
   auto execute = [&] {
     SqlEngine engine(*database_);
     auto reader = database_->BeginReadOnlyContext();
-    for (int n = 0; n < 16; ++n)
+    for (int n = 0; n < 16; ++n) {
       EXPECT_EQ(RunSql(&engine, &reader, sql), expected);
+    }
     ASSERT_SUCCESS(reader.PreCommit());
   };
   std::thread first(execute);
@@ -567,8 +568,8 @@ TEST_F(SqlEngineExtraTest,
   context_.reset();
   thread_compiled_plans.clear();
   PreparedPlanCache::Instance().Clear();
-  PreparedPlanSessionCache sessions[2];
-  const auto execute = [&](int session, int64_t key) {
+  std::array<PreparedPlanSessionCache, 2> sessions;
+  const auto execute = [&](size_t session, int64_t key) {
     ScopedPreparedPlanSession scope(&sessions[session]);
     auto read = database_->BeginReadOnlyContext();
     SqlEngine engine(*database_);
@@ -594,12 +595,18 @@ TEST_F(SqlEngineExtraTest,
   std::atomic<int> failures{0};
   for (int round = 0; round < 3; ++round) {
     std::thread a([&] {
-      for (int i = 0; i < 24; ++i)
-        if (!execute(0, 1 + i % 3)) ++failures;
+      for (int i = 0; i < 24; ++i) {
+        if (!execute(0, 1 + (i % 3))) {
+          ++failures;
+        }
+      }
     });
     std::thread b([&] {
-      for (int i = 0; i < 24; ++i)
-        if (!execute(1, 3 - i % 3)) ++failures;
+      for (int i = 0; i < 24; ++i) {
+        if (!execute(1, 3 - (i % 3))) {
+          ++failures;
+        }
+      }
     });
     a.join();
     b.join();
@@ -609,7 +616,7 @@ TEST_F(SqlEngineExtraTest,
   EXPECT_TRUE(thread_compiled_plans.empty());
   EXPECT_EQ(active_plan_session, nullptr);
   {
-    ScopedPreparedPlanSession outer(&sessions[0]);
+    ScopedPreparedPlanSession outer(sessions.data());
     EXPECT_TRUE(MarkFingerprintVolatile("session-only"));
     {
       ScopedPreparedPlanSession inner(&sessions[1]);
@@ -629,9 +636,10 @@ TEST_F(SqlEngineExtraTest,
          "(NULL,100),(-2,1),(-1,2),(0,3),(1,4),(2,5),(2,6),(3,7),(4,8)");
   ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
                         context_->GetTable("UpperOnly"));
-  for (int i = 10; i < 1000; ++i)
+  for (int i = 10; i < 1000; ++i) {
     ASSERT_SUCCESS(
         table->Insert(context_->txn_, Row({Value(i), Value(i)})).GetStatus());
+  }
   RunSql(engine_.get(), context_.get(),
          "CREATE INDEX upper_kv ON UpperOnly(k,v)");
   RunSql(engine_.get(), context_.get(), "ANALYZE UpperOnly");
@@ -642,16 +650,22 @@ TEST_F(SqlEngineExtraTest,
     auto expected =
         std::vector<Row>{Row({Value(-2), Value(1)}), Row({Value(-1), Value(2)}),
                          Row({Value(0), Value(3)}), Row({Value(1), Value(4)})};
-    if (direction == "DESC") std::ranges::reverse(expected);
-    const std::string sql =
-        "SELECT k,v FROM UpperOnly WHERE k < 2 ORDER BY k " + direction +
-        ", v " + direction;
+    if (direction == "DESC") {
+      std::ranges::reverse(expected);
+    }
+    std::string sql = "SELECT k,v FROM UpperOnly WHERE k < 2 ORDER BY k ";
+    sql += direction;
+    sql += ", v ";
+    sql += direction;
     EXPECT_EQ(RunSql(engine_.get(), context_.get(), sql), expected);
     const auto plan = RunSql(engine_.get(), context_.get(), "EXPLAIN " + sql);
     bool index_used = false;
-    for (const auto& row : plan)
-      if (row[0].value.varchar_value.find("IndexOnlyScan") != std::string::npos)
+    for (const auto& row : plan) {
+      if (row[0].value.varchar_value.find("IndexOnlyScan") !=
+          std::string::npos) {
         index_used = true;
+      }
+    }
     EXPECT_TRUE(index_used);
   }
   EXPECT_EQ(RunSql(engine_.get(), context_.get(),

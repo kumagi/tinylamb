@@ -18,6 +18,7 @@
 #define TINYLAMB_QUERY_STATEMENT_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -452,11 +453,13 @@ class SelectStatement : public Statement {
   }
   void SetSelectList(std::vector<NamedExpression> select_list) {
     select_list_ = std::move(select_list);
+    runtime_id_.Bump();
   }
   const std::vector<std::string>& FromClause() const { return from_clause_; }
   const Expression& WhereClause() const { return where_clause_; }
   void SetWhereClause(Expression where_clause) {
     where_clause_ = std::move(where_clause);
+    runtime_id_.Bump();
   }
   const std::vector<OrderByTerm>& OrderBy() const { return order_by_; }
   size_t Limit() const { return limit_; }
@@ -466,30 +469,42 @@ class SelectStatement : public Statement {
   void SetLimit(std::optional<size_t> limit) {
     has_limit_ = limit.has_value();
     limit_ = limit.value_or(0);
+    runtime_id_.Bump();
   }
-  void SetOffset(size_t offset) { offset_ = offset; }
+  void SetOffset(size_t offset) {
+    offset_ = offset;
+    runtime_id_.Bump();
+  }
   size_t Offset() const { return offset_; }
   bool Distinct() const { return distinct_; }
-  void SetDistinct(bool distinct) { distinct_ = distinct; }
+  void SetDistinct(bool distinct) {
+    distinct_ = distinct;
+    runtime_id_.Bump();
+  }
   bool HasDistinctOn() const { return !distinct_on_.empty(); }
   const std::vector<Expression>& DistinctOn() const { return distinct_on_; }
   void SetDistinctOn(std::vector<Expression> distinct_on) {
     distinct_on_ = std::move(distinct_on);
     distinct_ = true;
     complex_ = true;
+    runtime_id_.Bump();
   }
   // SELECT ... FOR UPDATE (GoogleSQL's only locking clause): the rows the
   // scan visits are write-intent locked and stay locked until the transaction
   // ends.  GoogleSQL has no FOR SHARE / NOWAIT / SKIP LOCKED, so a single flag
   // is the whole grammar.
   bool ForUpdate() const { return for_update_; }
-  void SetForUpdate(bool for_update) { for_update_ = for_update; }
+  void SetForUpdate(bool for_update) {
+    for_update_ = for_update;
+    runtime_id_.Bump();
+  }
   bool WithTies() const { return with_ties_; }
   void SetWithTies(bool with_ties) {
     with_ties_ = with_ties;
     if (with_ties) {
       complex_ = true;
     }
+    runtime_id_.Bump();
   }
   const std::vector<SelectSource>& Sources() const { return sources_; }
   const std::vector<Expression>& GroupBy() const { return group_by_; }
@@ -501,35 +516,46 @@ class SelectStatement : public Statement {
   bool RequiresRelationalEvaluation() const { return complex_; }
   // SELECT AS STRUCT: subquery consumers compare whole rows as structs.
   bool AsStruct() const { return as_struct_; }
-  void SetAsStruct(bool as_struct) { as_struct_ = as_struct; }
+  void SetAsStruct(bool as_struct) {
+    as_struct_ = as_struct;
+    runtime_id_.Bump();
+  }
   const std::unordered_map<std::string, std::string>& Aliases() const {
     return aliases_;
   }
   void AddAlias(std::string alias, std::string table) {
     aliases_.emplace(std::move(alias), std::move(table));
+    runtime_id_.Bump();
   }
   void SetSources(std::vector<SelectSource> sources) {
     sources_ = std::move(sources);
+    runtime_id_.Bump();
   }
   void SetGroupBy(std::vector<Expression> group_by) {
     group_by_ = std::move(group_by);
     complex_ = true;
+    runtime_id_.Bump();
   }
   // True when the statement carries the syntactically empty grouping set
   // (`GROUP BY ()`, or the () set of GROUPING SETS / ROLLUP). The grouping
   // key list holds a placeholder constant then, but the standard semantics
   // is exactly one group over all input rows -- emitted even when the input
   // is empty (COUNT(*) = 0, other aggregates NULL).
-  void SetGroupAll(bool group_all) { group_all_ = group_all; }
+  void SetGroupAll(bool group_all) {
+    group_all_ = group_all;
+    runtime_id_.Bump();
+  }
   bool IsGroupAll() const { return group_all_; }
   void SetHaving(Expression having) {
     having_ = std::move(having);
     complex_ = true;
+    runtime_id_.Bump();
   }
   void AddWithQuery(std::string name, std::shared_ptr<SelectStatement> query) {
     with_query_order_.push_back(name);
     with_queries_.emplace(std::move(name), std::move(query));
     complex_ = true;
+    runtime_id_.Bump();
   }
   void AddRecursiveWithQuery(std::string name,
                              std::shared_ptr<SelectStatement> query) {
@@ -541,6 +567,7 @@ class SelectStatement : public Statement {
   void RemoveWithQuery(const std::string& name) {
     with_queries_.erase(name);
     std::erase(with_query_order_, name);
+    runtime_id_.Bump();
   }
   // Drops every CTE declaration from this statement. Grouping-set expansion
   // copies the WITH clause onto each UNION ALL branch; the owning statement
@@ -551,6 +578,7 @@ class SelectStatement : public Statement {
     with_queries_.clear();
     with_query_order_.clear();
     recursive_with_queries_.clear();
+    runtime_id_.Bump();
   }
   [[nodiscard]] bool IsRecursiveWith(const std::string& name) const {
     return recursive_with_queries_.contains(name);
@@ -562,6 +590,7 @@ class SelectStatement : public Statement {
   }
   void SetRecursiveDepth(const std::string& name, RecursiveDepthSpec spec) {
     recursive_depth_specs_[name] = std::move(spec);
+    runtime_id_.Bump();
   }
   [[nodiscard]] const std::vector<std::string>& WithQueryOrder() const {
     return with_query_order_;
@@ -570,9 +599,11 @@ class SelectStatement : public Statement {
   void SetQualify(Expression qualify) {
     qualify_ = std::move(qualify);
     complex_ = true;
+    runtime_id_.Bump();
   }
   void SetOrderBy(std::vector<OrderByTerm> order_by) {
     order_by_ = std::move(order_by);
+    runtime_id_.Bump();
   }
   const std::vector<std::shared_ptr<SelectStatement>>& UnionAll() const {
     return union_all_;
@@ -606,6 +637,7 @@ class SelectStatement : public Statement {
     union_all_.push_back(std::move(query));
     set_operation_matches_.push_back(std::move(match));
     complex_ = true;
+    runtime_id_.Bump();
   }
   void AddUnionAll(std::shared_ptr<SelectStatement> query) {
     AddSetOperation(SetOperationKind::kUnionAll, std::move(query));
@@ -613,6 +645,7 @@ class SelectStatement : public Statement {
   void MarkUnionDistinct(bool by_name = false) {
     union_distinct_ = true;
     union_by_name_ = by_name;
+    runtime_id_.Bump();
   }
   [[nodiscard]] bool UnionDistinct() const { return union_distinct_; }
   [[nodiscard]] bool UnionByName() const { return union_by_name_; }
@@ -623,13 +656,25 @@ class SelectStatement : public Statement {
   void SetSetOperationTree(std::shared_ptr<SetOperationTree> tree) {
     set_operation_tree_ = std::move(tree);
     complex_ = true;
+    runtime_id_.Bump();
   }
   void ClearUnionAll() {
     union_all_.clear();
     set_operation_kinds_.clear();
     set_operation_matches_.clear();
+    runtime_id_.Bump();
   }
-  void MarkComplex() { complex_ = true; }
+  void MarkComplex() {
+    complex_ = true;
+    runtime_id_.Bump();
+  }
+  // Monotonic per-instance / per-mutation identity for runtime subquery
+  // caches.  Bumped on construction, copy, move, and every mutating setter so
+  // a recycled SelectStatement* address or in-place mutation never hits a
+  // stale pointer-keyed memo entry.
+  [[nodiscard]] uint64_t RuntimeId() const noexcept {
+    return runtime_id_.value;
+  }
   const std::string& Fingerprint() const {
     std::ostringstream stream;
     auto append_string = [&](std::string_view text) {
@@ -835,6 +880,27 @@ class SelectStatement : public Statement {
   bool union_by_name_{false};
   bool as_struct_{false};
   bool complex_{false};
+  struct RuntimeInstanceId {
+    uint64_t value{Next()};
+    RuntimeInstanceId() = default;
+    RuntimeInstanceId(const RuntimeInstanceId&) noexcept : value(Next()) {}
+    RuntimeInstanceId(RuntimeInstanceId&&) noexcept : value(Next()) {}
+    RuntimeInstanceId& operator=(const RuntimeInstanceId&) noexcept {
+      value = Next();
+      return *this;
+    }
+    RuntimeInstanceId& operator=(RuntimeInstanceId&&) noexcept {
+      value = Next();
+      return *this;
+    }
+    ~RuntimeInstanceId() = default;
+    void Bump() noexcept { value = Next(); }
+    static uint64_t Next() noexcept {
+      static std::atomic<uint64_t> next{1};
+      return next.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  RuntimeInstanceId runtime_id_;
   mutable std::string cached_fingerprint_;
 };
 

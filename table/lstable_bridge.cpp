@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/log_message.hpp"
 #include "common/serdes.hpp"
 #include "page/page.hpp"
 #include "page/page_manager.hpp"
@@ -107,7 +109,7 @@ bool DecodeRowImageIntoBlock(std::string_view image, slot_t slot_id,
   const char* bitmap = nullptr;
   if (has_null) {
     const size_t bitmap_bytes = (stored_count + 7) / 8;
-    if (static_cast<size_t>(end - cursor) < bitmap_bytes) {
+    if (std::cmp_less(end - cursor, bitmap_bytes)) {
       return false;
     }
     bitmap = cursor;
@@ -179,7 +181,7 @@ bool DecodeRowImageIntoBlock(std::string_view image, slot_t slot_id,
         }
         bin_size_t length = 0;
         cursor += DeserializeSlot(cursor, &length);
-        if (static_cast<size_t>(end - cursor) < length) {
+        if (std::cmp_less(end - cursor, length)) {
           return false;
         }
         col.varchar_bytes.insert(col.varchar_bytes.end(), cursor,
@@ -289,7 +291,8 @@ bool LSTableStore::SupportsSchema(const Schema& schema) noexcept {
 
 StatusOr<ExecResult> LSTableStore::ExecuteFragment(const Fragment& fragment,
                                                    Runtime runtime) const {
-  if (!lstable_schema.has_value() || pax_chunk == nullptr) {
+  if (!lstable_schema.has_value() || pax_chunk == nullptr ||
+      pax_chunk->TotalRowCount() != total_rows) {
     ExecResult rejected;
     rejected.status = Status::kNotImplemented;
     rejected.rejected = true;
@@ -333,6 +336,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
   page_id_t max_page_id = 0;
   const bool any_version_chains = txn.HasAnyPageVersionChains();
   std::unordered_set<page_id_t> visited;
+  constexpr uint64_t kMaxLSTableRows = 16'777'216ULL;
+  constexpr uint64_t kMaxLSTableBytes = 1ULL << 30;
+  uint64_t estimated_bytes = 0;
   while (page_id != 0) {
     if (!visited.insert(page_id).second) {
       return nullptr;
@@ -416,6 +422,15 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
     max_page_id = std::max(max_page_id, page_id);
     store->page_ids.push_back(page_id);
     store->total_rows += block.row_count;
+    for (const LSTableColumnBlock& col : block.columns) {
+      estimated_bytes +=
+          (col.int_cells.size() * sizeof(int64_t)) + col.varchar_bytes.size() +
+          (col.varchar_ends.size() * sizeof(uint32_t)) + col.nulls.size();
+    }
+    if (store->total_rows > kMaxLSTableRows ||
+        estimated_bytes > kMaxLSTableBytes) {
+      return nullptr;
+    }
     store->blocks.push_back(std::move(block));
     page_id = next_page;
   }
@@ -501,7 +516,7 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
                 identity_1_to_n = false;
               }
             }
-            if (identity_1_to_n && v != static_cast<int64_t>(expected_id)) {
+            if (identity_1_to_n && std::cmp_not_equal(v, expected_id)) {
               identity_1_to_n = false;
             }
             ++expected_id;
@@ -665,7 +680,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
                 break;
               }
               table_slots[slot] = DoubleDictSlot{
-                  h, canon_bits, d, static_cast<uint8_t>(distinct_vals.size())};
+                  .hash = h,
+                  .bits = canon_bits,
+                  .val = d,
+                  .code = static_cast<uint8_t>(distinct_vals.size())};
               distinct_vals.push_back(d);
               break;
             }
@@ -702,8 +720,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
           while (table_slots[slot].hash != 0) {
             slot = (slot + 1) & kTableMask;
           }
-          table_slots[slot] =
-              DoubleDictSlot{h, canon_bits, d, static_cast<uint8_t>(idx)};
+          table_slots[slot] = DoubleDictSlot{.hash = h,
+                                             .bits = canon_bits,
+                                             .val = d,
+                                             .code = static_cast<uint8_t>(idx)};
         }
         for (LSTablePageBlock& blk : store->blocks) {
           LSTableColumnBlock& col = blk.columns[c];
@@ -721,7 +741,9 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
             if (!have_last || b != last_b) {
               double d = 0.0;
               std::memcpy(&d, &b, sizeof(d));
-              if (d == 0.0) d = 0.0;
+              if (d == 0.0) {
+                d = 0.0;
+              }
               int64_t canon_bits = 0;
               std::memcpy(&canon_bits, &d, sizeof(canon_bits));
               const uint64_t h = hash_bits(canon_bits);
@@ -837,8 +859,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
                 break;
               }
               table_slots[slot] =
-                  DictSlot{h, sv.data(), static_cast<uint32_t>(sv.size()),
-                           static_cast<uint8_t>(distinct_views.size())};
+                  DictSlot{.hash = h,
+                           .data = sv.data(),
+                           .size = static_cast<uint32_t>(sv.size()),
+                           .code = static_cast<uint8_t>(distinct_views.size())};
               distinct_views.push_back(sv);
               break;
             }
@@ -882,9 +906,10 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
           while (table_slots[slot].hash != 0) {
             slot = (slot + 1) & kTableMask;
           }
-          table_slots[slot] =
-              DictSlot{h, sv.data(), static_cast<uint32_t>(sv.size()),
-                       static_cast<uint8_t>(idx)};
+          table_slots[slot] = DictSlot{.hash = h,
+                                       .data = sv.data(),
+                                       .size = static_cast<uint32_t>(sv.size()),
+                                       .code = static_cast<uint8_t>(idx)};
         }
 
         for (LSTablePageBlock& blk : store->blocks) {
@@ -942,11 +967,11 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
       int64_t row_id = 0;
       constexpr size_t kMaxPaxSampleRows = PaxChunk::kRowGroupSize;
       for (const LSTablePageBlock& blk : store->blocks) {
-        if (static_cast<size_t>(row_id) >= kMaxPaxSampleRows) {
+        if (std::cmp_greater_equal(row_id, kMaxPaxSampleRows)) {
           break;
         }
-        for (uint32_t r = 0; r < blk.row_count &&
-                             static_cast<size_t>(row_id) < kMaxPaxSampleRows;
+        for (uint32_t r = 0;
+             r < blk.row_count && std::cmp_less(row_id, kMaxPaxSampleRows);
              ++r) {
           std::vector<Value> vals;
           vals.reserve(schema.ColumnCount() + 1);
@@ -1002,12 +1027,15 @@ std::shared_ptr<const LSTableStore> BuildLSTableStore(Transaction& txn,
         }
       }
     }
+  } catch (const std::exception& e) {
+    LOG(WARN) << "PaxChunk sample construction skipped: " << e.what();
   } catch (...) {
-    // Keep store valid even if PaxChunk sample construction encounters an edge
-    // case.
+    LOG(WARN) << "PaxChunk sample construction skipped: unknown exception";
   }
 
-  table.SetLSTableStore(store);
+  if (store->uncommitted_owner_txn == 0 || table.GetLSTableStore() == nullptr) {
+    table.SetLSTableStore(store);
+  }
   return store;
 }
 
@@ -1027,12 +1055,19 @@ std::shared_ptr<const LSTableStore> GetOrBuildLSTableStore(
         current->uncommitted_owner_txn == txn.ID()) {
       return current;
     }
-    if (txn.IsReadOnly() || txn.WriteSetEmpty()) {
+    txn.SweepCommittedVersionChains();
+    if (!txn.HasAnyPageVersionChains() &&
+        (txn.IsReadOnly() || txn.WriteSetEmpty())) {
       return BuildLSTableStore(txn, table);
     }
+    return nullptr;
   }
   if (!allow_lazy_build || (current != nullptr && current->total_rows > 0) ||
       (!txn.IsReadOnly() && !txn.WriteSetEmpty())) {
+    return nullptr;
+  }
+  txn.SweepCommittedVersionChains();
+  if (txn.HasAnyPageVersionChains()) {
     return nullptr;
   }
   return BuildLSTableStore(txn, table);

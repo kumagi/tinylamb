@@ -211,7 +211,7 @@ class SortShapeTest : public ::testing::Test {
 // ------------------------------------------------------- logical contract ---
 
 TEST_F(SortShapeTest, SpillingSemiAntiJoinCannotElideParentSort) {
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t saved = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(saved); }
   } restore;

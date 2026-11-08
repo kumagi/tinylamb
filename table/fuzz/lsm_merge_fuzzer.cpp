@@ -52,7 +52,9 @@ Schema MakeSchema() {
 }  // namespace
 
 int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
-  if (size < 8) return 0;
+  if (size < 8) {
+    return 0;
+  }
   const Schema sc = MakeSchema();
 
   const int n_runs = 1 + (data[0] & 0x3);
@@ -68,7 +70,9 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
       off += sizeof(int64_t);
       ids.push_back(id % 100000);
     }
-    if (ids.empty()) continue;
+    if (ids.empty()) {
+      continue;
+    }
     std::sort(ids.begin(), ids.end());
     std::vector<char> blob;
     std::vector<SortedRun::Entry> index;
@@ -93,27 +97,41 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
     runs.emplace_back(std::move(blob), std::move(index),
                       base_gen + static_cast<uint64_t>(r));
   }
-  if (runs.empty()) return 0;
+  if (runs.empty()) {
+    return 0;
+  }
 
   std::vector<const SortedRun*> ptrs;
   ptrs.reserve(runs.size());
-  for (const auto& r : runs) ptrs.push_back(&r);
+  for (const auto& r : runs) {
+    ptrs.push_back(&r);
+  }
   auto chunk_or = MergeAllSortedRuns(ptrs, sc);
-  if (!chunk_or.HasValue()) return 0;
+  if (!chunk_or.HasValue()) {
+    return 0;
+  }
 
   const PaxChunk chunk = chunk_or.MoveValue();
   size_t total_in = 0;
-  for (const auto& r : runs) total_in += r.Size();
-  if (chunk.TotalRowCount() > total_in) std::abort();
+  for (const auto& r : runs) {
+    total_in += r.Size();
+  }
+  if (chunk.TotalRowCount() > total_in) {
+    std::abort();
+  }
 
   int64_t prev = 0;
   bool first = true;
   for (size_t i = 0; i < chunk.TotalRowCount(); ++i) {
     auto row_or = chunk.ReadRow(i, sc);
-    if (!row_or.HasValue()) std::abort();
+    if (!row_or.HasValue()) {
+      std::abort();
+    }
     const int64_t k = row_or.Value()[0].AsInt64();
     if (!first) {
-      if (!(prev < k)) std::abort();
+      if (!(prev < k)) {
+        std::abort();
+      }
     }
     prev = k;
     first = false;

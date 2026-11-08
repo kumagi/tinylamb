@@ -615,7 +615,8 @@ bool CollectSharedCteSites(SelectStatement* outer, const std::string& name,
         return false;
       }
       sites->push_back(
-          SharedCteSite{consumer, source.alias.empty() ? name : source.alias});
+          SharedCteSite{.consumer = consumer,
+                        .alias = source.alias.empty() ? name : source.alias});
     }
   }
   return true;
@@ -1956,7 +1957,7 @@ Expression ConditionalAggregate(const Expression& where,
 }  // namespace
 
 size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
-  static const bool fusion_disabled = [] {
+  const bool fusion_disabled = [] {
     const char* hatch = std::getenv("TINYLAMB_FUSE_SIBLING_AGG");
     return hatch != nullptr && std::string_view(hatch) == "0";
   }();
@@ -2156,6 +2157,7 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
 
   // Build every derived piece before the first mutation.
   std::vector<NamedExpression> fused_list;
+  fused_list.reserve(representative.keys.size());
   for (size_t k = 0; k < representative.keys.size(); ++k) {
     fused_list.emplace_back("__fk" + std::to_string(k), representative.keys[k]);
   }
@@ -2214,8 +2216,13 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
           BinaryOperation::kGreaterThan, ConstantValueExp(Value(int64_t(0)))));
     }
   }
-  // Members that disappear from FROM keep their join predicates, ANDed into
-  // the fused source's join condition.
+  // Members that disappear from FROM keep their join predicates. Each
+  // member's ON clause sits in the outer scope and may reference any member
+  // in the group (e.g. `ON d1.a = d2.a`), so rebind through every member.
+  // When the representative is the leading FROM source (index 0,
+  // JoinType::kCross), `Sources()[0].join_condition` is never evaluated by
+  // execution routes, so lifted join predicates must be appended to the outer
+  // WHERE clause instead.
   Expression rep_condition;
   std::vector<Expression> rebound_member_joins;
   for (const FuseMember& member : members) {
@@ -2223,18 +2230,26 @@ size_t FuseSiblingDerivedAggregates(SelectStatement* outer) {
     if (!condition) {
       continue;
     }
-    std::optional<Expression> rebound = RebindToFused(
-        condition, member, fused_alias, false, &member.agg_to_fused);
-    if (!rebound.has_value()) {
-      return 0;
+    std::optional<Expression> current = condition;
+    for (const FuseMember& m : members) {
+      current = RebindToFused(*current, m, fused_alias, false, &m.agg_to_fused);
+      if (!current.has_value()) {
+        return 0;
+      }
     }
-    rebound_member_joins.push_back(std::move(*rebound));
+    rebound_member_joins.push_back(std::move(*current));
   }
   if (!rebound_member_joins.empty()) {
-    rep_condition = rebound_member_joins.front();
-    for (size_t i = 1; i < rebound_member_joins.size(); ++i) {
-      rep_condition = BinaryExpressionExp(rep_condition, BinaryOperation::kAnd,
-                                          rebound_member_joins[i]);
+    if (representative.index == 0) {
+      for (Expression& jc : rebound_member_joins) {
+        appended.push_back(std::move(jc));
+      }
+    } else {
+      rep_condition = rebound_member_joins.front();
+      for (size_t i = 1; i < rebound_member_joins.size(); ++i) {
+        rep_condition = BinaryExpressionExp(
+            rep_condition, BinaryOperation::kAnd, rebound_member_joins[i]);
+      }
     }
   }
   // Kept (non-member) sources may reference member aliases in their own

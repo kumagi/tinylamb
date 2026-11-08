@@ -88,6 +88,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
       ConstantValueExp(Value(24)));
   auto compiled = TryCompileTypedFilterCompare(pred, schema, true);
   ASSERT_TRUE(compiled.has_value());
+  if (!compiled.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled->left, 1U);
   EXPECT_TRUE(compiled->constant_payload);
   EXPECT_EQ(compiled->int_constant, 24);
@@ -109,6 +112,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedConditionalInput) {
 
   auto compiled = TryCompileTypedConditionalInput(case_expr, schema);
   ASSERT_TRUE(compiled.has_value());
+  if (!compiled.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled->result_type, ValueType::kInt64);
 
   const Row matching_row({Value(1), Value(15), Value(100.0), Value(0.05),
@@ -129,6 +135,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
   const Expression single_col = ColumnValueExp(ColumnName("l_extendedprice"));
   auto compiled_single = TryCompileTypedDoubleExpr(single_col, schema);
   ASSERT_TRUE(compiled_single.has_value());
+  if (!compiled_single.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_single->shape,
             TypedDoubleExprInput::Shape::kSingleDoubleCol);
   EXPECT_DOUBLE_EQ(
@@ -141,6 +150,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
       ColumnValueExp(ColumnName("l_discount")));
   auto compiled_mul2 = TryCompileTypedDoubleExpr(mul_two, schema);
   ASSERT_TRUE(compiled_mul2.has_value());
+  if (!compiled_mul2.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_mul2->shape,
             TypedDoubleExprInput::Shape::kMulTwoDoubleCols);
   EXPECT_DOUBLE_EQ(
@@ -156,6 +168,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
                           BinaryOperation::kMultiply, one_minus_disc);
   auto compiled_disc = TryCompileTypedDoubleExpr(disc_price, schema);
   ASSERT_TRUE(compiled_disc.has_value());
+  if (!compiled_disc.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_disc->shape,
             TypedDoubleExprInput::Shape::kMulConstMinusCol);
   EXPECT_DOUBLE_EQ(
@@ -171,6 +186,9 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
       BinaryExpressionExp(disc_price, BinaryOperation::kMultiply, one_plus_tax);
   auto compiled_charge = TryCompileTypedDoubleExpr(charge, schema);
   ASSERT_TRUE(compiled_charge.has_value());
+  if (!compiled_charge.has_value()) {
+    return;
+  }
   EXPECT_EQ(compiled_charge->shape,
             TypedDoubleExprInput::Shape::kMulConstMinusColMulConstPlusCol);
   EXPECT_NEAR(
@@ -192,6 +210,9 @@ TEST(TypedStreamAggregateTest, TryCompilePositionalHavingAndConjuncts) {
       sum_qty, BinaryOperation::kGreaterThan, ConstantValueExp(Value(300)));
   auto single = TryCompilePositionalHaving(having1, aggs);
   ASSERT_TRUE(single.has_value());
+  if (!single.has_value()) {
+    return;
+  }
   EXPECT_EQ(single->agg_index, 0U);
   EXPECT_EQ(single->op, BinaryOperation::kGreaterThan);
   EXPECT_EQ(single->constant, Value(300));

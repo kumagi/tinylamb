@@ -1441,7 +1441,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   };
   struct RelColKeyHash {
     size_t operator()(const RelColKey& key) const noexcept {
-      return std::hash<size_t>()(key.rel) * 0x9e3779b97f4a7c15ULL ^
+      return (std::hash<size_t>()(key.rel) * 0x9e3779b97f4a7c15ULL) ^
              std::hash<ColumnName>()(key.column);
     }
   };
@@ -1507,15 +1507,15 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         const Column& lc = relations[left_rel].schema.GetColumn(*left_of_lhs);
         const Column& rc = relations[right_rel].schema.GetColumn(*right_of_rhs);
         if (lc.Type() == rc.Type() && lc.IsUnsigned() == rc.IsUnsigned()) {
-          key_class_union(key_class_node_id({left_rel, lhs}),
-                          key_class_node_id({right_rel, rhs}));
+          key_class_union(key_class_node_id({.rel = left_rel, .column = lhs}),
+                          key_class_node_id({.rel = right_rel, .column = rhs}));
         }
       } else if (crossed) {
         const Column& lc = relations[left_rel].schema.GetColumn(*left_of_rhs);
         const Column& rc = relations[right_rel].schema.GetColumn(*right_of_lhs);
         if (lc.Type() == rc.Type() && lc.IsUnsigned() == rc.IsUnsigned()) {
-          key_class_union(key_class_node_id({left_rel, rhs}),
-                          key_class_node_id({right_rel, lhs}));
+          key_class_union(key_class_node_id({.rel = left_rel, .column = rhs}),
+                          key_class_node_id({.rel = right_rel, .column = lhs}));
         }
       }
     }
@@ -1590,8 +1590,12 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     if (loaded[index] && estimated_rows[index] >= 100) {
       return relations[index].TotalRows() * 10 <= estimated_rows[index] * 8;
     }
-    if (!local_predicates[index].empty()) return true;
-    if (context.execution_runtime() == nullptr) return false;
+    if (!local_predicates[index].empty()) {
+      return true;
+    }
+    if (context.execution_runtime() == nullptr) {
+      return false;
+    }
     const auto stored = context.execution_runtime()->table_key_filters.find(
         TableKeyFilterKey(statement.Sources()[index]));
     return stored != context.execution_runtime()->table_key_filters.end() &&
@@ -1603,8 +1607,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         predicate.sources.size() != 2 ||
         !IsColumnEqualityPredicate(predicate.expression) ||
         predicate.expression->AsBinaryExpression().Op() !=
-            BinaryOperation::kEquals)
+            BinaryOperation::kEquals) {
       continue;
+    }
     const size_t index = *predicate.sources.begin();
     const size_t other = *std::next(predicate.sources.begin());
     const auto& binary = predicate.expression->AsBinaryExpression();
@@ -1683,12 +1688,16 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       return has_selective_neighbour ? 1 : 2;
     }
     if (selective[index] && has_selective_neighbour &&
-        estimated_rows[index] <= 500000)
+        estimated_rows[index] <= 500000) {
       return -1;
+    }
     if ((selective[index] || has_selective_neighbour) &&
-        !awaits_smaller_selective_neighbour)
+        !awaits_smaller_selective_neighbour) {
       return 0;
-    if (selective[index] || has_selective_neighbour) return 1;
+    }
+    if (selective[index] || has_selective_neighbour) {
+      return 1;
+    }
     return 2;
   };
   struct ExactFilteredEdge {
@@ -1777,7 +1786,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       });
   std::unordered_set<ColumnName> outer_referenced;
   const auto collect_expr_cols = [&](const Expression& expr) {
-    if (!expr) return;
+    if (!expr) {
+      return;
+    }
     for (const ColumnName& cn : expr->TouchedColumns()) {
       outer_referenced.insert(cn);
     }
@@ -1809,8 +1820,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   const size_t min_remaining_relations = 1;
   std::vector<std::shared_ptr<const LSTableStore>> pinned_stores;
   for (size_t position = 0; position < load_order.size(); ++position) {
-    for (size_t i = 0; i < selective.size(); ++i)
-      selective[i] = selective_source(i);
+    for (size_t i = 0; i < selective.size(); ++i) {
+      selective[i] = static_cast<uint8_t>(selective_source(i));
+    }
     auto best = load_order.begin() + static_cast<std::ptrdiff_t>(position);
     for (auto candidate = std::next(best); candidate != load_order.end();
          ++candidate) {
@@ -1843,7 +1855,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         local_predicates[idx].empty() && projections[idx].size() == 2) {
       size_t active_relations = 0;
       for (size_t i = 0; i < relations.size(); ++i) {
-        if (!absorbed[i]) ++active_relations;
+        if (absorbed[i] == 0U) {
+          ++active_relations;
+        }
       }
       const bool has_stored_key_filter =
           context.execution_runtime() != nullptr && [&] {
@@ -1881,7 +1895,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             if (other == idx) {
               other = *std::next(p.sources.begin());
             }
-            if (absorbed[other]) {
+            if (absorbed[other] != 0U) {
               predicates_ok = false;
               break;
             }
@@ -1909,7 +1923,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               predicates_ok = false;
               break;
             }
-            edges.push_back(PreJoinEdge{*d_col, other, *o_col});
+            edges.push_back(
+                PreJoinEdge{.d_col = *d_col, .other = other, .o_col = *o_col});
           }
           if (predicates_ok && !edges.empty()) {
             std::vector<slot_t> active_cols;
@@ -1979,7 +1994,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                       }
                     } else if (!base_sources[e.other] ||
                                deferred_derived[e.other] ||
-                               selective[e.other] ||
+                               (selective[e.other] != 0U) ||
                                !local_predicates[e.other].empty()) {
                       edges_valid = false;
                       break;
@@ -2037,8 +2052,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 if (!t_col_referenced) {
                   d_pk_col = cand_pk;
                   d_payload_col = cand_payload;
-                  target_rel = *cand_t_rel;
-                  target_col = *cand_t_col;
+                  target_rel = cand_t_rel;
+                  target_col = cand_t_col;
                   keep_pk_col = pk_in_outer;
                   break;
                 }
@@ -2459,8 +2474,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               return;
             }
           }
-          col_filters.push_back(SecondaryColFilter{cand, ptype, pcol, drows,
-                                                   cov, drel, is_exact});
+          col_filters.push_back(SecondaryColFilter{.filter = cand,
+                                                   .type = ptype,
+                                                   .projected_col = pcol,
+                                                   .driver_rows = drows,
+                                                   .coverage = cov,
+                                                   .driver_rel = drel,
+                                                   .exact = is_exact});
         };
     for (const PredicateInfo& predicate : predicates) {
       if (!predicate.resolved || predicate.contains_query ||
@@ -2838,15 +2858,18 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           const auto coverage = [&](const RuntimeFilterGroup& filter,
                                     slot_t column, ValueType type) {
             if (!statistics.HasValue() || statistics.Value()->Rows() == 0 ||
-                column >= statistics.Value()->Columns())
+                column >= statistics.Value()->Columns()) {
               return 1.0;
+            }
             const auto& stats = statistics.Value()->Column(column);
             if (const auto* exact = filter.ExactKeys();
                 exact &&
                 !relations[idx].schema.GetColumn(column).IsUnsigned()) {
               double matches = 0;
               for (int64_t key : *exact) {
-                if (filter.Reject(key)) continue;
+                if (filter.Reject(key)) {
+                  continue;
+                }
                 Value value(key);
                 value.type = type;
                 matches += stats.EstimateEqual(value);
@@ -2921,8 +2944,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       binding.column = *key_column;
       if (direct_base_scan && best_driver_exact &&
           best_driver_rel < relations.size()) {
-        exact_filtered_by[idx].push_back(
-            ExactFilteredEdge{*key_column, best_driver_rel});
+        exact_filtered_by[idx].push_back(ExactFilteredEdge{
+            .projected_col = *key_column, .driver_rel = best_driver_rel});
       }
       for (const SecondaryColFilter& sf : col_filters) {
         if (sf.filter != key_filter && sf.filter != nullptr &&
@@ -2935,7 +2958,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           if (direct_base_scan && sf.exact &&
               sf.driver_rel < relations.size()) {
             exact_filtered_by[idx].push_back(
-                ExactFilteredEdge{sf.projected_col, sf.driver_rel});
+                ExactFilteredEdge{.projected_col = sf.projected_col,
+                                  .driver_rel = sf.driver_rel});
           }
         }
       }
@@ -3020,13 +3044,16 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       absorbed_any = false;
       size_t active_relations = 0;
       for (size_t i = 0; i < relations.size(); ++i) {
-        if (!absorbed[i]) ++active_relations;
+        if (absorbed[i] == 0U) {
+          ++active_relations;
+        }
       }
       if (active_relations <= min_remaining_relations) {
         break;
       }
       for (size_t d = 0; d < relations.size(); ++d) {
-        if (absorbed[d] || !loaded[d] || relations[d].TotalRows() == 0 ||
+        if ((absorbed[d] != 0U) || !loaded[d] ||
+            relations[d].TotalRows() == 0 ||
             relations[d].schema.ColumnCount() == 0) {
           continue;
         }
@@ -3072,7 +3099,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           if (other == d) {
             other = *std::next(p.sources.begin());
           }
-          if (absorbed[other] || relations[other].TotalRows() == 0) {
+          if ((absorbed[other] != 0U) || relations[other].TotalRows() == 0) {
             predicates_ok = false;
             break;
           }
@@ -3101,12 +3128,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             predicates_ok = false;
             break;
           }
-          d_pk_col = *d_col;
+          d_pk_col = d_col;
           const bool has_exact = std::ranges::any_of(
               exact_filtered_by[other], [&](const ExactFilteredEdge& e) {
                 return e.projected_col == *o_col && e.driver_rel == d;
               });
-          neighbours.push_back(NeighbourCol{other, *o_col, has_exact});
+          neighbours.push_back(NeighbourCol{
+              .rel = other, .col = *o_col, .exact_filtered = has_exact});
         }
         if (!predicates_ok || !d_pk_col.has_value() || neighbours.empty()) {
           continue;
@@ -3162,8 +3190,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         const NeighbourCol anchor = *exact_it;
         bool all_neighbours_covered = true;
         for (const NeighbourCol& nc : neighbours) {
-          if (nc.exact_filtered ||
-              (nc.rel == anchor.rel && nc.col == anchor.col)) {
+          if (nc.rel == anchor.rel && nc.col == anchor.col) {
             continue;
           }
           bool connected_to_anchor = false;
@@ -3218,7 +3245,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         // relation in the same key equivalence class (TPC-H Q5, Q7, Q8, Q9,
         // Q10).
         for (size_t d = 0; d < relations.size(); ++d) {
-          if (absorbed[d] || !base_sources[d] || deferred_derived[d] ||
+          if ((absorbed[d] != 0U) || !base_sources[d] || deferred_derived[d] ||
               !loaded[d] || relations[d].HasSpill() ||
               relations[d].TotalRows() == 0 ||
               relations[d].schema.ColumnCount() < 2) {
@@ -3258,7 +3285,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             if (other == d) {
               other = *std::next(p.sources.begin());
             }
-            if (absorbed[other] || relations[other].HasSpill() ||
+            if ((absorbed[other] != 0U) || relations[other].HasSpill() ||
                 relations[other].TotalRows() == 0) {
               predicates_ok = false;
               break;
@@ -3287,7 +3314,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               predicates_ok = false;
               break;
             }
-            edges.push_back(JoinEdge{*d_col, other, *o_col});
+            edges.push_back(
+                JoinEdge{.d_col = *d_col, .other = other, .o_col = *o_col});
           }
           if (!predicates_ok || edges.empty()) {
             continue;
@@ -3452,8 +3480,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             if (!t_col_referenced) {
               d_pk_col = cand_pk;
               d_payload_col = cand_payload;
-              target_rel = *cand_t_rel;
-              target_col = *cand_t_col;
+              target_rel = cand_t_rel;
+              target_col = cand_t_col;
               append_payload = false;
               break;
             }
@@ -3461,8 +3489,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               std::optional<size_t> best_append_rel;
               std::optional<slot_t> best_append_col;
               if (relations[*cand_t_rel].rows.size() <= 131072) {
-                best_append_rel = *cand_t_rel;
-                best_append_col = *cand_t_col;
+                best_append_rel = cand_t_rel;
+                best_append_col = cand_t_col;
               }
               for (const PredicateInfo& p : predicates) {
                 if (!p.resolved || p.contains_query || p.sources.size() != 2 ||
@@ -3476,8 +3504,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 if (alt == *cand_t_rel) {
                   alt = *std::next(p.sources.begin());
                 }
-                if (alt == d || absorbed[alt] || relations[alt].HasSpill() ||
-                    relations[alt].rows.empty() ||
+                if (alt == d || (absorbed[alt] != 0U) ||
+                    relations[alt].HasSpill() || relations[alt].rows.empty() ||
                     relations[alt].rows.size() > 131072) {
                   continue;
                 }
@@ -3510,14 +3538,14 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                     relations[alt].rows.size() <
                         relations[*best_append_rel].rows.size()) {
                   best_append_rel = alt;
-                  best_append_col = *a_col;
+                  best_append_col = a_col;
                 }
               }
               if (best_append_rel.has_value() && best_append_col.has_value()) {
                 d_pk_col = cand_pk;
                 d_payload_col = cand_payload;
-                target_rel = *best_append_rel;
-                target_col = *best_append_col;
+                target_rel = best_append_rel;
+                target_col = best_append_col;
                 append_payload = true;
                 break;
               }
@@ -3548,7 +3576,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           int64_t max_k = std::numeric_limits<int64_t>::min();
           for (const Row& r : relations[d].rows) {
             const Value& kv = r[*d_pk_col];
-            if (kv.IsNull()) continue;
+            if (kv.IsNull()) {
+              continue;
+            }
             min_k = std::min(min_k, kv.value.int_value);
             max_k = std::max(max_k, kv.value.int_value);
           }
@@ -3570,7 +3600,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                                                      nullptr);
             for (const Row& r : relations[d].rows) {
               const Value& kv = r[*d_pk_col];
-              if (kv.IsNull()) continue;
+              if (kv.IsNull()) {
+                continue;
+              }
               const auto off = static_cast<size_t>(
                   static_cast<uint64_t>(kv.value.int_value) -
                   static_cast<uint64_t>(min_k));
@@ -3677,7 +3709,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               bool fits_i32 = true;
               for (const Row& r : relations[d].rows) {
                 const Value& pv = r[*d_payload_col];
-                if (pv.IsNull()) continue;
+                if (pv.IsNull()) {
+                  continue;
+                }
                 if (pv.value.int_value <= kNullPayloadI32 ||
                     pv.value.int_value > std::numeric_limits<int32_t>::max()) {
                   fits_i32 = false;
@@ -3712,8 +3746,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               std::vector<int64_t> mono_keys(d_rows);
               std::vector<int32_t> mono_payloads(d_rows);
               constexpr size_t kNumBuckets = 4096;
-              std::array<uint32_t, kNumBuckets> bucket_lo;
-              std::array<uint32_t, kNumBuckets> bucket_hi;
+              std::array<uint32_t, kNumBuckets> bucket_lo{};
+              std::array<uint32_t, kNumBuckets> bucket_hi{};
               bucket_lo.fill(static_cast<uint32_t>(d_rows));
               bucket_hi.fill(0);
               const auto bucket_of = [&](int64_t k) -> size_t {
@@ -3843,7 +3877,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                     for (size_t di = d_begin; di < d_end; ++di) {
                       const Row& r = relations[d].rows[di];
                       const Value& kv = r[*d_pk_col];
-                      if (kv.IsNull()) continue;
+                      if (kv.IsNull()) {
+                        continue;
+                      }
                       const auto off = static_cast<size_t>(
                           static_cast<uint64_t>(kv.value.int_value) -
                           static_cast<uint64_t>(min_k));
@@ -3942,11 +3978,12 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             for (const ExactFilteredEdge& edge : exact_filtered_by[d]) {
               if (edge.projected_col == *d_payload_col) {
                 exact_filtered_by[*target_rel].push_back(
-                    ExactFilteredEdge{*target_col, edge.driver_rel});
+                    ExactFilteredEdge{.projected_col = *target_col,
+                                      .driver_rel = edge.driver_rel});
               }
             }
-            for (size_t r = 0; r < exact_filtered_by.size(); ++r) {
-              for (ExactFilteredEdge& edge : exact_filtered_by[r]) {
+            for (auto& r : exact_filtered_by) {
+              for (ExactFilteredEdge& edge : r) {
                 if (edge.driver_rel == d) {
                   edge.driver_rel = std::numeric_limits<size_t>::max();
                 }
@@ -4000,7 +4037,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   size_t best_total_sim = std::numeric_limits<size_t>::max();
   size_t best_start_rows = std::numeric_limits<size_t>::max();
   for (size_t start = 0; start < relations.size(); ++start) {
-    if (absorbed[start]) {
+    if (absorbed[start] != 0U) {
       continue;
     }
     size_t sim_current = relations[start].TotalRows();
@@ -4009,7 +4046,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     std::unordered_set<size_t> sim_joined{start};
     std::unordered_set<size_t> sim_remaining;
     for (size_t i = 0; i < relations.size(); ++i) {
-      if (i != start && !absorbed[i]) {
+      if (i != start && (absorbed[i] == 0U)) {
         sim_remaining.insert(i);
       }
     }
@@ -4064,7 +4101,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   std::unordered_set<size_t> joined{first};
   std::unordered_set<size_t> remaining;
   for (size_t i = 0; i < relations.size(); ++i) {
-    if (i != first && !absorbed[i]) {
+    if (i != first && (absorbed[i] == 0U)) {
       remaining.insert(i);
     }
   }
@@ -4078,7 +4115,12 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
   const auto collect_deduped_applicable =
       [&](size_t target_rel, const std::unordered_set<size_t>& after_set,
           std::vector<Expression>* out_applicable, bool mark) {
-        std::vector<size_t> seen_target_cols;
+        struct SeenTargetEquality {
+          size_t target_col{0};
+          size_t other_rel{0};
+          size_t other_col{0};
+        };
+        std::vector<SeenTargetEquality> seen_target_cols;
         for (const PredicateInfo& predicate : predicates) {
           if (!predicate.resolved || predicate.contains_query ||
               predicate.sources.size() < 2 ||
@@ -4093,6 +4135,10 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
               IsColumnEqualityPredicate(predicate.expression) &&
               predicate.expression->AsBinaryExpression().Op() ==
                   BinaryOperation::kEquals) {
+            size_t other_rel = *predicate.sources.begin();
+            if (other_rel == target_rel) {
+              other_rel = *std::next(predicate.sources.begin());
+            }
             const BinaryExpression& bin =
                 predicate.expression->AsBinaryExpression();
             const ColumnName& lhs = bin.Left()->AsColumnValue().GetColumnName();
@@ -4102,18 +4148,76 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 LocalColumnOffset(relations[target_rel].schema, lhs);
             const auto t_r =
                 LocalColumnOffset(relations[target_rel].schema, rhs);
+            const auto o_l =
+                LocalColumnOffset(relations[other_rel].schema, lhs);
+            const auto o_r =
+                LocalColumnOffset(relations[other_rel].schema, rhs);
             std::optional<size_t> t_col;
-            if (t_l.has_value() && !t_r.has_value()) {
-              t_col = *t_l;
-            } else if (t_r.has_value() && !t_l.has_value()) {
-              t_col = *t_r;
+            std::optional<size_t> o_col;
+            if (t_l.has_value() && o_r.has_value() && !t_r.has_value() &&
+                !o_l.has_value()) {
+              t_col = t_l;
+              o_col = o_r;
+            } else if (t_r.has_value() && o_l.has_value() && !t_l.has_value() &&
+                       !o_r.has_value()) {
+              t_col = t_r;
+              o_col = o_l;
             }
-            if (t_col.has_value()) {
-              if (std::ranges::find(seen_target_cols, *t_col) !=
-                  seen_target_cols.end()) {
+            if (t_col.has_value() && o_col.has_value()) {
+              bool redundant = false;
+              for (const SeenTargetEquality& prev : seen_target_cols) {
+                if (prev.target_col != *t_col) {
+                  continue;
+                }
+                if (prev.other_rel == other_rel && prev.other_col == *o_col) {
+                  redundant = true;
+                  break;
+                }
+                if (prev.other_rel != other_rel) {
+                  for (const PredicateInfo& p : predicates) {
+                    if (!p.resolved || p.contains_query ||
+                        p.sources.size() != 2 ||
+                        !p.sources.contains(prev.other_rel) ||
+                        !p.sources.contains(other_rel) ||
+                        !IsColumnEqualityPredicate(p.expression) ||
+                        p.expression->AsBinaryExpression().Op() !=
+                            BinaryOperation::kEquals) {
+                      continue;
+                    }
+                    const BinaryExpression& pbin =
+                        p.expression->AsBinaryExpression();
+                    const ColumnName& pl =
+                        pbin.Left()->AsColumnValue().GetColumnName();
+                    const ColumnName& pr =
+                        pbin.Right()->AsColumnValue().GetColumnName();
+                    const auto pl_prev =
+                        LocalColumnOffset(relations[prev.other_rel].schema, pl);
+                    const auto pr_prev =
+                        LocalColumnOffset(relations[prev.other_rel].schema, pr);
+                    const auto pl_other =
+                        LocalColumnOffset(relations[other_rel].schema, pl);
+                    const auto pr_other =
+                        LocalColumnOffset(relations[other_rel].schema, pr);
+                    if ((pl_prev == prev.other_col && pr_other == *o_col &&
+                         !pr_prev && !pl_other) ||
+                        (pr_prev == prev.other_col && pl_other == *o_col &&
+                         !pl_prev && !pr_other)) {
+                      redundant = true;
+                      break;
+                    }
+                  }
+                  if (redundant) {
+                    break;
+                  }
+                }
+              }
+              if (redundant) {
                 continue;
               }
-              seen_target_cols.push_back(*t_col);
+              seen_target_cols.push_back(
+                  SeenTargetEquality{.target_col = *t_col,
+                                     .other_rel = other_rel,
+                                     .other_col = *o_col});
             }
           }
           out_applicable->push_back(predicate.expression);
@@ -4129,13 +4233,17 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       const auto count_varchar_cols = [](const Schema& s) {
         size_t n = 0;
         for (size_t c = 0; c < s.ColumnCount(); ++c) {
-          if (s.GetColumn(c).Type() == ValueType::kVarChar) ++n;
+          if (s.GetColumn(c).Type() == ValueType::kVarChar) {
+            ++n;
+          }
         }
         return n;
       };
       const bool group_keys_in_result =
           std::ranges::all_of(fusion->group_keys, [&](const Expression& gk) {
-            if (!gk) return false;
+            if (!gk) {
+              return false;
+            }
             const auto cols = gk->TouchedColumns();
             return !cols.empty() &&
                    std::ranges::all_of(cols, [&](const ColumnName& cn) {
@@ -4177,7 +4285,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                                         pair_applicable, outer, ctes)));
             relations[r1] = std::move(pair_joined);
             for (PredicateInfo& p : predicates) {
-              if (!p.resolved) continue;
+              if (!p.resolved) {
+                continue;
+              }
               if (p.sources.contains(r2)) {
                 p.sources.erase(r2);
                 p.sources.insert(r1);
@@ -4198,7 +4308,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       // There is no join-order choice at the last step. A frequency sweep
       // of a spilled fact table cannot change the selected input and can
       // cost another complete spill read before the actual hash probe.
-      if (remaining.size() == 1) break;
+      if (remaining.size() == 1) {
+        break;
+      }
       std::unordered_set<size_t> after = joined;
       after.insert(candidate);
       std::vector<Expression> applicable;
@@ -4247,7 +4359,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       const bool group_keys_in_result =
           fusion->group_keys.empty() ||
           std::ranges::all_of(fusion->group_keys, [&](const Expression& gk) {
-            if (!gk) return false;
+            if (!gk) {
+              return false;
+            }
             const auto cols = gk->TouchedColumns();
             return !cols.empty() &&
                    std::ranges::all_of(cols, [&](const ColumnName& cn) {
@@ -4306,7 +4420,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     RETURN_IF_FAIL(
         FilterRelation(context, &result, join_residual, outer, ctes));
   }
-  if (!pinned_stores.empty() && !(fusion != nullptr && fusion->fired)) {
+  if (!pinned_stores.empty() && (fusion == nullptr || !fusion->fired)) {
     for (Row& r : result.rows) {
       for (Value& v : r.values_) {
         if (v.type == ValueType::kVarChar && v.owned_data.empty() &&

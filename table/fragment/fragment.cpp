@@ -24,6 +24,7 @@
 #include <ranges>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "common/platform/endian.hpp"
 #include "table/workload/workload.hpp"
@@ -64,7 +65,9 @@ bool ConjunctSupported(Runtime runtime, const Schema& sc, const Conjunct& c) {
     }
     // The PREFIX is a byte-domain operator: it never applies to an int64
     // column.
-    if (c.op == CompareOp::kPrefix) return false;
+    if (c.op == CompareOp::kPrefix) {
+      return false;
+    }
     return c.literal_kind == LiteralKind::kInt64 && IsInt64Column(sc, c.col);
   }
   if (c.kind == ConjunctKind::kIn) {
@@ -214,8 +217,7 @@ bool CompareOpHolds(CompareOp op, std::string_view value,
       // longer). This is NOT the half-open range [literal, literal\0): a
       // value whose byte right after the prefix is 0x00 is a prefix match
       // but falls outside that range.
-      return value.size() >= literal.size() &&
-             value.compare(0, literal.size(), literal) == 0;
+      return value.size() >= literal.size() && value.starts_with(literal);
   }
   return false;
 }
@@ -223,8 +225,12 @@ bool CompareOpHolds(CompareOp op, std::string_view value,
 // The half-open range [lo, hi) with either side unbounded.
 bool VarcharRangeHolds(std::string_view value, std::string_view lo,
                        std::string_view hi) {
-  if (!lo.empty() && value < lo) return false;
-  if (!hi.empty() && !(value < hi)) return false;
+  if (!lo.empty() && value < lo) {
+    return false;
+  }
+  if (!hi.empty() && !(value < hi)) {
+    return false;
+  }
   return true;
 }
 
@@ -313,8 +319,12 @@ bool ChunkConjunctProvesEmpty(const PaxChunk& chunk, uint32_t g, slot_t col,
                               const Conjunct& c) {
   int64_t lo = 0;
   int64_t hi = 0;
-  if (!ConjunctWindow(c, &lo, &hi)) return false;
-  if (lo > hi) return true;  // the window is empty: nothing can match
+  if (!ConjunctWindow(c, &lo, &hi)) {
+    return false;
+  }
+  if (lo > hi) {
+    return true;  // the window is empty: nothing can match
+  }
   return !chunk.RGOverlapsCol(static_cast<int32_t>(g), col, lo, hi);
 }
 
@@ -326,7 +336,9 @@ bool ChunkConjunctProvesEmpty(const PaxChunk& chunk, uint32_t g, slot_t col,
 // [tag 1B][8B big-endian of (value ^ (1 << 63))]; anything else (a varchar
 // key, a truncated blob) has no int64 value.
 bool MemcomparableInt64Key(const std::string& key, int64_t* out) {
-  if (key.size() != 9) return false;
+  if (key.size() != 9) {
+    return false;
+  }
   if (static_cast<uint8_t>(key[0]) != static_cast<uint8_t>(ValueType::kInt64)) {
     return false;
   }
@@ -380,13 +392,17 @@ struct SurvivingRow {
 std::vector<slot_t> NeededColumns(const Schema& sc, const Fragment& frag) {
   std::vector<slot_t> cols;
   const auto add = [&cols, &sc](slot_t c) {
-    if (!IsInt64Column(sc, c)) return;
+    if (!IsInt64Column(sc, c)) {
+      return;
+    }
     if (std::find(cols.begin(), cols.end(), c) == cols.end()) {
       cols.push_back(c);
     }
   };
   add(sc.KeyColumnIndex());
-  for (const Conjunct& c : frag.conjuncts) add(c.col);
+  for (const Conjunct& c : frag.conjuncts) {
+    add(c.col);
+  }
   if (frag.aggregate.has_value()) {
     const Aggregate& agg = *frag.aggregate;
     switch (agg.kind) {
@@ -401,7 +417,9 @@ std::vector<slot_t> NeededColumns(const Schema& sc, const Fragment& frag) {
           add(agg.col);
         } else {
           for (const AggTerm& t : agg.terms) {
-            for (slot_t c : t.cols) add(c);
+            for (slot_t c : t.cols) {
+              add(c);
+            }
           }
         }
         break;
@@ -410,20 +428,28 @@ std::vector<slot_t> NeededColumns(const Schema& sc, const Fragment& frag) {
         break;
     }
   }
-  for (slot_t c : frag.group_cols) add(c);
-  if (frag.top_k.has_value()) add(frag.top_k->col);
+  for (slot_t c : frag.group_cols) {
+    add(c);
+  }
+  if (frag.top_k.has_value()) {
+    add(frag.top_k->col);
+  }
   // The projection's int64 columns: the projected values come from the same
   // decode as the filter's, so a projection over an int64 column is free
   // (it rides the buffer the scan already filled). A non-int64 projection
   // column is left to the executor.
-  for (slot_t c : frag.projection) add(c);
+  for (slot_t c : frag.projection) {
+    add(c);
+  }
   return cols;
 }
 
 // The index of a column inside the needed-column list, or -1.
 int NeededIndex(const std::vector<slot_t>& cols, slot_t c) {
   const auto it = std::find(cols.begin(), cols.end(), c);
-  if (it == cols.end()) return -1;
+  if (it == cols.end()) {
+    return -1;
+  }
   return static_cast<int>(it - cols.begin());
 }
 
@@ -447,7 +473,7 @@ struct ScanState {
   // Appends one row's values to the flat buffer and returns its offset.
   uint32_t AppendValues(const int64_t* row_values, const uint8_t* row_nulls,
                         size_t count) {
-    const uint32_t offset = static_cast<uint32_t>(this->values.size());
+    const auto offset = static_cast<uint32_t>(this->values.size());
     this->values.insert(this->values.end(), row_values, row_values + count);
     this->nulls.insert(this->nulls.end(), row_nulls, row_nulls + count);
     return offset;
@@ -471,11 +497,15 @@ bool ChunkKeyRange(const PaxChunk& chunk, uint32_t g, int64_t* lo,
 // are laid out back to back inside the chunk's data area.
 uint64_t ChunkCellBytes(const PaxChunk& chunk, uint32_t g, slot_t col) {
   const PaxChunk::Footer& f = chunk.GetFooter();
-  const size_t idx = static_cast<size_t>(g) * f.column_count + col;
-  if (idx + 1 >= f.column_offsets.size()) return 0;
+  const size_t idx = (static_cast<size_t>(g) * f.column_count) + col;
+  if (idx + 1 >= f.column_offsets.size()) {
+    return 0;
+  }
   const uint32_t begin = f.column_offsets[idx];
   const uint32_t end = f.column_offsets[idx + 1];
-  if (end < begin) return 0;
+  if (end < begin) {
+    return 0;
+  }
   return static_cast<uint64_t>(end - begin);
 }
 
@@ -487,7 +517,9 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
                ScanState* state) {
   const PaxChunk::Footer& footer = chunk.GetFooter();
   const uint32_t groups = footer.row_group_count;
-  if (groups == 0) return;
+  if (groups == 0) {
+    return;
+  }
   const slot_t key_col = sc.KeyColumnIndex();
   const int key_idx = NeededIndex(needed, key_col);
 
@@ -495,13 +527,19 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
   std::vector<uint32_t> window;
   window.reserve(groups);
   for (uint32_t g = 0; g < groups; ++g) {
-    if (g >= footer.row_counts.size()) break;
+    if (g >= footer.row_counts.size()) {
+      break;
+    }
     if (frag.access == AccessMode::kKeyRange) {
       int64_t klo = 0;
       int64_t khi = 0;
       if (ChunkKeyRange(chunk, g, &klo, &khi)) {
-        if (frag.range_lo.has_value() && khi < *frag.range_lo) continue;
-        if (frag.range_hi.has_value() && *frag.range_hi < klo) continue;
+        if (frag.range_lo.has_value() && khi < *frag.range_lo) {
+          continue;
+        }
+        if (frag.range_hi.has_value() && *frag.range_hi < klo) {
+          continue;
+        }
       }
     }
     window.push_back(g);
@@ -559,12 +597,16 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
 
   for (uint32_t g : window) {
     const uint16_t rc = footer.row_counts[g];
-    if (rc == 0) continue;
+    if (rc == 0) {
+      continue;
+    }
     if (point_row.has_value()) {
       // The point access touches exactly one row: skip the groups that do
       // not hold it.
       const uint64_t base = rg_base[g];
-      if (*point_row < base || *point_row >= base + rc) continue;
+      if (*point_row < base || *point_row >= base + rc) {
+        continue;
+      }
     }
     state->rows_in += rc;
 
@@ -572,8 +614,12 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
     // discarded whole.
     bool group_empty = false;
     for (const Conjunct& c : eval) {
-      if (c.kind == ConjunctKind::kIsNull) continue;
-      if (!IsInt64Column(sc, c.col)) continue;
+      if (c.kind == ConjunctKind::kIsNull) {
+        continue;
+      }
+      if (!IsInt64Column(sc, c.col)) {
+        continue;
+      }
       if (ChunkConjunctProvesEmpty(chunk, g, c.col, c)) {
         group_empty = true;
         break;
@@ -609,7 +655,7 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       const uint8_t* null_bits = chunk.CellNullBits(g, col);
       if (null_bits != nullptr) {
         for (uint16_t r = 0; r < rc; ++r) {
-          if ((null_bits[r >> 3] >> (7 - (r & 7))) & 1) {
+          if (((null_bits[r >> 3] >> (7 - (r & 7))) & 1) != 0) {
             column_nulls[ci][r] = 1;
           }
         }
@@ -626,8 +672,10 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
 
     const uint64_t base = rg_base[g];
     for (uint16_t r = 0; r < rc; ++r) {
-      const uint32_t global_row = static_cast<uint32_t>(base + r);
-      if (point_row.has_value() && global_row != *point_row) continue;
+      const auto global_row = static_cast<uint32_t>(base + r);
+      if (point_row.has_value() && global_row != *point_row) {
+        continue;
+      }
       // The key range is an ACCESS mode, not a conjunct: the zone map only
       // prunes the row groups that cannot hold a key in the range, so the
       // surviving groups still have to be filtered row by row.
@@ -646,14 +694,14 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       bool passes = true;
       // The varchar conjuncts: the mask answers them without decoding a
       // string into the fragment.
-      for (size_t vi = 0; vi < varchar_masks.size(); ++vi) {
-        const PaxSelectionVector& mask = varchar_masks[vi];
+      for (const auto& mask : varchar_masks) {
         const uint64_t global = base + r;
         if (global >= mask.bits.size() * 64) {
           passes = false;
           break;
         }
-        const bool marked = (mask.bits[global >> 6] >> (global & 63)) & 1;
+        const bool marked =
+            ((mask.bits[global >> 6] >> (global & 63)) & 1) != 0U;
         if (!marked) {
           passes = false;
           break;
@@ -666,7 +714,9 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       for (const Conjunct& c : eval) {
         if (c.kind == ConjunctKind::kIsNull) {
           const int ci = NeededIndex(needed, c.col);
-          if (ci < 0) continue;
+          if (ci < 0) {
+            continue;
+          }
           const bool is_null = column_nulls[static_cast<size_t>(ci)][r] != 0;
           if (is_null ==
               c.negated) {  // IS NULL wants null, IS NOT NULL wants not
@@ -676,7 +726,9 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
           continue;
         }
         const int ci = NeededIndex(needed, c.col);
-        if (ci < 0) continue;
+        if (ci < 0) {
+          continue;
+        }
         const int64_t value = column_values[static_cast<size_t>(ci)][r];
         bool holds = false;
         if (c.kind == ConjunctKind::kCompare) {
@@ -711,7 +763,7 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
         row.key = row_values[static_cast<size_t>(key_idx)];
         row.has_key = true;
       }
-      state->rows.push_back(std::move(row));
+      state->rows.push_back(row);
     }
   }
 }
@@ -756,8 +808,10 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
       row.artifact_index = artifact_index;
       row.row_index = i;
       const std::string key = run.GetEntry(i).BuildKey(run.Blob());
-      if (MemcomparableInt64Key(key, &row.key)) row.has_key = true;
-      state->rows.push_back(std::move(row));
+      if (MemcomparableInt64Key(key, &row.key)) {
+        row.has_key = true;
+      }
+      state->rows.push_back(row);
       continue;
     }
     Row decoded;
@@ -844,11 +898,11 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
     row.value_offset =
         state->AppendValues(row_values.data(), row_nulls.data(), needed.size());
     row.value_count = static_cast<uint32_t>(needed.size());
-    if (key_idx >= 0 && key_idx < static_cast<int>(needed.size())) {
+    if (key_idx >= 0 && std::cmp_less(key_idx, needed.size())) {
       row.key = row_values[static_cast<size_t>(key_idx)];
       row.has_key = true;
     }
-    state->rows.push_back(std::move(row));
+    state->rows.push_back(row);
   }
 }
 
@@ -871,8 +925,10 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
       row.deleted = true;
       row.artifact_index = artifact_index;
       row.row_index = static_cast<uint64_t>(ri);
-      if (MemcomparableInt64Key(key, &row.key)) row.has_key = true;
-      state->rows.push_back(std::move(row));
+      if (MemcomparableInt64Key(key, &row.key)) {
+        row.has_key = true;
+      }
+      state->rows.push_back(row);
       continue;
     }
     const Row& decoded = entry.row;
@@ -947,11 +1003,11 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
     row.value_offset =
         state->AppendValues(row_values.data(), row_nulls.data(), needed.size());
     row.value_count = static_cast<uint32_t>(needed.size());
-    if (key_idx >= 0 && key_idx < static_cast<int>(needed.size())) {
+    if (key_idx >= 0 && std::cmp_less(key_idx, needed.size())) {
       row.key = row_values[static_cast<size_t>(key_idx)];
       row.has_key = true;
     }
-    state->rows.push_back(std::move(row));
+    state->rows.push_back(row);
   }
 }
 
@@ -959,13 +1015,17 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
 // tombstone hides the whole key group. Returns the surviving rows.
 std::vector<SurvivingRow> ResolveDuplicates(std::vector<SurvivingRow> rows,
                                             bool dedup_possible) {
-  if (!dedup_possible) return rows;
+  if (!dedup_possible) {
+    return rows;
+  }
   // The rows arrive artifact by artifact; the artifacts are not ordered by
   // generation, so pick the winner per key explicitly.
   std::unordered_map<int64_t, size_t> winner;
   std::vector<uint8_t> dropped(rows.size(), 0);
   for (size_t i = 0; i < rows.size(); ++i) {
-    if (!rows[i].has_key) continue;
+    if (!rows[i].has_key) {
+      continue;
+    }
     const auto it = winner.find(rows[i].key);
     if (it == winner.end()) {
       winner.emplace(rows[i].key, i);
@@ -985,9 +1045,13 @@ std::vector<SurvivingRow> ResolveDuplicates(std::vector<SurvivingRow> rows,
   std::vector<SurvivingRow> out;
   out.reserve(rows.size());
   for (size_t i = 0; i < rows.size(); ++i) {
-    if (dropped[i] != 0) continue;
-    if (rows[i].deleted) continue;  // the tombstone hides the key group
-    out.push_back(std::move(rows[i]));
+    if (dropped[i] != 0) {
+      continue;
+    }
+    if (rows[i].deleted) {
+      continue;  // the tombstone hides the key group
+    }
+    out.push_back(rows[i]);
   }
   return out;
 }
@@ -1016,12 +1080,16 @@ struct RowReader {
 
   [[nodiscard]] int64_t Value(const SurvivingRow& row, slot_t col) const {
     const int idx = NeededIndex(*needed, col);
-    if (idx < 0) return 0;
+    if (idx < 0) {
+      return 0;
+    }
     return (*flat_values)[row.value_offset + static_cast<uint32_t>(idx)];
   }
   [[nodiscard]] bool IsNull(const SurvivingRow& row, slot_t col) const {
     const int idx = NeededIndex(*needed, col);
-    if (idx < 0) return true;
+    if (idx < 0) {
+      return true;
+    }
     return (*flat_nulls)[row.value_offset + static_cast<uint32_t>(idx)] != 0;
   }
 };
@@ -1039,11 +1107,15 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
       acc->count += 1;
       break;
     case AggregateKind::kCountCol:
-      if (!null_of(agg.col)) acc->count += 1;
+      if (!null_of(agg.col)) {
+        acc->count += 1;
+      }
       break;
     case AggregateKind::kSum: {
       if (agg.terms.empty()) {
-        if (null_of(agg.col)) break;
+        if (null_of(agg.col)) {
+          break;
+        }
         acc->sum += agg.coeff * value_of(agg.col);
         acc->count += 1;
         break;
@@ -1058,14 +1130,18 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
           }
           product *= value_of(col);
         }
-        if (null_term) continue;
+        if (null_term) {
+          continue;
+        }
         acc->sum += static_cast<int64_t>(product);
       }
       acc->count += 1;
       break;
     }
     case AggregateKind::kMin:
-      if (null_of(agg.col)) break;
+      if (null_of(agg.col)) {
+        break;
+      }
       if (!acc->has_value || value_of(agg.col) < acc->min_val) {
         acc->min_val = value_of(agg.col);
       }
@@ -1073,7 +1149,9 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
       acc->count += 1;
       break;
     case AggregateKind::kMax:
-      if (null_of(agg.col)) break;
+      if (null_of(agg.col)) {
+        break;
+      }
       if (!acc->has_value || value_of(agg.col) > acc->max_val) {
         acc->max_val = value_of(agg.col);
       }
@@ -1121,16 +1199,22 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
     }
   }
   for (const Conjunct& c : frag.conjuncts) {
-    if (c.col >= sc.ColumnCount()) return Status::kCorruption;
+    if (c.col >= sc.ColumnCount()) {
+      return Status::kCorruption;
+    }
     if (c.kind == ConjunctKind::kIn && c.in_literals.empty()) {
       return Status::kCorruption;
     }
   }
   for (slot_t c : frag.projection) {
-    if (c >= sc.ColumnCount()) return Status::kCorruption;
+    if (c >= sc.ColumnCount()) {
+      return Status::kCorruption;
+    }
   }
   for (slot_t c : frag.group_cols) {
-    if (c >= sc.ColumnCount()) return Status::kCorruption;
+    if (c >= sc.ColumnCount()) {
+      return Status::kCorruption;
+    }
   }
   if (frag.top_k.has_value() && frag.top_k->col >= sc.ColumnCount()) {
     return Status::kCorruption;
@@ -1140,11 +1224,15 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
     if (agg.kind == AggregateKind::kCountCol ||
         agg.kind == AggregateKind::kMin || agg.kind == AggregateKind::kMax ||
         agg.kind == AggregateKind::kApproxCountDistinct) {
-      if (agg.col >= sc.ColumnCount()) return Status::kCorruption;
+      if (agg.col >= sc.ColumnCount()) {
+        return Status::kCorruption;
+      }
     }
     for (const AggTerm& t : agg.terms) {
       for (slot_t c : t.cols) {
-        if (c >= sc.ColumnCount()) return Status::kCorruption;
+        if (c >= sc.ColumnCount()) {
+          return Status::kCorruption;
+        }
       }
     }
   }
@@ -1174,13 +1262,19 @@ bool AggregateSupported(const Capabilities& caps, const Aggregate& agg) {
 
 // The output shape a fragment produces.
 OutputKind OutputKindOf(const Fragment& frag) {
-  if (frag.top_k.has_value()) return OutputKind::kTopK;
-  if (!frag.group_cols.empty()) return OutputKind::kGroups;
+  if (frag.top_k.has_value()) {
+    return OutputKind::kTopK;
+  }
+  if (!frag.group_cols.empty()) {
+    return OutputKind::kGroups;
+  }
   if (frag.aggregate.has_value() &&
       frag.aggregate->kind != AggregateKind::kNone) {
     return OutputKind::kScalar;
   }
-  if (!frag.projection.empty()) return OutputKind::kProjectedBatch;
+  if (!frag.projection.empty()) {
+    return OutputKind::kProjectedBatch;
+  }
   return OutputKind::kSelection;
 }
 
@@ -1192,8 +1286,10 @@ void ScanArtifacts(const ArtifactSet& artifacts, const Fragment& frag,
                    const std::vector<slot_t>& needed, ScanState* state) {
   for (size_t ai = 0; ai < artifacts.size(); ++ai) {
     const ArtifactRef& a = artifacts[ai];
-    if (a.generation > frag.read_version) continue;  // MVCC bound
-    const uint32_t artifact_index = static_cast<uint32_t>(ai);
+    if (a.generation > frag.read_version) {
+      continue;  // MVCC bound
+    }
+    const auto artifact_index = static_cast<uint32_t>(ai);
     if (a.kind == ArtifactRef::Kind::kChunk && a.chunk != nullptr) {
       ScanChunk(*a.chunk, sc, frag, eval, varchar_eval, needed, artifact_index,
                 state);
@@ -1250,29 +1346,35 @@ double Calibrate(Runtime runtime) {
   // against one literal, N times. The result is the nanoseconds per cpu_unit
   // of THIS runtime, so the optimizer can compare a native fragment with a
   // WASM one in the same unit.
-  static const double kMeasured[] = {
+  static constexpr std::array<double, 2> kMeasured = {
       1.0,  // native (placeholder until the benchmark is wired)
       1.0,  // wasm
   };
   const size_t idx = runtime == Runtime::kNative ? 0 : 1;
   volatile uint64_t sink = 0;
   const auto start = std::chrono::steady_clock::now();
-  int64_t values[1024];
-  for (int i = 0; i < 1024; ++i) values[i] = i;
+  std::array<int64_t, 1024> values{};
+  for (size_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<int64_t>(i);
+  }
   constexpr int kRounds = 20000;
   for (int r = 0; r < kRounds; ++r) {
-    for (int i = 0; i < 1024; ++i) {
-      sink += static_cast<uint64_t>(values[i] < 512);
+    for (long value : values) {
+      sink += static_cast<uint64_t>(value < 512);
     }
   }
   const auto end = std::chrono::steady_clock::now();
   const double elapsed_ns =
       std::chrono::duration<double, std::nano>(end - start).count();
   const double comparisons = static_cast<double>(kRounds) * 1024.0;
-  if (comparisons <= 0) return 1.0;
+  if (comparisons <= 0) {
+    return 1.0;
+  }
   const double ns_per_comparison = elapsed_ns / comparisons;
   (void)sink;
-  if (ns_per_comparison <= 0) return 1.0;
+  if (ns_per_comparison <= 0) {
+    return 1.0;
+  }
   // kMeasured holds the reference ns/cpu_unit of the runtime's reference
   // machine; the measured value is normalized onto it so the ratio is
   // stable across machines.
@@ -1343,16 +1445,22 @@ std::vector<ConjunctQuote> Quote(Runtime runtime, const ArtifactSet& artifacts,
         }
         const uint32_t groups = footer.row_group_count;
         for (uint32_t g = 0; g < groups; ++g) {
-          if (g >= footer.row_counts.size()) break;
+          if (g >= footer.row_counts.size()) {
+            break;
+          }
           const uint16_t rc = footer.row_counts[g];
-          if (rc == 0) continue;
+          if (rc == 0) {
+            continue;
+          }
           rows += rc;
           const size_t idx =
-              static_cast<size_t>(g) * footer.column_count + c.col;
+              (static_cast<size_t>(g) * footer.column_count) + c.col;
           if (idx < footer.encodings.size()) {
             const auto scheme =
                 static_cast<PaxChunk::Scheme>(footer.encodings[idx]);
-            if (SchemeHasCompressedDomainKernel(scheme)) is_compressed = true;
+            if (SchemeHasCompressedDomainKernel(scheme)) {
+              is_compressed = true;
+            }
             per_row = std::min(per_row, PaxChunk::SchemeDecodeCost(scheme));
           }
           bytes += static_cast<double>(ChunkCellBytes(chunk, g, c.col));
@@ -1437,24 +1545,34 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
       const PaxChunk::Footer& footer = chunk.GetFooter();
       const uint32_t groups = footer.row_group_count;
       for (uint32_t g = 0; g < groups; ++g) {
-        if (g >= footer.row_counts.size()) break;
+        if (g >= footer.row_counts.size()) {
+          break;
+        }
         const uint16_t rc = footer.row_counts[g];
-        if (rc == 0) continue;
+        if (rc == 0) {
+          continue;
+        }
         if (fragment.access == AccessMode::kKeyRange) {
           int64_t klo = 0;
           int64_t khi = 0;
           if (ChunkKeyRange(chunk, g, &klo, &khi)) {
-            if (fragment.range_lo.has_value() && khi < *fragment.range_lo)
+            if (fragment.range_lo.has_value() && khi < *fragment.range_lo) {
               continue;
-            if (fragment.range_hi.has_value() && *fragment.range_hi < klo)
+            }
+            if (fragment.range_hi.has_value() && *fragment.range_hi < klo) {
               continue;
+            }
           }
         }
         report.rows_in += rc;
         bool group_empty = false;
         for (const Conjunct& c : eval) {
-          if (c.kind == ConjunctKind::kIsNull) continue;
-          if (!IsInt64Column(sc, c.col)) continue;
+          if (c.kind == ConjunctKind::kIsNull) {
+            continue;
+          }
+          if (!IsInt64Column(sc, c.col)) {
+            continue;
+          }
           if (ChunkConjunctProvesEmpty(chunk, g, c.col, c)) {
             group_empty = true;
             break;
@@ -1640,7 +1758,9 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
       result.rows_proved_pass = rows.size();
       return result;
     }
-    const RowReader reader{&state.values, &state.nulls, &needed};
+    const RowReader reader{.flat_values = &state.values,
+                           .flat_nulls = &state.nulls,
+                           .needed = &needed};
     std::map<std::vector<int64_t>, Accumulator> groups;
     for (const SurvivingRow& row : rows) {
       const std::vector<int64_t> key =
@@ -1672,7 +1792,9 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
 
   // The scalar aggregate.
   if (fragment.aggregate.has_value() && aggregate_pushed) {
-    const RowReader reader{&state.values, &state.nulls, &needed};
+    const RowReader reader{.flat_values = &state.values,
+                           .flat_nulls = &state.nulls,
+                           .needed = &needed};
     Accumulator acc;
     for (const SurvivingRow& row : rows) {
       AccumulateRow(*fragment.aggregate, row, reader, &acc);
@@ -1703,7 +1825,9 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
       result.output_rows = entries.size();
       return result;
     }
-    const RowReader reader{&state.values, &state.nulls, &needed};
+    const RowReader reader{.flat_values = &state.values,
+                           .flat_nulls = &state.nulls,
+                           .needed = &needed};
     std::vector<TopKEntry> entries;
     entries.reserve(rows.size());
     for (const SurvivingRow& row : rows) {
@@ -1716,7 +1840,9 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
                      [desc](const TopKEntry& a, const TopKEntry& b) {
                        return desc ? a.value > b.value : a.value < b.value;
                      });
-    if (entries.size() > spec.k) entries.resize(spec.k);
+    if (entries.size() > spec.k) {
+      entries.resize(spec.k);
+    }
     result.top_k = std::move(entries);
     result.output_rows = result.top_k.size();
     return result;
@@ -1725,10 +1851,12 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
   // The projection.
   if (!fragment.projection.empty()) {
     result.projected_width = static_cast<uint32_t>(fragment.projection.size());
-    const RowReader reader{&state.values, &state.nulls, &needed};
-    for (size_t ri = 0; ri < rows.size(); ++ri) {
+    const RowReader reader{.flat_values = &state.values,
+                           .flat_nulls = &state.nulls,
+                           .needed = &needed};
+    for (const auto& row : rows) {
       for (slot_t col : fragment.projection) {
-        result.projected_values.push_back(reader.Value(rows[ri], col));
+        result.projected_values.push_back(reader.Value(row, col));
       }
     }
     result.output_rows = rows.size();
@@ -1756,7 +1884,9 @@ StatusOr<KeyValueRows> MaterializeKeyValue(Runtime runtime,
   std::vector<Conjunct> eval;
   std::vector<Conjunct> varchar_eval;
   for (const Conjunct& c : fragment.conjuncts) {
-    if (!ConjunctSupported(runtime, schema, c)) continue;
+    if (!ConjunctSupported(runtime, schema, c)) {
+      continue;
+    }
     const bool is_varchar = c.kind == ConjunctKind::kVarcharRange ||
                             (c.kind == ConjunctKind::kCompare &&
                              c.literal_kind == LiteralKind::kBytes);

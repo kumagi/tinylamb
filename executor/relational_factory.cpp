@@ -235,7 +235,7 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
   Executor src = src_->EmitExecutor(ctx);
   if (const auto* index_scan = dynamic_cast<IndexScan*>(src.get());
-      index_scan && index_scan->EnforcesIntegerPredicate(exp_)) {
+      (index_scan != nullptr) && index_scan->EnforcesIntegerPredicate(exp_)) {
     return src;
   }
   // A Selection directly above a morsel-parallel scan is the Cascades core's
@@ -267,7 +267,8 @@ Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
 Executor ProjectionPlan::EmitExecutor(TransactionContext& ctx) const {
   Executor src = src_->EmitExecutor(ctx);
   if (auto* index_scan = dynamic_cast<IndexScan*>(src.get());
-      index_scan && index_scan->TrySetProjection(columns_, GetSchema())) {
+      (index_scan != nullptr) &&
+      index_scan->TrySetProjection(columns_, GetSchema())) {
     return src;
   }
   return std::make_shared<Projection>(columns_, src_->GetSchema(),
@@ -430,9 +431,13 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
             parallel_safe &&
             std::ranges::all_of(aggregates, [&](const NamedExpression& named) {
               const auto& agg = named.expression->AsAggregateExpression();
-              if (agg.HasWhereFilter()) return false;
+              if (agg.HasWhereFilter()) {
+                return false;
+              }
               if (!agg.Distinct()) {
-                if (IsCountStar(agg)) return true;
+                if (IsCountStar(agg)) {
+                  return true;
+                }
                 if (!agg.Child() ||
                     agg.Child()->Type() != TypeTag::kColumnValue) {
                   return false;
@@ -456,7 +461,9 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
               }
               const int off = tbl_schema.Offset(
                   agg.Child()->AsColumnValue().GetColumnName());
-              if (off < 0) return false;
+              if (off < 0) {
+                return false;
+              }
               const auto& col_def =
                   tbl_schema.GetColumn(static_cast<size_t>(off));
               if ((col_def.Type() != ValueType::kInt64 &&
@@ -467,7 +474,9 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
               int64_t g_min = std::numeric_limits<int64_t>::max();
               int64_t g_max = std::numeric_limits<int64_t>::min();
               for (const LSTablePageBlock& blk : lstable->blocks) {
-                if (blk.row_count == 0) continue;
+                if (blk.row_count == 0) {
+                  continue;
+                }
                 if (static_cast<size_t>(off) >= blk.columns.size()) {
                   return false;
                 }
@@ -790,7 +799,7 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
           dynamic_cast<const ProjectionPlan*>(input.get())) {
     const auto* scan =
         dynamic_cast<const FullScanPlan*>(projection->GetSource().get());
-    if (scan && scan->CanNarrow() &&
+    if ((scan != nullptr) && scan->CanNarrow() &&
         scan->GetStats().Columns() >= scan->GetSchema().ColumnCount()) {
       std::vector<slot_t> slots;
       bool valid = !projection->Columns().empty();
@@ -811,8 +820,9 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
       // Identity by position: aliases do not change the row image. Reordered
       // or duplicate projections retain the ordinary projection executor.
       if (valid && std::ranges::is_sorted(slots) &&
-          std::adjacent_find(slots.begin(), slots.end()) == slots.end())
+          std::adjacent_find(slots.begin(), slots.end()) == slots.end()) {
         input = std::make_shared<FullScanPlan>(*scan, std::move(slots));
+      }
     }
   }
   return std::make_shared<TopNExecutor>(input->EmitExecutor(ctx),
@@ -1211,7 +1221,7 @@ Executor MultiIndexCoveringScanPlan::EmitExecutor(
   if (ContainsParameterSlot(where_)) {
     participants.clear();
     for (const BitmapIndexRange& range : ranges_) {
-      const ReboundIndexKeys rebound = ReboundIndexKeysFromPredicate(
+      ReboundIndexKeys rebound = ReboundIndexKeysFromPredicate(
           where_, table_.GetSchema(), *range.index, /*want_points=*/false);
       if (rebound.begin_key.empty() && rebound.end_key.empty()) {
         return full_scan_fallback();

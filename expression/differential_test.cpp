@@ -1043,6 +1043,7 @@ TEST(DifferentialTest, GenerateArrayIntegerBoundariesAgreeAcrossEngines) {
         std::vector<Value>{Value(-3).WithUnsigned(), Value(-1).WithUnsigned()},
         std::vector<Value>{Value(5), Value(1)}}) {
     std::vector<Expression> expressions;
+    expressions.reserve(arguments.size());
     for (const Value& value : arguments) {
       expressions.push_back(ConstantValueExp(value));
     }

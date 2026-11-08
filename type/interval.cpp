@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cinttypes>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -140,14 +141,15 @@ StatusOr<std::string> IntervalValue::TryToString() const {
 
   std::array<char, 64> ym_buf{};
   if (months < 0) {
-    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "-%ld-%ld", std::abs(y),
-                    std::abs(m));
+    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "-%" PRId64 "-%" PRId64,
+                    static_cast<int64_t>(std::abs(y)),
+                    static_cast<int64_t>(std::abs(m)));
   } else {
-    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "%ld-%ld", y, m);
+    CheckedSnprintf(ym_buf.data(), ym_buf.size(), "%" PRId64 "-%" PRId64, y, m);
   }
 
   std::array<char, 32> d_buf{};
-  CheckedSnprintf(d_buf.data(), d_buf.size(), "%ld", days);
+  CheckedSnprintf(d_buf.data(), d_buf.size(), "%" PRId64, days);
 
   std::array<char, 64> t_buf{};
   bool neg_time = (nanos < 0);
@@ -158,17 +160,19 @@ StatusOr<std::string> IntervalValue::TryToString() const {
 
   if (abs_sub_ns != 0) {
     std::array<char, 16> frac{};
-    CheckedSnprintf(frac.data(), frac.size(), "%09ld", abs_sub_ns);
+    CheckedSnprintf(frac.data(), frac.size(), "%09" PRId64, abs_sub_ns);
     size_t end = 9;
     while (end > 0 && frac[end - 1] == '0') {
       --end;
     }
     frac[end] = '\0';
-    CheckedSnprintf(t_buf.data(), t_buf.size(), "%s%ld:%ld:%ld.%s",
+    CheckedSnprintf(t_buf.data(), t_buf.size(),
+                    "%s%" PRId64 ":%" PRId64 ":%" PRId64 ".%s",
                     neg_time ? "-" : "", abs_h, abs_min, abs_s, frac.data());
   } else {
-    CheckedSnprintf(t_buf.data(), t_buf.size(), "%s%ld:%ld:%ld",
-                    neg_time ? "-" : "", abs_h, abs_min, abs_s);
+    CheckedSnprintf(t_buf.data(), t_buf.size(),
+                    "%s%" PRId64 ":%" PRId64 ":%" PRId64, neg_time ? "-" : "",
+                    abs_h, abs_min, abs_s);
   }
 
   return std::string(ym_buf.data()) + " " + d_buf.data() + " " + t_buf.data();
@@ -523,7 +527,8 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           // The integer fields cannot report conversion failures, but a
           // partially parsed time component is rejected by the != 3 check.
           // NOLINTNEXTLINE(cert-err34-c)
-          if (sscanf(p.c_str(), "%ld:%ld:%lf", &th, &tm, &ts) != 3) {
+          if (sscanf(p.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th, &tm, &ts) !=
+              3) {
             ok = false;
             break;
           }
@@ -620,7 +625,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       // Failed conversions leave the zero-initialized fields, which is the
       // accepted parse result for malformed composite parts here.
       sscanf(  // NOLINT(cert-err33-c,cert-err34-c)
-          time_part.c_str(), "%ld:%ld:%lf", &th, &tm, &ts);
+          time_part.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th, &tm, &ts);
       // sscanf happily yields inf/1e300 for e.g. "0:0:1e999"; converting a
       // value outside int64 range (or NaN) is UB, not a wrap (fuzz-found via
       // UBSan: "inf is outside the range of representable values of long").

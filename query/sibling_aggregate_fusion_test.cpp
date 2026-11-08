@@ -162,6 +162,24 @@ TEST_F(SiblingAggregateFusionTest, AllNullGroupKeepsCountZeroAndNullSum) {
   EXPECT_TRUE(fused[0][2].IsNull());
 }
 
+TEST_F(SiblingAggregateFusionTest, NullGroupKeyRejectedByInnerJoinOnClause) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE nullable_keys (g INT64, v INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO nullable_keys VALUES (NULL, 10), (NULL, 20), (1, 5);");
+  const auto fused =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT a.g, a.c, b.s FROM "
+             "(SELECT g, COUNT(*) AS c FROM nullable_keys GROUP BY g) a "
+             "JOIN (SELECT g, SUM(v) AS s FROM nullable_keys GROUP BY g) b "
+             "ON a.g = b.g;");
+  EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 1U);
+  ASSERT_EQ(fused.size(), 1U);
+  EXPECT_EQ(fused[0][0], Value(1));
+  EXPECT_EQ(fused[0][1], Value(1));
+  EXPECT_EQ(fused[0][2], Value(5));
+}
+
 TEST_F(SiblingAggregateFusionTest, HavingLiftsToTheOuterScope) {
   const auto fused =
       RunSql(engine_.get(), context_.get(),

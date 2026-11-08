@@ -19,9 +19,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,7 +61,8 @@ PaxChunk BuildValidChunk() {
   constexpr int kRows = 300;
   for (int i = 0; i < kRows; ++i) {
     Row r{Value(i), Value(1 + ((i * 7919) % 97)),
-          Value("n" + std::to_string(i % 40)), Value(50.0 + (i % 128) * 0.25)};
+          Value("n" + std::to_string(i % 40)),
+          Value(50.0 + ((i % 128) * 0.25))};
     const std::string key = r.EncodeKeyMemcomparableFormat(sc);
     const auto key_off = static_cast<uint32_t>(blob.size());
     const uint32_t be_len = htobe32(static_cast<uint32_t>(key.size()));
@@ -81,7 +82,9 @@ PaxChunk BuildValidChunk() {
 }  // namespace
 
 int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
-  if (size < 16) return 0;
+  if (size < 16) {
+    return 0;
+  }
   const Schema sc = MakeSchema();
   static const PaxChunk kGood = BuildValidChunk();
 
@@ -95,10 +98,12 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
   const Status v1 = PaxChunk::ValidateChunkBytes(bytes);
   const Status v2 = PaxChunk::ValidateChunkBytes(bytes);
   if (v1 != v2) {
-    std::fprintf(stderr, "nondeterministic ValidateChunkBytes verdict\n");
+    std::cerr << "nondeterministic ValidateChunkBytes verdict\n";
     std::abort();
   }
-  if (v1 != Status::kSuccess) return 0;
+  if (v1 != Status::kSuccess) {
+    return 0;
+  }
 
   int64_t probe = 0;
   std::memcpy(&probe, data + size - 8, 8);
@@ -107,10 +112,12 @@ int FuzzPaxMutateOneInput(const uint8_t* data, size_t size) {
   for (size_t i = 0; i < bad.TotalRowCount(); i += 7) {
     auto r = bad.ReadRow(i, sc);
     if (r.HasValue()) {
-      if (r.Value().Count() != sc.ColumnCount()) std::abort();
+      if (r.Value().Count() != sc.ColumnCount()) {
+        std::abort();
+      }
     }
   }
-  const size_t row_i = static_cast<size_t>(probe % 64);
+  const auto row_i = static_cast<size_t>(probe % 64);
   auto cv = bad.ReadColumnValue(row_i, col, sc);
   (void)cv;
   size_t idx = 12345;

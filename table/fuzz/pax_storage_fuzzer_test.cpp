@@ -32,18 +32,6 @@
 
 namespace tinylamb::fuzz {
 
-int FuzzRowCodecOneInput(const uint8_t* data, size_t size);
-int FuzzMemcmpOneInput(const uint8_t* data, size_t size);
-int FuzzPaxMutateOneInput(const uint8_t* data, size_t size);
-int FuzzLsmMergeOneInput(const uint8_t* data, size_t size);
-int FuzzMemtableModelOneInput(const uint8_t* data, size_t size);
-int FuzzSchemaOneInput(const uint8_t* data, size_t size);
-int FuzzChunkFooterOneInput(const uint8_t* data, size_t size);
-int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size);
-int FuzzNullmapVarcharOneInput(const uint8_t* data, size_t size);
-int FuzzFooterSectionsOneInput(const uint8_t* data, size_t size);
-int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size);
-
 namespace {
 
 struct Rng {
@@ -99,6 +87,7 @@ TEST(PaxStorageFuzzerTest, PaxMutateSeeds) {
   for (int i = 0; i < 24; ++i) {
     std::vector<uint8_t> seed;
     const size_t mask_len = 1 + rng.Below(48);
+    seed.reserve(mask_len + 9);
     for (size_t k = 0; k < mask_len; ++k) {
       seed.push_back(static_cast<uint8_t>(rng.Next() & 0xFFU));
     }
@@ -211,7 +200,7 @@ TEST(PaxStorageFuzzerTest, ChunkFooterSeeds) {
           seed.push_back(static_cast<uint8_t>(roll >> 16));
           seed.push_back(static_cast<uint8_t>(roll >> 24));
         }
-        const int64_t probe = static_cast<int64_t>(rng.Next());
+        const auto probe = static_cast<int64_t>(rng.Next());
         const auto* p = reinterpret_cast<const uint8_t*>(&probe);
         seed.insert(seed.end(), p, p + 8);
         EXPECT_EQ(0, FuzzChunkFooterOneInput(seed.data(), seed.size()));
@@ -289,8 +278,8 @@ TEST(PaxStorageFuzzerTest, FooterSectionsSeeds) {
         for (size_t k = 5; k < 8; ++k) {
           seed[k] = static_cast<uint8_t>(static_cast<size_t>(sec) + k);
         }
-        const uint64_t probe = static_cast<uint64_t>(sec) * 1000003ULL +
-                               static_cast<uint64_t>(mode) * 7919ULL;
+        const uint64_t probe = (static_cast<uint64_t>(sec) * 1000003ULL) +
+                               (static_cast<uint64_t>(mode) * 7919ULL);
         for (int k = 0; k < 8; ++k) {
           seed[24 + static_cast<size_t>(k)] =
               static_cast<uint8_t>((probe >> (8 * k)) & 0xFFU);

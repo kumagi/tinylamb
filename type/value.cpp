@@ -673,8 +673,8 @@ bool LooksLikeIntervalText(std::string_view s) {
   // Interval text carries a single-hyphen month token ("2014-1 0 ..."); a
   // leading token shaped like an ISO date ("2014-01-01 ...") is a timestamp
   // string and must compare byte-exact instead.
-  if (s.size() < 3 || !((s[0] >= '0' && s[0] <= '9') || s[0] == '-' ||
-                        s[0] == '+' || s[0] == ' ')) {
+  if (s.size() < 3 || ((s[0] < '0' || s[0] > '9') && s[0] != '-' &&
+                       s[0] != '+' && s[0] != ' ')) {
     return false;
   }
   const size_t sp = s.find(' ');
@@ -849,12 +849,22 @@ StatusOr<size_t> DecodeMemcomparableFormatVarchar(const char* src,
     } else if (flag == 0) {
       // Empty-string encoding: the encoder emits a single all-zero group for
       // "". Consume the group and leave dst empty.
+      if (src != initial_offset ||
+          !std::all_of(buffer, buffer + 8, [](char c) { return c == '\0'; })) {
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable varchar length");
+      }
       src += 9;
       break;
     } else if (8 < flag) {
       return StatusError(StatusCode::kCorrupt,
                          "corrupt memcomparable varchar length");
     } else {
+      if (!std::all_of(buffer + flag, buffer + 8,
+                       [](char c) { return c == '\0'; })) {
+        return StatusError(StatusCode::kCorrupt,
+                           "corrupt memcomparable varchar padding");
+      }
       size += flag;
       src += 9;
       dst->resize(size);
@@ -868,6 +878,9 @@ StatusOr<size_t> DecodeMemcomparableFormatVarchar(const char* src,
 std::string EncodeMemcomparableFormatDouble(double in) {
   std::string ret(1 + 8, '\0');
   ret[0] = static_cast<char>(ValueType::kDouble);  // Embeds prefix.
+  if (std::isnan(in)) {
+    in = std::numeric_limits<double>::quiet_NaN();
+  }
   uint64_t bits = 0;
   std::memcpy(&bits, &in, sizeof(bits));
   uint64_t be = htobe64(bits);
@@ -996,14 +1009,22 @@ size_t VarcharMemcomparableLength(const char* src, size_t avail) {
   const char* p = src;
   size_t left = avail;
   for (;;) {
-    if (left < 9) throw std::runtime_error("truncated varchar group");
+    if (left < 9) {
+      throw std::runtime_error("truncated varchar group");
+    }
     const auto cnt = static_cast<uint8_t>(p[8]);
     if (cnt == 0 || cnt > 9) {
       throw std::runtime_error("broken varchar group count");
     }
+    if (cnt < 8 &&
+        !std::all_of(p + cnt, p + 8, [](char c) { return c == '\0'; })) {
+      throw std::runtime_error("corrupt memcomparable varchar padding");
+    }
     left -= 9;
     p += 9;
-    if (cnt != 9) break;
+    if (cnt != 9) {
+      break;
+    }
   }
   return static_cast<size_t>(p - src);
 }
@@ -1014,8 +1035,15 @@ size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
     case ValueType::kNull:
       throw std::runtime_error("Cannot encode unknown type.");
     case ValueType::kInt64:
-    case ValueType::kDate:
+      if (IsUnsigned()) {
+        return EncodeMemcomparableFormatUint64To(dst, value.int_value);
+      }
       return EncodeMemcomparableFormatIntegerTo(dst, value.int_value);
+    case ValueType::kDate: {
+      const size_t n = EncodeMemcomparableFormatIntegerTo(dst, value.int_value);
+      dst[0] = static_cast<char>(ValueType::kDate);
+      return n;
+    }
     case ValueType::kVarChar:
       return EncodeMemcomparableFormatVarcharTo(dst, value.varchar_value);
     case ValueType::kDouble:
@@ -1027,23 +1055,45 @@ size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
 }
 
 size_t Value::DecodeMemcomparableFormatBounded(const char* src, size_t avail) {
-  if (avail < 1) throw std::runtime_error("truncated tag");
-  const auto tag = static_cast<ValueType>(static_cast<uint8_t>(src[0]));
+  if (avail < 1) {
+    throw std::runtime_error("truncated tag");
+  }
+  const auto raw_tag = static_cast<uint8_t>(src[0]);
+  if (raw_tag == static_cast<uint8_t>(ValueType::kNull)) {
+    return 1;
+  }
+  if (raw_tag == kMemcomparableUint64) {
+    if (avail < 1 + 8) {
+      throw std::runtime_error("truncated numeric");
+    }
+    return 1 + 8;
+  }
+  const auto tag = static_cast<ValueType>(raw_tag);
   switch (tag) {
     case ValueType::kInt64:
     case ValueType::kDate:
     case ValueType::kDouble:
-      if (avail < 1 + 8) throw std::runtime_error("truncated numeric");
+      if (avail < 1 + 8) {
+        throw std::runtime_error("truncated numeric");
+      }
       return 1 + 8;
     case ValueType::kVarChar: {
       const bool empty =
           (avail >= 10) &&
           std::all_of(src + 1, src + 10, [](char c) { return c == '\0'; });
       if (empty) {
-        if (avail < 10) throw std::runtime_error("truncated varchar");
         return 10;
       }
       return 1 + VarcharMemcomparableLength(src + 1, avail - 1);
+    }
+    case ValueType::kArray: {
+      Value tmp;
+      const StatusOr<size_t> res =
+          tmp.TryDecodeMemcomparableFormat(std::string_view(src, avail));
+      if (!res.HasValue()) {
+        throw std::runtime_error(res.GetStatus().GetMessage());
+      }
+      return res.Value();
     }
     default:
       throw std::runtime_error("unknown memcomparable tag");
@@ -1149,14 +1199,24 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
           return StatusError(StatusCode::kCorrupt,
                              "corrupt memcomparable array: truncated");
         }
-        if (*p++ == 0) {
+        const auto present = static_cast<uint8_t>(*p++);
+        if (present == 0) {
           elements.emplace_back();
           continue;
+        }
+        if (present != 1) {
+          return StatusError(StatusCode::kCorrupt,
+                             "corrupt memcomparable array element presence");
         }
         Value element;
         std::string_view rest(p, static_cast<size_t>(end - p));
         ASSIGN_OR_RETURN(size_t, advanced,
                          element.TryDecodeMemcomparableFormat(rest));
+        if (element.IsNull()) {
+          return StatusError(
+              StatusCode::kCorrupt,
+              "corrupt memcomparable array non-null element is null");
+        }
         p += advanced;
         elements.push_back(std::move(element));
       }

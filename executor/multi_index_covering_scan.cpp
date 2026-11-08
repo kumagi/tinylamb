@@ -60,7 +60,7 @@ MultiIndexCoveringScan::MultiIndexCoveringScan(
 
 void MultiIndexCoveringScan::FillFromImage(Row* values,
                                            const Participant& participant,
-                                           const Row& image) const {
+                                           const Row& image) {
   for (const auto& [output, entry] : participant.fills) {
     if (entry < image.Count() && output < values->Count()) {
       (*values)[output] = image[entry];
@@ -145,7 +145,7 @@ Row MultiIndexCoveringScan::AssembleFromHeap(const Row& heap_row) const {
   assembled.values_.reserve(output_slots_.size());
   for (const slot_t slot : output_slots_) {
     if (slot >= heap_row.Count()) {
-      return Row();
+      return {};
     }
     assembled.values_.push_back(heap_row[slot]);
   }

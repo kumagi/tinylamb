@@ -156,7 +156,7 @@ class ExecutorTest : public ::testing::Test {
   // Waits (bounded) for the background GC worker to drop every committed
   // version chain: a page without chains is the index-only visibility-map
   // condition, so tests that need the fast path to fire wait here first.
-  void WaitForChainFreePages() {
+  void WaitForChainFreePages() const {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (rs_->TransactionStats().version_chains != 0) {
@@ -542,10 +542,13 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
   std::vector<Row> original;
   RowPosition updated;
   for (int i = 0; i < 100; ++i) {
-    original.emplace_back(Row({i % 10 ? Value(i % 4) : Value(), Value(i)}));
+    original.emplace_back(
+        Row({((i % 10) != 0) ? Value(i % 4) : Value(), Value(i)}));
     ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
                           table.Insert(seed.txn_, original.back()));
-    if (i == 1) updated = position;
+    if (i == 1) {
+      updated = position;
+    }
   }
   ASSERT_SUCCESS(
       rs_->CreateIndex(seed, "PredicateKeys",
@@ -559,9 +562,10 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
             .GetStatus());
     ASSERT_SUCCESS(writer.PreCommit());
   }
-  const auto compare = [](std::string name, BinaryOperation op, Value value) {
-    return BinaryExpressionExp(ColumnValueExp(std::move(name)), op,
-                               ConstantValueExp(std::move(value)));
+  const auto compare = [](const std::string& name, BinaryOperation op,
+                          const Value& value) {
+    return BinaryExpressionExp(ColumnValueExp(name), op,
+                               ConstantValueExp(value));
   };
   const std::vector<Expression> predicates{
       BinaryExpressionExp(
@@ -582,7 +586,9 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
     ASSIGN_OR_ASSERT_FAIL(Table, current,
                           rs_->GetTable(context, "PredicateKeys"));
     auto visible = original;
-    if (phase == 1) visible[1][1] = Value(998);
+    if (phase == 1) {
+      visible[1][1] = Value(998);
+    }
     for (size_t predicate = 0; predicate < predicates.size(); ++predicate) {
       for (bool ascending : {true, false}) {
         std::vector<Row> expected;
@@ -590,17 +596,20 @@ TEST_F(ExecutorTest, IndexOnlyKeyPredicatesKeepMultiplicityAndIncludeVersions) {
           const auto value =
               predicates[predicate]->TryEvaluate(row, current.GetSchema());
           ASSERT_TRUE(value.HasValue());
-          if (!value.Value().IsNull() && value.Value().Truthy())
+          if (!value.Value().IsNull() && value.Value().Truthy()) {
             expected.push_back(row);
+          }
         }
         IndexOnlyScan scan(context.txn_, current, current.GetIndex(0), Value(),
                            Value(), ascending, predicates[predicate],
                            current.GetSchema());
         std::vector<Row> actual;
         DataChunk batch;
-        while (scan.NextBatch(&batch, 7))
-          for (size_t i = 0; i < batch.Size(); ++i)
+        while (scan.NextBatch(&batch, 7) != 0U) {
+          for (size_t i = 0; i < batch.Size(); ++i) {
             actual.push_back(batch.RowAt(i));
+          }
+        }
         ASSERT_SUCCESS(scan.GetStatus());
         const auto by_payload = [](const Row& a, const Row& b) {
           return a[1] < b[1];
@@ -2166,8 +2175,9 @@ TEST_F(ExecutorTest, FusedTypedScanPreservesIntermediateSumOverflow) {
                                       ColumnValueExp("value")))};
     Row expected;
     std::vector<Row> reference_rows;
-    for (int64_t value : cases[i])
+    for (int64_t value : cases[i]) {
       reference_rows.emplace_back(std::vector<Value>{Value(value)});
+    }
     AggregationExecutor serial(
         std::make_shared<ConstantExecutor>(std::move(reference_rows)),
         Schema(name, {Column("value", ValueType::kInt64)}), aggregates);
@@ -6399,13 +6409,14 @@ TEST_F(ExecutorTest, TypedMorselTopNKeepsNullOrderStableTiesAndPositions) {
             Schema("TypedTop", {Column("k", ValueType::kInt64),
                                 Column("id", ValueType::kInt64),
                                 Column("padding", ValueType::kVarChar)})));
-    for (int64_t i = 0; i < 100; ++i)
+    for (int64_t i = 0; i < 100; ++i) {
       ASSERT_SUCCESS(
           table
               .Insert(writer.txn_,
                       Row({i % 9 == 0 ? Value() : Value(i % 5), Value(i),
                            Value(std::string(12000, 'x'))}))
               .GetStatus());
+    }
     ASSERT_SUCCESS(writer.PreCommit());
   }
   auto reader = rs_->BeginReadOnlyContext();
@@ -6437,7 +6448,7 @@ TEST_F(ExecutorTest, TypedMorselTopNKeepsNullOrderStableTiesAndPositions) {
       EXPECT_TRUE(parallel->WasTypedFolded());
     }
   }
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;

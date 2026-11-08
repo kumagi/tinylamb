@@ -67,7 +67,9 @@ int SortedRun::Entry::Compare(const Entry& rhs,
   // Compare keys: derive key bytes and lengths from both entries using the
   // 4-byte length prefix at key_offset_.
   auto key_at = [&blob](uint32_t off) -> std::string_view {
-    if (static_cast<size_t>(off) + sizeof(uint32_t) > blob.size()) return {};
+    if (static_cast<size_t>(off) + sizeof(uint32_t) > blob.size()) {
+      return {};
+    }
     uint32_t len = 0;
     memcpy(&len, blob.data() + off, sizeof(uint32_t));
     len = be32toh(len);
@@ -81,8 +83,9 @@ int SortedRun::Entry::Compare(const Entry& rhs,
 }
 
 std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
-  if (static_cast<size_t>(key_offset_) + sizeof(uint32_t) > blob.size())
+  if (static_cast<size_t>(key_offset_) + sizeof(uint32_t) > blob.size()) {
     return {};
+  }
   uint32_t len = 0;
   memcpy(&len, blob.data() + key_offset_, sizeof(uint32_t));
   len = be32toh(len);
@@ -90,7 +93,7 @@ std::string SortedRun::Entry::BuildKey(const std::vector<char>& blob) const {
     len = static_cast<uint32_t>(blob.size() - static_cast<size_t>(key_offset_) -
                                 sizeof(uint32_t));
   }
-  return std::string(blob.data() + key_offset_ + sizeof(uint32_t), len);
+  return {blob.data() + key_offset_ + sizeof(uint32_t), len};
 }
 
 Row SortedRun::Entry::BuildRow(const std::vector<char>& blob,
@@ -100,8 +103,12 @@ Row SortedRun::Entry::BuildRow(const std::vector<char>& blob,
   // BE key-length prefix as a row header and reads well past the entry
   // into unrelated blob bytes. Callers must gate on IsDeleted(); the
   // assert is stripped in Release, so refuse in code as well.
-  if (is_deleted_) return Row{};
-  if (row_offset_ >= blob.size()) return Row{};
+  if (is_deleted_) {
+    return Row{};
+  }
+  if (row_offset_ >= blob.size()) {
+    return Row{};
+  }
   // DeserializeBounded validates the column count and every varchar
   // length prefix against the remaining bytes BEFORE touching them, so a
   // corrupted blob throws instead of reading past the end (the unbounded
@@ -116,26 +123,36 @@ bool SortedRun::Entry::BuildRowInto(const std::vector<char>& blob,
                                     const Schema& sc, Row* out) const {
   // Same guards as BuildRow: a tombstone's row_offset_ points at the key
   // length prefix, not at a payload.
-  if (is_deleted_) return false;
-  if (row_offset_ >= blob.size()) return false;
+  if (is_deleted_) {
+    return false;
+  }
+  if (row_offset_ >= blob.size()) {
+    return false;
+  }
   // DeserializeBounded clears *out's cells and refills them; a caller
   // feeding rows of a stable shape in a loop therefore reuses the cell
   // buffer (and its capacity) instead of allocating per row.
-  out->DeserializeBounded(blob.data() + row_offset_, blob.size() - row_offset_,
-                          sc);
+  try {
+    out->DeserializeBounded(blob.data() + row_offset_,
+                            blob.size() - row_offset_, sc);
+  } catch (const std::exception&) {
+    return false;
+  }
   return true;
 }
 
 std::ostream& operator<<(std::ostream& o, const SortedRun::Entry& e) {
   o << "key_off=" << e.key_offset_ << " row_off=" << e.row_offset_;
-  if (e.is_deleted_) o << "(deleted)";
+  if (e.is_deleted_) {
+    o << "(deleted)";
+  }
   return o;
 }
 
 size_t SortedRun::LowerBound(std::string_view key) const {
   size_t lo = 0, hi = index_.size();
   while (lo < hi) {
-    size_t mid = lo + (hi - lo) / 2;
+    size_t mid = lo + ((hi - lo) / 2);
     if (index_[mid].Compare(key, blob_) < 0) {
       lo = mid + 1;
     } else {
@@ -148,9 +165,15 @@ size_t SortedRun::LowerBound(std::string_view key) const {
 Status SortedRun::Lookup(std::string_view key, const Schema& sc,
                          Row* row_out) const {
   size_t pos = LowerBound(key);
-  if (pos >= index_.size()) return Status::kNotExists;
-  if (index_[pos].Compare(key, blob_) != 0) return Status::kNotExists;
-  if (index_[pos].is_deleted_) return Status::kDeleted;
+  if (pos >= index_.size()) {
+    return Status::kNotExists;
+  }
+  if (index_[pos].Compare(key, blob_) != 0) {
+    return Status::kNotExists;
+  }
+  if (index_[pos].is_deleted_) {
+    return Status::kDeleted;
+  }
   // BuildRow throws std::runtime_error on a corrupt blob, but this is a
   // Status API: translate so corruption never escapes as an exception.
   try {
@@ -165,19 +188,23 @@ StatusOr<Row> SortedRun::Find(std::string_view key, const Schema& sc) const {
   // User-facing lookup: a tombstone in this run hides the row entirely.
   Row row;
   Status st = Lookup(key, sc, &row);
-  if (st == Status::kSuccess) return Row(std::move(row));
-  if (st == Status::kDeleted) return Status::kNotExists;
+  if (st == Status::kSuccess) {
+    return Row(std::move(row));
+  }
+  if (st == Status::kDeleted) {
+    return Status::kNotExists;
+  }
   return st;
 }
 
 std::string SortedRun::Iterator::Key() const {
   assert(IsValid());
-  return GetEntry().BuildKey(*blob_);
+  return GetEntry().BuildKey(parent_->Blob());
 }
 
 Row SortedRun::Iterator::Value() const {
   assert(IsValid());
-  return GetEntry().BuildRow(*blob_, *schema_);
+  return GetEntry().BuildRow(parent_->Blob(), *schema_);
 }
 
 int SortedRun::Iterator::Compare(const Iterator& rhs) const {
@@ -185,11 +212,11 @@ int SortedRun::Iterator::Compare(const Iterator& rhs) const {
   // comparison silently interpreted one run's offsets against the other
   // run's blob (release UB). Iterator::Compare has no Status channel, so
   // refuse loudly in release too.
-  if (blob_ != rhs.blob_) {
+  if (parent_ != rhs.parent_) {
     throw std::invalid_argument(
         "SortedRun::Iterator::Compare across different runs");
   }
-  return GetEntry().Compare(rhs.GetEntry(), *blob_);
+  return GetEntry().Compare(rhs.GetEntry(), parent_->Blob());
 }
 
 std::ostream& operator<<(std::ostream& o, const SortedRun& s) {

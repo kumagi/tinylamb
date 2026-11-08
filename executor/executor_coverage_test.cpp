@@ -87,7 +87,7 @@ TEST(TopNCoverageTest, BatchedHeapKeepsStableNullOrderPayloadAndPositions) {
       }
       return chunk->Size();
     }
-    void Dump(std::ostream&, int) const override {}
+    void Dump(std::ostream& /*o*/, int /*indent*/) const override {}
   };
   auto source = std::make_shared<Source>();
   for (int i = 0; i < 3000; ++i) {
@@ -305,15 +305,15 @@ TEST(IncrementalSortCoverageTest, LimitConsumesOnlyFirstPeerGroupAndLookahead) {
     size_t NextBatch(DataChunk* chunk, size_t max_rows) override {
       chunk->Reset();
       while (consumed < 10000 && chunk->Size() < max_rows) {
-        const auto group = static_cast<int64_t>(99 - consumed / 100);
-        const auto suffix = static_cast<int64_t>(99 - consumed % 100);
+        const auto group = static_cast<int64_t>(99 - (consumed / 100));
+        const auto suffix = static_cast<int64_t>(99 - (consumed % 100));
         chunk->Append(Row{Value(group), Value(suffix)},
                       RowPosition(1, static_cast<slot_t>(consumed)));
         ++consumed;
       }
       return chunk->Size();
     }
-    void Dump(std::ostream& out, int) const override {
+    void Dump(std::ostream& out, int /*indent*/) const override {
       out << "CountingSource";
     }
   };
@@ -349,7 +349,9 @@ TEST(IncrementalSortCoverageTest, SingletonPeersKeepPositionsAndLookahead) {
       }
       return chunk->Size();
     }
-    void Dump(std::ostream& out, int) const override { out << "Singletons"; }
+    void Dump(std::ostream& out, int /*indent*/) const override {
+      out << "Singletons";
+    }
   };
   const Schema schema(
       "t", {Column("g", ValueType::kInt64), Column("v", ValueType::kInt64)});
@@ -386,7 +388,7 @@ TEST(IncrementalSortCoverageTest, SingletonDoesNotElideSuffixErrors) {
 }
 
 TEST(IncrementalSortCoverageTest, SpilledNullPeerAndExplicitMaterialization) {
-  struct RestoreBudget {
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
     size_t limit = QueryMemoryBudget::Global().Limit();
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
@@ -394,7 +396,9 @@ TEST(IncrementalSortCoverageTest, SpilledNullPeerAndExplicitMaterialization) {
   const Schema schema(
       "t", {Column("g", ValueType::kInt64), Column("v", ValueType::kInt64)});
   std::vector<Row> input;
-  for (int64_t i = 2000; i >= 0; --i) input.push_back(Row({Value(), Value(i)}));
+  for (int64_t i = 2000; i >= 0; --i) {
+    input.push_back(Row({Value(), Value(i)}));
+  }
   input.push_back(Row({Value(1), Value(4)}));
   auto source = std::make_shared<ValuesExecutor>(std::move(input));
   IncrementalSortExecutor sort(
@@ -432,7 +436,7 @@ TEST(LimitCoverageTest, BoundedDemandCrossesProjectionAndFilterWithOffset) {
       }
       return chunk->Size();
     }
-    void Dump(std::ostream& out, int) const override {
+    void Dump(std::ostream& out, int /*indent*/) const override {
       out << "CountingSource";
     }
   };

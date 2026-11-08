@@ -6,24 +6,14 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
 ## Key files
 
 - `transaction.{hpp,cpp}` — `Transaction{txn_id, snapshot, read/write sets,
-  prev_lsn chain, status}`. Emits Insert/Update/Delete + CLR log records;
-  visibility and durability are separate (dependent durable-LSN barrier
-  before commit). The leaf/branch log emitters
-  (`DeleteLeafLog`/`DeleteBranchLog`/`UpdateLeafLog`/`Set{Low,High}Fence`/
-  `SetFoster`) also **register an index-undo space reservation**
-  (`ReserveIndexUndoBytes`): the bytes the record's UNDO will re-consume stay
-  out of OTHER transactions' admissions until this transaction resolves
-  (the Leaf/Branch twin of the RowPage hole reservation — without it a
-  concurrent insert admitted on the freed bytes makes the abort undo
-  physically impossible, fail-stops the runtime abort, and wedges the
-  restart's loser undo against the same page). Own reservations never block
-  own operations (the reverse-chain undo frees a later op's bytes before an
-  earlier op's undo re-claims them).
-  Each reservation shard also counts page entries per owner under that same
-  mutex. Coarse foreign-owner checks consult this exact summary, so a large
-  CREATE INDEX does not re-scan its own growing page map on every insert.
-  Repeated byte claims count once per (page, owner); final release removes
-  the summary entry. The per-page byte admission and drain protocol are unchanged.
+  prev_lsn chain, status}`. Emits row (`InsertLog`/`UpdateLog`/`DeleteLog`/
+  `SetRowPageNextLog`/`SetRowPagePrevLog`), LSM index (`LsmPutLog`/
+  `LsmDeleteLog`/`LsmDestroyLog`), page allocation (`AllocatePageLog`/
+  `DestroyPageLog`), and CLR log records; visibility and durability are
+  separate (dependent durable-LSN barrier before commit). `ReserveIndexUndoBytes`
+  tracks per-page index-undo byte reservations across 64 shards (counted per
+  `(page, owner)` under each shard's mutex so coarse foreign-owner checks stay
+  O(1) per shard).
 - `transaction_manager.{hpp,cpp}` — `Begin(read_only)` / `PreCommit` /
   commit (`COMMIT` record → publish versions/release intents → durability
   barrier → reply) / abort (backward
@@ -54,13 +44,9 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
   is in flight (commit fsync, write-back gate — counted by
   `DurabilityBarrierGuard` around `WaitForWALDurable`) or the group-commit
   backlog exceeds 1 MiB, an expired hatch deadline extends toward
-  `kDurabilityIntentWaitFloor` (60 s) instead of firing, the twin of
-  `LockManager::kDurabilityWaitFloor`. A stalled fsync slows holders
-  without deadlocking them, and timing their waiters out manufactured abort
-  cascades whenever a checkpoint's data-file sync stretched every fsync
-  (measured on TPC-C: bursts of 5 s escapes and a 42% throughput crash
-  exactly while a checkpoint flushed; after the fix 71 timeouts in 4
-  minutes dropped to 6 — the genuine latch cycles).
+  `kDurabilityIntentWaitFloor` (60 s) instead of firing. A stalled fsync slows
+  holders without deadlocking them, and timing their waiters out manufactured
+  abort cascades whenever a data-file sync stretched every fsync.
   MVCC version chains live
   in 256 shards; the background GC worker sweeps small version spaces in
   one full pass and large ones in rotating shard windows (adaptive to
@@ -87,7 +73,7 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
 
 ## Two things you must not conflate
 
-Row **latch** (`PagePool`) vs MVCC **write-intent** (version chain).
+Page content **latch** (`PageRef`) vs MVCC **write-intent** (version chain).
 Canonical flow: `Begin → write-intent → WAL → PreCommit/Abort`.
 
 Test: `./build/transaction_test`, `transaction_extra_test`.

@@ -1,0 +1,68 @@
+-- tinylamb-oracle-test v1
+-- seed: 5967554911748571385
+-- table: t116402980
+-- predicate: (s >= 'zz')
+-- setup: CREATE TABLE t116402980 (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));
+-- setup: INSERT INTO t116402980 VALUES (0, NULL, -1, TRUE, 'a');
+-- setup: INSERT INTO t116402980 VALUES (1, 3, -2, NULL, NULL);
+-- setup: INSERT INTO t116402980 VALUES (2, -1, NULL, TRUE, '');
+-- setup: INSERT INTO t116402980 VALUES (3, 3, -2, TRUE, '');
+-- setup: INSERT INTO t116402980 VALUES (4, 0, -2, TRUE, '');
+-- setup: INSERT INTO t116402980 VALUES (5, 1, -2, FALSE, '');
+-- setup: INSERT INTO t116402980 VALUES (6, 2, NULL, NULL, '');
+-- setup: INSERT INTO t116402980 VALUES (7, 0, 0, TRUE, NULL);
+-- setup: CREATE TABLE t116402980_s (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));
+-- setup: INSERT INTO t116402980_s VALUES (500, -3, -2, TRUE, NULL);
+-- setup: INSERT INTO t116402980_s VALUES (501, -2, -2, FALSE, '');
+-- setup: INSERT INTO t116402980_s VALUES (502, 3, -1, NULL, 'a');
+-- tlp: SELECT flag, s FROM t116402980 WHERE (s >= 'zz');
+-- tlp: SELECT flag, s FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb')));
+-- tlp: SELECT flag, s FROM t116402980 WHERE ((s >= 'zz')) AND NOT (((NOT (s IS NOT NULL)) AND (s >= 'bb')));
+-- tlp: SELECT flag, s FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) IS NULL;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t116402980 WHERE (s >= 'zz') GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t116402980 WHERE ((s >= 'zz')) AND NOT (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) GROUP BY a;
+-- tlpagg: SELECT a, COUNT(*), SUM(b) FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) IS NULL GROUP BY a;
+-- unionall: SELECT u, a, b, flag, s FROM t116402980 WHERE (s >= 'zz');
+-- unionall: SELECT u, a, b, flag, s FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) UNION ALL SELECT u, a, b, flag, s FROM t116402980 WHERE ((s >= 'zz')) AND NOT (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) UNION ALL SELECT u, a, b, flag, s FROM t116402980 WHERE ((s >= 'zz')) AND (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) IS NULL;
+-- orpartition: SELECT u + 1, a FROM t116402980 WHERE ((s >= 'zz')) OR (((NOT (s IS NOT NULL)) AND (s >= 'bb')));
+-- orpartition: SELECT u + 1, a FROM t116402980 WHERE ((s >= 'zz')) IS TRUE UNION ALL SELECT u + 1, a FROM t116402980 WHERE (((NOT (s IS NOT NULL)) AND (s >= 'bb'))) IS TRUE AND ((s >= 'zz')) IS NOT TRUE;
+-- niv: SELECT u FROM t116402980 WHERE a NOT IN (5, -1);
+-- niv: SELECT u FROM t116402980 WHERE NOT (a = 5 OR a = -1);
+-- dso: SELECT a FROM (SELECT a FROM t116402980 UNION DISTINCT SELECT a FROM t116402980_s) d WHERE a <= 0;
+-- dso: SELECT a FROM t116402980 WHERE a <= 0 UNION DISTINCT SELECT a FROM t116402980_s WHERE a <= 0;
+-- norec: SELECT COUNT(*) FROM t116402980 WHERE (s >= 'zz');
+-- norec: SELECT SUM(CASE WHEN (s >= 'zz') THEN 1 ELSE 0 END) FROM t116402980;
+-- pqs: SELECT COUNT(*) FROM t116402980 WHERE (NOT (s >= 'zz'));
+-- pqsu: SELECT u FROM t116402980 WHERE (NOT (s >= 'zz'));
+-- pqsexpected: 6
+-- pqspivot: 3
+-- idxddl: CREATE UNIQUE INDEX idx_fuzz0 ON t116402980(u);
+-- idxddl: CREATE INDEX idx_fuzz1 ON t116402980(b,s);
+-- idxprobe: SELECT COUNT(*) FROM t116402980 WHERE (s >= 'zz');
+-- skip: SELECT COUNT(DISTINCT a) FROM t116402980;
+-- skip: SELECT DISTINCT a FROM t116402980 ORDER BY a;
+-- skip: SELECT COUNT(DISTINCT a) FROM t116402980 WHERE (s >= 'zz');
+-- win: 50|2|0|1|0|0|-4611686018427387904|SELECT u, NTILE(2) OVER (PARTITION BY a ORDER BY u) FROM t116402980 ORDER BY u;
+-- win: 3|1|2|0|0|2|-2|SELECT u, LEAD(b, 1, -2) OVER (PARTITION BY a ORDER BY u) FROM t116402980 ORDER BY u;
+-- win: 11|0|2|2|-1|0|-4611686018427387904|SELECT u, COUNT(u) OVER (ORDER BY u ROWS BETWEEN 0 PRECEDING AND 2 FOLLOWING) FROM t116402980 ORDER BY u;
+-- topties: SELECT u, a FROM t116402980 ORDER BY a LIMIT 3 WITH TIES;
+-- toptieslimit: 3
+-- dqe: SELECT COUNT(*) FROM t116402980 WHERE (s >= 'zz');
+-- dqe: SELECT COUNT(*) FROM t116402980;
+-- dqe: DELETE FROM t116402980 WHERE (s >= 'zz');
+-- troc: INSERT INTO t116402980 VALUES (1000, 3, -1, TRUE, 'a');
+-- trocprobe: SELECT COUNT(*), SUM(a), SUM(b) FROM t116402980;
+-- setop: SELECT a FROM t116402980 WHERE (s >= 'zz') INTERSECT DISTINCT SELECT a FROM t116402980_s WHERE ((s < '') AND ((b = b) OR (((~b) = 0))));
+-- orderby: SELECT u, a FROM t116402980 WHERE (s >= 'zz') ORDER BY a, u LIMIT 0 OFFSET 0;
+-- ordinalorder: WITH q AS (SELECT u, a FROM t116402980 WHERE (s >= 'zz')) SELECT * FROM q ORDER BY 1 DESC NULLS FIRST, a;
+-- having: SELECT a, COUNT(*), SUM(b) FROM t116402980 GROUP BY a HAVING COUNT(b) IS NOT NULL;
+-- havingexpect: [NULL, 1, -1]
+-- havingexpect: [-1, 1, NULL]
+-- havingexpect: [0, 2, -2]
+-- havingexpect: [1, 1, -2]
+-- havingexpect: [2, 1, NULL]
+-- havingexpect: [3, 2, -4]
+-- xmode: WITH c AS (SELECT u, a, b, flag, s FROM t116402980) SELECT c1.u, c2.u AS u2, c1.a, c2.b FROM c c1 JOIN c c2 ON c1.a = c2.a WHERE c1.b >= -2 AND c2.a <= 1;
+-- xmode: SELECT d1.a, d1.c1, d1.s1, d2.c2, d2.m2 FROM (SELECT a, COUNT(*) AS c1, SUM(b) AS s1 FROM t116402980 WHERE ((s >= 'zz')) AND a IS NOT NULL GROUP BY a) d1 LEFT JOIN (SELECT a, COUNT(b) AS c2, MAX(u) AS m2 FROM t116402980 WHERE b IS NOT NULL OR flag IS TRUE GROUP BY a) d2 ON d1.a = d2.a;
+-- failure: auto-generated by sql_oracle_fuzzer | predicate: (s >= 'zz') | [DSO MISMATCH] | lhs: SELECT a FROM (SELECT a FROM t116402980 UNION DISTINCT SELECT a FROM t116402980_s) d WHERE a <= 0; (5 rows) | [-1] | [-2] | [-3] | [0] | [0] | rhs: SELECT a FROM t116402980 WHERE a <= 0 UNION DISTINCT SELECT a FROM t116402980_s WHERE a <= 0; (4 rows) | [-1] | [-2] | [-3] | [0]

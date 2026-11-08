@@ -24,7 +24,6 @@ namespace {
 
 using relational_detail::AnalyzePredicates;
 using relational_detail::ConcatRows;
-using relational_detail::EqualityKeys;
 using relational_detail::EqualityPairKey;
 using relational_detail::EstimateJoinRows;
 using relational_detail::EstimateJoinRowsCached;

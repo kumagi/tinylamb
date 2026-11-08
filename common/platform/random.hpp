@@ -63,7 +63,8 @@ uint64_t UniformOffset(Engine& engine, uint64_t urange) {
     const uint64_t uerange = urange + 1;
 #if defined(__SIZEOF_INT128__)
     if constexpr (kEngineRange == UINT64_MAX) {
-      return NearlyDivisionless<unsigned __int128, uint64_t>(engine, uerange);
+      __extension__ using uint128_t = unsigned __int128;
+      return NearlyDivisionless<uint128_t, uint64_t>(engine, uerange);
     } else
 #endif
         if constexpr (kEngineRange == UINT32_MAX) {

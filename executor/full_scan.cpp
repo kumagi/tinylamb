@@ -118,14 +118,19 @@ size_t FullScan::NextBatch(DataChunk* destination, size_t max_rows) {
 
 StatusOr<bool> FullScan::TryFoldTypedBatches(
     const std::function<Status(size_t, const TypedCellBatch&)>& consume) {
-  if (started_) return false;
+  if (started_) {
+    return false;
+  }
   for (size_t i = 0; i < output_schema_.ColumnCount(); ++i) {
     const ValueType type = output_schema_.GetColumn(i).Type();
     if (type != ValueType::kInt64 && type != ValueType::kDate &&
-        type != ValueType::kDouble)
+        type != ValueType::kDouble) {
       return false;
+    }
   }
-  if (output_schema_.ColumnCount() == 0) return false;
+  if (output_schema_.ColumnCount() == 0) {
+    return false;
+  }
   started_ = true;
   typed_folded_ = true;
   TypedCellBatch batch;
@@ -183,7 +188,9 @@ StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
 
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {
   o << "FullScan: " << table_->GetSchema().Name();
-  if (typed_folded_) o << " fused-typed-fold";
+  if (typed_folded_) {
+    o << " fused-typed-fold";
+  }
   if (max_rows_ != std::numeric_limits<size_t>::max()) {
     o << " (max rows: " << max_rows_ << ")";
   }

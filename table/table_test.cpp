@@ -363,7 +363,9 @@ TEST_F(TableTest, UpdateRelocationHealsStaleTailHintAndKeepsOwnership) {
             RowPosition, inserted,
             table->Insert(setup.txn_,
                           Row({Value(i), Value(std::string(16000, 'a'))})));
-        if (i == 16) original_position = inserted;
+        if (i == 16) {
+          original_position = inserted;
+        }
       }
       ASSERT_SUCCESS(setup.PreCommit());
     }
@@ -1491,6 +1493,117 @@ TEST_F(TableTest, DropTableWaitsForActiveIndexScan) {
   EXPECT_EQ(drop_future.wait_for(std::chrono::seconds(5)),
             std::future_status::ready);
   EXPECT_EQ(drop_future.get(), Status::kSuccess);
+}
+
+TEST_F(TableTest, UniqueIndexWaitsForAbortedWriterAndSucceeds) {
+  for (const IndexMode mode :
+       {IndexMode::kUnique, IndexMode::kVersionedUnique}) {
+    const std::string tbl_name =
+        mode == IndexMode::kUnique ? "uniq_single_wait" : "uniq_ver_wait";
+    {
+      TransactionContext setup = rs_->BeginContext();
+      Schema sc(tbl_name, {Column("k", ValueType::kInt64),
+                           Column("v", ValueType::kInt64)});
+      ASSERT_SUCCESS(rs_->CreateTable(setup, sc).GetStatus());
+      ASSERT_SUCCESS(rs_->CreateIndex(
+          setup, tbl_name, IndexSchema("idx_" + tbl_name, {0}, {}, mode)));
+      ASSERT_SUCCESS(setup.txn_.PreCommit());
+    }
+
+    std::promise<void> s1_inserted;
+    std::future<void> s1_inserted_fut = s1_inserted.get_future();
+    std::promise<void> release_s1;
+    std::future<void> release_s1_fut = release_s1.get_future();
+
+    auto s1_worker = std::async(std::launch::async, [&]() {
+      TransactionContext s1 = rs_->BeginContext();
+      auto tbl = s1.GetTable(tbl_name).Value();
+      Status s = tbl->Insert(s1.txn_, Row({Value(42), Value(1)})).GetStatus();
+      s1_inserted.set_value();
+      release_s1_fut.wait();
+      EXPECT_EQ(s, Status::kSuccess);
+      EXPECT_EQ(s1.txn_.Abort(), Status::kSuccess);
+    });
+
+    s1_inserted_fut.wait();
+
+    auto s2_worker = std::async(std::launch::async, [&]() -> Status {
+      TransactionContext s2 = rs_->BeginContext();
+      auto tbl = s2.GetTable(tbl_name).Value();
+      Status ins = tbl->Insert(s2.txn_, Row({Value(42), Value(2)})).GetStatus();
+      if (ins != Status::kSuccess) {
+        (void)s2.txn_.Abort();
+        return ins;
+      }
+      return s2.txn_.PreCommit();
+    });
+
+    EXPECT_EQ(s2_worker.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release_s1.set_value();
+    s1_worker.get();
+    EXPECT_EQ(s2_worker.get(), Status::kSuccess);
+
+    TransactionContext check = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                check.GetTable(tbl_name));
+    size_t count = 0;
+    for (Iterator it = tbl->BeginFullScan(check.txn_); it.IsValid(); ++it) {
+      EXPECT_EQ((*it)[0], Value(42));
+      EXPECT_EQ((*it)[1], Value(2));
+      ++count;
+    }
+    EXPECT_EQ(count, 1U);
+  }
+}
+
+TEST_F(TableTest, VersionedUniqueIndexRejectsPostSnapshotCommittedDuplicate) {
+  {
+    TransactionContext setup = rs_->BeginContext();
+    Schema sc("uniq_post_snap",
+              {Column("k", ValueType::kInt64), Column("v", ValueType::kInt64)});
+    ASSERT_SUCCESS(rs_->CreateTable(setup, sc).GetStatus());
+    ASSERT_SUCCESS(rs_->CreateIndex(setup, "uniq_post_snap",
+                                    IndexSchema("idx_uniq_post_snap", {0}, {},
+                                                IndexMode::kVersionedUnique)));
+    ASSERT_SUCCESS(setup.txn_.PreCommit());
+  }
+
+  TransactionContext s1 = rs_->BeginContext();
+  TransactionContext s2 = rs_->BeginContext();
+
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, t1,
+                              s1.GetTable("uniq_post_snap"));
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, t2,
+                              s2.GetTable("uniq_post_snap"));
+
+  ASSERT_SUCCESS(t1->Insert(s1.txn_, Row({Value(42), Value(1)})).GetStatus());
+  ASSERT_SUCCESS(s1.txn_.PreCommit());
+
+  EXPECT_EQ(t2->Insert(s2.txn_, Row({Value(42), Value(2)})).GetStatus(),
+            Status::kDuplicates);
+  ASSERT_SUCCESS(s2.txn_.Abort());
+}
+
+TEST_F(TableTest,
+       LsmScanRangeFiltersForeignUncommittedEntriesAndDestroyConflicts) {
+  TransactionContext s1 = rs_->BeginContext();
+  TransactionContext s2 = rs_->BeginContext();
+  PageManager* pm = s1.txn_.GetPageManager();
+  const page_id_t tree_id = 99999;
+
+  ASSERT_SUCCESS(pm->LsmInsert(s1.txn_, tree_id, "k1", "v1"));
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s1.txn_.ID()).size(), 1U);
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s2.txn_.ID()).size(), 0U);
+  ASSERT_SUCCESS(s1.txn_.PreCommit());
+
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s2.txn_.ID()).size(), 1U);
+
+  TransactionContext d1 = rs_->BeginContext();
+  ASSERT_SUCCESS(pm->LsmDestroy(d1.txn_, tree_id));
+  EXPECT_EQ(pm->LsmInsert(s2.txn_, tree_id, "k2", "v2"), Status::kConflicts);
+  ASSERT_SUCCESS(d1.txn_.Abort());
+  ASSERT_SUCCESS(s2.txn_.Abort());
 }
 
 }  // namespace tinylamb

@@ -14,8 +14,6 @@ This directory is responsible for managing transactions, which are the fundament
   - **Commit and Abort**: It orchestrates the commit and abort processes. When a transaction is committed, it writes a `COMMIT` record to the log. When a transaction is aborted, it walks the same chain to compensate every change with a CLR and then appends a `COMMIT`-typed terminator (there is no `ABORT` record type) so restart recovery classifies the transaction as finished.
   - **Compensation Log Records (CLRs)**: During an abort, for each change that is undone, the `TransactionManager` writes a Compensation Log Record (CLR) to the log. CLRs describe the undo operation and are essential for ensuring that the rollback process itself is idempotent and can survive a crash.
 
-- **`LockManager`**: An auxiliary row-lock table (Strict 2PL semantics: shared and exclusive locks per `RowPosition`). It is **not** the primary isolation mechanism — conflict control between writers is handled by the MVCC version store and per-row write intents in the `TransactionManager` (see `transaction/AGENTS.md` and `docs/lock_order.md`). The `LockManager` exists for test-facing locking semantics and for callers that need explicit row locks; the `TransactionManager` itself never takes or releases `LockManager` locks (unlocking is the caller's job).
-
 ## Workflow
 
 The typical lifecycle of a transaction is as follows:
@@ -27,7 +25,7 @@ The typical lifecycle of a transaction is as follows:
     -   Writes first acquire a per-row write intent (`AddWriteSet`); conflicts are resolved by the configured deadlock policy (wait-die, wound-wait, detection) and the executor unwinds the transaction on a lost race.
     -   The transaction generates a log record for the operation and appends it to the log.
 4.  When the client is finished, it calls either `PreCommit()` or `Abort()` on the `Transaction` object.
-    -   **Commit**: The `TransactionManager` writes a `COMMIT` record to the log, publishes the staged versions, and releases the write intents. `LockManager` locks, if any were taken, are released by the caller.
-    -   **Abort**: The `TransactionManager` walks the log chain, writes a CLR for each change, releases the write intents, marks the transaction aborted, and appends a `COMMIT`-typed terminator.
+    -   **Commit**: The `TransactionManager` writes a `COMMIT` record to the log, publishes the staged versions, and releases the write intents.
+    -   **Abort**: The `TransactionManager` reverts staged in-memory mutations, releases the write intents, marks the transaction aborted, and appends an `ABORT` log record when WAL records were emitted.
 
 This combination of locking for concurrency control and logging for durability and atomicity ensures that the database operates reliably and maintains data consistency even in the presence of concurrent access and system failures.
