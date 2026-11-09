@@ -56,23 +56,23 @@ bool KeyImageHasNull(const Row& key_image) {
 
 }  // namespace
 
-SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
-                                   const Index& index, const Value& begin,
-                                   const Value& end, bool ascending,
-                                   Expression where, Schema sc,
-                                   size_t prefix_cols)
+SkipScanDistinct::SkipScanDistinct(
+    Transaction& txn, const Table& table, const Index& index,
+    const Value& begin, const Value& end, bool ascending, Expression where,
+    Schema sc, size_t prefix_cols,
+    TransactionManager::IndexReadGuard index_read_guard)
     : SkipScanDistinct(
           txn, table, index,
           begin.IsNull() ? std::vector<Value>{} : std::vector<Value>{begin},
           end.IsNull() ? std::vector<Value>{} : std::vector<Value>{end},
-          ascending, std::move(where), std::move(sc), prefix_cols) {}
+          ascending, std::move(where), std::move(sc), prefix_cols,
+          std::move(index_read_guard)) {}
 
-SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
-                                   const Index& index,
-                                   const std::vector<Value>& begin_key,
-                                   const std::vector<Value>& end_key,
-                                   bool ascending, Expression where, Schema sc,
-                                   size_t prefix_cols)
+SkipScanDistinct::SkipScanDistinct(
+    Transaction& txn, const Table& table, const Index& index,
+    const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
+    bool ascending, Expression where, Schema sc, size_t prefix_cols,
+    TransactionManager::IndexReadGuard index_read_guard)
     : txn_(txn),
       table_(table),
       index_(index),
@@ -83,6 +83,9 @@ SkipScanDistinct::SkipScanDistinct(Transaction& txn, const Table& table,
       schema_(std::move(sc)),
       prefix_cols_(prefix_cols),
       is_unique_(index.StoresSingleValue()),
+      index_read_guard_(index_read_guard.HoldsLock()
+                            ? std::move(index_read_guard)
+                            : txn.AcquireIndexReadGuard(index.Root())),
       bpt_(index.Root()),
       iter_(&bpt_, &txn_, EncodeParts(begin_key_),
             EncodeEndParts(index_, end_key_), ascending_) {}
@@ -192,8 +195,40 @@ size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
   // result exceeds one batch.
   destination->Reset();
   while (destination->Size() < max_rows && !finished_ && iter_.IsValid()) {
+    if (iter_.Value().empty()) {
+      if (ascending_) {
+        ++iter_;
+      } else {
+        --iter_;
+      }
+      continue;
+    }
     current_index_key_.Clear();
     current_index_key_.DecodeMemcomparableFormat(iter_.Key());
+
+    bool found_visible = false;
+    auto check_candidate = [&](const RowPosition& pos) -> StatusOr<bool> {
+      current_pos_ = pos;
+      current_row_resolved_ = false;
+      ResolveCurrentRow();
+      if (status_ != Status::kSuccess) {
+        return status_;
+      }
+      if (!current_row_.IsValid()) {
+        return false;
+      }
+      if (where_) {
+        StatusOr<Value> res = where_->TryEvaluate(current_row_, schema_);
+        if (!res.HasValue()) {
+          status_ = res.GetStatus();
+          return status_;
+        }
+        if (!res.Value().Truthy()) {
+          return false;
+        }
+      }
+      return true;
+    };
 
     if (is_unique_ && !KeyImageHasNull(current_index_key_)) {
       StatusOr<Table::IndexValueType> val =
@@ -204,7 +239,13 @@ size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
         FailWith(status_);
         return destination->Size();
       }
-      current_pos_ = val.Value().pos;
+      StatusOr<bool> ok = check_candidate(val.Value().pos);
+      if (!ok.HasValue()) {
+        finished_ = true;
+        FailWith(ok.GetStatus());
+        return destination->Size();
+      }
+      found_visible = ok.Value();
     } else {
       StatusOr<std::vector<Table::IndexValueType>> val =
           Decode<std::vector<Table::IndexValueType>>(iter_.Value());
@@ -214,38 +255,31 @@ size_t SkipScanDistinct::NextBatch(DataChunk* destination, size_t max_rows) {
         FailWith(status_);
         return destination->Size();
       }
-      if (val.Value().empty()) {
-        if (ascending_) {
-          ++iter_;
-        } else {
-          --iter_;
+      for (const Table::IndexValueType& entry : val.Value()) {
+        StatusOr<bool> ok = check_candidate(entry.pos);
+        if (!ok.HasValue()) {
+          finished_ = true;
+          FailWith(ok.GetStatus());
+          return destination->Size();
         }
-        continue;
+        if (ok.Value()) {
+          found_visible = true;
+          break;
+        }
       }
-      current_pos_ = val.Value()[0].pos;
     }
 
-    current_row_resolved_ = false;
-    ResolveCurrentRow();
-
-    bool matched = true;
-    if (where_) {
-      StatusOr<Value> res = where_->TryEvaluate(current_row_, schema_);
-      if (!res.HasValue()) {
-        status_ = res.GetStatus();
-        FailWith(status_);
-        return destination->Size();
-      }
-      matched = res.Value().Truthy();
-    }
-
-    std::string prev_encoded_key = iter_.Key();
-    Row prev_key = current_index_key_;
-
-    SeekNextDistinct(prev_encoded_key, prev_key);
-
-    if (matched && current_row_.IsValid()) {
+    if (found_visible) {
+      std::string prev_encoded_key = iter_.Key();
+      Row prev_key = current_index_key_;
       destination->Append(current_row_, current_pos_);
+      SeekNextDistinct(prev_encoded_key, prev_key);
+    } else {
+      if (ascending_) {
+        ++iter_;
+      } else {
+        --iter_;
+      }
     }
   }
   if (!iter_.IsValid()) {

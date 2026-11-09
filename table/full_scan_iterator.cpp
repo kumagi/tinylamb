@@ -685,10 +685,10 @@ void FullScanIterator::BuildTypedDecodePlan() {
     const bool keep = kept == nullptr ||
                       (kept_cursor < kept->size() && (*kept)[kept_cursor] == i);
     const ValueType type = schema.GetColumn(i).Type();
-    if (type != ValueType::kInt64 && type != ValueType::kDate &&
+    if (keep && type != ValueType::kInt64 && type != ValueType::kDate &&
         type != ValueType::kDouble && type != ValueType::kVarChar) {
       // ARRAY (and any future variable-shape type) has no cell payload; the
-      // caller falls back to the Row loop.
+      // caller falls back to the Row loop when projected.
       typed_keep_slots_.clear();
       return;
     }
@@ -704,10 +704,12 @@ void FullScanIterator::BuildTypedDecodePlan() {
       }
       ++kept_cursor;
     }
-    // The constant-offset prefix runs until the first VARCHAR payload: every
-    // earlier stored column (kept or skipped) serializes as exactly 8 bytes,
-    // so kept slots inside it read at schema-constant image offsets.
-    if (type == ValueType::kVarChar) {
+    // The constant-offset prefix runs until the first variable-width payload
+    // (VARCHAR or ARRAY): every earlier stored column (kept or skipped)
+    // serializes as exactly 8 bytes, so kept slots inside it read at
+    // schema-constant image offsets.
+    if (type != ValueType::kInt64 && type != ValueType::kDate &&
+        type != ValueType::kDouble) {
       variable_seen = true;
     } else if (!variable_seen) {
       typed_const_prefix_ = i + 1;

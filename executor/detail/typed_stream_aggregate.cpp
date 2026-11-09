@@ -5034,7 +5034,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                       continue;
                     }
                     cell_type = proj_types[col];
-                    cell = blk.columns[proj_to_full[col]].int_cells[r];
+                    if (cell_type == ValueType::kInt64 ||
+                        cell_type == ValueType::kDouble ||
+                        cell_type == ValueType::kDate) {
+                      cell = blk.columns[proj_to_full[col]].int_cells[r];
+                    }
                     cell_unsigned = proj_unsigned[col] != 0;
                     fallback_col = col;
                   } else {
@@ -5047,7 +5051,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     continue;
                   }
                   cell_type = proj_types[column];
-                  cell = blk.columns[proj_to_full[column]].int_cells[r];
+                  if (cell_type == ValueType::kInt64 ||
+                      cell_type == ValueType::kDouble ||
+                      cell_type == ValueType::kDate) {
+                    cell = blk.columns[proj_to_full[column]].int_cells[r];
+                  }
                   cell_unsigned = proj_unsigned[column] != 0;
                   fallback_col = column;
                 } else {
@@ -5332,11 +5340,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               iterator.GetStatus() != Status::kSuccess) {
             worker_errors[worker] = iterator.GetStatus();
           }
-          if (fill_cache) {
-            publish_morsel(morsel, &fill_buffer);
-          }
           if (worker_errors[worker] != Status::kSuccess) {
             break;
+          }
+          if (fill_cache) {
+            publish_morsel(morsel, &fill_buffer);
           }
           continue;
         }
@@ -5353,6 +5361,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if (worker_errors[worker] != Status::kSuccess) {
             break;
           }
+        }
+        if (worker_errors[worker] == Status::kSuccess &&
+            iterator.GetStatus() != Status::kSuccess) {
+          worker_errors[worker] = iterator.GetStatus();
+        }
+        if (worker_errors[worker] != Status::kSuccess) {
+          break;
         }
         if (fill_cache) {
           publish_morsel(morsel, &fill_buffer);

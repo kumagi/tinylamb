@@ -10,7 +10,7 @@
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -32,8 +32,9 @@ inline void StoreWordMask(ValidityBitmap* out_mask, size_t word_index,
   words[word_index] = word_mask & valid_mask;
 }
 
-inline void OrWordMask(ValidityBitmap* out_mask, size_t word_index,
-                       uint64_t word_mask, size_t valid_bits) {
+[[maybe_unused]] inline void OrWordMask(ValidityBitmap* out_mask,
+                                        size_t word_index, uint64_t word_mask,
+                                        size_t valid_bits) {
   auto& words = out_mask->Words();
   const uint64_t valid_mask = (uint64_t{1} << valid_bits) - 1;
   words[word_index] |= word_mask & valid_mask;
@@ -287,7 +288,7 @@ bool HasAvx2() {
   static const bool supported = __builtin_cpu_supports("avx2");
   return supported;
 }
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(__aarch64__)
 
 inline uint64_t PackNeonMask4(uint64x2_t cmp0, uint64x2_t cmp1) {
   static constexpr uint32_t kWeights[4] = {1U, 2U, 4U, 8U};
@@ -503,7 +504,7 @@ void SimdComparisonKernel::CompareInt64(const int64_t* data, size_t count,
     EvaluateScalarInt64Avx2(data, count, op, target, out_mask);
     return;
   }
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(__aarch64__)
   EvaluateScalarInt64Neon(data, count, op, target, out_mask);
   return;
 #endif
@@ -545,7 +546,7 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
     EvaluateScalarDoubleAvx2(data, count, op, target, out_mask);
     return;
   }
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(__aarch64__)
   EvaluateScalarDoubleNeon(data, count, op, target, out_mask);
   return;
 #endif
@@ -622,7 +623,7 @@ void SimdComparisonKernel::CompareInt64Vectors(const int64_t* lhs,
     EvaluateVectorInt64Avx2(lhs, rhs, count, op, out_mask);
     return;
   }
-#elif defined(__aarch64__) || defined(__ARM_NEON)
+#elif defined(__aarch64__)
   EvaluateVectorInt64Neon(lhs, rhs, count, op, out_mask);
   return;
 #endif

@@ -133,4 +133,18 @@ TEST(SqlAggregateFuzzer, ReplayCommittedRegressionFiles) {
   }
 }
 
+TEST(SqlAggregateFuzzer,
+     CrashSeedsFromTypedParallelStreamAggregateVarcharCount) {
+  const std::vector<std::vector<uint8_t>> crash_inputs = {
+      {236, 153, 18, 136, 137, 188, 196, 13, 45, 64, 247, 37, 250, 153, 236},
+      {215, 38, 167, 223, 166, 176, 217, 176},
+      {140, 12, 12, 12, 12, 12, 3, 174},
+      {234, 234, 234, 73, 234},
+      {2, 104, 47, 96, 72, 91, 202, 250, 2, 104},
+  };
+  for (const auto& bytes : crash_inputs) {
+    AggregateFuzzTry(bytes.data(), bytes.size(), false);
+  }
+}
+
 }  // namespace tinylamb

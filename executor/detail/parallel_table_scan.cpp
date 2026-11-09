@@ -776,9 +776,28 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       lstable_fast_loop_decides_all && has_ample_memory_budget;
   const auto materialize_lstable_row =
       [&](const LSTablePageBlock& blk,
-          const LSTableColumnBlock* const* proj_cols, size_t col_count,
-          uint32_t r, Row* out_row) {
+          const LSTableColumnBlock* const* proj_cols,
+          const int64_t* const* proj_int_ptrs, const ValueType* proj_types,
+          bool blk_fast_scalar, size_t col_count, uint32_t r, Row* out_row) {
+        if (col_count == 3) {
+          out_row->values_.reserve(4);
+        }
         out_row->values_.resize(col_count);
+        if (blk_fast_scalar) [[likely]] {
+          Value* const dst_base = out_row->values_.data();
+          for (size_t k = 0; k < col_count; ++k) {
+            Value& dst = dst_base[k];
+            const ValueType vt = proj_types[k];
+            dst.type = vt;
+            const int64_t raw = proj_int_ptrs[k][r];
+            if (vt == ValueType::kDouble) {
+              dst.value.double_value = std::bit_cast<double>(raw);
+            } else {
+              dst.value.int_value = raw;
+            }
+          }
+          return;
+        }
         for (size_t k = 0; k < col_count; ++k) {
           const LSTableColumnBlock& col =
               proj_cols != nullptr
@@ -827,7 +846,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     try {
       auto& local = shards[w];
       if (lstable_store != nullptr) {
-        local.rows.reserve(4096);
+        const size_t init_res = std::clamp<size_t>(
+            lstable_store->total_rows / (workers * 8), 4096, 65536);
+        local.rows.reserve(init_res);
         const auto* peek_ptr = integer_peeks.empty() ? nullptr : &integer_peeks;
         const size_t total_blocks = lstable_store->blocks.size();
         (void)lstable_blocks_per_morsel;
@@ -1066,15 +1087,35 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
             constexpr size_t kMaxFastProjCols = 16;
             std::array<const LSTableColumnBlock*, kMaxFastProjCols>
                 proj_cols_buf{};
+            std::array<const int64_t*, kMaxFastProjCols> proj_int_ptrs_buf{};
+            std::array<ValueType, kMaxFastProjCols> proj_types_buf{};
             const LSTableColumnBlock* const* proj_cols_ptr = nullptr;
+            const int64_t* const* proj_int_ptrs = nullptr;
+            const ValueType* proj_types_ptr = nullptr;
+            bool blk_fast_scalar = false;
             if (col_count <= kMaxFastProjCols) {
+              blk_fast_scalar = true;
               for (size_t k = 0; k < col_count; ++k) {
                 const slot_t col_idx = projection != nullptr
                                            ? (*projection)[k]
                                            : static_cast<slot_t>(k);
-                proj_cols_buf[k] = &blk->columns[col_idx];
+                const LSTableColumnBlock* cblk = &blk->columns[col_idx];
+                proj_cols_buf[k] = cblk;
+                proj_types_buf[k] = cblk->type;
+                if (cblk->has_null || cblk->is_unsigned ||
+                    (cblk->type != ValueType::kInt64 &&
+                     cblk->type != ValueType::kDate &&
+                     cblk->type != ValueType::kDouble)) {
+                  blk_fast_scalar = false;
+                } else {
+                  proj_int_ptrs_buf[k] = cblk->int_cells.data();
+                }
               }
               proj_cols_ptr = proj_cols_buf.data();
+              if (blk_fast_scalar) {
+                proj_int_ptrs = proj_int_ptrs_buf.data();
+                proj_types_ptr = proj_types_buf.data();
+              }
             }
             const LSTableColumnBlock* const rf_col =
                 (active_lstable_rf != nullptr && full_key_column.has_value())
@@ -1127,11 +1168,37 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               const uint32_t nrows = blk->row_count;
               for (uint32_t r = 0; r < nrows; ++r) {
                 Row& out_row = local.rows.emplace_back();
-                materialize_lstable_row(*blk, proj_cols_ptr, col_count, r,
-                                        &out_row);
+                materialize_lstable_row(*blk, proj_cols_ptr, proj_int_ptrs,
+                                        proj_types_ptr, blk_fast_scalar,
+                                        col_count, r, &out_row);
               }
               shard_seen[w] += nrows;
               shard_out[w] += nrows;
+              continue;
+            }
+            if (fast_in_memory_append && rf_col != nullptr && rf_has_dense &&
+                !rf_col_monotonic && !rf_col_has_null &&
+                fast_extra_rf_count == 0 && dict_all_pass && peek_all_pass &&
+                col_cmp_all_pass) {
+              const uint32_t nrows = blk->row_count;
+              const int64_t* const rf_cells = rf_col->int_cells.data();
+              const auto span_u =
+                  static_cast<uint64_t>(rf_hi) - static_cast<uint64_t>(rf_lo);
+              const auto lo_u = static_cast<uint64_t>(rf_lo);
+              uint32_t matched_in_blk = 0;
+              for (uint32_t r = 0; r < nrows; ++r) {
+                const uint64_t off = static_cast<uint64_t>(rf_cells[r]) - lo_u;
+                if (off <= span_u && (rf_dense_bits[off >> 6] &
+                                      (uint64_t{1} << (off & 63))) != 0) {
+                  Row& out_row = local.rows.emplace_back();
+                  materialize_lstable_row(*blk, proj_cols_ptr, proj_int_ptrs,
+                                          proj_types_ptr, blk_fast_scalar,
+                                          col_count, r, &out_row);
+                  ++matched_in_blk;
+                }
+              }
+              shard_seen[w] += matched_in_blk;
+              shard_out[w] += matched_in_blk;
               continue;
             }
             for (uint32_t r = 0; r < blk->row_count; ++r) {
@@ -1300,8 +1367,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               ++shard_seen[w];
               if (fast_in_memory_append) {
                 Row& out_row = local.rows.emplace_back();
-                materialize_lstable_row(*blk, proj_cols_ptr, col_count, r,
-                                        &out_row);
+                materialize_lstable_row(*blk, proj_cols_ptr, proj_int_ptrs,
+                                        proj_types_ptr, blk_fast_scalar,
+                                        col_count, r, &out_row);
                 ++shard_out[w];
                 continue;
               }
@@ -1312,13 +1380,16 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               }
               if (fully_decided && has_ample_memory_budget) {
                 Row& out_row = local.rows.emplace_back();
-                materialize_lstable_row(*blk, proj_cols_ptr, col_count, r,
-                                        &out_row);
+                materialize_lstable_row(*blk, proj_cols_ptr, proj_int_ptrs,
+                                        proj_types_ptr, blk_fast_scalar,
+                                        col_count, r, &out_row);
                 ++shard_out[w];
                 continue;
               }
               Row row;
-              materialize_lstable_row(*blk, proj_cols_ptr, col_count, r, &row);
+              materialize_lstable_row(*blk, proj_cols_ptr, proj_int_ptrs,
+                                      proj_types_ptr, blk_fast_scalar,
+                                      col_count, r, &row);
               bool matches = true;
               if (!fully_decided) {
                 if (worker_programs.complete) {
@@ -1469,13 +1540,14 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       total_in_memory += shards[w].rows.size();
     }
   }
-  if (worker_programs.complete) {
+  if (worker_programs.complete || !has_post_simple_filter) {
     bool can_parallel_merge = has_ample_memory_budget && workers > 1 &&
                               total_in_memory >= 16384 &&
                               result->rows.empty() && !result->HasSpill();
     if (can_parallel_merge) {
       for (size_t w = 0; w < workers; ++w) {
-        if (shards[w].HasSpill() || !deferred_rows[w].empty()) {
+        if (shards[w].HasSpill() ||
+            (w < deferred_rows.size() && !deferred_rows[w].empty())) {
           can_parallel_merge = false;
           break;
         }
@@ -1511,17 +1583,19 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       // Workers decided every row except the deferred ones; move results and
       // re-check the deferred rows with the contextful evaluator.
       for (size_t w = 0; w < workers; ++w) {
-        for (Row& row : deferred_rows[w]) {
-          Status deferred_error{Status::kSuccess};
-          if (MatchScanFilter(row, result_schema, *scan_filter, outer, context,
-                              ctes, &deferred_error)) {
-            result->AddRow(std::move(row));
+        if (w < deferred_rows.size()) {
+          for (Row& row : deferred_rows[w]) {
+            Status deferred_error{Status::kSuccess};
+            if (MatchScanFilter(row, result_schema, *scan_filter, outer,
+                                context, ctes, &deferred_error)) {
+              result->AddRow(std::move(row));
+            }
+            if (!deferred_error.ok() && error != nullptr && error->ok()) {
+              *error = std::move(deferred_error);
+            }
           }
-          if (!deferred_error.ok() && error != nullptr && error->ok()) {
-            *error = std::move(deferred_error);
-          }
+          deferred_rows[w].clear();
         }
-        deferred_rows[w].clear();
         record_error(shards[w].FinishSpill());
         if (!shards[w].HasSpill()) {
           result->MergeInMemoryShard(std::move(shards[w]));

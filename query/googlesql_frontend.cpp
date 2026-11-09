@@ -127,8 +127,6 @@ ParseShard& ShardFor(std::string_view sql) {
   return parse_shards[std::hash<std::string_view>{}(sql) % kParseCacheShards];
 }
 
-#if defined(TINYLAMB_OS_WINDOWS)
-
 std::filesystem::path ResolveGoogleSqlExecutable() {
   if (const char* env = std::getenv("TINYLAMB_GOOGLESQL_BIN");
       env != nullptr && *env != '\0') {
@@ -142,13 +140,25 @@ std::filesystem::path ResolveGoogleSqlExecutable() {
   const std::filesystem::path exe_dir =
       platform::CurrentExecutablePath().parent_path();
   if (!exe_dir.empty()) {
+#if defined(TINYLAMB_OS_WINDOWS)
     const std::filesystem::path sibling = exe_dir / "execute_query.exe";
+#else
+    const std::filesystem::path sibling = exe_dir / "execute_query";
+#endif
     if (std::filesystem::exists(sibling, ec)) {
       return sibling;
     }
   }
+#if !defined(TINYLAMB_OS_WINDOWS)
+  const std::filesystem::path tmp_shim("/tmp/tinylamb-execute-query");
+  if (std::filesystem::exists(tmp_shim, ec)) {
+    return tmp_shim;
+  }
+#endif
   return configured;
 }
+
+#if defined(TINYLAMB_OS_WINDOWS)
 
 GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   const std::filesystem::path exe_path = ResolveGoogleSqlExecutable();
@@ -374,7 +384,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
                                                        STDERR_FILENO);
         }
         if (spawn_err == 0) {
-          std::string arg0(TINYLAMB_GOOGLESQL_EXECUTABLE);
+          std::string arg0 = ResolveGoogleSqlExecutable().string();
           std::string arg1("--mode=parse");
           std::string arg2("-");
           std::array<char*, 4> argv = {arg0.data(), arg1.data(), arg2.data(),
@@ -382,9 +392,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
           posix_spawnattr_t attributes{};
           spawn_err = platform::InitSpawnAttributes(&attributes);
           if (spawn_err == 0) {
-            spawn_err =
-                posix_spawn(&child, TINYLAMB_GOOGLESQL_EXECUTABLE, &actions,
-                            &attributes, argv.data(), platform::Environment());
+            spawn_err = posix_spawn(&child, arg0.c_str(), &actions, &attributes,
+                                    argv.data(), platform::Environment());
             posix_spawnattr_destroy(&attributes);
           }
         }
@@ -409,13 +418,14 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
                 .error = "cannot start GoogleSQL: " + reason};
       }
       if (child == 0) {
+        const std::string resolved = ResolveGoogleSqlExecutable().string();
         dup2(input_pipe[0], STDIN_FILENO);
         dup2(output_pipe[1], STDOUT_FILENO);
         dup2(output_pipe[1], STDERR_FILENO);
         CloseAll(input_pipe);
         CloseAll(output_pipe);
-        execl(TINYLAMB_GOOGLESQL_EXECUTABLE, TINYLAMB_GOOGLESQL_EXECUTABLE,
-              "--mode=parse", "-", static_cast<char*>(nullptr));
+        execl(resolved.c_str(), resolved.c_str(), "--mode=parse", "-",
+              static_cast<char*>(nullptr));
         _exit(127);
       }
     }

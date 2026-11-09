@@ -777,12 +777,18 @@ StatusOr<Value> FormatFunction(const std::string& name,
     }
   }
   const std::string fmt = raw_str(arguments[0]);
+  constexpr int64_t kMaxFormatWidthOrPrecision = 1'000'000;
+  constexpr size_t kMaxFormatOutputBytes = 1'000'000;
   std::string result;
   size_t arg_idx = 1;
   for (size_t i = 0; i < fmt.size(); ++i) {
     if (fmt[i] == '%' && i + 1 < fmt.size()) {
       ++i;
       if (fmt[i] == '%') {
+        if (result.size() >= kMaxFormatOutputBytes) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT output exceeds maximum allowed size");
+        }
         result.push_back('%');
         continue;
       }
@@ -796,7 +802,7 @@ StatusOr<Value> FormatFunction(const std::string& name,
         zero_pad = true;
         ++i;
       }
-      int width = 0;
+      int64_t width = 0;
       if (i < fmt.size() && fmt[i] == '*') {
         if (arg_idx >= arguments.size()) {
           return StatusError(StatusCode::kInvalidArgument,
@@ -810,15 +816,27 @@ StatusOr<Value> FormatFunction(const std::string& name,
           return StatusError(StatusCode::kInvalidArgument,
                              "FORMAT: dynamic width must be an integer");
         }
-        width = static_cast<int>(width_arg.value.int_value);
+        if (width_arg.IsUnsigned()
+                ? static_cast<uint64_t>(width_arg.value.int_value) >
+                      static_cast<uint64_t>(kMaxFormatWidthOrPrecision)
+                : (width_arg.value.int_value < -kMaxFormatWidthOrPrecision ||
+                   width_arg.value.int_value > kMaxFormatWidthOrPrecision)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT: width exceeds maximum allowed size");
+        }
+        width = width_arg.value.int_value;
         ++i;
       }
       while (i < fmt.size() &&
              (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
         width = (width * 10) + (fmt[i] - '0');
+        if (width > kMaxFormatWidthOrPrecision) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT: width exceeds maximum allowed size");
+        }
         ++i;
       }
-      int precision = -1;
+      int64_t precision = -1;
       if (i < fmt.size() && fmt[i] == '.') {
         ++i;
         if (i < fmt.size() && fmt[i] == '*') {
@@ -835,14 +853,33 @@ StatusOr<Value> FormatFunction(const std::string& name,
             return StatusError(StatusCode::kInvalidArgument,
                                "FORMAT: dynamic precision must be an integer");
           }
-          precision = static_cast<int>(precision_arg.value.int_value);
+          if (precision_arg.IsUnsigned()
+                  ? static_cast<uint64_t>(precision_arg.value.int_value) >
+                        static_cast<uint64_t>(kMaxFormatWidthOrPrecision)
+                  : precision_arg.value.int_value >
+                        kMaxFormatWidthOrPrecision) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "FORMAT: precision exceeds maximum allowed size");
+          }
+          precision = precision_arg.value.int_value < 0
+                          ? -1
+                          : precision_arg.value.int_value;
           ++i;
         } else {
           precision = 0;
         }
         while (i < fmt.size() &&
                (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
+          if (precision < 0) {
+            precision = 0;
+          }
           precision = (precision * 10) + (fmt[i] - '0');
+          if (precision > kMaxFormatWidthOrPrecision) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "FORMAT: precision exceeds maximum allowed size");
+          }
           ++i;
         }
       }
@@ -927,8 +964,15 @@ StatusOr<Value> FormatFunction(const std::string& name,
             formatted_item = std::to_string(arg.value.int_value);
           }
         } else if (arg.type == ValueType::kDouble) {
-          formatted_item =
-              std::to_string(static_cast<int64_t>(arg.value.double_value));
+          const double d = arg.value.double_value;
+          if (!std::isfinite(d) ||
+              d < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+              d >= -static_cast<double>(std::numeric_limits<int64_t>::min())) {
+            return StatusError(
+                StatusCode::kInvalidArgument,
+                "FORMAT: float argument out of range for integer specifier");
+          }
+          formatted_item = std::to_string(static_cast<int64_t>(d));
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
@@ -938,20 +982,25 @@ StatusOr<Value> FormatFunction(const std::string& name,
         if (arg.IsNull()) {
           formatted_item = "NULL";
         } else if (arg.type == ValueType::kDouble) {
-          formatted_item =
-              FormatFloatingForPrintf(arg.value.double_value, spec, precision);
+          formatted_item = FormatFloatingForPrintf(arg.value.double_value, spec,
+                                                   static_cast<int>(precision));
         } else if (arg.type == ValueType::kInt64) {
           const double d = arg.IsUnsigned()
                                ? static_cast<double>(
                                      static_cast<uint64_t>(arg.value.int_value))
                                : static_cast<double>(arg.value.int_value);
-          formatted_item = FormatFloatingForPrintf(d, spec, precision);
+          formatted_item =
+              FormatFloatingForPrintf(d, spec, static_cast<int>(precision));
         } else {
           return StatusError(
               StatusCode::kInvalidArgument,
               "FORMAT: invalid argument type for float specifier");
         }
       } else {
+        if (result.size() + 2 > kMaxFormatOutputBytes) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "FORMAT output exceeds maximum allowed size");
+        }
         result.push_back('%');
         result.push_back(spec);
         continue;
@@ -977,8 +1026,16 @@ StatusOr<Value> FormatFunction(const std::string& name,
         char pad_char = zero_pad ? '0' : ' ';
         formatted_item.insert(0, pad_len, pad_char);
       }
+      if (result.size() + formatted_item.size() > kMaxFormatOutputBytes) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "FORMAT output exceeds maximum allowed size");
+      }
       result += formatted_item;
     } else {
+      if (result.size() >= kMaxFormatOutputBytes) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "FORMAT output exceeds maximum allowed size");
+      }
       result.push_back(fmt[i]);
     }
   }
@@ -2227,21 +2284,88 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // length / octet_length / byte_length stay byte-oriented.
     return Value(static_cast<int64_t>(input.size()));
   }
-  if (name == "instr" || name == "strpos") {
+  if (name == "strpos") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
-                         name + " requires 2 arguments");
+                         "STRPOS requires 2 arguments");
     }
     if (values[0].IsNull() || values[1].IsNull()) {
       return Value();
     }
     const std::string hay = raw_str(values[0]);
     const std::string needle = raw_str(values[1]);
+    if (needle.empty()) {
+      return Value(int64_t{1});
+    }
     const size_t pos = hay.find(needle);
     if (pos == std::string::npos) {
       return Value(int64_t{0});
     }
-    return Value(static_cast<int64_t>(pos + 1));
+    size_t code_points = 0;
+    for (size_t i = 0; i < pos; ++i) {
+      const auto byte = static_cast<unsigned char>(hay[i]);
+      if ((byte & 0xC0) != 0x80) {
+        ++code_points;
+      }
+    }
+    return Value(static_cast<int64_t>(code_points + 1));
+  }
+  if (name == "instr") {
+    if (values.size() < 2 || values.size() > 4) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "INSTR requires 2 to 4 arguments");
+    }
+    if (values[0].IsNull() || values[1].IsNull() ||
+        (values.size() >= 3 && values[2].IsNull()) ||
+        (values.size() == 4 && values[3].IsNull())) {
+      return Value();
+    }
+    const std::string source = raw_str(values[0]);
+    const std::string target = raw_str(values[1]);
+    const int64_t position = values.size() >= 3 ? to_i64(values[2], 1) : 1;
+    const int64_t occurrence = values.size() == 4 ? to_i64(values[3], 1) : 1;
+    if (position == 0 || occurrence <= 0) {
+      return Value(int64_t{0});
+    }
+    const auto s_offsets = utf8_offsets(source);
+    const size_t s_cps = s_offsets.size() > 1 ? s_offsets.size() - 1 : 0;
+    const auto t_offsets = utf8_offsets(target);
+    const size_t t_cps = t_offsets.size() > 1 ? t_offsets.size() - 1 : 0;
+    if (t_cps == 0) {
+      if (position > 0 && static_cast<size_t>(position) <= s_cps + 1) {
+        return Value(position);
+      }
+      return Value(int64_t{0});
+    }
+    std::vector<size_t> matches;
+    if (position > 0) {
+      auto start_cp = static_cast<size_t>(position - 1);
+      for (size_t cp = start_cp; cp + t_cps <= s_cps; ++cp) {
+        const size_t b_start = s_offsets[cp];
+        const size_t b_end = s_offsets[cp + t_cps];
+        if (source.substr(b_start, b_end - b_start) == target) {
+          matches.push_back(cp + 1);
+        }
+      }
+    } else {
+      const int64_t target_cp = static_cast<int64_t>(s_cps) + position;
+      if (target_cp >= 0) {
+        for (int64_t cp = target_cp; cp >= 0; --cp) {
+          if (static_cast<size_t>(cp) + t_cps <= s_cps) {
+            const size_t b_start = s_offsets[static_cast<size_t>(cp)];
+            const size_t b_end = s_offsets[static_cast<size_t>(cp) + t_cps];
+            if (source.substr(b_start, b_end - b_start) == target) {
+              matches.push_back(static_cast<size_t>(cp) + 1);
+            }
+          }
+        }
+      }
+    }
+    if (static_cast<size_t>(occurrence) <= matches.size()) {
+      return Value(
+          static_cast<int64_t>(matches[static_cast<size_t>(occurrence) - 1]));
+    }
+    return Value(int64_t{0});
   }
   if (name == "lpad" || name == "rpad") {
     if (values.size() < 2 || values.size() > 3) {
@@ -3783,15 +3907,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    const std::optional<int64_t> nanos =
+    const std::optional<__int128> nanos =
         ParseTimestampTextNanos(raw_str(values[0]));
     if (!nanos.has_value()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid TIMESTAMP: " + raw_str(values[0]));
     }
-    auto floor_div = [](int64_t a, int64_t b) {
-      const int64_t q = a / b;
-      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    auto floor_div = [](__int128 a, __int128 b) -> int64_t {
+      const __int128 q = a / b;
+      return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
+                                                                         : q);
     };
     if (name == "unix_date") {
       return Value(floor_div(*nanos, 86400000000000LL));
@@ -4146,8 +4271,19 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if ((step > 0 && begin > end) || (step < 0 && begin < end)) {
         return Value::Array({}, "INT64");
       }
-      std::vector<Value> elements;
       constexpr size_t kMaxGeneratedElements = 1'000'000;
+      const __int128 diff =
+          step > 0
+              ? (static_cast<__int128>(end) - static_cast<__int128>(begin))
+              : (static_cast<__int128>(begin) - static_cast<__int128>(end));
+      const __int128 abs_step =
+          step > 0 ? static_cast<__int128>(step) : -static_cast<__int128>(step);
+      if (abs_step > 0 &&
+          diff / abs_step >= static_cast<__int128>(kMaxGeneratedElements)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "GENERATE_SERIES generated too many elements");
+      }
+      std::vector<Value> elements;
       for (int64_t current = begin;;) {
         if (elements.size() == kMaxGeneratedElements) {
           return StatusError(StatusCode::kInvalidArgument,
@@ -5042,12 +5178,16 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
       return StatusError(StatusCode::kInvalidArgument,
                          "IFERROR requires 2 arguments");
     }
-    if (auto attempt =
-            args_[0]->TryEvaluate(left, left_schema, right, right_schema);
-        attempt.HasValue()) {
-      return attempt;
-    }
-    return args_[1]->TryEvaluate(left, left_schema, right, right_schema);
+    const bool as_double =
+        IfBranchesPromoteToDouble(args_, left_schema, right_schema, 0);
+    auto primary =
+        args_[0]->TryEvaluate(left, left_schema, right, right_schema);
+    ASSIGN_OR_RETURN(
+        Value, taken,
+        primary.HasValue()
+            ? std::move(primary)
+            : args_[1]->TryEvaluate(left, left_schema, right, right_schema));
+    return NormalizeIfBranch(std::move(taken), as_double);
   }
   if (func_name_ == "iserror") {
     if (args_.size() != 1) {

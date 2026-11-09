@@ -475,6 +475,10 @@ Status AggregateAccumulator::TryApplyCore(
     case AggregationType::kBitAnd:
     case AggregationType::kBitOr:
     case AggregationType::kBitXor: {
+      if (value.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "BIT aggregate requires an integer argument");
+      }
       const int64_t next = value.value.int_value;
       if (value.IsUnsigned()) {
         bit_is_uint64_ = true;
@@ -698,6 +702,20 @@ Status AggregateAccumulator::TryRecordQuantileParam(
     return StatusError(
         StatusCode::kInvalidArgument,
         "The second argument to APPROX_QUANTILES function must be an integer");
+  }
+  if (number.type == ValueType::kDouble) {
+    const double d = number.value.double_value;
+    if (std::isnan(d) || d < 1.0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "The second argument to APPROX_QUANTILES function must be positive");
+    }
+    if (d > 100000.0) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "The second argument to APPROX_QUANTILES function cannot be greater "
+          "than 100000");
+    }
   }
   const int64_t n = number.type == ValueType::kInt64
                         ? number.value.int_value

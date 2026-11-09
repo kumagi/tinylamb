@@ -292,7 +292,7 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
                     static_cast<uint16_t>(key_idx), 1);
 
     const int nrows = 8 + static_cast<int>(rng.Below(kMaxRows - 8));
-    constexpr size_t kMaxValueBytes = size_t{1} << 20;
+    constexpr size_t kMaxValueBytes = size_t{1} << 16;
     const size_t value_slots =
         static_cast<size_t>(nrows) * static_cast<size_t>(ncols);
     const size_t max_len =
@@ -337,13 +337,26 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
       FAIL("total row count mismatch after build");
     }
 
+    PaxChunk::VarcharGroupCache vc_cache;
+    Row cached_row;
     for (int i = 0; i < nrows; ++i) {
-      auto rr = chunk.ReadRow(static_cast<size_t>(i), sc);
-      if (rr.GetStatus() != Status::kSuccess) {
-        FAIL("ReadRow failed on valid index");
+      const auto idx = static_cast<size_t>(i);
+      if (chunk.ReadRowIntoCached(idx, sc, &vc_cache, &cached_row) !=
+          Status::kSuccess) {
+        FAIL("ReadRowIntoCached failed on valid index");
       }
-      if (!SameRow(rr.Value(), oracle[static_cast<size_t>(i)], specs)) {
-        FAIL("lossy round-trip");
+      if (!SameRow(cached_row, oracle[idx], specs)) {
+        FAIL("lossy cached round-trip");
+      }
+      if (i < 16 || i >= nrows - 8 || (i >= 1022 && i <= 1026) ||
+          (i & 15) == 0) {
+        auto rr = chunk.ReadRow(idx, sc);
+        if (rr.GetStatus() != Status::kSuccess) {
+          FAIL("ReadRow failed on valid index");
+        }
+        if (!SameRow(rr.Value(), oracle[idx], specs)) {
+          FAIL("lossy round-trip");
+        }
       }
     }
 

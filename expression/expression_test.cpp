@@ -2599,4 +2599,86 @@ TEST(ExpressionTest, CastExpression_ValidationAndSafeCast) {
       safe_cast_overflow_str_f32->Evaluate(dummy_row, dummy_schema).IsNull());
 }
 
+TEST(ExpressionTest,
+     AggregateExpressionToStringIncludesFilterAndSecondaryArgument) {
+  auto filtered_count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("x"), false);
+  filtered_count->SetWhereFilter(
+      BinaryExpressionExp(ColumnValueExp("x"), BinaryOperation::kGreaterThan,
+                          ConstantValueExp(Value(int64_t{0}))));
+  Expression unfiltered_count =
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("x"));
+  EXPECT_NE(filtered_count->ToString(), unfiltered_count->ToString());
+  EXPECT_EQ(filtered_count->ToString(), "COUNT(x WHERE (x > 0))");
+}
+
+TEST(ExpressionTest, CastStringWithHyphensToBytesPreservesRawBytes) {
+  Row dummy_row;
+  Schema dummy_schema;
+  auto cast_date_str =
+      CastExpressionExp(ConstantValueExp(Value("2026-01-02")), "BYTES", false);
+  Value date_bytes = cast_date_str->Evaluate(dummy_row, dummy_schema);
+  ASSERT_EQ(date_bytes.type, ValueType::kVarChar);
+  EXPECT_EQ(std::string(date_bytes.value.varchar_value), "2026-01-02");
+
+  auto cast_uuid_str = CastExpressionExp(
+      ConstantValueExp(Value("550e8400-e29b-41d4-a716-446655440000")), "BYTES",
+      false);
+  Value uuid_bytes = cast_uuid_str->Evaluate(dummy_row, dummy_schema);
+  ASSERT_EQ(uuid_bytes.type, ValueType::kVarChar);
+  EXPECT_EQ(std::string(uuid_bytes.value.varchar_value),
+            "550e8400-e29b-41d4-a716-446655440000");
+}
+
+TEST(ExpressionTest, StrposAndInstrUseUtf8CodePointPositionsInAstEvaluation) {
+  Row dummy_row;
+  Schema dummy_schema;
+  // "あいう" is 3 UTF-8 code points (9 bytes). "い" is at code point 2, "う"
+  // at 3.
+  auto strpos_expr = FunctionCallExp(
+      "strpos",
+      {ConstantValueExp(Value("あいう")), ConstantValueExp(Value("う"))});
+  Value strpos_val = strpos_expr->Evaluate(dummy_row, dummy_schema);
+  EXPECT_EQ(strpos_val, Value(int64_t{3}));
+
+  auto instr_expr =
+      FunctionCallExp("instr", {ConstantValueExp(Value("あいうあい")),
+                                ConstantValueExp(Value("い")),
+                                ConstantValueExp(Value(int64_t{1})),
+                                ConstantValueExp(Value(int64_t{2}))});
+  Value instr_val = instr_expr->Evaluate(dummy_row, dummy_schema);
+  EXPECT_EQ(instr_val, Value(int64_t{5}));
+}
+
+TEST(ExpressionTest, UnixTimestampsBefore1677AndAfter2262DoNotWrapInt64Nanos) {
+  Row dummy_row;
+  Schema dummy_schema;
+  auto pre_1677 = FunctionCallExp(
+      "unix_seconds", {ConstantValueExp(Value("0001-01-01 00:00:00+00"))});
+  Value pre_val = pre_1677->Evaluate(dummy_row, dummy_schema);
+  EXPECT_EQ(pre_val, Value(int64_t{-62135596800LL}));
+
+  auto post_2262 = FunctionCallExp(
+      "unix_seconds", {ConstantValueExp(Value("9999-12-31 23:59:59+00"))});
+  Value post_val = post_2262->Evaluate(dummy_row, dummy_schema);
+  EXPECT_EQ(post_val, Value(int64_t{253402300799LL}));
+}
+
+TEST(ExpressionTest, IferrorJoinContextOverloadNormalizesBranchesToDouble) {
+  Row empty_row;
+  Schema empty_schema;
+  auto iferror_expr = FunctionCallExp(
+      "iferror",
+      {ConstantValueExp(Value(int64_t{42})), ConstantValueExp(Value(1.5))});
+  StatusOr<Value> single_eval =
+      iferror_expr->TryEvaluate(empty_row, empty_schema);
+  StatusOr<Value> join_eval = iferror_expr->TryEvaluate(
+      &empty_row, empty_schema, &empty_row, empty_schema);
+  ASSERT_TRUE(single_eval.HasValue());
+  ASSERT_TRUE(join_eval.HasValue());
+  EXPECT_EQ(single_eval.Value().type, ValueType::kDouble);
+  EXPECT_EQ(join_eval.Value().type, ValueType::kDouble);
+  EXPECT_EQ(single_eval.Value(), join_eval.Value());
+}
+
 }  // namespace tinylamb

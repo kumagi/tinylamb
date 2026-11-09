@@ -724,11 +724,67 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
     result->SetDistinctOn(std::move(d_on));
   }
   result->SetWithTies(select.WithTies());
+  for (size_t branch_index = 0; branch_index < select.UnionAll().size();
+       ++branch_index) {
+    const SetOperationKind kind =
+        branch_index < select.SetOperationKinds().size()
+            ? select.SetOperationKinds()[branch_index]
+            : SetOperationKind::kUnionAll;
+    const SetOperationMatch match = branch_index < select.Matches().size()
+                                        ? select.Matches()[branch_index]
+                                        : SetOperationMatch{};
+    result->AddSetOperation(
+        kind, SubstituteInSelect(*select.UnionAll()[branch_index], bindings),
+        match);
+  }
+  if (const auto& source_tree = select.GetSetOperationTree();
+      source_tree != nullptr) {
+    auto tree = std::make_shared<SetOperationTree>();
+    tree->kinds = source_tree->kinds;
+    tree->grouped = source_tree->grouped;
+    bool shares_branches =
+        source_tree->first != nullptr && !select.UnionAll().empty() &&
+        source_tree->branches.size() == select.UnionAll().size();
+    for (size_t i = 0; shares_branches && i < source_tree->branches.size();
+         ++i) {
+      shares_branches =
+          source_tree->branches[i].get() == select.UnionAll()[i].get();
+    }
+    if (shares_branches) {
+      tree->first = SubstituteInSelect(*source_tree->first, bindings);
+      tree->branches = result->UnionAll();
+    } else {
+      if (source_tree->first != nullptr) {
+        tree->first = SubstituteInSelect(*source_tree->first, bindings);
+      }
+      tree->branches.reserve(source_tree->branches.size());
+      for (const auto& branch : source_tree->branches) {
+        tree->branches.push_back(branch ? SubstituteInSelect(*branch, bindings)
+                                        : nullptr);
+      }
+    }
+    result->SetSetOperationTree(std::move(tree));
+  }
+  if (select.UnionDistinct()) {
+    result->MarkUnionDistinct(select.UnionByName());
+  }
   for (const auto& [name, query] : select.WithQueries()) {
-    result->AddWithQuery(name, SubstituteInSelect(*query, bindings));
+    auto bound_query = SubstituteInSelect(*query, bindings);
+    if (select.IsRecursiveWith(name)) {
+      result->AddRecursiveWithQuery(name, std::move(bound_query));
+      if (const RecursiveDepthSpec* depth = select.RecursiveDepthOf(name);
+          depth != nullptr) {
+        result->SetRecursiveDepth(name, *depth);
+      }
+    } else {
+      result->AddWithQuery(name, std::move(bound_query));
+    }
   }
   if (select.RequiresRelationalEvaluation()) {
     result->MarkComplex();
+  }
+  if (select.ForUpdate()) {
+    result->SetForUpdate(true);
   }
   result->SetAsStruct(select.AsStruct());
   return result;
@@ -3240,13 +3296,25 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
       }
     } else {
       try {
-        tz_hours = std::stoi(tz_part);
+        if (tz_part.size() >= 4 &&
+            std::isdigit(static_cast<unsigned char>(tz_part[0])) != 0 &&
+            std::isdigit(static_cast<unsigned char>(tz_part[1])) != 0 &&
+            std::isdigit(static_cast<unsigned char>(tz_part[2])) != 0 &&
+            std::isdigit(static_cast<unsigned char>(tz_part[3])) != 0) {
+          tz_hours = std::stoi(tz_part.substr(0, 2));
+          tz_mins = std::stoi(tz_part.substr(2, 2));
+        } else {
+          tz_hours = std::stoi(tz_part);
+        }
       } catch (...) {
         tz_hours = 0;
         tz_mins = 0;
       }
     }
     total_offset_mins = (tz_hours * 60 + tz_mins) * (sign == '-' ? -1 : 1);
+  }
+  if (base_time.size() > 10 && (base_time[10] == 'T' || base_time[10] == 't')) {
+    base_time[10] = ' ';
   }
   bool is_leap_sec = false;
   if (base_time.find(":59:60") != std::string::npos) {
@@ -4521,6 +4589,9 @@ StatusOr<Expression> VisitExpression(
                 field.text = std::to_string(v.value.int_value);
               } else if (v.type == ValueType::kDouble) {
                 field.text = FormatDoubleShortest(v.value.double_value);
+              } else if (v.type == ValueType::kDate) {
+                field.text = v.AsString();
+                field.is_string = true;
               } else {
                 field.text = v.AsString();
               }
@@ -5493,7 +5564,8 @@ Status AppendSources(
     // cross product, so reject until the shared columns can be resolved.
     return AstStatus("GoogleSQL AST: unsupported NATURAL join");
   }
-  AppendSources(*operands[0], incoming, std::move(condition), sources);
+  RETURN_IF_FAIL(
+      AppendSources(*operands[0], incoming, std::move(condition), sources));
   JoinType type = JoinType::kInner;
   if (node.detail == "COMMA") {
     type = JoinType::kCross;

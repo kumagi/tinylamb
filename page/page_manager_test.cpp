@@ -115,5 +115,37 @@ TEST_F(PageManagerTest, ExclusiveFileLockRejectsConcurrentOpen) {
   EXPECT_EQ(second.GetStatus(), Status::kConflicts);
 }
 
+TEST_F(PageManagerTest,
+       WriteFuzzyCheckpointAtomicRenamePreservesExclusiveLockAndData) {
+  Transaction txn = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                        pm_->AllocateNewPage(txn, PageType::kRowPage));
+  const page_id_t pid = page->PageID();
+  ASSIGN_OR_ASSERT_FAIL(slot_t, slot, page->Insert(txn, "checkpoint_payload"));
+  page.PageUnlock();
+  ASSERT_SUCCESS(txn.PreCommit());
+
+  ASSERT_SUCCESS(pm_->WriteFuzzyCheckpoint(42));
+  EXPECT_FALSE(std::filesystem::exists(prefix_ + ".db.tmp"));
+
+  // After atomic tmp+rename replacement, the new inode must still hold an
+  // exclusive flock so concurrent opens fail with Status::kConflicts.
+  StatusOr<std::unique_ptr<PageManager>> second =
+      PageManager::Create(prefix_ + ".db", 64, false);
+  EXPECT_EQ(second.GetStatus(), Status::kConflicts);
+
+  pm_->DropAllPages();
+  lsn_t replay_start = 0;
+  ASSERT_SUCCESS(pm_->LoadFuzzyCheckpoint(&replay_start));
+  EXPECT_EQ(replay_start, 42U);
+
+  Transaction verify = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(PageRef, loaded, pm_->GetPage(pid));
+  ASSIGN_OR_ASSERT_FAIL(std::string_view, row, loaded->Read(verify, slot));
+  EXPECT_EQ(row, "checkpoint_payload");
+  loaded.PageUnlock();
+  ASSERT_SUCCESS(verify.PreCommit());
+}
+
 }  // namespace
 }  // namespace tinylamb

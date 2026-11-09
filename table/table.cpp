@@ -77,15 +77,45 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
                           idx.mode_);
   }
 
+  std::map<std::string, std::vector<IndexValueType>> grouped_multi;
   Iterator it = BeginFullScan(txn);
   while (it.IsValid()) {
-    Status status = IndexInsert(txn, indexes_.back(), *it, it.Position());
+    const Row row = *it;
+    const bool key_has_null = std::ranges::any_of(
+        indexes_.back().sc_.key_,
+        [&row](const slot_t key_column) { return row[key_column].IsNull(); });
+    if (!indexes_.back().IsUnique() || key_has_null) {
+      std::vector<Value> include_values;
+      include_values.reserve(indexes_.back().sc_.include_.size());
+      for (const slot_t& i : indexes_.back().sc_.include_) {
+        include_values.push_back(row[i]);
+      }
+      grouped_multi[indexes_.back().GenerateKey(row)].push_back(
+          IndexValueType{it.Position(), Row(std::move(include_values))});
+      ++it;
+      continue;
+    }
+    Status status = IndexInsert(txn, indexes_.back(), row, it.Position());
     if (status != Status::kSuccess) {
       indexes_.pop_back();
       std::ignore = LsmIndex(root_pid).Destroy(txn);
       return status;
     }
     ++it;
+  }
+  if (!grouped_multi.empty()) {
+    auto index_write_guard = txn.AcquireIndexWriteGuard(root_pid);
+    BPlusTree bpt(root_pid);
+    page_id_t cursor = 0;
+    for (const auto& [key, rps] : grouped_multi) {
+      Status status = bpt.Insert(txn, key, Encode(rps), &cursor);
+      if (status != Status::kSuccess) {
+        index_write_guard.unlock();
+        indexes_.pop_back();
+        std::ignore = LsmIndex(root_pid).Destroy(txn);
+        return status;
+      }
+    }
   }
   return Status::kSuccess;
 }
@@ -532,12 +562,14 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // Phase2-3: serialize the pre-update image once, on first use, instead of
   // rebuilding it for every compensation attempt.
   std::string original_image;
-  const auto restore_physical_row = [&]() -> Status {
+  const auto restore_physical_row = [&](const RowPosition& target_pos,
+                                        bool target_was_inserted) -> Status {
     if (original_image.empty()) {
       original_image.resize(original_row.Size());
       std::ignore = original_row.Serialize(original_image.data());
     }
-    StatusOr<PageRef> written = txn.GetPageManager()->GetPage(pos.page_id);
+    StatusOr<PageRef> written =
+        txn.GetPageManager()->GetPage(target_pos.page_id);
     if (written.GetStatus() != Status::kSuccess) {
       txn.MarkFailed();
       return written.GetStatus();
@@ -549,7 +581,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     StatusOr<lsn_t> compensation_end =
         written.Value()->body.row_page.RestorePhysicalUpdate(
-            pos.page_id, txn, pos.slot, original_image);
+            target_pos.page_id, txn, target_pos.slot, original_image);
     if (compensation_end.GetStatus() != Status::kSuccess) {
       txn.MarkFailed();
       return compensation_end.GetStatus();
@@ -557,7 +589,11 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     written.Value()->SetPageLSN(compensation_end.Value());
     written.Value()->SetRecLSN(txn.PrevLSN());
     try {
-      txn.RegisterVersionWrite(pos, original_image, original_image);
+      txn.RegisterVersionWrite(
+          target_pos,
+          target_was_inserted ? std::optional<std::string_view>(std::nullopt)
+                              : std::optional<std::string_view>(original_image),
+          original_image);
     } catch (...) {
       txn.MarkFailed();
       return Status::kRuntimeError;
@@ -587,7 +623,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
     if (deleted < indexes_.size()) {
       reinstate_old_keys(deleted, pos);
-      const Status restore_status = restore_physical_row();
+      const Status restore_status =
+          restore_physical_row(pos, /*target_was_inserted=*/false);
       return contextualize(
           restore_status == Status::kSuccess ? failure : restore_status,
           "in-place index update");
@@ -605,7 +642,8 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
       // reinstate every original key, and rewrite the original row image.
       undo_index_inserts(inserted);
       reinstate_old_keys(indexes_.size(), pos);
-      const Status restore_status = restore_physical_row();
+      const Status restore_status =
+          restore_physical_row(pos, /*target_was_inserted=*/false);
       return contextualize(
           restore_status == Status::kSuccess ? failure : restore_status,
           "in-place index update");
@@ -787,11 +825,16 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     }
   }
   if (inserted < indexes_.size()) {
-    // The row lives at new_pos now; undo the partial inserts and repoint the
-    // original keys at the relocated position.
+    // The row lives at new_pos now; undo the partial inserts, restore the
+    // original row image at new_pos, and repoint the original keys at the
+    // relocated position.
     undo_index_inserts(inserted);
+    const Status restore_status =
+        restore_physical_row(new_pos, /*target_was_inserted=*/true);
     reinstate_old_keys(indexes_.size(), new_pos);
-    return contextualize(failure, "relocation index update");
+    return contextualize(
+        restore_status == Status::kSuccess ? failure : restore_status,
+        "relocation index update");
   }
   return new_pos;
 }

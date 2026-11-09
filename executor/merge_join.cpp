@@ -126,13 +126,19 @@ void MergeJoin::Materialize() {
       left_positions_.push_back(batch.PositionAt(i));
     }
   }
-  FailWithChildOf(*left_);
+  if (FailWithChildOf(*left_)) {
+    output_.clear();
+    return;
+  }
   while (right_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_rows_.push_back(batch.RowAt(i));
     }
   }
-  FailWithChildOf(*right_);
+  if (FailWithChildOf(*right_)) {
+    output_.clear();
+    return;
+  }
 
   if (left_width_ == 0 && !left_rows_.empty()) {
     left_width_ = left_rows_.front().values_.size();
@@ -322,6 +328,9 @@ size_t MergeJoin::NextBatch(DataChunk* destination, size_t max_rows) {
     return 0;
   }
   Materialize();
+  if (GetStatus() != Status::kSuccess) {
+    return 0;
+  }
   if (residual_error_ != Status::kSuccess) {
     FailWith(residual_error_);
     return 0;

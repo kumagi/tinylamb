@@ -3690,6 +3690,58 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     return rewrite_status;
   }
   RETURN_IF_FAIL(rewrite_status);
+  {
+    // Whole-row table references (e.g. `SELECT r, rs FROM rs GROUP BY ...`)
+    // rewrite inside `core.Rewrite(ctx)` to `__struct_json__(...)` function
+    // calls. Flatten any composite expression in `core.select_` into its
+    // constituent `ColumnValue`s so the core plan projects every underlying
+    // table column with its qualified schema name for `GroupedFinishExecutor`.
+    std::vector<NamedExpression> flat_core_select;
+    flat_core_select.reserve(core.select_.size());
+    auto push_unique_col = [&](const ColumnName& col) {
+      if (col.name == "*" || col.name.empty()) {
+        return;
+      }
+      const bool already =
+          std::ranges::any_of(flat_core_select, [&](const NamedExpression& e) {
+            return e.expression &&
+                   e.expression->Type() == TypeTag::kColumnValue &&
+                   e.expression->AsColumnValue().GetColumnName() == col;
+          });
+      if (!already) {
+        flat_core_select.emplace_back("", ColumnValueExp(col));
+      }
+    };
+    for (const NamedExpression& item : core.select_) {
+      if (!item.expression) {
+        continue;
+      }
+      if (item.expression->Type() == TypeTag::kColumnValue) {
+        push_unique_col(item.expression->AsColumnValue().GetColumnName());
+      } else if (item.expression->Type() == TypeTag::kConstantValue) {
+        flat_core_select.push_back(item);
+      } else {
+        const std::function<void(const Expression&)> collect_in_order =
+            [&](const Expression& expr) {
+              if (!expr) {
+                return;
+              }
+              if (expr->Type() == TypeTag::kColumnValue) {
+                push_unique_col(expr->AsColumnValue().GetColumnName());
+                return;
+              }
+              for (const Expression& child : ExpressionChildren(expr)) {
+                collect_in_order(child);
+              }
+            };
+        collect_in_order(item.expression);
+      }
+    }
+    if (flat_core_select.empty()) {
+      flat_core_select.emplace_back("", ConstantValueExp(Value(true)));
+    }
+    core.select_ = std::move(flat_core_select);
+  }
   auto statement = std::make_shared<SelectStatement>(select);
   std::vector<Column> output_columns;
   output_columns.reserve(result_column_names_.size());
@@ -3726,6 +3778,84 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     const char* route = std::getenv("TINYLAMB_GROUPED_ROUTE");
     return route == nullptr || std::string_view(route) != "cascades";
   }();
+  // Bare non-grouped columns outside aggregates evaluate against the group
+  // representative row, whose identity is not stable across access-path
+  // choices (e.g. IndexScan vs FullScan). Route such queries through the
+  // relational grouping pipeline even under TINYLAMB_GROUPED_ROUTE=cascades.
+  const bool depends_on_representative_row = [&]() {
+    if (grouped_route_relational) {
+      return false;
+    }
+    const auto resolve_col = [&](const ColumnName& col) -> ColumnName {
+      if (!col.schema.empty()) {
+        return ColumnName(AsciiToLower(col.schema), AsciiToLower(col.name));
+      }
+      for (const NamedExpression& item : core.select_) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const ColumnName& cand =
+            item.expression->AsColumnValue().GetColumnName();
+        if (IdentifierEquals(cand.name, col.name)) {
+          return ColumnName(AsciiToLower(cand.schema), AsciiToLower(cand.name));
+        }
+      }
+      return ColumnName("", AsciiToLower(col.name));
+    };
+    std::unordered_set<ColumnName> grouped_columns;
+    std::unordered_set<std::string> grouped_expr_strings;
+    if (!select.IsGroupAll()) {
+      for (const Expression& g : select.GroupBy()) {
+        const Expression resolved_g = substitute_aliases(g);
+        if (!resolved_g) {
+          continue;
+        }
+        grouped_expr_strings.insert(resolved_g->ToString());
+        if (resolved_g->Type() == TypeTag::kColumnValue) {
+          grouped_columns.insert(
+              resolve_col(resolved_g->AsColumnValue().GetColumnName()));
+        }
+      }
+    }
+    const std::function<bool(const Expression&)> has_ungrouped_column =
+        [&](const Expression& expr) -> bool {
+      if (!expr || expr->Type() == TypeTag::kAggregateExp ||
+          expr->Type() == TypeTag::kQueryExp) {
+        return false;
+      }
+      if (grouped_expr_strings.contains(expr->ToString())) {
+        return false;
+      }
+      if (expr->Type() == TypeTag::kColumnValue) {
+        const ColumnName& col = expr->AsColumnValue().GetColumnName();
+        if (col.name == "*" || col.name.empty()) {
+          return false;
+        }
+        return !grouped_columns.contains(resolve_col(col));
+      }
+      for (const Expression& child : ExpressionChildren(expr)) {
+        if (has_ungrouped_column(child)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    for (const NamedExpression& item : select.SelectList()) {
+      if (has_ungrouped_column(item.expression)) {
+        return true;
+      }
+    }
+    if (has_ungrouped_column(substitute_aliases(select.Having()))) {
+      return true;
+    }
+    for (const auto& term : select.OrderBy()) {
+      if (has_ungrouped_column(substitute_aliases(term.expression))) {
+        return true;
+      }
+    }
+    return false;
+  }();
   auto emit_relational = [&]() -> StatusOr<Executor> {
     StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
         statement, Schema("", output_columns), ctx);
@@ -3742,7 +3872,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     Executor executor = relational_plan->EmitExecutor(ctx);
     return WithPlanExplain(std::move(executor), std::move(relational_plan));
   };
-  if (grouped_route_relational) {
+  if (grouped_route_relational || depends_on_representative_row) {
     StatusOr<Executor> relational_executor = emit_relational();
     if (relational_executor.HasValue()) {
       return relational_executor.MoveValue();
@@ -6190,6 +6320,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         bool skip_scan = false;
         if (index_only != nullptr && scan_table != nullptr &&
             !index_only->GetIndex().RetainsDeletedEntries() &&
+            !ctx.txn_.IndexKeysMayBeStale(index_only->GetIndex().Root()) &&
             index_only->GetIndex().sc_.key_.size() == 1 &&
             index_only->BeginKey().empty() && index_only->EndKey().empty() &&
             distinct_items.size() == 1 && distinct_items[0].expression &&

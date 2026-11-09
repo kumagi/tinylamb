@@ -1273,6 +1273,11 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
             if (val.IsNull()) {
               break;
             }
+            if (val.type != ValueType::kInt64) {
+              return FailWith(
+                  StatusError(StatusCode::kInvalidArgument,
+                              "BIT aggregate requires an integer argument"));
+            }
             const int64_t v = val.value.int_value;
             int64_t& cur = results[i].value.int_value;
             if (results[i].IsNull()) {

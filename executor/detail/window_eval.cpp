@@ -1149,9 +1149,27 @@ struct WindowRuntime {
                                            .schema = schema,
                                            .outer = outer}),
                                     nullptr, context, *ctes)));
-      const int64_t num = n_value.value.int_value;
-      if (num <= 0) {
-        return Value();
+      if (n_value.IsNull()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Null number of quantiles is not supported");
+      }
+      int64_t num = -1;
+      if (n_value.type == ValueType::kInt64) {
+        num = n_value.value.int_value;
+      } else if (n_value.type == ValueType::kDouble) {
+        const double d = n_value.value.double_value;
+        if (std::isnan(d) || d < 1.0 || d > 100000.0) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "Invalid number of quantiles");
+        }
+        num = static_cast<int64_t>(d);
+      } else {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "APPROX_QUANTILES requires an integer count");
+      }
+      if (num <= 0 || num > 100000) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "Invalid number of quantiles");
       }
       std::vector<Value> sorted = non_null;
       std::sort(sorted.begin(), sorted.end(),
@@ -1189,8 +1207,26 @@ struct WindowRuntime {
                                                .schema = schema,
                                                .outer = outer}),
                                         nullptr, context, *ctes)));
-          if (!n_value.IsNull()) {
+          if (n_value.IsNull()) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "Null top-k count is not supported");
+          }
+          if (n_value.type == ValueType::kInt64) {
             k = n_value.value.int_value;
+          } else if (n_value.type == ValueType::kDouble) {
+            const double d = n_value.value.double_value;
+            if (std::isnan(d) || d < 1.0 || d > 100000.0) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "Invalid top-k count");
+            }
+            k = static_cast<int64_t>(d);
+          } else {
+            return StatusError(StatusCode::kInvalidArgument,
+                               fn + " requires an integer count");
+          }
+          if (k <= 0 || k > 100000) {
+            return StatusError(StatusCode::kInvalidArgument,
+                               "Invalid top-k count");
           }
         }
       }
@@ -1312,9 +1348,13 @@ struct WindowRuntime {
     if (fn == "SUM" || fn == "AVG") {
       bool any_double = false;
       for (const Value& value : non_null) {
+        if (value.type != ValueType::kInt64 &&
+            value.type != ValueType::kDouble) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             fn + " requires a numeric argument");
+        }
         if (value.type == ValueType::kDouble) {
           any_double = true;
-          break;
         }
       }
       if (any_double) {
@@ -1419,6 +1459,12 @@ struct WindowRuntime {
       return Value(static_cast<int64_t>(0));
     }
     if (fn == "BIT_AND" || fn == "BIT_OR" || fn == "BIT_XOR") {
+      for (const Value& value : non_null) {
+        if (value.type != ValueType::kInt64) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             fn + " requires an integer argument");
+        }
+      }
       int64_t acc = non_null[0].value.int_value;
       for (size_t i = 1; i < non_null.size(); ++i) {
         const int64_t next = non_null[i].value.int_value;

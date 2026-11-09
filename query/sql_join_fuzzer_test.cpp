@@ -144,6 +144,48 @@ TEST(SqlJoinFuzzer, SixAggregateFusedJoinAndCrashSeedsRegression) {
   }
 }
 
+TEST(SqlJoinFuzzer, SpillNullAwareAntiAndNonEquiRightFullJoinRegression) {
+  JoinTrace trace;
+  trace.setup = {
+      "CREATE TABLE fact (u INT64, k INT64, a INT64);",
+      "CREATE TABLE dim (k INT64, tag VARCHAR(8));",
+      "INSERT INTO fact VALUES (0, 1, 10);",
+      "INSERT INTO fact VALUES (1, 2, -2);",
+      "INSERT INTO fact VALUES (2, 1, 0);",
+      "INSERT INTO fact VALUES (3, 2, -1);",
+      "INSERT INTO fact VALUES (4, 9, 3);",
+      "INSERT INTO fact VALUES (5, 1, 5);",
+      "INSERT INTO fact VALUES (6, NULL, 7);",
+      "INSERT INTO fact VALUES (7, 2, -4);",
+      "INSERT INTO fact VALUES (8, 1, 1);",
+      "INSERT INTO fact VALUES (9, 2, 2);",
+      "INSERT INTO dim VALUES (1, 'a');",
+      "INSERT INTO dim VALUES (2, 'b');",
+      "INSERT INTO dim VALUES (3, 'c');",
+      "INSERT INTO dim VALUES (1, 'd');",
+      "INSERT INTO dim VALUES (2, 'e');",
+      "INSERT INTO dim VALUES (3, 'f');",
+      "INSERT INTO dim VALUES (1, 'g');",
+      "INSERT INTO dim VALUES (2, 'h');",
+      "INSERT INTO dim VALUES (100, 'z');",
+      "INSERT INTO dim VALUES (NULL, 'n');",
+  };
+  trace.queries = {
+      {"SELECT f.u FROM fact f WHERE f.k NOT IN"
+       " (SELECT k FROM dim WHERE k IS NOT NULL) ORDER BY f.u;",
+       {"|4|,"}},
+      {"SELECT COUNT(*), COUNT(f.u), COUNT(d2.tag)"
+       " FROM fact f RIGHT JOIN dim d ON f.k = d.k"
+       " RIGHT JOIN dim d2 ON f.a >= d2.k;",
+       {"|77|,|75|,|77|,"}},
+      {"SELECT COUNT(*), COUNT(f.u), COUNT(d2.tag)"
+       " FROM fact f LEFT JOIN dim d ON f.k = d.k"
+       " FULL JOIN dim d2 ON d.k <> d2.k;",
+       {"|147|,|146|,|145|,"}},
+  };
+  EXPECT_EQ(ReplayJoinTrace(trace), "");
+}
+
 TEST(SqlJoinFuzzer, ReplayCommittedRegressionFiles) {
   const char* dir = std::getenv("TINYLAMB_JOIN_REGRESSION_DIR");
   if (dir == nullptr) {

@@ -2361,4 +2361,99 @@ TEST_F(RelationalRegressionTest,
   }
 }
 
+TEST_F(RelationalRegressionTest,
+       WindowApproxQuantilesAndTypedAggregatesRejectInvalidTypes) {
+  auto expect_query_error = [&](std::string_view sql) {
+    TransactionContext ctx = rs_->BeginContext();
+    SqlEngine engine(*rs_);
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    if (!prepared.HasValue()) {
+      ctx.Abort();
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_NE(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
+    ctx.Abort();
+  };
+
+  // Bug 4: DOUBLE count in window APPROX_QUANTILES must not reinterpret IEEE754
+  // bits as int64_t and loop 4.6e18 times: valid small DOUBLE converts to int64
+  // count, while out-of-range / non-numeric counts fail cleanly.
+  const auto quant_rows = RelationalRun(
+      *rs_, "SELECT APPROX_QUANTILES(k, 2.0) OVER () FROM SmallKeys");
+  ASSERT_EQ(quant_rows.size(), 4U);
+  ASSERT_TRUE(quant_rows[0][0].IsArray());
+  EXPECT_EQ(quant_rows[0][0].ArrayElements().size(), 3U);
+  expect_query_error("SELECT APPROX_QUANTILES(k, 1e20) OVER () FROM SmallKeys");
+  expect_query_error(
+      "SELECT APPROX_QUANTILES(k, 1000000) OVER () FROM SmallKeys");
+
+  // Bug 6: VARCHAR input to window SUM/AVG/BIT_OR and aggregate BIT_OR must
+  // return an error rather than reading union int_value UB.
+  RelationalRun(*rs_, "CREATE TABLE WinStr (s STRING)");
+  RelationalRun(*rs_, "INSERT INTO WinStr VALUES ('abc'), ('def')");
+  expect_query_error("SELECT SUM(s) OVER () FROM WinStr");
+  expect_query_error("SELECT AVG(s) OVER () FROM WinStr");
+  expect_query_error("SELECT BIT_OR(s) OVER () FROM WinStr");
+  expect_query_error("SELECT BIT_OR(s) FROM WinStr");
+}
+
+TEST_F(RelationalRegressionTest,
+       RelationStickySpillErrorPropagatesThroughFinishSpillAndMerge) {
+  relational_detail::Relation rel;
+  rel.schema = Schema("s", {Column("k", ValueType::kInt64)});
+  rel.spill_tail_ = std::make_shared<SpillFile>();
+  ASSERT_SUCCESS(rel.spill_tail_->FinishWriting());
+  // Appending to an already-finished SpillFile simulates a spill write error,
+  // latching spill_error_ and resetting spill_tail_.
+  rel.AddRow(Row({Value(int64_t{1})}));
+  EXPECT_FALSE(rel.GetStatus().ok());
+  EXPECT_FALSE(rel.FinishSpill().ok());
+  EXPECT_FALSE(
+      rel.ForEachRow([](const Row&) { return Status::kSuccess; }).ok());
+
+  relational_detail::Relation dst;
+  dst.schema = Schema("s", {Column("k", ValueType::kInt64)});
+  dst.MergeInMemoryShard(std::move(rel));
+  EXPECT_FALSE(dst.GetStatus().ok());
+  EXPECT_FALSE(dst.FinishSpill().ok());
+}
+
+TEST_F(RelationalRegressionTest,
+       FusedGroupedJoinPreservesHavingWhenOutputSpills) {
+  auto setup = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, fact,
+      rs_->CreateTable(
+          setup, Schema("SpillHavingFact", {Column("fk", ValueType::kInt64),
+                                            Column("v", ValueType::kInt64)})));
+  for (int64_t i = 0; i < 2000; ++i) {
+    const int64_t fk = i % 10;
+    const int64_t v = (fk < 5) ? 1 : 10;
+    ASSERT_SUCCESS(
+        fact.Insert(setup.txn_, Row({Value(fk), Value(v)})).GetStatus());
+  }
+  ASSERT_SUCCESS(setup.PreCommit());
+
+  struct RestoreBudget {  // NOLINT(cppcoreguidelines-special-member-functions)
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  // Constrain memory budget so the fused grouped-join output spills to disk,
+  // and use MIN(f.v) so post_having must run on the post-grouped relation.
+  QueryMemoryBudget::Global().ResetForTest(128);
+  const std::string sql =
+      "SELECT a.k, MIN(f.v), SUM(f.v) FROM SpillHavingFact f "
+      "JOIN KeyTable a ON f.fk = a.k "
+      "GROUP BY a.k HAVING SUM(f.v) > 500 ORDER BY a.k";
+  const auto rows = RelationalRun(*rs_, sql);
+  ASSERT_EQ(rows.size(), 5U);
+  for (int64_t i = 0; i < 5; ++i) {
+    EXPECT_EQ(rows[static_cast<size_t>(i)],
+              Row({Value(i + 5), Value(10), Value(2000)}));
+  }
+}
+
 }  // namespace tinylamb

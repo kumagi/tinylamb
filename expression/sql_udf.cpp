@@ -179,6 +179,10 @@ std::string EncodeStructJson(
           }
         }
         break;
+      case ValueType::kDate:
+        text = value.AsString();
+        is_string = true;
+        break;
       default:
         text = value.AsString();
         break;

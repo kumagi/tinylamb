@@ -1209,5 +1209,34 @@ TEST(FunctionCallTest, GreatestLeastOnArraysWithIncomparableElements) {
   EXPECT_EQ(least_res.Value(), small);
 }
 
+TEST(FunctionCallTest, FormatRejectsExcessiveWidthAndPrecisionWithoutOom) {
+  Row dummy_row;
+  Schema dummy_schema;
+  // Dynamic width / precision above 1M and huge literal digit runs must
+  // return kInvalidArgument instead of allocating hundreds of MB or
+  // overflowing signed int.
+  EXPECT_FALSE(ExecuteFunction("format", {Value(std::string("$A%#*s")),
+                                          Value(int64_t{223990482}),
+                                          Value(std::string("x"))})
+                   .HasValue());
+  EXPECT_FALSE(
+      ExecuteFunction("format", {Value(std::string("%.*f")),
+                                 Value(int64_t{200000000}), Value(1.5)})
+          .HasValue());
+  EXPECT_FALSE(ExecuteFunction("format", {Value(std::string("%999999999999s")),
+                                          Value(std::string("x"))})
+                   .HasValue());
+  EXPECT_FALSE(ExecuteFunction("format", {Value(std::string("%.999999999999d")),
+                                          Value(int64_t{42})})
+                   .HasValue());
+  // Reasonable width/precision continues to work identically across AST and
+  // ExecuteFunction.
+  const auto ok = ExecuteFunction(
+      "format", {Value(std::string("%*.*s")), Value(int64_t{5}),
+                 Value(int64_t{3}), Value(std::string("hello"))});
+  ASSERT_TRUE(ok.HasValue());
+  EXPECT_EQ(ok.Value(), Value(std::string("  hel")));
+}
+
 }  // namespace
 }  // namespace tinylamb

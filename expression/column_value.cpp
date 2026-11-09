@@ -64,9 +64,7 @@ int ResolveOffset(const Schema& schema, const ColumnName& name) {
         // Projection schemas are deliberately neutral: a qualified source
         // column remains qualified in the expression, while the projected
         // result schema no longer carries that source qualifier.
-        // Neutral projected schemas may still retain the source qualifier on
-        // each ColumnName (for example StringTable.primary_key).
-        (schema.Name().empty())) {
+        (schema.Name().empty() && candidate.schema.empty())) {
       return static_cast<int>(i);
     }
   }

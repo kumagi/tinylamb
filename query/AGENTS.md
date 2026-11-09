@@ -103,9 +103,10 @@ to copy.
         .A column without a declared default has the implicit default NULL — no
         error(BigQuery semantics, pinned by the `dml_*` compliance cases and
   `QueryTest.ColumnDefault*`)
-        .DEFAULT cannot combine with PRIMARY KEY or
-    FOREIGN KEY on the same column(
-        single constraint slot; the pinned parser rejects the adjacency anyway)
+        .DEFAULT and FOREIGN KEY cannot combine with each other or with
+    PRIMARY KEY on the same column(
+        single constraint slot; the AST visitor rejects conflicting
+        constraints explicitly)
             .- `PRIMARY KEY` in `CREATE TABLE` is metadata only
     : **INSERT does not enforce its uniqueness *
       *(duplicates are stored).The contract is pinned by

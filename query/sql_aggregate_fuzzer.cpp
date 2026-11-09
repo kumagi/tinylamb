@@ -22,6 +22,7 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "executor/query_memory.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
@@ -106,6 +107,17 @@ std::optional<std::vector<std::vector<Value>>> RunQuery(Database& db,
   }
   return rows;
 }
+
+struct ScopedQueryMemory {
+  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+    QueryMemoryBudget::Global().ResetForTest(budget_bytes);
+  }
+  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ScopedQueryMemory(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory(ScopedQueryMemory&&) = delete;
+  ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+};
 
 constexpr const char* kDdl =
     "CREATE TABLE t (u INT64, a INT64, b INT64, s VARCHAR(8), f DOUBLE);";
@@ -830,8 +842,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   std::vector<MRow> mirror;
   // ~12% of rounds cross the morsel/parallel-aggregation threshold; the
   // small-table domain (-3..3) is kept so group counts stay meaningful.
+  // A subset of `large` rounds scale to ~33,000 rows to cross the 16,384 and
+  // 32,768 parallel aggregation/filter thresholds without extra RNG draws.
   const bool large = g.Chance(12);
-  const int row_count = large ? g.Pick(8300, 8450) : g.Pick(5, 12);
+  const int raw_count = large ? g.Pick(8300, 8450) : g.Pick(5, 12);
+  const int row_count =
+      (large && raw_count >= 8410) ? (33000 + (raw_count - 8410)) : raw_count;
   // Per-column flag for INT64 extremes: VAR_*/STDDEV_* accumulation order
   // is only bit-exact when every term stays inside the long-double
   // mantissa, so those aggregates are generated only for extreme-free
@@ -923,7 +939,9 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   }
   // Commit setup so read-only queries can trigger lazy LSTableStore creation
   // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
 
   std::string report;
@@ -1931,13 +1949,24 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
     res.Value().Drain();
   }
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
   const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
-  for (int pass = 0; pass < 2; ++pass) {
-    if (pass == 1) {
+  const int num_passes = large ? 2 : 4;
+  for (int pass = 0; pass < num_passes; ++pass) {
+    if (pass == 1 || pass == 3) {
       platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
+    } else if (prev_route != nullptr) {
+      platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+    } else {
+      platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+    }
+    std::optional<ScopedQueryMemory> low_mem;
+    if (pass >= 2) {
+      low_mem.emplace(512);
     }
     for (const AggQueryExpect& qe : t.queries) {
       std::string error;
@@ -1954,9 +1983,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         } else {
           platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
         }
-        report += std::string(pass == 0 ? "[AGGREGATE-INDEXED MISMATCH] "
-                                        : "[AGGREGATE-CASCADES MISMATCH] ") +
-                  qe.sql + "\n";
+        static constexpr std::array<const char*, 4> kPassTags = {
+            "[AGGREGATE-INDEXED MISMATCH] ", "[AGGREGATE-CASCADES MISMATCH] ",
+            "[AGGREGATE-SPILL MISMATCH] ",
+            "[AGGREGATE-CASCADES-SPILL MISMATCH] "};
+        report +=
+            std::string(kPassTags[static_cast<size_t>(pass)]) + qe.sql + "\n";
         report += "  expected (" + std::to_string(expected.size()) + "):\n";
         for (const std::string& r : expected) {
           report += "    " + r + "\n";
@@ -2038,7 +2070,9 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   if (auto res = engine.Execute(ctx, "ANALYZE t;"); res.HasValue()) {
     res.Value().Drain();
   }
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
   if (std::string rep = check_all("[AGGREGATE-INDEXED REPLAY MISMATCH]");
       !rep.empty()) {
@@ -2048,6 +2082,18 @@ std::string ReplayAggregateTrace(const AggTrace& trace, bool verbose) {
   const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
   platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
   std::string rep = check_all("[AGGREGATE-CASCADES REPLAY MISMATCH]");
+  if (rep.empty() && trace.setup.size() > 4) {
+    ScopedQueryMemory low_mem(512);
+    rep = check_all("[AGGREGATE-CASCADES-SPILL REPLAY MISMATCH]");
+    if (rep.empty()) {
+      if (prev_route != nullptr) {
+        platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+      } else {
+        platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+      }
+      rep = check_all("[AGGREGATE-SPILL REPLAY MISMATCH]");
+    }
+  }
   if (prev_route != nullptr) {
     platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
   } else {

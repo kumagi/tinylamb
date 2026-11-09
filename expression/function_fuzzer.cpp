@@ -195,8 +195,9 @@ Value MakeArg(Cursor& c, bool bounded_sequence = false) {
         const uint8_t b = c.Next();
         if (b == 255) {
           // Exercise the > 1,000,000 element guard in O(1) without spending
-          // seconds materializing 500k..999k elements on every shift input.
-          return Value(int64_t{1'000'005});
+          // seconds materializing 500k..999k elements when start > 0 or step
+          // > 1.
+          return Value(int64_t{1} << 30);
         }
         return Value(int64_t{1} << (b % 10));
       }

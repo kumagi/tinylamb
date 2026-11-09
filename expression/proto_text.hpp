@@ -126,7 +126,7 @@ bool IsKnownEnumTypeName(const std::string& type_name);
 
 // Parses GoogleSQL-style timestamp text ("YYYY-MM-DD[ T]HH:MM:SS[.fff][±tz]")
 // into epoch nanoseconds (UTC); nullopt when unparsable.
-std::optional<int64_t> ParseTimestampTextNanos(std::string_view text);
+std::optional<__int128> ParseTimestampTextNanos(std::string_view text);
 
 // True when the field belongs to a proto compiled with required fields that
 // this engine models (used to reject null/missing constructions).

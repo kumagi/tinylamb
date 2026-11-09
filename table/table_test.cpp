@@ -1606,4 +1606,73 @@ TEST_F(TableTest,
   ASSERT_SUCCESS(s2.txn_.Abort());
 }
 
+TEST_F(TableTest,
+       UpdateRelocationWithSecondaryUniqueConflictRestoresOldRowImage) {
+  RowPosition target_pos;
+  {
+    TransactionContext setup = rs_->BeginContext();
+    Schema sc("reloc_comp",
+              {Column("pk", ValueType::kInt64), Column("u", ValueType::kInt64),
+               Column("pad", ValueType::kVarChar)});
+    ASSERT_SUCCESS(rs_->CreateTable(setup, sc).GetStatus());
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(setup, "reloc_comp",
+                         IndexSchema("idx_pk", {0}, {}, IndexMode::kUnique)));
+    ASSERT_SUCCESS(
+        rs_->CreateIndex(setup, "reloc_comp",
+                         IndexSchema("idx_u", {1}, {}, IndexMode::kUnique)));
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                setup.GetTable("reloc_comp"));
+    ASSIGN_OR_ASSERT_FAIL(
+        RowPosition, pos1,
+        tbl->Insert(setup.txn_, Row({Value(1), Value(10), Value("small")})));
+    target_pos = pos1;
+    // Fill the first page so any large update to row 1 must relocate to a new
+    // page.
+    for (int i = 0; i < 12; ++i) {
+      ASSERT_SUCCESS(
+          tbl->Insert(setup.txn_, Row({Value(100 + i), Value(1000 + i),
+                                       Value(std::string(1200, 'f'))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        tbl->Insert(setup.txn_, Row({Value(2), Value(20), Value("other")}))
+            .GetStatus());
+    ASSERT_SUCCESS(setup.txn_.PreCommit());
+  }
+
+  TransactionContext ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                              ctx.GetTable("reloc_comp"));
+  // Update row (pk=1, u=10) with a huge payload (forcing page relocation) and
+  // u=20 (which conflicts on the second unique index idx_u AFTER idx_pk was
+  // updated to point at the relocated position).
+  StatusOr<RowPosition> upd =
+      tbl->Update(ctx.txn_, target_pos,
+                  Row({Value(1), Value(20), Value(std::string(3000, 'Z'))}));
+  EXPECT_EQ(upd.GetStatus(), Status::kDuplicates);
+  // Even if the caller commits after handling the statement-level duplicate
+  // error, the table and both unique indexes must still expose the original row
+  // (1, 10, "small").
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
+
+  TransactionContext verify = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, vtbl,
+                              verify.GetTable("reloc_comp"));
+  bool found_pk1 = false;
+  Iterator it = vtbl->BeginFullScan(verify.txn_);
+  while (it.IsValid()) {
+    const Row& r = *it;
+    if (r[0] == Value(1)) {
+      found_pk1 = true;
+      EXPECT_EQ(r[1], Value(10));
+      EXPECT_EQ(r[2], Value("small"));
+    }
+    ++it;
+  }
+  EXPECT_EQ(it.GetStatus(), Status::kSuccess);
+  EXPECT_TRUE(found_pk1);
+  ASSERT_SUCCESS(verify.txn_.PreCommit());
+}
+
 }  // namespace tinylamb

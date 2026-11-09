@@ -1262,7 +1262,14 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
           }
         }
         if (owned.size() == 1) {
-          return TryResolveFieldPath((*current->row)[owned.front()], fields);
+          const ValueType col_type =
+              current->schema->GetColumn(owned.front()).Type();
+          const Value& col_val = (*current->row)[owned.front()];
+          if (col_type == ValueType::kVarChar ||
+              (col_type == ValueType::kNull &&
+               (col_val.IsNull() || col_val.type == ValueType::kVarChar))) {
+            return TryResolveFieldPath(col_val, fields);
+          }
         }
       }
       // Split point k: segments[0..k] form the base column reference
@@ -1287,13 +1294,18 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
         if (offset >= 0) {
           const Value& base_value =
               (*current->row)[static_cast<size_t>(offset)];
+          const ValueType col_type =
+              current->schema->GetColumn(static_cast<size_t>(offset)).Type();
+          const bool traversable_base =
+              col_type == ValueType::kVarChar ||
+              (col_type == ValueType::kNull &&
+               (base_value.IsNull() || base_value.type == ValueType::kVarChar));
           // Only textual STRUCT/PROTO values carry traversable fields; a
           // scalar match here came from a qualifier/alias fallback, so keep
           // searching other scopes instead of failing the whole lookup.
           // NULL bases (empty/unset protos) resolve to NULL field values
           // rather than aborting the lookup.
-          if (base_value.IsNull() || base_value.type == ValueType::kVarChar ||
-              split + 1 == segments.size()) {
+          if (traversable_base || split + 1 == segments.size()) {
             return TryResolveFieldPath(
                 base_value,
                 std::vector<std::string>(
@@ -2148,6 +2160,17 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
   // passes cannot resolve (aggregate children bound to the wrong column).
   CollectExpressionColumns(statement.Qualify(), columns);
   for (const SelectStatement::OrderByTerm& term : statement.OrderBy()) {
+    if (term.expression && term.expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& cn = term.expression->AsColumnValue().GetColumnName();
+      if (cn.schema.empty() &&
+          std::ranges::any_of(statement.SelectList(),
+                              [&](const NamedExpression& proj) {
+                                return !proj.name.empty() &&
+                                       IdentifierEquals(proj.name, cn.name);
+                              })) {
+        continue;
+      }
+    }
     CollectExpressionColumns(term.expression, columns);
   }
   for (const SelectSource& source : statement.Sources()) {

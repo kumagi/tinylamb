@@ -127,8 +127,14 @@ std::string AggregateExpression::ToString() const {
       out += ", " + argument->ToString();
     }
   }
+  if (secondary_arg_) {
+    out += ", " + secondary_arg_->ToString();
+  }
   if (ignore_nulls_) {
     out += " IGNORE NULLS";
+  }
+  if (where_filter_) {
+    out += " WHERE " + where_filter_->ToString();
   }
   if (having_ != AggregateHavingModifier::kNone && having_cond_) {
     out += having_ == AggregateHavingModifier::kMax ? " HAVING MAX "

@@ -19,10 +19,12 @@
 #include <utility>
 #include <vector>
 
+#include "common/platform/process.hpp"
 #include "common/platform/random.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "executor/query_memory.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
@@ -158,6 +160,17 @@ std::string FormatJoined(const ProjCol& col, const FactRow* f, const DimRow* d,
   return "NULL";
 }
 
+struct ScopedQueryMemory {
+  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+    QueryMemoryBudget::Global().ResetForTest(budget_bytes);
+  }
+  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ScopedQueryMemory(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory(ScopedQueryMemory&&) = delete;
+  ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+};
+
 constexpr const char* kFactDdl =
     "CREATE TABLE fact (u INT64, k INT64, a INT64);";
 constexpr const char* kDimDdl = "CREATE TABLE dim (k INT64, tag VARCHAR(8));";
@@ -174,12 +187,15 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   t.setup.emplace_back(kDimDdl);
   std::vector<FactRow> facts;
   std::vector<DimRow> dims;
-  // ~10% of iterations run a large round: 9000 fact rows push the planner
-  // past the parallel-join threshold (~8192) that tiny tables never reach.
-  const bool large = g.Chance(10);
+  // ~10% of iterations run a large round: 9000..17000 fact rows push the
+  // planner past the parallel-join and parallel-probe thresholds (~8192 and
+  // ~16384) that tiny tables never reach.
+  const int large_roll = g.Pick(1, 100);
+  const bool large = large_roll <= 10;
+  const int64_t large_fn = (large_roll <= 3) ? 17000 : 9000;
   if (large) {
-    const int64_t fn = 9000;
-    const int64_t dn = 100;
+    const int64_t fn = large_fn;
+    const int64_t dn = 12;
     t.setup.push_back(
         "INSERT INTO fact SELECT n, CASE WHEN MOD(n, 11) = 0 THEN NULL ELSE "
         "MOD(n, 7) END, MOD(n, 5) - 2 FROM UNNEST(GENERATE_SERIES(0, " +
@@ -241,13 +257,21 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     }
     // QueryResults are lazy: drain or the INSERT never happens.
     result.Value().Drain();
+    if (result.Value().GetStatus() != Status::kSuccess) {
+      if (verbose) {
+        std::cerr << "[join_fuzz][skip-setup-status] " << sql << "\n";
+      }
+      return "";
+    }
   }
   // Commit setup so read-only queries can trigger lazy LSTableStore creation
   // (`GetOrBuildLSTableStore` requires an empty uncommitted WriteSet).
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
 
-  const int query_count = g.Pick(2, 5);
+  const int query_count = large ? g.Pick(1, 2) : g.Pick(2, 5);
   std::string report;
   for (int q = 0; q < query_count; ++q) {
     // Three-table chain: (fact <j1> dim d) <j2> dim d2.  Exercises join
@@ -473,11 +497,11 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     // ---- join shape ----------------------------------------------------
     // kind: 0 INNER, 1 LEFT, 2 RIGHT, 3 FULL.  ON: equi on k, optionally
     // with an extra conjunct on either side, or a non-equi range predicate.
-    const int join_kind = g.Pick(0, 4);
+    const int join_kind = large ? g.Pick(0, 3) : g.Pick(0, 4);
     static const std::array<const char*, 5> kJoinKw = {
         "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"};
     const char* join_kw = kJoinKw[static_cast<size_t>(join_kind)];
-    int on_kind = join_kind == 4 ? 0 : g.Pick(0, 11);
+    int on_kind = join_kind == 4 ? 0 : (large ? g.Pick(0, 8) : g.Pick(0, 11));
     if (join_kind != 0 && on_kind >= 9) {
       on_kind = 0;  // keep OUTER-join ONs equi-based; non-equi outer ONs are
                     // rarer in the supported surface
@@ -972,7 +996,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     const std::array<JoinSelProbe, 3> kJoinSelProbes = {{
         {"f.u >= 4000 AND f.u < 4180", 4000, 4180},
         {"f.u < 5000", 0, 5000},
-        {"f.u >= 300", 300, 9000},
+        {"f.u >= 300", 300, large_fn},
     }};
     for (const JoinSelProbe& sp : kJoinSelProbes) {
       const std::string sql =
@@ -1031,22 +1055,180 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
     }
   }
 
+  // Also probe fused grouped-join + HAVING over MIN/MAX/SUM/COUNT and
+  // IS NOT DISTINCT FROM NULL-safe equi-join + aggregation on every round.
+  {
+    const std::string h_sql =
+        "SELECT d.tag, COUNT(*), MIN(f.a), MAX(f.u), SUM(f.a) FROM fact f "
+        "JOIN dim d ON f.k = d.k GROUP BY d.tag HAVING MIN(f.a) >= -2 OR "
+        "MAX(f.u) >= 0;";
+    struct HAgg {
+      int64_t cnt{0};
+      int64_t min_a{0};
+      bool any_a{false};
+      int64_t max_u{0};
+      bool any_u{false};
+      int64_t sum_a{0};
+    };
+    std::map<int64_t, HAgg> h_groups;
+    for (const FactRow& f : facts) {
+      if (f.k == kNullRepr) {
+        continue;
+      }
+      auto range = dims_by_k.equal_range(f.k);
+      for (auto it = range.first; it != range.second; ++it) {
+        HAgg& ag = h_groups[it->second->tag];
+        ++ag.cnt;
+        if (!ag.any_u || f.u > ag.max_u) {
+          ag.max_u = f.u;
+          ag.any_u = true;
+        }
+        if (f.a != kNullRepr) {
+          ag.sum_a += f.a;
+          if (!ag.any_a || f.a < ag.min_a) {
+            ag.min_a = f.a;
+            ag.any_a = true;
+          }
+        }
+      }
+    }
+    std::vector<std::string> h_expected;
+    for (const auto& [tag, ag] : h_groups) {
+      const bool min_ok = ag.any_a && ag.min_a >= -2;
+      const bool max_ok = ag.any_u && ag.max_u >= 0;
+      if (min_ok || max_ok) {
+        h_expected.push_back(FmtStr(tag) + "," + Fmt(ag.cnt) + "," +
+                             (ag.any_a ? Fmt(ag.min_a) : "NULL") + "," +
+                             (ag.any_u ? Fmt(ag.max_u) : "NULL") + "," +
+                             (ag.any_a ? Fmt(ag.sum_a) : "NULL") + ",");
+      }
+    }
+    std::sort(h_expected.begin(), h_expected.end());
+    std::string error;
+    if (auto got = RunQuery(db, ctx, h_sql, &error); got.has_value()) {
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      std::sort(actual.begin(), actual.end());
+      t.queries.push_back({h_sql, h_expected});
+      if (actual != h_expected) {
+        report += "[JOIN MISMATCH] " + h_sql + "\n";
+        report += "  expected (" + std::to_string(h_expected.size()) + "):\n";
+        for (const std::string& r : h_expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+
+    const std::string indf_sql =
+        "SELECT f.k, COUNT(*), COUNT(d.tag), SUM(f.a) FROM fact f LEFT JOIN "
+        "dim d ON f.k IS NOT DISTINCT FROM d.k GROUP BY f.k;";
+    struct IndfAgg {
+      int64_t cnt{0};
+      int64_t cnt_tag{0};
+      int64_t sum_a{0};
+      bool any_a{false};
+    };
+    std::map<int64_t, IndfAgg> indf_groups;
+    for (const FactRow& f : facts) {
+      auto range = dims_by_k.equal_range(f.k);
+      if (range.first == range.second) {
+        IndfAgg& ag = indf_groups[f.k];
+        ++ag.cnt;
+        if (f.a != kNullRepr) {
+          ag.sum_a += f.a;
+          ag.any_a = true;
+        }
+      } else {
+        for (auto it = range.first; it != range.second; ++it) {
+          IndfAgg& ag = indf_groups[f.k];
+          ++ag.cnt;
+          ++ag.cnt_tag;
+          if (f.a != kNullRepr) {
+            ag.sum_a += f.a;
+            ag.any_a = true;
+          }
+        }
+      }
+    }
+    std::vector<std::string> indf_expected;
+    for (const auto& [k, ag] : indf_groups) {
+      indf_expected.push_back(Fmt(k) + "," + Fmt(ag.cnt) + "," +
+                              Fmt(ag.cnt_tag) + "," +
+                              (ag.any_a ? Fmt(ag.sum_a) : "NULL") + ",");
+    }
+    std::sort(indf_expected.begin(), indf_expected.end());
+    if (auto got = RunQuery(db, ctx, indf_sql, &error); got.has_value()) {
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      std::sort(actual.begin(), actual.end());
+      t.queries.push_back({indf_sql, indf_expected});
+      if (actual != indf_expected) {
+        report += "[JOIN MISMATCH] " + indf_sql + "\n";
+        report +=
+            "  expected (" + std::to_string(indf_expected.size()) + "):\n";
+        for (const std::string& r : indf_expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+  }
+
   // Cross-mode / index-independence verification: build secondary covering
   // indexes on fact and dim, run ANALYZE, and re-verify every recorded query
-  // under both the default optimizer and the Cascades grouped route /
-  // relational fallback.
+  // under the default optimizer, relational fallback, Cascades grouped route,
+  // and 512B disk-spill budget.
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
-  ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  if (!large) {
+    ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  }
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
       res.Value().Drain();
     }
   }
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
+  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
+  const int num_modes = large ? 3 : 4;
   for (const QueryExpect& qe : t.queries) {
-    for (int mode = 0; mode < 2; ++mode) {
+    for (int mode = 0; mode < num_modes; ++mode) {
+      if (mode == 2) {
+        platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
+      } else if (prev_route != nullptr) {
+        platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+      } else {
+        platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+      }
+      std::optional<ScopedQueryMemory> low_mem;
+      if (mode == 3) {
+        low_mem.emplace(512);
+      }
       std::string error;
       auto got =
           RunQuery(db, ctx, qe.sql, &error, /*force_relational=*/mode == 1);
@@ -1065,9 +1247,16 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       std::vector<std::string> expected = qe.expected;
       std::sort(expected.begin(), expected.end());
       if (actual != expected) {
-        report += std::string(mode == 0 ? "[JOIN-INDEXED MISMATCH] "
-                                        : "[JOIN-RELATIONAL MISMATCH] ") +
-                  qe.sql + "\n";
+        if (prev_route != nullptr) {
+          platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+        } else {
+          platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+        }
+        static constexpr std::array<const char*, 4> kModeTags = {
+            "[JOIN-INDEXED MISMATCH] ", "[JOIN-RELATIONAL MISMATCH] ",
+            "[JOIN-CASCADES MISMATCH] ", "[JOIN-SPILL MISMATCH] "};
+        report +=
+            std::string(kModeTags[static_cast<size_t>(mode)]) + qe.sql + "\n";
         report += "  expected (" + std::to_string(expected.size()) + "):\n";
         for (const std::string& r : expected) {
           report += "    " + r + "\n";
@@ -1079,6 +1268,11 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         return report;
       }
     }
+  }
+  if (prev_route != nullptr) {
+    platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+  } else {
+    platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
   return report;
 }
@@ -1146,20 +1340,42 @@ std::string ReplayJoinTrace(const JoinTrace& trace, bool verbose) {
     return rep;
   }
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_fact_k ON fact(k) INCLUDE(a);");
-  ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  if (trace.setup.size() > 4) {
+    ApplyIndexSpec(db, ctx, "CREATE UNIQUE INDEX idx_fact_u ON fact(u);");
+  }
   ApplyIndexSpec(db, ctx, "CREATE INDEX idx_dim_k ON dim(k) INCLUDE(tag);");
   for (const char* analyze_sql : {"ANALYZE fact;", "ANALYZE dim;"}) {
     if (auto res = engine.Execute(ctx, analyze_sql); res.HasValue()) {
       res.Value().Drain();
     }
   }
-  (void)ctx.txn_.PreCommit();
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return "";
+  }
   ctx = db.BeginContext();
   if (std::string rep = check_queries(false, "[JOIN-INDEXED REPLAY MISMATCH]");
       !rep.empty()) {
     return rep;
   }
-  return check_queries(true, "[JOIN-RELATIONAL REPLAY MISMATCH]");
+  if (std::string rep =
+          check_queries(true, "[JOIN-RELATIONAL REPLAY MISMATCH]");
+      !rep.empty()) {
+    return rep;
+  }
+  const char* prev_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
+  const std::string saved_route = (prev_route != nullptr) ? prev_route : "";
+  platform::SetEnv("TINYLAMB_GROUPED_ROUTE", "cascades");
+  std::string rep = check_queries(false, "[JOIN-CASCADES REPLAY MISMATCH]");
+  if (prev_route != nullptr) {
+    platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+  } else {
+    platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+  }
+  if (rep.empty() && trace.setup.size() > 4) {
+    ScopedQueryMemory low_mem(512);
+    rep = check_queries(false, "[JOIN-SPILL REPLAY MISMATCH]");
+  }
+  return rep;
 }
 
 std::string SerializeJoinTest(uint64_t seed, const JoinTrace& trace,

@@ -434,6 +434,78 @@ StatusOr<Relation> Project(TransactionContext& context,
     CollectAggregates(order_expression, &aggregate_expressions,
                       &seen_aggregates);
   }
+  std::vector<slot_t> ungrouped_slots;
+  if (grouped) {
+    std::unordered_set<slot_t> grouped_slots;
+    std::unordered_set<std::string> grouped_expr_strings;
+    if (!statement.IsGroupAll()) {
+      for (const Expression& g : statement.GroupBy()) {
+        if (!g) {
+          continue;
+        }
+        grouped_expr_strings.insert(g->ToString());
+        if (g->Type() == TypeTag::kColumnValue) {
+          const ColumnName& gcol = g->AsColumnValue().GetColumnName();
+          if (std::optional<slot_t> slot =
+                  LocalColumnOffset(input.schema, gcol);
+              slot.has_value()) {
+            grouped_slots.insert(*slot);
+          }
+          if (gcol.schema.empty()) {
+            for (const NamedExpression& proj : statement.SelectList()) {
+              if (!proj.name.empty() &&
+                  IdentifierEquals(proj.name, gcol.name) && proj.expression) {
+                grouped_expr_strings.insert(proj.expression->ToString());
+                if (proj.expression->Type() == TypeTag::kColumnValue) {
+                  if (std::optional<slot_t> slot = LocalColumnOffset(
+                          input.schema,
+                          proj.expression->AsColumnValue().GetColumnName());
+                      slot.has_value()) {
+                    grouped_slots.insert(*slot);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    const std::function<void(const Expression&)> collect_ungrouped =
+        [&](const Expression& expr) {
+          if (!expr || expr->Type() == TypeTag::kAggregateExp ||
+              expr->Type() == TypeTag::kQueryExp) {
+            return;
+          }
+          if (grouped_expr_strings.contains(expr->ToString())) {
+            return;
+          }
+          if (expr->Type() == TypeTag::kColumnValue) {
+            const ColumnName& col = expr->AsColumnValue().GetColumnName();
+            if (col.name.empty() || col.name == "*") {
+              return;
+            }
+            if (std::optional<slot_t> slot =
+                    LocalColumnOffset(input.schema, col);
+                slot.has_value() && !grouped_slots.contains(*slot)) {
+              if (std::ranges::find(ungrouped_slots, *slot) ==
+                  ungrouped_slots.end()) {
+                ungrouped_slots.push_back(*slot);
+              }
+            }
+            return;
+          }
+          for (const Expression& child : ExpressionChildren(expr)) {
+            collect_ungrouped(child);
+          }
+        };
+    for (const NamedExpression& proj : statement.SelectList()) {
+      collect_ungrouped(proj.expression);
+    }
+    collect_ungrouped(having_expr);
+    for (const Expression& order_expression : resolved_order_expressions) {
+      collect_ungrouped(order_expression);
+    }
+  }
   struct GroupState {
     Row representative;
     size_t accumulator_offset{0};
@@ -519,9 +591,36 @@ StatusOr<Relation> Project(TransactionContext& context,
         ++context.execution_runtime()->aggregate_updates;
       }
     }
-    // Only new groups need a representative row.
+    // Only new groups need a representative row, unless bare ungrouped columns
+    // are referenced, in which case we pick the canonical minimum row across
+    // `ungrouped_slots` (NULLS LAST) so join/spill reordering cannot change the
+    // chosen representative.
     if (inserted) {
       group.representative = row;
+    } else if (!ungrouped_slots.empty()) {
+      for (slot_t slot : ungrouped_slots) {
+        if (slot >= row.Size() || slot >= group.representative.Size()) {
+          continue;
+        }
+        const Value& cand = row[slot];
+        const Value& curr = group.representative[slot];
+        if (cand.IsNull() != curr.IsNull()) {
+          if (!cand.IsNull()) {
+            group.representative = row;
+          }
+          break;
+        }
+        if (!cand.IsNull()) {
+          const int cmp = CompareForOrderBy(cand, curr);
+          if (cmp < 0) {
+            group.representative = row;
+            break;
+          }
+          if (cmp > 0) {
+            break;
+          }
+        }
+      }
     }
     if (context.execution_runtime() != nullptr) {
       ++context.execution_runtime()->aggregate_input_rows;
@@ -623,8 +722,8 @@ StatusOr<Relation> Project(TransactionContext& context,
       // AggregateAccumulator::Merge.  DISTINCT on SUM/AVG has no set-union
       // merge and keeps the serial pass.  Spilled inputs also stay serial:
       // input.rows would only cover the resident prefix.
-      bool parallel_grouping =
-          !input.HasSpill() && input.TotalRows() >= kParallelGroupMinRows;
+      bool parallel_grouping = ungrouped_slots.empty() && !input.HasSpill() &&
+                               input.TotalRows() >= kParallelGroupMinRows;
       std::vector<std::optional<slot_t>> parallel_key_offsets;
       std::vector<std::optional<slot_t>> parallel_child_offsets;
       std::vector<bool> parallel_count_star;
@@ -5201,66 +5300,61 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
     // The fused probe emitted the grouped+projected rows already; only the
     // ORDER BY / LIMIT tail remains, and eligibility guarantees every order
     // term resolves against the projected output.
-    input.FinishSpill();
-    if (post_having.active && !fusion_spec.post_having_applied &&
-        !input.HasSpill()) {
+    RETURN_IF_FAIL(input.FinishSpill());
+    RETURN_IF_FAIL(input.GetStatus());
+    if (post_having.active && !fusion_spec.post_having_applied) {
       double threshold = post_having.constant_or_factor;
       bool valid_threshold = true;
       if (post_having.is_self_sum_factor) {
         double grand_total = 0.0;
         bool any_nonnull = false;
-        for (const Row& r : input.rows) {
+        RETURN_IF_FAIL(input.ForEachRow([&](const Row& r) {
           const Value& v = r[post_having.select_col];
           if (v.IsNull()) {
-            continue;
+            return;
           }
           any_nonnull = true;
           grand_total += v.type == ValueType::kDouble
                              ? v.value.double_value
                              : static_cast<double>(v.value.int_value);
-        }
+        }));
         if (!any_nonnull) {
           valid_threshold = false;
         } else {
           threshold = grand_total * post_having.constant_or_factor;
         }
       }
+      auto row_passes_having = [&](const Row& r) -> bool {
+        const Value& v = r[post_having.select_col];
+        if (v.IsNull()) {
+          return false;
+        }
+        const double dv = v.type == ValueType::kDouble
+                              ? v.value.double_value
+                              : static_cast<double>(v.value.int_value);
+        switch (post_having.op) {
+          case BinaryOperation::kEquals:
+            return dv == threshold;
+          case BinaryOperation::kNotEquals:
+            return dv != threshold;
+          case BinaryOperation::kLessThan:
+            return dv < threshold;
+          case BinaryOperation::kLessThanEquals:
+            return dv <= threshold;
+          case BinaryOperation::kGreaterThan:
+            return dv > threshold;
+          case BinaryOperation::kGreaterThanEquals:
+            return dv >= threshold;
+          default:
+            return false;
+        }
+      };
       if (!valid_threshold) {
-        input.rows.clear();
-      } else {
+        input.ResetContents();
+      } else if (!input.HasSpill()) {
         size_t out_idx = 0;
         for (size_t ri = 0; ri < input.rows.size(); ++ri) {
-          const Value& v = input.rows[ri][post_having.select_col];
-          if (v.IsNull()) {
-            continue;
-          }
-          const double dv = v.type == ValueType::kDouble
-                                ? v.value.double_value
-                                : static_cast<double>(v.value.int_value);
-          bool cmp_ok = false;
-          switch (post_having.op) {
-            case BinaryOperation::kEquals:
-              cmp_ok = (dv == threshold);
-              break;
-            case BinaryOperation::kNotEquals:
-              cmp_ok = (dv != threshold);
-              break;
-            case BinaryOperation::kLessThan:
-              cmp_ok = (dv < threshold);
-              break;
-            case BinaryOperation::kLessThanEquals:
-              cmp_ok = (dv <= threshold);
-              break;
-            case BinaryOperation::kGreaterThan:
-              cmp_ok = (dv > threshold);
-              break;
-            case BinaryOperation::kGreaterThanEquals:
-              cmp_ok = (dv >= threshold);
-              break;
-            default:
-              break;
-          }
-          if (cmp_ok) {
+          if (row_passes_having(input.rows[ri])) {
             if (out_idx != ri) {
               input.rows[out_idx] = std::move(input.rows[ri]);
             }
@@ -5268,6 +5362,19 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           }
         }
         input.rows.resize(out_idx);
+      } else {
+        Relation filtered(context.execution_runtime());
+        filtered.schema = input.schema;
+        filtered.using_columns = input.using_columns;
+        CopyExecutionStats(&filtered, input);
+        RETURN_IF_FAIL(input.ForEachRow([&](const Row& r) {
+          if (row_passes_having(r)) {
+            filtered.AddRow(r);
+          }
+        }));
+        RETURN_IF_FAIL(filtered.FinishSpill());
+        RETURN_IF_FAIL(filtered.GetStatus());
+        input = std::move(filtered);
       }
     }
     if (!statement.OrderBy().empty()) {
@@ -5298,7 +5405,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
           Relation, window_over_aggregate,
           (ExecuteWindowOverAggregate(context, *effective, std::move(input),
                                       outer, ctes, !where_fully_applied)));
-      window_over_aggregate.FinishSpill();
+      RETURN_IF_FAIL(window_over_aggregate.FinishSpill());
+      RETURN_IF_FAIL(window_over_aggregate.GetStatus());
       return window_over_aggregate;
     }
     ASSIGN_OR_RETURN(
@@ -5313,7 +5421,8 @@ StatusOr<Relation> ExecuteQuery(  // NOLINT(misc-no-recursion)
   ASSIGN_OR_RETURN(Relation, result,
                    (FinishQuery(context, *effective, std::move(input), outer,
                                 ctes, !where_fully_applied, hidden_columns)));
-  result.FinishSpill();
+  RETURN_IF_FAIL(result.FinishSpill());
+  RETURN_IF_FAIL(result.GetStatus());
   return result;
 }
 

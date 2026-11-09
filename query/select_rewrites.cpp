@@ -519,10 +519,12 @@ Expression StripCteQualifier(  // NOLINT(misc-no-recursion)
 }
 
 // Counts references to `name` inside *nested* scopes of `statement` (derived
-// tables, subqueries, set-operation branches) but not in the statement's own
-// FROM list or in its sibling WITH bodies.
+// tables, subqueries, set-operation branches, nested WITH bodies) but not in
+// the top-level statement's own FROM list.
 size_t CountNestedCteReferences(const SelectStatement& statement,
-                                const std::string& name);
+                                const std::string& name,
+                                bool count_own_sources = false,
+                                bool walk_with_queries = true);
 
 void CountNestedCteReferencesInExpression(  // NOLINT(misc-no-recursion)
     const Expression& expression, const std::string& name, size_t* count) {
@@ -532,7 +534,7 @@ void CountNestedCteReferencesInExpression(  // NOLINT(misc-no-recursion)
   if (expression->Type() == TypeTag::kQueryExp) {
     const QueryExpression& query = expression->AsQueryExpression();
     if (query.Query() != nullptr) {
-      *count += CountNestedCteReferences(*query.Query(), name);
+      *count += CountNestedCteReferences(*query.Query(), name, true, true);
     }
     CountNestedCteReferencesInExpression(query.Test(), name, count);
     return;
@@ -542,12 +544,17 @@ void CountNestedCteReferencesInExpression(  // NOLINT(misc-no-recursion)
   }
 }
 
-size_t CountNestedCteReferences(const SelectStatement& statement,
-                                const std::string& name) {
+size_t CountNestedCteReferences(  // NOLINT(misc-no-recursion)
+    const SelectStatement& statement, const std::string& name,
+    bool count_own_sources, bool walk_with_queries) {
   size_t count = 0;
   for (const SelectSource& source : statement.Sources()) {
+    if (count_own_sources && source.query == nullptr && !source.unnest &&
+        source.table == name) {
+      ++count;
+    }
     if (source.query != nullptr) {
-      count += CountNestedCteReferences(*source.query, name);
+      count += CountNestedCteReferences(*source.query, name, true, true);
     }
     CountNestedCteReferencesInExpression(source.join_condition, name, &count);
     CountNestedCteReferencesInExpression(source.unnest, name, &count);
@@ -566,16 +573,24 @@ size_t CountNestedCteReferences(const SelectStatement& statement,
   }
   for (const auto& branch : statement.UnionAll()) {
     if (branch != nullptr) {
-      count += CountNestedCteReferences(*branch, name);
+      count += CountNestedCteReferences(*branch, name, true, true);
     }
   }
   if (const auto& tree = statement.GetSetOperationTree(); tree != nullptr) {
     if (tree->first != nullptr) {
-      count += CountNestedCteReferences(*tree->first, name);
+      count += CountNestedCteReferences(*tree->first, name, true, true);
     }
     for (const auto& branch : tree->branches) {
       if (branch != nullptr) {
-        count += CountNestedCteReferences(*branch, name);
+        count += CountNestedCteReferences(*branch, name, true, true);
+      }
+    }
+  }
+  if (walk_with_queries) {
+    for (const auto& [cte_name, cte_body] : statement.WithQueries()) {
+      if (cte_body != nullptr &&
+          !(cte_name == name && statement.IsRecursiveWith(cte_name))) {
+        count += CountNestedCteReferences(*cte_body, name, true, true);
       }
     }
   }
@@ -601,7 +616,9 @@ bool CollectSharedCteSites(SelectStatement* outer, const std::string& name,
     }
   }
   for (SelectStatement* consumer : consumers) {
-    if (CountNestedCteReferences(*consumer, name) != 0) {
+    if (CountNestedCteReferences(*consumer, name, /*count_own_sources=*/false,
+                                 /*walk_with_queries=*/consumer != outer) !=
+        0) {
       return false;
     }
     for (const SelectSource& source : consumer->Sources()) {

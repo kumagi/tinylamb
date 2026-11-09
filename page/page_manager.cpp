@@ -290,6 +290,7 @@ PageManager::PageManager(std::string db_name, int lock_fd)
 PageManager::~PageManager() { CloseDatabaseFile(); }
 
 void PageManager::CloseDatabaseFile() {
+  std::scoped_lock io_lk(checkpoint_io_mu_);
   if (lock_fd_ >= 0) {
     (void)platform::UnlockFile(lock_fd_);
     platform::CloseFile(lock_fd_);
@@ -1154,36 +1155,77 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
   const uint32_t crc = Crc32C(buf.data(), buf.size());
   AppendU32(&buf, crc);
 
-  // Write in-place to lock_fd_ so the flock held on db_name_ stays attached to
-  // the exact inode on disk!
+  // Atomically replace db_name_ via a temp file + fdatasync + rename while
+  // transferring the exclusive advisory lock to the new inode before rename so
+  // no crash can leave db_name_ truncated/half-written and no lock gap exists.
+  std::scoped_lock io_lk(checkpoint_io_mu_);
   if (lock_fd_ < 0) {
     return Status::kIOError;
   }
-  if (platform::Truncate(lock_fd_, 0) != 0) {
+  const std::string tmp_path = db_name_ + ".tmp";
+  const int tmp_fd = platform::OpenFile(tmp_path,
+                                        {.mode = platform::OpenMode::kReadWrite,
+                                         .create = true,
+                                         .truncate = true},
+                                        0644);
+  if (tmp_fd < 0) {
     return StatusError(
         StatusCode::kIOError,
-        "ftruncate failed on checkpoint: " + std::string(std::strerror(errno)));
+        "open failed on checkpoint temp: " + std::string(std::strerror(errno)));
   }
+  auto cleanup_tmp = [&](int fd_to_close) {
+    if (fd_to_close >= 0) {
+      platform::CloseFile(fd_to_close);
+    }
+    std::error_code ec;
+    std::filesystem::remove(tmp_path, ec);
+  };
   size_t written = 0;
   while (written < buf.size()) {
     const ssize_t n =
-        platform::Pwrite(lock_fd_, buf.data() + written, buf.size() - written,
+        platform::Pwrite(tmp_fd, buf.data() + written, buf.size() - written,
                          static_cast<int64_t>(written));
     if (n <= 0) {
       if (errno == EINTR) {
         continue;
       }
+      const int err = errno;
+      cleanup_tmp(tmp_fd);
       return StatusError(
           StatusCode::kIOError,
-          "pwrite failed on checkpoint: " + std::string(std::strerror(errno)));
+          "pwrite failed on checkpoint: " + std::string(std::strerror(err)));
     }
     written += static_cast<size_t>(n);
   }
-  if (platform::DataSync(lock_fd_) != 0) {
+  if (platform::DataSync(tmp_fd) != 0) {
+    const int err = errno;
+    cleanup_tmp(tmp_fd);
     return StatusError(
         StatusCode::kIOError,
-        "fdatasync failed on checkpoint: " + std::string(std::strerror(errno)));
+        "fdatasync failed on checkpoint: " + std::string(std::strerror(err)));
   }
+  if (platform::TryLockExclusive(tmp_fd) != 0) {
+    const int err = errno;
+    cleanup_tmp(tmp_fd);
+    return StatusError(
+        StatusCode::kIOError,
+        "lock failed on checkpoint temp: " + std::string(std::strerror(err)));
+  }
+  std::error_code rename_ec;
+  std::filesystem::rename(tmp_path, db_name_, rename_ec);
+  if (rename_ec) {
+    (void)platform::UnlockFile(tmp_fd);
+    cleanup_tmp(tmp_fd);
+    return StatusError(StatusCode::kIOError,
+                       "rename failed on checkpoint: " + rename_ec.message());
+  }
+  const std::filesystem::path parent_dir =
+      std::filesystem::path(db_name_).parent_path();
+  (void)platform::SyncDirectory(parent_dir.empty() ? std::filesystem::path(".")
+                                                   : parent_dir);
+  (void)platform::UnlockFile(lock_fd_);
+  platform::CloseFile(lock_fd_);
+  lock_fd_ = tmp_fd;
   return Status::kSuccess;
 }
 

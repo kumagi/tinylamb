@@ -109,8 +109,10 @@ uint64_t BloomRuntimeFilter::Hash(int64_t key, unsigned probe) {
 size_t BloomRuntimeFilter::BitsForKeys(size_t distinct_keys) {
   size_t want = distinct_keys * 10;
   want = std::max<size_t>(want, 512);
+  constexpr uint64_t kMaxBloomBits =
+      sizeof(size_t) >= 8 ? (uint64_t{1} << 34) : (uint64_t{1} << 30);
   size_t bits = 512;
-  while (bits < want && bits < (size_t{1} << 34)) {
+  while (bits < want && static_cast<uint64_t>(bits) < kMaxBloomBits) {
     bits <<= 1U;
   }
   return bits;

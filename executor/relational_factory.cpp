@@ -848,9 +848,25 @@ Executor IndexSkipScanPlan::EmitExecutor(TransactionContext& txn) const {
 }
 
 Executor SkipScanDistinctPlan::EmitExecutor(TransactionContext& txn) const {
+  auto stale_fallback = [&]() -> Executor {
+    Executor scan =
+        SortedByIndexKey(std::make_shared<FullScan>(txn.txn_, table_),
+                         table_.GetSchema(), table_, index_, ascending_);
+    Executor projected = std::make_shared<Projection>(
+        select_items_, table_.GetSchema(), std::move(scan));
+    return std::make_shared<DistinctExecutor>(std::move(projected));
+  };
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
+  }
+  auto index_read_guard = txn.txn_.AcquireIndexReadGuard(index_.Root());
+  if (txn.txn_.IndexKeysMayBeStale(index_.Root())) {
+    return stale_fallback();
+  }
   Executor scan = std::make_shared<SkipScanDistinct>(
       txn.txn_, table_, index_, std::vector<Value>{}, std::vector<Value>{},
-      ascending_, ConstantValueExp(Value(true)), table_.GetSchema(), 0);
+      ascending_, ConstantValueExp(Value(true)), table_.GetSchema(), 0,
+      std::move(index_read_guard));
   return std::make_shared<Projection>(select_items_, table_.GetSchema(),
                                       std::move(scan));
 }

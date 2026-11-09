@@ -1129,8 +1129,8 @@ StatusOr<Relation> HybridHashJoin(
   std::vector<SpillFile> left_parts(partitions);
   std::vector<SpillFile> right_parts(partitions);
 
-  left.FinishSpill();
-  right.FinishSpill();
+  RETURN_IF_FAIL(left.FinishSpill());
+  RETURN_IF_FAIL(right.FinishSpill());
 
   auto right_partition = [&](const Row& row) -> size_t {
     if (integer_key) {
@@ -1146,7 +1146,8 @@ StatusOr<Relation> HybridHashJoin(
     return SpillPartitionOf(left_key_string(row), partitions);
   };
 
-  right.ForEachRow([&](const Row& row) {
+  Status spill_err{Status::kSuccess};
+  RETURN_IF_FAIL(right.ForEachRow([&](const Row& row) {
     if (build_key_excluded(row)) {
       return;
     }
@@ -1159,9 +1160,13 @@ StatusOr<Relation> HybridHashJoin(
         resident_matched.push_back(0);
       }
     } else {
-      right_parts[part].Append(row);
+      const Status st = right_parts[part].Append(row);
+      if (st != Status::kSuccess && spill_err == Status::kSuccess) {
+        spill_err = st;
+      }
     }
-  });
+  }));
+  RETURN_IF_FAIL(spill_err);
   right.rows.clear();
   right.rows.shrink_to_fit();
   right.ReleaseCharge();
@@ -1228,7 +1233,7 @@ StatusOr<Relation> HybridHashJoin(
     }
   };
 
-  left.ForEachRow([&](const Row& left_row) {
+  RETURN_IF_FAIL(left.ForEachRow([&](const Row& left_row) {
     if (probe_key_excluded(left_row)) {
       if (left_join) {
         std::vector<Value> nulls(right_width);
@@ -1240,9 +1245,13 @@ StatusOr<Relation> HybridHashJoin(
     if (part == 0 && right_parts[0].Empty()) {
       probe_resident(left_row);
     } else {
-      left_parts[part].Append(left_row);
+      const Status st = left_parts[part].Append(left_row);
+      if (st != Status::kSuccess && spill_err == Status::kSuccess) {
+        spill_err = st;
+      }
     }
-  });
+  }));
+  RETURN_IF_FAIL(spill_err);
   left.rows.clear();
   left.rows.shrink_to_fit();
   left.ReleaseCharge();
@@ -1252,7 +1261,7 @@ StatusOr<Relation> HybridHashJoin(
   const bool resident_folded = !right_parts[0].Empty();
   if (resident_folded) {
     for (const Row& row : resident_right) {
-      right_parts[0].Append(row);
+      RETURN_IF_FAIL(right_parts[0].Append(row));
     }
   } else if (right_join) {
     // Partition 0 stayed fully resident and was probed live: emit the build
@@ -1270,8 +1279,8 @@ StatusOr<Relation> HybridHashJoin(
   resident_charge.ReleaseAll();
 
   for (size_t part = 0; part < partitions; ++part) {
-    left_parts[part].FinishWriting();
-    right_parts[part].FinishWriting();
+    RETURN_IF_FAIL(left_parts[part].FinishWriting());
+    RETURN_IF_FAIL(right_parts[part].FinishWriting());
   }
 
   for (size_t part = 0; part < partitions; ++part) {
@@ -1298,7 +1307,7 @@ StatusOr<Relation> HybridHashJoin(
         part_str_buckets.emplace(right_key_string(row), &row);
       }
     }
-    left_parts[part].ForEachRow([&](const Row& left_row) {
+    RETURN_IF_FAIL(left_parts[part].ForEachRow([&](const Row& left_row) {
       bool matched = false;
       if (integer_key) {
         const int64_t key = IntegerJoinKey(left_row, left_key_column);
@@ -1341,7 +1350,7 @@ StatusOr<Relation> HybridHashJoin(
         std::vector<Value> nulls(right_width);
         result.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
       }
-    });
+    }));
     // RIGHT / FULL: unmatched build rows of this partition, including rows
     // that only ever lived in the spill file (D8: never dropped).
     if (right_join) {
@@ -1354,7 +1363,8 @@ StatusOr<Relation> HybridHashJoin(
       }
     }
   }
-  result.FinishSpill();
+  RETURN_IF_FAIL(result.FinishSpill());
+  RETURN_IF_FAIL(result.GetStatus());
   return result;
 }
 
@@ -1567,16 +1577,11 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
                                source.join_type == JoinType::kFull;
   const bool want_right_nulls = source.join_type == JoinType::kRight ||
                                 source.join_type == JoinType::kFull;
-  // Unmatched right-side emission needs index-addressable rows; spillable
-  // inputs are materialized up front (the relational join is the fallback
-  // path, so this keeps semantics without touching the hybrid operator).
-  if (want_right_nulls && right.HasSpill()) {
-    ASSIGN_OR_RETURN(Relation, materialized_right, MaterializeRelation(right));
-    right = std::move(materialized_right);
-  }
-  right.FinishSpill();
+  RETURN_IF_FAIL(right.FinishSpill());
+  RETURN_IF_FAIL(left.GetStatus());
+  RETURN_IF_FAIL(right.GetStatus());
   const Row* right_base = right.rows.empty() ? nullptr : right.rows.data();
-  std::vector<char> right_matched(want_right_nulls ? right.rows.size() : 0, 0);
+  std::vector<char> right_matched(want_right_nulls ? right.TotalRows() : 0, 0);
   auto mark_right_match = [&](const Row& right_row) {
     if (!want_right_nulls || right_base == nullptr) {
       return;
@@ -1701,23 +1706,30 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
 
   if (equality_keys.empty()) {
     ++result.nested_loop_joins;
-    left.FinishSpill();
-    right.FinishSpill();
-    left.ForEachRow([&](const Row& left_row) {
+    RETURN_IF_FAIL(left.FinishSpill());
+    RETURN_IF_FAIL(right.FinishSpill());
+    RETURN_IF_FAIL(left.ForEachRow([&](const Row& left_row) {
       bool matched = false;
-      right.ForEachRow([&](const Row& right_row) {
+      size_t right_idx = 0;
+      const Status st = right.ForEachRow([&](const Row& right_row) {
         ++result.join_comparisons;
         Row combined = ConcatRows(left_row, right_row);
         if (matches(combined)) {
-          mark_right_match(right_row);
+          if (want_right_nulls && right_idx < right_matched.size()) {
+            right_matched[right_idx] = 1;
+          }
           result.AddRow(std::move(combined));
           matched = true;
         }
+        ++right_idx;
       });
+      if (st != Status::kSuccess && residual_error == Status::kSuccess) {
+        residual_error = st;
+      }
       if (!matched) {
         emit_unmatched(left_row);
       }
-    });
+    }));
   } else {
     ++result.hash_joins;
     // D8 (docs/design.md): the hybrid operator now implements null-safe
@@ -1929,19 +1941,54 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
   // RIGHT / FULL OUTER: every build-side row that never matched emits once,
   // null-extended on the left.
   if (want_right_nulls) {
-    for (size_t index = 0; index < right.rows.size(); ++index) {
-      if (right_matched[index] != 0) {
-        continue;
+    size_t index = 0;
+    RETURN_IF_FAIL(right.ForEachRow([&](const Row& right_row) {
+      if (index < right_matched.size() && right_matched[index] == 0) {
+        std::vector<Value> nulls(left.schema.ColumnCount());
+        result.AddRow(ConcatRows(Row(std::move(nulls)), right_row));
       }
-      std::vector<Value> nulls(left.schema.ColumnCount());
-      result.AddRow(ConcatRows(Row(std::move(nulls)), right.rows[index]));
-    }
+      ++index;
+    }));
   }
-  result.FinishSpill();
+  RETURN_IF_FAIL(result.FinishSpill());
+  RETURN_IF_FAIL(result.GetStatus());
   result.peak_intermediate_rows =
       std::max(result.peak_intermediate_rows, result.TotalRows());
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->join_ms += ElapsedMs(join_begin);
+  }
+  if (residual_error == Status::kSuccess && result.join_comparisons == 0 &&
+      !residual.empty()) {
+    Row dummy_row(std::vector<Value>(result.schema.ColumnCount()));
+    Scope scope{.row = &dummy_row, .schema = &result.schema, .outer = outer};
+    scope.using_columns = result.using_columns.get();
+    const auto validate_columns = [&](const auto& self,
+                                      const Expression& expr) -> Status {
+      if (!expr || expr->Type() == TypeTag::kQueryExp) {
+        return Status::kSuccess;
+      }
+      if (expr->Type() == TypeTag::kColumnValue) {
+        const ColumnName& col = expr->AsColumnValue().GetColumnName();
+        if (col.name != "*") {
+          StatusOr<Value> val = TryLookup(col, scope);
+          if (!val.HasValue()) {
+            return val.GetStatus();
+          }
+        }
+        return Status::kSuccess;
+      }
+      for (const Expression& child : ExpressionChildren(expr)) {
+        RETURN_IF_FAIL(self(self, child));
+      }
+      return Status::kSuccess;
+    };
+    for (const Expression& predicate : residual) {
+      const Status st = validate_columns(validate_columns, predicate);
+      if (st != Status::kSuccess) {
+        residual_error = st;
+        break;
+      }
+    }
   }
   RETURN_IF_FAIL(residual_error);
   return result;
@@ -1991,17 +2038,20 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
 
   if (equality_keys.empty()) {
     ++result.nested_loop_joins;
-    left.FinishSpill();
-    right.FinishSpill();
-    left.ForEachRow([&](const Row& left_row) {
-      right.ForEachRow([&](const Row& right_row) {
+    RETURN_IF_FAIL(left.FinishSpill());
+    RETURN_IF_FAIL(right.FinishSpill());
+    RETURN_IF_FAIL(left.ForEachRow([&](const Row& left_row) {
+      const Status st = right.ForEachRow([&](const Row& right_row) {
         ++result.join_comparisons;
         Row combined = ConcatRows(left_row, right_row);
         if (matches(combined)) {
           result.AddRow(std::move(combined));
         }
       });
-    });
+      if (st != Status::kSuccess && residual_error == Status::kSuccess) {
+        residual_error = st;
+      }
+    }));
   } else {
     ++result.hash_joins;
     const bool has_null_safe_key = std::ranges::any_of(
@@ -2320,6 +2370,39 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
       std::max(result.peak_intermediate_rows, result.TotalRows());
   if (context.execution_runtime() != nullptr) {
     context.execution_runtime()->join_ms += ElapsedMs(join_begin);
+  }
+  if (residual_error == Status::kSuccess && result.join_comparisons == 0 &&
+      !residual.empty()) {
+    Row dummy_row(std::vector<Value>(result.schema.ColumnCount()));
+    Scope scope{.row = &dummy_row, .schema = &result.schema, .outer = outer};
+    scope.using_columns = result.using_columns.get();
+    const auto validate_columns = [&](const auto& self,
+                                      const Expression& expr) -> Status {
+      if (!expr || expr->Type() == TypeTag::kQueryExp) {
+        return Status::kSuccess;
+      }
+      if (expr->Type() == TypeTag::kColumnValue) {
+        const ColumnName& col = expr->AsColumnValue().GetColumnName();
+        if (col.name != "*") {
+          StatusOr<Value> val = TryLookup(col, scope);
+          if (!val.HasValue()) {
+            return val.GetStatus();
+          }
+        }
+        return Status::kSuccess;
+      }
+      for (const Expression& child : ExpressionChildren(expr)) {
+        RETURN_IF_FAIL(self(self, child));
+      }
+      return Status::kSuccess;
+    };
+    for (const Expression& predicate : residual) {
+      const Status st = validate_columns(validate_columns, predicate);
+      if (st != Status::kSuccess) {
+        residual_error = st;
+        break;
+      }
+    }
   }
   RETURN_IF_FAIL(residual_error);
   return result;

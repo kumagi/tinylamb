@@ -19,6 +19,7 @@
 #include "database/transaction_context.hpp"
 #include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
@@ -27,7 +28,30 @@
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
+namespace tinylamb {
+struct LSTableStore;
+}  // namespace tinylamb
+
 namespace tinylamb::relational_detail {
+
+struct DeferredLSTablePkLookup {
+  std::shared_ptr<const LSTableStore> store;
+  slot_t pk_col{0};
+  slot_t store_pk_col{0};
+  slot_t payload_col{0};
+  slot_t target_proj_col{0};
+  ValueType payload_type{ValueType::kNull};
+  bool payload_unsigned{false};
+};
+
+struct DeferredLSTableProbe {
+  std::shared_ptr<const LSTableStore> store;
+  std::vector<slot_t> projection;
+  ScanRuntimeFilter runtime_filter;
+  std::vector<Expression> local_preds;
+  std::vector<IntegerPeekCompare> integer_peeks;
+  std::vector<DeferredLSTablePkLookup> pk_lookups;
+};
 
 template <typename Key, typename Hash = std::hash<Key>,
           typename Equal = std::equal_to<Key>>
@@ -195,7 +219,8 @@ StatusOr<Value> EvaluateProgramValue(const BytecodeProgram& program,
 StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     TransactionContext& context, const Relation& left, const Relation& right,
     const std::vector<Expression>& predicates, JoinType join_type,
-    const Scope* outer, const CteMap& ctes, GroupedJoinFusionSpec* fusion);
+    const Scope* outer, const CteMap& ctes, GroupedJoinFusionSpec* fusion,
+    const DeferredLSTableProbe* deferred_left_probe = nullptr);
 
 StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     TransactionContext& context, const SelectStatement& statement,

@@ -388,26 +388,27 @@ StatusOr<CivilTime> TryValueToCivilTime(const Value& val) {
                      "requires DATE, DATETIME or TIMESTAMP");
 }
 
-int64_t CivilTimeToNanos(const CivilTime& ct) {
+__int128 CivilTimeToNanos(const CivilTime& ct) {
   std::chrono::year_month_day ymd{
       std::chrono::year{ct.year},
       std::chrono::month{static_cast<unsigned>(ct.month)},
       std::chrono::day{static_cast<unsigned>(ct.day)}};
   int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-  int64_t secs =
-      (days * 86400LL) + (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
-  return (secs * 1000000000LL) + ct.subsecond_nanos;
+  __int128 secs = (static_cast<__int128>(days) * 86400) + (ct.hour * 3600LL) +
+                  (ct.minute * 60LL) + ct.second;
+  return (secs * 1000000000) + ct.subsecond_nanos;
 }
 
-CivilTime NanosToCivilTime(int64_t nanos) {
-  auto floor_div = [](int64_t a, int64_t b) -> int64_t {
-    const int64_t q = a / b;
+CivilTime NanosToCivilTime(__int128 nanos) {
+  auto floor_div = [](__int128 a, __int128 b) -> __int128 {
+    const __int128 q = a / b;
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
-  int64_t secs = floor_div(nanos, 1000000000LL);
-  int64_t sub_ns = nanos - (secs * 1000000000LL);
-  int64_t days = floor_div(secs, 86400LL);
-  int64_t day_secs = secs - (days * 86400LL);
+  __int128 secs = floor_div(nanos, 1000000000);
+  auto sub_ns = static_cast<int64_t>(nanos - (secs * 1000000000));
+  auto days = static_cast<int64_t>(floor_div(secs, 86400));
+  auto day_secs =
+      static_cast<int64_t>(secs - (static_cast<__int128>(days) * 86400));
 
   std::chrono::sys_days sys_d{std::chrono::days{days}};
   std::chrono::year_month_day ymd{sys_d};
@@ -631,7 +632,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (is_timestamp) {
       int tz_offset_sec =
           ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-      int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
+      __int128 ns = CivilTimeToNanos(ct) +
+                    (static_cast<__int128>(tz_offset_sec) * 1000000000);
       ct = NanosToCivilTime(ns);
     }
     const bool is_date = (name == "date_add" || name == "date_sub" ||
@@ -679,7 +681,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (is_timestamp) {
         int tz_offset_sec =
             ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-        int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL);
+        __int128 ns = CivilTimeToNanos(ct) -
+                      (static_cast<__int128>(tz_offset_sec) * 1000000000);
         CivilTime utc_ct = NanosToCivilTime(ns);
         return Value(FormatCivilTime(utc_ct) + "+00");
       }
@@ -778,7 +781,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::string(buf.data()));
     }
     if (is_timestamp) {
-      int64_t ns = CivilTimeToNanos(res_ct) + ((8 * 3600LL) * 1000000000LL);
+      __int128 ns = CivilTimeToNanos(res_ct) +
+                    (static_cast<__int128>(8 * 3600LL) * 1000000000);
       CivilTime utc_ct = NanosToCivilTime(ns);
       return Value(FormatCivilTime(utc_ct) + "+00");
     }
@@ -1590,7 +1594,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (s.find('+') != std::string::npos ||
           s.find('Z') != std::string::npos ||
           s.find('z') != std::string::npos) {
-        int64_t ns = CivilTimeToNanos(ct) + ((-8 * 3600LL) * 1000000000LL);
+        __int128 ns = CivilTimeToNanos(ct) +
+                      (static_cast<__int128>(-8 * 3600LL) * 1000000000);
         ct = NanosToCivilTime(ns);
       }
       return Value(FormatCivilTime(ct));
@@ -1608,7 +1613,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
       int tz_offset_sec = ParseTimeZoneOffset(arg1_str, &ct, 0);
       if (tz_offset_sec != 0) {
-        int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
+        __int128 ns = CivilTimeToNanos(ct) +
+                      (static_cast<__int128>(tz_offset_sec) * 1000000000);
         ct = NanosToCivilTime(ns);
       }
       return Value(FormatCivilTime(ct));
@@ -1700,7 +1706,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       }
     }
-    int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL);
+    __int128 ns = CivilTimeToNanos(ct) -
+                  (static_cast<__int128>(tz_offset_sec) * 1000000000);
     CivilTime utc_ct = NanosToCivilTime(ns);
     return Value(FormatCivilTime(utc_ct) + "+00");
   }
@@ -1723,8 +1730,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           if (tz_pos != std::string::npos) {
             tz_offset_sec = ParseTimeZoneOffset(s.substr(tz_pos), &ct, 0);
           }
-          int64_t ns = CivilTimeToNanos(ct) - (tz_offset_sec * 1000000000LL) +
-                       ((-8 * 3600LL) * 1000000000LL);
+          __int128 ns = CivilTimeToNanos(ct) -
+                        (static_cast<__int128>(tz_offset_sec) * 1000000000) +
+                        (static_cast<__int128>(-8 * 3600LL) * 1000000000);
           ct = NanosToCivilTime(ns);
         }
         std::array<char, 64> buf{};
@@ -1766,7 +1774,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       std::string tz_str = raw_str(arguments[1]);
       int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, 0);
       if (tz_offset_sec != 0) {
-        int64_t ns = CivilTimeToNanos(ct) + (tz_offset_sec * 1000000000LL);
+        __int128 ns = CivilTimeToNanos(ct) +
+                      (static_cast<__int128>(tz_offset_sec) * 1000000000);
         ct = NanosToCivilTime(ns);
       }
       std::array<char, 64> buf{};
@@ -2184,15 +2193,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const std::optional<int64_t> nanos =
+    const std::optional<__int128> nanos =
         ParseTimestampTextNanos(raw_str(arguments[0]));
     if (!nanos.has_value()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid TIMESTAMP: " + raw_str(arguments[0]));
     }
-    auto floor_div_unix = [](int64_t a, int64_t b) {
-      const int64_t q = a / b;
-      return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+    auto floor_div_unix = [](__int128 a, __int128 b) -> int64_t {
+      const __int128 q = a / b;
+      return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
+                                                                         : q);
     };
     if (name == "unix_date") {
       return Value(floor_div_unix(*nanos, 86400000000000LL));
@@ -2399,13 +2409,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (s1.find('+') != std::string::npos ||
         s1.find('Z') != std::string::npos ||
         s1.find('z') != std::string::npos) {
-      int64_t ns = CivilTimeToNanos(ct1) + ((-8 * 3600LL) * 1000000000LL);
+      __int128 ns = CivilTimeToNanos(ct1) +
+                    (static_cast<__int128>(-8 * 3600LL) * 1000000000);
       ct1 = NanosToCivilTime(ns);
     }
     if (s2.find('+') != std::string::npos ||
         s2.find('Z') != std::string::npos ||
         s2.find('z') != std::string::npos) {
-      int64_t ns = CivilTimeToNanos(ct2) + ((-8 * 3600LL) * 1000000000LL);
+      __int128 ns = CivilTimeToNanos(ct2) +
+                    (static_cast<__int128>(-8 * 3600LL) * 1000000000);
       ct2 = NanosToCivilTime(ns);
     }
     if (unit == "year" || unit == "years") {
@@ -2463,32 +2475,38 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
     CivilTime t1 = trunc_to_unit(ct1, unit);
     CivilTime t2 = trunc_to_unit(ct2, unit);
-    int64_t ns1 = CivilTimeToNanos(t1);
-    int64_t ns2 = CivilTimeToNanos(t2);
-    int64_t diff_ns = ns1 - ns2;
+    __int128 ns1 = CivilTimeToNanos(t1);
+    __int128 ns2 = CivilTimeToNanos(t2);
+    __int128 diff_ns = ns1 - ns2;
     if (unit == "week" || unit == "weeks") {
-      return Value(diff_ns / (7LL * 86400LL * 1000000000LL));
+      return Value(
+          static_cast<int64_t>(diff_ns / (7LL * 86400LL * 1000000000LL)));
     }
     if (unit == "day" || unit == "days") {
-      return Value(diff_ns / (86400LL * 1000000000LL));
+      return Value(static_cast<int64_t>(diff_ns / (86400LL * 1000000000LL)));
     }
     if (unit == "hour" || unit == "hours") {
-      return Value(diff_ns / (3600LL * 1000000000LL));
+      return Value(static_cast<int64_t>(diff_ns / (3600LL * 1000000000LL)));
     }
     if (unit == "minute" || unit == "minutes") {
-      return Value(diff_ns / (60LL * 1000000000LL));
+      return Value(static_cast<int64_t>(diff_ns / (60LL * 1000000000LL)));
     }
     if (unit == "second" || unit == "seconds") {
-      return Value(diff_ns / 1000000000LL);
+      return Value(static_cast<int64_t>(diff_ns / 1000000000LL));
     }
     if (unit == "millisecond" || unit == "milliseconds") {
-      return Value(diff_ns / 1000000LL);
+      return Value(static_cast<int64_t>(diff_ns / 1000000LL));
     }
     if (unit == "microsecond" || unit == "microseconds") {
-      return Value(diff_ns / 1000LL);
+      return Value(static_cast<int64_t>(diff_ns / 1000LL));
     }
     if (unit == "nanosecond" || unit == "nanoseconds") {
-      return Value(diff_ns);
+      if (diff_ns < std::numeric_limits<int64_t>::min() ||
+          diff_ns > std::numeric_limits<int64_t>::max()) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "nanosecond diff out of int64 range");
+      }
+      return Value(static_cast<int64_t>(diff_ns));
     }
     return StatusError(StatusCode::kInvalidArgument,
                        "unsupported unit in " + name + ": " + unit);
@@ -2549,15 +2567,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
     ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(d)));
     if (is_timestamp) {
-      int64_t d_utc_ns = CivilTimeToNanos(ct);
+      __int128 d_utc_ns = CivilTimeToNanos(ct);
       if (!has_explicit_tz) {
         int parse_tz_sec =
             ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-        d_utc_ns -= parse_tz_sec * 1000000000LL;
+        d_utc_ns -= static_cast<__int128>(parse_tz_sec) * 1000000000;
       }
       int trunc_tz_sec = ParseTimeZoneOffset(trunc_tz, &ct, -8 * 3600);
-      CivilTime trunc_local_ct =
-          NanosToCivilTime(d_utc_ns + (trunc_tz_sec * 1000000000LL));
+      CivilTime trunc_local_ct = NanosToCivilTime(
+          d_utc_ns + (static_cast<__int128>(trunc_tz_sec) * 1000000000));
       if (unit == "year" || unit == "years") {
         trunc_local_ct.month = 1;
         trunc_local_ct.day = 1;
@@ -2625,8 +2643,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       int new_trunc_tz_sec =
           ParseTimeZoneOffset(trunc_tz, &trunc_local_ct, -8 * 3600);
-      int64_t res_utc_ns =
-          CivilTimeToNanos(trunc_local_ct) - (new_trunc_tz_sec * 1000000000LL);
+      __int128 res_utc_ns =
+          CivilTimeToNanos(trunc_local_ct) -
+          (static_cast<__int128>(new_trunc_tz_sec) * 1000000000);
       CivilTime res_utc_ct = NanosToCivilTime(res_utc_ns);
       return Value(FormatCivilTime(res_utc_ct) + "+00");
     }
@@ -2970,20 +2989,25 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             "unsupported interval unit in " + name + ": " + unit);
       }
 
-      int64_t d_ns = CivilTimeToNanos(d_ct);
+      __int128 d_ns = CivilTimeToNanos(d_ct);
       if (is_ts && !d_has_tz) {
         int tz_sec =
             ParseTimeZoneOffset(GetDefaultTimeZone(), &d_ct, -8 * 3600);
-        d_ns -= tz_sec * 1000000000LL;
+        d_ns -= static_cast<__int128>(tz_sec) * 1000000000;
       }
-      int64_t orig_ns = CivilTimeToNanos(orig_ct);
+      __int128 orig_ns = CivilTimeToNanos(orig_ct);
       if (is_ts && (!has_origin || !orig_has_tz)) {
         int tz_sec =
             ParseTimeZoneOffset(GetDefaultTimeZone(), &orig_ct, -8 * 3600);
-        orig_ns -= tz_sec * 1000000000LL;
+        orig_ns -= static_cast<__int128>(tz_sec) * 1000000000;
       }
-      int64_t diff_ns = d_ns - orig_ns;
-      int64_t bucket_ns = orig_ns + (floor_div(diff_ns, step_ns) * step_ns);
+      __int128 diff_ns = d_ns - orig_ns;
+      auto floor_div_128 = [](__int128 a, __int128 b) -> __int128 {
+        const __int128 q = a / b;
+        return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+      };
+      __int128 bucket_ns =
+          orig_ns + (floor_div_128(diff_ns, step_ns) * step_ns);
       CivilTime res_ct = NanosToCivilTime(bucket_ns);
 
       if (d.type == ValueType::kDate && name == "date_bucket") {
@@ -5917,221 +5941,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(-arguments[0].value.double_value);
   }
   if (name == "format") {
-    if (arguments.empty()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "FORMAT requires at least 1 argument");
-    }
-    if (arguments[0].IsNull()) {
-      return Value();
-    }
-    // FORMAT propagates NULL from a value or a dynamic width/precision
-    // argument; rendering it as the literal text "NULL" changes the result
-    // from SQL NULL to a non-null STRING.
-    if (std::any_of(arguments.begin() + 1, arguments.end(),
-                    [](const Value& argument) { return argument.IsNull(); })) {
-      return Value();
-    }
-    const std::string fmt = raw_str(arguments[0]);
-    std::string result;
-    size_t arg_idx = 1;
-    for (size_t i = 0; i < fmt.size(); ++i) {
-      if (fmt[i] == '%' && i + 1 < fmt.size()) {
-        ++i;
-        if (fmt[i] == '%') {
-          result.push_back('%');
-          continue;
-        }
-        bool hash_flag = false;
-        bool zero_pad = false;
-        if (fmt[i] == '#') {
-          hash_flag = true;
-          ++i;
-        }
-        if (i < fmt.size() && fmt[i] == '0') {
-          zero_pad = true;
-          ++i;
-        }
-        int width = 0;
-        if (i < fmt.size() && fmt[i] == '*') {
-          if (arg_idx >= arguments.size()) {
-            return StatusError(
-                StatusCode::kInvalidArgument,
-                "FORMAT: not enough arguments for format string");
-          }
-          const Value& width_arg = arguments[arg_idx++];
-          if (width_arg.IsNull()) {
-            return Value();
-          }
-          if (width_arg.type != ValueType::kInt64) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "FORMAT: dynamic width must be an integer");
-          }
-          width = static_cast<int>(width_arg.value.int_value);
-          ++i;
-        }
-        while (i < fmt.size() &&
-               (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
-          width = (width * 10) + (fmt[i] - '0');
-          ++i;
-        }
-        int precision = -1;
-        if (i < fmt.size() && fmt[i] == '.') {
-          ++i;
-          if (i < fmt.size() && fmt[i] == '*') {
-            if (arg_idx >= arguments.size()) {
-              return StatusError(
-                  StatusCode::kInvalidArgument,
-                  "FORMAT: not enough arguments for format string");
-            }
-            const Value& precision_arg = arguments[arg_idx++];
-            if (precision_arg.IsNull()) {
-              return Value();
-            }
-            if (precision_arg.type != ValueType::kInt64) {
-              return StatusError(
-                  StatusCode::kInvalidArgument,
-                  "FORMAT: dynamic precision must be an integer");
-            }
-            precision = static_cast<int>(precision_arg.value.int_value);
-            ++i;
-          } else {
-            precision = 0;
-          }
-          while (i < fmt.size() &&
-                 (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
-            precision = (precision * 10) + (fmt[i] - '0');
-            ++i;
-          }
-        }
-        if (i >= fmt.size()) {
-          break;
-        }
-        char spec = fmt[i];
-
-        if (arg_idx >= arguments.size()) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "FORMAT: not enough arguments for format string");
-        }
-        const Value& arg = arguments[arg_idx++];
-        std::string formatted_item;
-        if (spec == 'T' || spec == 't') {
-          if (arg.IsNull()) {
-            formatted_item = "NULL";
-          } else if (arg.type == ValueType::kVarChar) {
-            std::string s = raw_str(arg);
-            formatted_item += "\"";
-            for (char c : s) {
-              if (c == '"') {
-                formatted_item += "\\\"";
-              } else if (c == '\\') {
-                formatted_item += "\\\\";
-              } else if (c == '\n') {
-                formatted_item += "\\n";
-              } else if (c == '\r') {
-                formatted_item += "\\r";
-              } else if (c == '\t') {
-                formatted_item += "\\t";
-              } else {
-                formatted_item.push_back(c);
-              }
-            }
-            formatted_item += "\"";
-          } else if (arg.type == ValueType::kInt64) {
-            formatted_item = std::to_string(arg.value.int_value);
-          } else if (arg.type == ValueType::kDouble) {
-            formatted_item = std::to_string(arg.value.double_value);
-          } else {
-            formatted_item = arg.AsString();
-          }
-        } else if (spec == 's') {
-          if (arg.IsNull()) {
-            formatted_item = "NULL";
-          } else {
-            formatted_item = raw_str(arg);
-          }
-        } else if (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
-                   spec == 'X' || spec == 'o') {
-          if (arg.IsNull()) {
-            formatted_item = "NULL";
-          } else if (arg.type == ValueType::kInt64) {
-            if (spec == 'x') {
-              std::array<char, 32> buf{};
-              (void)snprintf(buf.data(), buf.size(),
-                             hash_flag ? "0x%lx" : "%lx",
-                             static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf.data();
-            } else if (spec == 'X') {
-              std::array<char, 32> buf{};
-              (void)snprintf(buf.data(), buf.size(),
-                             hash_flag ? "0X%lX" : "%lX",
-                             static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf.data();
-            } else if (spec == 'o') {
-              std::array<char, 32> buf{};
-              (void)snprintf(buf.data(), buf.size(), hash_flag ? "0%lo" : "%lo",
-                             static_cast<unsigned long>(arg.value.int_value));
-              formatted_item = buf.data();
-            } else {
-              formatted_item = std::to_string(arg.value.int_value);
-            }
-          } else if (arg.type == ValueType::kDouble) {
-            formatted_item =
-                std::to_string(static_cast<int64_t>(arg.value.double_value));
-          } else {
-            return StatusError(
-                StatusCode::kInvalidArgument,
-                "FORMAT: invalid argument type for integer specifier");
-          }
-        } else if (spec == 'f' || spec == 'g' || spec == 'e' || spec == 'E') {
-          if (arg.IsNull()) {
-            formatted_item = "NULL";
-          } else if (arg.type == ValueType::kDouble) {
-            formatted_item = FormatFloatingForPrintf(arg.value.double_value,
-                                                     spec, precision);
-          } else if (arg.type == ValueType::kInt64) {
-            formatted_item = FormatFloatingForPrintf(
-                static_cast<double>(arg.value.int_value), spec, precision);
-          } else {
-            return StatusError(
-                StatusCode::kInvalidArgument,
-                "FORMAT: invalid argument type for float specifier");
-          }
-        } else {
-          result.push_back('%');
-          result.push_back(spec);
-          continue;
-        }
-
-        if (precision >= 0 && (spec == 't' || spec == 'T' || spec == 's')) {
-          if (formatted_item.size() > static_cast<size_t>(precision)) {
-            formatted_item =
-                formatted_item.substr(0, static_cast<size_t>(precision));
-          }
-        }
-        if (precision >= 0 &&
-            (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
-             spec == 'X' || spec == 'o') &&
-            formatted_item != "NULL" &&
-            formatted_item.size() < static_cast<size_t>(precision)) {
-          formatted_item.insert(
-              0, static_cast<size_t>(precision) - formatted_item.size(), '0');
-        }
-        if (width > 0 && formatted_item.size() < static_cast<size_t>(width)) {
-          const size_t pad_len =
-              static_cast<size_t>(width) - formatted_item.size();
-          char pad_char = zero_pad ? '0' : ' ';
-          formatted_item.insert(0, pad_len, pad_char);
-        }
-        result += formatted_item;
-      } else {
-        result.push_back(fmt[i]);
-      }
-    }
-    if (arg_idx < arguments.size()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "FORMAT: too many arguments for format string");
-    }
-    return Value(std::move(result));
+    return ExecuteFunction(name, arguments);
   }
 
   if (name == "current_timestamp") {

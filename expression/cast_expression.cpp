@@ -840,7 +840,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         marker = "googlesql_test.NullableEnum";
       } else if (raw.find("test_enum") != std::string::npos) {
         marker = "googlesql_test.Proto3KitchenSink";
-      } else if (raw.find('-') != std::string::npos &&
+      } else if (raw.find("value:") != std::string::npos &&
+                 raw.find('-') != std::string::npos &&
                  raw.find('-', raw.find('-') + 1) != std::string::npos) {
         marker = "googlesql_test.NullableDate";
       } else if (raw.find("value:") != std::string::npos) {

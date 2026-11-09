@@ -20,6 +20,7 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "executor/query_memory.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/column.hpp"
@@ -702,9 +703,10 @@ struct RunOutcome {
 };
 
 RunOutcome RunStatement(Database& db, TransactionContext& ctx,
-                        const std::string& sql) {
+                        const std::string& sql, bool force_relational = false) {
   RunOutcome outcome;
   SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
     return outcome;  // rejected: skip, not a finding
@@ -779,32 +781,140 @@ struct ScopedBytecodeDisabled {
   bool previous_;
 };
 
+struct ScopedQueryMemory {
+  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+    QueryMemoryBudget::Global().ResetForTest(budget_bytes);
+  }
+  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ScopedQueryMemory(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory(ScopedQueryMemory&&) = delete;
+  ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+};
+
+struct ScopedEnvVar {
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    if (const char* prev = std::getenv(name)) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    platform::SetEnv(name, value);
+  }
+  ~ScopedEnvVar() {
+    if (had_prev_) {
+      platform::SetEnv(name_, prev_.c_str());
+    } else {
+      platform::UnsetEnv(name_);
+    }
+  }
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+  ScopedEnvVar(ScopedEnvVar&&) = delete;
+  ScopedEnvVar& operator=(ScopedEnvVar&&) = delete;
+
+  const char* name_;
+  bool had_prev_{false};
+  std::string prev_;
+};
+
+bool IsPlanOrderIndependentSelect(std::string_view sql) {
+  for (const std::string_view tok :
+       {"LIMIT", "OFFSET", "OVER", "STRING_AGG", "ARRAY_AGG", "ANY_VALUE",
+        "TABLESAMPLE", "RAND"}) {
+    if (sql.find(tok) != std::string_view::npos) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Oracle (2): re-runs `sql` with bytecode disabled and compares the AST-path
-// result against `first`, produced on the bytecode/JIT fast path. Returns ""
-// on agreement, otherwise a diagnostic naming the diverging path.
+// result against `first`, produced on the bytecode/JIT fast path. Also checks
+// relational fallback, Cascades grouped route, and 512B disk-spill budget.
+// Returns "" on agreement, otherwise a diagnostic naming the diverging path.
 std::string CheckEvaluationPaths(Database& db, TransactionContext& ctx,
                                  const std::string& sql,
                                  const RunOutcome& first) {
-  ScopedBytecodeDisabled guard(true);
-  const RunOutcome again = RunStatement(db, ctx, sql);
-  if (again.threw) {
-    return "[GRIFFIN-THROW-AST] " + sql + "\n  what: " + again.error + "\n" +
-           "  bytecode path: " + std::to_string(first.rows.size()) + " rows\n";
-  }
-  if (again.ran != first.ran) {
-    return "[GRIFFIN-PATH MISMATCH] " + sql +
-           "\n  bytecode ran=" + (first.ran ? "true" : "false") +
-           " ast ran=" + (again.ran ? "true" : "false") + "\n";
-  }
-  if (again.ran && again.rows != first.rows) {
-    std::string report = "[GRIFFIN-RESULT MISMATCH] " + sql + "\n";
-    for (const std::string& row : first.rows) {
-      report += "  bytecode| " + row + "\n";
+  {
+    ScopedBytecodeDisabled guard(true);
+    const RunOutcome again = RunStatement(db, ctx, sql);
+    if (again.threw) {
+      return "[GRIFFIN-THROW-AST] " + sql + "\n  what: " + again.error + "\n" +
+             "  bytecode path: " + std::to_string(first.rows.size()) +
+             " rows\n";
     }
-    for (const std::string& row : again.rows) {
-      report += "  ast     | " + row + "\n";
+    if (again.ran != first.ran) {
+      return "[GRIFFIN-PATH MISMATCH] " + sql +
+             "\n  bytecode ran=" + (first.ran ? "true" : "false") +
+             " ast ran=" + (again.ran ? "true" : "false") + "\n";
     }
-    return report;
+    if (again.ran && again.rows != first.rows) {
+      std::string report = "[GRIFFIN-RESULT MISMATCH] " + sql + "\n";
+      for (const std::string& row : first.rows) {
+        report += "  bytecode| " + row + "\n";
+      }
+      for (const std::string& row : again.rows) {
+        report += "  ast     | " + row + "\n";
+      }
+      return report;
+    }
+  }
+
+  const bool order_indep = IsPlanOrderIndependentSelect(sql);
+  // Check external disk spill (512B budget) on all SELECTs for crash/throw
+  // safety, and for exact multiset agreement when order-independent.
+  {
+    ScopedQueryMemory low_mem(512);
+    const RunOutcome spill = RunStatement(db, ctx, sql);
+    if (spill.threw) {
+      return "[GRIFFIN-THROW-SPILL] " + sql + "\n  what: " + spill.error + "\n";
+    }
+    if (order_indep && spill.ran && spill.rows != first.rows) {
+      std::string report = "[GRIFFIN-SPILL MISMATCH] " + sql + "\n";
+      for (const std::string& row : first.rows) {
+        report += "  default| " + row + "\n";
+      }
+      for (const std::string& row : spill.rows) {
+        report += "  spill  | " + row + "\n";
+      }
+      return report;
+    }
+  }
+
+  if (order_indep) {
+    const RunOutcome rel =
+        RunStatement(db, ctx, sql, /*force_relational=*/true);
+    if (rel.threw) {
+      return "[GRIFFIN-THROW-RELATIONAL] " + sql + "\n  what: " + rel.error +
+             "\n";
+    }
+    if (rel.ran && rel.rows != first.rows) {
+      std::string report = "[GRIFFIN-RELATIONAL MISMATCH] " + sql + "\n";
+      for (const std::string& row : first.rows) {
+        report += "  default   | " + row + "\n";
+      }
+      for (const std::string& row : rel.rows) {
+        report += "  relational| " + row + "\n";
+      }
+      return report;
+    }
+
+    ScopedEnvVar gr("TINYLAMB_GROUPED_ROUTE", "cascades");
+    const RunOutcome cas = RunStatement(db, ctx, sql);
+    if (cas.threw) {
+      return "[GRIFFIN-THROW-CASCADES] " + sql + "\n  what: " + cas.error +
+             "\n";
+    }
+    if (cas.ran && cas.rows != first.rows) {
+      std::string report = "[GRIFFIN-CASCADES MISMATCH] " + sql + "\n";
+      for (const std::string& row : first.rows) {
+        report += "  default | " + row + "\n";
+      }
+      for (const std::string& row : cas.rows) {
+        report += "  cascades| " + row + "\n";
+      }
+      return report;
+    }
   }
   return "";
 }
@@ -848,6 +958,90 @@ std::string RunSession(
   return "";
 }
 
+const std::vector<std::vector<std::string>>& ExtendedSeedPool() {
+  static const auto* pool = new std::vector<std::vector<std::string>>{
+      // ARRAY<INT64> table + GROUP BY + UNNEST
+      {
+          "CREATE TABLE gf_arr (id INT64, grp INT64, tags ARRAY<INT64>, label "
+          "STRING);",
+          "INSERT INTO gf_arr VALUES (1, 10, [1, 2, 3], 'a'), (2, 10, [], "
+          "'b'), (3, 20, NULL, 'a'), (4, 20, [4, 5], NULL);",
+          "SELECT grp, COUNT(*), MIN(id), MAX(id), SUM(id) FROM gf_arr GROUP "
+          "BY grp;",
+          "SELECT label, COUNT(*), SUM(id) FROM gf_arr GROUP BY label;",
+          "SELECT a.id, u FROM gf_arr a, UNNEST(a.tags) AS u WHERE a.grp >= "
+          "10;",
+      },
+      // USING lstable PAX columnar store + ANALYZE + CUBE + filtered agg
+      {
+          "CREATE TABLE gf_lst (u INT64, a INT64, b FLOAT64, s STRING) USING "
+          "lstable;",
+          "INSERT INTO gf_lst VALUES (1, 10, 1.5, 'x'), (2, 10, -0.5, 'yy'), "
+          "(3, 20, NULL, 'x'), (4, NULL, 3.25, NULL), (5, 20, 2.0, 'yy');",
+          "ANALYZE gf_lst;",
+          "SELECT a, s, COUNT(*), COUNT(s), SUM(a), SUM(b), MIN(s), MAX(s) "
+          "FROM gf_lst GROUP BY CUBE(a, s);",
+          "SELECT a, COUNT(*) FILTER (WHERE s = 'x') AS cx, SUM(a) FILTER "
+          "(WHERE b > 0) AS sb FROM gf_lst GROUP BY a HAVING COUNT(*) FILTER "
+          "(WHERE s = 'x') >= 0;",
+      },
+      // DATE + STRUCT + TO_JSON_STRING + STRPOS
+      {
+          "CREATE TABLE gf_json (id INT64, dt DATE, name STRING, v INT64);",
+          "INSERT INTO gf_json VALUES (1, DATE '2024-01-15', 'alpha-1', 10), "
+          "(2, DATE '2024-06-30', 'beta-2-x', -5), (3, NULL, NULL, 0);",
+          "SELECT id, TO_JSON_STRING(STRUCT(id AS k, dt AS d, name AS n, v AS "
+          "val)) AS j FROM gf_json;",
+          "SELECT id, DATE_DIFF(DATE_ADD(dt, INTERVAL v DAY), dt, DAY) AS dd, "
+          "STRPOS(COALESCE(name, ''), '-') AS sp FROM gf_json;",
+      },
+      // Nested WITH CTEs + LATERAL + IS NOT DISTINCT FROM outer join
+      {
+          "CREATE TABLE gf_p (pk INT64, pv INT64, ps STRING);",
+          "INSERT INTO gf_p VALUES (1, 100, 'x'), (2, NULL, 'y'), (NULL, 50, "
+          "'x'), (3, 200, NULL);",
+          "WITH c1 AS (SELECT pk, pv, ps FROM gf_p WHERE pv IS NOT NULL OR pk "
+          "IS NULL), c2 AS (SELECT pk, pv FROM c1 WHERE pk IS NOT NULL) SELECT "
+          "c1.pk, c2.pv, c1.ps FROM c1 LEFT JOIN c2 ON c1.pk IS NOT DISTINCT "
+          "FROM c2.pk;",
+          "SELECT p.pk, lat.cnt, lat.sm FROM gf_p p, LATERAL (SELECT COUNT(*) "
+          "AS cnt, SUM(q.pv) AS sm FROM gf_p q WHERE q.ps IS NOT DISTINCT FROM "
+          "p.ps) lat;",
+      },
+      // Fused grouped-join + HAVING over MIN/MAX/SUM/COUNT + MERGE INTO
+      {
+          "CREATE TABLE gf_fact (u INT64, k INT64, a INT64);",
+          "CREATE TABLE gf_dim (k INT64, tag STRING);",
+          "INSERT INTO gf_fact VALUES (1, 1, 10), (2, 1, -5), (3, 2, 20), (4, "
+          "NULL, 7), (5, 2, -1);",
+          "INSERT INTO gf_dim VALUES (1, 'x'), (2, 'yy'), (3, 'z');",
+          "SELECT d.tag, COUNT(*), MIN(f.a), MAX(f.u), SUM(f.a) FROM gf_fact f "
+          "JOIN gf_dim d ON f.k = d.k GROUP BY d.tag HAVING MIN(f.a) >= -10 OR "
+          "MAX(f.u) >= 1;",
+          "MERGE INTO gf_dim t USING gf_fact s ON t.k = s.u WHEN MATCHED AND "
+          "s.a > 0 THEN UPDATE SET tag = 'upd' WHEN NOT MATCHED THEN INSERT "
+          "(k, tag) VALUES (s.u + 10, 'new');",
+          "SELECT k, tag FROM gf_dim;",
+      },
+      // Multi-window RANGE/GROUPS + EXCLUDE + QUALIFY + 3-way set ops
+      {
+          "CREATE TABLE gf_win (u INT64, grp STRING, a INT64, b INT64);",
+          "INSERT INTO gf_win VALUES (1, 'x', 1, 10), (2, 'x', 1, 20), (3, "
+          "'x', 2, 30), (4, 'y', NULL, 40), (5, NULL, 2, -5);",
+          "SELECT u, grp, a, SUM(b) OVER (PARTITION BY grp ORDER BY a RANGE "
+          "BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) AS rs, "
+          "COUNT(grp) OVER (PARTITION BY grp ORDER BY a GROUPS BETWEEN 1 "
+          "PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) AS gc, DENSE_RANK() OVER "
+          "(PARTITION BY grp ORDER BY a NULLS FIRST) AS dr FROM gf_win QUALIFY "
+          "dr <= 2;",
+          "(SELECT a, b FROM gf_win WHERE b > 0 EXCEPT ALL SELECT a, b FROM "
+          "gf_win WHERE grp = 'y') UNION ALL (SELECT a, b FROM gf_win "
+          "INTERSECT ALL SELECT a, b FROM gf_win WHERE a IS NOT NULL);",
+      },
+  };
+  return *pool;
+}
+
 }  // namespace
 
 std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
@@ -879,7 +1073,13 @@ std::string RunGriffinIteration(std::mt19937& rng, bool verbose,
     const MetadataSnapshot meta = SnapshotMetadata(db, ctx);
     return SubstituteIdentifiers(sql, meta, rng);
   };
-  const std::string report = RunSession(db, ctx, statements, &t, substitute);
+  std::string report = RunSession(db, ctx, statements, &t, substitute);
+  if (report.empty()) {
+    const auto& ext_pool = ExtendedSeedPool();
+    const std::vector<std::string>& ext_case =
+        ext_pool[platform::UniformInt<size_t>(rng, 0, ext_pool.size() - 1)];
+    report = RunSession(db, ctx, ext_case, &t, nullptr);
+  }
   db.DeleteAll();
 
   if (verbose && report.empty()) {

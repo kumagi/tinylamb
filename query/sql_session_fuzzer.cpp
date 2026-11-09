@@ -1132,16 +1132,120 @@ std::string CheckIndexProbe(Database& db, TransactionContext& ctx, Gen& g,
     actual.push_back(r.ToString());
   }
   std::sort(actual.begin(), actual.end());
-  if (*expected == actual) {
-    return "";
+  if (*expected != actual) {
+    std::string report = "index probe mismatch on " + t.name + " :: " + *sql +
+                         "\n  mirror says " + std::to_string(expected->size()) +
+                         " rows, engine says " + std::to_string(actual.size()) +
+                         "\n";
+    report += "  expected:\n" + DumpLines(*expected);
+    report += "  actual:\n" + DumpLines(actual);
+    return report;
   }
-  std::string report = "index probe mismatch on " + t.name + " :: " + *sql +
-                       "\n  mirror says " + std::to_string(expected->size()) +
-                       " rows, engine says " + std::to_string(actual.size()) +
-                       "\n";
-  report += "  expected:\n" + DumpLines(*expected);
-  report += "  actual:\n" + DumpLines(actual);
-  return report;
+
+  // Also validate specialized index-only / skip-scan / min-max access paths
+  // (IndexOnlyScan, SkipScanDistinct, MinMaxIndexPlan, 2nd-column SkipScan)
+  // deterministically without perturbing `g`'s RNG stream.
+  const size_t spec_kind = (t.rows.size() * 31 + static_cast<size_t>(slot) * 7 +
+                            key.size() * 13 + static_cast<size_t>(op[0])) %
+                           4;
+  std::string spec_sql;
+  std::vector<std::string> spec_expected;
+  if (spec_kind == 0) {
+    // Covering IndexOnlyScan: project only the leading index column.
+    spec_sql = "SELECT " + ColName(slot) + " FROM " + t.name + " WHERE " +
+               ColName(slot) + " " + op + " " + lit(probe) + ";";
+    std::vector<Row> spec_want;
+    spec_want.reserve(want.size());
+    for (const Row& r : want) {
+      spec_want.push_back(Row({r[static_cast<size_t>(slot)]}));
+    }
+    spec_expected = SortedDump(spec_want);
+  } else if (spec_kind == 1) {
+    // SkipScanDistinct: SELECT DISTINCT <leading_key_col> FROM t.
+    spec_sql = "SELECT DISTINCT " + ColName(slot) + " FROM " + t.name + ";";
+    std::vector<Row> spec_want;
+    spec_want.reserve(t.rows.size());
+    for (const Row& r : t.rows) {
+      spec_want.push_back(Row({r[static_cast<size_t>(slot)]}));
+    }
+    spec_expected = SortedDump(spec_want);
+    spec_expected.erase(std::unique(spec_expected.begin(), spec_expected.end()),
+                        spec_expected.end());
+  } else if (spec_kind == 2) {
+    // MinMaxIndexPlan: SELECT MIN(col), MAX(col), COUNT(col) FROM t.
+    spec_sql = "SELECT MIN(" + ColName(slot) + "), MAX(" + ColName(slot) +
+               "), COUNT(" + ColName(slot) + ") FROM " + t.name + ";";
+    Value min_v;
+    Value max_v;
+    int64_t cnt = 0;
+    for (const Row& r : t.rows) {
+      const Value& v = r[static_cast<size_t>(slot)];
+      if (v.IsNull()) {
+        continue;
+      }
+      ++cnt;
+      if (min_v.IsNull() || v < min_v) {
+        min_v = v;
+      }
+      if (max_v.IsNull() || max_v < v) {
+        max_v = v;
+      }
+    }
+    spec_expected = SortedDump({Row({min_v, max_v, Value(cnt)})});
+  } else if (key.size() >= 2) {
+    // Composite 2nd-key IndexSkipScan + IndexOnlyScan.
+    const int slot1 = key[1];
+    const MirrorColumn& col1 = t.columns[static_cast<size_t>(slot1)];
+    Value probe1;
+    if (!t.rows.empty()) {
+      probe1 = t.rows[0][static_cast<size_t>(slot1)];
+    } else if (col1.type == ColType::kInt) {
+      probe1 = Value(int64_t{0});
+    } else if (col1.type == ColType::kStr) {
+      probe1 = Value(std::string("a"));
+    } else {
+      probe1 = Value(0.0);
+    }
+    spec_sql = "SELECT " + ColName(slot) + ", " + ColName(slot1) + " FROM " +
+               t.name + " WHERE " + ColName(slot1) + " = " + lit(probe1) + ";";
+    std::vector<Row> spec_want;
+    for (const Row& r : t.rows) {
+      const Value& v1 = r[static_cast<size_t>(slot1)];
+      if (!v1.IsNull() && !probe1.IsNull() && v1 == probe1) {
+        spec_want.push_back(
+            Row({r[static_cast<size_t>(slot)], r[static_cast<size_t>(slot1)]}));
+      }
+    }
+    spec_expected = SortedDump(spec_want);
+  }
+
+  if (!spec_sql.empty()) {
+    auto spec_got = RunSelect(db, ctx, spec_sql, error);
+    if (!spec_got.has_value()) {
+      *sql = spec_sql;
+      *expected = spec_expected;
+      return "index specialized probe engine error: " + spec_sql +
+             " :: " + *error + "\n";
+    }
+    std::vector<std::string> spec_actual;
+    spec_actual.reserve(spec_got->size());
+    for (const Row& r : *spec_got) {
+      spec_actual.push_back(r.ToString());
+    }
+    std::sort(spec_actual.begin(), spec_actual.end());
+    *sql = spec_sql;
+    *expected = spec_expected;
+    if (spec_expected != spec_actual) {
+      std::string report =
+          "index specialized probe mismatch on " + t.name + " :: " + spec_sql +
+          "\n  mirror says " + std::to_string(spec_expected.size()) +
+          " rows, engine says " + std::to_string(spec_actual.size()) + "\n";
+      report += "  expected:\n" + DumpLines(spec_expected);
+      report += "  actual:\n" + DumpLines(spec_actual);
+      return report;
+    }
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------

@@ -22,10 +22,10 @@ temporary file + `fsync` + `rename` with the following layout:
 
 | Section | Fields | Purpose |
 |---------|--------|---------|
-| Header | `magic` (`kFuzzyCheckpointMagic` = `TLCP`), `version` (= 1), `next_pid`, `begin_lsn` | Snapshot identity, page-id high-water mark, and WAL replay anchor LSN |
-| Pages | `num_pages` followed by `(page_id, type, page_lsn, rec_lsn, prev_pid, next_pid, row_count, slots...)` | Full state of all live `RowPage` blocks |
-| Trees | `num_trees` followed by `(tree_id, destroyed, committed_mem, runs, uncommitted memtable...)` | Full state of all LSM-Tree indexes and catalog trees |
-| Recovery metadata | `dpt` (`page_id -> rec_lsn`) and `att` (`txn_id -> last_lsn, first_lsn, status`) | Dirty-page table and active-transaction table at snapshot time |
+| Header | `magic` (`kFuzzyCheckpointMagic` = `TLSMCKP1`), `version` (= 2), `replay_start_lsn`, `max_committed_txn_id` | Snapshot identity, WAL replay anchor LSN, and highest committed transaction ID |
+| Pages | `max_pid`, `free_pages`, `num_pages` followed by `(page_id, prev_pid, next_pid, link_lsn, slots, slot_lsns)` | Committed state of all live `RowPage` blocks |
+| Trees | `num_trees` followed by `(tree_id, compacted_entries...)` | Compacted committed state of all LSM-Tree indexes and catalog trees |
+| Footer | `crc32c` | Whole-payload CRC-32C integrity check |
 
 On startup, `RecoveryManager::RecoverFrom` loads `<dbname>.db` via
 `PageManager::LoadFuzzyCheckpoint` and replays WAL segments starting from

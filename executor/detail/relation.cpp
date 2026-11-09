@@ -192,6 +192,10 @@ void Relation::AddRow(Row row) {
 }
 
 void Relation::MergeInMemoryShard(Relation&& shard) {
+  if (shard.spill_error_ != Status::kSuccess &&
+      spill_error_ == Status::kSuccess) {
+    spill_error_ = shard.spill_error_;
+  }
   if (shard.rows.empty() && !shard.HasSpill()) {
     shard.ReleaseCharge();
     return;
@@ -221,7 +225,10 @@ void Relation::MergeInMemoryShard(Relation&& shard) {
   }
   shard.rows.clear();
   if (shard.HasSpill()) {
-    shard.ForEachRow([this](const Row& row) { AddRow(row); });
+    const Status st = shard.ForEachRow([this](const Row& row) { AddRow(row); });
+    if (st != Status::kSuccess && spill_error_ == Status::kSuccess) {
+      spill_error_ = st;
+    }
   }
   shard.ReleaseCharge();
 }
@@ -232,7 +239,7 @@ Status Relation::FinishSpill() {
     if (status != Status::kSuccess && spill_error_ == Status::kSuccess) {
       spill_error_ = status;
     }
-    return status;
+    return spill_error_;
   }
   return spill_error_;
 }

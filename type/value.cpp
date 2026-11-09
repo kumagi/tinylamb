@@ -508,10 +508,26 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
     case ValueType::kDouble:
       return DeserializeDouble(src, &value.double_value);
     case ValueType::kArray: {
+      static thread_local size_t deserialize_depth = 0;
+      if (deserialize_depth >= 32) {
+        *out_status = StatusError(StatusCode::kCorrupt,
+                                  "corrupt array: nesting depth exceeded");
+        return 0;
+      }
+      struct DepthGuard {
+        DepthGuard() { ++deserialize_depth; }
+        ~DepthGuard() { --deserialize_depth; }
+      } guard;
       array_.reset();
       const char* cursor = src;
       uint32_t count = 0;
       cursor += DeserializeU32(cursor, &count);
+      constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
+      if (count > kMaxEncodedArrayElements) {
+        *out_status =
+            StatusError(StatusCode::kCorrupt, "corrupt array element count");
+        return 0;
+      }
       std::string_view sql_type;
       cursor += DeserializeStringView(cursor, &sql_type);
       std::vector<Value> elements;
@@ -568,9 +584,25 @@ size_t Value::SkipSerializedInto(const char* src, ValueType as_type,
       return sizeof(bin_size_t) + len;
     }
     case ValueType::kArray: {
+      static thread_local size_t skip_depth = 0;
+      if (skip_depth >= 32) {
+        *out_status = StatusError(StatusCode::kCorrupt,
+                                  "corrupt array: nesting depth exceeded");
+        return 0;
+      }
+      struct DepthGuard {
+        DepthGuard() { ++skip_depth; }
+        ~DepthGuard() { --skip_depth; }
+      } guard;
       const char* cursor = src;
       uint32_t count = 0;
       cursor += DeserializeU32(cursor, &count);
+      constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
+      if (count > kMaxEncodedArrayElements) {
+        *out_status =
+            StatusError(StatusCode::kCorrupt, "corrupt array element count");
+        return 0;
+      }
       std::string_view sql_type;
       cursor += DeserializeStringView(cursor, &sql_type);
       for (uint32_t i = 0; i < count; ++i) {
@@ -1159,6 +1191,16 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       return len + 1;
     }
     case static_cast<uint8_t>(ValueType::kArray): {
+      static thread_local size_t memcmp_decode_depth = 0;
+      if (memcmp_decode_depth >= 32) {
+        return StatusError(
+            StatusCode::kCorrupt,
+            "corrupt memcomparable array: nesting depth exceeded");
+      }
+      struct DepthGuard {
+        DepthGuard() { ++memcmp_decode_depth; }
+        ~DepthGuard() { --memcmp_decode_depth; }
+      } guard;
       type = ValueType::kArray;
       const char* p = cursor;
       uint32_t be = 0;
@@ -1187,9 +1229,12 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       ++p;
       // The count comes from the encoded image; a corrupt key may carry an
       // absurd value, so reject reservations beyond any real page-sized
-      // array instead of attempting a multi-gigabyte allocation.
+      // array or beyond the remaining byte budget (each element consumes at
+      // least one presence byte) instead of attempting a multi-megabyte
+      // allocation per nested frame.
       constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
-      if (count > kMaxEncodedArrayElements) {
+      if (count > kMaxEncodedArrayElements ||
+          count > static_cast<size_t>(end - p)) {
         return StatusError(StatusCode::kCorrupt,
                            "corrupt memcomparable array element count");
       }

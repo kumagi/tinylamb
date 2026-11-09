@@ -289,6 +289,29 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       if (!relations.contains(col_name.schema)) {
         return Status::kNotExists;
       }
+      if (!expand_proto_value_table && col_name.name != "*") {
+        bool relation_has_known_columns = false;
+        bool column_exists = false;
+        const size_t dot = col_name.name.find('.');
+        const std::string_view root_name =
+            dot == std::string::npos
+                ? std::string_view(col_name.name)
+                : std::string_view(col_name.name).substr(0, dot);
+        for (const ColumnName& known : all_cols) {
+          if (!CaseInsensitiveEquals(known.schema, col_name.schema)) {
+            continue;
+          }
+          relation_has_known_columns = true;
+          if (CaseInsensitiveEquals(known.name, col_name.name) ||
+              CaseInsensitiveEquals(known.name, root_name)) {
+            column_exists = true;
+            break;
+          }
+        }
+        if (relation_has_known_columns && !column_exists) {
+          return Status::kNotExists;
+        }
+      }
       return Status::kSuccess;
     }
     if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
@@ -593,7 +616,12 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     }
     if (leaf_schema != nullptr) {
       const Schema& sc = *leaf_schema;
-      relation_column_counts[relation] = sc.ColumnCount();
+      relation_column_counts[relation] =
+          (sc.ColumnCount() == 1 &&
+           sc.GetColumn(0).Type() != ValueType::kVarChar &&
+           sc.GetColumn(0).Type() != ValueType::kNull)
+              ? 2
+              : sc.ColumnCount();
       for (size_t i = 0; i < sc.ColumnCount(); ++i) {
         const ColumnName& col_name = sc.GetColumn(i).Name();
         all_cols.emplace_back(relation, col_name.name);
@@ -613,7 +641,12 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table,
                      ctx.GetTable(physical));
     const Schema& sc = from_table->GetSchema();
-    relation_column_counts[relation] = sc.ColumnCount();
+    relation_column_counts[relation] =
+        (sc.ColumnCount() == 1 &&
+         sc.GetColumn(0).Type() != ValueType::kVarChar &&
+         sc.GetColumn(0).Type() != ValueType::kNull)
+            ? 2
+            : sc.ColumnCount();
     for (size_t i = 0; i < sc.ColumnCount(); ++i) {
       const ColumnName& col_name = sc.GetColumn(i).Name();
       all_cols.emplace_back(relation, col_name.name);

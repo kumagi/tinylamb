@@ -1432,6 +1432,52 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       }
     }
   }
+  const auto matches_group_column = [&](const ColumnName& col) {
+    for (const Expression& key : statement.GroupBy()) {
+      if (!key || key->Type() != TypeTag::kColumnValue) {
+        continue;
+      }
+      const ColumnName& gcol = key->AsColumnValue().GetColumnName();
+      if (!IdentifierEquals(gcol.name, col.name)) {
+        continue;
+      }
+      if (gcol.schema.empty() || col.schema.empty() ||
+          IdentifierEquals(gcol.schema, col.schema)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const std::function<bool(const Expression&)> has_ungrouped_bare_col =
+      [&](const Expression& expr) -> bool {
+    if (!expr || expr->Type() == TypeTag::kAggregateExp ||
+        expr->Type() == TypeTag::kQueryExp) {
+      return false;
+    }
+    for (const Expression& key : statement.GroupBy()) {
+      if (key && key->ToString() == expr->ToString()) {
+        return false;
+      }
+    }
+    if (expr->Type() == TypeTag::kColumnValue) {
+      const ColumnName& col = expr->AsColumnValue().GetColumnName();
+      if (col.name.empty() || col.name == "*") {
+        return false;
+      }
+      return !matches_group_column(col);
+    }
+    for (const Expression& child : ExpressionChildren(expr)) {
+      if (has_ungrouped_bare_col(child)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (const NamedExpression& item : statement.SelectList()) {
+    if (has_ungrouped_bare_col(item.expression)) {
+      return bail("ungrouped bare column");
+    }
+  }
   std::vector<const AggregateExpression*> aggregates;
   std::unordered_set<const AggregateExpression*> seen;
   for (const NamedExpression& item : statement.SelectList()) {

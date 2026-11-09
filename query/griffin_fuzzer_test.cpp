@@ -130,5 +130,31 @@ TEST(GriffinFuzzer, ReplayCommittedRegressionFiles) {
   }
 }
 
+TEST(GriffinFuzzer,
+     QualifiedNonexistentColumnAndUngroupedLeftJoinRepresentativeRegression) {
+  // Regression for griffin_fuzz-repro-17154338944608924769,
+  // 10946922447985395703, 11641915892569236690 (Root Cause 2A: nonexistent
+  // table-qualified columns r.lk / gk.y must be rejected consistently by all
+  // routes) and 9473164197374685349, 3047919724090122967, 12281152844797537137
+  // (Root Cause 2B: bare non-grouped columns over LEFT JOIN + GROUP BY must
+  // not change representative row under TINYLAMB_GROUPED_ROUTE=cascades).
+  for (uint64_t seed : {
+           17154338944608924769ULL,
+           10946922447985395703ULL,
+           11641915892569236690ULL,
+           9473164197374685349ULL,
+           3047919724090122967ULL,
+           12281152844797537137ULL,
+           2051286306716623367ULL,
+           69293237138238933ULL,
+       }) {
+    std::mt19937 rng(static_cast<uint32_t>(seed));
+    GriffinTrace trace;
+    trace.seed = seed;
+    EXPECT_EQ(RunGriffinIteration(rng, false, &trace), "") << "seed=" << seed;
+    EXPECT_EQ(ReplayGriffinTrace(trace, false), "") << "seed=" << seed;
+  }
+}
+
 }  // namespace
 }  // namespace tinylamb

@@ -1464,6 +1464,14 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
     // NULL-key rows for ANTI joins although `NULL NOT IN (...)` is UNKNOWN.
     enum class ProbeState : int8_t { kNull = -1, kNoMatch = 0, kMatch = 1 };
     std::vector<ProbeState> matched(s.left.rows.size(), ProbeState::kNoMatch);
+    for (size_t i = 0; i < s.left.rows.size(); ++i) {
+      const KeyRef k = KeyOf(s.left.rows[i].first, left_cols_,
+                             JoinHashIndex::KeyMode::kBytes, ValueType::kInt64,
+                             &scratch, NullSafeArg());
+      if (!k.valid) {
+        matched[i] = ProbeState::kNull;
+      }
+    }
     for (size_t p = 0; p < kReactiveSpillPartitions; ++p) {
       ASSIGN_OR_RETURN(std::vector<PositionedRow>, right_part,
                        (s.right.spills[p].ReadAllPositioned()));
@@ -1473,20 +1481,19 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
       const SideIndex side_index =
           BuildSideIndex(right_part, right_cols_, int_mode, NullSafeArg());
       for (size_t i = 0; i < s.left.rows.size(); ++i) {
-        if (matched[i] == ProbeState::kMatch) {
+        if (matched[i] == ProbeState::kMatch ||
+            matched[i] == ProbeState::kNull) {
           continue;
         }
         const int state = probe_lookup(s.left.rows[i], side_index);
         if (state == 1) {
           matched[i] = ProbeState::kMatch;
-        } else if (state < 0 && matched[i] == ProbeState::kNoMatch) {
+        } else if (state < 0) {
           matched[i] = ProbeState::kNull;
         }
       }
     }
     for (size_t i = 0; i < s.left.rows.size(); ++i) {
-      // Semi emits only matches; anti emits both kNoMatch and kNull because
-      // a NULL probe key matches nothing.
       if (probe_survives(static_cast<int>(matched[i]))) {
         emit_probe(s.left.rows[i]);
       }
@@ -1503,7 +1510,12 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
       if (right_part.empty()) {
         if (!semi) {
           for (const PositionedRow& probe : left_part) {
-            emit_probe(probe);
+            const KeyRef k =
+                KeyOf(probe.first, left_cols_, JoinHashIndex::KeyMode::kBytes,
+                      ValueType::kInt64, &scratch, NullSafeArg());
+            if (probe_survives(k.valid ? 0 : -1)) {
+              emit_probe(probe);
+            }
           }
         }
         continue;

@@ -14,6 +14,7 @@
 #include "expression/expression.hpp"
 #include "index/lsm_index.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction_manager.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -30,12 +31,14 @@ class SkipScanDistinct : public ExecutorBase {
  public:
   SkipScanDistinct(Transaction& txn, const Table& table, const Index& index,
                    const Value& begin, const Value& end, bool ascending,
-                   Expression where, Schema sc, size_t prefix_cols = 0);
+                   Expression where, Schema sc, size_t prefix_cols = 0,
+                   TransactionManager::IndexReadGuard index_read_guard = {});
 
   SkipScanDistinct(Transaction& txn, const Table& table, const Index& index,
                    const std::vector<Value>& begin_key,
                    const std::vector<Value>& end_key, bool ascending,
-                   Expression where, Schema sc, size_t prefix_cols = 0);
+                   Expression where, Schema sc, size_t prefix_cols = 0,
+                   TransactionManager::IndexReadGuard index_read_guard = {});
 
   SkipScanDistinct(const SkipScanDistinct&) = delete;
   SkipScanDistinct(SkipScanDistinct&&) = delete;
@@ -65,6 +68,7 @@ class SkipScanDistinct : public ExecutorBase {
   size_t prefix_cols_{0};
   bool is_unique_{false};
 
+  TransactionManager::IndexReadGuard index_read_guard_;
   BPlusTree bpt_;
   BPlusTreeIterator iter_;
   RowPosition current_pos_;

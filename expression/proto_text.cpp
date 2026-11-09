@@ -211,25 +211,26 @@ struct SimpleCivilTime {
   int64_t nanos = 0;  // subsecond
 };
 
-int64_t CivilToNanos(const SimpleCivilTime& ct) {
+__int128 CivilToNanos(const SimpleCivilTime& ct) {
   const std::chrono::year_month_day ymd{std::chrono::year{ct.year},
                                         std::chrono::month{ct.month},
                                         std::chrono::day{ct.day}};
   const int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-  const int64_t secs =
-      (days * 86400LL) + (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
-  return (secs * 1000000000LL) + ct.nanos;
+  const __int128 secs = (static_cast<__int128>(days) * 86400) +
+                        (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
+  return (secs * 1000000000) + ct.nanos;
 }
 
-SimpleCivilTime NanosToCivil(int64_t nanos) {
-  auto floor_div = [](int64_t a, int64_t b) {
-    const int64_t q = a / b;
+SimpleCivilTime NanosToCivil(__int128 nanos) {
+  auto floor_div = [](__int128 a, __int128 b) -> __int128 {
+    const __int128 q = a / b;
     return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
   };
-  const int64_t secs = floor_div(nanos, 1000000000LL);
-  const int64_t sub = nanos - (secs * 1000000000LL);
-  const int64_t days = floor_div(secs, 86400LL);
-  const int64_t day_secs = secs - (days * 86400LL);
+  const __int128 secs = floor_div(nanos, 1000000000);
+  const auto sub = static_cast<int64_t>(nanos - (secs * 1000000000));
+  const auto days = static_cast<int64_t>(floor_div(secs, 86400));
+  const auto day_secs =
+      static_cast<int64_t>(secs - (static_cast<__int128>(days) * 86400));
   const std::chrono::sys_days sd{std::chrono::days{days}};
   const std::chrono::year_month_day ymd{sd};
   SimpleCivilTime ct;
@@ -245,7 +246,7 @@ SimpleCivilTime NanosToCivil(int64_t nanos) {
 
 // Parses GoogleSQL-style timestamp text ("YYYY-MM-DD[ T]HH:MM:SS[.fff][±tz]").
 // Returns nanos since epoch UTC, or nullopt when unparsable.
-std::optional<int64_t> ParseTimestampText(std::string_view s) {
+std::optional<__int128> ParseTimestampText(std::string_view s) {
   SimpleCivilTime ct;
   int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
   // NOLINTNEXTLINE(cert-err34-c)
@@ -257,7 +258,7 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
   ct.month = static_cast<unsigned>(M);
   ct.day = static_cast<unsigned>(D);
   size_t pos = 10;
-  while (pos < s.size() && s[pos] == ' ') {
+  while (pos < s.size() && (s[pos] == ' ' || s[pos] == 'T' || s[pos] == 't')) {
     ++pos;
   }
   if (pos < s.size()) {
@@ -293,8 +294,8 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
         if (std::sscanf(std::string(s.substr(pos + 1)).c_str(), "%d:%d", &th,
                         &tm) >= 1) {
           const int offset = (th * 3600) + (tm * 60);
-          return CivilToNanos(ct) - (static_cast<int64_t>(offset) *
-                                     1000000000LL * (sign == '-' ? -1 : 1));
+          return CivilToNanos(ct) - (static_cast<__int128>(offset) *
+                                     1000000000 * (sign == '-' ? -1 : 1));
         }
       }
     }
@@ -304,7 +305,7 @@ std::optional<int64_t> ParseTimestampText(std::string_view s) {
 
 // Renders epoch nanos in GoogleSQL UTC timestamp text; precision picks the
 // number of fractional digits to print (0 = whole seconds).
-std::string FormatTimestampNanos(int64_t nanos, int precision) {
+std::string FormatTimestampNanos(__int128 nanos, int precision) {
   const SimpleCivilTime ct = NanosToCivil(nanos);
   std::array<char, 80> buf{};
   if (precision <= 0 || ct.nanos == 0) {
@@ -420,17 +421,20 @@ Value ApplyReadConversion(FieldFormat format, Value v) {
     }
     case FieldFormat::kTsSeconds:
       if (v.type == ValueType::kInt64) {
-        return Value(FormatTimestampNanos(v.value.int_value * 1000000000LL, 0));
+        return Value(FormatTimestampNanos(
+            static_cast<__int128>(v.value.int_value) * 1000000000, 0));
       }
       return v;
     case FieldFormat::kTsMillis:
       if (v.type == ValueType::kInt64) {
-        return Value(FormatTimestampNanos(v.value.int_value * 1000000LL, 3));
+        return Value(FormatTimestampNanos(
+            static_cast<__int128>(v.value.int_value) * 1000000, 3));
       }
       return v;
     case FieldFormat::kTsMicros:
       if (v.type == ValueType::kInt64) {
-        return Value(FormatTimestampNanos(v.value.int_value * 1000LL, 6));
+        return Value(FormatTimestampNanos(
+            static_cast<__int128>(v.value.int_value) * 1000, 6));
       }
       return v;
   }
@@ -467,14 +471,15 @@ std::optional<Value> ApplyWriteConversion(FieldFormat format, const Value& v) {
     case FieldFormat::kTsMillis:
     case FieldFormat::kTsMicros:
       if (v.type == ValueType::kVarChar) {
-        const std::optional<int64_t> nanos =
+        const std::optional<__int128> nanos =
             ParseTimestampText(std::string_view(v.value.varchar_value));
         if (!nanos.has_value()) {
           return std::nullopt;
         }
-        auto floor_div = [](int64_t a, int64_t b) {
-          const int64_t q = a / b;
-          return ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+        auto floor_div = [](__int128 a, __int128 b) -> int64_t {
+          const __int128 q = a / b;
+          return static_cast<int64_t>(
+              ((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1 : q);
         };
         switch (format) {
           case FieldFormat::kTsSeconds:
@@ -1931,7 +1936,7 @@ StatusOr<bool> TryReadProtoTextField(std::string_view text,
   return TryProtoTextExtractField(text, key, out);
 }
 
-std::optional<int64_t> ParseTimestampTextNanos(std::string_view text) {
+std::optional<__int128> ParseTimestampTextNanos(std::string_view text) {
   return ParseTimestampText(text);
 }
 

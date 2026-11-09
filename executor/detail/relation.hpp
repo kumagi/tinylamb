@@ -85,6 +85,9 @@ struct Relation {
         first = st;
       }
     }
+    if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
+      first = spill_error_;
+    }
     return first;
   }
 
@@ -110,6 +113,9 @@ struct Relation {
       if (st != Status::kSuccess && first == Status::kSuccess) {
         first = st;
       }
+    }
+    if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
+      first = spill_error_;
     }
     return first;
   }

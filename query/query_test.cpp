@@ -7933,4 +7933,147 @@ TEST_F(QueryTest,
              "balance < CAST(18446744073709551615 AS UINT64) ORDER BY id"),
       (std::vector<Row>{Row({Value(0)}), Row({Value(1)}), Row({Value(3)})}));
 }
+
+TEST_F(QueryTest, ArrayColumnTableSupportsAggregationAndGroupBy) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE arr_agg (grp BIGINT, tags ARRAY<INT64>, val BIGINT)");
+  RunSql(ctx, *db_,
+         "INSERT INTO arr_agg VALUES "
+         "(1, [10, 20], 100), (1, [30], 200), (2, [], 50)");
+  EXPECT_EQ(RunSql(ctx, *db_, "SELECT COUNT(*), SUM(val) FROM arr_agg"),
+            (std::vector<Row>{Row({Value(3), Value(350)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT grp, COUNT(*), SUM(val) FROM arr_agg "
+                   "GROUP BY grp ORDER BY grp"),
+            (std::vector<Row>{Row({Value(1), Value(2), Value(300)}),
+                              Row({Value(2), Value(1), Value(50)})}));
+}
+
+TEST_F(QueryTest,
+       ParallelLstAggregationHandlesVarcharCountMinMaxAboveThreshold) {
+  {
+    auto seed = db_->BeginContext();
+    RunSql(seed, *db_,
+           "CREATE TABLE lst_varchar_agg (id BIGINT, label STRING)");
+    ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, tbl,
+                                seed.GetTable("lst_varchar_agg"));
+    for (int64_t i = 0; i < 33000; ++i) {
+      ASSERT_SUCCESS(
+          tbl->Insert(seed.txn_,
+                      Row({Value(i), Value(i % 2 == 0 ? "aa" : "zz")}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(seed.PreCommit());
+  }
+  {
+    auto analyze_ctx = db_->BeginContext();
+    RunSql(analyze_ctx, *db_, "ANALYZE");
+    ASSERT_SUCCESS(analyze_ctx.PreCommit());
+  }
+  auto ctx = db_->BeginContext();
+  EXPECT_EQ(
+      RunSql(
+          ctx, *db_,
+          "SELECT COUNT(label), MIN(label), MAX(label) FROM lst_varchar_agg"),
+      (std::vector<Row>{Row({Value(33000), Value("aa"), Value("zz")})}));
+}
+
+TEST_F(QueryTest,
+       TimestampsOutsideInt64NanosEpochAndIsoTSeparatorEvaluateCorrectly) {
+  auto ctx = db_->BeginContext();
+  // Bug 5: CivilTimeToNanos before 1677 and after 2262 must not wrap int64_t.
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT UNIX_SECONDS(TIMESTAMP('0001-01-01 00:00:00+00')), "
+             "UNIX_SECONDS(TIMESTAMP('9999-12-31 23:59:59+00'))"),
+      (std::vector<Row>{Row({Value(-62135596800LL), Value(253402300799LL)})}));
+
+  // Bug 15: ISO-8601 'T' separator with explicit offset or Z must preserve
+  // time-of-day and apply timezone offset accurately.
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT CAST(TIMESTAMP '2020-01-01T12:34:56Z' AS STRING), "
+                   "CAST(TIMESTAMP '2020-01-01T12:34:56+09:00' AS STRING)"),
+            (std::vector<Row>{Row({Value("2020-01-01 12:34:56+00"),
+                                   Value("2020-01-01 03:34:56+00")})}));
+}
+
+TEST_F(QueryTest, OrderByDistinguishesFilteredAggregatesWithDifferentFilters) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE filt_ord (grp BIGINT, v BIGINT)");
+  RunSql(ctx, *db_,
+         "INSERT INTO filt_ord VALUES "
+         "(1, 10), (1, 10), (1, -5), "
+         "(2, 10), (2, -5), (2, -5)");
+  // grp=1 has COUNT(v>0)=2, COUNT(v<0)=1; grp=2 has COUNT(v>0)=1, COUNT(v<0)=2.
+  // Ordering by COUNT(v WHERE v < 0) ASC must place grp=1 first.
+  const auto rows = RunSql(ctx, *db_,
+                           "SELECT grp, COUNT(v WHERE v > 0) "
+                           "FROM filt_ord GROUP BY grp "
+                           "ORDER BY COUNT(v WHERE v < 0) ASC");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(2)}));
+  EXPECT_EQ(rows[1], Row({Value(2), Value(1)}));
+}
+
+TEST_F(QueryTest, StructWithDateEncodesValidQuotedJsonForJsonType) {
+  auto ctx = db_->BeginContext();
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT JSON_TYPE(TO_JSON(STRUCT(DATE '2026-01-02' AS d)))"),
+            (std::vector<Row>{Row({Value("object")})}));
+  RunSql(ctx, *db_, "CREATE TABLE struct_date_tbl (d DATE)");
+  RunSql(ctx, *db_, "INSERT INTO struct_date_tbl VALUES (DATE '2026-01-02')");
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT JSON_TYPE(TO_JSON(STRUCT(d AS d))) FROM struct_date_tbl"),
+      (std::vector<Row>{Row({Value("object")})}));
+}
+
+TEST_F(QueryTest, NestedLeftNaturalJoinRejectsInsteadOfDroppingSources) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE nj1 (id BIGINT)");
+  RunSql(ctx, *db_, "CREATE TABLE nj2 (id BIGINT)");
+  RunSql(ctx, *db_, "CREATE TABLE nj3 (id BIGINT)");
+  SqlEngine engine(*db_);
+  StatusOr<Executor> prepared = engine.Prepare(
+      ctx, "SELECT * FROM (nj1 NATURAL JOIN nj2) JOIN nj3 ON nj1.id = nj3.id");
+  EXPECT_FALSE(prepared.HasValue());
+}
+
+TEST_F(QueryTest, TvfWithUnionAllBodyPreservesAllSetOperationBranches) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_,
+         "CREATE TABLE FUNCTION tvf_union(x INT64) AS "
+         "SELECT x AS v UNION ALL SELECT x + 10 AS v");
+  const auto rows = RunSql(ctx, *db_, "SELECT v FROM tvf_union(5) ORDER BY v");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(5)}));
+  EXPECT_EQ(rows[1], Row({Value(15)}));
+}
+
+TEST_F(QueryTest,
+       SharedCteReferencedInSubqueryDoesNotPushDownRestrictiveFilter) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cte_src (k BIGINT)");
+  RunSql(ctx, *db_, "INSERT INTO cte_src VALUES (1), (2), (3)");
+  // The outer FROM filters `c WHERE c.k = 1`, while the scalar subquery counts
+  // all rows in `c`. Pushing `k = 1` into `c` would starve the scalar subquery
+  // and return 1 instead of 3.
+  const auto rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k FROM cte_src) "
+             "SELECT c.k, (SELECT COUNT(*) FROM c) FROM c WHERE c.k = 1");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value(3)}));
+
+  // Also test when `c` is referenced inside a nested WITH inside a sibling CTE.
+  const auto nested_with_rows =
+      RunSql(ctx, *db_,
+             "WITH c AS (SELECT k FROM cte_src), "
+             "d AS (WITH inner_c AS (SELECT k FROM c) "
+             "SELECT COUNT(*) AS cnt FROM inner_c) "
+             "SELECT c.k, d.cnt FROM c CROSS JOIN d WHERE c.k = 1");
+  ASSERT_EQ(nested_with_rows.size(), 1U);
+  EXPECT_EQ(nested_with_rows[0], Row({Value(1), Value(3)}));
+}
 }  // namespace tinylamb

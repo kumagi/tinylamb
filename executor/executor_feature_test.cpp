@@ -2527,4 +2527,57 @@ TEST_F(SkipScanDistinctTest, UniqueIndexNullKeysDecodeAsMultiValue) {
   EXPECT_LE(null_rows, 2U);
 }
 
+TEST_F(SkipScanDistinctTest,
+       DeletedFirstEntryInPrefixGroupStillFindsSurvivingKeys) {
+  const Schema schema("pt_del", {Column("a", ValueType::kInt64),
+                                 Column("b", ValueType::kInt64)});
+  Table tbl = database_->CreateTable(*context_, schema).MoveValue();
+  ASSERT_EQ(database_->CreateIndex(*context_, schema.Name(),
+                                   IndexSchema("pt_del_ab_idx", {0, 1}, {},
+                                               IndexMode::kNonUnique)),
+            Status::kSuccess);
+  ASSIGN_OR_ASSERT_FAIL_CONST(std::shared_ptr<Table>, mutable_tbl,
+                              context_->GetTable("pt_del"));
+  const RowPosition pos_1_1 =
+      mutable_tbl->Insert(context_->txn_, Row({Value(1), Value(1)}))
+          .MoveValue();
+  ASSERT_TRUE(mutable_tbl->Insert(context_->txn_, Row({Value(1), Value(2)}))
+                  .HasValue());
+  ASSERT_TRUE(mutable_tbl->Insert(context_->txn_, Row({Value(2), Value(1)}))
+                  .HasValue());
+  // Delete the first key (1, 1) so the LSM index holds a tombstone / invisible
+  // entry at the start of prefix a=1 while (1, 2) remains visible.
+  ASSERT_EQ(mutable_tbl->Delete(context_->txn_, pos_1_1), Status::kSuccess);
+  ASSERT_EQ(context_->PreCommit(), Status::kSuccess);
+
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+  Table table = database_->GetTable(*context_, "pt_del").MoveValue();
+  const Index& index = table.GetIndex(0);
+
+  SkipScanDistinct scan(context_->txn_, table, index, std::vector<Value>{},
+                        std::vector<Value>{}, true,
+                        ConstantValueExp(Value(true)), table.GetSchema(),
+                        /*prefix_cols=*/1);
+  const std::vector<Row> out = Drain(&scan);
+  EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+  ASSERT_EQ(out.size(), 2U);
+  EXPECT_EQ(out[0][0], Value(int64_t{1}));
+  EXPECT_EQ(out[1][0], Value(int64_t{2}));
+}
+
+TEST(MergeJoinTest, FailedChildLatchesStatusWithoutPartialResult) {
+  {
+    MergeJoin left_fail(std::make_shared<FailingSource>(), {0}, Src({IRow(1)}),
+                        {0}, JoinKind::kInner, 1, 1);
+    EXPECT_TRUE(Drain(&left_fail).empty());
+    EXPECT_NE(left_fail.GetStatus(), Status::kSuccess);
+  }
+  {
+    MergeJoin right_fail(Src({IRow(1)}), {0}, std::make_shared<FailingSource>(),
+                         {0}, JoinKind::kLeftOuter, 1, 1);
+    EXPECT_TRUE(Drain(&right_fail).empty());
+    EXPECT_NE(right_fail.GetStatus(), Status::kSuccess);
+  }
+}
+
 }  // namespace tinylamb

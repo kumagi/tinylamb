@@ -29,6 +29,7 @@
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
+#include "executor/query_memory.hpp"
 #include "query/fuzz_scoped_db.hpp"
 #include "query/sql_engine.hpp"
 #include "type/row.hpp"
@@ -1226,6 +1227,17 @@ struct ScopedEnv {
   std::string prev_;
 };
 
+struct ScopedQueryMemory {
+  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+    QueryMemoryBudget::Global().ResetForTest(budget_bytes);
+  }
+  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ScopedQueryMemory(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
+  ScopedQueryMemory(ScopedQueryMemory&&) = delete;
+  ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+};
+
 // Executes a SELECT and returns its rows.  nullopt means the engine rejected
 // the query (skip the oracle).
 std::optional<std::vector<Row>> RunRowsMode(Database& db,
@@ -1874,8 +1886,9 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
 
     // Mode C: USING lstable PAX columnar store + ANALYZE.
     if (lst_ready) {
-      if (auto lst_rows = RunRowsMode(db, ctx, substitute_lst(sql),
-                                      /*force_relational=*/false, &error);
+      const std::string lsql = substitute_lst(sql);
+      if (auto lst_rows =
+              RunRowsMode(db, ctx, lsql, /*force_relational=*/false, &error);
           lst_rows.has_value()) {
         const std::vector<std::string> s_lst = SerializeSorted(*lst_rows);
         if (s_lst != s_ref) {
@@ -1885,6 +1898,60 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
                      DumpRows(s_ref);
           *report += "  actual (" + std::to_string(s_lst.size()) + "):\n" +
                      DumpRows(s_lst);
+          return true;
+        }
+      }
+      // Mode D: USING lstable + Cascades GROUP BY route.
+      {
+        ScopedEnv gr("TINYLAMB_GROUPED_ROUTE", "cascades");
+        if (auto lst_cas_rows =
+                RunRowsMode(db, ctx, lsql, /*force_relational=*/false, &error);
+            lst_cas_rows.has_value()) {
+          const std::vector<std::string> s_lst_cas =
+              SerializeSorted(*lst_cas_rows);
+          if (s_lst_cas != s_ref) {
+            *report += "[XMODE-LSTABLE-CASCADES MISMATCH]\n";
+            *report += "  query: " + sql + "\n";
+            *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                       DumpRows(s_ref);
+            *report += "  actual (" + std::to_string(s_lst_cas.size()) +
+                       "):\n" + DumpRows(s_lst_cas);
+            return true;
+          }
+        }
+      }
+    }
+
+    // Mode E: External disk spill under tight QueryMemoryBudget (512B).
+    {
+      ScopedQueryMemory low_mem(512);
+      if (auto spill_rows =
+              RunRowsMode(db, ctx, sql, /*force_relational=*/false, &error);
+          spill_rows.has_value()) {
+        const std::vector<std::string> s_spill = SerializeSorted(*spill_rows);
+        if (s_spill != s_ref) {
+          *report += "[XMODE-SPILL MISMATCH]\n";
+          *report += "  query: " + sql + "\n";
+          *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                     DumpRows(s_ref);
+          *report += "  actual (" + std::to_string(s_spill.size()) + "):\n" +
+                     DumpRows(s_spill);
+          return true;
+        }
+      }
+      ScopedEnv gr("TINYLAMB_GROUPED_ROUTE", "cascades");
+      if (auto cas_spill_rows =
+              RunRowsMode(db, ctx, sql, /*force_relational=*/false, &error);
+          cas_spill_rows.has_value()) {
+        const std::vector<std::string> s_cas_spill =
+            SerializeSorted(*cas_spill_rows);
+        if (s_cas_spill != s_ref) {
+          *report += "[XMODE-CASCADES-SPILL MISMATCH]\n";
+          *report += "  query: " + sql + "\n";
+          *report += "  expected (" + std::to_string(s_ref.size()) + "):\n" +
+                     DumpRows(s_ref);
+          *report += "  actual (" + std::to_string(s_cas_spill.size()) +
+                     "):\n" + DumpRows(s_cas_spill);
           return true;
         }
       }
@@ -3585,10 +3652,126 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
           tab + " WHERE (" + t.predicate + ") GROUP BY a, flag;");
     }
 
-    // Sample 2 distinct composite probes per iteration to keep per-seed latency
-    // low while covering all 6 composite query families uniformly across seeds.
+    // Nested WITH CTE referencing an earlier CTE (stresses
+    // CountNestedCteReferences & PushSharedCteRestrictions).
+    {
+      const int k1 = xg.Pick(-2, 1);
+      const int k2 = xg.Pick(0, 3);
+      candidates.push_back(
+          "WITH c1 AS (SELECT u, a, b, flag, s FROM " + tab +
+          "), c2 AS (SELECT u, a, b FROM c1 WHERE a IS NOT NULL OR flag IS "
+          "TRUE) SELECT x.u, y.u AS yu, x.a, y.b FROM c1 x LEFT JOIN c2 y ON "
+          "x.a = y.a WHERE x.b >= " +
+          std::to_string(k1) + " OR y.b <= " + std::to_string(k2) + ";");
+    }
+
+    // Fused grouped-join + HAVING over MIN/MAX/SUM/COUNT (stresses
+    // TryBuildFusedGroupedJoin HavingProxy under disk spill).
+    if (!jtab.empty() || !stab.empty()) {
+      const std::string other = !jtab.empty() ? jtab : stab;
+      const std::string okey = !jtab.empty() ? "x" : "a";
+      const int k1 = xg.Pick(-2, 1);
+      const int k2 = xg.Pick(1, 5);
+      candidates.push_back(
+          "SELECT " + tab + ".a, COUNT(*) AS cnt, MIN(" + tab +
+          ".b) AS min_b, MAX(" + tab + ".u) AS max_u, SUM(" + tab +
+          ".b) AS sum_b FROM " + tab + " JOIN " + other + " ON " + tab +
+          ".a = " + other + "." + okey + " GROUP BY " + tab + ".a HAVING MIN(" +
+          tab + ".b) >= " + std::to_string(k1) + " OR MAX(" + tab +
+          ".u) <= " + std::to_string(k2) + " OR COUNT(*) >= 2;");
+    }
+
+    // Aggregate FILTER (WHERE ...) in SELECT + HAVING + ORDER BY (stresses
+    // AggregateExpression::ToString filter discrimination during rebinding).
+    {
+      candidates.push_back(
+          "SELECT a, COUNT(*) FILTER (WHERE flag IS TRUE) AS cf_t, "
+          "COUNT(*) FILTER (WHERE flag IS NOT TRUE) AS cf_f, "
+          "SUM(b) FILTER (WHERE a >= 0) AS sb_pos, "
+          "SUM(b) FILTER (WHERE a < 0) AS sb_neg FROM " +
+          tab +
+          " GROUP BY a HAVING COUNT(*) FILTER (WHERE flag IS TRUE) >= 0 "
+          "ORDER BY COUNT(*) FILTER (WHERE flag IS TRUE) DESC, a NULLS FIRST;");
+    }
+
+    // Multi-OVER Window with RANGE/GROUPS frames, EXCLUDE, VARCHAR/BOOL
+    // ordering, and QUALIFY.
+    {
+      const int qmax = xg.Pick(1, 4);
+      candidates.push_back(
+          "SELECT u, a, s, SUM(b) OVER (PARTITION BY flag ORDER BY a RANGE "
+          "BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) AS "
+          "rng_sum, COUNT(s) OVER (PARTITION BY s ORDER BY a GROUPS BETWEEN 1 "
+          "PRECEDING AND 1 FOLLOWING) AS grp_cnt, DENSE_RANK() OVER "
+          "(PARTITION BY flag ORDER BY s NULLS LAST, a) AS dr FROM " +
+          tab + " QUALIFY dr <= " + std::to_string(qmax) + ";");
+    }
+
+    // IS NOT DISTINCT FROM NULL-safe join + residual filter.
+    if (!stab.empty()) {
+      candidates.push_back("SELECT " + tab + ".u, " + stab + ".u AS su, " +
+                           tab + ".a, " + stab + ".b, " + tab + ".s FROM " +
+                           tab + " LEFT JOIN " + stab + " ON " + tab +
+                           ".a IS NOT DISTINCT FROM " + stab + ".a AND " + tab +
+                           ".s IS NOT DISTINCT FROM " + stab + ".s WHERE (" +
+                           t.predicate + ") OR " + stab + ".u IS NULL;");
+    }
+
+    // Correlated LATERAL subquery with aggregation.
+    if (!stab.empty()) {
+      candidates.push_back(
+          "SELECT " + tab + ".u, " + tab + ".a, lat.cnt, lat.max_b FROM " +
+          tab + ", LATERAL (SELECT COUNT(*) AS cnt, MAX(s2.b) AS max_b FROM " +
+          stab + " s2 WHERE s2.a = " + tab + ".a OR (s2.a IS NULL AND " + tab +
+          ".a IS NULL)) lat WHERE (" + t.predicate + ");");
+    }
+
+    // 3-way chained set operations (EXCEPT ALL + UNION ALL + INTERSECT ALL).
+    if (!stab.empty()) {
+      candidates.push_back(
+          "(SELECT a, b FROM " + tab + " WHERE " + t.predicate +
+          " EXCEPT ALL SELECT a, b FROM " + stab +
+          " WHERE b IS NOT NULL) UNION ALL (SELECT a, b FROM " + tab +
+          " INTERSECT ALL SELECT a, b FROM " + stab + ");");
+    }
+
+    // STRUCT + TO_JSON_STRING + DATE_ADD + GENERATE_SERIES + STRPOS/LPAD.
+    {
+      candidates.push_back(
+          "SELECT u, TO_JSON_STRING(STRUCT(a AS f_a, flag AS f_flag, "
+          "COALESCE(s, 'null') AS f_s, DATE_ADD(DATE '2020-01-01', INTERVAL "
+          "COALESCE(a, 0) DAY) AS f_d)) AS js, "
+          "ARRAY_LENGTH(GENERATE_SERIES(1, LEAST(GREATEST(COALESCE(a, 0) + 2, "
+          "1), 5))) AS alen, STRPOS(LPAD(COALESCE(s, ''), 5, 'z'), 'a') AS sp "
+          "FROM " +
+          tab + " WHERE (" + t.predicate + ");");
+    }
+
+    // Non-top-level subqueries inside CASE WHEN and OR disjuncts.
+    if (!jtab.empty()) {
+      candidates.push_back(
+          "SELECT u, a, CASE WHEN a IN (SELECT x FROM " + jtab +
+          " WHERE x IS NOT NULL) THEN 'in' WHEN EXISTS (SELECT 1 FROM " + jtab +
+          " WHERE " + jtab + ".y = " + tab +
+          ".s) THEN 'ex' ELSE 'none' END AS tag FROM " + tab + " WHERE (" +
+          t.predicate + ") OR EXISTS (SELECT 1 FROM " + jtab + " WHERE " +
+          jtab + ".x = " + tab + ".b);");
+    }
+
+    // GROUP BY CUBE(a, flag, s) with GROUPING() and BIT_XOR.
+    {
+      candidates.push_back(
+          "SELECT a, flag, s, GROUPING(a) AS ga, GROUPING(flag) AS gf, "
+          "GROUPING(s) AS gs, COUNT(*), SUM(b), BIT_XOR(a) FROM " +
+          tab + " WHERE (" + t.predicate +
+          ") OR flag IS NOT NULL GROUP BY CUBE(a, flag, s);");
+    }
+
+    // Sample composite probes per iteration to keep per-seed latency low
+    // while covering all composite query families uniformly across seeds.
     std::shuffle(candidates.begin(), candidates.end(), xrng);
-    const size_t keep = std::min<size_t>(2, candidates.size());
+    const size_t keep =
+        std::min<size_t>(is_fuzz_run ? 4 : 3, candidates.size());
     t.xmode_probes.assign(candidates.begin(),
                           candidates.begin() + static_cast<ptrdiff_t>(keep));
   }

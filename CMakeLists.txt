@@ -122,7 +122,10 @@ set(TINYLAMB_GOOGLESQL_VERSION "2026.7.2" CACHE STRING
 if(TINYLAMB_ENABLE_GOOGLESQL)
     set(_googlesql_download_dir "${CMAKE_BINARY_DIR}/_deps/googlesql")
     set(_googlesql_executable "${_googlesql_download_dir}/execute_query")
-    if(EXISTS "$ENV{HOME}/.local/share/googlesql-zygote/execute_query_parse")
+    if(DEFINED TINYLAMB_GOOGLESQL_EXECUTABLE_PATH AND
+       NOT TINYLAMB_GOOGLESQL_EXECUTABLE_PATH STREQUAL "")
+        set(_googlesql_executable "${TINYLAMB_GOOGLESQL_EXECUTABLE_PATH}")
+    elseif(EXISTS "$ENV{HOME}/.local/share/googlesql-zygote/execute_query_parse")
         file(MAKE_DIRECTORY "${_googlesql_download_dir}")
         file(COPY_FILE "$ENV{HOME}/.local/share/googlesql-zygote/execute_query_parse"
              "${_googlesql_executable}")
@@ -147,6 +150,8 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
                          GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
     elseif(WIN32)
         set(_googlesql_executable "execute_query.exe")
+    elseif(CMAKE_CROSSCOMPILING)
+        set(_googlesql_executable "/tmp/tinylamb-execute-query")
     else()
         message(WARNING
                 "No prebuilt GoogleSQL parser is available for this platform; "
@@ -154,7 +159,7 @@ if(TINYLAMB_ENABLE_GOOGLESQL)
         set(TINYLAMB_ENABLE_GOOGLESQL OFF)
     endif()
 
-    if(TINYLAMB_ENABLE_GOOGLESQL AND NOT WIN32 AND NOT EXISTS "${_googlesql_executable}")
+    if(TINYLAMB_ENABLE_GOOGLESQL AND DEFINED _googlesql_asset AND NOT EXISTS "${_googlesql_executable}")
         if(EXISTS "/google/bin/releases/googlesql-devtools/execute_query/execute_query")
             file(MAKE_DIRECTORY "${_googlesql_download_dir}")
             file(COPY "/google/bin/releases/googlesql-devtools/execute_query/execute_query"

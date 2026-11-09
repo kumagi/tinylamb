@@ -249,4 +249,48 @@ TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
   EXPECT_EQ(restored[0], Value(int64_t{1}));
 }
 
+TEST(RowTest, PeekSerializedSize_WithArrayAndTrailingColumns_Succeeds) {
+  const Schema schema("with_array", {Column("id", ValueType::kInt64),
+                                     Column("tags", ValueType::kArray),
+                                     Column("score", ValueType::kInt64)});
+  const Value nested_arr =
+      Value::Array({Value("alpha"), Value("beta")}, "STRING");
+  const Value outer_arr =
+      Value::Array({Value(int64_t{10}), Value(), nested_arr}, "INT64");
+  const Row row({Value(int64_t{42}), outer_arr, Value(int64_t{99})});
+  std::vector<char> buf(row.Size());
+  const size_t written = row.Serialize(buf.data());
+  ASSERT_EQ(written, row.Size());
+
+  const size_t peeked_size =
+      Row::PeekSerializedSize(buf.data(), buf.size(), schema);
+  EXPECT_EQ(peeked_size, written);
+
+  Row projected;
+  const size_t proj_read =
+      projected.DeserializeProjected(buf.data(), schema, {0, 2});
+  EXPECT_EQ(proj_read, written);
+  ASSERT_EQ(projected.values_.size(), 2U);
+  EXPECT_EQ(projected[0], Value(int64_t{42}));
+  EXPECT_EQ(projected[1], Value(int64_t{99}));
+}
+
+TEST(RowTest,
+     TryDecodeMemcomparableFormat_NestedCorruptArrayCount_RejectsWithoutOom) {
+  // Regression for
+  // row_codec_fuzzer-oom-9c305b17307e237863e3cd290ce6946f026ddb35: 16 nested
+  // kArray headers each claiming 856,064 elements in a 160-byte buffer
+  // previously reserved ~54 MB per frame before noticing truncation.
+  std::string payload;
+  for (int i = 0; i < 16; ++i) {
+    payload.push_back(static_cast<char>(ValueType::kArray));
+    payload.append("\x00\x0d\x10\x00", 4);  // count = 856064 (big-endian)
+    payload.push_back('\0');                // empty sql_type + NUL
+    payload.push_back('\x01');              // first element present
+  }
+  Value v;
+  const StatusOr<size_t> decoded = v.TryDecodeMemcomparableFormat(payload);
+  EXPECT_FALSE(decoded.HasValue());
+}
+
 }  // namespace tinylamb

@@ -117,19 +117,27 @@ ParallelAggregationExecutor::ParallelAggregationExecutor(
         generic_indices_.push_back(index);
       }
     } else if (!aggregate.Distinct() && !has_filter &&
+               (aggregate.GetType() == AggregationType::kCount ||
+                aggregate.GetType() == AggregationType::kSum ||
+                aggregate.GetType() == AggregationType::kAvg ||
+                aggregate.GetType() == AggregationType::kMin ||
+                aggregate.GetType() == AggregationType::kMax) &&
                aggregate.Child()->Type() == TypeTag::kColumnValue) {
       const int offset = input_schema_.Offset(
           aggregate.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0) {
-        if (input_schema_.GetColumn(static_cast<size_t>(offset)).Type() ==
-            ValueType::kDouble) {
+        const ValueType col_type =
+            input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
+        if (col_type == ValueType::kDouble) {
           input.kind = AggregateInputKind::kDoubleColumn;
           input.column = static_cast<size_t>(offset);
           double_column_indices_.push_back(index);
-        } else {
+        } else if (col_type == ValueType::kInt64) {
           input.kind = AggregateInputKind::kInt64Column;
           input.column = static_cast<size_t>(offset);
           int64_column_indices_.push_back(index);
+        } else {
+          generic_indices_.push_back(index);
         }
       } else {
         generic_indices_.push_back(index);

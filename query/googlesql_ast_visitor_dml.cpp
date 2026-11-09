@@ -1350,6 +1350,12 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
           return AstError<std::unique_ptr<Statement>>(
               "GoogleSQL AST: column has two FOREIGN KEYs");
         }
+        if (col.GetConstraint().ctype != Constraint::kNothing &&
+            col.GetConstraint().ctype != Constraint::kNotNull) {
+          return AstError<std::unique_ptr<Statement>>(
+              "column " + col.Name().name +
+              " cannot combine FOREIGN KEY with its existing constraint");
+        }
         const bool was_unsigned = col.IsUnsigned();
         col = Column(col.Name().name, col.Type(),
                      Constraint(Constraint::kForeign,

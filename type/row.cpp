@@ -628,6 +628,71 @@ size_t Row::EncodeKeyMemcomparableFormatTo(const Schema& sc, char* dst) const {
   return values_[idx].EncodeMemcomparableFormatTo(dst);
 }
 
+namespace {
+
+size_t PeekValueSerializedSize(  // NOLINT(misc-no-recursion)
+    const char* src, size_t max_len, size_t need, ValueType vt,
+    size_t depth = 0) {
+  if (depth > 32) {
+    throw std::runtime_error("array nesting depth exceeded");
+  }
+  switch (vt) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+    case ValueType::kDouble:
+      if (max_len - need < sizeof(int64_t)) {
+        throw std::runtime_error("row exceeds available bytes");
+      }
+      return need + sizeof(int64_t);
+    case ValueType::kVarChar: {
+      if (max_len - need < sizeof(bin_size_t)) {
+        throw std::runtime_error("truncated varchar header");
+      }
+      bin_size_t len = 0;
+      DeserializeSlot(src + need, &len);
+      if (max_len - need < sizeof(bin_size_t) + len) {
+        throw std::runtime_error("row exceeds available bytes");
+      }
+      return need + sizeof(bin_size_t) + len;
+    }
+    case ValueType::kArray: {
+      if (max_len - need < sizeof(uint32_t) + sizeof(bin_size_t)) {
+        throw std::runtime_error("truncated array header");
+      }
+      uint32_t elem_count = 0;
+      need += DeserializeU32(src + need, &elem_count);
+      bin_size_t type_len = 0;
+      DeserializeSlot(src + need, &type_len);
+      if (max_len - need < sizeof(bin_size_t) + type_len) {
+        throw std::runtime_error("truncated array type header");
+      }
+      need += sizeof(bin_size_t) + type_len;
+      if (elem_count > max_len - need) {
+        throw std::runtime_error("truncated array element presence byte");
+      }
+      for (uint32_t i = 0; i < elem_count; ++i) {
+        if (max_len - need < 1) {
+          throw std::runtime_error("truncated array element presence byte");
+        }
+        const bool present = src[need++] != 0;
+        if (!present) {
+          continue;
+        }
+        if (max_len - need < 1) {
+          throw std::runtime_error("truncated array element type byte");
+        }
+        const auto elem_vt = static_cast<ValueType>(src[need++]);
+        need = PeekValueSerializedSize(src, max_len, need, elem_vt, depth + 1);
+      }
+      return need;
+    }
+    default:
+      throw std::runtime_error("null column cannot be deserialized");
+  }
+}
+
+}  // namespace
+
 size_t Row::PeekSerializedSize(const char* src, size_t max_len,
                                const Schema& sc) {
   if (max_len < sizeof(slot_t)) {
@@ -655,27 +720,7 @@ size_t Row::PeekSerializedSize(const char* src, size_t max_len,
       continue;
     }
     const ValueType vt = sc.GetColumn(i).Type();
-    switch (vt) {
-      case ValueType::kInt64:
-      case ValueType::kDate:
-      case ValueType::kDouble:
-        need += sizeof(int64_t);
-        break;
-      case ValueType::kVarChar: {
-        if (max_len - need < sizeof(bin_size_t)) {
-          throw std::runtime_error("truncated varchar header");
-        }
-        bin_size_t len = 0;
-        DeserializeSlot(src + need, &len);
-        need += sizeof(bin_size_t) + len;
-        break;
-      }
-      default:
-        throw std::runtime_error("null column cannot be deserialized");
-    }
-    if (need > max_len) {
-      throw std::runtime_error("row exceeds available bytes");
-    }
+    need = PeekValueSerializedSize(src, max_len, need, vt);
   }
   return need;
 }

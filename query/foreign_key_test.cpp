@@ -258,4 +258,25 @@ TEST_F(ForeignKeyTest, ConstraintSurvivesCatalogRoundTrip) {
            "INSERT INTO fk_child VALUES (11, 2)");
 }
 
+TEST_F(ForeignKeyTest,
+       RejectsCombiningForeignKeyWithDefaultOrPrimaryKeyOnSameColumn) {
+  ExpectOk(engine_.get(), context_.get(),
+           "CREATE TABLE fk_base (id BIGINT PRIMARY KEY)");
+  // Combining DEFAULT with FOREIGN KEY on the same column would overwrite the
+  // single Column::constraint_ slot; must be rejected at DDL time.
+  const std::string err_default =
+      ExpectThrow(engine_.get(), context_.get(),
+                  "CREATE TABLE fk_bad_def (id BIGINT PRIMARY KEY, "
+                  "pid BIGINT DEFAULT 1 REFERENCES fk_base(id))");
+  EXPECT_FALSE(err_default.empty());
+
+  // Combining PRIMARY KEY with FOREIGN KEY on the same column must also be
+  // rejected instead of silently dropping PRIMARY KEY / NOT NULL semantics.
+  const std::string err_pk =
+      ExpectThrow(engine_.get(), context_.get(),
+                  "CREATE TABLE fk_bad_pk ("
+                  "pid BIGINT PRIMARY KEY REFERENCES fk_base(id))");
+  EXPECT_FALSE(err_pk.empty());
+}
+
 }  // namespace tinylamb

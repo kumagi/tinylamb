@@ -218,6 +218,7 @@ class PageManager {
                                   const Transaction* watcher);
 
   std::string db_name_;
+  mutable std::mutex checkpoint_io_mu_;
   int lock_fd_{-1};
 
   mutable std::mutex blocks_mu_;
