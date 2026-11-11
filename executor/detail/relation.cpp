@@ -167,14 +167,12 @@ void Relation::AddRow(Row row) {
       return;
     }
     if (Status append = spill_tail_->Append(row); append != Status::kSuccess) {
-      // Spill write failed (e.g. disk quota exceeded).  Drop the row and
-      // continue with degraded results rather than crashing; the sticky
-      // error lets callers with an error channel surface the truncation.
+      // Preserve previously appended rows and their count. The failed row
+      // is not part of the spill; the sticky error prevents success over a
+      // partial result.
       if (spill_error_ == Status::kSuccess) {
         spill_error_ = append;
       }
-      spill_tail_.reset();
-      ++spilled_rows_;
       return;
     }
     peak_intermediate_rows =

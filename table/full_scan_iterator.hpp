@@ -211,7 +211,7 @@ class FullScanIterator : public IteratorBase {
   // Bitmap rows keep the canonical column walk.
   struct PlannedPeek {
     struct VariableSkip {
-      ValueType type;
+      ValueType type{ValueType::kNull};
       uint32_t fixed_after{0};
     };
     bool valid{false};
@@ -232,7 +232,7 @@ class FullScanIterator : public IteratorBase {
                                                       const char* row);
   [[nodiscard]] int64_t PeekCompareValue(const PlannedPeek& peek,
                                          const char* row) const;
-  [[nodiscard]] bool PassesPeekFilters(std::string_view row) const;
+  [[nodiscard]] StatusOr<bool> PassesPeekFilters(std::string_view row) const;
   // Resolves the next visible row image (the SeekVisibleRow ladder) and
   // advances pos_ past it; nullopt at exhaustion or on a latched failure.
   [[nodiscard]] std::optional<std::string_view> NextVisibleImage();

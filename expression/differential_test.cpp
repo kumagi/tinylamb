@@ -17,6 +17,7 @@
 // date_add/date_sub, extract} x {int64, double, varchar, date, bool-as-int64}
 // x {non-NULL, left NULL, right NULL, both NULL} plus exception cells
 // (division by zero, INT64_MIN/-1, int64 overflow, type mismatch).
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -777,6 +779,23 @@ TEST(DifferentialTest, Evaluate_StringConcatenation_MatchesAcrossPaths) {
   tally.Summarize("concat");
 }
 
+TEST(DifferentialTest,
+     AuditInCollationConflictsSurviveRewritesAndBytecodeFallback) {
+  const Schema schema("t", {Column("s", ValueType::kVarChar)});
+  const Row row({Value("a").WithCollation(1)});
+  const Expression conflict = InExpressionExp(
+      ColumnValueExp("s"), {ConstantValueExp(Value("A").WithCollation(2))});
+  EXPECT_FALSE(conflict->TryEvaluate(row, schema).HasValue());
+  const auto rewritten =
+      ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(conflict);
+  EXPECT_FALSE(rewritten->TryEvaluate(row, schema).HasValue());
+  EXPECT_FALSE(BytecodeCompiler::Compile(conflict, schema).has_value());
+  const Expression short_circuit = InExpressionExp(
+      ColumnValueExp("s"), {ConstantValueExp(Value("a").WithCollation(1)),
+                            ConstantValueExp(Value("A").WithCollation(2))});
+  EXPECT_EQ(short_circuit->TryEvaluate(row, schema).MoveValue(), Value(true));
+}
+
 TEST(DifferentialTest, Evaluate_CaseAndIn_MatchesAcrossPaths) {
   const Schema& schema = IntSchema();
   const std::vector<Row> rows{
@@ -945,7 +964,8 @@ TEST(DifferentialTest,
               .ValueAt(0);
       uint8_t jit_out = 0;
       jit->Filter(&*sample, &jit_out, 1, kConstant);
-      EXPECT_EQ(bytecode, Value(jit_out != 0))
+      EXPECT_EQ(ast, bytecode) << "jit-filter/" << op_name << " i=" << *sample;
+      EXPECT_EQ(ast, Value(jit_out != 0))
           << "jit-filter/" << op_name << " i=" << *sample;
     }
   }
@@ -1207,6 +1227,67 @@ TEST(DifferentialTest, EvaluateDetailPath_ConcatNull_MatchesCanonical) {
   ASSERT_EQ(detail.kind, Attempt::Kind::kValue);
   EXPECT_TRUE(ast.value.IsNull());
   EXPECT_TRUE(detail.value.IsNull());
+}
+
+TEST(DifferentialTest, AuditMixedUnsignedDivisionAndModulo) {
+  const Schema schema("numbers", {Column("i", ValueType::kInt64),
+                                  Column("j", ValueType::kInt64)});
+  DifferentialTally tally;
+  for (const auto& [row, quotient, remainder] :
+       std::vector<std::tuple<Row, Value, Value>>{
+           {Row({Value(-5), Value(2).WithUnsigned()}), Value(-2), Value(-1)},
+           {Row({Value(5).WithUnsigned(), Value(-2)}), Value(-2), Value(1)},
+           {Row({Value(int64_t{-1}).WithUnsigned(), Value(-2)}),
+            Value(int64_t{-9223372036854775807LL}), Value(1)}}) {
+    for (const auto& [name, expected] :
+         std::vector<std::pair<std::string, Value>>{{"div", quotient},
+                                                    {"mod", remainder}}) {
+      const auto expression =
+          FunctionCallExp(name, {ColumnValueExp("i"), ColumnValueExp("j")});
+      const auto program = BytecodeCompiler::Compile(expression, schema);
+      tally.Compare(
+          name, row.ToString(),
+          {{"ast", EvaluateAst(expression, row, schema)},
+           {"bytecode", EvaluateBytecode(program, schema, row)},
+           {"relational", EvaluateDetailPath(expression, row, schema)}},
+          expected);
+    }
+    const auto modulo = BinaryExpressionExp(
+        ColumnValueExp("i"), BinaryOperation::kModulo, ColumnValueExp("j"));
+    const auto program = BytecodeCompiler::Compile(modulo, schema);
+    tally.Compare("modulo", row.ToString(),
+                  {{"ast", EvaluateAst(modulo, row, schema)},
+                   {"bytecode", EvaluateBytecode(program, schema, row)},
+                   {"relational", EvaluateDetailPath(modulo, row, schema)}},
+                  remainder);
+  }
+  tally.Summarize("audit mixed unsigned arithmetic");
+}
+
+TEST(DifferentialTest, AuditDateExtractKeepsSignedAndWideYears) {
+  const Schema schema("dates", {Column("d", ValueType::kDate)});
+  DifferentialTally tally;
+  for (const int year : {-1000, 10000, 2000}) {
+    const std::chrono::year_month_day date{
+        std::chrono::year{year}, std::chrono::month{3}, std::chrono::day{14}};
+    const Row row({Value::DateFromDays(
+        std::chrono::sys_days{date}.time_since_epoch().count())});
+    for (const auto& [function, expected] :
+         std::vector<std::pair<std::string, int64_t>>{{"extract_year", year},
+                                                      {"extract_month", 3},
+                                                      {"extract_day", 14}}) {
+      const auto expression = FunctionCallExp(function, {ColumnValueExp("d")});
+      const auto program = BytecodeCompiler::Compile(expression, schema);
+      ASSERT_TRUE(program.has_value());
+      tally.Compare(
+          function, std::to_string(year),
+          {{"ast", EvaluateAst(expression, row, schema)},
+           {"bytecode", EvaluateBytecode(program, schema, row)},
+           {"relational", EvaluateDetailPath(expression, row, schema)}},
+          Value(expected));
+    }
+  }
+  tally.Summarize("audit wide dates");
 }
 
 }  // namespace tinylamb

@@ -808,6 +808,56 @@ TEST_F(PlanTest, CompositeIndexRangeUsesTrailingKeyWithDampedCorrelation) {
   ASSERT_SUCCESS(ctx.PreCommit());
 }
 
+TEST_F(PlanTest, AuditAffineOrderingRejectsMultiplierOverflow) {
+  auto ctx = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, ctx.GetTable("Sc2"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, stats,
+                        ctx.GetStats("Sc2"));
+  IndexScanPlan scan(*table, table->GetIndex(0), *stats, {}, {}, true, nullptr,
+                     {ColumnName("Sc2.d1")});
+  const auto factor = ConstantValueExp(Value(INT64_MAX));
+  const auto key = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp("Sc2.d1"), BinaryOperation::kMultiply,
+                          factor),
+      BinaryOperation::kMultiply, factor);
+  EXPECT_FALSE(scan.IsOrderedBy({key}, {true}));
+}
+
+TEST_F(PlanTest, AuditLeadingRangeIndexOnlyUsesUndampedSelectivity) {
+  auto ctx = rs_->BeginContext();
+  const Schema schema("composite_range",
+                      {Column("group_id", ValueType::kInt64),
+                       Column("sequence_id", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(ctx, schema));
+  for (int64_t i = 0; i < 1000; ++i) {
+    ASSERT_SUCCESS(
+        table.Insert(ctx.txn_, Row({Value(i % 10), Value(i)})).GetStatus());
+  }
+  ASSERT_SUCCESS(table.CreateIndex(
+      ctx.txn_,
+      IndexSchema("composite_range_idx", {0, 1}, {}, IndexMode::kNonUnique)));
+  TableStatistics statistics(schema);
+  ASSERT_SUCCESS(statistics.Update(ctx.txn_, table));
+  const Index& index = table.GetIndex(0);
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("composite_range.group_id")),
+          BinaryOperation::kEquals, ConstantValueExp(Value(int64_t{1}))),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(
+          ColumnValueExp(ColumnName("composite_range.sequence_id")),
+          BinaryOperation::kGreaterThanEquals,
+          ConstantValueExp(Value(int64_t{20}))));
+  IndexScanPlan scan(table, index, statistics, {Value(int64_t{1})},
+                     {Value(int64_t{2})}, true, predicate);
+  IndexOnlyScanPlan index_only(table, index, statistics, {Value(int64_t{1})},
+                               {Value(int64_t{2})}, true, predicate);
+  EXPECT_LT(scan.EmitRowCount(), 500U);
+  EXPECT_GT(scan.EmitRowCount(), 10U);
+  EXPECT_EQ(scan.EmitRowCount(), index_only.EmitRowCount());
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(PlanTest, DistinctPlansEstimateProjectedNdv) {
   auto ctx = rs_->BeginContext();
   const Schema schema("cardinality_distinct",

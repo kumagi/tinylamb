@@ -53,11 +53,17 @@ class AggregationExecutor : public ExecutorBase {
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
+  [[nodiscard]] bool AffineFolded() const { return affine_folded_; }
+  [[nodiscard]] static bool CanFoldAffineSums(
+      const Schema& schema, const std::vector<NamedExpression>& aggregates);
 
  private:
   bool Execute(Row* dst);
   bool NextGeneric(Row* dst);
   StatusOr<bool> TryFoldScan(Row* dst);
+  StatusOr<bool> TryFoldAffineSums(Row* dst);
+  StatusOr<bool> TryFoldDistinctColumn(Row* dst);
+  StatusOr<bool> TryFoldDateExtrema(Row* dst);
 
   // How each aggregate reads its input for the vectorized accumulator path.
   // kGeneric falls back to the per-row Evaluate loop below.
@@ -75,7 +81,9 @@ class AggregationExecutor : public ExecutorBase {
   };
   // Accumulates one whole batch through the typed accumulators.  Returns
   // false when the batch layout does not match the declared types; the caller
-  // must then run the generic per-row loop for that batch untouched.
+  // must then run the generic per-row loop for that batch untouched. A false
+  // return with a failed GetStatus() instead aborts execution: arithmetic
+  // failure may occur after earlier accumulators have consumed the batch.
   bool AccumulateTypedBatch(std::vector<Value>* results,
                             std::vector<int64_t>* counts,
                             const DataChunk& chunk) const;
@@ -91,6 +99,7 @@ class AggregationExecutor : public ExecutorBase {
   std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>
       accumulators_;
   bool all_typed_{false};
+  bool affine_folded_{false};
   bool executed_ = false;
   DataChunk input_batch_;
   bool jit_sum_eligible_{false};

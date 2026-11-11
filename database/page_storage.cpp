@@ -117,7 +117,7 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     storage->pm_->GetPool()->DropAllPages();
     return recovered;
   }
-  RETURN_IF_FAIL(storage->pm_->InitializeMetaPage());
+  RETURN_IF_FAIL(PageManager::InitializeMetaPage());
   // End-of-recovery checkpoint: anchor the replayed state durably before the
   // first user transaction. Without this, the whole recovery window replays
   // again on every restart until the first periodic checkpoint lands -- a

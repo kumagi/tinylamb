@@ -1186,17 +1186,22 @@ bool TransactionManager::HasForeignWriteIntent(const Transaction& txn,
 
 Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
                                                  const RowPosition& rp) {
+  txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kNone);
   if (fail_stop_.load(std::memory_order_acquire)) {
+    txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kFailStopped);
     return StatusError(StatusCode::kIOError,
                        "transaction manager is fail-stopped");
   }
   if (txn.IsFinished()) {
+    txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kConflict);
     return Status::kConflicts;
   }
   if (txn.IsWounded()) {
+    txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kWounded);
     return Status::kConflicts;
   }
   if (GetDeadlockPolicy() == DeadlockPolicy::kNoWait) {
+    txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kConflict);
     return Status::kConflicts;
   }
   VersionShard& shard = version_shards_[VersionShardIndex(rp)];
@@ -1216,6 +1221,7 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
     const auto found = shard.versions.find(rp);
     if (found != shard.versions.end() && found->second.pending &&
         found->second.pending->owner_thread == std::this_thread::get_id()) {
+      txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kConflict);
       return Status::kDuplicates;
     }
   }
@@ -1225,6 +1231,7 @@ Status TransactionManager::WaitForRowWriteIntent(Transaction& txn,
     for (size_t hops = 0; hops <= wait_for_edges_.size() && cursor != 0;
          ++hops) {
       if (cursor == txn.ID()) {
+        txn.RecordIntentWaitFailure(Transaction::IntentWaitFailure::kConflict);
         return Status::kConflicts;
       }
       const auto edge = wait_for_edges_.find(cursor);
@@ -2290,43 +2297,6 @@ void TransactionManager::MoveActiveTransaction(Transaction* from,
   }
 }
 
-void TransactionManager::UnregisterActiveTransaction(Transaction* txn) {
-  std::scoped_lock lk(transaction_table_lock);
-  if (active_transactions_.empty()) {
-    return;
-  }
-  auto it = active_transactions_.find(txn->txn_id_);
-  if (it != active_transactions_.end() && it->second == txn) {
-    active_transactions_.erase(it);
-    // The move-assignment adopts a new identity next; a snapshot entry left
-    // under the old one would pin GarbageCollectVersions forever (the
-    // destructor only releases the entry keyed by the adopted id).
-    active_snapshots_.erase(txn->txn_id_);
-  }
-}
-
-void TransactionManager::ReleaseActiveTransaction(Transaction* txn) {
-  std::scoped_lock lk(transaction_table_lock);
-  // Early-out covers transactions whose manager was detached by our
-  // destructor path as well as finished ones; there is nothing to release.
-  if (active_transactions_.empty()) {
-    return;
-  }
-  auto it = active_transactions_.find(txn->txn_id_);
-  if (it != active_transactions_.end() && it->second == txn) {
-    active_transactions_.erase(it);
-    active_snapshots_.erase(txn->txn_id_);
-    if (!txn->IsReadOnly()) {
-      const uint64_t pending =
-          commits_since_gc_.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (pending == kGcCommitThreshold) {
-        std::scoped_lock wake(gc_mutex_);
-        gc_cv_.notify_all();
-      }
-    }
-  }
-}
-
 int TransactionManager::ReservationBisectMode() {
   // Diagnostic bisect for the reservation machinery (env
   // TINYLAMB_DISABLE_INDEX_RESERVATION): 0=on, 1=off, 2=no shared map,
@@ -2372,7 +2342,7 @@ void TransactionManager::ReserveIndexUndoBytes(Transaction& txn, page_id_t pid,
 size_t TransactionManager::IndexUndoReservedBytes(page_id_t pid,
                                                   txn_id_t self) const {
   const int bisect = ReservationBisectMode();
-  if (bisect != 0 && bisect != 4 && bisect != 5) {
+  if (bisect != 0 && bisect != 5) {
     return 0;
   }
   const IndexReservationShard& shard =

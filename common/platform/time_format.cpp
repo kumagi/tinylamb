@@ -55,7 +55,7 @@ void CivilFromDays(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
   *y = yoe + (era * 400) + (*m <= 2 ? 1 : 0);
 }
 
-#if !defined(_WIN32)
+#ifndef _WIN32
 std::array<char, 4> kGmtZoneName = {'G', 'M', 'T', '\0'};
 #else
 struct WinTmZoneShadow {
@@ -85,7 +85,7 @@ void GmTime(int64_t seconds, struct tm* out) {
   out->tm_wday = static_cast<int>(((days % 7) + 11) % 7);  // 1970-01-01: Thu
   out->tm_yday = static_cast<int>(days - DaysFromCivil(y, 1, 1));
   out->tm_isdst = 0;
-#if !defined(_WIN32)
+#ifndef _WIN32
   out->tm_gmtoff = 0;
   out->tm_zone = kGmtZoneName.data();
 #else
@@ -106,7 +106,7 @@ int64_t TimeGm(struct tm* tm) {
 
 void LocalTime(std::time_t seconds, struct tm* out) {
   *out = {};
-#if defined(_WIN32)
+#ifdef _WIN32
   (void)::localtime_s(out, &seconds);
 #else
   (void)::localtime_r(&seconds, out);

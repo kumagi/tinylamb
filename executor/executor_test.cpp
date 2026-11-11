@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -79,6 +80,7 @@
 #include "plan/product_plan.hpp"
 #include "plan/selection_plan.hpp"
 #include "plan/values_plan.hpp"
+#include "table/lstable_bridge.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -997,6 +999,22 @@ TEST_F(ExecutorTest, LookupJoin) {
   // Assert -- cursor exhausted and all matched pairs consumed
   ASSERT_FALSE(ij.Next(&got, nullptr));
   ASSERT_TRUE(expected.empty());
+}
+
+TEST_F(ExecutorTest, AuditLookupJoinRejectsMissingProjectionColumn) {
+  TransactionContext ctx = rs_->BeginContext();
+  ASSERT_SUCCESS(rs_->CreateIndex(
+      ctx, kTableName,
+      IndexSchema("audit_projection", {0}, {}, IndexMode::kNonUnique)));
+  auto table = ctx.GetTable(kTableName);
+  ASSERT_TRUE(table.HasValue());
+  LookupJoin join(
+      ctx.txn_, std::make_shared<FullScan>(ctx.txn_, *table.Value()), {99},
+      *table.Value(), table.Value()->GetIndex(table.Value()->IndexCount() - 1),
+      {0});
+  DataChunk chunk;
+  EXPECT_EQ(join.NextBatch(&chunk), 0U);
+  EXPECT_EQ(join.GetStatus(), Status::kInvalidArgument);
 }
 
 TEST_F(ExecutorTest, LookupJoinWithCompositeKey) {
@@ -3689,6 +3707,7 @@ std::vector<Row> RelationalRun(Database& database, std::string_view sql) {
   while (prepared.Value()->Next(&row, nullptr)) {
     rows.push_back(row);
   }
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess) << sql;
   EXPECT_EQ(context.PreCommit(), Status::kSuccess);
   return rows;
 }
@@ -3996,7 +4015,7 @@ TEST_F(ExecutorTest, RelationalScalarSubqueryReturnsNullWhenEmpty) {
 TEST_F(ExecutorTest, RelationalIntervalAndNoFromQueries) {
   const auto interval = RelationalRun(*rs_, "SELECT INTERVAL 3 DAY;");
   ASSERT_EQ(interval.size(), 1U);
-  EXPECT_EQ(interval[0][0], Value("3 day"));
+  EXPECT_EQ(interval[0][0], Value("0-0 3 0:0:0").WithInterval());
 
   const auto boolean = RelationalRun(*rs_, "SELECT 1 OR 1;");
   ASSERT_EQ(boolean.size(), 1U);
@@ -6526,6 +6545,491 @@ TEST_F(ExecutorTest, FullScanExecutesLSTableFragmentOverPaxChunk) {
   EXPECT_EQ(res.status, Status::kSuccess);
   EXPECT_EQ(res.scalar_count, 3U);
   EXPECT_EQ(res.scalar_value, 6);
+}
+
+TEST_F(ExecutorTest, AffineSumFoldsShareColumnsAndPreserveNullsAndOverflow) {
+  const int64_t hi = std::numeric_limits<int64_t>::max();
+  const std::vector<std::vector<Value>> cases{
+      {Value(1), Value(), Value(4), Value(7)},
+      {Value(-10), Value(-5), Value()},
+      {Value(), Value()},
+      {},
+      {Value(hi - 1), Value(1)},
+      {Value(hi)},
+      {Value(hi), Value(1), Value(-1)}};
+  for (size_t test = 0; test < cases.size(); ++test) {
+    SCOPED_TRACE(test);
+    const std::string name = "AffineSum" + std::to_string(test);
+    const Schema schema(name, {Column("value", ValueType::kInt64)});
+    std::vector<Row> reference;
+    {
+      auto writer = rs_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+      for (const auto& value : cases[test]) {
+        reference.emplace_back(std::vector<Value>{value});
+        ASSERT_SUCCESS(table.Insert(writer.txn_, reference.back()).GetStatus());
+      }
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    const std::vector<NamedExpression> aggregates{
+        NamedExpression("base",
+                        AggregateExpressionExp(AggregationType::kSum,
+                                               ColumnValueExp("value"))),
+        NamedExpression("plus",
+                        AggregateExpressionExp(
+                            AggregationType::kSum,
+                            BinaryExpressionExp(ColumnValueExp("value"),
+                                                BinaryOperation::kAdd,
+                                                ConstantValueExp(Value(1))))),
+        NamedExpression("minus",
+                        AggregateExpressionExp(
+                            AggregationType::kSum,
+                            BinaryExpressionExp(ColumnValueExp("value"),
+                                                BinaryOperation::kSubtract,
+                                                ConstantValueExp(Value(-1)))))};
+    WaitForChainFreePages();
+    auto reader = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, reader.GetTable(name));
+    auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+    AggregationExecutor actual(scan, schema, aggregates);
+    AggregationExecutor expected(std::make_shared<ConstantExecutor>(reference),
+                                 schema, aggregates);
+    Row row, wanted;
+    EXPECT_EQ(actual.Next(&row, nullptr), expected.Next(&wanted, nullptr));
+    EXPECT_EQ(actual.GetStatus(), expected.GetStatus());
+    if (actual.GetStatus().ok()) {
+      EXPECT_EQ(row, wanted);
+    }
+    if (test < 3) {
+      EXPECT_TRUE(actual.AffineFolded());
+    }
+    if (test >= 5) {
+      EXPECT_FALSE(actual.AffineFolded());
+    }
+    EXPECT_FALSE(actual.Next(&row, nullptr));
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+}
+
+TEST_F(ExecutorTest, AffineSumRetainsSnapshotVisibility) {
+  const Schema schema("AffineSnapshot", {Column("value", ValueType::kInt64)});
+  RowPosition position;
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    ASSIGN_OR_ASSERT_FAIL(RowPosition, inserted,
+                          table.Insert(writer.txn_, Row({Value(10)})));
+    position = inserted;
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  auto old = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        old.GetTable("AffineSnapshot"));
+  auto scan = std::make_shared<ParallelScan>(old.txn_, *table, 2, 1);
+  {
+    auto writer = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        table->Update(writer.txn_, position, Row({Value(90)})).GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  AggregationExecutor aggregate(
+      scan, schema,
+      {NamedExpression("s",
+                       AggregateExpressionExp(
+                           AggregationType::kSum,
+                           BinaryExpressionExp(ColumnValueExp("value"),
+                                               BinaryOperation::kAdd,
+                                               ConstantValueExp(Value(5)))))});
+  Row row;
+  ASSERT_TRUE(aggregate.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value(15)}));
+  EXPECT_FALSE(aggregate.AffineFolded());
+  ASSERT_SUCCESS(aggregate.GetStatus());
+  ASSERT_SUCCESS(old.PreCommit());
+}
+
+TEST_F(ExecutorTest, BlockTopNFiltersStringsAndKeepsStablePositions) {
+  const Schema schema("StringTop", {Column("text", ValueType::kVarChar),
+                                    Column("id", ValueType::kInt64),
+                                    Column("payload", ValueType::kVarChar)});
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(
+                  writer.txn_,
+                  Row({i % 17 == 0 ? Value() : Value(i % 2 ? "alpha" : "Alpha"),
+                       Value(i), Value(std::string(600, 'x'))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("StringTop"));
+  for (const auto op : {BinaryOperation::kNotEquals, BinaryOperation::kLike,
+                        BinaryOperation::kNotLike}) {
+    const std::vector<Expression> predicates{BinaryExpressionExp(
+        ColumnValueExp("text"), op,
+        ConstantValueExp(
+            Value(op == BinaryOperation::kNotEquals ? "" : "%lph%")))};
+    const auto filter =
+        relational_detail::CompileScanFilter(predicates, schema);
+    std::vector<Row> reference;
+    std::vector<RowPosition> positions;
+    FullScan original(reader.txn_, *table);
+    Row row;
+    RowPosition position;
+    while (original.Next(&row, &position)) {
+      if (relational_detail::MatchSimpleCompare(row, filter.simple.at(0))) {
+        reference.push_back(row);
+        positions.push_back(position);
+      }
+    }
+    for (const bool ascending : {true, false}) {
+      auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+      scan->SetRowFilter(
+          predicates, filter,
+          relational_detail::CompileWorkerFilter(filter, schema));
+      const std::vector<TopNExecutor::Key> keys{{ColumnValueExp("text"),
+                                                 ascending, false,
+                                                 Collation::kCaseInsensitive}};
+      TopNExecutor actual(scan, schema, keys, 9, 4);
+      TopNExecutor expected(std::make_shared<ConstantExecutor>(reference),
+                            schema, keys, 9, 4);
+      Row wanted;
+      while (expected.Next(&wanted, nullptr)) {
+        ASSERT_TRUE(actual.Next(&row, &position));
+        EXPECT_EQ(row, wanted);
+        const auto found = std::ranges::find(reference, row);
+        ASSERT_NE(found, reference.end());
+        EXPECT_EQ(position,
+                  positions[static_cast<size_t>(found - reference.begin())]);
+      }
+      EXPECT_FALSE(actual.Next(&row, nullptr));
+      ASSERT_SUCCESS(actual.GetStatus());
+      EXPECT_TRUE(scan->WasTypedFolded());
+    }
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(ExecutorTest, BlockDistinctUsesCanonicalStringEqualityAndNulls) {
+  const Schema schema("BlockDistinct", {Column("s", ValueType::kVarChar),
+                                        Column("n", ValueType::kInt64)});
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    const std::vector<Value> strings{Value(),
+                                     Value(""),
+                                     Value("4-th avenue"),
+                                     Value("4-rd avenue"),
+                                     Value("0-12 0 0:0:0"),
+                                     Value("1-0 0 0:0:0"),
+                                     Value("4-th avenue")};
+    for (const auto& text : strings) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({text, Value(std::numeric_limits<int64_t>::min())}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("BlockDistinct"));
+  for (const std::string column : {"s", "n"}) {
+    auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+    AggregationExecutor aggregate(
+        scan, schema,
+        {NamedExpression(
+            "d", AggregateExpressionExp(AggregationType::kCount,
+                                        ColumnValueExp(column), true))});
+    Row row;
+    ASSERT_TRUE(aggregate.Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(column == "s" ? 5 : 1)}));
+    EXPECT_TRUE(scan->WasTypedFolded());
+    ASSERT_SUCCESS(aggregate.GetStatus());
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(ExecutorTest, BlockDateExtremaKeepDateTypeAndNullableBoundaries) {
+  const Schema schema("DateExtrema", {Column("d", ValueType::kDate)});
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (const Value& date :
+         {Value(), Value::Date("1969-12-31"), Value::Date("2024-02-29")}) {
+      ASSERT_SUCCESS(table.Insert(writer.txn_, Row({date})).GetStatus());
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("DateExtrema"));
+  auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+  AggregationExecutor aggregate(
+      scan, schema,
+      {NamedExpression("lo", AggregateExpressionExp(AggregationType::kMin,
+                                                    ColumnValueExp("d"))),
+       NamedExpression("hi", AggregateExpressionExp(AggregationType::kMax,
+                                                    ColumnValueExp("d")))});
+  Row row;
+  ASSERT_TRUE(aggregate.Next(&row, nullptr));
+  EXPECT_EQ(row, Row({Value::Date("1969-12-31"), Value::Date("2024-02-29")}));
+  EXPECT_EQ(row[0].type, ValueType::kDate);
+  EXPECT_EQ(row[1].type, ValueType::kDate);
+  EXPECT_TRUE(scan->WasTypedFolded());
+  ASSERT_SUCCESS(aggregate.GetStatus());
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(ExecutorTest, WholeColumnStoreFoldKeepsScanGuardsAndErrors) {
+  const Schema schema("WholeStore", {Column("n", ValueType::kInt64)});
+  RowPosition first;
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t n = 0; n < 400; ++n) {
+      ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
+                            table.Insert(writer.txn_, Row({Value(n)})));
+      if (n == 0) {
+        first = position;
+      }
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("WholeStore"));
+  size_t calls = 0;
+  const auto consume = [&](const LSTableStore& store) {
+    ++calls;
+    EXPECT_EQ(store.total_rows, 400U);
+    return Status::kSuccess;
+  };
+  {
+    ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{0});
+    ASSIGN_OR_ASSERT_FAIL(bool, folded, scan.TryFoldLSTableStore(consume));
+    EXPECT_TRUE(folded);
+    EXPECT_TRUE(scan.WasTypedFolded());
+    EXPECT_EQ(calls, 1U);
+    ASSIGN_OR_ASSERT_FAIL(bool, repeated, scan.TryFoldLSTableStore(consume));
+    EXPECT_FALSE(repeated);
+    Row row;
+    EXPECT_FALSE(scan.Next(&row, nullptr));
+    EXPECT_FALSE(scan.Next(&row, nullptr));
+    ASSERT_SUCCESS(scan.GetStatus());
+  }
+  for (const bool throws : {false, true}) {
+    ParallelScan scan(reader.txn_, *table, 2, 1);
+    auto result = scan.TryFoldLSTableStore([&](const LSTableStore&) -> Status {
+      if (throws) {
+        throw std::runtime_error("fold callback error");
+      }
+      return Status::kCorrupt;
+    });
+    EXPECT_FALSE(result.HasValue());
+    EXPECT_NE(scan.GetStatus(), Status::kSuccess);
+    Row row;
+    EXPECT_FALSE(scan.Next(&row, nullptr));
+    EXPECT_FALSE(scan.Next(&row, nullptr));
+  }
+  for (const bool attached : {false, true}) {
+    ParallelScan scan(reader.txn_, *table, 2, 1, std::nullopt,
+                      attached ? std::vector<IntegerPeekCompare>{}
+                               : std::vector<IntegerPeekCompare>{
+                                     {.column = 0,
+                                      .op = BinaryOperation::kEquals,
+                                      .constant = 1}});
+    if (attached) {
+      const std::vector<Expression> predicates{
+          BinaryExpressionExp(ColumnValueExp("n"), BinaryOperation::kEquals,
+                              ConstantValueExp(Value(1)))};
+      const auto filter =
+          relational_detail::CompileScanFilter(predicates, schema);
+      scan.SetRowFilter(predicates, filter,
+                        relational_detail::CompileWorkerFilter(filter, schema));
+    }
+    ASSIGN_OR_ASSERT_FAIL(bool, folded, scan.TryFoldLSTableStore(consume));
+    EXPECT_FALSE(folded);
+    Row row;
+    ASSERT_TRUE(scan.Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(1)}));
+    EXPECT_FALSE(scan.Next(&row, nullptr));
+    ASSERT_SUCCESS(scan.GetStatus());
+  }
+  {
+    ParallelScan scan(reader.txn_, *table, 2, 1);
+    Row row;
+    ASSERT_TRUE(scan.Next(&row, nullptr));
+    ASSIGN_OR_ASSERT_FAIL(bool, folded, scan.TryFoldLSTableStore(consume));
+    EXPECT_FALSE(folded);
+  }
+  {
+    ParallelScan scan(reader.txn_, *table, 2, 1, std::vector<slot_t>{1});
+    ASSIGN_OR_ASSERT_FAIL(bool, folded, scan.TryFoldLSTableStore(consume));
+    EXPECT_FALSE(folded);
+  }
+  // A store obtained before a concurrent update must not bypass the old
+  // reader's version-chain traversal, even though it is still owned here.
+  ParallelScan old_scan(reader.txn_, *table, 2, 1);
+  ASSERT_NE(old_scan.GetLSTableStore(), nullptr);
+  {
+    auto writer = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        table->Update(writer.txn_, first, Row({Value(999)})).GetStatus());
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  ASSIGN_OR_ASSERT_FAIL(bool, old_folded,
+                        old_scan.TryFoldLSTableStore(consume));
+  EXPECT_FALSE(old_folded);
+  int64_t sum = 0;
+  Row row;
+  while (old_scan.Next(&row, nullptr)) {
+    sum += row[0].value.int_value;
+  }
+  EXPECT_EQ(sum, 399 * 400 / 2);
+  ASSERT_SUCCESS(old_scan.GetStatus());
+  EXPECT_EQ(calls, 1U);
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(ExecutorTest, WideDictionaryDistinctAndMembershipUseVisibleRows) {
+  const Schema schema("EncodedDistinct", {Column("s", ValueType::kVarChar),
+                                          Column("n", ValueType::kInt64)});
+  std::vector<Value> texts{Value(), Value(""), Value("0-12 0 0:0:0"),
+                           Value("1-0 0 0:0:0")};
+  for (size_t i = 0; i < 300; ++i) {
+    std::string text(80, 'x');
+    text += std::to_string(i);
+    texts.emplace_back(std::move(text));
+  }
+  constexpr int64_t kRows = 12280;
+  {
+    auto writer = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(writer, schema));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(writer.txn_,
+                      Row({texts[static_cast<size_t>(i) % texts.size()],
+                           Value(i * 3)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+  }
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("EncodedDistinct"));
+  for (const int64_t bound : {int64_t{0}, int64_t{30}, kRows * 3}) {
+    std::unordered_set<Value> expected;
+    for (int64_t i = 0; i * 3 < bound; ++i) {
+      const auto& text = texts[static_cast<size_t>(i) % texts.size()];
+      if (!text.IsNull()) {
+        expected.insert(text);
+      }
+    }
+    auto scan = std::make_shared<ParallelScan>(
+        reader.txn_, *table, 2, 1, std::nullopt,
+        std::vector<IntegerPeekCompare>{{.column = 1,
+                                         .op = BinaryOperation::kLessThan,
+                                         .constant = bound}});
+    ASSERT_NE(scan->GetLSTableStore(), nullptr);
+    EXPECT_EQ(scan->GetLSTableStore()->dictionaries[0].wide_code_bytes, 2);
+    EXPECT_TRUE(scan->GetLSTableStore()->dictionaries[0].bytewise_equality);
+    AggregationExecutor aggregate(
+        scan, schema,
+        {NamedExpression("d",
+                         AggregateExpressionExp(AggregationType::kCount,
+                                                ColumnValueExp("s"), true))});
+    Row row;
+    ASSERT_TRUE(aggregate.Next(&row, nullptr));
+    EXPECT_EQ(row, Row({Value(static_cast<int64_t>(expected.size()))}));
+    EXPECT_TRUE(scan->WasTypedFolded());
+    ASSERT_SUCCESS(aggregate.GetStatus());
+  }
+  const auto store = table->GetLSTableStore();
+  ASSERT_NE(store, nullptr);
+  int64_t absent = 1;
+  while (store->MayContainInteger(1, absent) && absent < kRows * 3) {
+    absent += 3;
+  }
+  ASSERT_LT(absent, kRows * 3);
+  for (const bool attached : {false, true}) {
+    for (const int64_t value : {absent, int64_t{0}, (kRows - 1) * 3}) {
+      const auto make_scan = [&] {
+        if (attached) {
+          auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+          const std::vector<Expression> predicates{
+              BinaryExpressionExp(ColumnValueExp("n"), BinaryOperation::kEquals,
+                                  ConstantValueExp(Value(value)))};
+          const auto filter =
+              relational_detail::CompileScanFilter(predicates, schema);
+          scan->SetRowFilter(
+              predicates, filter,
+              relational_detail::CompileWorkerFilter(filter, schema));
+          return scan;
+        }
+        return std::make_shared<ParallelScan>(
+            reader.txn_, *table, 2, 1, std::nullopt,
+            std::vector<IntegerPeekCompare>{{.column = 1,
+                                             .op = BinaryOperation::kEquals,
+                                             .constant = value}});
+      };
+      auto scan = make_scan();
+      Row row;
+      if (value != absent) {
+        ASSERT_TRUE(scan->Next(&row, nullptr));
+        EXPECT_EQ(row[1], Value(value));
+      }
+      EXPECT_FALSE(scan->Next(&row, nullptr));
+      EXPECT_FALSE(scan->Next(&row, nullptr));
+      ASSERT_SUCCESS(scan->GetStatus());
+      std::atomic<size_t> rows{0};
+      auto folded = make_scan()->TryFoldLSTableBlocks(
+          2,
+          [&](size_t, const LSTablePageBlock&, const uint32_t*, size_t count) {
+            rows += count;
+            return Status::kSuccess;
+          });
+      ASSERT_TRUE(folded.HasValue());
+      EXPECT_TRUE(folded.Value());
+      EXPECT_EQ(rows.load(), value == absent ? 0 : 1);
+    }
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(ExecutorTest, TypedGroupingHandlesConstantsEmptyInputAndAverageCasts) {
+  RelationalRun(*rs_, "CREATE TABLE ConstantGroups (k STRING, n INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO ConstantGroups VALUES ('a',1), ('a',3), "
+                "('b',NULL), ('b',7)");
+  const auto rows =
+      RelationalRun(*rs_,
+                    "SELECT 1, k, AVG(CAST(n AS FLOAT64)), COUNT(*) "
+                    "FROM ConstantGroups GROUP BY 1,k ORDER BY k");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(1), Value("a"), Value(2.0), Value(2)}));
+  EXPECT_EQ(rows[1], Row({Value(1), Value("b"), Value(7.0), Value(2)}));
+  EXPECT_TRUE(
+      RelationalRun(*rs_,
+                    "SELECT 'constant', COUNT(*) FROM ConstantGroups "
+                    "WHERE n > 100 GROUP BY 'constant' ORDER BY COUNT(*)")
+          .empty());
+  EXPECT_EQ(
+      RelationalRun(*rs_, "SELECT AVG(CAST(n AS FLOAT64)) FROM ConstantGroups"),
+      std::vector<Row>{Row({Value(11.0 / 3.0)})});
 }
 
 }  // namespace tinylamb

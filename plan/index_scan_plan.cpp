@@ -75,8 +75,7 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
     if (!AffineColumn(binary.Left(), target, multiplier)) {
       return false;
     }
-    *multiplier *= constant;
-    return true;
+    return !__builtin_mul_overflow(*multiplier, constant, multiplier);
   }
   return false;
 }

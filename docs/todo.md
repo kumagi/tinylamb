@@ -1,7 +1,8 @@
 #tinylamb 統合 TODO / 再建プラン
 
-このファイルを `executor_todo.md` と `optimizer_todo.md` に代わる唯一の
-TODO リストとする。完了を確認できた項目はここには掲載しない。
+実装候補と過去の完了記録をまとめる一覧。`executor_todo.md`、
+`optimizer_todo.md`、`next-actions.md` と併用する。古い完了記録には撤去・
+統合前の名前が残るため、現行の実装・到達経路・回帰テストを照合して判断する。
 
 ## 判定基準
 
@@ -76,21 +77,19 @@ Cascades rule / cost / statistics
 
 ### LogicalOperator / Memo
 
-（以下はすべて実装・テスト合格を確認済み:
-- `kSingleJoin`, `kMarkJoin`（一致・不一致・UNKNOWN marker 列）
-- `kDistinct` / `kDuplicateElim` 論理演算子と物理契約統一
-- `kConstantTable`（`kValues` と分離）
-- `kEmpty` 論理演算子
-- `kWindow`（PARTITION、ORDER、frame、exclude）
-- `kUnnest`、`kGenerateSeries` 論理ノード
-- `kRecursiveCte`、`kWorkTableScan` Memoノード
-- `kMaterialize`、`kEagerSpool`、`kLazySpool`
-- `kExpand`（GROUPING SETS / ROLLUP / CUBE）
-- `kApply` / `kLateralJoin`
-- `kExchange` / `kGather` / `kBroadcast` / `kRedistribute`
-- `kSample` / `kTableSample`
-- `kAssert`（cardinality / not null assertion）
-- 対応する `dsl::*` パターンヘルパーおよび `Memo::AddExpression`, `RequiredChildProperties` 全網羅）
+現行 `plan/cascades.hpp` の `LogicalOperator` は次のとおり。
+
+- Scan、Join、OuterJoin、CrossJoin、SemiJoin、AntiJoin
+- Selection、Projection、Aggregation、Sort、TopN、Distinct、Limit
+- Union / UnionAll、Intersect / IntersectAll、Except / ExceptAll
+- Empty、Values、DummyScan、Window、Unnest、RecursiveCte、Apply、Sample、Relational
+
+`SingleJoin` / `MarkJoin` / `ConstantTable` / `GenerateSeries` / `WorkTableScan` /
+`Materialize` / `EagerSpool` / `LazySpool` / `Expand` / `LateralJoin` /
+`Exchange` / `Gather` / `Broadcast` / `Redistribute` / `Assert` は現行の
+専用論理 enum ではない。相当する SQL 機能は共有 Values、UNNEST、
+サブクエリ評価、GROUPING SETS の枝展開等で実行するものと未実装のものがある。
+専用ノードやパターンヘルパーが存在すると推定して新しい規則を書かない。
 
 ### Payload、Schema、PhysicalProperties
 
@@ -144,7 +143,7 @@ Cascades rule / cost / statistics
       `plan/cascades_test.cpp` の `SemiReductionPushdownAnnotatesTheProbeKeys` /
       `SemiReductionPushdownSkipsNonEqualityJoins` /
       `SemiReductionPushdownAnnotatesEveryCompositeKey`）。
-- [x] As-of Join / Interval Joinを実装する。
+- [ ] As-of Join / Interval Join の SQL・計画・実行経路を実装する（旧専用実装は撤去済み）。
 
 ### Sort / Top-N
 
@@ -297,7 +296,7 @@ Cascades rule / cost / statistics
 - [x] `TwoPhaseDistinctAgg`を実装する。
 - [x] MIN/MAXのindex-only aggregate scanを実装する（非NULLな単一キー列を
       順序付きインデックスの先頭1件から取得）。
-- [x] SQL標準 `FILTER (WHERE ...)` をASTから実行器まで接続する。
+- [ ] SQL標準 `FILTER (WHERE ...)` の構文を接続する。現行の対応形は GoogleSQL `AGG(x WHERE p)`。
 - [x] Ordered-set aggregate（PERCENTILE_CONT / WITHIN GROUP）を実装する。
 - [x] Grouping Sets / Rollup / Cube executorを実装する。
 - [x] bitwise、bool_and、bool_orのvectorized pathを実装する。
@@ -637,7 +636,7 @@ Cascades rule / cost / statistics
 （以下はリレーショナル経路で実装済み: Insert, Update, UpdateFrom(MERGE脱糖), Delete, BatchInsert, Upsert/ON CONFLICT, TableTriggers）
 
 - [x] Upsert / ON CONFLICTを実装する。
-- [x] MATCHED / NOT MATCHEDのMergeExecutorを実装する。
+- [x] MERGE の MATCHED / NOT MATCHED を SQL エンジンで実行する（専用 `MergeExecutor` は存在しない）。
 - [x] UPDATE FROM / DELETE USINGを実装する。
       `UPDATE ... FROM` は実装済み（フロントエンドが
       `MERGE INTO t USING src ON <WHERE> WHEN MATCHED THEN UPDATE SET ...` へ
@@ -753,7 +752,7 @@ Cascades rule / cost / statistics
 - [x] AnalyzeScan（ヒストグラム構築用）を実装する。
 - [x] ReservoirSampleを実装する。
 - [x] HyperLogLogによる統計収集(AnalyzeScan)を実装する。
-- [x] 実行時feedback用CardinalityProbeを実装する。
+- [ ] 専用 CardinalityProbe による実行時 feedback を設計する（現行クラスは存在しない）。
 
 ---
 
@@ -1365,17 +1364,11 @@ Cascades rule / cost / statistics
 - [x] memory許可量とspill確率、parallel speedupをモデル化する。
 - [x] index clustering factor(correlation)のモデル化は済。
 - [ ] page cache hit率のモデル化。
-  - 判定記録 (2026-10-23, スキップ維持): 2案とも構成物が大きい。(a) cost 側:
-    先行の clustering penalty (RangeClusteringPenalty, 非相関で最大 3x/row) は
-    再訪局所性の近似で既に効いている。上界の精度化 (= ヒット率 modeled な
-    予定ミス数 min(matched, pages)) には ANALYZE が page 数を測る stats 拡張
-    (永続化ラウンドトリップ) と ルール時点の pool capacity (実行時 env
-    `TINYLAMB_PAGE_POOL_BYTES`、コンパイル時には無い) が要る — capacity を
-    cost の定数に焼くと plan cache 再生中の env 変更と契約が衝突する。
-    (b) runtime 側: `PagePool::CacheHits()/CacheMisses()` は実測計器として
-    既に存在 (page/page_pool.hpp)。modeling を見る前にこの計器を
-    EXPLAIN ANALYZE に出す導線 (実行 feedback 節の [x] 項目の延長) が低-cost
-    の第一着手点。着手順: 計器公開 → 分布観測 → capacity 有りモデル。
+  - 現行は RAM 上の PageManager であり、退任した PagePool の容量・
+    eviction モデルをそのままコストへ持ち込めない。既存の計器は
+    `PageManager::CacheHits()/CacheMisses()`（`page/page_manager.hpp`）。
+    これらはページ取得の成否を数え、ディスク buffer-pool の cache miss
+    を示すものではない。I/O と常駐メモリの実測定義を決めてから設計する。
 - [x] PAX / zone map選択性をcostへ反映する。
 - [x] Top-N limit hintを全implementation ruleへ伝播する。
   - 実装契約 (limit hint 伝播): `ApplyLimitHint` (plan/implementation_rules.cpp
@@ -1476,12 +1469,12 @@ Cascades rule / cost / statistics
 - [x] late materializationの列batchを実装する。
 - [x] PipelineBreakerをHash build / Sort / Materializeへ明示する。
 - [x] morsel-driven parallelismをCascades DOPへ接続する。
-- [x] Exchange / Gather / Redistribute executorを実装する。
+- [ ] Exchange / Gather / Redistribute executor を実装する（旧専用クラスは撤去済み）。
 - [x] shared-build ParallelHashJoinを実装する。
 - [x] ParallelMergeJoin、ScanPartition steeringを実装する。
-- [x] NUMA-aware arenaを実装する。
+- [ ] NUMA-aware arena を実装する。
 - [x] SIMD比較kernelとJITの役割分担を実装する。
-- [x] batch aggregationのdictionary encodingを実装する。
+- [ ] 汎用 batch aggregation の dictionary encoding を設計する（`DictionaryBatchAggregation` クラスは存在しない。個別の PAX 辞書集約とは別）。
 - [x] compressed PAX direct scan、zero-copy projectionを実装する。
 - [x] operatorごとのmemory reservationを実装する。
 - [ ] HashJoin / HashAgg / Sort / Windowのspill protocolを統一する。
@@ -1512,10 +1505,10 @@ Cascades rule / cost / statistics
       テスト木では期待値が張れない。着手点: Distribution 型の拡張
       (もしくは dedicated DistributionRequirement property) —
       分布 v2 の契約 (todo 分布節の残項目) と同じ設計セッションで。
-- [x] partial agg/finalize、two-phase distinctを分散経路へ接続する。
-- [x] window partition再分散、scan range分割を実装する。
-- [x] ExchangeHash / Broadcast / Gather / Rangeを実装する。
-- [x] RemoteScan、DistributedAggFinalizeを実装する。
+- [ ] partial agg/finalize、two-phase distinct をノード間分散経路へ接続する。
+- [ ] window partition のノード間再分散を実装する（単一ノードの scan range 分割とは別）。
+- [ ] ExchangeHash / Broadcast / Gather / Range を実装する。
+- [ ] RemoteScan / DistributedAggFinalize を実装する（旧専用クラスは撤去済み）。
 
 ---
 

@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,6 +43,71 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(ValueAuditTest, MoveStringLeavesNullAndKeepsExactBorrowedSlice) {
+  for (size_t length : {size_t{3}, size_t{2048}}) {
+    const std::string text(length, 'a');
+    Value original{std::string(text)};
+    Value shared = original;
+    EXPECT_EQ(shared.MoveString(), text);
+    EXPECT_TRUE(shared.IsNull());
+    EXPECT_EQ(original.AsStringView(), text);
+    auto moved = original.MoveString();
+    EXPECT_EQ(moved, text);
+    moved.clear();
+    moved.shrink_to_fit();
+    EXPECT_TRUE(original.IsNull());
+    Value borrowed;
+    borrowed.type = ValueType::kVarChar;
+    borrowed.value.varchar_value = text;
+    EXPECT_EQ(borrowed.MoveString(), text);
+    EXPECT_TRUE(borrowed.IsNull());
+    Value sliced{std::string(text)};
+    sliced.value.varchar_value = sliced.AsStringView().substr(1);
+    EXPECT_EQ(sliced.MoveString(), text.substr(1));
+    EXPECT_TRUE(sliced.IsNull());
+  }
+}
+
+TEST(ValueAuditTest, BufferKeyEncodingMatchesAllocatingEncoding) {
+  for (const Value& value :
+       {Value(), Value::Array({Value(), Value(7), Value("x")}, "STRING"),
+        Value::Array({Value::Array({Value(1), Value()}, "INT64")},
+                     "ARRAY<INT64>")}) {
+    const auto encoded = value.TryEncodeMemcomparableFormat();
+    ASSERT_TRUE(encoded.HasValue());
+    std::string buffer(encoded.Value().size(), '\0');
+    EXPECT_NO_THROW(EXPECT_EQ(value.EncodeMemcomparableFormatTo(buffer.data()),
+                              buffer.size()));
+    EXPECT_EQ(buffer, encoded.Value());
+  }
+}
+
+TEST(ValueAuditTest, ExistingArrayDecoderBoundsRejectHugeCountsAndDepth) {
+  std::array<char, 4> huge_count{
+      static_cast<char>(0xff), static_cast<char>(0xff), static_cast<char>(0xff),
+      static_cast<char>(0xff)};
+  Value decoded;
+  EXPECT_FALSE(
+      decoded.TryDeserialize(huge_count.data(), ValueType::kArray).HasValue());
+  EXPECT_FALSE(Value::TrySkipSerialized(huge_count.data(), ValueType::kArray)
+                   .HasValue());
+  Value nested = Value::Array({}, "INT64");
+  for (int depth = 0; depth < 40; ++depth) {
+    nested = Value::Array({nested}, "ARRAY");
+  }
+  std::string buffer(nested.Size(), '\0');
+  nested.Serialize(buffer.data());
+  EXPECT_FALSE(
+      decoded.TryDeserialize(buffer.data(), ValueType::kArray).HasValue());
+  EXPECT_FALSE(
+      Value::TrySkipSerialized(buffer.data(), ValueType::kArray).HasValue());
+  const Value shallow = Value::Array({Value(1)}, "INT64");
+  buffer.resize(shallow.Size());
+  shallow.Serialize(buffer.data());
+  EXPECT_TRUE(
+      decoded.TryDeserialize(buffer.data(), ValueType::kArray).HasValue());
+}
 
 TEST(ValueTest, Constructor_Default_CreatesNullValue) {
   Value v;
@@ -105,6 +171,43 @@ TEST(ValueTest,
   SerializeDeserializeTest(v_long);
 }
 
+TEST(ValueTest, ArrayCopiesSurviveScalarOverwritesAndConcurrentOwners) {
+  const Value array = Value::Array(
+      {Value::Array({Value(7), Value("owned string payload")}, "INT64"),
+       Value(9)},
+      "ARRAY<INT64>");
+  Value original = array;
+  Value copied = original;
+  original = Value(42);
+  Value moved = std::move(copied);
+  ASSERT_EQ(moved.ArrayElements().size(), 2U);
+  EXPECT_EQ(moved.ArrayElements()[0].ArrayElements()[1],
+            Value("owned string payload"));
+  // Replacing a retained array payload with a string, then another array,
+  // exercises all lifetime transitions independently of the current tag.
+  original = Value("replacement string");
+  original = moved;
+  moved = Value();
+  EXPECT_EQ(original.ArrayElements()[1], Value(9));
+  std::vector<std::thread> workers;
+  workers.reserve(4);
+  for (int worker = 0; worker < 4; ++worker) {
+    workers.emplace_back([array] {
+      for (int i = 0; i < 1000; ++i) {
+        Value copy = array;
+        Value second = copy;
+        copy = Value(i);
+        copy = second;
+        second = Value("scalar");
+        EXPECT_EQ(copy.ArrayElements()[0].ArrayElements()[0], Value(7));
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+}
+
 TEST(ValueTest, Array_RoundTripSerializationAndMemcomparable_PreservesArray) {
   const Value array =
       Value::Array({Value(int64_t{1}), Value(int64_t{2})}, "INT64");
@@ -160,6 +263,123 @@ TEST(ValueTest, Deserialize_VarcharFromBuffer_OwnsDecodedPayload) {
   ASSERT_EQ(written, buffer.size());
   EXPECT_EQ(restored.value.varchar_value, "page-payload");
   EXPECT_EQ(restored.owned_data, "page-payload");
+}
+
+TEST(ValueTest, StringCopiesDetachBeforeMutationAndDecode) {
+  for (const std::string& text :
+       {std::string("small"), std::string(200, 'x')}) {
+    const Value original{std::string(text)};
+    const std::hash<Value> hash;
+    const auto expected_hash = std::hash<std::string_view>()(text);
+    EXPECT_EQ(hash(original), expected_hash);
+    Value copied = original;
+    copied.SetStringView(copied.AsStringView().substr(1));
+    EXPECT_EQ(copied.AsStringView(), std::string_view(text).substr(1));
+    EXPECT_EQ(hash(copied),
+              std::hash<std::string_view>()(std::string_view(text).substr(1)));
+    EXPECT_EQ(hash(original), expected_hash);
+    EXPECT_EQ(original.AsStringView(), text);
+
+    Value decoded = original;
+    const Value replacement(std::string("replacement"));
+    std::string buffer(replacement.Size(), '\0');
+    replacement.Serialize(buffer.data());
+    ASSERT_TRUE(
+        decoded.TryDeserialize(buffer.data(), ValueType::kVarChar).HasValue());
+    EXPECT_EQ(decoded.AsStringView(), "replacement");
+    EXPECT_EQ(hash(decoded), hash(replacement));
+    EXPECT_EQ(original.AsStringView(), text);
+
+    Value taken = original;
+    EXPECT_EQ(taken.MoveString(), text);
+    EXPECT_EQ(original.AsStringView(), text);
+    taken.SetInt64(17);
+    taken.SetString(std::string("reused"));
+    EXPECT_EQ(taken.AsStringView(), "reused");
+    EXPECT_EQ(original.AsStringView(), text);
+
+    std::vector<std::thread> workers;
+    workers.reserve(4);
+    for (size_t worker = 0; worker < 4; ++worker) {
+      workers.emplace_back([&original, &text, &hash, expected_hash] {
+        for (size_t i = 0; i < 1000; ++i) {
+          Value local = original;
+          local.SetStringView("thread-local");
+          EXPECT_EQ(local.AsStringView(), "thread-local");
+          EXPECT_EQ(original.AsStringView(), text);
+          EXPECT_EQ(hash(original), expected_hash);
+          EXPECT_EQ(hash(local), hash(Value("thread-local")));
+        }
+      });
+    }
+    for (auto& worker : workers) {
+      worker.join();
+    }
+  }
+}
+
+TEST(ValueTest, StringHashChecksBorrowedSlicesAndRetainedMutableReferences) {
+  const std::hash<Value> hash;
+  Value owned("abcdef");
+  const uint64_t original = hash(owned);
+  Value slice = owned;
+  slice.value.varchar_value = owned.AsStringView().substr(1, 3);
+  EXPECT_EQ(hash(slice), hash(Value("bcd")));
+  EXPECT_EQ(hash(owned), original);
+  Value borrowed;
+  borrowed.type = ValueType::kVarChar;
+  borrowed.value.varchar_value = owned.AsStringView();
+  EXPECT_EQ(hash(borrowed), original);
+  Value mutable_value("alpha");
+  std::string& text = mutable_value.owned_data.Mutable();
+  mutable_value.value.varchar_value = text;
+  EXPECT_EQ(hash(mutable_value), hash(Value("alpha")));
+  text[0] = 'o';
+  EXPECT_EQ(hash(mutable_value), hash(Value("olpha")));
+  mutable_value.SetStringView("gamma");
+  EXPECT_EQ(hash(mutable_value), hash(Value("gamma")));
+  text[0] = 'l';
+  EXPECT_EQ(hash(mutable_value), hash(Value("lamma")));
+  const auto taken = mutable_value.MoveString();
+  EXPECT_EQ(taken, "lamma");
+  mutable_value.SetStringView("delta");
+  EXPECT_EQ(hash(mutable_value), hash(Value("delta")));
+  text[0] = 'f';
+  EXPECT_EQ(hash(mutable_value), hash(Value("felta")));
+  const Value interval = Value("1-0 0 0:0:0").WithInterval();
+  const Value same_interval = Value("01-00 0 00:00:00").WithInterval();
+  EXPECT_EQ(interval, same_interval);
+  EXPECT_EQ(hash(interval), hash(same_interval));
+  EXPECT_EQ(hash(interval), hash(same_interval));
+}
+
+TEST(ValueTest, SharedPayloadChangesBetweenStringsArraysAndScalars) {
+  const Value original =
+      Value::Array({Value("nested text"), Value()}, "STRING");
+  Value shared = original;
+  shared.SetInt64(17);
+  // Reuse a scalar slot whose old owner is still an array. The string view
+  // may refer into that old array, so capture its bytes before releasing it.
+  shared.SetStringView(original.ArrayElements()[0].AsStringView());
+  EXPECT_EQ(shared.AsStringView(), "nested text");
+  EXPECT_EQ(original.ArrayElements().size(), 2U);
+  shared = original;
+  Value moved = std::move(shared);
+  EXPECT_EQ(moved, original);
+  moved.SetString(std::string("different"));
+  EXPECT_EQ(original.ArrayElements()[0], Value("nested text"));
+  const Value text("old string");
+  Value decoded = text;
+  std::string buffer(original.Size(), '\0');
+  original.Serialize(buffer.data());
+  ASSERT_TRUE(
+      decoded.TryDeserialize(buffer.data(), ValueType::kArray).HasValue());
+  EXPECT_EQ(decoded, original);
+  EXPECT_EQ(text, Value("old string"));
+  decoded.SetStringView(decoded.ArrayElements()[0].AsStringView());
+  EXPECT_EQ(decoded.AsStringView(), "nested text");
+  // The other array's ownership must survive releasing the decoded copy.
+  EXPECT_EQ(original.ArrayElements()[0], Value("nested text"));
 }
 
 TEST(ValueTest, OutputOperator_VariousTypes_OutputsToLogWithoutError) {
@@ -852,6 +1072,37 @@ TEST(DateTest, ExtremeMonthOffsetsFailWithoutOverflow) {
   EXPECT_FALSE(TryAddDateIntervalDays(base, INT64_MAX, "months").HasValue());
 }
 
+TEST(ValueAuditTest, IntervalShapedStringsKeepByteOrderingAndIdentity) {
+  const Value two("2-0 0 0:0:0"), ten("10-0 0 0:0:0");
+  EXPECT_FALSE(two < ten);
+  EXPECT_GT(CompareForOrderBy(two, ten), 0);
+  EXPECT_GT(two.EncodeMemcomparableFormat(), ten.EncodeMemcomparableFormat());
+  EXPECT_NE(Value("1-0 0 0:0:0"), Value("01-00 0 00:00:00"));
+  const Value typed_two = two.WithInterval(), typed_ten = ten.WithInterval();
+  EXPECT_LT(typed_two, typed_ten);
+  EXPECT_LT(CompareForOrderBy(typed_two, typed_ten), 0);
+  EXPECT_LT(typed_two.EncodeMemcomparableFormat(),
+            typed_ten.EncodeMemcomparableFormat());
+  EXPECT_NE(typed_two, two);
+  for (const Value& original :
+       {typed_two, typed_ten,
+        Value::Array({typed_two, typed_ten}, "INTERVAL")}) {
+    Value restored;
+    const auto key = original.EncodeMemcomparableFormat();
+    ASSERT_TRUE(restored.TryDecodeMemcomparableFormat(key).HasValue());
+    EXPECT_EQ(restored, original);
+    EXPECT_EQ(restored.IsInterval(), original.IsInterval());
+    std::stringstream stream;
+    Encoder encoder(stream);
+    encoder << original;
+    Decoder decoder(stream);
+    decoder >> restored;
+    ASSERT_FALSE(decoder.Failed());
+    EXPECT_EQ(restored, original);
+    EXPECT_EQ(restored.IsInterval(), original.IsInterval());
+  }
+}
+
 TEST(ValueTest, DeserializeReusedValueClearsPreviousAttributes) {
   for (const Value& original :
        {Value(-1), Value("plain"), Value(2.5), Value::DateFromDays(0),
@@ -1253,7 +1504,7 @@ TEST(DateTest, SetDefaultTimeZone_CustomAndEmpty_UpdatesOrResetsTimeZone) {
   std::string default_tz = GetDefaultTimeZone();
 
   EXPECT_EQ(utc_tz, "UTC");
-  EXPECT_EQ(default_tz, "America/Los_Angeles");
+  EXPECT_EQ(default_tz, "UTC");
 }
 
 TEST(IntervalTest,
@@ -1492,6 +1743,38 @@ TEST(ValueTest, UnsignedInt64_ComparisonAndOrdering) {
   EXPECT_EQ(CompareForOrderBy(umax, s_max), 1);
 }
 
+TEST(ValueAuditTest, MixedUnsignedDivisionAndModuloKeepSignedOperands) {
+  const Value unsigned_two = Value(2).WithUnsigned();
+  const Value unsigned_max = Value(int64_t{-1}).WithUnsigned();
+  for (const auto& [left, right, quotient, remainder] :
+       std::vector<std::tuple<Value, Value, Value, Value>>{
+           {Value(-5), unsigned_two, Value(-2), Value(-1)},
+           {Value(5).WithUnsigned(), Value(-2), Value(-2),
+            Value(1).WithUnsigned()},
+           {unsigned_max, Value(-2), Value(int64_t{-9223372036854775807LL}),
+            Value(1).WithUnsigned()},
+           {Value(std::numeric_limits<int64_t>::min()).WithUnsigned(),
+            Value(-1), Value(std::numeric_limits<int64_t>::min()),
+            Value(0).WithUnsigned()}}) {
+    auto div = left.TryArithmetic(right, BinaryOperation::kDivide);
+    auto mod = left.TryArithmetic(right, BinaryOperation::kModulo);
+    ASSERT_TRUE(div.HasValue()) << div.GetStatus();
+    ASSERT_TRUE(mod.HasValue()) << mod.GetStatus();
+    EXPECT_EQ(div.Value(), quotient);
+    EXPECT_EQ(div.Value().IsUnsigned(), quotient.IsUnsigned());
+    EXPECT_EQ(mod.Value(), remainder);
+    EXPECT_EQ(mod.Value().IsUnsigned(), remainder.IsUnsigned());
+  }
+  EXPECT_FALSE(unsigned_max.TryArithmetic(Value(-1), BinaryOperation::kDivide)
+                   .HasValue());
+  EXPECT_FALSE(unsigned_max.TryArithmetic(Value(0), BinaryOperation::kDivide)
+                   .HasValue());
+  EXPECT_FALSE(
+      Value(-1)
+          .TryArithmetic(Value(0).WithUnsigned(), BinaryOperation::kModulo)
+          .HasValue());
+}
+
 TEST(ValueTest, UnsignedInt64_ArithmeticAndStringConversion) {
   const Value u0 = Value(int64_t{0}).WithUnsigned();
   const Value u10 = Value(int64_t{10}).WithUnsigned();
@@ -1562,6 +1845,21 @@ TEST(ValueTest, UnsignedInt64_ArithmeticAndStringConversion) {
   auto xor_res = umax ^ u10;
   EXPECT_TRUE(xor_res.IsUnsigned());
   EXPECT_EQ(xor_res ^ u10, umax);
+}
+
+TEST(ValueTest, HyphenatedWordsAreNotIntervalKeys) {
+  const Value left("4-th avenue");
+  const Value right("4-rd avenue");
+  EXPECT_NE(left, right);
+  EXPECT_LT(right, left);
+  const Value cyrillic_left("4-й расписок фронт");
+  const Value cyrillic_right("4-я расписок фронт");
+  EXPECT_NE(cyrillic_left, cyrillic_right);
+  const std::unordered_set<Value> distinct{cyrillic_left, cyrillic_right};
+  EXPECT_EQ(distinct.size(), 2);
+  EXPECT_NE(Value("0-12 0 0:0:0"), Value("1-0 0 0:0:0"));
+  EXPECT_EQ(Value("0-12 0 0:0:0").WithInterval(),
+            Value("1-0 0 0:0:0").WithInterval());
 }
 
 }  // namespace tinylamb

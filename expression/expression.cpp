@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <typeinfo>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -44,65 +45,79 @@
 
 namespace tinylamb {
 
+namespace {
+template <typename Target, typename Source>
+Target& CheckedExpressionCast(Source& expression) {
+  // Most AST nodes have exactly the requested concrete type. Pointer identity
+  // proves that case without walking the RTTI inheritance graph. Extensions,
+  // derived constants (ParameterSlot), and mismatches keep dynamic_cast's
+  // original behavior, including std::bad_cast on an incompatible node.
+  if (&typeid(expression) == &typeid(Target)) {
+    return static_cast<Target&>(expression);
+  }
+  return dynamic_cast<Target&>(expression);
+}
+}  // namespace
+
 const ColumnValue& ExpressionBase::AsColumnValue() const {
-  return dynamic_cast<const ColumnValue&>(*this);
+  return CheckedExpressionCast<const ColumnValue>(*this);
 }
 
 ColumnValue& ExpressionBase::AsColumnValue() {
-  return dynamic_cast<ColumnValue&>(*this);
+  return CheckedExpressionCast<ColumnValue>(*this);
 }
 
 const BinaryExpression& ExpressionBase::AsBinaryExpression() const {
-  return dynamic_cast<const BinaryExpression&>(*this);
+  return CheckedExpressionCast<const BinaryExpression>(*this);
 }
 
 const ConstantValue& ExpressionBase::AsConstantValue() const {
-  return dynamic_cast<const ConstantValue&>(*this);
+  return CheckedExpressionCast<const ConstantValue>(*this);
 }
 
 const UnaryExpression& ExpressionBase::AsUnaryExpression() const {
-  return dynamic_cast<const UnaryExpression&>(*this);
+  return CheckedExpressionCast<const UnaryExpression>(*this);
 }
 
 const AggregateExpression& ExpressionBase::AsAggregateExpression() const {
-  return dynamic_cast<const AggregateExpression&>(*this);
+  return CheckedExpressionCast<const AggregateExpression>(*this);
 }
 
 const CaseExpression& ExpressionBase::AsCaseExpression() const {
-  return dynamic_cast<const CaseExpression&>(*this);
+  return CheckedExpressionCast<const CaseExpression>(*this);
 }
 
 const InExpression& ExpressionBase::AsInExpression() const {
-  return dynamic_cast<const InExpression&>(*this);
+  return CheckedExpressionCast<const InExpression>(*this);
 }
 
 const FunctionCallExpression& ExpressionBase::AsFunctionCallExpression() const {
-  return dynamic_cast<const FunctionCallExpression&>(*this);
+  return CheckedExpressionCast<const FunctionCallExpression>(*this);
 }
 
 const QueryExpression& ExpressionBase::AsQueryExpression() const {
-  return dynamic_cast<const QueryExpression&>(*this);
+  return CheckedExpressionCast<const QueryExpression>(*this);
 }
 
 const IntervalExpression& ExpressionBase::AsIntervalExpression() const {
-  return dynamic_cast<const IntervalExpression&>(*this);
+  return CheckedExpressionCast<const IntervalExpression>(*this);
 }
 
 const ArrayExpression& ExpressionBase::AsArrayExpression() const {
-  return dynamic_cast<const ArrayExpression&>(*this);
+  return CheckedExpressionCast<const ArrayExpression>(*this);
 }
 
 const CastExpression& ExpressionBase::AsCastExpression() const {
-  return dynamic_cast<const CastExpression&>(*this);
+  return CheckedExpressionCast<const CastExpression>(*this);
 }
 
 const WindowFunctionCallExpression&
 ExpressionBase::AsWindowFunctionCallExpression() const {
-  return dynamic_cast<const WindowFunctionCallExpression&>(*this);
+  return CheckedExpressionCast<const WindowFunctionCallExpression>(*this);
 }
 
 const LambdaExpression& ExpressionBase::AsLambdaExpression() const {
-  return dynamic_cast<const LambdaExpression&>(*this);
+  return CheckedExpressionCast<const LambdaExpression>(*this);
 }
 
 std::unordered_set<ColumnName> ExpressionBase::TouchedColumns() const {

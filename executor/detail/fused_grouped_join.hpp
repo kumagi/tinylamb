@@ -50,6 +50,7 @@ struct DeferredLSTableProbe {
   ScanRuntimeFilter runtime_filter;
   std::vector<Expression> local_preds;
   std::vector<IntegerPeekCompare> integer_peeks;
+  std::vector<NullPeekCompare> null_peeks;
   std::vector<DeferredLSTablePkLookup> pk_lookups;
 };
 
@@ -80,9 +81,13 @@ class FlatJoinBuckets {
   };
 
   void reserve(size_t count) {
-    if (count >= kNoEntry ||
-        count > (std::numeric_limits<size_t>::max() - 1) / 2) {
+    if (count >= kNoEntry) {
       throw std::length_error("join bucket capacity overflow");
+    }
+    if constexpr (sizeof(size_t) <= sizeof(uint32_t)) {
+      if (count > (std::numeric_limits<size_t>::max() - 1) / 2) {
+        throw std::length_error("join bucket capacity overflow");
+      }
     }
     const size_t target = count + ((count / 2) + 1);
     size_t bucket_count = 8;
@@ -181,6 +186,7 @@ struct ProgramShape {
     kColEq2StrOr,
     kColNe2StrAnd,
     kColLikePrefix,
+    kIntComparisons,
   };
   enum class CaseValKind : uint8_t {
     kNone = 0,
@@ -190,6 +196,7 @@ struct ProgramShape {
   };
   CaseCondKind case_cond{CaseCondKind::kNone};
   CaseValKind case_val{CaseValKind::kNone};
+  bool case_else_null{false};
   int32_t case_cond_col{-1};
   int64_t case_cond_int{0};
   std::string_view case_cond_str0;
@@ -197,6 +204,13 @@ struct ProgramShape {
   int32_t case_val_col0{-1};
   int32_t case_val_col1{-1};
   double case_val_const{1.0};
+  struct IntCaseComparison {
+    int32_t left{-1};
+    int32_t subtract{-1};
+    BinaryOperation op{BinaryOperation::kEquals};
+    int64_t constant{0};
+  };
+  std::vector<IntCaseComparison> case_int_comparisons;
 
   [[nodiscard]] bool HasPairDirect() const noexcept {
     return direct_column >= 0 || extract_date_col >= 0 || mul_col0 >= 0 ||

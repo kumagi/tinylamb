@@ -119,7 +119,8 @@ int CompareWithCollation(const Value& left, const Value& right) {
 
 int CompareUnderCollation(const Value& left, const Value& right,
                           Collation collation) {
-  if (collation != Collation::kCaseInsensitive) {
+  if (collation != Collation::kCaseInsensitive || left.IsInterval() ||
+      right.IsInterval()) {
     return CompareForOrderBy(left, right);
   }
   // Only a VARCHAR pair can be folded; every other shape (including the

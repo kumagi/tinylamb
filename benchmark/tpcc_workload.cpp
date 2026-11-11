@@ -41,9 +41,11 @@
 namespace tinylamb {
 namespace {
 
+#ifndef TINYLAMB_TPCC_EXTERNAL_ONLY
 constexpr std::array<std::string_view, 9> kTpccTables = {
     "warehouse", "district", "customer",  "history",   "item",
     "stock",     "orders",   "new_order", "order_line"};
+#endif
 
 std::string Number(double value) {
   std::ostringstream out;

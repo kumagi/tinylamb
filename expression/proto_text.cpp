@@ -217,7 +217,8 @@ __int128 CivilToNanos(const SimpleCivilTime& ct) {
                                         std::chrono::day{ct.day}};
   const int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
   const __int128 secs = (static_cast<__int128>(days) * 86400) +
-                        (ct.hour * 3600LL) + (ct.minute * 60LL) + ct.second;
+                        (static_cast<__int128>(ct.hour) * 3600) +
+                        (static_cast<__int128>(ct.minute) * 60) + ct.second;
   return (secs * 1000000000) + ct.nanos;
 }
 
@@ -1351,8 +1352,9 @@ StatusOr<std::optional<std::string>> SetFieldInBody(
     const std::string_view body, const std::vector<std::string>& path,
     const size_t depth, const Value& new_value, const std::string& type_name) {
   std::vector<ProtoTextEntry> entries;
-  if (!ParseProtoTextEntries(body, &entries) && !entries.empty()) {
-    return std::optional<std::string>{};
+  if (!ParseProtoTextEntries(body, &entries)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Cannot update malformed proto TEXT payload");
   }
   const std::string& target = path[depth];
   const bool final_segment = depth + 1 == path.size();

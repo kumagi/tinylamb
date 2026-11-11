@@ -108,7 +108,9 @@ class StatusOr {
   // Constructors are intentionally implicit!
   StatusOr(Status s) : status_(s), value_(std::nullopt) {}            // NOLINT
   StatusOr(StatusCode code) : status_(code), value_(std::nullopt) {}  // NOLINT
-  StatusOr(T v) : status_(Status::kSuccess), value_(std::move(v)) {}  // NOLINT
+  StatusOr(T v)
+      : status_(Status::kSuccess),
+        value_(std::in_place, std::move(v)) {}  // NOLINT
   // Implicit conversion from anything convertible to T (e.g. string literals
   // into StatusOr<std::string>) so `return "abc";` keeps working.
   template <typename U>
@@ -118,7 +120,7 @@ class StatusOr {
              !std::is_same_v<std::decay_t<U>, Status> &&
              !std::is_same_v<std::decay_t<U>, StatusCode>)
   StatusOr(U&& v)  // NOLINT
-      : status_(Status::kSuccess), value_(std::forward<U>(v)) {}
+      : status_(Status::kSuccess), value_(std::in_place, std::forward<U>(v)) {}
 
   [[nodiscard]] bool HasValue() const { return status_ == Status::kSuccess; }
   // Callers must check HasValue() first: accessing the value of a failed

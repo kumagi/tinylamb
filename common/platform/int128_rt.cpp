@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "common/platform/int128_conversion.hpp"
+
 namespace {
 
 using ti128 = __int128;
@@ -81,24 +83,6 @@ double U128ToF64(tu128 u) {
   return d;
 }
 
-// Truncate-to-zero conversion shared by the signed/unsigned fix routines.
-tu128 F64ToU128(double d) {
-  uint64_t bits;
-  std::memcpy(&bits, &d, sizeof(bits));
-  const int exponent = static_cast<int>((bits >> 52) & 0x7ff) - 1023;
-  if (exponent < 0) {
-    return 0;
-  }
-  const uint64_t mantissa = (bits & ((1ULL << 52) - 1)) | (1ULL << 52);
-  if (exponent >= 127) {
-    return ~static_cast<tu128>(0);
-  }
-  if (exponent >= 52) {
-    return static_cast<tu128>(mantissa) << (exponent - 52);
-  }
-  return mantissa >> (52 - exponent);
-}
-
 float U128ToF32(tu128 u) { return static_cast<float>(U128ToF64(u)); }
 
 }  // namespace
@@ -121,14 +105,12 @@ float __floattisf(ti128 v) { return static_cast<float>(__floattidf(v)); }
 float __floatuntisf(tu128 v) { return U128ToF32(v); }
 
 ti128 __fixdfti(double d) {
-  const tu128 u = F64ToU128(d);
-  if (d < 0) {
-    return -static_cast<ti128>(u);
-  }
-  return static_cast<ti128>(u);
+  return tinylamb::platform::SaturatingDoubleToInt128(d);
 }
 
-tu128 __fixunsdfti(double d) { return d < 0 ? 0 : F64ToU128(d); }
+tu128 __fixunsdfti(double d) {
+  return d < 0 ? 0 : tinylamb::platform::DoubleToUInt128Magnitude(d);
+}
 
 ti128 __fixsfti(float f) { return __fixdfti(f); }
 

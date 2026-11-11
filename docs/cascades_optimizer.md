@@ -15,7 +15,7 @@ implementations.
 
 
 The current audit and complete registry are in [optimizer_rule_audit.md](optimizer_rule_audit.md).
-There are 83 logical and 46 physical registrations. Normal single-table queries
+There are 86 logical and 46 physical registrations. Normal single-table queries
 and simple column-key GROUP BY use the same memo as joins; only exact MIN/MAX
 index endpoint retrieval retains its specialized shortcut. Advanced grouped SQL
 keeps the existing relational finish where the narrow memo contract declines.
@@ -52,7 +52,7 @@ rewrites. A pushed scan is added to the Selection result group; it must not
 mutate the shared input group. Scan bounds must remain semantically exact.
 
 The built-in logical rules include (see `RuleSet::Default` in
-`plan/cascades.cpp` for the authoritative list, 83 registrations):
+`plan/cascades.cpp` for the authoritative list, 86 registrations):
 
 - `join_commutativity`
 - `join_enumeration`
@@ -263,13 +263,14 @@ Tests for rule isolation and memo enumeration are in
 - `PhysicalProperties` contains `require_row_position`, `ordering`,
   `limit_hint`, `access_method`, and the reserved `distribution`. Selection,
   projection, and limit forward requirements; joins and aggregation drop them.
-- Logical exploration drives an dependency-aware worklist to completion, bounded by
-  the built-in `kMaxExploreSteps` (20000 rule applications; exploration stops
-  silently at the cap and keeps the best plan so far — visible only via
-  `dump_memo`). `OptimizerOptions::search_step_budget` additionally caps rule
-  applications explicitly, degrading gracefully to the best plan found so far. `OptimizerOptions::search_step_budget` optionally
-  caps rule applications, degrading gracefully to the best plan found so far
-  (`SearchEngine::BudgetExhausted`, reported in `dump_memo`). Costing prunes
+- Logical exploration drives a dependency-aware worklist, bounded by
+  `kMaxExploreSteps` (20000 worklist pops/group visits) and
+  `kMaxExploreRuleSteps` (50000 rule applications). The rule-application cap
+  and worklist-pop caps set `SearchEngine::ExploreLimitReached` when work
+  remains. `OptimizerOptions::search_step_budget` can impose a smaller
+  rule-application budget; that separate limit sets `BudgetExhausted`, which
+  the optimizer reports in `dump_memo`. The optimizer keeps the best available plan when exploration
+  stops. Costing prunes
   branch-and-bound style: expressions whose children alone reach the incumbent
   are skipped. Groups have an expression cap and set
   `Memo::Degraded()` when alternatives are dropped. Join enumeration partitions

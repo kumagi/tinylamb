@@ -48,7 +48,8 @@ class ParallelMergeJoin : public ExecutorBase, public PipelineBreaker {
                     size_t worker_count = std::thread::hardware_concurrency(),
                     JoinKind kind = JoinKind::kInner,
                     Expression residual = Expression(),
-                    Schema residual_schema = Schema(), size_t right_width = 0);
+                    Schema residual_schema = Schema(), size_t right_width = 0,
+                    size_t left_width = 0);
 
   ~ParallelMergeJoin() override = default;
 

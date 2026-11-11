@@ -565,6 +565,16 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
       wrapper_terms.push_back(std::move(term));
       continue;
     }
+    // GROUPING describes a branch's active keys, not the NULL value in the
+    // union output. Materialize before rebinding output columns; otherwise
+    // GROUPING(wrapper.key) survives into the ordinary scalar evaluator.
+    if (ContainsGroupingCall(term.expression)) {
+      RETURN_IF_FAIL(add_window_input(term.expression));
+      term.expression = ColumnValueExp(ColumnName(
+          wrapper_alias, hidden_columns.at(term.expression->ToString())));
+      wrapper_terms.push_back(std::move(term));
+      continue;
+    }
     Expression rebound = rebind_output_names(term.expression);
     const auto by_text = entry_by_text.find(rebound->ToString());
     if (by_text != entry_by_text.end()) {
@@ -752,6 +762,17 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
 
 StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
                                          const GoogleSqlAstNode& pivot) {
+  // The parser has no catalog schema. Inferring no grouping keys for a base
+  // table (or a derived *) silently turns PIVOT into one global aggregate.
+  // Require an explicit derived projection until binding can expand the keys.
+  if (!base.query || std::ranges::any_of(base.query->SelectList(),
+                                         [](const NamedExpression& item) {
+                                           return item.name.empty() ||
+                                                  item.name == "*";
+                                         })) {
+    return AstError<SelectSource>(
+        "PIVOT requires a subquery with explicit named columns");
+  }
   const GoogleSqlAstNode* expr_list = pivot.Child("PivotExpressionList");
   const GoogleSqlAstNode* for_col = pivot.Child("PathExpression");
   const GoogleSqlAstNode* value_list = pivot.Child("PivotValueList");
@@ -807,15 +828,15 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   for (const auto& agg : aggs) {
     if ((agg.arg_node != nullptr) && agg.arg_node->kind != "Star") {
       ASSIGN_OR_RETURN(std::string, hv157400_0, (Path(*agg.arg_node)));
-      agg_column_names.insert(std::move(hv157400_0));
+      agg_column_names.insert(Lower(hv157400_0));
     }
   }
 
   std::vector<Expression> group_by_exprs;
   if (base.query) {
     for (const NamedExpression& named : base.query->SelectList()) {
-      if (named.name != pivot_col_name &&
-          !agg_column_names.contains(named.name)) {
+      if (Lower(named.name) != Lower(pivot_col_name) &&
+          !agg_column_names.contains(Lower(named.name))) {
         projections.emplace_back(named.name,
                                  ColumnValueExp(ColumnName(named.name)));
         group_by_exprs.push_back(ColumnValueExp(ColumnName(named.name)));
@@ -949,7 +970,7 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
   for (const GoogleSqlAstNode* item : in_items->Children("UnpivotInItem")) {
     const GoogleSqlAstNode* in_expr_list = item->Child("ExpressionList");
     if (in_expr_list == nullptr || in_expr_list->children.empty()) {
-      continue;
+      return AstError<SelectSource>("GoogleSQL AST: empty UNPIVOT IN item");
     }
     ASSIGN_OR_RETURN(std::string, hv162376_0,
                      (Path(*in_expr_list->children[0])));
@@ -997,6 +1018,9 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     }
   }
 
+  if (root_branch == nullptr) {
+    return AstError<SelectSource>("GoogleSQL AST: empty UNPIVOT IN list");
+  }
   SelectSource result;
   result.query = std::move(root_branch);
   result.alias = saved_alias.empty() ? "unpivot_table" : saved_alias;
@@ -1008,6 +1032,8 @@ namespace {
 struct ColumnTypeInfo {
   ValueType type{ValueType::kNull};
   bool is_unsigned{false};
+  uint8_t integer_bits{64};
+  bool is_interval{false};
 };
 
 StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
@@ -1041,11 +1067,23 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   if (type == "int" || type == "int64" || type == "integer" ||
       type == "bigint" || type == "bool" || type == "boolean" ||
       type == "int32" || type == "int16" || type == "int8") {
-    return ColumnTypeInfo{.type = ValueType::kInt64, .is_unsigned = false};
+    return ColumnTypeInfo{
+        .type = ValueType::kInt64,
+        .is_unsigned = false,
+        .integer_bits = static_cast<uint8_t>(type == "int8"    ? 8
+                                             : type == "int16" ? 16
+                                             : type == "int32" ? 32
+                                                               : 64)};
   }
   if (type == "uint" || type == "uint64" || type == "uint32" ||
       type == "uint16" || type == "uint8") {
-    return ColumnTypeInfo{.type = ValueType::kInt64, .is_unsigned = true};
+    return ColumnTypeInfo{
+        .type = ValueType::kInt64,
+        .is_unsigned = true,
+        .integer_bits = static_cast<uint8_t>(type == "uint8"    ? 8
+                                             : type == "uint16" ? 16
+                                             : type == "uint32" ? 32
+                                                                : 64)};
   }
   if (type == "numeric" || type == "decimal" || type == "double" ||
       type == "float" || type == "float64" || type == "float32" ||
@@ -1055,9 +1093,12 @@ StatusOr<ColumnTypeInfo> ColumnType(const GoogleSqlAstNode& definition) {
   if (type == "date") {
     return ColumnTypeInfo{.type = ValueType::kDate, .is_unsigned = false};
   }
+  if (type == "interval") {
+    return ColumnTypeInfo{.type = ValueType::kVarChar, .is_interval = true};
+  }
   if (type == "string" || type == "varchar" || type == "char" ||
       type == "timestamp" || type == "datetime" || type == "time" ||
-      type == "interval" || type == "bytes" || type == "json") {
+      type == "bytes" || type == "json") {
     return ColumnTypeInfo{.type = ValueType::kVarChar, .is_unsigned = false};
   }
   if (type == "array" || type.starts_with("array<")) {
@@ -1251,6 +1292,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         }
       }
       Column col(std::move(col_name), col_info.type);
+      col.SetIntegerBits(col_info.integer_bits);
+      col.SetInterval(col_info.is_interval);
       if (col_info.is_unsigned) {
         col.SetUnsigned(true);
       }
@@ -1261,26 +1304,26 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       if (attrs != nullptr) {
         if (attrs->Child("PrimaryKeyColumnAttribute") != nullptr) {
           const bool was_unsigned = columns.back().IsUnsigned();
+          const uint8_t integer_bits = columns.back().IntegerBits();
           columns.back() = Column(columns.back().Name().name, col_info.type,
                                   Constraint(Constraint::kPrimaryKey));
           columns.back().SetUnsigned(was_unsigned);
+          columns.back().SetIntegerBits(integer_bits);
+          columns.back().SetInterval(col_info.is_interval);
         }
-        // NOT NULL rides the column's constraint slot: a key constraint or
-        // an attribute with slot payload keeps its slot.  Kept semantics:
-        //  - PRIMARY KEY: key constraints are enforced non-NULL by the table
-        //    writer (CheckRowConstraints treats kPrimaryKey as kNotNull), so
-        //    the slot stays kPrimaryKey and the declaration adds nothing.
-        //  - FOREIGN KEY / DEFAULT: their slot payload has no NOT NULL side
-        //    channel, so the conflicting dual constraint is not representable;
-        //    the key/default keeps the slot (previous behavior for these
-        //    columns is unchanged; the NOT NULL half stays unenforced).
+        // PRIMARY KEY already enforces non-NULL in CheckRowConstraints.
+        // Otherwise NOT NULL occupies the single constraint slot. DEFAULT
+        // and FOREIGN KEY processing below reject a conflicting occupied slot.
         if (attrs->Child("NotNullColumnAttribute") != nullptr &&
             columns.back().GetConstraint().ctype == Constraint::kNothing) {
           const bool was_unsigned = columns.back().IsUnsigned();
+          const uint8_t integer_bits = columns.back().IntegerBits();
           columns.back() =
               Column(columns.back().Name().name, columns.back().Type(),
                      Constraint(Constraint::kNotNull));
           columns.back().SetUnsigned(was_unsigned);
+          columns.back().SetIntegerBits(integer_bits);
+          columns.back().SetInterval(col_info.is_interval);
         }
         for (const GoogleSqlAstNode* attr :
              attrs->Children("ForeignKeyColumnAttribute")) {
@@ -1308,10 +1351,13 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
               " cannot combine DEFAULT with its existing constraint");
         }
         const bool was_unsigned = columns.back().IsUnsigned();
+        const uint8_t integer_bits = columns.back().IntegerBits();
         columns.back() =
             Column(columns.back().Name().name, columns.back().Type(),
                    Constraint(Constraint::kDefault, *column_default));
         columns.back().SetUnsigned(was_unsigned);
+        columns.back().SetIntegerBits(integer_bits);
+        columns.back().SetInterval(col_info.is_interval);
       }
     }
     for (const GoogleSqlAstNode* fk : elements->Children("ForeignKey")) {
@@ -1357,11 +1403,15 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
               " cannot combine FOREIGN KEY with its existing constraint");
         }
         const bool was_unsigned = col.IsUnsigned();
+        const bool was_interval = col.IsInterval();
+        const uint8_t integer_bits = col.IntegerBits();
         col = Column(col.Name().name, col.Type(),
                      Constraint(Constraint::kForeign,
                                 Value(FormatForeignKeyReference(
                                     fk.parent_table, fk.parent_columns))));
         col.SetUnsigned(was_unsigned);
+        col.SetIntegerBits(integer_bits);
+        col.SetInterval(was_interval);
         found = true;
         break;
       }

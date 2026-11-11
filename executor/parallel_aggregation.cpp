@@ -1357,10 +1357,16 @@ Status ParallelAggregationExecutor::Merge(PartialState* destination,
     switch (aggregate.GetType()) {
       case AggregationType::kSum:
         if (!source.values[index].IsNull()) {
-          destination->values[index] =
-              destination->values[index].IsNull()
-                  ? source.values[index]
-                  : destination->values[index] + source.values[index];
+          if (destination->values[index].IsNull()) {
+            destination->values[index] = source.values[index];
+          } else {
+            relational_detail::AggregateAccumulator merged_sum(&aggregate,
+                                                               &input_schema_);
+            RETURN_IF_FAIL(merged_sum.Add(destination->values[index]));
+            RETURN_IF_FAIL(merged_sum.Add(source.values[index]));
+            ASSIGN_OR_RETURN(Value, total, merged_sum.TryFinish());
+            destination->values[index] = std::move(total);
+          }
         }
         break;
       case AggregationType::kAvg:

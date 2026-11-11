@@ -600,7 +600,7 @@ TEST_F(TransactionCoverageTest,
   ASSERT_TRUE(writer.AddWriteSet(rp));
   writer.RegisterVersionWrite(rp, std::nullopt, "committed");
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   Transaction reader = tm_->Begin(true);
   EXPECT_EQ(reader.DurabilityDependence(), 0U);
@@ -811,7 +811,7 @@ TEST_F(TransactionCoverageTest, MetricsCountersObserveIntentAndCommitPath) {
 
   writer.RegisterVersionWrite(rp, std::nullopt, "v");
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);  // wal_wait counters
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   const TransactionRuntimeStats stats = tm_->RuntimeStats();
   EXPECT_GE(stats.write_intent_attempts, 1U);
@@ -846,7 +846,7 @@ TEST_F(TransactionCoverageTest, CommitWaitReturnsOnceRecordsAreFlushed) {
     ASSERT_TRUE(writer.AddWriteSet(rp));
     writer.RegisterVersionWrite(rp, std::nullopt, "pipelined");
     ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-    writer.CommitWait();
+    ASSERT_SUCCESS(writer.CommitWait());
     EXPECT_GE(slow->CommittedLSN(), writer.PrevLSN());
   }
   EXPECT_EQ(std::remove(slow_name.c_str()), 0);
@@ -1391,6 +1391,16 @@ TEST_F(TransactionCoverageTest, DeadlockDetectorBreaksThreeTransactionCycle) {
 // half-finished transaction behind.
 // ---------------------------------------------------------------------------
 
+TEST_F(TransactionCoverageTest, AuditCommitWaitPropagatesWalFailure) {
+  Transaction writer = tm_->Begin();
+  ASSERT_TRUE(writer.InsertLog(180, 0, "pending").HasValue());
+  ASSERT_GT(writer.PrevRecordEndLSN(), writer.PrevLSN());
+  ASSERT_SUCCESS(writer.CommitWait());
+  EXPECT_GE(l_->DurableLSN(), writer.PrevRecordEndLSN());
+  ForceWalFailure(l_.get());
+  EXPECT_NE(writer.CommitWait(), Status::kSuccess);
+}
+
 TEST_F(TransactionCoverageTest,
        PreCommitAddLogFailureAbortsAndReleasesIntents) {
   const RowPosition rp(80, 1);
@@ -1442,7 +1452,7 @@ TEST_F(TransactionCoverageTest,
   ASSERT_TRUE(writer.AddWriteSet(rp));
   writer.RegisterVersionWrite(rp, std::nullopt, "v1");
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   ForceWalFailure(l_.get());
   Transaction reader = tm_->Begin(true);
@@ -1680,6 +1690,9 @@ TEST_F(TransactionCoverageRecoveryTest, RealStorageCommitFailureStopsNewWork) {
 
   Transaction blocked = tm_->Begin();
   EXPECT_FALSE(blocked.AddWriteSet(rp));
+  EXPECT_NE(tm_->WaitForRowWriteIntent(blocked, rp), Status::kSuccess);
+  EXPECT_EQ(blocked.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kFailStopped);
   EXPECT_EQ(blocked.ReadVersion(rp, std::nullopt).GetStatus(),
             Status::kIOError);
 }

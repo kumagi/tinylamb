@@ -13,6 +13,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -154,9 +155,10 @@ StatusOr<Value> QueryExpression::TryEvaluate(const Row& row,
     bool found = false;
     bool saw_null = test_value.IsNull();
     for (const Value& candidate : values) {
-      if (!test_value.IsNull() && !candidate.IsNull() &&
-          test_value.Collation() != 0 && candidate.Collation() != 0 &&
-          test_value.Collation() != candidate.Collation()) {
+      if (found) {
+        break;
+      }
+      if (HaveConflictingCollations(test_value, candidate)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "Collation conflict between the IN operands");
       }

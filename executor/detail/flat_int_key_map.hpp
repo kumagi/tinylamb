@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_EXECUTOR_DETAIL_FLAT_INT_KEY_MAP_HPP
 #define TINYLAMB_EXECUTOR_DETAIL_FLAT_INT_KEY_MAP_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -121,9 +122,10 @@ class FlatIntKeyMap {
 
   struct EmptyTag {};
   struct Slot {
-    int64_t key;
-    T value;
-    [[no_unique_address]] std::conditional_t<kCompact, EmptyTag, uint8_t> used;
+    int64_t key{0};
+    T value{};
+    [[no_unique_address]] std::conditional_t<kCompact, EmptyTag, uint8_t>
+        used{};
   };
 
   [[nodiscard]] static bool Occupied(const Slot& slot) {
@@ -210,10 +212,11 @@ class FlatIntSet {
   static constexpr uint64_t kMaxDenseSpan = 33'554'432ULL;
 
   [[nodiscard]] static size_t ReservationBytes(size_t members) {
-    return sizeof(FlatIntSet) + CapacityFor(members) * sizeof(Slot);
+    return sizeof(FlatIntSet) + (CapacityFor(members) * sizeof(Slot));
   }
 
   void Reserve(size_t members) {
+    dense_overflow_.store(false, std::memory_order_relaxed);
     dense_mode_ = false;
     dense_bits_.clear();
     slots_.assign(CapacityFor(members), Slot{});
@@ -234,6 +237,7 @@ class FlatIntSet {
     slots_.clear();
     mask_ = 0;
     dense_bits_.assign(static_cast<size_t>((span >> 6) + 1), 0ULL);
+    dense_overflow_.store(false, std::memory_order_relaxed);
     dense_mode_ = true;
     dense_min_ = min_key;
     dense_max_ = max_key;
@@ -244,7 +248,16 @@ class FlatIntSet {
 
   [[nodiscard]] bool IsDenseMode() const noexcept { return dense_mode_; }
 
+  // A failed dense build must be discarded before publishing a predicate.
+  [[nodiscard]] bool DenseOverflowed() const noexcept {
+    return dense_overflow_.load(std::memory_order_relaxed);
+  }
+
   void InsertDenseAtomic(int64_t key) noexcept {
+    if (!dense_mode_ || key < dense_min_ || key > dense_max_) {
+      dense_overflow_.store(true, std::memory_order_relaxed);
+      return;
+    }
     const uint64_t off =
         static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_min_);
     const uint64_t bit_mask = uint64_t{1} << (off & 63);
@@ -284,13 +297,17 @@ class FlatIntSet {
   }
 
   void Insert(int64_t key) {
+    if (dense_mode_ && (key < dense_min_ || key > dense_max_)) {
+      dense_overflow_.store(true, std::memory_order_relaxed);
+      return;
+    }
     if (!has_bounds_) {
       has_bounds_ = true;
       min_key_ = key;
       max_key_ = key;
     } else {
-      if (key < min_key_) min_key_ = key;
-      if (key > max_key_) max_key_ = key;
+      min_key_ = std::min(key, min_key_);
+      max_key_ = std::max(key, max_key_);
     }
     if (dense_mode_) {
       const uint64_t off =
@@ -348,8 +365,8 @@ class FlatIntSet {
           static_cast<uint64_t>(clamped_lo) - static_cast<uint64_t>(dense_min_);
       const uint64_t off_hi =
           static_cast<uint64_t>(clamped_hi) - static_cast<uint64_t>(dense_min_);
-      const size_t word_lo = static_cast<size_t>(off_lo >> 6);
-      const size_t word_hi = static_cast<size_t>(off_hi >> 6);
+      const auto word_lo = static_cast<size_t>(off_lo >> 6);
+      const auto word_hi = static_cast<size_t>(off_hi >> 6);
       if (word_hi - word_lo <= 8) {
         const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
         const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));
@@ -431,6 +448,7 @@ class FlatIntSet {
   int64_t dense_max_ = 0;
   size_t size_ = 0;
   size_t mask_ = 0;
+  std::atomic<bool> dense_overflow_{false};
   bool dense_mode_ = false;
   bool has_bounds_ = false;
 };

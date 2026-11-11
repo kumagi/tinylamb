@@ -61,7 +61,6 @@
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
 #include "common/platform/time_format.hpp"
-#include "common/platform/time_zone.hpp"
 #include "common/regex_guard.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
@@ -234,68 +233,14 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
   return res;
 }
 
-int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
-                        int default_offset = 0) {
-  if (tz_str.empty()) {
-    return default_offset;
-  }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
-      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
-      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
-    return 0;
-  }
-  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
-      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
-    char sign = tz_str[3];
-    int h = 0, m = 0;
-    std::string rem(tz_str.substr(4));
-    // Unparsed tokens leave h/m at 0 (UTC); conversion errors are tolerated
-    // by design for malformed zone strings.
-    if (rem.find(':') != std::string::npos) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d:%d", &h, &m);
-    } else if (rem.size() == 4) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%2d%2d", &h, &m);
-    } else {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d", &h);
-    }
-    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
-  }
-  if (tz_str[0] == '+' || tz_str[0] == '-') {
-    char sign = tz_str[0];
-    int h = 0, m = 0;
-    std::string rem(tz_str.substr(1));
-    // Unparsed tokens leave h/m at 0 (UTC); conversion errors are tolerated
-    // by design for malformed zone strings.
-    if (rem.find(':') != std::string::npos) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d:%d", &h, &m);
-    } else if (rem.size() == 4) {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%2d%2d", &h, &m);
-    } else {
-      // NOLINTNEXTLINE(cert-err33-c, cert-err34-c)
-      sscanf(rem.c_str(), "%d", &h);
-    }
-    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
-  }
-  std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") {
-    zone_name = "Pacific/Chatham";
-  }
-  int y = (ct != nullptr) ? ct->year : 2000;
-  int mon = (ct != nullptr) ? ct->month : 1;
-  int d = (ct != nullptr) ? ct->day : 1;
-  int h = (ct != nullptr) ? ct->hour : 0;
-  int min = (ct != nullptr) ? ct->minute : 0;
-  int s = (ct != nullptr) ? ct->second : 0;
-  y = std::max(y, 1970);
-  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
-      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
-      min, s);
-  return offset.value_or(default_offset);
+StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
+                                  const CivilTime* ct = nullptr) {
+  return TryTimeZoneOffsetAtLocalTime(
+      zone, ct != nullptr ? std::max(ct->year, 1970) : 2000,
+      ct != nullptr ? static_cast<unsigned>(ct->month) : 1,
+      ct != nullptr ? static_cast<unsigned>(ct->day) : 1,
+      ct != nullptr ? ct->hour : 0, ct != nullptr ? ct->minute : 0,
+      ct != nullptr ? ct->second : 0);
 }
 
 CivilTime ValueToCivilTime(const Value& val) {
@@ -871,9 +816,7 @@ StatusOr<Value> FormatFunction(const std::string& name,
         }
         while (i < fmt.size() &&
                (std::isdigit(static_cast<unsigned char>(fmt[i])) != 0)) {
-          if (precision < 0) {
-            precision = 0;
-          }
+          precision = std::max<int64_t>(precision, 0);
           precision = (precision * 10) + (fmt[i] - '0');
           if (precision > kMaxFormatWidthOrPrecision) {
             return StatusError(
@@ -1048,6 +991,94 @@ StatusOr<Value> FormatFunction(const std::string& name,
 
 StatusOr<Value> ExecuteBuiltin(const std::string& name,
                                const std::vector<Value>& values) {
+  // A length-bearing view keeps builtin dispatch from repeatedly measuring
+  // literal names through the out-of-line std::string comparison overload.
+  const std::string_view name_view(name);
+  if (name_view == "round") {
+    if (values.empty() || values.size() > 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "ROUND requires 1 or 2 arguments");
+    }
+    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
+      return Value();
+    }
+    int64_t digits = 0;
+    if (values.size() == 2) {
+      if (values[1].type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ROUND digits must be an integer");
+      }
+      digits = values[1].value.int_value;
+    }
+    if (values[0].type == ValueType::kInt64) {
+      if (values[0].IsUnsigned()) {
+        const auto v = static_cast<uint64_t>(values[0].value.int_value);
+        if (digits >= 0) {
+          return values[0];
+        }
+        uint64_t scale = 1;
+        for (uint64_t i = 0; i < uint64_t{0} - static_cast<uint64_t>(digits);
+             ++i) {
+          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
+            return Value(int64_t{0}).WithUnsigned();
+          }
+          scale *= 10;
+        }
+        uint64_t q = v / scale;
+        const uint64_t rem = v % scale;
+        const uint64_t half = scale / 2;
+        if (rem >= half) {
+          q += 1;
+        }
+        uint64_t result = 0;
+        if (__builtin_mul_overflow(q, scale, &result)) {
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in ROUND");
+        }
+        return Value(static_cast<int64_t>(result)).WithUnsigned();
+      }
+      const int64_t v = values[0].value.int_value;
+      if (digits >= 0) {
+        return Value(v);
+      }
+      int64_t scale = 1;
+      // `-digits` is itself INT64_MIN for digits == INT64_MIN and cannot be
+      // negated in signed arithmetic (UBSan, found by FUNCTION fuzzing).
+      const uint64_t trunc_digits =
+          digits == std::numeric_limits<int64_t>::min()
+              ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+              : static_cast<uint64_t>(-digits);
+      for (uint64_t i = 0; i < trunc_digits; ++i) {
+        if (scale > std::numeric_limits<int64_t>::max() / 10) {
+          return Value(int64_t{0});
+        }
+        scale *= 10;
+      }
+      int64_t q = v / scale;
+      const int64_t rem = v % scale;
+      const int64_t half = scale / 2;
+      const bool negative = v < 0;
+      if ((negative ? -rem : rem) >= half) {
+        q += negative ? -1 : 1;
+      }
+      int64_t result = 0;
+      if (__builtin_mul_overflow(q, scale, &result)) {
+        return StatusError(StatusCode::kIsInfinity,
+                           "integer overflow in ROUND");
+      }
+      return Value(result);
+    }
+    if (values[0].type == ValueType::kDouble) {
+      const double val = values[0].value.double_value;
+      if (std::isnan(val)) {
+        return Value(val);
+      }
+      const double factor = std::pow(10.0, digits);
+      return Value(std::round(val * factor) / factor);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "ROUND requires numeric argument");
+  }
   auto raw_str = [](const Value& val) -> std::string {
     if (val.type == ValueType::kVarChar) {
       return std::string(val.value.varchar_value);
@@ -1112,7 +1143,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // and SELECT AS <proto> route non-constant repeated-field arrays and enum
   // values through them so invalid data fails execution instead of being
   // silently dropped from the text-format representation.
-  if (name == "$proto_repeated_guard") {
+  if (name_view == "$proto_repeated_guard") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "$proto_repeated_guard requires 2 arguments");
@@ -1132,8 +1163,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return values[1];
   }
-  if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
-    const size_t expected = name == "$proto_field_guard" ? 3 : 2;
+  if (name_view == "$proto_field_guard" || name_view == "$proto_enum_guard") {
+    const size_t expected = name_view == "$proto_field_guard" ? 3 : 2;
     if (values.size() != expected) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " argument count mismatch");
@@ -1149,7 +1180,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return expected == 3 ? values[2] : values[0];
   }
-  if (name == "__pipe_concat") {
+  if (name_view == "__pipe_concat") {
     if (values.size() != 2 || !values[0].IsArray()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__pipe_concat requires an array and separator");
@@ -1195,14 +1226,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::move(result));
   }
-  if (name == "__struct_set") {
+  if (name_view == "__struct_set") {
     if (values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__struct_set requires 3 arguments");
     }
     return TryStructSetField(values[0], raw_str(values[1]), values[2]);
   }
-  if (name == "get_field") {
+  if (name_view == "get_field") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "get_field requires 2 arguments");
@@ -1240,7 +1271,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "field not found: " + field);
   }
-  if (name == "__get_field_safe") {
+  if (name_view == "__get_field_safe") {
     // Field access that tolerates NULL bases and missing members by
     // returning NULL; used for dotted references in DML predicates.
     if (values.size() != 2) {
@@ -1298,7 +1329,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // NOTE: `__struct_set` / `get_field` are handled by the earlier blocks
   // above, which return on every path; the copies that used to sit here were
   // unreachable merge artifacts and have been removed.
-  if (name == "rand") {
+  if (name_view == "rand") {
     if (!values.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RAND requires no arguments");
@@ -1311,7 +1342,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                                                                        1.0);
     return Value(uniform(rng));
   }
-  if (name == "coalesce") {
+  if (name_view == "coalesce") {
     for (const auto& val : values) {
       if (!val.IsNull()) {
         return val;
@@ -1327,7 +1358,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // Value::operator== (NULL == NULL is true, cross-type is false, so a NULL
   // first argument still yields NULL); GREATEST/LEAST propagate NULL and
   // promote mixed INT64/DOUBLE numerically.
-  if (name == "nullif") {
+  if (name_view == "nullif") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "NULLIF requires 2 arguments");
@@ -1343,14 +1374,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return values[0];
   }
-  if (name == "ifnull") {
+  if (name_view == "ifnull") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "IFNULL requires 2 arguments");
     }
     return !values[0].IsNull() ? values[0] : values[1];
   }
-  if (name == "greatest" || name == "least") {
+  if (name_view == "greatest" || name_view == "least") {
     if (values.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires at least 1 argument");
@@ -1383,18 +1414,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (best.type == ValueType::kInt64 &&
           values[i].type == ValueType::kInt64) {
         const bool takes =
-            name == "greatest" ? values[i] > best : values[i] < best;
+            name_view == "greatest" ? values[i] > best : values[i] < best;
         if (takes) {
           best = values[i];
         }
       } else if (numeric(best) && numeric(values[i])) {
-        const bool takes = name == "greatest"
+        const bool takes = name_view == "greatest"
                                ? as_double(values[i]) > as_double(best)
                                : as_double(values[i]) < as_double(best);
         if (takes) {
           best = values[i];
         }
-      } else if (name == "greatest") {
+      } else if (name_view == "greatest") {
         ASSIGN_OR_RETURN(bool, takes, values[i].TryGreater(best));
         if (takes) {
           best = values[i];
@@ -1418,7 +1449,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return best;
   }
-  if (name == "concat") {
+  if (name_view == "concat") {
     std::string result;
     for (const auto& value : values) {
       if (value.IsNull()) {
@@ -1432,7 +1463,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::move(result));
   }
-  if (name == "upper") {
+  if (name_view == "upper") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "UPPER requires 1 argument");
@@ -1442,7 +1473,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(UnicodeUpper(raw_str(values[0])));
   }
-  if (name == "lower") {
+  if (name_view == "lower") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LOWER requires 1 argument");
@@ -1452,7 +1483,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(UnicodeLower(raw_str(values[0])));
   }
-  if (name == "collate") {
+  if (name_view == "collate") {
     // COLLATE(value, 'spec'): attaches a collator without changing the
     // value. Every downstream comparison, grouping and ordering then resolves
     // the same collation through the shared contract (type/collation.hpp); the
@@ -1467,7 +1498,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return values[0].WithCollation(
         static_cast<uint8_t>(CollationOfSpec(raw_str(values[1]))));
   }
-  if (name == "bit_count") {
+  if (name_view == "bit_count") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "BIT_COUNT requires 1 argument");
@@ -1487,7 +1518,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(static_cast<int64_t>(
         std::popcount(static_cast<uint64_t>(input.value.int_value))));
   }
-  if (name == "normalize_and_casefold" || name == "normalize") {
+  if (name_view == "normalize_and_casefold" || name_view == "normalize") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -1518,7 +1549,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                            name + " supports NFC/NFKC only, got " + mode);
       }
     }
-    if (name == "normalize") {
+    if (name_view == "normalize") {
       return values[0];
     }
     return Value(UnicodeCaseFold(raw_str(values[0])));
@@ -1537,7 +1568,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        fname + " requires numeric argument");
   };
-  if (name == "abs") {
+  if (name_view == "abs") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ABS requires 1 argument");
@@ -1562,7 +1593,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "ABS requires numeric argument");
   }
-  if (name == "sign") {
+  if (name_view == "sign") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SIGN requires 1 argument");
@@ -1588,91 +1619,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "SIGN requires numeric argument");
   }
-  if (name == "round") {
-    if (values.empty() || values.size() > 2) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ROUND requires 1 or 2 arguments");
-    }
-    if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
-      return Value();
-    }
-    int64_t digits = 0;
-    if (values.size() == 2) {
-      if (values[1].type != ValueType::kInt64) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "ROUND digits must be an integer");
-      }
-      digits = values[1].value.int_value;
-    }
-    if (values[0].type == ValueType::kInt64) {
-      if (values[0].IsUnsigned()) {
-        const auto v = static_cast<uint64_t>(values[0].value.int_value);
-        if (digits >= 0) {
-          return values[0];
-        }
-        uint64_t scale = 1;
-        for (int64_t i = 0; i < -digits; ++i) {
-          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
-            return Value(int64_t{0}).WithUnsigned();
-          }
-          scale *= 10;
-        }
-        uint64_t q = v / scale;
-        const uint64_t rem = v % scale;
-        const uint64_t half = scale / 2;
-        if (rem >= half) {
-          q += 1;
-        }
-        uint64_t result = 0;
-        if (__builtin_mul_overflow(q, scale, &result)) {
-          return StatusError(StatusCode::kIsInfinity,
-                             "integer overflow in ROUND");
-        }
-        return Value(static_cast<int64_t>(result)).WithUnsigned();
-      }
-      const int64_t v = values[0].value.int_value;
-      if (digits >= 0) {
-        return Value(v);
-      }
-      int64_t scale = 1;
-      // `-digits` is itself INT64_MIN for digits == INT64_MIN and cannot be
-      // negated in signed arithmetic (UBSan, found by FUNCTION fuzzing).
-      const uint64_t trunc_digits =
-          digits == std::numeric_limits<int64_t>::min()
-              ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
-              : static_cast<uint64_t>(-digits);
-      for (uint64_t i = 0; i < trunc_digits; ++i) {
-        if (scale > std::numeric_limits<int64_t>::max() / 10) {
-          return Value(int64_t{0});
-        }
-        scale *= 10;
-      }
-      int64_t q = v / scale;
-      const int64_t rem = v % scale;
-      const int64_t half = scale / 2;
-      const bool negative = v < 0;
-      if ((negative ? -rem : rem) >= half) {
-        q += negative ? -1 : 1;
-      }
-      int64_t result = 0;
-      if (__builtin_mul_overflow(q, scale, &result)) {
-        return StatusError(StatusCode::kIsInfinity,
-                           "integer overflow in ROUND");
-      }
-      return Value(result);
-    }
-    if (values[0].type == ValueType::kDouble) {
-      const double val = values[0].value.double_value;
-      if (std::isnan(val)) {
-        return Value(val);
-      }
-      const double factor = std::pow(10.0, digits);
-      return Value(std::round(val * factor) / factor);
-    }
-    return StatusError(StatusCode::kInvalidArgument,
-                       "ROUND requires numeric argument");
-  }
-  if (name == "trunc" || name == "truncate") {
+  if (name_view == "trunc" || name_view == "truncate") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -1732,7 +1679,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires numeric argument");
   }
-  if (name == "ceil" || name == "ceiling") {
+  if (name_view == "ceil" || name_view == "ceiling") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -1749,7 +1696,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires numeric argument");
   }
-  if (name == "floor") {
+  if (name_view == "floor") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "FLOOR requires 1 argument");
@@ -1766,7 +1713,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return StatusError(StatusCode::kInvalidArgument,
                        "FLOOR requires numeric argument");
   }
-  if (name == "mod") {
+  if (name_view == "mod") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "MOD requires 2 arguments");
@@ -1782,8 +1729,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           return StatusError(StatusCode::kIsInfinity,
                              "division by zero in MOD");
         }
-        const auto l = static_cast<uint64_t>(values[0].value.int_value);
-        return Value(static_cast<int64_t>(l % r)).WithUnsigned();
+        return values[0].TryArithmetic(values[1], BinaryOperation::kModulo);
       }
       if (values[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
@@ -1825,7 +1771,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::fmod(l, r));
   }
-  if (name == "pow" || name == "power") {
+  if (name_view == "pow" || name_view == "power") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -1867,7 +1813,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(res);
   }
-  if (name == "sqrt") {
+  if (name_view == "sqrt") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SQRT requires 1 argument");
@@ -1882,7 +1828,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::sqrt(v));
   }
-  if (name == "cbrt") {
+  if (name_view == "cbrt") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CBRT requires 1 argument");
@@ -1893,7 +1839,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "CBRT"));
     return Value(AccurateCbrt(v));
   }
-  if (name == "ln") {
+  if (name_view == "ln") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LN requires 1 argument");
@@ -1904,9 +1850,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "LN"));
     return Value(std::log(v));
   }
-  if (name == "log" || name == "log10") {
-    if (name == "log10" ? values.size() != 1
-                        : (values.empty() || values.size() > 2)) {
+  if (name_view == "log" || name_view == "log10") {
+    if (name_view == "log10" ? values.size() != 1
+                             : (values.empty() || values.size() > 2)) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " argument count mismatch");
     }
@@ -1914,7 +1860,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], name));
-    if (name == "log10") {
+    if (name_view == "log10") {
       return Value(std::log10(v));
     }
     if (values.size() == 1) {
@@ -1926,7 +1872,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::log(v) / std::log(base));
   }
-  if (name == "exp") {
+  if (name_view == "exp") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "EXP requires 1 argument");
@@ -1942,7 +1888,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(res);
   }
-  if (name == "cos") {
+  if (name_view == "cos") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "COS requires 1 argument");
@@ -1953,7 +1899,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "COS"));
     return Value(std::cos(v));
   }
-  if (name == "sin") {
+  if (name_view == "sin") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SIN requires 1 argument");
@@ -1964,7 +1910,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "SIN"));
     return Value(std::sin(v));
   }
-  if (name == "tan") {
+  if (name_view == "tan") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TAN requires 1 argument");
@@ -1975,7 +1921,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "TAN"));
     return Value(std::tan(v));
   }
-  if (name == "acos") {
+  if (name_view == "acos") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ACOS requires 1 argument");
@@ -1990,7 +1936,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::acos(v));
   }
-  if (name == "asin") {
+  if (name_view == "asin") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ASIN requires 1 argument");
@@ -2005,7 +1951,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::asin(v));
   }
-  if (name == "atan") {
+  if (name_view == "atan") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ATAN requires 1 argument");
@@ -2016,7 +1962,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "ATAN"));
     return Value(std::atan(v));
   }
-  if (name == "atan2") {
+  if (name_view == "atan2") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ATAN2 requires 2 arguments");
@@ -2028,13 +1974,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, x, to_numeric_double(values[1], "ATAN2"));
     return Value(std::atan2(y, x));
   }
-  if (name == "pi") {
+  if (name_view == "pi") {
     if (!values.empty()) {
       return StatusError(StatusCode::kInvalidArgument, "PI takes no arguments");
     }
     return Value(M_PI);
   }
-  if (name == "radians") {
+  if (name_view == "radians") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RADIANS requires 1 argument");
@@ -2045,7 +1991,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, r0, to_numeric_double(values[0], "RADIANS"));
     return Value(r0 * (M_PI / 180.0));
   }
-  if (name == "degrees") {
+  if (name_view == "degrees") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DEGREES requires 1 argument");
@@ -2056,7 +2002,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, r0, to_numeric_double(values[0], "DEGREES"));
     return Value(r0 * (180.0 / M_PI));
   }
-  if (name == "cosh") {
+  if (name_view == "cosh") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "COSH requires 1 argument");
@@ -2072,7 +2018,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(res);
   }
-  if (name == "sinh") {
+  if (name_view == "sinh") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SINH requires 1 argument");
@@ -2088,7 +2034,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(res);
   }
-  if (name == "tanh") {
+  if (name_view == "tanh") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TANH requires 1 argument");
@@ -2099,7 +2045,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, v, to_numeric_double(values[0], "TANH"));
     return Value(std::tanh(v));
   }
-  if (name == "div") {
+  if (name_view == "div") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DIV requires 2 arguments");
@@ -2115,8 +2061,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           return StatusError(StatusCode::kIsInfinity,
                              "division by zero in DIV");
         }
-        const auto l = static_cast<uint64_t>(values[0].value.int_value);
-        return Value(static_cast<int64_t>(l / r)).WithUnsigned();
+        return values[0].TryArithmetic(values[1], BinaryOperation::kDivide);
       }
       if (values[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
@@ -2141,7 +2086,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(static_cast<int64_t>(quotient));
   }
-  if (name == "ieee_divide" || name == "safe_divide") {
+  if (name_view == "ieee_divide" || name_view == "safe_divide") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -2152,15 +2097,15 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(double, l, to_numeric_double(values[0], name));
     ASSIGN_OR_RETURN(double, r, to_numeric_double(values[1], name));
     if (r == 0.0) {
-      return name == "safe_divide" ? Value() : Value(l / r);
+      return name_view == "safe_divide" ? Value() : Value(l / r);
     }
     const double res = l / r;
-    if (name == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+    if (name_view == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
       return Value();
     }
     return Value(res);
   }
-  if (name == "substr" || name == "substring") {
+  if (name_view == "substr" || name_view == "substring") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SUBSTR requires two or three arguments");
@@ -2209,7 +2154,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
 
-  if (name == "byte_substr") {
+  if (name_view == "byte_substr") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SUBSTR requires two or three arguments");
@@ -2257,8 +2202,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
             : total_bytes;
     return Value(input.substr(static_cast<size_t>(actual_start), length));
   }
-  if (name == "length" || name == "char_length" || name == "character_length" ||
-      name == "octet_length" || name == "byte_length") {
+  if (name_view == "length" || name_view == "char_length" ||
+      name_view == "character_length" || name_view == "octet_length" ||
+      name_view == "byte_length") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -2267,7 +2213,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     const std::string input = raw_str(values[0]);
-    if (name == "char_length" || name == "character_length") {
+    if (name_view == "char_length" || name_view == "character_length") {
       // SQL CHAR_LENGTH counts CHARACTER CODE POINTS; the relational
       // evaluator (expression_eval.cpp utf8_len) and the compliance golden
       // (CHAR_LENGTH("€") = 1) already do.  Byte-counting here made the
@@ -2284,7 +2230,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     // length / octet_length / byte_length stay byte-oriented.
     return Value(static_cast<int64_t>(input.size()));
   }
-  if (name == "strpos") {
+  if (name_view == "strpos") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STRPOS requires 2 arguments");
@@ -2310,7 +2256,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(static_cast<int64_t>(code_points + 1));
   }
-  if (name == "instr") {
+  if (name_view == "instr") {
     if (values.size() < 2 || values.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "INSTR requires 2 to 4 arguments");
@@ -2367,7 +2313,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(int64_t{0});
   }
-  if (name == "lpad" || name == "rpad") {
+  if (name_view == "lpad" || name_view == "rpad") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 or 3 arguments");
@@ -2409,9 +2355,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (needed % pad_cps != 0) {
       pad_str += utf8_substr(pad, 0, needed % pad_cps);
     }
-    return Value(name == "lpad" ? pad_str + s : s + pad_str);
+    return Value(name_view == "lpad" ? pad_str + s : s + pad_str);
   }
-  if (name == "trim") {
+  if (name_view == "trim") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TRIM requires 1 or 2 arguments");
@@ -2429,7 +2375,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const size_t end = s.find_last_not_of(cutset);
     return Value(s.substr(start, end - start + 1));
   }
-  if (name == "ltrim") {
+  if (name_view == "ltrim") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LTRIM requires 1 or 2 arguments");
@@ -2446,7 +2392,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(s.substr(start));
   }
-  if (name == "rtrim") {
+  if (name_view == "rtrim") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RTRIM requires 1 or 2 arguments");
@@ -2463,7 +2409,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(s.substr(0, end + 1));
   }
-  if (name == "replace") {
+  if (name_view == "replace") {
     if (values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REPLACE requires 3 arguments");
@@ -2484,7 +2430,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::move(s));
   }
-  if (name == "starts_with") {
+  if (name_view == "starts_with") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STARTS_WITH requires 2 arguments");
@@ -2494,7 +2440,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(raw_str(values[0]).starts_with(raw_str(values[1])));
   }
-  if (name == "ends_with") {
+  if (name_view == "ends_with") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ENDS_WITH requires 2 arguments");
@@ -2505,7 +2451,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(raw_str(values[0]).ends_with(raw_str(values[1])));
   }
 
-  if (name == "reverse") {
+  if (name_view == "reverse") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REVERSE requires 1 argument");
@@ -2526,7 +2472,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "byte_reverse") {
+  if (name_view == "byte_reverse") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REVERSE requires 1 argument");
@@ -2539,7 +2485,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(s));
   }
 
-  if (name == "array_to_string") {
+  if (name_view == "array_to_string") {
     if (values.size() != 2 && values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_TO_STRING requires 2 or 3 arguments");
@@ -2620,7 +2566,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(out));
   }
 
-  if (name == "repeat") {
+  if (name_view == "repeat") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REPEAT requires 2 arguments");
@@ -2658,7 +2604,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "left" || name == "byte_left") {
+  if (name_view == "left" || name_view == "byte_left") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LEFT requires 2 arguments");
@@ -2676,13 +2622,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (len == 0) {
       return Value(std::string());
     }
-    if (name == "byte_left") {
+    if (name_view == "byte_left") {
       return Value(s.substr(0, static_cast<size_t>(len)));
     }
     return Value(utf8_substr(s, 0, static_cast<size_t>(len)));
   }
 
-  if (name == "right" || name == "byte_right") {
+  if (name_view == "right" || name_view == "byte_right") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RIGHT requires 2 arguments");
@@ -2700,7 +2646,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (len == 0) {
       return Value(std::string());
     }
-    if (name == "byte_right") {
+    if (name_view == "byte_right") {
       const size_t start = s.size() >= static_cast<size_t>(len)
                                ? s.size() - static_cast<size_t>(len)
                                : 0;
@@ -2714,7 +2660,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(utf8_substr(s, start_cp, static_cast<size_t>(len)));
   }
 
-  if (name == "ascii") {
+  if (name_view == "ascii") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ASCII requires 1 argument");
@@ -2729,7 +2675,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
   }
 
-  if (name == "unicode") {
+  if (name_view == "unicode") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "UNICODE requires 1 argument");
@@ -2765,7 +2711,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(static_cast<int64_t>(code));
   }
 
-  if (name == "chr") {
+  if (name_view == "chr") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CHR requires 1 argument");
@@ -2773,8 +2719,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    const int64_t code =
-        values[0].type == ValueType::kInt64 ? values[0].value.int_value : 0;
+    if (values[0].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CHR requires an integer argument");
+    }
+    const int64_t code = values[0].value.int_value;
     std::string res;
     if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
@@ -2797,7 +2746,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "code_points_to_string") {
+  if (name_view == "code_points_to_string") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CODE_POINTS_TO_STRING requires 1 argument");
@@ -2839,7 +2788,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "code_points_to_bytes") {
+  if (name_view == "code_points_to_bytes") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CODE_POINTS_TO_BYTES requires 1 argument");
@@ -2867,7 +2816,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "initcap") {
+  if (name_view == "initcap") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "INITCAP requires 1 or 2 arguments");
@@ -2881,7 +2830,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(UnicodeInitcap(s, delims, has_delim));
   }
 
-  if (name == "translate") {
+  if (name_view == "translate") {
     if (values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TRANSLATE requires 3 arguments");
@@ -2939,7 +2888,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "soundex") {
+  if (name_view == "soundex") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SOUNDEX requires 1 argument");
@@ -3020,7 +2969,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "split") {
+  if (name_view == "split") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SPLIT requires 1 or 2 arguments");
@@ -3060,7 +3009,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value::Array(std::move(elems), "STRING");
   }
 
-  if (name == "split_substr") {
+  if (name_view == "split_substr") {
     if (values.size() < 2 || values.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SPLIT_SUBSTR requires 2 to 4 arguments");
@@ -3120,7 +3069,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value(std::move(res));
   }
 
-  if (name == "regexp_contains") {
+  if (name_view == "regexp_contains") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_CONTAINS requires 2 arguments");
@@ -3139,7 +3088,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
   }
 
-  if (name == "regexp_match") {
+  if (name_view == "regexp_match") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_MATCH requires 2 arguments");
@@ -3158,7 +3107,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
   }
 
-  if (name == "regexp_instr" || name == "byte_regexp_instr") {
+  if (name_view == "regexp_instr" || name_view == "byte_regexp_instr") {
     if (values.size() < 2 || values.size() > 5) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_INSTR requires 2 to 5 arguments");
@@ -3182,7 +3131,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           StatusCode::kInvalidArgument,
           "REGEXP_INSTR position and occurrence must be positive");
     }
-    const bool byte_mode = name == "byte_regexp_instr";
+    const bool byte_mode = name_view == "byte_regexp_instr";
     const auto offsets = utf8_offsets(s);
     const size_t total_cps = offsets.size() - 1;
     if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
@@ -3238,7 +3187,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
   }
 
-  if (name == "regexp_extract_all" || name == "byte_regexp_extract_all") {
+  if (name_view == "regexp_extract_all" ||
+      name_view == "byte_regexp_extract_all") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT_ALL requires 2 arguments");
@@ -3265,16 +3215,16 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         }
         ++it;
       }
-      return Value::Array(std::move(results), name == "byte_regexp_extract_all"
-                                                  ? "BYTES"
-                                                  : "STRING");
+      return Value::Array(
+          std::move(results),
+          name_view == "byte_regexp_extract_all" ? "BYTES" : "STRING");
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid regular expression: " + pat);
     }
   }
 
-  if (name == "regexp_extract") {
+  if (name_view == "regexp_extract") {
     if (values.size() < 2 || values.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT requires 2 to 4 arguments");
@@ -3300,7 +3250,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
   }
 
-  if (name == "regexp_replace") {
+  if (name_view == "regexp_replace") {
     if (values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_REPLACE requires 3 arguments");
@@ -3308,20 +3258,30 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || values[1].IsNull() || values[2].IsNull()) {
       return Value();
     }
-    const std::string s = raw_str(values[0]);
-    const std::string pat = raw_str(values[1]);
-    const std::string rep = raw_str(values[2]);
+    std::array<std::string, 3> owned;
+    std::array<std::string_view, 3> views;
+    for (size_t i = 0; i < views.size(); ++i) {
+      if (values[i].type == ValueType::kVarChar) {
+        views[i] = values[i].AsStringView();
+      } else {
+        owned[i] = raw_str(values[i]);
+        views[i] = owned[i];
+      }
+    }
     try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      return Value(std::regex_replace(s, re, rep));
+      ASSIGN_OR_RETURN(std::string, replaced,
+                       ReplaceCheckedRegex(views[0], views[1], views[2]));
+      return Value(std::move(replaced));
     } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "invalid regular expression: " + std::string(views[1]));
     }
   }
 
-  if (name == "__bit_and" || name == "__bit_or" || name == "__bit_xor" ||
-      name == "__shift_left" || name == "__shift_right") {
+  if (name_view == "__bit_and" || name_view == "__bit_or" ||
+      name_view == "__bit_xor" || name_view == "__shift_left" ||
+      name_view == "__shift_right") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -3338,13 +3298,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     const int64_t rhs = values[1].value.int_value;
     const bool is_u = values[0].IsUnsigned() || values[1].IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
-    if (name == "__bit_and") {
+    if (name_view == "__bit_and") {
       return with_u(Value(lhs & rhs));
     }
-    if (name == "__bit_or") {
+    if (name_view == "__bit_or") {
       return with_u(Value(lhs | rhs));
     }
-    if (name == "__bit_xor") {
+    if (name_view == "__bit_xor") {
       return with_u(Value(lhs ^ rhs));
     }
     if (rhs < 0) {
@@ -3355,11 +3315,12 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto ulhs = static_cast<uint64_t>(lhs);
-    const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    const uint64_t shifted =
+        name_view == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
     return with_u(Value(static_cast<int64_t>(shifted)));
   }
-  if (name == "safe_add" || name == "safe_subtract" ||
-      name == "safe_multiply") {
+  if (name_view == "safe_add" || name_view == "safe_subtract" ||
+      name_view == "safe_multiply") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -3380,19 +3341,19 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         const auto l = static_cast<uint64_t>(values[0].value.int_value);
         const auto r = static_cast<uint64_t>(values[1].value.int_value);
         uint64_t res = 0;
-        if (name == "safe_add") {
+        if (name_view == "safe_add") {
           if (__builtin_add_overflow(l, r, &res)) {
             return Value();
           }
           return Value(static_cast<int64_t>(res)).WithUnsigned();
         }
-        if (name == "safe_subtract") {
+        if (name_view == "safe_subtract") {
           if (__builtin_sub_overflow(l, r, &res)) {
             return Value();
           }
           return Value(static_cast<int64_t>(res)).WithUnsigned();
         }
-        if (name == "safe_multiply") {
+        if (name_view == "safe_multiply") {
           if (__builtin_mul_overflow(l, r, &res)) {
             return Value();
           }
@@ -3401,21 +3362,21 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       }
       const int64_t l = values[0].value.int_value;
       const int64_t r = values[1].value.int_value;
-      if (name == "safe_add") {
+      if (name_view == "safe_add") {
         int64_t res = 0;
         if (__builtin_add_overflow(l, r, &res)) {
           return Value();
         }
         return Value(res);
       }
-      if (name == "safe_subtract") {
+      if (name_view == "safe_subtract") {
         int64_t res = 0;
         if (__builtin_sub_overflow(l, r, &res)) {
           return Value();
         }
         return Value(res);
       }
-      if (name == "safe_multiply") {
+      if (name_view == "safe_multiply") {
         int64_t res = 0;
         if (__builtin_mul_overflow(l, r, &res)) {
           return Value();
@@ -3437,14 +3398,15 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          static_cast<uint64_t>(values[1].value.int_value))
                    : static_cast<double>(values[1].value.int_value))
             : values[1].value.double_value;
-    const double checked =
-        name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
+    const double checked = name_view == "safe_add"
+                               ? l + r
+                               : (name_view == "safe_subtract" ? l - r : l * r);
     if (std::isinf(checked) || std::isnan(checked)) {
       return Value();
     }
     return Value(checked);
   }
-  if (name == "safe_negate") {
+  if (name_view == "safe_negate") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SAFE_NEGATE requires 1 argument");
@@ -3471,8 +3433,51 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(-values[0].value.double_value);
   }
-  if (name == "extract_year" || name == "extract_month" ||
-      name == "extract_day") {
+  // INTERVAL carries a domain tag; timestamp punctuation cannot prove it.
+  // Keep component extraction here so AST, bytecode and relational callers
+  // share the same signed decomposition and parse-error handling.
+  if (name_view.starts_with("extract_") && !values.empty() &&
+      values[0].IsInterval()) {
+    if (values.size() != 1) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "EXTRACT from INTERVAL requires one argument");
+    }
+    ASSIGN_OR_RETURN(IntervalValue, interval,
+                     IntervalValue::TryParse(values[0].value.varchar_value));
+    const int64_t seconds = interval.nanos / 1000000000LL;
+    const int64_t fraction = interval.nanos % 1000000000LL;
+    if (name_view == "extract_year") {
+      return Value(interval.months / 12);
+    }
+    if (name_view == "extract_month") {
+      return Value(interval.months % 12);
+    }
+    if (name_view == "extract_day") {
+      return Value(interval.days);
+    }
+    if (name_view == "extract_hour") {
+      return Value(seconds / 3600);
+    }
+    if (name_view == "extract_minute") {
+      return Value((seconds % 3600) / 60);
+    }
+    if (name_view == "extract_second") {
+      return Value(seconds % 60);
+    }
+    if (name_view == "extract_millisecond") {
+      return Value(fraction / 1000000LL);
+    }
+    if (name_view == "extract_microsecond") {
+      return Value(fraction / 1000LL);
+    }
+    if (name_view == "extract_nanosecond") {
+      return Value(fraction);
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "unsupported EXTRACT part for INTERVAL");
+  }
+  if (name_view == "extract_year" || name_view == "extract_month" ||
+      name_view == "extract_day") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "EXTRACT requires one argument");
@@ -3485,6 +3490,22 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return StatusError(StatusCode::kInvalidArgument,
                          "EXTRACT requires DATE or STRING");
     }
+    if (values[0].type == ValueType::kDate) {
+      const int64_t days = values[0].DateDays();
+      if (days < kDateMinDays || days > kDateMaxDays) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "DATE value out of range");
+      }
+      const std::chrono::year_month_day date{
+          std::chrono::sys_days{std::chrono::days{static_cast<int>(days)}}};
+      if (name_view == "extract_year") {
+        return Value(static_cast<int64_t>(static_cast<int>(date.year())));
+      }
+      if (name_view == "extract_month") {
+        return Value(static_cast<int64_t>(static_cast<unsigned>(date.month())));
+      }
+      return Value(static_cast<int64_t>(static_cast<unsigned>(date.day())));
+    }
     const std::string date = values[0].type == ValueType::kDate
                                  ? values[0].AsString()
                                  : std::string(values[0].value.varchar_value);
@@ -3493,9 +3514,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     int64_t part = 0;
     try {
-      if (name == "extract_year") {
+      if (name_view == "extract_year") {
         part = std::stoll(date.substr(0, 4));
-      } else if (name == "extract_month") {
+      } else if (name_view == "extract_month") {
         part = std::stoll(date.substr(5, 2));
       } else {
         part = std::stoll(date.substr(8, 2));
@@ -3506,7 +3527,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(part);
   }
-  if (name == "current_timestamp") {
+  if (name_view == "current_timestamp") {
     if (!values.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_TIMESTAMP takes no arguments");
@@ -3519,7 +3540,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S");
     return Value(output.str());
   }
-  if (name == "user" || name == "session_user") {
+  if (name_view == "user" || name_view == "session_user" ||
+      name_view == "current_user") {
     if (!values.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "USER takes no arguments");
@@ -3530,7 +3552,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
   }
-  if (name == "current_datetime") {
+  if (name_view == "current_datetime") {
     if (values.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_DATETIME takes at most 1 argument");
@@ -3538,14 +3560,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 1 && values[0].IsNull()) {
       return Value();
     }
-    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
@@ -3559,7 +3581,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                       .subsecond_nanos = 0};
     return Value(FormatCivilTime(current));
   }
-  if (name == "current_date") {
+  if (name_view == "current_date") {
     if (values.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_DATE takes at most 1 argument");
@@ -3567,14 +3589,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 1 && values[0].IsNull()) {
       return Value();
     }
-    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
     if (values.size() == 1 && !values[0].IsNull()) {
       std::string tz_str = raw_str(values[0]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
@@ -3586,7 +3608,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value::DateFromDays(
         std::chrono::sys_days{ymd}.time_since_epoch().count());
   }
-  if (name == "string") {
+  if (name_view == "string") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STRING requires 1 or 2 arguments");
@@ -3597,11 +3619,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values.size() == 2) {
       CivilTime ct = ValueToCivilTime(values[0]);
       std::string tz_str = raw_str(values[1]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
-      }
-      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -3623,8 +3641,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(raw_str(values[0]));
   }
-  if (name == "format_timestamp" || name == "format_datetime" ||
-      name == "format_date") {
+  if (name_view == "format_timestamp" || name_view == "format_datetime" ||
+      name_view == "format_date") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " takes 2 or 3 arguments");
@@ -3640,13 +3658,18 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return Value();
       }
       std::string tz_str = raw_str(values[2]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset,
+                         (ParseTimeZoneOffset(tz_str, &ct)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
-    } else if (name == "format_datetime" || name == "format_timestamp") {
-      tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+    } else if (name_view == "format_datetime" ||
+               name_view == "format_timestamp") {
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+        tz_offset_sec = parsed_offset;
+      }
     }
     ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;
@@ -3680,7 +3703,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return Value(std::string{buf.data()});
   }
-  if (name == "parse_timestamp") {
+  if (name_view == "parse_timestamp") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP requires 2 or 3 arguments");
@@ -3693,15 +3716,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     std::string fmt = raw_str(values[0]);
     std::string input = raw_str(values[1]);
-    int tz_offset_sec =
-        ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr, -8 * 3600);
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr)));
     if (values.size() == 3) {
       std::string tz_str = raw_str(values[2]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     struct tm tm = {};
     tm.tm_year = 100;
@@ -3739,7 +3761,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
 
   // Deferred STRUCT(...) construction: arguments alternate field name and
   // value; encoding is shared with the relational interpreter.
-  if (name == "__struct_json__") {
+  if (name_view == "__struct_json__") {
     bool triple_form = values.size() % 3 == 0;
     for (size_t i = 2; triple_form && i < values.size(); i += 3) {
       triple_form = values[i].IsNull() || values[i].type == ValueType::kInt64;
@@ -3754,15 +3776,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           value.value.varchar_value == "null") {
         value = Value();
       }
-      fields.emplace_back(values[i].IsNull()
-                              ? std::string()
-                              : std::string(values[i].value.varchar_value),
-                          std::move(value));
+      fields.emplace_back(
+          values[i].IsNull() ? std::string() : raw_str(values[i]),
+          std::move(value));
     }
     return Value(EncodeStructJson(fields));
   }
 
-  if (name == "__proto_new") {
+  if (name_view == "__proto_new") {
     // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
     // (type_name, value1, field1, value2, field2, ...).  Builds the proto
     // TEXT payload; required-field and enum-member violations throw.
@@ -3780,14 +3801,14 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                      TryConstructProtoText(type_name, fields));
     return Value(std::move(proto_text));
   }
-  if (name == "__value_table_value") {
+  if (name_view == "__value_table_value") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_value requires one argument");
     }
     return values.front();
   }
-  if (name == "__value_table_proto") {
+  if (name_view == "__value_table_proto") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_proto requires two arguments");
@@ -3814,7 +3835,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                      TryConstructProtoText(type_name, fields));
     return Value(std::move(proto_text));
   }
-  if (name == "__value_table_proto_existing") {
+  if (name_view == "__value_table_proto_existing") {
     if (values.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_proto_existing requires two arguments");
@@ -3845,7 +3866,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                      TryConstructProtoText(type_name, fields));
     return Value(std::move(proto_text));
   }
-  if (name == "__proto_set") {
+  if (name_view == "__proto_set") {
     // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
     if (values.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -3878,7 +3899,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                      TryProtoTextSetField(payload, path, values[2], type_name));
     return Value(rewritten.value_or(payload));
   }
-  if (name == "__get_extension") {
+  if (name_view == "__get_extension") {
     // value.(pkg.Ext.field): reads the bracketed extension entry from a
     // proto TEXT payload; NULL bases yield NULL.
     if (values.size() != 2) {
@@ -3898,8 +3919,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return out;
   }
-  if (name == "unix_seconds" || name == "unix_millis" ||
-      name == "unix_micros" || name == "unix_date") {
+  if (name_view == "unix_seconds" || name_view == "unix_millis" ||
+      name_view == "unix_micros" || name_view == "unix_date") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires one TIMESTAMP argument");
@@ -3918,13 +3939,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
                                                                          : q);
     };
-    if (name == "unix_date") {
+    if (name_view == "unix_date") {
       return Value(floor_div(*nanos, 86400000000000LL));
     }
-    if (name == "unix_seconds") {
+    if (name_view == "unix_seconds") {
       return Value(floor_div(*nanos, 1000000000LL));
     }
-    if (name == "unix_millis") {
+    if (name_view == "unix_millis") {
       return Value(floor_div(*nanos, 1000000LL));
     }
     return Value(floor_div(*nanos, 1000LL));
@@ -3934,7 +3955,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // scope-based relational evaluator supports (expression_eval.cpp), or a
   // plan-shape change that routes the predicate through this evaluator turns
   // a working query into "not yet executable".
-  if (name == "is_inf" || name == "is_nan") {
+  if (name_view == "is_inf" || name_view == "is_nan") {
     if (values.size() != 1) {
       return Value();
     }
@@ -3946,7 +3967,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value(int64_t{0});
     }
     const double v = arg.value.double_value;
-    if (name == "is_inf") {
+    if (name_view == "is_inf") {
       return Value(std::isinf(v) ? int64_t{1} : int64_t{0});
     }
     return Value(std::isnan(v) ? int64_t{1} : int64_t{0});
@@ -3954,12 +3975,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
 
   // FORMAT with non-constant arguments must render per row; the constant
   // shape folds at rewrite time, so this is the executable counterpart.
-  if (name == "format") {
+  if (name_view == "format") {
     return FormatFunction(name, values);
   }
 
   // Hashing family: raw digest bytes (BYTES semantics), hex via TO_HEX.
-  if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512") {
+  if (name_view == "md5" || name_view == "sha1" || name_view == "sha256" ||
+      name_view == "sha512") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -3968,19 +3990,19 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     const std::string input = raw_str(values[0]);
-    if (name == "md5") {
+    if (name_view == "md5") {
       return Value(digest::Md5Digest(input));
     }
-    if (name == "sha1") {
+    if (name_view == "sha1") {
       return Value(digest::Sha1Digest(input));
     }
-    if (name == "sha256") {
+    if (name_view == "sha256") {
       return Value(digest::Sha256Digest(input));
     }
     return Value(digest::Sha512Digest(input));
   }
 
-  if (name == "farm_fingerprint") {
+  if (name_view == "farm_fingerprint") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "FARM_FINGERPRINT requires 1 argument");
@@ -3996,7 +4018,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // string-based JSON representation; TO_JSON renders a scalar/struct value
   // as JSON text. Struct payloads ({...} VARCHAR) pass through both routes
   // untouched so TO_JSON(PARSE_JSON(...)) round-trips object text.
-  if (name == "parse_json" || name == "to_json") {
+  if (name_view == "parse_json" || name_view == "to_json") {
     if (values.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -4004,7 +4026,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull()) {
       return Value();
     }
-    if (name == "parse_json") {
+    if (name_view == "parse_json") {
       if (values[0].type != ValueType::kVarChar) {
         return StatusError(StatusCode::kInvalidArgument,
                            "PARSE_JSON requires a string argument");
@@ -4022,10 +4044,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // JSON accessor family.  The same evaluator backs the json_path_constant_fold
   // rewrite (fold) and this execution path, so constant and row-wise inputs
   // cannot diverge.
-  if (name == "json_extract" || name == "json_query" || name == "json_value" ||
-      name == "json_extract_scalar" || name == "json_extract_array" ||
-      name == "json_query_array" || name == "json_value_array" ||
-      name == "json_extract_string_array") {
+  if (name_view == "json_extract" || name_view == "json_query" ||
+      name_view == "json_value" || name_view == "json_extract_scalar" ||
+      name_view == "json_extract_array" || name_view == "json_query_array" ||
+      name_view == "json_value_array" ||
+      name_view == "json_extract_string_array") {
     if (values.empty() || values.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -4047,7 +4070,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // INTERVAL construction from runtime parts (the visitor emits this for
   // `INTERVAL <column> DAY`); the result is the encoded interval text that
   // generate_date_array and interval arithmetic consume.
-  if (name == "make_interval") {
+  if (name_view == "make_interval") {
     if (values.size() < 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "make_interval requires at least 2 arguments");
@@ -4063,10 +4086,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     ASSIGN_OR_RETURN(IntervalValue, iv,
                      (IntervalValue::TryParse(val_str, unit_str)));
     ASSIGN_OR_RETURN(std::string, iv_text, (iv.TryToString()));
-    return Value(std::move(iv_text));
+    return Value(std::move(iv_text)).WithInterval();
   }
 
-  if (name == "generate_array") {
+  if (name_view == "generate_array") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_ARRAY requires 2 or 3 arguments");
@@ -4234,7 +4257,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // The body mirrors the executor's detail evaluator one-to-one; both and
   // the plan-layer folds share this exact code, so the engines cannot
   // diverge element-wise.
-  if (name == "generate_series") {
+  if (name_view == "generate_series") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_SERIES requires 2 or 3 arguments");
@@ -4340,7 +4363,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     return Value::Array(std::move(elements), "DOUBLE");
   }
 
-  if (name == "generate_date_array") {
+  if (name_view == "generate_date_array") {
     if (values.size() < 2 || values.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_DATE_ARRAY requires 2 or 3 arguments");
@@ -4696,29 +4719,11 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
     return true;
   }
   if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
-    std::string unescaped;
-    unescaped.reserve(trimmed.size());
-    for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
-      if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
-        ++i;
-        switch (trimmed[i]) {
-          case 'n':
-            unescaped.push_back('\n');
-            break;
-          case 't':
-            unescaped.push_back('\t');
-            break;
-          case 'r':
-            unescaped.push_back('\r');
-            break;
-          default:
-            unescaped.push_back(trimmed[i]);
-            break;
-        }
-      } else {
-        unescaped.push_back(trimmed[i]);
-      }
+    auto string = json_text::DecodeJsonString(trimmed);
+    if (!string) {
+      return false;
     }
+    std::string unescaped = std::move(*string);
     constexpr std::string_view kDateMarker = "__tinylamb_date__:";
     if (unescaped.starts_with(kDateMarker)) {
       // A malformed marked DATE must not throw through this bool-returning
@@ -4763,10 +4768,22 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
       size_t start = 0;
       int depth = 0;
       bool quoted = false;
+      bool escaped = false;
+      if (TrimJson(body).empty()) {
+        *parsed = Value::Array({}, element_type);
+        return true;
+      }
       for (size_t i = 0; i <= body.size(); ++i) {
         const bool at_end = i == body.size();
         const char c = at_end ? ',' : body[i];
-        if (!at_end && c == '"') {
+        if (at_end && (quoted || depth != 0)) {
+          return false;
+        }
+        if (quoted && !at_end && escaped) {
+          escaped = false;
+        } else if (quoted && !at_end && c == '\\') {
+          escaped = true;
+        } else if (!at_end && c == '"') {
           quoted = !quoted;
         } else if (!quoted && !at_end && (c == '[' || c == '{' || c == '(')) {
           ++depth;
@@ -4779,7 +4796,11 @@ bool JsonTextToValue(const std::string& text, Value* parsed) {
             elements.emplace_back();
           } else if (item.front() == '"' && item.back() == '"' &&
                      item.size() >= 2) {
-            elements.emplace_back(item.substr(1, item.size() - 2));
+            auto string = json_text::DecodeJsonString(item);
+            if (!string) {
+              return false;
+            }
+            elements.emplace_back(std::move(*string));
           } else if (element_type == "DATE") {
             StatusOr<Value> date_element = Value::TryDate(item);
             if (date_element.HasValue()) {
@@ -4907,7 +4928,10 @@ StatusOr<Value> TryStructSetField(const Value& json, const std::string& path,
         rebuilt += encoded_new;
       } else {
         Value nested;
-        JsonTextToValue(value_text, &nested);
+        if (!JsonTextToValue(value_text, &nested)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "invalid nested STRUCT member JSON");
+        }
         ASSIGN_OR_RETURN(Value, sub,
                          TryStructSetField(nested, rest, new_value));
         ASSIGN_OR_RETURN(std::string, encoded_sub,
@@ -5281,11 +5305,14 @@ StatusOr<Value> FunctionCallExpression::TryEvaluate(
       return StatusError(StatusCode::kInvalidArgument,
                          "IFERROR requires 2 arguments");
     }
+    const bool as_double = IfBranchesPromoteToDouble(args_, schema, 0);
     if (auto attempt = args_[0]->TryEvaluate(row, schema, context);
         attempt.HasValue()) {
-      return attempt;
+      return NormalizeIfBranch(attempt.MoveValue(), as_double);
     }
-    return args_[1]->TryEvaluate(row, schema, context);
+    ASSIGN_OR_RETURN(Value, fallback,
+                     args_[1]->TryEvaluate(row, schema, context));
+    return NormalizeIfBranch(std::move(fallback), as_double);
   }
   if (func_name_ == "iserror") {
     if (args_.size() != 1) {
@@ -5491,7 +5518,8 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
     return {TypeTag::kDouble};
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
-    return args_[0]->ResultType(schema);
+    return args_.empty() ? tinylamb::Type(TypeTag::kInvalid)
+                         : args_[0]->ResultType(schema);
   }
   return {TypeTag::kVarChar};
 }
@@ -5629,7 +5657,8 @@ Type FunctionCallExpression::ResultType(const Schema& left,
     return {TypeTag::kDouble};
   }
   if (func_name_ == "date_add" || func_name_ == "date_sub") {
-    return args_[0]->ResultType(left, right);
+    return args_.empty() ? tinylamb::Type(TypeTag::kInvalid)
+                         : args_[0]->ResultType(left, right);
   }
   return {TypeTag::kVarChar};
 }

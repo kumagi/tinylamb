@@ -365,6 +365,62 @@ std::vector<Expression> SplitOrDisjuncts(const Expression& expression) {
   return result;
 }
 
+// The schema-free rewrite proof cannot establish a column comparison's
+// domain. Join inference has bound tables, so prove the narrow numeric/date
+// case here without relaxing the general expression rewrite guard.
+bool BoundPredicateCannotThrow(  // NOLINT(misc-no-recursion)
+    const Expression& expression,
+    const std::unordered_map<std::string, std::shared_ptr<Table>>& tables) {
+  if (ExpressionCannotThrowForPlanner(expression)) {
+    return true;
+  }
+  if (!expression || expression->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const auto& binary = expression->AsBinaryExpression();
+  if (binary.Op() == BinaryOperation::kAnd ||
+      binary.Op() == BinaryOperation::kOr) {
+    return BoundPredicateCannotThrow(binary.Left(), tables) &&
+           BoundPredicateCannotThrow(binary.Right(), tables);
+  }
+  switch (binary.Op()) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      break;
+    default:
+      return false;
+  }
+  const auto domain =
+      [&](const Expression& operand) -> std::optional<ValueType> {
+    if (operand->Type() == TypeTag::kConstantValue) {
+      return operand->AsConstantValue().GetValue().type;
+    }
+    if (operand->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+    const ColumnName& column = operand->AsColumnValue().GetColumnName();
+    const auto relations = ColumnRelations(column, tables);
+    if (relations.size() != 1) {
+      return std::nullopt;
+    }
+    const Schema& schema = tables.at(*relations.begin())->GetSchema();
+    const int offset = schema.Offset(ColumnName("", column.name));
+    if (offset < 0) {
+      return std::nullopt;
+    }
+    return schema.GetColumn(static_cast<size_t>(offset)).Type();
+  };
+  const auto left = domain(binary.Left());
+  const auto right = domain(binary.Right());
+  return left && right && left == right &&
+         (*left == ValueType::kInt64 || *left == ValueType::kDouble ||
+          *left == ValueType::kDate);
+}
+
 std::vector<CrossColumnEquality> InferCommonOrJoinEqualities(
     const std::vector<Expression>& conjuncts,
     const std::unordered_map<std::string, std::shared_ptr<Table>>& tables,
@@ -383,7 +439,7 @@ std::vector<CrossColumnEquality> InferCommonOrJoinEqualities(
     if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
         conjunct->AsBinaryExpression().Op() != BinaryOperation::kOr ||
         !SafeToReduceEvaluationCount(conjunct) ||
-        !ExpressionCannotThrowForPlanner(conjunct)) {
+        !BoundPredicateCannotThrow(conjunct, tables)) {
       continue;
     }
     const std::vector<Expression> branches = SplitOrDisjuncts(conjunct);
@@ -3622,10 +3678,16 @@ StatusOr<Plan> Optimizer::Optimize(const QueryData& query,
     }
     if (all_columns) {
       properties.ordering = std::move(ordering);
+      properties.sort_ascending = query.order_ascending_;
+      properties.sort_nulls_first = query.order_nulls_first_;
     }
   }
   if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
-    properties.limit_hint = query.limit_offset_ + query.limit_count_;
+    properties.limit_hint =
+        query.limit_offset_ >
+                std::numeric_limits<size_t>::max() - query.limit_count_
+            ? std::numeric_limits<size_t>::max()
+            : query.limit_offset_ + query.limit_count_;
   }
 
   // MIN/MAX can read one index endpoint without a child scan. Every other

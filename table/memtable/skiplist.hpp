@@ -18,6 +18,7 @@
 #define TINYLAMB_MEMTABLE_SKIPLIST_HPP
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -37,19 +38,18 @@ class SkipArena final {
   SkipArena() = default;
   SkipArena(const SkipArena&) = delete;
   SkipArena& operator=(const SkipArena&) = delete;
+  SkipArena(SkipArena&&) = delete;
+  SkipArena& operator=(SkipArena&&) = delete;
 
   ~SkipArena() { FreeAll(); }
 
   void* Allocate(size_t bytes) {
-    bytes = (bytes + 15u) & ~size_t{15};  // 16B alignment
+    bytes = (bytes + 15U) & ~size_t{15};  // 16B alignment
     if (remaining_ < bytes) {
       const size_t cap = bytes > kChunkSize ? bytes : kChunkSize;
-      // push_back(unique_ptr) instead of emplace_back(new char[]): if the
-      // vector reallocates and throws bad_alloc mid-growth, the owning
-      // temporary still destroys the fresh chunk. The raw-pointer form
-      // leaked it on exactly that path.
-      chunks_.push_back(std::unique_ptr<char[]>(new char[cap]));
-      cursor_ = chunks_.back().get();
+      // Each chunk owns its bytes even if growing the outer vector throws.
+      chunks_.emplace_back(cap);
+      cursor_ = chunks_.back().data();
       remaining_ = cap;
     }
     void* p = cursor_;
@@ -73,7 +73,7 @@ class SkipArena final {
 
  private:
   static constexpr size_t kChunkSize = size_t{1} << 18;  // 256 KiB
-  std::vector<std::unique_ptr<char[]>> chunks_;
+  std::vector<std::vector<char>> chunks_;
   char* cursor_{nullptr};
   size_t remaining_{0};
 };
@@ -91,6 +91,8 @@ class SkipList final {
   SkipList();
   SkipList(const SkipList&) = delete;
   SkipList& operator=(const SkipList&) = delete;
+  SkipList(SkipList&&) = delete;
+  SkipList& operator=(SkipList&&) = delete;
   ~SkipList() { Clear(); }
 
   // Insert `entry` under `key`, replacing any existing value. Returns true
@@ -144,7 +146,7 @@ class SkipList final {
   // Defined in skiplist.cpp: RowEntry + key_len + height + inline key bytes
   // trailing after `height` next pointers, single arena block.
   Node* head_{nullptr};  // kMaxLevel-height sentinel, never carries data
-  Node* tail_[kMaxLevel]{};
+  std::array<Node*, kMaxLevel> tail_{};
 
   [[nodiscard]] int PickHeight();
   Node* NewNode(std::string_view key, RowEntry&& entry, int height);
@@ -159,7 +161,7 @@ class SkipList final {
                                  uint64_t word, uint8_t tail, bool fixed9);
 
   SkipArena arena_;
-  uint32_t rng_{0x9E3779B9u};
+  uint32_t rng_{0x9E3779B9U};
   size_t size_{0};
   int max_height_{1};
 };

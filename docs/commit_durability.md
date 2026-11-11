@@ -39,14 +39,10 @@
 
 - 待機点: `WaitForDurable(レコード終端)`。AddLog 戻り値はレコード先頭 LSN
   であり恒久化地点ではない。
-- Abort 経路は待機しない（2026-10-02 第6ラウンド）。undo ウォークは
-  `RecoveryManager::ReadLog` が生 Logger のリングバッファ
-  （`Logger::TryCopyBuffered`）から揮発レコードを直接読むため、レコードの
-  ディスク到達を待つ必要がない。Abort 記録の恒久化は不要というのが根拠:
-  クラッシュで揮発分が失われても再起動 loser cleanup が同一のロールバックを
-  再現する。リング外かつ未ディスクのレコード（WAL 書き出し滞留 > 8MiB）だけ
-  1 回のグループコミット待ちにフォールバックする
-  （`TransactionManager::Abort` の `read_undo_record`）。
+- Abort 経路は恒久化を待たない。`staged_records_` を逆順にメモリへ適用し、
+  未コミット MVCC 版を破棄して、ログを書いた transaction には `kAbort` を追記する。
+  WAL の読み戻しや `read_undo_record` の待機はない。再起動は `kCommit` のある
+  transaction だけを再生するため、揮発した Abort レコードは loser の復元を招かない。
 - read-only txn: 自前のログ書込はないが、観測版があれば右端の依存 LSN 待機が発生する。
   何も観測しなければ待機しない（依存 0）。
 - チェックポイント: transaction status / prev LSN は `transaction_table_lock`

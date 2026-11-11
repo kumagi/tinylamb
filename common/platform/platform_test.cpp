@@ -22,8 +22,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -32,7 +35,10 @@
 #include "common/platform/cpu_affinity.hpp"
 #include "common/platform/endian.hpp"
 #include "common/platform/event_poller.hpp"
+#include "common/platform/extended_float.hpp"
 #include "common/platform/file_io.hpp"
+#include "common/platform/int128_conversion.hpp"
+#include "common/platform/os.hpp"
 #include "common/platform/process.hpp"
 #include "common/platform/socket.hpp"
 #include "common/platform/synced_stream.hpp"
@@ -40,6 +46,67 @@
 #include "gtest/gtest.h"
 
 namespace tinylamb::platform {
+#ifdef __SIZEOF_INT128__
+TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
+  const unsigned __int128 sign_bit = static_cast<unsigned __int128>(1) << 127;
+  const auto maximum = static_cast<__int128>(sign_bit - 1);
+  const __int128 minimum = -maximum - 1;
+  EXPECT_EQ(SaturatingDoubleToInt128(-0x1p127), minimum);
+  EXPECT_EQ(SaturatingDoubleToInt128(-0x1p128), minimum);
+  EXPECT_EQ(SaturatingDoubleToInt128(0x1p127), maximum);
+  EXPECT_EQ(SaturatingDoubleToInt128(0x1p128), maximum);
+  EXPECT_EQ(SaturatingDoubleToInt128(-42.75), -42);
+  EXPECT_EQ(SaturatingDoubleToInt128(42.75), 42);
+  EXPECT_EQ(DoubleToUInt128Magnitude(0x1p127), sign_bit);
+  EXPECT_EQ(DoubleToUInt128Magnitude(0x1.8p127), sign_bit + (sign_bit >> 1));
+  EXPECT_EQ(DoubleToUInt128Magnitude(0x1p128),
+            ~static_cast<unsigned __int128>(0));
+  EXPECT_EQ(SaturatingDoubleToInt128(std::numeric_limits<double>::quiet_NaN()),
+            0);
+  EXPECT_EQ(SaturatingDoubleToInt128(-std::numeric_limits<double>::infinity()),
+            minimum);
+}
+#endif
+
+TEST(SoftExtendedAuditTest,
+     IntegralConversionsSaturateWithoutUndefinedBehavior) {
+  EXPECT_EQ(static_cast<int64_t>(SoftExtended(1e100)), INT64_MAX);
+  EXPECT_EQ(static_cast<int64_t>(SoftExtended(-1e100)), INT64_MIN);
+  EXPECT_EQ(static_cast<uint64_t>(SoftExtended(1e100)), UINT64_MAX);
+  EXPECT_EQ(static_cast<uint64_t>(SoftExtended(-1e100)), 0U);
+  EXPECT_EQ(static_cast<int64_t>(SoftExtended(INT64_MAX)), INT64_MAX);
+  EXPECT_EQ(static_cast<int64_t>(SoftExtended(INT64_MIN)), INT64_MIN);
+  EXPECT_EQ(static_cast<uint64_t>(SoftExtended(UINT64_MAX)), UINT64_MAX);
+  EXPECT_EQ(static_cast<int8_t>(SoftExtended(128)), INT8_MAX);
+  EXPECT_EQ(static_cast<int8_t>(SoftExtended(-129)), INT8_MIN);
+  EXPECT_EQ(static_cast<uint8_t>(SoftExtended(-1)), 0);
+  EXPECT_EQ(static_cast<int>(SoftExtended(-3.75)), -3);
+  EXPECT_EQ(static_cast<int>(SoftExtended(0.75)), 0);
+  EXPECT_EQ(
+      static_cast<int>(SoftExtended(std::numeric_limits<double>::quiet_NaN())),
+      0);
+}
+
+#ifndef TINYLAMB_OS_WINDOWS
+TEST(ProcessAuditTest, SpawnOverridesEnvironmentOnlyInChild) {
+  ASSERT_EQ(SetEnv("TINYLAMB_AUDIT_SPAWN_ENV", "parent", 1), 0);
+  std::string error;
+  EXPECT_EQ(RunProcess("/bin/sh",
+                       {"-c",
+                        "test \"$TINYLAMB_AUDIT_SPAWN_ENV\" = 'child value' && "
+                        "test \"$1\" = 'argument with spaces'",
+                        "audit", "argument with spaces"},
+                       {{"TINYLAMB_AUDIT_SPAWN_ENV", "child value"}}, &error),
+            0)
+      << error;
+  EXPECT_STREQ(std::getenv("TINYLAMB_AUDIT_SPAWN_ENV"), "parent");
+  EXPECT_EQ(RunProcess("/bin/sh", {"-c", "exit 23"}, {}, &error), 23);
+  EXPECT_EQ(RunProcess("/path/that/does/not/exist", {}, {}, &error), -1);
+  EXPECT_FALSE(error.empty());
+  EXPECT_EQ(UnsetEnv("TINYLAMB_AUDIT_SPAWN_ENV"), 0);
+}
+#endif
+
 namespace {
 
 uint32_t WaitFor(EventPoller& poller, int fd, int timeout_ms = 1000) {
@@ -145,6 +212,26 @@ TEST(PlatformSocketTest, AcceptAppliesFlagsAndSendSkipsSigPipe) {
   }
   EXPECT_LT(sent, 0);
   CloseSocket(client);
+}
+
+TEST(PlatformEventPollerTest, EmptyPollerWaitsForRegistrationAndReadiness) {
+  EventPoller poller;
+  Waker waker;
+  ASSERT_TRUE(poller.Open());
+  ASSERT_TRUE(waker.Open());
+  std::promise<void> entered;
+  auto started = entered.get_future();
+  auto waiting = std::async(std::launch::async, [&] {
+    std::array<PollResult, 1> results{};
+    entered.set_value();
+    return poller.Wait(results, -1);
+  });
+  started.wait();
+  EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(25)),
+            std::future_status::timeout);
+  EXPECT_TRUE(poller.Add(waker.ReadFd(), kPollReadable));
+  waker.Wake();
+  EXPECT_EQ(waiting.get(), 1);
 }
 
 TEST(PlatformEventPollerTest, LevelTriggeredReadWriteAndPeerClose) {

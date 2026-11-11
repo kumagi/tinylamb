@@ -1244,8 +1244,8 @@ std::vector<PlanAlternative> ScanAlternatives(
       std::vector<Value> end_key;
       std::unordered_set<slot_t> consumed;
       // Slots fully pinned by equality. Only these are provably exact in the
-      // scan output; range-bound slots may leak boundary rows, so predicates
-      // touching them must be re-checked by a Selection (see `covered`).
+      // scan output. Range-bound slots still need the scan's residual check
+      // and contribute the range I/O penalty below.
       std::unordered_set<slot_t> equality_slots;
       size_t equality_prefix = 0;
       // Key construction contract: begin/end vectors may differ in length
@@ -1322,11 +1322,9 @@ std::vector<PlanAlternative> ScanAlternatives(
         // capture it before wrapping.
         const bool covering =
             std::dynamic_pointer_cast<IndexOnlyScanPlan>(candidate) != nullptr;
-        // The scan filter is applied either by the scan itself or, when its
-        // columns are not covered by the index key, by a Selection on top.
-        // Only equality-pinned slots are provably exact in the scan output;
-        // range bounds (and the short-end ceiling) can leak boundary rows, so
-        // any predicate touching them is re-checked by a Selection.
+        // Keep the residual's logical selectivity and EXPLAIN node. The scan
+        // holds this same expression, so SelectionPlan emits only the child
+        // without evaluating the shared predicate twice.
         const bool covered =
             !filter ||
             std::ranges::all_of(
@@ -4515,9 +4513,18 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           }
           Plan set_operation = std::make_shared<SetOperationPlan>(
               std::move(plans), operation, std::move(order_keys));
-          const double output_rows = operation == SetOperationKind::kUnionAll
-                                         ? input_rows
-                                         : children.front().estimated_rows;
+          double output_rows = children.front().estimated_rows;
+          if (operation == SetOperationKind::kUnionAll ||
+              operation == SetOperationKind::kUnion) {
+            // Without cross-branch overlap statistics, use the sum as a
+            // conservative estimate instead of the first branch's cardinality.
+            output_rows = input_rows;
+          } else if (operation == SetOperationKind::kIntersect ||
+                     operation == SetOperationKind::kIntersectAll) {
+            for (const BestPlan& child : children) {
+              output_rows = std::min(output_rows, child.estimated_rows);
+            }
+          }
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(set_operation),
                               .local_cost = input_rows,
@@ -4566,7 +4573,8 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               for (const SortKey& key : sort->Keys()) {
                 keys.push_back(TopNKey{.expression = key.expression,
                                        .ascending = key.ascending,
-                                       .nulls_first = key.nulls_first});
+                                       .nulls_first = key.nulls_first,
+                                       .collation = key.collation});
               }
               Plan topn = std::make_shared<TopNPlan>(
                   sort->Child(), std::move(keys), logical.limit_count,

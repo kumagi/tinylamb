@@ -26,13 +26,17 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "common/byte_stream.hpp"
 #include "common/constants.hpp"
 #include "common/log_message.hpp"
 #include "common/random_string.hpp"
+#include "common/status_or.hpp"
 #include "recovery/logger.hpp"
 
 namespace tinylamb {
@@ -40,30 +44,57 @@ namespace tinylamb {
 constexpr int kBufferSize = 64;
 constexpr size_t kMaxLogs = 1024;
 
-// Byte-driven WAL fuzzer.  Each input byte controls a record length and payload
-// directly, so libFuzzer can evolve record boundaries and sizes toward the
-// group-commit buffer edge cases instead of sampling a PRNG.
+// Append and wait through the same Status boundary as database clients. A
+// stopped or failed logger must terminate the input rather than spin forever
+// waiting for a byte count that can no longer be committed.
+inline Status AppendLoggerFuzzInput(Logger& logger, ByteStream& stream,
+                                    std::vector<std::string>* written,
+                                    bool verbose) {
+  lsn_t durable_target = logger.DurableLSN();
+  for (size_t i = 0; i < kMaxLogs && stream.Remaining(); ++i) {
+    std::string log_data(stream.Bytes(stream.Pick(256)));
+    ASSIGN_OR_RETURN(lsn_t, start, logger.AddLog(log_data));
+    durable_target = start + log_data.size();
+    if (verbose) {
+      LOG(TRACE) << log_data;
+    }
+    written->emplace_back(std::move(log_data));
+  }
+  return logger.WaitForDurable(durable_target);
+}
+
+// Byte-driven WAL fuzzer. Each input owns a directory so failures also clean
+// up segment metadata, instead of leaking it across long libFuzzer runs.
 inline void Try(const uint8_t* data, size_t size, bool verbose) {
   ByteStream stream(data, size);
-  std::string filename = RandomString(16) + "-fuzzer.log";
-  // Best-effort cleanup: ENOENT is expected on a fresh run.
-  (void)std::remove(filename.c_str());
+  const std::filesystem::path directory = RandomString(16) + "-logger-fuzz";
+  std::error_code error;
+  if (!std::filesystem::create_directory(directory, error)) {
+    return;
+  }
+  struct Cleanup {
+    explicit Cleanup(std::filesystem::path directory)
+        : path(std::move(directory)) {}
+    Cleanup(const Cleanup&) = delete;
+    Cleanup& operator=(const Cleanup&) = delete;
+    Cleanup(Cleanup&&) = delete;
+    Cleanup& operator=(Cleanup&&) = delete;
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } cleanup{directory};
+  const std::string filename = (directory / "input.log").string();
+  auto created = Logger::Create(filename, kBufferSize, 1);
+  if (!created.HasValue()) {
+    return;
+  }
+  std::unique_ptr<Logger> logger = created.MoveValue();
   std::vector<std::string> written;
-  std::unique_ptr<Logger> logger =
-      Logger::Create(filename, kBufferSize, 1).MoveValue();
-  {
-    lsn_t total = 0;
-    for (size_t i = 0; i < kMaxLogs && stream.Remaining(); ++i) {
-      std::string log_data(stream.Bytes(stream.Pick(256)));
-      logger->AddLog(log_data);
-      if (verbose) {
-        LOG(TRACE) << log_data;
-      }
-      total += log_data.size();
-      written.emplace_back(log_data);
-    }
-    while (logger->CommittedLSN() < total) {
-    }
+  if (AppendLoggerFuzzInput(*logger, stream, &written, verbose) !=
+      Status::kSuccess) {
+    return;
   }
 
   std::ifstream file;
@@ -82,8 +113,6 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   std::string a(1, ' ');
   file.read(a.data(), 1);
   assert(file.eof());
-  // Best-effort cleanup: ENOENT is expected on a fresh run.
-  (void)std::remove(filename.c_str());
 }
 
 }  // namespace tinylamb

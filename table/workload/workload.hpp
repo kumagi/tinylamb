@@ -62,6 +62,9 @@ class WorkloadTracker {
   WorkloadTracker() = default;
   WorkloadTracker(const WorkloadTracker&) = delete;
   WorkloadTracker& operator=(const WorkloadTracker&) = delete;
+  WorkloadTracker(WorkloadTracker&&) = delete;
+  WorkloadTracker& operator=(WorkloadTracker&&) = delete;
+  ~WorkloadTracker() = default;
 
   void RecordFilter(const ColumnName& col);
   void RecordAggregate(const ColumnName& col);

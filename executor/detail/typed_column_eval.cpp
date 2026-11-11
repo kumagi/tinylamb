@@ -47,6 +47,7 @@
 #include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/case_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -65,6 +66,7 @@
 #include "table/table.hpp"
 #include "type/collation.hpp"
 #include "type/column.hpp"
+#include "type/date.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -137,9 +139,7 @@ BinaryOperation FlipTypedCompare(BinaryOperation operation) {
 bool DecideTypedFilterCompare(const Value& left, const Value& right,
                               const TypedFilterCompare& compare) {
   if (compare.string_payload) {
-    const std::string_view a = left.value.varchar_value;
-    const bool equal = a == std::string_view(compare.string_constant);
-    return compare.op == BinaryOperation::kEquals ? equal : !equal;
+    return MatchTypedStringCompare(left.value.varchar_value, compare);
   }
   if (compare.constant_payload) {
     if (compare.is_double) {
@@ -218,6 +218,47 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
     return std::nullopt;
   }
   const BinaryExpression& binary = predicate->AsBinaryExpression();
+  if (allow_const_fold &&
+      (binary.Op() == BinaryOperation::kLike ||
+       binary.Op() == BinaryOperation::kNotLike) &&
+      binary.Left()->Type() == TypeTag::kColumnValue &&
+      binary.Right()->Type() == TypeTag::kConstantValue &&
+      !ContainsParameterSlot(predicate)) {
+    const auto offset = LocalColumnOffset(
+        scan_schema, binary.Left()->AsColumnValue().GetColumnName());
+    const Value& pattern = binary.Right()->AsConstantValue().GetValue();
+    if (!offset ||
+        scan_schema.GetColumn(static_cast<slot_t>(*offset)).Type() !=
+            ValueType::kVarChar ||
+        scan_schema.GetColumn(static_cast<slot_t>(*offset)).IsInterval() ||
+        pattern.type != ValueType::kVarChar || pattern.IsInterval() ||
+        pattern.IsCaseInsensitive()) {
+      return std::nullopt;
+    }
+    std::string_view literal = pattern.value.varchar_value;
+    const bool leading = literal.starts_with('%');
+    if (leading) {
+      literal.remove_prefix(1);
+    }
+    const bool trailing = literal.ends_with('%');
+    if (trailing) {
+      literal.remove_suffix(1);
+    }
+    if (literal.find_first_of("%_") != std::string_view::npos) {
+      return std::nullopt;
+    }
+    using Kind = TypedFilterCompare::StringMatchKind;
+    TypedFilterCompare compiled{.left = static_cast<slot_t>(*offset),
+                                .op = binary.Op(),
+                                .constant_payload = true,
+                                .string_payload = true,
+                                .string_constant = std::string(literal)};
+    compiled.string_match = leading && trailing ? Kind::kContains
+                            : leading           ? Kind::kSuffix
+                            : trailing          ? Kind::kPrefix
+                                                : Kind::kExact;
+    return compiled;
+  }
   if (IsComparison(binary.Op()) &&
       binary.Left()->Type() == TypeTag::kColumnValue &&
       binary.Right()->Type() == TypeTag::kColumnValue) {
@@ -257,6 +298,22 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
         Expression column = folded.Left();
         Expression constant = folded.Right();
         BinaryOperation op = folded.Op();
+        auto try_fold_closed_constant = [](Expression* expr_ptr) {
+          const Expression& expr = *expr_ptr;
+          if (!expr || expr->Type() == TypeTag::kConstantValue ||
+              expr->Type() == TypeTag::kColumnValue) {
+            return;
+          }
+          if (!ContainsVolatileCall(expr) && !ContainsParameterSlot(expr) &&
+              !ContainsQuery(expr) && expr->TouchedColumns().empty()) {
+            StatusOr<Value> val = expr->TryEvaluate(Row(), Schema());
+            if (val.HasValue()) {
+              *expr_ptr = ConstantValueExp(val.MoveValue());
+            }
+          }
+        };
+        try_fold_closed_constant(&column);
+        try_fold_closed_constant(&constant);
         if (column->Type() == TypeTag::kConstantValue &&
             constant->Type() == TypeTag::kColumnValue) {
           std::swap(column, constant);
@@ -278,10 +335,21 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
             if (!column_object.IsUnsigned() &&
                 (column_type == ValueType::kInt64 ||
                  column_type == ValueType::kDate) &&
-                constant_value.type == column_type) {
+                constant_value.type == column_type &&
+                !constant_value.IsUnsigned()) {
               compiled.is_double = false;
               compiled.int_constant = constant_value.value.int_value;
               supported = true;
+            } else if (column_type == ValueType::kDate &&
+                       constant_value.type == ValueType::kVarChar) {
+              // Match the AST's DATE/string coercion, but parse a valid
+              // constant once instead of parsing it for every input row.
+              const auto days =
+                  TryParseDateDays(constant_value.value.varchar_value);
+              if (days.HasValue()) {
+                compiled.int_constant = days.Value();
+                supported = true;
+              }
             } else if (!column_object.IsUnsigned() &&
                        column_type == ValueType::kInt64 &&
                        constant_value.type == ValueType::kDouble &&
@@ -312,9 +380,18 @@ std::optional<TypedFilterCompare> TryCompileTypedFilterCompare(
               }
             } else if (!column_object.IsUnsigned() &&
                        column_type == ValueType::kDouble &&
-                       constant_value.type == ValueType::kDouble) {
+                       (constant_value.type == ValueType::kDouble ||
+                        (constant_value.type == ValueType::kInt64 &&
+                         !constant_value.IsUnsigned() &&
+                         constant_value.value.int_value >=
+                             -(int64_t{1} << 53) &&
+                         constant_value.value.int_value <=
+                             (int64_t{1} << 53)))) {
               compiled.is_double = true;
-              compiled.double_constant = constant_value.value.double_value;
+              compiled.double_constant =
+                  constant_value.type == ValueType::kDouble
+                      ? constant_value.value.double_value
+                      : static_cast<double>(constant_value.value.int_value);
               supported = true;
             } else if (column_type == ValueType::kVarChar &&
                        constant_value.type == ValueType::kVarChar &&
@@ -746,10 +823,18 @@ TypedAggregationPlan PlanTypedAggregation(
   if (stmt.Distinct()) {
     return plan;
   }
-  // Group keys: plain columns only.
+  // A deterministic integer expression adds no grouping information when
+  // every input column is already a plain key. Keep its checked evaluation
+  // for every group so removing it from the hash key cannot erase errors.
+  std::vector<Expression> dependent_keys;
   for (const Expression& key : stmt.GroupBy()) {
+    if (key && key->Type() == TypeTag::kConstantValue &&
+        !ContainsParameterSlot(key)) {
+      continue;
+    }
     if (!key || key->Type() != TypeTag::kColumnValue) {
-      return plan;
+      dependent_keys.push_back(key);
+      continue;
     }
     const auto offset =
         LocalColumnOffset(scan_schema, key->AsColumnValue().GetColumnName());
@@ -757,6 +842,40 @@ TypedAggregationPlan PlanTypedAggregation(
       return plan;
     }
     plan.key_offsets.push_back(static_cast<slot_t>(*offset));
+  }
+  std::vector<std::string> dependent_identities;
+  if (!dependent_keys.empty()) {
+    // HAVING reclamation can discard partial groups during the scan. Keep
+    // that shape on the ordinary evaluator until it also validates keys.
+    if (having_expr || plan.key_offsets.empty()) {
+      return plan;
+    }
+    std::vector<Column> key_columns;
+    for (const auto offset : plan.key_offsets) {
+      const auto& column = scan_schema.GetColumn(offset);
+      if (column.Type() != ValueType::kInt64 || column.IsUnsigned()) {
+        return plan;
+      }
+      key_columns.push_back(column);
+    }
+    const Schema key_schema("", std::move(key_columns));
+    for (const auto& key : dependent_keys) {
+      if (!key || ContainsParameterSlot(key)) {
+        return plan;
+      }
+      auto input = TryCompileTypedIntExpr(key, key_schema);
+      if (!input) {
+        return plan;
+      }
+      auto program = BytecodeCompiler::CompileRowCached(key, key_schema);
+      auto identity = ScalarExpressionCacheKey({key}, scan_schema);
+      if (!program || !identity) {
+        return plan;
+      }
+      plan.dependent_key_programs.push_back(std::move(*program));
+      plan.dependent_key_inputs.push_back(std::move(*input));
+      dependent_identities.push_back(std::move(*identity));
+    }
   }
   // WHERE: every conjunct must compile to context-free bytecode.
   static const bool filter_peek_disabled =
@@ -805,13 +924,26 @@ TypedAggregationPlan PlanTypedAggregation(
             all_plain = false;
           }
           for (const Expression& item : membership.list_) {
-            if (!all_plain || !item ||
-                item->Type() != TypeTag::kConstantValue) {
+            if (!all_plain || !item) {
               all_plain = false;
               break;
             }
-            const Value& item_value = item->AsConstantValue().GetValue();
-            if (item_value.IsNull() ||
+            // A negative literal is represented by unary minus. Fold other
+            // closed, deterministic constants too, but defer errors and all
+            // row-, parameter- or query-dependent expressions to the normal
+            // IN evaluator, which retains short-circuit semantics.
+            if (ContainsVolatileCall(item) || ContainsParameterSlot(item) ||
+                ContainsQuery(item) || !item->TouchedColumns().empty()) {
+              all_plain = false;
+              break;
+            }
+            auto folded = item->TryEvaluate(Row(), Schema());
+            if (!folded.HasValue()) {
+              all_plain = false;
+              break;
+            }
+            const Value& item_value = folded.Value();
+            if (item_value.IsNull() || item_value.IsUnsigned() ||
                 (!compiled.is_string && item_value.type != column_type)) {
               all_plain = false;
               break;
@@ -850,167 +982,38 @@ TypedAggregationPlan PlanTypedAggregation(
         }
       }
     }
-    if (peel_allowed && !peeled && predicate->Type() == TypeTag::kBinaryExp) {
-      // Column-vs-column compares of one numeric type evaluate positionally:
-      // a multi-million-row fold (Q21's l_receiptdate > l_commitdate) skips
-      // the per-row bytecode dispatch.  Such a compare can never raise, so
-      // the conjunct-order error semantics are unchanged.
-      const BinaryExpression& binary = predicate->AsBinaryExpression();
-      if (IsComparison(binary.Op()) &&
-          binary.Left()->Type() == TypeTag::kColumnValue &&
-          binary.Right()->Type() == TypeTag::kColumnValue) {
-        const auto left_offset = LocalColumnOffset(
-            scan_schema, binary.Left()->AsColumnValue().GetColumnName());
-        const auto right_offset = LocalColumnOffset(
-            scan_schema, binary.Right()->AsColumnValue().GetColumnName());
-        if (left_offset && right_offset) {
-          const Column& left_column =
-              scan_schema.GetColumn(static_cast<slot_t>(*left_offset));
-          const Column& right_column =
-              scan_schema.GetColumn(static_cast<slot_t>(*right_offset));
-          const ValueType left_type = left_column.Type();
-          if (!left_column.IsUnsigned() && !right_column.IsUnsigned() &&
-              left_type == right_column.Type() &&
-              (left_type == ValueType::kInt64 ||
-               left_type == ValueType::kDate ||
-               left_type == ValueType::kDouble)) {
-            plan.filter_compares.push_back(TypedFilterCompare{
-                .left = static_cast<slot_t>(*left_offset),
-                .right = static_cast<slot_t>(*right_offset),
-                .op = binary.Op(),
-                .is_double = left_type == ValueType::kDouble});
-            peeled = true;
-          }
+    if (peel_allowed && !peeled) {
+      auto compare = TryCompileTypedFilterCompare(predicate, scan_schema,
+                                                  !const_peek_disabled);
+      if (compare) {
+        plan.filter_compares.push_back(std::move(*compare));
+        peeled = true;
+      }
+    }
+    if (!peeled && peel_allowed && !const_peek_disabled &&
+        predicate->Type() == TypeTag::kBinaryExp &&
+        predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
+      const auto branches = SplitDisjuncts(predicate);
+      std::vector<std::vector<TypedFilterCompare>> disjunction;
+      bool supported = branches.size() <= 16;
+      for (const auto& branch : branches) {
+        if (!supported) {
+          break;
         }
-      } else if (IsComparison(binary.Op()) && !const_peek_disabled &&
-                 (binary.Left()->Type() == TypeTag::kColumnValue ||
-                  binary.Right()->Type() == TypeTag::kColumnValue)) {
-        // Column-vs-constant compares peel the same way after constant
-        // folding (Q1's `l_shipdate <= date_sub(date '1998-12-01',
-        // INTERVAL 74 day)` folds to a DATE constant).  Folding reuses the
-        // scan-filter path's rules, including the NOT-of-ordered-double
-        // suppression, so a peel never changes a NaN verdict.  A folding
-        // failure keeps the conjunct in bytecode exactly as before.
-        ExpressionRewriter rewriter(
-            ContainsNotOfOrderedDoubleComparison(predicate, scan_schema)
-                ? NotComparisonFreeRules()
-                : ExpressionRuleSet::Default());
-        rewriter.set_schema(&scan_schema);
-        StatusOr<Expression> folded_or = rewriter.TryRewrite(predicate);
-        if (folded_or.HasValue() && folded_or.Value() &&
-            folded_or.Value()->Type() == TypeTag::kBinaryExp) {
-          const BinaryExpression& folded =
-              folded_or.Value()->AsBinaryExpression();
-          if (IsComparison(folded.Op())) {
-            Expression column = folded.Left();
-            Expression constant = folded.Right();
-            BinaryOperation op = folded.Op();
-            auto try_fold_closed_constant = [](Expression* expr_ptr) {
-              const Expression& expr = *expr_ptr;
-              if (!expr || expr->Type() == TypeTag::kConstantValue ||
-                  expr->Type() == TypeTag::kColumnValue) {
-                return;
-              }
-              if (!ContainsVolatileCall(expr) && !ContainsParameterSlot(expr) &&
-                  !ContainsQuery(expr) && expr->TouchedColumns().empty()) {
-                StatusOr<Value> val = expr->TryEvaluate(Row(), Schema());
-                if (val.HasValue()) {
-                  *expr_ptr = ConstantValueExp(val.MoveValue());
-                }
-              }
-            };
-            try_fold_closed_constant(&column);
-            try_fold_closed_constant(&constant);
-            if (column->Type() == TypeTag::kConstantValue &&
-                constant->Type() == TypeTag::kColumnValue) {
-              std::swap(column, constant);
-              op = FlipTypedCompare(op);
-            }
-            if (column->Type() == TypeTag::kColumnValue &&
-                constant->Type() == TypeTag::kConstantValue) {
-              const auto offset = LocalColumnOffset(
-                  scan_schema, column->AsColumnValue().GetColumnName());
-              const Value& constant_value =
-                  constant->AsConstantValue().GetValue();
-              if (offset && !constant_value.IsNull()) {
-                const Column& column_object =
-                    scan_schema.GetColumn(static_cast<slot_t>(*offset));
-                const ValueType column_type = column_object.Type();
-                TypedFilterCompare compiled{
-                    .left = static_cast<slot_t>(*offset),
-                    .op = op,
-                    .constant_payload = true};
-                bool supported = false;
-                if (!column_object.IsUnsigned() &&
-                    (column_type == ValueType::kInt64 ||
-                     column_type == ValueType::kDate) &&
-                    constant_value.type == column_type) {
-                  compiled.is_double = false;
-                  compiled.int_constant = constant_value.value.int_value;
-                  supported = true;
-                } else if (!column_object.IsUnsigned() &&
-                           column_type == ValueType::kInt64 &&
-                           constant_value.type == ValueType::kDouble &&
-                           std::isfinite(constant_value.value.double_value) &&
-                           constant_value.value.double_value >=
-                               -static_cast<double>(int64_t{1} << 52) &&
-                           constant_value.value.double_value <=
-                               static_cast<double>(int64_t{1} << 52)) {
-                  const double d = constant_value.value.double_value;
-                  const auto fl = static_cast<int64_t>(std::floor(d));
-                  const auto cl = static_cast<int64_t>(std::ceil(d));
-                  if (fl == cl) {
-                    compiled.is_double = false;
-                    compiled.int_constant = fl;
-                    supported = true;
-                  } else if (op == BinaryOperation::kGreaterThan ||
-                             op == BinaryOperation::kGreaterThanEquals) {
-                    compiled.op = BinaryOperation::kGreaterThan;
-                    compiled.is_double = false;
-                    compiled.int_constant = fl;
-                    supported = true;
-                  } else if (op == BinaryOperation::kLessThan ||
-                             op == BinaryOperation::kLessThanEquals) {
-                    compiled.op = BinaryOperation::kLessThanEquals;
-                    compiled.is_double = false;
-                    compiled.int_constant = fl;
-                    supported = true;
-                  }
-                } else if (!column_object.IsUnsigned() &&
-                           column_type == ValueType::kDouble &&
-                           (constant_value.type == ValueType::kDouble ||
-                            (constant_value.type == ValueType::kInt64 &&
-                             !constant_value.IsUnsigned() &&
-                             constant_value.value.int_value >=
-                                 -(int64_t{1} << 53) &&
-                             constant_value.value.int_value <=
-                                 (int64_t{1} << 53)))) {
-                  compiled.is_double = true;
-                  compiled.double_constant =
-                      constant_value.type == ValueType::kDouble
-                          ? constant_value.value.double_value
-                          : static_cast<double>(constant_value.value.int_value);
-                  supported = true;
-                } else if (column_type == ValueType::kVarChar &&
-                           constant_value.type == ValueType::kVarChar &&
-                           !constant_value.IsCaseInsensitive() &&
-                           PlainStringComparable(
-                               constant_value.value.varchar_value) &&
-                           (op == BinaryOperation::kEquals ||
-                            op == BinaryOperation::kNotEquals)) {
-                  compiled.string_payload = true;
-                  compiled.string_constant =
-                      std::string(constant_value.value.varchar_value);
-                  supported = true;
-                }
-                if (supported) {
-                  plan.filter_compares.push_back(std::move(compiled));
-                  peeled = true;
-                }
-              }
-            }
+        std::vector<TypedFilterCompare> conjunction;
+        for (const auto& term : SplitConjuncts(branch)) {
+          auto compare = TryCompileTypedFilterCompare(term, scan_schema, true);
+          if (!compare) {
+            supported = false;
+            break;
           }
+          conjunction.push_back(std::move(*compare));
         }
+        disjunction.push_back(std::move(conjunction));
+      }
+      if (supported) {
+        plan.filter_disjunctions.push_back(std::move(disjunction));
+        peeled = true;
       }
     }
     if (!peeled) {
@@ -1047,7 +1050,36 @@ TypedAggregationPlan PlanTypedAggregation(
       plan.aggregates.push_back(std::move(input));
       continue;
     }
-    const Expression& child = aggregate->Child();
+    Expression child = aggregate->Child();
+    if (type == AggregationType::kAvg && !aggregate->Distinct() &&
+        child->Type() == TypeTag::kCastExp) {
+      const auto& cast = child->AsCastExpression();
+      // AVG already promotes each integer input to DOUBLE. Byte lengths
+      // have the same signed integer domain on every row, including NULL.
+      if (cast.TargetValueType() == ValueType::kDouble &&
+          cast.Child()->Type() == TypeTag::kFunctionCallExp) {
+        const auto& function = cast.Child()->AsFunctionCallExpression();
+        if ((function.FuncName() == "byte_length" ||
+             function.FuncName() == "octet_length" ||
+             function.FuncName() == "length") &&
+            function.Args().size() == 1) {
+          child = cast.Child();
+        }
+      }
+      if (cast.TargetValueType() == ValueType::kDouble &&
+          cast.Child()->Type() == TypeTag::kColumnValue) {
+        const auto offset = LocalColumnOffset(
+            scan_schema, cast.Child()->AsColumnValue().GetColumnName());
+        if (offset) {
+          const auto& column =
+              scan_schema.GetColumn(static_cast<size_t>(*offset));
+          if (!column.IsUnsigned() && (column.Type() == ValueType::kInt64 ||
+                                       column.Type() == ValueType::kDouble)) {
+            child = cast.Child();
+          }
+        }
+      }
+    }
     if (child->Type() == TypeTag::kColumnValue) {
       const auto offset = LocalColumnOffset(
           scan_schema, child->AsColumnValue().GetColumnName());
@@ -1085,14 +1117,20 @@ TypedAggregationPlan PlanTypedAggregation(
       std::optional<BytecodeProgram> compiled =
           BytecodeCompiler::CompileRowCached(child, scan_schema,
                                              BytecodeCompiler::Context::kValue);
-      if (!compiled.has_value() || compiled->ResultType() == ValueType::kNull) {
+      const bool dynamic_coalesce =
+          child->Type() == TypeTag::kFunctionCallExp &&
+          (child->AsFunctionCallExpression().FuncName() == "coalesce" ||
+           child->AsFunctionCallExpression().FuncName() == "ifnull");
+      if (!compiled.has_value() ||
+          (compiled->ResultType() == ValueType::kNull && !dynamic_coalesce)) {
         return plan;
       }
       // A SUM/AVG over a computed child must not land in the unsigned
       // inference path: only exact int64/double results qualify.
       if ((type == AggregationType::kSum || type == AggregationType::kAvg) &&
           compiled->ResultType() != ValueType::kInt64 &&
-          compiled->ResultType() != ValueType::kDouble) {
+          compiled->ResultType() != ValueType::kDouble &&
+          (!dynamic_coalesce || compiled->ResultType() != ValueType::kNull)) {
         return plan;
       }
       input.child = std::move(*compiled);
@@ -1144,7 +1182,7 @@ TypedAggregationPlan PlanTypedAggregation(
         kind = SlimAggKind::kSumDouble;
       }
     } else if (!distinct_free && type == AggregationType::kCount) {
-      // COUNT(DISTINCT ...) over an INT64/DATE input keeps the inline-slot
+      // COUNT(DISTINCT ...) over a numeric/DATE input keeps the inline-slot
       // slim layout (same 8-slot threshold as the generic accumulator).
       ValueType input_type = ValueType::kNull;
       if (input.column.has_value()) {
@@ -1157,6 +1195,8 @@ TypedAggregationPlan PlanTypedAggregation(
       }
       if (input_type == ValueType::kInt64 || input_type == ValueType::kDate) {
         kind = SlimAggKind::kCountDistinctInt64;
+      } else if (input_type == ValueType::kDouble) {
+        kind = SlimAggKind::kCountDistinctDouble;
       }
     }
     plan.slim_kinds.push_back(kind);
@@ -1166,11 +1206,39 @@ TypedAggregationPlan PlanTypedAggregation(
   // Classifies one output expression as a group-key column or a top-level
   // aggregate; `alias` names the select item it came from for ORDER BY
   // alias resolution (empty for direct select items).
-  const auto classify = [&](const Expression& expression,
-                            std::string_view alias,
+  const auto classify = [&](const Expression& original, std::string_view alias,
                             TypedEmitItem* item) -> bool {
-    if (!expression) {
+    if (!original) {
       return false;
+    }
+    Expression expression = original;
+    if ((original->Type() == TypeTag::kBinaryExp ||
+         original->Type() == TypeTag::kUnaryExp ||
+         original->Type() == TypeTag::kCaseExp) &&
+        !ContainsParameterSlot(original) && !ContainsAggregate(original)) {
+      // GROUPING SETS expansion creates constant arithmetic and CASE guards
+      // after the SQL rewrite pass. Fold only those constant rules here so
+      // their output can still use compact group-key/constant emission.
+      static const ExpressionRuleSet constant_rules = [] {
+        ExpressionRuleSet rules;
+        for (const auto& rule : ExpressionRuleSet::Default().Rules()) {
+          if (rule.Name() == "fold_binary" || rule.Name() == "fold_unary" ||
+              rule.Name() == "simplify_case") {
+            rules.Add(rule);
+          }
+        }
+        return rules;
+      }();
+      auto simplified = ExpressionRewriter(constant_rules).TryRewrite(original);
+      if (!simplified.HasValue()) {
+        return false;
+      }
+      expression = simplified.MoveValue();
+    }
+    if (expression->Type() == TypeTag::kConstantValue &&
+        !ContainsParameterSlot(expression)) {
+      item->constant = expression->AsConstantValue().GetValue();
+      return true;
     }
     if (!alias.empty() && expression->Type() == TypeTag::kAggregateExp) {
       const auto pos =
@@ -1209,6 +1277,17 @@ TypedAggregationPlan PlanTypedAggregation(
                               .index = static_cast<size_t>(std::distance(
                                   aggregate_expressions.begin(), pos))};
         return true;
+      }
+    }
+    if (!dependent_identities.empty()) {
+      const auto identity = ScalarExpressionCacheKey({expression}, scan_schema);
+      if (identity) {
+        const auto found = std::ranges::find(dependent_identities, *identity);
+        if (found != dependent_identities.end()) {
+          item->dependent_key = static_cast<size_t>(
+              std::distance(dependent_identities.begin(), found));
+          return true;
+        }
       }
     }
     return false;
@@ -1396,7 +1475,7 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
     return spec;
   };
   if (disabled || statement.Sources().size() < 2 || statement.Distinct() ||
-      statement.Having() || HasWindowFunctions(statement) ||
+      ContainsQuery(statement.Having()) || HasWindowFunctions(statement) ||
       StatementContainsVolatileFunction(statement)) {
     return bail("shape head");
   }
@@ -1433,20 +1512,15 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
     }
   }
   const auto matches_group_column = [&](const ColumnName& col) {
-    for (const Expression& key : statement.GroupBy()) {
+    return std::ranges::any_of(statement.GroupBy(), [&](const Expression& key) {
       if (!key || key->Type() != TypeTag::kColumnValue) {
-        continue;
+        return false;
       }
-      const ColumnName& gcol = key->AsColumnValue().GetColumnName();
-      if (!IdentifierEquals(gcol.name, col.name)) {
-        continue;
-      }
-      if (gcol.schema.empty() || col.schema.empty() ||
-          IdentifierEquals(gcol.schema, col.schema)) {
-        return true;
-      }
-    }
-    return false;
+      const ColumnName& group_column = key->AsColumnValue().GetColumnName();
+      return IdentifierEquals(group_column.name, col.name) &&
+             (group_column.schema.empty() || col.schema.empty() ||
+              IdentifierEquals(group_column.schema, col.schema));
+    });
   };
   const std::function<bool(const Expression&)> has_ungrouped_bare_col =
       [&](const Expression& expr) -> bool {
@@ -1466,23 +1540,41 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
       }
       return !matches_group_column(col);
     }
-    for (const Expression& child : ExpressionChildren(expr)) {
-      if (has_ungrouped_bare_col(child)) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(ExpressionChildren(expr),
+                               has_ungrouped_bare_col);
   };
   for (const NamedExpression& item : statement.SelectList()) {
     if (has_ungrouped_bare_col(item.expression)) {
       return bail("ungrouped bare column");
     }
   }
+  // Alias-dependent or context-specific HAVING forms keep the ordinary
+  // grouped evaluator. Comparisons and arithmetic over aggregate calls and
+  // explicit group keys need only the representative and aggregate map.
+  const std::function<bool(const Expression&)> simple_having =
+      [&](const Expression& expression) {
+        if (!expression || expression->Type() == TypeTag::kAggregateExp ||
+            expression->Type() == TypeTag::kConstantValue ||
+            expression->Type() == TypeTag::kColumnValue) {
+          return true;
+        }
+        if (expression->Type() != TypeTag::kBinaryExp &&
+            expression->Type() != TypeTag::kUnaryExp) {
+          return false;
+        }
+        return std::ranges::all_of(ExpressionChildren(expression),
+                                   simple_having);
+      };
+  if (has_ungrouped_bare_col(statement.Having()) ||
+      !simple_having(statement.Having())) {
+    return bail("having scope");
+  }
   std::vector<const AggregateExpression*> aggregates;
   std::unordered_set<const AggregateExpression*> seen;
   for (const NamedExpression& item : statement.SelectList()) {
     CollectAggregates(item.expression, &aggregates, &seen);
   }
+  CollectAggregates(statement.Having(), &aggregates, &seen);
   for (const AggregateExpression* aggregate : aggregates) {
     // Only mergeable streaming kinds fuse: the parallel build merges
     // thread-local accumulator states.  COUNT(DISTINCT plain column) merges
@@ -1568,9 +1660,15 @@ GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
           ConstantValueExp(Value(static_cast<int64_t>(position + 1)));
     }
   }
-  spec.group_keys.assign(statement.GroupBy().begin(),
-                         statement.GroupBy().end());
+  // GROUP BY () and the grand-total ROLLUP branch carry a synthetic
+  // constant key in the IR. Treat that marker as a keyless aggregate so an
+  // empty join still emits its single group before HAVING is evaluated.
+  if (!statement.IsGroupAll()) {
+    spec.group_keys.assign(statement.GroupBy().begin(),
+                           statement.GroupBy().end());
+  }
   spec.aggregates = std::move(aggregates);
+  spec.having = statement.Having();
   spec.count_star.reserve(spec.aggregates.size());
   for (const AggregateExpression* aggregate : spec.aggregates) {
     spec.count_star.push_back(IsCountStar(*aggregate));

@@ -7415,7 +7415,7 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
     uint8_t* const bmp = P.null_bmp.data();
     int64_t* const vals_p = (p_i64 || p_dbl) ? P.vals.data() : nullptr;
     uint64_t* const ubits_p = (p_i64 || p_dbl) ? P.ubits.data() : nullptr;
-    uint8_t* const hll = P.hll;
+    uint8_t* const hll = P.hll.data();
     auto& fm = col_freq[c];
     auto& xs = P.xorset;
     auto& ds = P.distinct;
@@ -7669,16 +7669,18 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
             bmp[i >> 3] = static_cast<uint8_t>(bmp[i >> 3] | (0x80 >> (i & 7)));
             has_null = true;
           }
-          const int64_t eraw = is_null ? 0 : static_cast<int64_t>(pay[i]);
-          mono = mono && (i == 0 || eraw >= prev);
-          prev = eraw;
-          emin = eraw < emin ? eraw : emin;
-          emax = eraw > emax ? eraw : emax;
-          if (ds.Find(eraw) == nullptr) {
-            ds.InsertNew(eraw, 0);
+          if (p_dbl) {
+            const int64_t eraw = is_null ? 0 : static_cast<int64_t>(pay[i]);
+            mono = mono && (i == 0 || eraw >= prev);
+            prev = eraw;
+            emin = eraw < emin ? eraw : emin;
+            emax = eraw > emax ? eraw : emax;
+            if (ds.Find(eraw) == nullptr) {
+              ds.InsertNew(eraw, 0);
+            }
+            vals_p[i] = eraw;
+            ubits_p[i] = static_cast<uint64_t>(eraw);
           }
-          vals_p[i] = eraw;
-          ubits_p[i] = static_cast<uint64_t>(eraw);
           if (!is_null) {
             mn = 0 < mn ? 0 : mn;
             mx = 0 > mx ? 0 : mx;
@@ -7812,7 +7814,7 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
       constexpr size_t kMask = (4 * kMaxIdxDistinct) - 1;
       std::array<uint32_t, kMaxIdxDistinct> fill{};
       uint16_t* const rows = csr.rows.data();
-      const uint32_t* const offs = csr.offsets;
+      const uint32_t* const offs = csr.offsets.data();
       // Columnar path: the key domain here is int64-or-null (a mistyped
       // cell already threw in the profile sweep above), so the raw payload
       // word IS the key and NULL joins key 0 exactly like the Row path.
@@ -9038,6 +9040,9 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
         (prune_cost -
          (s == Scheme::kPostings ? 0.0 : static_cast<double>(inv_bytes))) /
         m;
+    if (limit <= 0.0) {
+      return 0;
+    }
     if (!(limit < static_cast<double>(SIZE_MAX))) {
       return kNoEncodeBudget;
     }
@@ -9325,7 +9330,7 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
         }
         break;
       case Scheme::kPostings:
-        // int64 only; the structural gates (4 <= d <= 128, d <= n/8) are the
+        // int64 only; the structural gates (4 <= d <= 64, d <= n/8) are the
         // encoder's own and stay under force.
         if (!is_double && vals.size() > 1) {
           direct = EncPostingsI64(vals, kNoEncodeBudget, distinct_hint);
@@ -9957,6 +9962,14 @@ std::optional<EncodedBlock> EncodeInt64Block(Scheme scheme,
   if (values.empty() || values.size() > UINT32_MAX) {
     return std::nullopt;
   }
+  // These codecs were designed for physical row groups and may carry u16
+  // counts/positions internally. Until a codec certifies a wider envelope,
+  // decline large experimental blocks instead of emitting truncated headers.
+  if (values.size() > UINT16_MAX &&
+      (scheme != Scheme::kPlain && scheme != Scheme::kConst &&
+       scheme != Scheme::kRle)) {
+    return std::nullopt;
+  }
   const std::vector<int64_t> input(values.begin(), values.end());
   EncodedCol encoded;
   switch (scheme) {
@@ -10196,6 +10209,13 @@ std::optional<EncodedBlock> EncodeDoubleBitsBlock(
   if (values.empty() || values.size() > UINT32_MAX) {
     return std::nullopt;
   }
+  // These codecs were designed for physical row groups and may carry u16
+  // counts/positions internally. Until a codec certifies a wider envelope,
+  // decline large experimental blocks instead of emitting truncated headers.
+  if (values.size() > UINT16_MAX &&
+      (scheme != Scheme::kPlain && scheme != Scheme::kConst)) {
+    return std::nullopt;
+  }
   const std::vector<uint64_t> input(values.begin(), values.end());
   EncodedCol encoded;
   switch (scheme) {
@@ -10277,6 +10297,12 @@ std::optional<EncodedBlock> EncodeDoubleBitsBlock(
 std::optional<EncodedBlock> EncodeVarcharBlock(
     Scheme scheme, std::span<const std::string> values) {
   if (values.empty() || values.size() > UINT32_MAX) {
+    return std::nullopt;
+  }
+  // These codecs were designed for physical row groups and may carry u16
+  // counts/positions internally. Until a codec certifies a wider envelope,
+  // decline large experimental blocks instead of emitting truncated headers.
+  if (values.size() > UINT16_MAX && (scheme != Scheme::kPlain)) {
     return std::nullopt;
   }
   EncodedCol encoded;

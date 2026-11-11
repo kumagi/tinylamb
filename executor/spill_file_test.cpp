@@ -17,6 +17,20 @@
 
 namespace tinylamb {
 
+TEST(SpillFileTest, AuditSemanticValueTagsSurviveSpill) {
+  SpillFile spill;
+  const Row original({Value("2-0 0 0:0:0").WithInterval(),
+                      Value("A").WithCollation(2), Value(-1).WithUnsigned()});
+  ASSERT_SUCCESS(spill.Append(original));
+  ASSERT_SUCCESS(spill.FinishWriting());
+  ASSIGN_OR_ASSERT_FAIL(std::vector<Row>, rows, spill.ReadAllRows());
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_TRUE(rows[0][0].IsInterval());
+  EXPECT_EQ(rows[0][1].Collation(), 2);
+  EXPECT_TRUE(rows[0][2].IsUnsigned());
+  EXPECT_EQ(rows[0], original);
+}
+
 TEST(SpillFileTest, Append_MultipleRows_ReadsAllRowsCorrectly) {
   SpillFile spill;
   ASSERT_SUCCESS(spill.Append(Row({Value(1), Value("a")})));

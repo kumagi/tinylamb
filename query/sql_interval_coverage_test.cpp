@@ -80,44 +80,47 @@ class SqlIntervalCoverageTest : public ::testing::Test {
 };
 
 TEST_F(SqlIntervalCoverageTest, SingleUnitForms) {
-  ExpectScalar("SELECT INTERVAL '1' YEAR", Value(std::string("1 year")));
-  ExpectScalar("SELECT INTERVAL '2' MONTH", Value(std::string("2 month")));
-  ExpectScalar("SELECT INTERVAL '5' DAY", Value(std::string("5 day")));
-  ExpectScalar("SELECT INTERVAL '6' HOUR", Value(std::string("6 hour")));
-  ExpectScalar("SELECT INTERVAL '7' MINUTE", Value(std::string("7 minute")));
-  ExpectScalar("SELECT INTERVAL '8' SECOND", Value(std::string("8 second")));
+  ExpectScalar("SELECT INTERVAL '1' YEAR", Value("1-0 0 0:0:0").WithInterval());
+  ExpectScalar("SELECT INTERVAL '2' MONTH",
+               Value("0-2 0 0:0:0").WithInterval());
+  ExpectScalar("SELECT INTERVAL '5' DAY", Value("0-0 5 0:0:0").WithInterval());
+  ExpectScalar("SELECT INTERVAL '6' HOUR", Value("0-0 0 6:0:0").WithInterval());
+  ExpectScalar("SELECT INTERVAL '7' MINUTE",
+               Value("0-0 0 0:7:0").WithInterval());
+  ExpectScalar("SELECT INTERVAL '8' SECOND",
+               Value("0-0 0 0:0:8").WithInterval());
 }
 
 TEST_F(SqlIntervalCoverageTest, CompoundUnitForms) {
   ExpectScalar("SELECT INTERVAL '1-2' YEAR TO MONTH",
-               Value(std::string("1 year to month")));
+               Value("1-2 0 0:0:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '1 2:3:4' DAY TO SECOND",
-               Value(std::string("1 day to second")));
+               Value("0-0 1 2:3:4").WithInterval());
   ExpectScalar("SELECT INTERVAL '3:4' HOUR TO MINUTE",
-               Value(std::string("3 hour to minute")));
+               Value("0-0 0 3:4:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '4:5:6.789' HOUR TO SECOND",
-               Value(std::string("4 hour to second")));
+               Value("0-0 0 4:5:6.789").WithInterval());
   ExpectScalar("SELECT INTERVAL '2 3' DAY TO HOUR",
-               Value(std::string("2 day to hour")));
+               Value("0-0 2 3:0:0").WithInterval());
 }
 
 TEST_F(SqlIntervalCoverageTest, IntervalArithmetic) {
   ExpectScalar("SELECT INTERVAL '1' DAY + INTERVAL '2' HOUR",
-               Value(std::string("1 day2 hour")));
+               Value("0-0 1 2:0:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '1-2' YEAR TO MONTH + INTERVAL '3' MONTH",
-               Value(std::string("1 year to month3 month")));
+               Value("1-5 0 0:0:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '1' SECOND + INTERVAL '0.5' SECOND",
-               Value(std::string("1 second0 second")));
+               Value("0-0 0 0:0:1.5").WithInterval());
   ExpectScalar("SELECT make_interval(1, 2, 3, 4)",
-               Value(std::string("0-0 1 0:0:0")));
+               Value("0-0 1 0:0:0").WithInterval());
 }
 
 TEST_F(SqlIntervalCoverageTest, LenientAndExtremeComponents) {
   // Malformed components fall back to zero instead of erroring.
-  ExpectScalar("SELECT INTERVAL 'xx' DAY", Value(std::string("0 day")));
+  ExpectScalar("SELECT INTERVAL 'xx' DAY", Value("0-0 0 0:0:0").WithInterval());
   // Huge year counts parse without overflowing the month accumulator.
   ExpectScalar("SELECT INTERVAL '9999999999999' YEAR",
-               Value(std::string("9999999999999 year")));
+               Value("9999999999999-0 0 0:0:0").WithInterval());
 }
 
 }  // namespace tinylamb

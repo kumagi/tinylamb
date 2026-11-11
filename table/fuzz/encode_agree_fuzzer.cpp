@@ -189,7 +189,7 @@ int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
   PaxChunk chunk;
   {
     ForceGuard guard(force);
-    chunk = PaxChunk::BuildFromSortedRun(MakeRun(rows, sc), sc);
+    chunk = PaxChunk::BuildFromSortedRun(MakeRun(rows, sc), sc).MoveValue();
   }
 
   const Status v = PaxChunk::ValidateChunkBytes(chunk.Data());

@@ -13,6 +13,7 @@
 
 #include <regex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/status_or.hpp"
@@ -86,6 +87,113 @@ TEST(RegexGuardCompileTest, RejectsMalformedPatternsWithOneError) {
   EXPECT_FALSE(malformed.HasValue());
   EXPECT_NE(malformed.GetStatus().GetMessage().find("invalid regular"),
             std::string::npos);
+}
+
+TEST(RegexGuardCompileTest, CachedPatternsKeepIndependentPrograms) {
+  for (int pass = 0; pass < 3; ++pass) {
+    for (int i = 0; i < 20; ++i) {
+      const std::string pattern = "prefix" + std::to_string(i) + "$";
+      auto result = CompileCheckedRegex(pattern);
+      ASSERT_TRUE(result.HasValue());
+      const std::regex& compiled = result.Value();
+      EXPECT_TRUE(std::regex_match("prefix" + std::to_string(i), compiled));
+    }
+  }
+  EXPECT_FALSE(CompileCheckedRegex("(a+)+").HasValue());
+}
+
+TEST(RegexGuardCompileTest, ReplacementUsesGoogleSqlCaptures) {
+  auto captured =
+      ReplaceCheckedRegex("abc123def", "([a-z]+)([0-9]+)", R"(\2-\1-\0)");
+  ASSERT_TRUE(captured.HasValue());
+  EXPECT_EQ(captured.Value(), "123-abc-abc123def");
+  auto followed_by_digit = ReplaceCheckedRegex("x", "(x)", R"(\19)");
+  ASSERT_TRUE(followed_by_digit.HasValue());
+  EXPECT_EQ(followed_by_digit.Value(), "x9");
+  auto literal = ReplaceCheckedRegex("x", "(x)", R"($1&\\)");
+  ASSERT_TRUE(literal.HasValue());
+  EXPECT_EQ(literal.Value(), "$1&\\");
+  EXPECT_FALSE(ReplaceCheckedRegex("x", "(x)", R"(\2)").HasValue());
+  EXPECT_FALSE(ReplaceCheckedRegex("x", "(x)", "\\").HasValue());
+}
+
+TEST(RegexGuardCompileTest, ReplacementMatchesReferenceForByteAndEmptyMatches) {
+  const std::vector<std::string> patterns{
+      "a*",      "(a|b)+", "[^/]+", "^.*$",        R"(\s+)", R"([\s\S]*)",
+      R"(a\.b)", "^a$",    "a|",    "[[:space:]]", "(a)?b"};
+  const std::vector<std::string> inputs{
+      "", "a", "ab", "a.b", "aaab", "a\nb", "a\rb", "a\vb", "a\n", "日本語"};
+  for (const auto& pattern : patterns) {
+    for (const auto& input : inputs) {
+      SCOPED_TRACE(pattern);
+      SCOPED_TRACE(input);
+      auto result = ReplaceCheckedRegex(input, pattern, "replacement");
+      ASSERT_TRUE(result.HasValue());
+      EXPECT_EQ(result.Value(),
+                std::regex_replace(input, std::regex(pattern), "replacement"));
+    }
+  }
+}
+
+TEST(RegexGuardCompileTest, ReplacementViewsRespectBoundsAndCacheOwnership) {
+  std::string input("p:a\0b:s", 7);
+  std::string pattern = "!(a)?";
+  std::string replacement = R"(!\1$?)";
+  const auto run = [&] {
+    return ReplaceCheckedRegex(std::string_view(input).substr(2, 3),
+                               std::string_view(pattern).substr(1, 3),
+                               std::string_view(replacement).substr(1, 3));
+  };
+  for (int pass = 0; pass < 2; ++pass) {
+    auto result = run();
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value(), std::string("a$\0b", 4));
+  }
+  // All cache keys must own their bytes after the input views expire or change.
+  pattern = "!(b)?";
+  replacement = R"(!$\1?)";
+  auto changed = run();
+  ASSERT_TRUE(changed.HasValue());
+  EXPECT_EQ(changed.Value(), std::string("a\0$b", 4));
+  auto previous = ReplaceCheckedRegex("a", "(a)", R"(\1$)");
+  ASSERT_TRUE(previous.HasValue());
+  EXPECT_EQ(previous.Value(), "a$");
+  auto empty = ReplaceCheckedRegex({}, {}, "x");
+  ASSERT_TRUE(empty.HasValue());
+  EXPECT_EQ(empty.Value(), "x");
+  auto nul_pattern = ReplaceCheckedRegex(std::string_view(input).substr(2, 3),
+                                         std::string_view("\0", 1), "_");
+  ASSERT_TRUE(nul_pattern.HasValue());
+  EXPECT_EQ(nul_pattern.Value(), "a_b");
+}
+
+TEST(RegexGuardCompileTest, ReplacementProgramsKeepKeysAndUncachedLimits) {
+  for (int pass = 0; pass < 3; ++pass) {
+    for (int i = 0; i < 20; ++i) {
+      const std::string suffix = std::to_string(i);
+      auto result = ReplaceCheckedRegex("v", "(v)", R"(\1)" + suffix);
+      ASSERT_TRUE(result.HasValue());
+      EXPECT_EQ(result.Value(), "v" + suffix);
+    }
+    auto two = ReplaceCheckedRegex("vw", "(v)(w)", R"(\2)");
+    ASSERT_TRUE(two.HasValue());
+    EXPECT_EQ(two.Value(), "w");
+    EXPECT_FALSE(ReplaceCheckedRegex("v", "(v)", R"(\2)").HasValue());
+    EXPECT_FALSE(ReplaceCheckedRegex("v", "(v)", R"(\a)").HasValue());
+    const auto rejected = ReplaceCheckedRegex("v", "(v+)+", R"(\a)");
+    EXPECT_NE(rejected.GetStatus().GetMessage().find("nested repetition"),
+              std::string::npos);
+    const std::string large_replacement = std::string(4097, 'x') + "$";
+    auto large = ReplaceCheckedRegex("v", "(v)", large_replacement);
+    ASSERT_TRUE(large.HasValue());
+    EXPECT_EQ(large.Value(), large_replacement);
+    // One large character class exercises an uncached pattern without deep
+    // recursive regex syntax. Neither size limit may change the result.
+    auto long_pattern =
+        ReplaceCheckedRegex("a", "[" + std::string(4096, 'a') + "]", "z");
+    ASSERT_TRUE(long_pattern.HasValue());
+    EXPECT_EQ(long_pattern.Value(), "z");
+  }
 }
 
 }  // namespace tinylamb

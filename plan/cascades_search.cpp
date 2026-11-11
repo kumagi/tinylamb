@@ -787,7 +787,7 @@ std::string PhysicalProperties::Key() const {
     key.push_back('|');
     key.append(ordering[i].ToString());
     key.push_back(':');
-    key.push_back(i < sort_ascending.size() && sort_ascending[i] ? 'a' : 'd');
+    key.push_back(i >= sort_ascending.size() || sort_ascending[i] ? 'a' : 'd');
     key.push_back(i < sort_nulls_first.size() ? ':' : '=');
     const std::optional<bool>& nulls_first =
         i < sort_nulls_first.size() ? sort_nulls_first[i] : std::nullopt;

@@ -184,14 +184,17 @@ IndexScanIterator::IndexScanIterator(
     status_ = iter_.GetStatus();
     return;
   }
-  // A complete equality seek reads one key: copying its neighbours would
-  // add work to every OLTP lookup. Prefix/range walks amortize the snapshot.
+  // LSM construction already took a transaction-filtered snapshot. Ordinary
+  // point reads must use it too: rereading the live memtable exposes foreign
+  // pending updates/deletes. Heap-image caching is still range-only.
   const bool exact_point =
       begin_key.size() == index.sc_.key_.size() && begin_key == end_key;
+  if (!resolve_head_) {
+    iter_.EnableStableLeafCache();
+  }
   if (!resolve_head_ && !exact_point &&
       (index_read_lock_.HoldsLock() ||
        ((index_read_guard != nullptr) && index_read_guard->HoldsLock()))) {
-    iter_.EnableStableLeafCache();
     cache_heap_images_ = txn_.IsReadOnly();
   }
   UpdateIteratorState();
@@ -461,9 +464,16 @@ void IndexScanIterator::DecodeVisibleRow(std::string_view image) const {
     image = visible.Value();
   }
   for (const IntegerPeekCompare& peek : integer_peeks_) {
-    const auto value = Row::TryPeekInteger(
+    const auto peeked = Row::TryPeekInteger(
         image.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
         table_.schema_, peek.column);
+    if (!peeked.HasValue()) {
+      const_cast<IndexScanIterator*>(this)->status_ = peeked.GetStatus();
+      const_cast<IndexScanIterator*>(this)->Clear();
+      current_row_.Clear();
+      return;
+    }
+    const auto value = peeked.Value();
     if (!value || !MatchIntegerCompare(*value, peek.op, peek.constant)) {
       current_row_.Clear();
       return;

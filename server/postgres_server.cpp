@@ -178,10 +178,18 @@ std::string_view StripLeadingComments(std::string_view sql) {
     }
     if (pos + 1 < sql.size() && sql[pos] == '/' && sql[pos + 1] == '*') {
       pos += 2;
-      while (pos + 1 < sql.size() && (sql[pos] != '*' || sql[pos + 1] != '/')) {
-        ++pos;
+      size_t depth = 1;
+      while (pos < sql.size() && depth != 0) {
+        if (sql.substr(pos, 2) == "/*") {
+          ++depth;
+          pos += 2;
+        } else if (sql.substr(pos, 2) == "*/") {
+          --depth;
+          pos += 2;
+        } else {
+          ++pos;
+        }
       }
-      pos = std::min(sql.size(), pos + 2);
       continue;
     }
     return sql.substr(std::min(pos, sql.size()));
@@ -274,9 +282,10 @@ class PostgresServer::Impl {
       startup_error_ = "failed to open database " + database_path + ": " +
                        ToString(created.GetStatus());
     }
-    read_worker_count_ = options_.read_worker_threads;
+    constexpr size_t kMaxReadWorkers = 16;
+    read_worker_count_ =
+        std::min(options_.read_worker_threads, kMaxReadWorkers);
     if (read_worker_count_ == 0) {
-      constexpr size_t kMaxReadWorkers = 16;
       read_worker_count_ =
           std::min(kMaxReadWorkers,
                    std::max<size_t>(1, std::thread::hardware_concurrency()));
@@ -377,7 +386,7 @@ class PostgresServer::Impl {
     // Reserve one descriptor so AcceptClients() can still drain the
     // listener when the process hits EMFILE/ENFILE (level-triggered epoll
     // would otherwise spin forever on the readable listener).
-#if defined(TINYLAMB_OS_POSIX)
+#ifdef TINYLAMB_OS_POSIX
     reserve_fd_ = platform::OpenFile("/dev/null", {});
 #endif
     // Authentication is a stub: every connecting user is trusted. Warn when
@@ -400,6 +409,7 @@ class PostgresServer::Impl {
     ScopedIoCpuAffinity affinity;
     io_cpu_ = affinity.Cpu();
     std::array<platform::PollResult, 64> events{};
+    auto listener_retry_at = std::chrono::steady_clock::now();
     while (!stopping_.load()) {
       // Bounded wait so the idle-connection sweep below keeps running even
       // when no events arrive.
@@ -447,6 +457,14 @@ class PostgresServer::Impl {
         }
       }
       SweepIdleClients();
+      if (listener_shed_due_to_fd_pressure_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= listener_retry_at) {
+          listener_retry_at =
+              now + std::chrono::milliseconds(kIdleSweepIntervalMs);
+          AcceptClients();
+        }
+      }
       EmitMetrics();
     }
     StopReadWorkers();
@@ -643,7 +661,7 @@ class PostgresServer::Impl {
   }
 
   void AcceptClients() {
-#if defined(TINYLAMB_OS_POSIX)
+#ifdef TINYLAMB_OS_POSIX
     // A previous EMFILE shed removed the listener from epoll; try to restore
     // the reserve descriptor (and the epoll registration) before accepting.
     if (listener_shed_due_to_fd_pressure_) {
@@ -667,7 +685,7 @@ class PostgresServer::Impl {
       const int fd = platform::AcceptSocket(
           listener_fd_, {.nonblocking = true, .close_on_exec = true});
       if (fd < 0) {
-#if defined(TINYLAMB_OS_POSIX)
+#ifdef TINYLAMB_OS_POSIX
         if ((errno == EMFILE || errno == ENFILE) && reserve_fd_ >= 0) {
           // Descriptor exhaustion: the level-triggered listener stays
           // readable and would spin forever. Consume (and shed) one pending
@@ -686,8 +704,8 @@ class PostgresServer::Impl {
           if (reserve_fd_ < 0) {
             // Without a reserve descriptor the next EMFILE accept would spin
             // the level-triggered loop. Shed the listener from epoll until a
-            // future AcceptClients call restores the reserve: the cost is a
-            // delayed accept, not a busy loop.
+            // timed event-loop retry restores the reserve. The retry must
+            // not depend on readability of the now-unregistered listener.
             (void)poller_.Remove(listener_fd_);
             listener_shed_due_to_fd_pressure_ = true;
           }
@@ -1063,7 +1081,8 @@ class PostgresServer::Impl {
     Queue(client, pgwire::ParameterStatus("client_encoding", "UTF8"));
     Queue(client, pgwire::ParameterStatus("DateStyle", "ISO, MDY"));
     Queue(client, pgwire::ParameterStatus("integer_datetimes", "on"));
-    Queue(client, pgwire::ParameterStatus("standard_conforming_strings", "on"));
+    Queue(client,
+          pgwire::ParameterStatus("standard_conforming_strings", "off"));
     Queue(client, pgwire::ParameterStatus("TimeZone", "UTC"));
     Queue(client,
           pgwire::BackendKeyData(static_cast<uint32_t>(platform::GetPid()),
@@ -1243,12 +1262,16 @@ class PostgresServer::Impl {
     // COMMIT/ROLLBACK finalize it, so `UPDATE ...; ROLLBACK` in one message
     // really undoes the UPDATE.
     std::unique_ptr<TransactionContext> implicit;
-    if (client.transaction == nullptr && client.transaction_status != 'E') {
-      implicit =
-          std::make_unique<TransactionContext>(database_->BeginContext());
-    }
     bool ok = true;
     for (const std::string& statement : statements) {
+      // COMMIT/ROLLBACK ends the previous block, but the remaining statements
+      // still share a new implicit block until the message ends or another
+      // transaction-control statement consumes it.
+      if (!implicit && client.transaction == nullptr &&
+          client.transaction_status != 'E') {
+        implicit =
+            std::make_unique<TransactionContext>(database_->BeginContext());
+      }
       if (RegistersTempObject(statement)) {
         client.session_has_temp_objects = true;
       }

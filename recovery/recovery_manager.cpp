@@ -288,8 +288,14 @@ std::optional<lsn_t> RecoveryManager::PreRollPaddingEnd(
     at += read.bytes;
   }
   if (SegmentFdFor(boundary) == nullptr) {
+    // A legacy roll pads the current file before creating its successor.
+    // A crash between those writes leaves a zero suffix in the last file,
+    // not a hole in the retained WAL. A later file still proves a hole.
+    bool any = false;
+    const auto highest = Logger::FindHighestSegment(log_name_, &any);
     if (missing_successor != nullptr) {
-      *missing_successor = true;
+      *missing_successor =
+          !highest.HasValue() || !any || highest.Value() != segment;
     }
     return std::nullopt;
   }
@@ -435,8 +441,7 @@ RecoveryManager::TailDamage RecoveryManager::ClassifyTailDamage(
         (static_cast<lsn_t>(Logger::SegmentIndex(valid_end, segment_size_)) +
          1) *
         static_cast<lsn_t>(segment_size_);
-    return on_disk >= segment_end ? TailDamage::kSuspect
-                                  : TailDamage::kZeroTail;
+    return on_disk > segment_end ? TailDamage::kSuspect : TailDamage::kZeroTail;
   }
 
   LogRecord probe_record;

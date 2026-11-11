@@ -31,9 +31,11 @@ struct SqlScalarFunction {
 
   [[nodiscard]] size_t RequiredArgs() const {
     size_t required = 0;
-    for (const Expression& default_value : defaults) {
-      if (!default_value) {
-        ++required;
+    // Positional arguments may omit only a suffix consisting of defaults.
+    // Missing metadata denotes a required parameter as well.
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (i >= defaults.size() || !defaults[i]) {
+        required = i + 1;
       }
     }
     return required;
@@ -51,7 +53,7 @@ void RegisterSqlScalarFunction(SqlScalarFunction function);
 // Binds evaluated argument values to the parameter names of `function`,
 // producing the synthetic single-row scope the body evaluates against.
 // Trailing parameters with DEFAULT expressions are padded; wrong argument
-// counts raise std::runtime_error.
+// counts return InvalidArgument.
 struct SqlUdfBinding {
   Row row;
   Schema schema;

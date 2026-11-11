@@ -20,9 +20,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/endian.hpp"
 #include "common/runtime_filter.hpp"
 #include "page/row_position.hpp"
 #include "table/fragment/fragment.hpp"
@@ -48,6 +51,23 @@ struct LSTableColumnDictionary {
   static constexpr uint8_t kNullCode = 0xFFU;
   static constexpr size_t kMaxEntries = 254;
   bool active{false};
+  // Own the 8-bit stream once per column; page blocks borrow subspans.
+  std::vector<uint8_t> narrow_codes;
+  // Wide shared dictionaries own a contiguous code stream in physical
+  // block/row order. Page blocks keep offsets into this owner. The logical
+  // lane width is 2/4 bytes; packed_code_bits can override the storage width.
+  // active remains false: the 8-bit dictionary kernels have 256-entry masks.
+  uint8_t wide_code_bytes{0};
+  std::vector<uint8_t> wide_codes;
+  // Integer dictionaries can pack each code into its exact bit width. The
+  // logical 2/4-byte lane width above still classifies the domain. Packed
+  // streams are little-endian and have seven zero padding bytes for a safe
+  // unaligned 64-bit read at the final row. NULL uses int_entries.size().
+  uint8_t packed_code_bits{0};
+  size_t packed_code_count{0};
+  // True only after every distinct byte string has been checked against
+  // Value equality. Interval-equivalent spellings otherwise remain peers.
+  bool bytewise_equality{false};
   bool all_single_byte{false};
   ValueType value_type{ValueType::kVarChar};
   std::vector<std::string> entries;
@@ -56,6 +76,40 @@ struct LSTableColumnDictionary {
   std::vector<double> one_minus_double_entries;
   std::vector<double> one_plus_double_entries;
   std::array<uint8_t, 256> single_byte_chars{};
+
+  [[nodiscard]] size_t DictionaryCodeCount() const noexcept {
+    if (active) {
+      return narrow_codes.size();
+    }
+    return packed_code_bits != 0  ? packed_code_count
+           : wide_code_bytes != 0 ? wide_codes.size() / wide_code_bytes
+                                  : 0;
+  }
+
+  [[nodiscard]] uint32_t DictionaryCodeAt(size_t row) const noexcept {
+    if (row >= DictionaryCodeCount()) {
+      return UINT32_MAX;
+    }
+    if (active) {
+      return narrow_codes[row];
+    }
+    if (packed_code_bits != 0) {
+      const size_t bit = row * packed_code_bits;
+      uint64_t word = 0;
+      std::memcpy(&word, wide_codes.data() + (bit / 8), sizeof(word));
+      return static_cast<uint32_t>((le64toh(word) >> (bit % 8)) &
+                                   ((uint64_t{1} << packed_code_bits) - 1));
+    }
+    const auto* data = wide_codes.data() + (row * wide_code_bytes);
+    if (wide_code_bytes == 2) {
+      uint16_t code = 0;
+      std::memcpy(&code, data, sizeof(code));
+      return code;
+    }
+    uint32_t code = 0;
+    std::memcpy(&code, data, sizeof(code));
+    return code;
+  }
 };
 
 struct LSTableColumnBlock {
@@ -64,6 +118,7 @@ struct LSTableColumnBlock {
   bool has_null{false};
   bool has_min_max{false};
   bool has_double_min_max{false};
+  bool has_nan{false};
   bool all_single_byte_varchar{false};
   uint8_t for_width{0};
   int64_t for_base{0};
@@ -72,10 +127,12 @@ struct LSTableColumnBlock {
   double min_double{std::numeric_limits<double>::infinity()};
   double max_double{-std::numeric_limits<double>::infinity()};
   const LSTableColumnDictionary* dict{nullptr};
+  size_t wide_code_begin{0};
+  size_t wide_code_count{0};
   std::array<uint64_t, 4> dict_mask{};
-  std::vector<uint8_t> dict_codes;
+  std::span<const uint8_t> dict_codes;
   std::vector<uint16_t> for16_codes;
-  std::vector<int64_t> int_cells;
+  std::span<const int64_t> int_cells;
   std::vector<uint8_t> varchar_bytes;
   std::vector<uint32_t> varchar_ends;
   std::vector<uint8_t> nulls;
@@ -85,6 +142,11 @@ struct LSTableColumnBlock {
   }
 
   [[nodiscard]] std::string_view VarcharAt(size_t row) const noexcept {
+    if (dict != nullptr && dict->wide_code_bytes != 0) {
+      const uint32_t code = DictionaryCodeAt(row);
+      return code < dict->entries.size() ? std::string_view(dict->entries[code])
+                                         : std::string_view{};
+    }
     if (dict != nullptr && dict->active) {
       if (row >= dict_codes.size()) {
         return {};
@@ -105,6 +167,13 @@ struct LSTableColumnBlock {
     }
     return {reinterpret_cast<const char*>(varchar_bytes.data()) + begin,
             end - begin};
+  }
+
+  [[nodiscard]] uint32_t DictionaryCodeAt(size_t row) const noexcept {
+    if (dict == nullptr || row >= wide_code_count) {
+      return UINT32_MAX;
+    }
+    return dict->DictionaryCodeAt(wide_code_begin + row);
   }
 };
 
@@ -134,6 +203,14 @@ struct LSTableStore {
   std::vector<uint32_t> flat_page_to_block;
   std::unordered_map<page_id_t, size_t> page_to_block;
   std::vector<LSTableColumnDictionary> dictionaries;
+  // Numeric cells are owned once per column in physical row order. Page
+  // blocks borrow slices only after construction has finished growing these
+  // buffers. VARCHAR columns have empty entries here.
+  std::vector<std::vector<int64_t>> integer_columns;
+  // Immutable column membership synopses, valid under the same generation
+  // and snapshot checks as the encoded blocks. A positive probe is only a
+  // candidate; it never substitutes for the row predicate.
+  std::vector<std::shared_ptr<const BloomRuntimeFilter>> integer_membership;
   std::vector<uint8_t> column_is_monotonic;
   std::vector<uint8_t> column_is_unique_nonnull;
   std::vector<uint8_t> column_is_identity_1_to_n;
@@ -160,6 +237,14 @@ struct LSTableStore {
   }
 
   [[nodiscard]] static bool SupportsSchema(const Schema& schema) noexcept;
+
+  [[nodiscard]] bool MayContainInteger(slot_t column, int64_t value) const {
+    if (column >= integer_membership.size()) {
+      return true;
+    }
+    const auto& membership = integer_membership[column];
+    return !membership || !membership->Reject(value);
+  }
 };
 
 [[nodiscard]] std::shared_ptr<const LSTableStore> BuildLSTableStore(

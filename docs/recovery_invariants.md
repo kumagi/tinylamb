@@ -1,176 +1,108 @@
 # Recovery invariants
 
-After crash or `Database::EmulateCrash()` + reopen:
+Current implementation, verified against the source on 2026-11-11.
 
-1. **Committed transactions** are visible; **aborted** or **in-flight** work is
-   rolled back.
-   Abort chains carry the same terminator record recovery classifies commits
-   by (`LogType::kCommit`), so `TransactionManager::Abort` appends it only
-   after the undo walk compensated the whole chain. Every CLR records the
-   original record's `prev_lsn` as its undo-next pointer, so a crash during a
-   multi-step abort resumes at the first uncompensated predecessor. A partially compensated
-   chain stays un-terminated and is finished by the restart loser-undo
-   (idempotent through the `page_lsn` guard in `UndoLoserChains`); appending
-   the terminator unconditionally would resurrect the uncompensated tail as
-   committed data.
-2. **Page LSN** on disk ≤ **CommittedLSN** for durable commits.
-3. **Checksum** validates every page read from disk; corrupt pages fail closed.
-4. **Compaction-driven `<dbname>.db` snapshot** stores `begin_lsn`, the dirty-page
-   table (DPT), and the active-transaction table (ATT); replay starts from
-   `min(begin_lsn, min_dpt_rec_lsn, min_att_first_lsn)` (or LSN 0 when no
-   `<dbname>.db` exists yet).
-5. **Catalog** table/index metadata matches row pages after redo completes.
-6. **Recycled WAL never holds a needed record**: after a durable checkpoint
-    the log is truncated by whole segments (see `docs/wal_format.md`), and
-    every consumer -- redo from the DPT, loser-chain undo, torn-tail
-    truncation, runtime abort walks -- stays at or above the retained start
-    because the recycle floor is the minimum over (checkpoint begin LSN,
-    oldest DPT recLSN, oldest active transaction's first LSN, oldest
-    unsynced full-page image). Each checkpoint also flushes stale dirty
-    pages (oldest recLSN first, time-budgeted) so the oldest-DPT-recLSN
-    component actually advances under sustained load. The allocator meta page
-    is synchronously flushed outside that budget before the master record is
-    published; a failed meta flush aborts the checkpoint without recycling.
-    `SyncDataFile` retires only images whose pwrite completed before the
-    sync began: emitting, in-flight, and failed writes remain pending, and a
-    later successful pwrite plus sync is required for retirement. A torn
-    data-file page rebuilds from its retained `kFullPageImage` record plus
-    the deltas above it.
+## Persistence and visibility
 
-## Idempotent redo/undo (D2, `docs/design.md`)
+1. Restart loads committed snapshot state and replays records only for owners
+   with a valid `kCommit` in the retained WAL scan. Aborted and unfinished
+   transactions are not replayed. A synchronous successful commit must survive;
+   asynchronous commits can be lost before their WAL becomes durable.
+2. `BufferedLSN` is the appended end, `CommittedLSN` is the written end, and
+   `DurableLSN` is the synced end. Only `WaitForDurable` / `DurableLSN` proves
+   durability. Publishing MVCC versions and acknowledging a commit are separate
+   steps; see [commit durability](commit_durability.md).
+3. `CheckpointManager::WriteCheckpoint` captures the current buffered end and
+   the oldest active transaction's first LSN under the transaction registry and
+   per-transaction chain locks. Its replay anchor is their minimum (the buffered
+   end when no active transaction has logged).
+4. Before writing the snapshot, the checkpoint manager waits for the WAL's
+   captured durable target. `PageManager::WriteFuzzyCheckpoint` serializes
+   committed block slots/link stamps, free page IDs, committed LSM entries,
+   allocator high-water mark, transaction-ID high-water mark and replay anchor.
+   There is no persisted dirty-page table or active-transaction table.
+5. `<db>.db` starts with `TLSMCKP1`, snapshot version 2, and ends with CRC32C.
+   Loading checks the checksum, field bounds and complete consumption. Corrupt
+   input must fail with a status rather than exposing partially decoded data to
+   queries. Snapshot writes use a temporary file, data sync and atomic rename.
+6. WAL recycling follows successful snapshot publication and only removes whole
+   segments below the replay anchor. The logger also checks retained segment
+   boundaries so a legacy straddling record does not lose its head. Active
+   transactions can pin WAL indefinitely. No DPT, full-page-image retention
+   term, or `TINYLAMB_WAL_RETENTION_WARN_BYTES` warning is implemented.
+7. Catalog and row/index state are recovered through the same committed-record
+   filter. A snapshot with missing WAL, an anchor below the retained start, or a
+   recycled WAL prefix without an anchor is rejected as corrupt.
 
-Recovery may apply the same log more than once: a loser UNDO rewinds
-`page_lsn`, so a second `RecoverFrom` re-runs both REDO and UNDO.  Therefore
-the page-level apply/undo operations are logically idempotent -- an
-already-applied or already-undone mutation is a SUCCESSFUL NO-OP, not an
-error:
+## Runtime abort and replay
 
-- Row delete / insert undo on an empty, absent or out-of-range slot does not
-  decrement `row_count_` a second time (the underflow-to-65535 symptom).
-- Leaf insert re-apply overwrites the existing key in place (no duplicate
-  entry, no row-count growth); leaf delete/update of a missing key is a no-op
-  and never drops a neighbouring row.
-- Branch insert re-apply keeps ONE separator per key (child id overwritten in
-  place).  Branch UPDATE re-apply of a missing key never overwrites the
-  landing neighbour or the foster slot.  Branch DELETE re-apply
-  (`Page::DeleteBranchImpl`, the REDO/UNDO-only entry) verifies the recorded
-  separator still exists; the forward path keeps its promote-lowest special
-  case.
-- Page LSN remains the FAST filter (an already-newer page skips the record),
-  but it is never the sole correctness basis -- the page operations are
-  self-guarding, so replay order changes (CLR, original record, restart)
-  cannot corrupt the page.
-- Format/structure corruption is NOT hidden as a no-op: ordinary page APIs
-  still reject invalid types, while recovery validates replay target types
-  and returns `kCorrupt` before advancing page LSN. The page checksum still
-  gates reads, so genuine damage fails loudly while a merely-absent apply
-  target succeeds quietly. Replay payload-size and page-capacity failures
-  likewise return an error before advancing the page LSN; a rejected
-  full-page image cannot be mistaken for an applied image.
-- The UNDO side has one deliberate exception to the hard type check: when the
-  target page's type no longer matches the record because the page was
-  destroyed or re-issued AFTER the record was written (a newer incarnation),
-  the operation's effects no longer exist, so `LogUndo` logs the CLR (the
-  loser chain must terminate on every future replay), skips the physical
-  mutation, and leaves the page's own stamps untouched. A mismatch on a page
-  whose current incarnation still predates the record remains `kCorrupt`.
+`TransactionManager::Abort` reverses `staged_records_` in memory through
+`PageManager::ApplyTransactionAbort`, removes pending MVCC versions and appends
+one `kAbort` when the transaction has logged. It does not read the WAL chain,
+write a CLR for every operation, append a `kCommit`, or wait for abort durability.
+A failure during rollback/append is surfaced and can fail-stop the transaction
+engine. Restart needs no loser undo because it never replays those transactions.
 
-`kSystemDestroyPage` (D3): REDO re-initializes the target page as
-`kFreePage`; the free list is rebuilt by a `[1, max_page_count]` scan at the
-end of `RecoverFrom` (only pages that ENDED recovery as free pages are
-linked; live and lossy-undone images are preserved).  Destroy records carry
-the old page type and body image, so UNDO of an aborted destroy (e.g. a
-rolled-back DROP TABLE) restores the page exactly and pops it from the
-allocator stack.  Re-applying the same destroy redo or re-running the whole
-recovery is idempotent.
+`kCompensateUpdate` still exists for `RowPage::RestorePhysicalUpdate`; it is not
+a restart undo-next chain protocol. Alloc/destroy records carry a page ID (the
+allocation type is in flags), not a page-body or allocator undo image. Replay
+uses committed slot/link/entry LSNs and allocation state to avoid overwriting
+newer snapshot data. Destruction removes committed state and tracks free IDs;
+there is no `kFreePage` scan or B+Tree leaf/branch redo path.
 
-`kSystemAllocPage` v6 is transactional. Every record carries a fixed 16-byte
-big-endian allocator snapshot: pre-allocation `first_free_page` and
-`max_page_count`. Fresh allocation has no undo bytes, recycled allocation has
-a fixed 16-byte big-endian `next_free_page`/`destroyer` snapshot, and in-place
-page-type changes retain the complete 32 KiB old target body. No payload reads
-`MetaPage` or `FreePage` object representation. Runtime abort and loser recovery
-therefore restore the allocator without relying on a restart-time free-list
-scan. `kCompensateAllocPage` is appended before either page changes; recovery
-validates exact payload sizes and allocator/free-list invariants, then treats
-the CLR as the idempotent redo image. Fresh undo makes the target free and
-restores the old high-water mark. Recycled redo pops the captured link and
-repairs the high-water mark to `max(old_max_page_count, page_id)`. Recycled undo
-restores the exact old free state and allocator fields, including a free-list
-head ahead of a stale high-water mark; when later allocator activity forces a
-safe merge rather than an exact snapshot restore, the merged head and monotonic
-high-water mark are retained. Legacy v1-v5 allocation records have no undo
-payload and keep the legacy redo-only behavior.
-Recycled-page MVCC chains are cleaned only after the allocation commits; the
-cleanup preserves that transaction's pending versions on the new incarnation,
-while abort leaves the old incarnation's chains intact.
-
-`AddLog` and visibility (D4): a transaction's versions become visible only
-AFTER its commit record's `AddLog` returns; durability of the commit (own
-and observed dependencies) is a separate barrier before results reach the
-user -- see `docs/commit_durability.md`.
+Rollback restoration must restore the previous row even when another write has
+consumed the byte budget released by a shrink/delete. That admission budget is
+for new writes, not a reason to discard an undo image.
 
 ## Recovery pipeline
 
-```
-Startup → read checkpoint LSN
-       → scan WAL from checkpoint (rate-limited progress lines per phase:
-         torn-tail scan / analysis / redo collection / torn-page sweep)
-       → REDO page writes + row ops (parallel per-page replay)
-       → UNDO uncommitted transactions
-       → torn-page checksum sweep over the whole allocated range
-         (parallel classification; single-page recovery stays serial)
-       → END-OF-RECOVERY CHECKPOINT: publish a fresh master record so the
-         replayed state is durable immediately -- a crash right after a
-         long recovery re-pays only the post-checkpoint WAL, and the
-         recycled-prefix becomes reclaimable without waiting for the
-         periodic timer
-       → open for queries (one-line summary: WAL window, committed/loser
-         counts, pages rebuilt, elapsed)
-```
+1. Load and validate the fuzzy checkpoint, if present.
+2. Validate the retained WAL window from the selected replay anchor, classifying
+   any damaged tail according to [WAL format](wal_format.md).
+3. Scan once to collect committed transaction IDs and the transaction-ID high
+   water mark. Seed the next transaction ID from that mark.
+4. Scan again in LSN order and apply only records whose owner committed. Both
+   passes are single-threaded and skip recognized segment padding.
+5. `PageStorage::Create` attempts an end-of-recovery checkpoint unless
+   `TINYLAMB_DISABLE_EOR_CHECKPOINT` is present. Failure logs a warning and keeps
+   the retained WAL; subsequent compaction/explicit checkpoints can retry.
 
-The end-of-recovery checkpoint is best-effort: a failure logs a warning and
-the periodic checkpoint retries; the recovered pages stay protected by the
-retained WAL either way.
+The current implementation has no restart UNDO phase, full-page-image repair,
+allocated-page checksum sweep, parallel page replay, or `.last_checkpoint`
+master-record publication. Snapshot corruption requires recovery from an
+appropriate backup; the code does not reconstruct a damaged snapshot from a
+retained full-page-image log.
 
 ## Testing
 
-- Unit: `recovery_manager_test`, `checkpoint_manager_test`, `logger_test`.
-- Segmented WAL / recycling / FPW: `recovery_extra_test`
-  (`WalRollsAcrossSegmentsAndReadsBack`, `LegacySingleFileLogMigratesToSegments`,
-  `CheckpointRecyclesOldSegmentsAndRestarts`,
-  `TornPageRebuildsFromFullPageImageAfterRecycle`,
-  `TornWalTailAcrossSegmentsTruncatesWithForce`,
-  `WholeWalReplaysWhenNoCheckpointExisted`).
-- Torn-tail auto-truncation (safe classes) and `--force`:
-  `HalfWrittenRecordAutoTruncatesWithoutForce`,
-  `ZeroFilledTailAutoTruncatesWithoutForce`,
-  `CorruptTailAbortsByDefault`, `ForceRecoversFromCorruptTail`.
-- Commit visibility under concurrent checkpoints (ATT-classification race
-  regression): `DatabaseExtraTest.CommittedRowsSurviveCrashDuringCheckpointStorm`.
-- Checkpoint worker lifecycle (`Start()` gating, interval 0 disabled):
-  `CheckpointTest.WorkerStaysParkedUntilStart`,
-  `CheckpointTest.ZeroIntervalDisablesPeriodicCheckpointing`.
-- Allocation undo: `PageManagerTest.RuntimeFreshAllocationAbortReusesId`,
-  `PageManagerTest.RuntimeRecycledAllocationAbortRestoresFreeBodyAndReusesId`,
-  `RecoveryManagerTest.FreshLoserAllocationUndoRestoresIdForImmediateReuse`,
-  `RecoveryManagerTest.RecycledLoserAllocationUndoRestoresBodyForImmediateReuse`,
-  `RecoveryManagerTest.VersionSixCommittedAllocationSurvivesRecovery`.
-- Idempotence / destroy (D2/D3): `LoserUndoSurvivesRepeatedRecoveryPasses`,
-  `RowPageLinkRedoAndLoserUndo`,
-  `Update_CommittedRelocationSurvivesCrashReplay`,
-  `DestroyPageRedoTwiceOnSamePageIsIdempotent`,
-  `DestroyPageUndoRestoresRowContent`, `DeleteRowReappliedIsIdempotent`,
-  `CatalogTest.DropTableCrashRecoveryReclaimsPages`,
-  `CheckpointManagerTest.CompactionPersistsStateAndTruncatesWalReplay`.
-- WAL CRC (D9): `MidRecordBitFlipStopsScanAtThatRecord`,
-  `MixedLegacyAndCurrentVersionLogsScanCleanly`,
-  `LegacyV1DestroyRecordStillParses`.
-- Logger D1: `D1NoRecordsInterleavedAcrossProducers`,
-  `D1RejectsRecordOverMaxSize`.
-- Fuzz: `table_fuzzer` performs random DML, calls `EmulateCrash()`, reopens the
-  database, and verifies the row model (`table/table_fuzzer.hpp`).
-- End-to-end: `table/table_fuzzer_replay.cpp` replays libFuzzer corpora.
+The following names exist in the current tree (2026-11-11). This inventory
+is not a claim that every legacy recovery failure mode has a replacement test.
+
+- Record serialization and committed/loser recovery:
+  `LogRecordTest.RoundTripSerialization` and
+  `RecoveryManagerTest.ReplaysCommittedAndIgnoresUncommittedLosers`.
+- Snapshot state and replay anchors:
+  `PageManagerTest.UnboundedRowBlockInsertUpdateDeleteAndFuzzyCheckpoint`,
+  `CheckpointManagerTest.FuzzyCheckpointWithInFlightAndPostCheckpointTxns`,
+  `CheckpointManagerTest.CompactionShortensWalReplayWithoutCheckpointSidecar`.
+- Concurrent checkpoint visibility:
+  `DatabaseExtraTest.CommittedRowsSurviveCrashDuringCheckpointStorm`.
+- Catalog restart/drop: `CatalogTest.TwoCleanRecoveryCyclesKeepTable` and
+  `CatalogTest.DropTableCrashRecoveryReclaimsPages`.
+- Logger durability, segmentation, fixed logical ends and damaged metadata:
+  `recovery/logger_test.cpp`, including
+  `LoggerTest.WaitForDurableObservesFsync`,
+  `LoggerTest.FixedSegmentsRejectEitherDamagedSlotAndForcedScanKeepsBody`,
+  `LoggerTest.FixedSegmentsSyncFailureNeverAdvancesDurableEnd`, and
+  `LoggerTest.D1NoRecordsInterleavedAcrossProducers`.
+- Worker shutdown: `CheckpointManagerTest.RapidConstructAndStopDoesNotLoseWakeup`.
+- Random DML/restart model checking: `table/table_fuzzer.hpp` and
+  `table/table_fuzzer_replay.cpp`.
+
+The former `recovery_extra_test`, B+Tree page/allocator undo tests, and
+legacy-format CRC test names were removed with their implementations. Do
+not count them as passing or present coverage. New changes to corruption
+handling or replay idempotence need current regression tests of their own.
 
 ## Related docs
 

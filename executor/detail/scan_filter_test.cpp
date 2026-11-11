@@ -51,6 +51,84 @@ Schema MakeTestSchema() {
                         });
 }
 
+TEST(FlatIntSetAuditTest, RejectsOutOfRangeDenseWrites) {
+  FlatIntSet set;
+  ASSERT_TRUE(set.TryReserveDense(-2, 2));
+  set.Insert(-2);
+  set.Insert(2);
+  set.Insert(INT64_MIN);
+  set.Insert(INT64_MAX);
+  EXPECT_TRUE(set.DenseOverflowed());
+  EXPECT_EQ(set.Size(), 2U);
+  EXPECT_FALSE(set.Contains(INT64_MIN));
+  EXPECT_FALSE(set.Contains(INT64_MAX));
+  ASSERT_TRUE(set.TryReserveDense(INT64_MAX - 2, INT64_MAX));
+  set.InsertDenseAtomic(INT64_MAX);
+  set.InsertDenseAtomic(INT64_MIN);
+  set.FinalizeDenseBounds();
+  EXPECT_TRUE(set.DenseOverflowed());
+  EXPECT_EQ(set.Size(), 1U);
+  EXPECT_TRUE(set.Contains(INT64_MAX));
+  EXPECT_FALSE(set.Contains(INT64_MIN));
+  set.Reserve(4);
+  EXPECT_FALSE(set.DenseOverflowed());
+}
+
+TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
+  const Schema schema("", {Column("d", ValueType::kDate)});
+  const Value literal("2000-06-30");
+  const Value day = Value::DateFromDays(11138);
+  for (const auto op :
+       {BinaryOperation::kEquals, BinaryOperation::kNotEquals,
+        BinaryOperation::kLessThan, BinaryOperation::kLessThanEquals,
+        BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals}) {
+    const auto expression =
+        BinaryExpressionExp(ColumnValueExp("d"), op, ConstantValueExp(literal));
+    const auto compiled = TryCompileSimpleCompare(expression, schema);
+    if (!compiled) {
+      FAIL() << "date comparison did not compile";
+    }
+    EXPECT_TRUE(compiled->date_string_payload);
+    EXPECT_EQ(compiled->constant, literal);
+    for (const Value& value :
+         {Value(), day, Value::DateFromDays(11137), Value::DateFromDays(11139),
+          Value("2000-06-30"), Value("2001-01-01")}) {
+      const Row row({value});
+      auto expected = expression->TryEvaluate(row, schema);
+      ASSERT_TRUE(expected.HasValue());
+      EXPECT_EQ(MatchSimpleCompare(row, *compiled), expected.Value().Truthy());
+    }
+  }
+  const auto invalid = TryCompileSimpleCompare(
+      BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
+                          ConstantValueExp(Value("invalid date"))),
+      schema);
+  if (!invalid) {
+    FAIL() << "invalid literal comparison did not compile";
+  }
+  EXPECT_FALSE(invalid->date_string_payload);
+}
+
+TEST(ScanFilterTest, AuditDateNumericComparisonUsesCheckedEvaluator) {
+  const Schema schema(
+      "", {Column("d", ValueType::kDate), Column("i", ValueType::kInt64)});
+  const Row row({Value::DateFromDays(5), Value(5)});
+  for (const auto op : {BinaryOperation::kEquals, BinaryOperation::kNotEquals,
+                        BinaryOperation::kLessThan}) {
+    for (const auto& rhs :
+         {ConstantValueExp(Value(5)), ConstantValueExp(Value(5.0)),
+          ColumnValueExp("i")}) {
+      for (bool reverse : {false, true}) {
+        const auto expression =
+            reverse ? BinaryExpressionExp(rhs, op, ColumnValueExp("d"))
+                    : BinaryExpressionExp(ColumnValueExp("d"), op, rhs);
+        EXPECT_FALSE(TryCompileSimpleCompare(expression, schema));
+        EXPECT_FALSE(expression->TryEvaluate(row, schema).HasValue());
+      }
+    }
+  }
+}
+
 TEST(ScanFilterTest, FastLikeMatchAsciiAndWildcards) {
   EXPECT_TRUE(FastLikeMatch("", ""));
   EXPECT_TRUE(FastLikeMatch("abc", "%"));
@@ -91,6 +169,74 @@ TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {
       BinaryExpressionExp(ColumnValueExp(ColumnName("id")),
                           BinaryOperation::kEquals, ConstantValueExp(Value(1)));
   EXPECT_FALSE(TryDecideConstantConjunct(col_pred).has_value());
+}
+
+TEST(ScanFilterTest, ConstantArithmeticInListCompilesWithoutRowEvaluation) {
+  const Schema schema = MakeTestSchema();
+  const Expression predicate = InExpressionExp(
+      ColumnValueExp("id"),
+      {ConstantValueExp(Value(10)),
+       BinaryExpressionExp(ConstantValueExp(Value(10)), BinaryOperation::kAdd,
+                           ConstantValueExp(Value(1)))});
+  const auto filter = CompileScanFilter({predicate}, schema);
+  ASSERT_TRUE(filter.residual.empty());
+  ASSERT_EQ(filter.disjunctive_branches.size(), 2U);
+  const auto peeks = BuildIntegerPeeks(filter, nullptr, schema);
+  ASSERT_EQ(peeks.size(), 2U);
+  EXPECT_EQ(peeks[0].op, BinaryOperation::kGreaterThanEquals);
+  EXPECT_EQ(peeks[0].constant, 10);
+  EXPECT_EQ(peeks[1].op, BinaryOperation::kLessThanEquals);
+  EXPECT_EQ(peeks[1].constant, 11);
+  for (int64_t value = 8; value < 14; ++value) {
+    const Row row({Value(value), Value(), Value(), Value()});
+    bool matches = false;
+    for (const auto& branch : filter.disjunctive_branches) {
+      ASSERT_EQ(branch.simple.size(), 1U);
+      matches |= MatchSimpleCompare(row, branch.simple[0]);
+    }
+    ASSERT_TRUE(predicate->TryEvaluate(row, schema).HasValue());
+    EXPECT_EQ(matches, predicate->TryEvaluate(row, schema).Value().Truthy());
+  }
+  // An error is left on the row evaluator, including its short-circuit rules.
+  const auto raising = InExpressionExp(
+      ColumnValueExp("id"),
+      {BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kDivide,
+                           ConstantValueExp(Value(0)))});
+  EXPECT_FALSE(CompileScanFilter({raising}, schema).residual.empty());
+  // A sparse list's enclosure admits holes; the real filter must reject them.
+  const auto sparse = CompileScanFilter(
+      {InExpressionExp(ColumnValueExp("id"), {ConstantValueExp(Value(10)),
+                                              ConstantValueExp(Value(12))})},
+      schema);
+  EXPECT_EQ(BuildIntegerPeeks(sparse, nullptr, schema).size(), 2U);
+  const Row hole({Value(11), Value(), Value(), Value()});
+  for (const auto& branch : sparse.disjunctive_branches) {
+    EXPECT_FALSE(MatchSimpleCompare(hole, branch.simple[0]));
+  }
+}
+
+TEST(ScanFilterTest, DisjunctEnclosureCombinesBoundsAcrossColumns) {
+  const auto eq = [](const char* column, int value) {
+    return BinaryExpressionExp(ColumnValueExp(column), BinaryOperation::kEquals,
+                               ConstantValueExp(Value(value)));
+  };
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(eq("id", 10), BinaryOperation::kAnd, eq("alt_id", 1)),
+      BinaryOperation::kOr,
+      BinaryExpressionExp(eq("id", 12), BinaryOperation::kAnd,
+                          eq("alt_id", 2)));
+  const auto filter = CompileScanFilter({predicate}, MakeTestSchema());
+  const auto peeks = BuildIntegerPeeks(filter, nullptr, MakeTestSchema());
+  ASSERT_EQ(peeks.size(), 4U);
+  EXPECT_EQ(peeks[0].column, 0U);
+  EXPECT_EQ(peeks[0].constant, 10);
+  EXPECT_EQ(peeks[1].constant, 12);
+  EXPECT_EQ(peeks[2].column, 3U);
+  const auto unbounded =
+      CompileScanFilter({BinaryExpressionExp(eq("id", 10), BinaryOperation::kOr,
+                                             eq("alt_id", 1))},
+                        MakeTestSchema());
+  EXPECT_TRUE(BuildIntegerPeeks(unbounded, nullptr, MakeTestSchema()).empty());
 }
 
 TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
@@ -152,6 +298,48 @@ TEST(ScanFilterTest, TryCompileAndMatchSimpleCompare) {
       Row({Value(10), Value(0.0), Value("x"), Value(5)}), *compiled_col));
 }
 
+TEST(ScanFilterTest, CoalesceComparisonDropsOnlyRejectingFallbacks) {
+  const Schema schema("t", {Column("x", ValueType::kInt64)});
+  for (const auto op :
+       {BinaryOperation::kEquals, BinaryOperation::kNotEquals,
+        BinaryOperation::kLessThan, BinaryOperation::kLessThanEquals,
+        BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals}) {
+    for (const auto& fallback : {Value(), Value(-1), Value(0), Value(1)}) {
+      for (const bool reversed : {false, true}) {
+        const auto coalesce = FunctionCallExp(
+            "coalesce", {ColumnValueExp("x"), ConstantValueExp(fallback)});
+        const auto zero = ConstantValueExp(Value(0));
+        const auto expression = reversed
+                                    ? BinaryExpressionExp(zero, op, coalesce)
+                                    : BinaryExpressionExp(coalesce, op, zero);
+        auto missing = expression->TryEvaluate(Row({Value()}), schema);
+        ASSERT_TRUE(missing.HasValue());
+        const auto compiled = TryCompileSimpleCompare(expression, schema);
+        if (!missing.Value().IsNull() && missing.Value().Truthy()) {
+          EXPECT_FALSE(compiled.has_value());
+          continue;
+        }
+        ASSERT_TRUE(compiled.has_value()) << expression->ToString();
+        if (!compiled.has_value()) {
+          continue;
+        }
+        for (const auto& value : {Value(), Value(-2), Value(0), Value(2)}) {
+          const Row row({value});
+          auto expected = expression->TryEvaluate(row, schema);
+          ASSERT_TRUE(expected.HasValue());
+          EXPECT_EQ(MatchSimpleCompare(row, *compiled),
+                    !expected.Value().IsNull() && expected.Value().Truthy());
+        }
+      }
+    }
+  }
+  const auto a = BinaryExpressionExp(
+      FunctionCallExp("ifnull",
+                      {ColumnValueExp("x"), ConstantValueExp(Value(0))}),
+      BinaryOperation::kGreaterThan, ConstantValueExp(Value(0)));
+  EXPECT_TRUE(TryCompileSimpleCompare(a, schema));
+}
+
 TEST(ScanFilterTest, TryCompileAndMatchPrefixIn) {
   const Schema schema = MakeTestSchema();
   const Expression substr_call = FunctionCallExp(
@@ -194,6 +382,7 @@ TEST(ScanFilterTest, MatchPrebuiltMembershipThreeValuedAndExistence) {
       .runtime_filter = nullptr,
       .contains_null = false,
       .existence = false,
+      .string_values = nullptr,
   };
   EXPECT_TRUE(MatchPrebuiltMembership(Row({Value(10)}), in_pred));
   EXPECT_FALSE(MatchPrebuiltMembership(Row({Value(30)}), in_pred));
@@ -218,6 +407,27 @@ TEST(ScanFilterTest, MatchPrebuiltMembershipThreeValuedAndExistence) {
   not_exists_pred.existence = true;
   EXPECT_TRUE(MatchPrebuiltMembership(Row({Value(30)}), not_exists_pred));
   EXPECT_TRUE(MatchPrebuiltMembership(Row({Value()}), not_exists_pred));
+}
+
+TEST(ScanFilterTest, StringMembershipPreservesNullEmptyAndCollationSemantics) {
+  auto strings = std::make_shared<relational_detail::MembershipStringSet>();
+  strings->insert("ABC");
+  PrebuiltMembershipPredicate pred;
+  pred.column = 0;
+  pred.domain_type = ValueType::kVarChar;
+  pred.string_values = strings;
+  EXPECT_TRUE(MatchPrebuiltMembership(Row({Value("ABC")}), pred));
+  EXPECT_FALSE(MatchPrebuiltMembership(Row({Value("abc")}), pred));
+  EXPECT_TRUE(
+      MatchPrebuiltMembership(Row({Value("abc").WithCollation(2)}), pred));
+  EXPECT_FALSE(MatchPrebuiltMembership(Row({Value()}), pred));
+  pred.negated = true;
+  EXPECT_TRUE(MatchPrebuiltMembership(Row({Value("missing")}), pred));
+  pred.contains_null = true;
+  EXPECT_FALSE(MatchPrebuiltMembership(Row({Value("missing")}), pred));
+  strings->clear();
+  pred.contains_null = false;
+  EXPECT_TRUE(MatchPrebuiltMembership(Row({Value()}), pred));
 }
 
 TEST(ScanFilterTest, MatchPrebuiltScalarCompare) {

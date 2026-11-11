@@ -1,0 +1,4 @@
+# Separate from the TCP/Quack comparison dependencies.
+duckdb==2.0.0
+sqlglot==30.30.0
+matplotlib==3.11.2

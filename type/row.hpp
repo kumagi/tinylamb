@@ -100,9 +100,10 @@ struct Row {
                                                  size_t max_len,
                                                  const Schema& sc);
   // Read a single INT64/DATE column without materializing other values.
-  [[nodiscard]] static std::optional<int64_t> TryPeekInteger(const char* src,
-                                                             const Schema& sc,
-                                                             slot_t column);
+  // NULL/non-integer values return nullopt; malformed images return Status.
+  // As with TryDeserialize, src must address a complete serialized row image.
+  [[nodiscard]] static StatusOr<std::optional<int64_t>> TryPeekInteger(
+      const char* src, const Schema& sc, slot_t column);
   // Serialized byte size of the row image (count + optional null bitmap +
   // payload).  Bounds checks over cell indexes want Count(), never this.
   [[nodiscard]] size_t Size() const;
@@ -128,7 +129,11 @@ struct Row {
   }
   void Clear() { values_.clear(); }
   [[nodiscard]] bool IsValid() const { return !values_.empty(); }
-  [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const;
+  [[nodiscard]] StatusOr<Row> TryExtract(const std::vector<slot_t>& elms) const;
+  // Legacy throwing wrapper. Storage/executor callers use TryExtract.
+  [[nodiscard]] Row Extract(const std::vector<slot_t>& elms) const {
+    return ExcShimUnwrap(TryExtract(elms), "Row::Extract");
+  }
   Row operator+(const Row& rhs) const;
 
   bool operator==(const Row& rhs) const = default;

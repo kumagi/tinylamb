@@ -12,6 +12,10 @@
 
 namespace tinylamb {
 
+// Bound dump construction and every public visitor entry before recursive
+// helpers or unique_ptr tree destruction can exhaust the native stack.
+inline constexpr size_t kMaxGoogleSqlAstDepth = 128;
+
 struct GoogleSqlAstNode {
   std::string kind;
   std::string detail;

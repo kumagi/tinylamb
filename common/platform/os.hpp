@@ -20,7 +20,7 @@
 // Target-OS detection. Prefer these over raw compiler macros: in particular
 // Apple's compilers do not define __unix__, so `#if defined(__unix__)`
 // silently excludes macOS from POSIX-only code paths.
-#if defined(__linux__)
+#ifdef __linux__
 #define TINYLAMB_OS_LINUX 1
 #elif defined(__APPLE__) && defined(__MACH__)
 #define TINYLAMB_OS_MACOS 1

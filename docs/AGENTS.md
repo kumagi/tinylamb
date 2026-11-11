@@ -3,8 +3,8 @@
 Read before designing, cite when changing behavior. Most binding first:
 
 - `lock_order.md` — normative lock ordering (storage + txn work must obey).
-- `recovery_invariants.md`, `wal_format.md` — ARIES invariants + on-disk WAL
-  layout   (`kWalRecordVersion = 6`).
+- `recovery_invariants.md`, `wal_format.md` — committed-snapshot recovery invariants +
+  on-disk WAL layout (`LogRecord::kCurrentVersion = 7`).
 - `page_format.md`, `page_checksum.md`, `value_storage.md` — on-disk formats.
 - `expression_evaluation.md` — AST/Bytecode/JIT equivalence contract.
 - `cascades_optimizer.md` (+ `optimizer_todo.md`,
@@ -12,9 +12,9 @@ Read before designing, cite when changing behavior. Most binding first:
 - `commit_durability.md`, `lock_timeout.md` — commit/wait semantics.
 - `environment_variables.md` — every `TINYLAMB_*` env var the code reads
   (A/B hatches, budgets, fault-injection probes).
-- `adr-proposal.md` + `review/` (`*_review.md`) — decision records. (There is
-  no `docs/adr/` directory; create `NNN-<topic>.md` there only if establishing
-  a standing ADR location.)
+- `adr-proposal.md` + `review/` (`*_review.md`) — proposals and reviews.
+  Accepted decisions live in `adr/`, including
+  `adr/0001-fixed-wal-logical-end.md`.
 - `next-actions.md` — improvement backlog. `todo.md`, `executor_todo.md`,
   `bug_audit_2026-08.md` — triage lists, check before claiming "known issue".
   (`executor_todo.md` is partly superseded per `todo.md`'s header — cross-check

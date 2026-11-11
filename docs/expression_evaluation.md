@@ -53,8 +53,7 @@ condition before the next WHEN. This preserves `TryPickBranch` semantics
 exactly: a NULL condition never takes its branch, a raising condition aborts
 the whole CASE in evaluation order, and no match yields ELSE-or-NULL. Branch
 types must unify (CaseExpression::ResultType kInvalid fails Compile, as
-before — such shapes stay on the AST evaluator). Programs containing the
-lowering stay canonical (jumps are outside the fast interpreter's set). The
+before — such shapes stay on the AST evaluator). The fast interpreter supports the lowering's jumps and Pop operations; VARCHAR/DATE kernels delegate to canonical scalar evaluation. The
 null-check/truthiness unary family (IS [NOT] NULL, IS [NOT] TRUE/FALSE) is
 type-agnostic on both legs and compiles for any operand type. Coverage:
 `bytecode_test.cpp` (`SearchedCase_*`) and `differential_test.cpp`.
@@ -126,3 +125,10 @@ if a matching bytecode pattern exists.
 checks AST, bytecode, and JIT filter kernels agree on simple INT64
 column-vs-constant compares (non-NULL rows for JIT). Add similar tests when
 new bytecode→JIT mappings are introduced.
+
+## DATE の暦要素（2026-11-11 監査修正）
+
+`extract_year` / `extract_month` / `extract_day` は DATE の日数から暦要素を求める。
+負の年と 5 桁の年も省略せず、AST・Bytecode・高速 VM は同じ値を返す。
+文字列を固定位置で切り出す既存の互換処理は VARCHAR 入力だけに適用する。
+回帰: `DifferentialTest.AuditDateExtractKeepsSignedAndWideYears`。

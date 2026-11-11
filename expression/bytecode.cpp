@@ -111,14 +111,17 @@ std::optional<BytecodeOp> BinaryOpcode(ValueType type) {
   return std::nullopt;
 }
 
-// Mirrors the AST extract_{year,month,day} evaluator (FunctionCallExpression):
-// DATE renders through FormatDateDays ("%04d-%02u-%02u") and slices, VARCHAR
-// slices raw, then std::stoll parses each slice with its whitespace/sign/
-// digit scanning and std::logic_error -> error mapping.  Reproduced here so
-// the VM kernel is differential-equal to the AST on every input.
+// DATE parts come directly from the calendar, including signed/wide years.
+// VARCHAR retains the AST's string-slice/stoll parsing contract.
 StatusOr<Value> TryExtractDatePart(const Value& value, uint16_t part) {
   if (value.IsNull()) {
     return Value();
+  }
+  if (value.IsInterval()) {
+    return ExecuteFunction(part == 0   ? "extract_year"
+                           : part == 1 ? "extract_month"
+                                       : "extract_day",
+                           {value});
   }
   if (value.type == ValueType::kDate) {
     if (value.value.int_value < kDateMinDays ||
@@ -129,13 +132,7 @@ StatusOr<Value> TryExtractDatePart(const Value& value, uint16_t part) {
     const std::chrono::year_month_day ymd{std::chrono::sys_days{
         std::chrono::days{static_cast<int>(value.value.int_value)}}};
     if (part == 0) {
-      const int64_t year = static_cast<int>(ymd.year());
-      if (year >= -999 && year <= 9999) {
-        return Value(year);
-      }
-      // The formatted year runs past 4 digits, so the AST's substr(0, 4)
-      // keeps only the leading 4 (e.g. 12345 -> 1234, -1234 -> -123).
-      return Value(year / 10);
+      return Value(static_cast<int64_t>(static_cast<int>(ymd.year())));
     }
     if (part == 1) {
       return Value(static_cast<int64_t>(static_cast<unsigned>(ymd.month())));
@@ -302,7 +299,15 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
       // unsupported functions) fails compilation and the caller falls back
       // to the AST evaluator.
       const InExpression& in = expression->AsInExpression();
-      if (in.list_.empty()) {
+      // String IN additionally checks explicit collation conflicts; plain
+      // equality bytecode cannot represent that check. Keep it on the AST.
+      const auto numeric_or_date = [&](const Expression& operand) {
+        const auto type = ValueTypeFor(operand->ResultType(schema));
+        return type == ValueType::kInt64 || type == ValueType::kDouble ||
+               type == ValueType::kDate;
+      };
+      if (in.list_.empty() || !numeric_or_date(in.child_) ||
+          !std::ranges::all_of(in.list_, numeric_or_date)) {
         return false;
       }
       Expression expanded = BinaryExpressionExp(
@@ -423,6 +428,37 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
     case TypeTag::kFunctionCallExp: {
       const FunctionCallExpression& call =
           expression->AsFunctionCallExpression();
+      if (call.FuncName() == "byte_length" ||
+          call.FuncName() == "octet_length" || call.FuncName() == "length") {
+        if (call.Args().size() != 1 ||
+            !CompileNode(call.Args()[0], schema, program)) {
+          return false;
+        }
+        program->AddInstruction({.opcode = BytecodeOp::kByteLength});
+        return true;
+      }
+      if (call.FuncName() == "coalesce" || call.FuncName() == "ifnull") {
+        if (call.Args().empty() ||
+            (call.FuncName() == "ifnull" && call.Args().size() != 2)) {
+          return false;
+        }
+        std::vector<size_t> exits;
+        for (size_t i = 0; i < call.Args().size(); ++i) {
+          if (!CompileNode(call.Args()[i], schema, program)) {
+            return false;
+          }
+          if (i + 1 != call.Args().size()) {
+            exits.push_back(program->Size());
+            program->AddInstruction({.opcode = BytecodeOp::kJumpIfNotNull});
+            program->AddInstruction({.opcode = BytecodeOp::kPop});
+          }
+        }
+        for (const auto jump : exits) {
+          program->SetJumpTarget(jump, static_cast<int32_t>(program->Size()) -
+                                           static_cast<int32_t>(jump));
+        }
+        return true;
+      }
       // EXTRACT(year|month|day FROM x) lowers to one dedicated op whose
       // kernel reproduces the AST evaluator; every other function (and any
       // odd arity) fails compilation and the caller falls back to the AST
@@ -456,8 +492,8 @@ bool CompileNode(  // NOLINT(misc-no-recursion)
 
 namespace {
 
-// The boxing-free interpreter covers these opcodes only; jumps and the
-// varchar/date kernels stay on the canonical path.
+// The fast interpreter supports these opcodes, including control-flow jumps.
+// VARCHAR/DATE operations delegate to the canonical scalar evaluator.
 bool FastOpcode(BytecodeOp opcode) {
   switch (opcode) {
     case BytecodeOp::kLoadColumn:
@@ -472,6 +508,7 @@ bool FastOpcode(BytecodeOp opcode) {
     case BytecodeOp::kJump:
     case BytecodeOp::kJumpIfFalse:
     case BytecodeOp::kJumpIfTrue:
+    case BytecodeOp::kJumpIfNotNull:
     case BytecodeOp::kPop:
       return true;
     default:
@@ -584,6 +621,16 @@ bool EncodeCompileTree(const Expression& expression, Encoder* encoder,
       }
       return child(conditional.else_clause_);
     }
+    case TypeTag::kFunctionCallExp: {
+      const auto& call = expression->AsFunctionCallExpression();
+      if (call.FuncName() != "coalesce" && call.FuncName() != "ifnull" &&
+          call.FuncName() != "byte_length" &&
+          call.FuncName() != "octet_length" && call.FuncName() != "length") {
+        return false;
+      }
+      *encoder << call.FuncName() << static_cast<uint64_t>(call.Args().size());
+      return std::ranges::all_of(call.Args(), child);
+    }
     default:
       // Functions, subqueries, aggregates and other context-bearing nodes
       // keep the ordinary compiler; none enter the retained cache.
@@ -652,7 +699,9 @@ std::optional<BytecodeProgram> BytecodeCompiler::CompileRowCached(
     return found->second;
   }
   auto program = Compile(expression, schema, context);
-  if (!program && expression && expression->Type() == TypeTag::kCaseExp) {
+  if (!program && expression &&
+      (expression->Type() == TypeTag::kCaseExp ||
+       expression->Type() == TypeTag::kFunctionCallExp)) {
     // CompileNode emits the same branch dispatch as the AST without requiring
     // one static output vector type. Keep each branch's returned Value intact.
     BytecodeProgram dynamic;
@@ -713,6 +762,38 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
     if (!CompileNode(folded, schema, &program)) {
       return std::nullopt;
     }
+    const auto uniform_coalesce = [&](const auto& self,
+                                      const Expression& node) -> bool {
+      if (!node) {
+        return true;
+      }
+      if (node->Type() == TypeTag::kFunctionCallExp) {
+        const auto& call = node->AsFunctionCallExpression();
+        if (call.FuncName() == "coalesce" || call.FuncName() == "ifnull") {
+          ValueType common = ValueType::kNull;
+          for (const auto& arg : call.Args()) {
+            const auto type = ValueTypeFor(arg->ResultType(schema));
+            if (type == ValueType::kNull) {
+              if (arg->Type() != TypeTag::kConstantValue ||
+                  !arg->AsConstantValue().GetValue().IsNull()) {
+                return false;
+              }
+              continue;
+            }
+            if (common != ValueType::kNull && common != type) {
+              return false;
+            }
+            common = type;
+          }
+        }
+      }
+      return std::ranges::all_of(
+          ExpressionChildren(node),
+          [&](const auto& child) { return self(self, child); });
+    };
+    if (!uniform_coalesce(uniform_coalesce, folded)) {
+      return std::nullopt;
+    }
     const ValueType result_type = ValueTypeFor(folded->ResultType(schema));
     if (result_type == ValueType::kNull) {
       return std::nullopt;
@@ -729,7 +810,9 @@ std::optional<BytecodeProgram> BytecodeCompiler::Compile(
 
 StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
     const DataChunk& input) const {
-  ColumnVector result(result_type_, input.Size());
+  // Infer the value domain as well as the physical type: the static result
+  // type alone cannot distinguish UINT64 from INT64.
+  ColumnVector result(ValueType::kNull, input.Size());
   std::vector<Value> stack;
   stack.reserve(instructions_.size());
   for (size_t row = 0; row < input.Size(); ++row) {
@@ -762,6 +845,12 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           }
           break;
         }
+        case BytecodeOp::kJumpIfNotNull:
+          if (!stack.back().IsNull()) {
+            pc += static_cast<size_t>(instruction.jump_target);
+            --pc;
+          }
+          break;
         case BytecodeOp::kJump:
           pc += static_cast<size_t>(instruction.jump_target);
           --pc;
@@ -801,6 +890,18 @@ StatusOr<ColumnVector> BytecodeProgram::TryEvaluateBatch(
           ASSIGN_OR_RETURN(Value, part_value,
                            TryExtractDatePart(child, instruction.operand));
           stack.push_back(std::move(part_value));
+          break;
+        }
+        case BytecodeOp::kByteLength: {
+          assert(!stack.empty());
+          const auto& child = stack.back();
+          const Value result_value =
+              child.IsNull() ? Value()
+                             : Value(static_cast<int64_t>(
+                                   child.type == ValueType::kVarChar
+                                       ? child.value.varchar_value.size()
+                                       : child.AsString().size()));
+          stack.back() = result_value;
           break;
         }
         case BytecodeOp::kPop: {
@@ -855,6 +956,12 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         }
         break;
       }
+      case BytecodeOp::kJumpIfNotNull:
+        if (!stack.back().IsNull()) {
+          pc += static_cast<size_t>(instruction.jump_target);
+          --pc;
+        }
+        break;
       case BytecodeOp::kJump:
         pc += static_cast<size_t>(instruction.jump_target);
         --pc;
@@ -891,6 +998,18 @@ StatusOr<Value> BytecodeProgram::TryEvaluateRow(const Row& row) const {
         ASSIGN_OR_RETURN(Value, part_value,
                          TryExtractDatePart(child, instruction.operand));
         stack.push_back(std::move(part_value));
+        break;
+      }
+      case BytecodeOp::kByteLength: {
+        assert(!stack.empty());
+        const auto& child = stack.back();
+        const Value result_value =
+            child.IsNull() ? Value()
+                           : Value(static_cast<int64_t>(
+                                 child.type == ValueType::kVarChar
+                                     ? child.value.varchar_value.size()
+                                     : child.AsString().size()));
+        stack.back() = result_value;
         break;
       }
       case BytecodeOp::kPop: {
@@ -1016,6 +1135,31 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
   if (!fast_interpretable_) {
     return FastEval::kUnsupported;
   }
+  // Column projections and NULL tests need no VM stack or payload decoding.
+  // Preserve the actual Value domain, including unsigned integers and arrays.
+  if (!instructions_.empty() && instructions_.size() <= 3 &&
+      instructions_[0].opcode == BytecodeOp::kLoadColumn &&
+      instructions_[0].operand < row.Count()) {
+    const Value& value = row[instructions_[0].operand];
+    if (instructions_.size() == 1) {
+      *out = value;
+      return FastEval::kDone;
+    }
+    const auto& test = instructions_[1];
+    const bool negate = instructions_.size() == 3 &&
+                        instructions_[2].opcode == BytecodeOp::kUnaryInt64 &&
+                        instructions_[2].unary == UnaryOperation::kNot;
+    if ((instructions_.size() == 2 || negate) &&
+        test.opcode == BytecodeOp::kUnaryInt64 &&
+        (test.unary == UnaryOperation::kIsNull ||
+         test.unary == UnaryOperation::kIsNotNull)) {
+      const bool result = test.unary == UnaryOperation::kIsNull
+                              ? value.IsNull()
+                              : !value.IsNull();
+      *out = Value(static_cast<int64_t>(result != negate));
+      return FastEval::kDone;
+    }
+  }
   // The interpreter has no call instruction; one stack per thread removes a
   // heap allocation per row (same trick as TryEvaluateRow).
   thread_local std::vector<FastSlot> stack;
@@ -1043,6 +1187,12 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
   for (size_t pc = 0; pc < instructions_.size(); ++pc) {
     const BytecodeInstruction& instruction = instructions_[pc];
     switch (instruction.opcode) {
+      case BytecodeOp::kJumpIfNotNull:
+        if (!stack.back().is_null) {
+          pc += static_cast<size_t>(instruction.jump_target);
+          --pc;
+        }
+        continue;
       case BytecodeOp::kJump:
         pc += static_cast<size_t>(instruction.jump_target);
         --pc;
@@ -1442,10 +1592,7 @@ BytecodeProgram::FastEval BytecodeProgram::TryEvaluateRowFast(
         const std::chrono::year_month_day ymd{std::chrono::sys_days{
             std::chrono::days{static_cast<int>(child.bits)}}};
         if (instruction.operand == 0) {
-          const int64_t year = static_cast<int>(ymd.year());
-          // The formatted year runs past 4 digits past this range, so the
-          // AST's substr(0, 4) keeps only the leading 4 digits.
-          push_int(stack, year >= -999 && year <= 9999 ? year : year / 10);
+          push_int(stack, static_cast<int64_t>(static_cast<int>(ymd.year())));
         } else if (instruction.operand == 1) {
           push_int(stack,
                    static_cast<int64_t>(static_cast<unsigned>(ymd.month())));

@@ -35,7 +35,7 @@ NTP 等の同期を推奨するが必須ではない。
 
 ```
 n1〜n3: {datadir}/
-  <dbname>.db / .log / .last_checkpoint     ← 既存形式のまま
+  <dbname>.db / .log.meta / .log.<index>   ← 現行の snapshot と分割 WAL
   wal/stream_%u.log                         ← epoch モード(M2〜)
   node_id                                   ← 登録済み nodeid
 {controldir}(n1〜n3): meta, log_*.seg, snap_*(Raft、§distributed_raft.md §8)
@@ -57,12 +57,10 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 
 ## 2. 互換性とバージョニングポリシー
 
-- **WAL レコード**: `LogRecord` にバージョン欄は無い。未知の LogType に遭遇した
-  古いバイナリは解析停止(=ログ末尾扱い)する。したがって:
-  - compat モード(`--wal-streams=1 --epochs=off`、既定)では**新レコード種を
-    1 本も書かない**。WAL バイト列は旧バイナリと完全同一。
-  - epoch モードで書いた WAL(kEpochBegin 等を含む)を読めるのは新バイナリのみ。
-    **M2 以降の旧バイナリへのダウングレードは不可**(§5 の代替で戻す)。
+- **WAL レコード**: 現行の `LogRecord` は version 7 のみを受け入れる。
+  magic/version/長さ/CRC は native-endian を含むため、異種 endian 間の配送形式
+  としてそのまま使えない。以下の compat / epoch モードは未実装の提案であり、
+  新レコード種の導入には新バージョンと移行・ダウングレード方針が必要になる。
 - **配送プロトコル**: フレーム先頭 version=1(`distributed_raft.md` §4 と同じ
   形式)。不一致は接続拒否。major 違いは混在禁止。
 - **Raft プロトコル**: 固定 v1。FSM コマンドは先頭バイトがコマンドバージョン。
@@ -75,9 +73,10 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 
 - **前提**: なし(いつでも実行可)。
 - **手順**:
-  1. 現行負荷・容量・WAL 増加速度を記録(WAL は現在切り詰めが存在しないため
-     **無限増大する**。`RecoverFrom` が常に先頭 0 から走査する現状
-     (page_storage.cpp:52)と合わせ、Phase 0 の WP-0a 修正の根拠データを取る)。
+  1. 現行負荷・容量・WAL 増加速度を記録する。現在はチェックポイントの replay
+     anchor を下回るセグメントの recycle が実装済みで、復旧は検証済みの
+     `max(anchor, log_start)` から走査する。長期 active transaction が保持を
+     阻む場合も含めて、残存 WAL 量と復旧時間を測定する。
   2. クラッシュリカバリ訓練: ステージングで kill -9 → 再起動 → 整合検査。
   3. ベースライン取得: TPC-C / TPC-H を実行し BenchmarkHistory.md へ記録。
   4. n2/n3 の到達性・ポート・ディスク・fsync 診断。
@@ -122,7 +121,7 @@ WAL 互換性により新バイナリの単一ノードモードへはいつで�
 
 ```
 1. [n1] checkpoint 要求(admin 経由)。完了を master record 更新で確認
-2. [n2] base backup: n1 の <dbname>.db / wal/ 全 stream / .last_checkpoint を
+2. [n2] base backup: n1 の <dbname>.db / wal/ 全 stream と各 WAL metadata を
    通常のファイルコピーで取得(下記の安全性根拠参照)
 3. [n2] 起動: RecoveryManager が全 stream を走査し REDO/UNDO。
    recovery 完了後、receiver を listen(9200)し、

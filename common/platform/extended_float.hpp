@@ -44,9 +44,10 @@ class SoftExtended {
  public:
   constexpr SoftExtended() = default;
   // Implicit, like the arithmetic conversions to long double it replaces.
-  template <typename T,
-            typename = std::enable_if_t<std::is_arithmetic_v<T>>>
-  SoftExtended(T value) {  // NOLINT(google-explicit-constructor)
+  template <typename T>
+  SoftExtended(T value)
+    requires(std::is_arithmetic_v<T>)
+  {  // NOLINT(google-explicit-constructor)
     if constexpr (std::is_floating_point_v<T>) {
       FromDouble(static_cast<double>(value));
     } else if constexpr (std::is_signed_v<T>) {
@@ -60,14 +61,37 @@ class SoftExtended {
 
   explicit operator double() const { return ToDouble(); }
   explicit operator float() const { return static_cast<float>(ToDouble()); }
-  // Truncates toward zero, exactly (an int64 survives a round trip).
-  template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
-  explicit operator T() const {
-    if (kind_ != Kind::kFinite || exponent_ <= -64) return T{0};
-    if (exponent_ >= 0) return static_cast<T>(ToDouble());  // out of range
-    const uint64_t magnitude = mantissa_ >> (-exponent_);
-    return negative_ ? static_cast<T>(~magnitude + 1)
-                     : static_cast<T>(magnitude);
+  // Truncates toward zero exactly, saturating finite overflow to the target
+  // integer range. Non-finite inputs map to zero.
+  template <typename T>
+  explicit operator T() const
+    requires(std::is_integral_v<T>)
+  {
+    if (kind_ != Kind::kFinite || exponent_ <= -64) {
+      return T{0};
+    }
+    if (exponent_ > 0) {
+      return negative_ ? std::numeric_limits<T>::lowest()
+                       : std::numeric_limits<T>::max();
+    }
+    const uint64_t magnitude =
+        exponent_ == 0 ? mantissa_ : mantissa_ >> (-exponent_);
+    if constexpr (std::is_same_v<T, bool>) {
+      return magnitude != 0;
+    }
+    if (negative_) {
+      if constexpr (std::is_signed_v<T>) {
+        const uint64_t limit =
+            static_cast<uint64_t>(std::numeric_limits<T>::max()) + 1;
+        if (magnitude >= limit) {
+          return std::numeric_limits<T>::lowest();
+        }
+        return static_cast<T>(-static_cast<int64_t>(magnitude));
+      }
+      return T{0};
+    }
+    const uint64_t limit = std::numeric_limits<T>::max();
+    return static_cast<T>(std::min(magnitude, limit));
   }
 
   friend SoftExtended operator+(SoftExtended a, SoftExtended b) {
@@ -162,7 +186,9 @@ class SoftExtended {
   // with `sticky` marking nonzero bits already shifted out) to 64 bits.
   static SoftExtended Round(bool negative, uint128_t value, int exponent,
                             bool sticky) {
-    if (value == 0) return Special(Kind::kZero, negative);
+    if (value == 0) {
+      return Special(Kind::kZero, negative);
+    }
     const auto hi = static_cast<uint64_t>(value >> 64);
     const auto lo = static_cast<uint64_t>(value);
     const int lead =
@@ -192,13 +218,19 @@ class SoftExtended {
     r.mantissa_ = mantissa;
     r.exponent_ = exponent + shift;
     const int64_t lead_exponent = int64_t{r.exponent_} + 63;
-    if (lead_exponent > kMaxExponent) return Special(Kind::kInf, negative);
-    if (lead_exponent < kMinExponent) return Special(Kind::kZero, negative);
+    if (lead_exponent > kMaxExponent) {
+      return Special(Kind::kInf, negative);
+    }
+    if (lead_exponent < kMinExponent) {
+      return Special(Kind::kZero, negative);
+    }
     return r;
   }
 
   static SoftExtended Add(SoftExtended a, SoftExtended b, bool subtract) {
-    if (subtract) b.negative_ = !b.negative_;
+    if (subtract) {
+      b.negative_ = !b.negative_;
+    }
     if (a.kind_ == Kind::kNaN || b.kind_ == Kind::kNaN) {
       return Special(Kind::kNaN, false);
     }
@@ -212,9 +244,15 @@ class SoftExtended {
     if (a.kind_ == Kind::kZero && b.kind_ == Kind::kZero) {
       return Special(Kind::kZero, a.negative_ && b.negative_);
     }
-    if (a.kind_ == Kind::kZero) return b;
-    if (b.kind_ == Kind::kZero) return a;
-    if (a.exponent_ < b.exponent_) std::swap(a, b);
+    if (a.kind_ == Kind::kZero) {
+      return b;
+    }
+    if (b.kind_ == Kind::kZero) {
+      return a;
+    }
+    if (a.exponent_ < b.exponent_) {
+      std::swap(a, b);
+    }
     // Keep 63 guard bits below the larger operand's significand.
     uint128_t big = static_cast<uint128_t>(a.mantissa_) << 63;
     uint128_t small = static_cast<uint128_t>(b.mantissa_) << 63;
@@ -241,7 +279,9 @@ class SoftExtended {
       }
       return Round(a.negative_, diff, exponent, sticky);
     }
-    if (big == small) return Special(Kind::kZero, false);
+    if (big == small) {
+      return Special(Kind::kZero, false);
+    }
     return Round(b.negative_, small - big, exponent, false);
   }
 
@@ -272,12 +312,16 @@ class SoftExtended {
       return b.kind_ == Kind::kInf ? Special(Kind::kNaN, true)
                                    : Special(Kind::kInf, negative);
     }
-    if (b.kind_ == Kind::kInf) return Special(Kind::kZero, negative);
+    if (b.kind_ == Kind::kInf) {
+      return Special(Kind::kZero, negative);
+    }
     if (b.kind_ == Kind::kZero) {
       return a.kind_ == Kind::kZero ? Special(Kind::kNaN, true)
                                     : Special(Kind::kInf, negative);
     }
-    if (a.kind_ == Kind::kZero) return Special(Kind::kZero, negative);
+    if (a.kind_ == Kind::kZero) {
+      return Special(Kind::kZero, negative);
+    }
     const uint128_t numerator = static_cast<uint128_t>(a.mantissa_) << 64;
     uint128_t quotient = numerator / b.mantissa_;
     uint128_t remainder = numerator % b.mantissa_;
@@ -299,27 +343,41 @@ class SoftExtended {
 
   // -1: a < b, 0: equal, 1: a > b, 2: unordered.
   static int Compare(SoftExtended a, SoftExtended b) {
-    if (a.kind_ == Kind::kNaN || b.kind_ == Kind::kNaN) return 2;
+    if (a.kind_ == Kind::kNaN || b.kind_ == Kind::kNaN) {
+      return 2;
+    }
     const int sa = a.Sign();
     const int sb = b.Sign();
-    if (sa != sb) return sa < sb ? -1 : 1;
-    if (sa == 0) return 0;
+    if (sa != sb) {
+      return sa < sb ? -1 : 1;
+    }
+    if (sa == 0) {
+      return 0;
+    }
     const int magnitude = CompareMagnitude(a, b);
     return sa > 0 ? magnitude : -magnitude;
   }
   [[nodiscard]] int Sign() const {
-    if (kind_ == Kind::kZero) return 0;
+    if (kind_ == Kind::kZero) {
+      return 0;
+    }
     return negative_ ? -1 : 1;
   }
   static int CompareMagnitude(SoftExtended a, SoftExtended b) {
     if (a.kind_ == Kind::kInf || b.kind_ == Kind::kInf) {
-      if (a.kind_ == b.kind_) return 0;
+      if (a.kind_ == b.kind_) {
+        return 0;
+      }
       return a.kind_ == Kind::kInf ? 1 : -1;
     }
     const int64_t ea = int64_t{a.exponent_} + 63;
     const int64_t eb = int64_t{b.exponent_} + 63;
-    if (ea != eb) return ea < eb ? -1 : 1;
-    if (a.mantissa_ != b.mantissa_) return a.mantissa_ < b.mantissa_ ? -1 : 1;
+    if (ea != eb) {
+      return ea < eb ? -1 : 1;
+    }
+    if (a.mantissa_ != b.mantissa_) {
+      return a.mantissa_ < b.mantissa_ ? -1 : 1;
+    }
     return 0;
   }
 
@@ -351,7 +409,9 @@ class SoftExtended {
       kept = mantissa_ >> shift;
       const uint64_t dropped = mantissa_ & ((uint64_t{1} << shift) - 1);
       const uint64_t half = uint64_t{1} << (shift - 1);
-      if (dropped > half || (dropped == half && (kept & 1U) != 0)) ++kept;
+      if (dropped > half || (dropped == half && (kept & 1U) != 0)) {
+        ++kept;
+      }
     }
     const double magnitude =
         std::ldexp(static_cast<double>(kept), static_cast<int>(lsb));
@@ -365,16 +425,22 @@ class SoftExtended {
 };
 
 inline SoftExtended Sqrt(SoftExtended x) {
-  if (x.kind_ == SoftExtended::Kind::kNaN) return x;
-  if (x.kind_ == SoftExtended::Kind::kZero) return x;  // sqrt(-0) = -0
+  if (x.kind_ == SoftExtended::Kind::kNaN) {
+    return x;
+  }
+  if (x.kind_ == SoftExtended::Kind::kZero) {
+    return x;  // sqrt(-0) = -0
+  }
   if (x.negative_) {
     return SoftExtended::Special(SoftExtended::Kind::kNaN, true);
   }
-  if (x.kind_ == SoftExtended::Kind::kInf) return x;
+  if (x.kind_ == SoftExtended::Kind::kInf) {
+    return x;
+  }
   // radicand = mantissa * 2^e with e even, scaled into [2^126, 2^128) so the
   // integer root carries exactly 64 significant bits.
   __extension__ using uint128_t = unsigned __int128;
-  uint128_t radicand = static_cast<uint128_t>(x.mantissa_);
+  auto radicand = static_cast<uint128_t>(x.mantissa_);
   int exponent = x.exponent_;
   if ((exponent & 1) != 0) {
     radicand <<= 63;
@@ -387,7 +453,9 @@ inline SoftExtended Sqrt(SoftExtended x) {
   uint128_t root = 0;
   uint128_t rem = radicand;
   uint128_t bit = static_cast<uint128_t>(1) << 126;
-  while (bit > rem) bit >>= 2;
+  while (bit > rem) {
+    bit >>= 2;
+  }
   while (bit != 0) {
     if (rem >= root + bit) {
       rem -= root + bit;
@@ -400,7 +468,7 @@ inline SoftExtended Sqrt(SoftExtended x) {
   // root has 64 bits (radicand >= 2^126); round to nearest: up iff the
   // remainder exceeds root (exact halves are impossible).
   bool round_up = rem > root;
-  uint64_t mantissa = static_cast<uint64_t>(root);
+  auto mantissa = static_cast<uint64_t>(root);
   int result_exponent = exponent / 2;
   if (round_up) {
     ++mantissa;

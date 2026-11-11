@@ -186,31 +186,40 @@ void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
   if (views_registered_epoch_ == epoch) {
     return;
   }
-  views_registered_epoch_ = epoch;
   StatusOr<std::vector<std::string>> names =
       database_->ListViewDefinitions(ctx);
   if (!names.HasValue()) {
     return;
   }
+  bool complete = true;
   for (const std::string& name : names.Value()) {
     StatusOr<std::string> text = database_->GetViewDefinition(ctx, name);
     if (!text.HasValue()) {
+      complete = false;
       continue;
     }
     const GoogleSqlParseResult parsed = GoogleSqlFrontend::Parse(text.Value());
     if (!parsed.ok) {
+      complete = false;
       continue;
     }
     StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
         GoogleSqlAstParser::Parse(parsed.ast);
     if (!ast.HasValue() || ast.Value() == nullptr) {
+      complete = false;
       continue;
     }
     const GoogleSqlAstNode* query = ast.Value()->Child("Query");
     if (query == nullptr) {
+      complete = false;
       continue;
     }
     RegisterViewDefinition(name, *query);
+  }
+  // A transient catalog/parser failure must be retried even if no DDL changes
+  // the epoch. Successful individual definitions may already be registered.
+  if (complete) {
+    views_registered_epoch_ = epoch;
   }
 }
 
@@ -900,66 +909,10 @@ bool ProjectionContainsUniqueKey(const Plan& plan,
   return false;
 }
 
-// The compact Value representation intentionally stores INT32/UINT32/UINT64
-// as INT64 bit patterns, so the catalog schema does not retain the narrower
-// SQL spelling. DML still has to enforce assignment bounds; the compliance
-// tables use the conventional *_value names for these columns.
-bool NarrowIntegerFits(const ColumnName& column, const Value& value) {
-  if (value.IsNull() ||
-      (value.type != ValueType::kInt64 && value.type != ValueType::kDate)) {
-    return true;
-  }
-  std::string name = column.name;
-  std::ranges::transform(name, name.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  const int64_t number = value.value.int_value;
-  if (name.find("uint64") != std::string::npos) {
-    return value.IsUnsigned() || number >= 0;
-  }
-  if (name.find("uint32") != std::string::npos) {
-    if (!value.IsUnsigned() && number < 0) {
-      return false;
-    }
-    return static_cast<uint64_t>(number) <= 4294967295ULL;
-  }
-  if (name.find("int32") != std::string::npos) {
-    if (value.IsUnsigned()) {
-      return static_cast<uint64_t>(number) <= 2147483647ULL;
-    }
-    return number >= -2147483648LL && number <= 2147483647LL;
-  }
-  if (name.find("uint16") != std::string::npos) {
-    if (!value.IsUnsigned() && number < 0) {
-      return false;
-    }
-    return static_cast<uint64_t>(number) <= 65535ULL;
-  }
-  if (name.find("int16") != std::string::npos) {
-    if (value.IsUnsigned()) {
-      return static_cast<uint64_t>(number) <= 32767ULL;
-    }
-    return number >= -32768 && number <= 32767;
-  }
-  if (name.find("uint8") != std::string::npos) {
-    if (!value.IsUnsigned() && number < 0) {
-      return false;
-    }
-    return static_cast<uint64_t>(number) <= 255ULL;
-  }
-  if (name.find("int8") != std::string::npos) {
-    if (value.IsUnsigned()) {
-      return static_cast<uint64_t>(number) <= 127ULL;
-    }
-    return number >= -128 && number <= 127;
-  }
-  return true;
-}
-
-Status ValidateNarrowInteger(const ColumnName& column, const Value& value) {
-  if (!NarrowIntegerFits(column, value)) {
+Status ValidateNarrowInteger(const Column& column, const Value& value) {
+  if (!column.IntegerValueFits(value)) {
     return {Status::kInvalidArgument,
-            "assignment out of range for column " + column.name};
+            "assignment out of range for column " + column.Name().name};
   }
   return Status::kSuccess;
 }
@@ -1608,7 +1561,7 @@ std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
       // identical for every parameter combination.
       const auto& col = shape.schema.GetColumn(i);
       const ValueType expected = col.Type();
-      if (ValidateNarrowInteger(col.Name(), evaluated[i]) != Status::kSuccess) {
+      if (ValidateNarrowInteger(col, evaluated[i]) != Status::kSuccess) {
         // The slow path re-validates and surfaces the diagnostic.
         return std::nullopt;
       }
@@ -2357,9 +2310,10 @@ StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
         }
       }
       if (proto_target) {
-        const auto rewritten =
-            ProtoTextSetField(std::string(cell.value.varchar_value),
-                              entry.proto_path, edit_cell, proto_type);
+        ASSIGN_OR_RETURN(
+            std::optional<std::string>, rewritten,
+            TryProtoTextSetField(std::string(cell.value.varchar_value),
+                                 entry.proto_path, edit_cell, proto_type));
         if (rewritten.has_value()) {
           cell = Value(std::string(*rewritten));
         }
@@ -2518,8 +2472,9 @@ StatusOr<std::optional<std::string>> SetStructPathByOrdinals(
           const std::string_view proto_text(nested_value.value.varchar_value);
           const std::string proto_type =
               InferProtoTypeName(proto_text, proto_path);
-          const auto proto = ProtoTextSetField(
-              std::string(proto_text), proto_path, new_value, proto_type);
+          ASSIGN_OR_RETURN(std::optional<std::string>, proto,
+                           TryProtoTextSetField(proto_text, proto_path,
+                                                new_value, proto_type));
           rebuilt += proto.has_value()
                          ? EncodeStructMemberJson(Value(std::string(*proto)))
                          : members[i].second;
@@ -2657,6 +2612,8 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
     ++source;
   }
 
+  RETURN_IF_FAIL(source.GetStatus());
+
   // Resolve each path segment's positional index from any matched row that
   // carries the segment names explicitly (anonymous tuples store fN keys).
   for (auto& target : field_targets) {
@@ -2711,12 +2668,13 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
             Value, assigned,
             (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
                                             ctx, relational_detail::CteMap{})));
-        ValidateEnumFieldValue(
+        RETURN_IF_FAIL(TryValidateEnumFieldValue(
             proto_type,
             target.segments.empty() ? std::string() : target.segments.back(),
-            assigned);
-        auto rewritten = ProtoTextSetField(
-            std::string(payload), target.segments, assigned, proto_type);
+            assigned));
+        ASSIGN_OR_RETURN(std::optional<std::string>, rewritten,
+                         TryProtoTextSetField(payload, target.segments,
+                                              assigned, proto_type));
         if (rewritten.has_value()) {
           cell = Value(std::move(*rewritten));
         }
@@ -3289,7 +3247,6 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
     (void)inserted;
     ++modified;
   }
-  database_->BumpSchemaEpoch();
   return Executor(std::make_shared<ConstantExecutor>(
       Row({Value(merge.DesugaredFromUpdate() ? "Update Rows" : "Merge Rows"),
            Value(modified)})));
@@ -3788,7 +3745,7 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     }
     const auto resolve_col = [&](const ColumnName& col) -> ColumnName {
       if (!col.schema.empty()) {
-        return ColumnName(AsciiToLower(col.schema), AsciiToLower(col.name));
+        return {AsciiToLower(col.schema), AsciiToLower(col.name)};
       }
       for (const NamedExpression& item : core.select_) {
         if (!item.expression ||
@@ -3798,10 +3755,10 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
         const ColumnName& cand =
             item.expression->AsColumnValue().GetColumnName();
         if (IdentifierEquals(cand.name, col.name)) {
-          return ColumnName(AsciiToLower(cand.schema), AsciiToLower(cand.name));
+          return {AsciiToLower(cand.schema), AsciiToLower(cand.name)};
         }
       }
-      return ColumnName("", AsciiToLower(col.name));
+      return {"", AsciiToLower(col.name)};
     };
     std::unordered_set<ColumnName> grouped_columns;
     std::unordered_set<std::string> grouped_expr_strings;
@@ -3834,12 +3791,8 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
         }
         return !grouped_columns.contains(resolve_col(col));
       }
-      for (const Expression& child : ExpressionChildren(expr)) {
-        if (has_ungrouped_column(child)) {
-          return true;
-        }
-      }
-      return false;
+      return std::ranges::any_of(ExpressionChildren(expr),
+                                 has_ungrouped_column);
     };
     for (const NamedExpression& item : select.SelectList()) {
       if (has_ungrouped_column(item.expression)) {
@@ -3849,12 +3802,9 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     if (has_ungrouped_column(substitute_aliases(select.Having()))) {
       return true;
     }
-    for (const auto& term : select.OrderBy()) {
-      if (has_ungrouped_column(substitute_aliases(term.expression))) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(select.OrderBy(), [&](const auto& term) {
+      return has_ungrouped_column(substitute_aliases(term.expression));
+    });
   }();
   auto emit_relational = [&]() -> StatusOr<Executor> {
     StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
@@ -4426,8 +4376,8 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
         sort_keys.emplace_back("", order_expression);
         continue;
       }
-      const NamedExpression* matched = nullptr;
-      for (const NamedExpression& item : projection_items) {
+      NamedExpression* matched = nullptr;
+      for (NamedExpression& item : projection_items) {
         if (item.expression &&
             item.expression->ToString() == order_expression->ToString()) {
           matched = &item;
@@ -4443,6 +4393,13 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
             break;
           }
         }
+      }
+      if (matched != nullptr && !matched->name.empty() &&
+          std::ranges::count_if(projection_items, [&](const auto& item) {
+            return IdentifierEquals(item.name, matched->name);
+          }) > 1) {
+        matched->name = "$sort" + std::to_string(static_cast<size_t>(
+                                      matched - projection_items.data()));
       }
       // An anonymous select item (`MOD(x, 2)` with no alias) has no output
       // name to bind to, so it takes the hidden-column path even though the
@@ -4670,8 +4627,12 @@ StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
       std::swap(saved_parameters, plan_cache_parameters_);
       if (exec.HasValue()) {
         Row probe;
-        const bool any = exec.Value()->Next(&probe, nullptr) &&
-                         exec.Value()->GetStatus() == Status::kSuccess;
+        const bool any = exec.Value()->Next(&probe, nullptr);
+        if (exec.Value()->GetStatus() != Status::kSuccess) {
+          // Preserve the subquery so the checked DML evaluator reports its
+          // error. Failure is never proof of an empty EXISTS result.
+          return expression;
+        }
         dml_fold_applied_ = true;
         return ConstantValueExp(Value(query.Negated() ? !any : any));
       }
@@ -4865,6 +4826,13 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                   ? Constraint(Constraint::kPrimaryKey)
                   : Constraint();
           columns.emplace_back(col_name, vtype, constraint);
+          columns.back().SetIntegerBits(schema_column.IntegerBits());
+          columns.back().SetUnsigned(schema_column.IsUnsigned());
+          columns.back().SetInterval(
+              schema_column.IsInterval() ||
+              std::ranges::any_of(rows, [i](const Row& row) {
+                return i < row.Count() && row[i].IsInterval();
+              }));
           if (std::ranges::any_of(rows, [i](const Row& row) {
                 return i < row.Size() && row[i].IsUnsigned();
               })) {
@@ -5049,7 +5017,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         for (size_t i = 0; i < row.values_.size(); ++i) {
           const auto& col = table->GetSchema().GetColumn(i);
           const ValueType expected = col.Type();
-          if (Status st_ni = ValidateNarrowInteger(col.Name(), row[i]);
+          if (Status st_ni = ValidateNarrowInteger(col, row[i]);
               st_ni != Status::kSuccess) {
             last_error_ = st_ni.GetMessage();
             return Status::kUnknown;
@@ -5239,6 +5207,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       // anything they reject keeps the existing materialized/relational
       // path untouched.
       (void)ReduceGroupByFunctionalDependencies(select.get(), ctx);
+      (void)InlineSingleUseGroupedCtes(select.get(), ctx);
       (void)InlineSingleUseCtes(select.get());
       // A CTE that stays shared cannot take one consumer's filter, but it can
       // take the disjunction of every consumer's restriction: that keeps every
@@ -6159,6 +6128,16 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                      IdentifierEquals(item.name, order_name.name);
             });
         if (selected != query.select_.end()) {
+          // Client labels were captured before physical planning. Give a
+          // duplicated output name a unique internal binding so ordering the
+          // second projection cannot resolve to the first one.
+          if (!selected->name.empty() &&
+              std::ranges::count_if(query.select_, [&](const auto& item) {
+                return IdentifierEquals(item.name, selected->name);
+              }) > 1) {
+            selected->name = "$sort" + std::to_string(std::distance(
+                                           query.select_.begin(), selected));
+          }
           // Keep the optimizer's required ordering in terms of the selected
           // expression itself.  A bare ORDER BY alias is an output-schema
           // name, not an input column, and retaining it here would make the
@@ -6571,12 +6550,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       if (update.HasNestedDml()) {
         // Nested per-row array DML: rows are rewritten element-wise here
         // because array mutations are not expressible as plain projections.
-        StatusOr<Executor> result =
-            ExecuteNestedArrayUpdate(ctx, update, table.get());
-        if (result.HasValue()) {
-          database_->BumpSchemaEpoch();
-        }
-        return result;
+        return ExecuteNestedArrayUpdate(ctx, update, table.get());
       }
       const Schema& schema = table->GetSchema();
       {
@@ -6600,12 +6574,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
               "targets in one SET clause");
         }
         if (dotted_target) {
-          StatusOr<Executor> result =
-              ExecuteStructFieldUpdate(ctx, update, table.get());
-          if (result.HasValue()) {
-            database_->BumpSchemaEpoch();
-          }
-          return result;
+          return ExecuteStructFieldUpdate(ctx, update, table.get());
         }
       }
       std::vector<NamedExpression> output;

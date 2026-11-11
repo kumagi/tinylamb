@@ -18,6 +18,9 @@
 #define TINYLAMB_COMMON_PLATFORM_EVENT_POLLER_HPP
 
 #include <cstdint>
+#ifdef _WIN32
+#include <condition_variable>
+#endif
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -53,10 +56,12 @@ class EventPoller {
   ~EventPoller();
   EventPoller(const EventPoller&) = delete;
   EventPoller& operator=(const EventPoller&) = delete;
+  EventPoller(EventPoller&&) = delete;
+  EventPoller& operator=(EventPoller&&) = delete;
 
   // Creates the kernel object. Returns false with errno set on failure.
   bool Open();
-  bool IsOpen() const { return poll_fd_ >= 0; }
+  [[nodiscard]] bool IsOpen() const { return poll_fd_ >= 0; }
   void Close();
 
   // Each returns false with errno set on failure.
@@ -70,7 +75,10 @@ class EventPoller {
 
  private:
   int poll_fd_{-1};
-#if !defined(__linux__)
+#ifdef _WIN32
+  std::condition_variable interest_changed_;
+#endif
+#ifndef __linux__
   // kqueue registers read and write as independent filters, so Modify needs
   // the previous interest to know which filters to add or delete.
   std::mutex mu_;
@@ -88,11 +96,13 @@ class Waker {
   ~Waker();
   Waker(const Waker&) = delete;
   Waker& operator=(const Waker&) = delete;
+  Waker(Waker&&) = delete;
+  Waker& operator=(Waker&&) = delete;
 
   bool Open();  // false with errno set on failure
-  bool IsOpen() const { return read_fd_ >= 0; }
+  [[nodiscard]] bool IsOpen() const { return read_fd_ >= 0; }
   void Close();
-  int ReadFd() const { return read_fd_; }
+  [[nodiscard]] int ReadFd() const { return read_fd_; }
   void Wake() const;
   void Drain() const;
 

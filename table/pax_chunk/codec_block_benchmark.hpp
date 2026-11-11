@@ -30,7 +30,11 @@
 // serializing a footer.  The persisted footer stores row counts as uint16_t,
 // so a footer-shaped benchmark cannot represent one 65,536-row cell; this
 // adapter lets the experiment vary the codec block independently from the
-// existing 1,024-row physical row group.
+// existing 1,024-row physical row group. Compressed schemes conservatively
+// decline blocks above 65,535 rows unless their wider wire fields are proven:
+// PLAIN and CONST accept larger numeric blocks, integer RLE also does, and
+// varchar PLAIN is the sole large string-block path. Smaller per-codec limits
+// still apply. A declined block is unsupported, never a zero-byte encoding.
 namespace tinylamb::codec_benchmark {
 
 enum class ValueKind : uint8_t { kInt64, kDoubleBits, kVarchar };

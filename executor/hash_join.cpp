@@ -751,8 +751,12 @@ bool HashJoin::MaterializeOrThrow() {
   return true;
 }
 
-size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
+size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) try {
   destination->Reset();
+  if (materialize_failed_) {
+    FailWith(materialize_error_);
+    return 0;
+  }
   if (!materialized_) {
     if (!MaterializeOrThrow()) {
       return 0;
@@ -768,6 +772,11 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
     while (destination->Size() < max_rows && EmitNextMatch(&row, &position)) {
       destination->Append(row, position);
     }
+    if (state_ && state_->spill_error != Status::kSuccess) {
+      destination->Reset();
+      FailWith(state_->spill_error);
+      return 0;
+    }
     return destination->Size();
   }
   while (output_offset_ < output_.size() && destination->Size() < max_rows) {
@@ -776,6 +785,19 @@ size_t HashJoin::NextBatch(DataChunk* destination, size_t max_rows) {
     ++output_offset_;
   }
   return destination->Size();
+} catch (const std::exception& error) {
+  destination->Reset();
+  materialize_failed_ = true;
+  materialize_error_ = StatusError(StatusCode::kRuntimeError, error.what());
+  FailWith(materialize_error_);
+  return 0;
+} catch (...) {
+  destination->Reset();
+  materialize_failed_ = true;
+  materialize_error_ =
+      StatusError(StatusCode::kRuntimeError, "hash join worker failed");
+  FailWith(materialize_error_);
+  return 0;
 }
 
 Status HashJoin::Materialize() {
@@ -854,6 +876,13 @@ Status HashJoin::MaterializeSingle() {
 
   const std::vector<PositionedRow>& left_rows = s.left.rows;
   const std::vector<PositionedRow>& right_rows = s.right.rows;
+  if (right_width_ == 0 && !right_rows.empty()) {
+    right_width_ = right_rows.front().first.Count();
+  }
+  if (right_width_ == 0 && right_rows.empty() && !left_rows.empty()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "SingleJoin requires the empty right input width");
+  }
   std::string scratch;
 
   const std::optional<ValueType> int_mode =
@@ -1081,6 +1110,13 @@ Status HashJoin::MaterializeOuter() {
 
   const bool preserve_left = kind_ != JoinKind::kRightOuter;
   const bool preserve_right = kind_ != JoinKind::kLeftOuter;
+  if ((preserve_left && !left_rows.empty() && right_rows.empty() &&
+       right_width_ == 0) ||
+      (preserve_right && !right_rows.empty() && left_rows.empty() &&
+       left_width_ == 0)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "outer join requires the empty input width");
+  }
   std::vector<bool> matched_right(right_rows.size(), false);
   std::string scratch;
   const std::optional<ValueType> int_mode =

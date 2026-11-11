@@ -38,6 +38,30 @@ std::shared_ptr<const PreparedValues> Vals(std::vector<Value> values) {
 
 }  // namespace
 
+TEST(VolatileFingerprintTest, SaturationIsBoundedAndCannotReviveStalePlans) {
+  PreparedPlanSessionCache session;
+  ScopedPreparedPlanSession scope(&session);
+  for (size_t i = 0; i < kVolatileFingerprintCapacity; ++i) {
+    EXPECT_TRUE(MarkFingerprintVolatile("fold-" + std::to_string(i)));
+  }
+  EXPECT_FALSE(MarkFingerprintVolatile("overflow"));
+  EXPECT_TRUE(session.volatile_fingerprints.empty());
+  for (size_t i = 0; i < kVolatileFingerprintCapacity * 2; ++i) {
+    const std::string key = "fold-" + std::to_string(i);
+    EXPECT_FALSE(MarkFingerprintVolatile(key));
+    DemoteVolatileFingerprint(key, true);
+    EXPECT_TRUE(IsVolatileSpecializedPlan(key));
+  }
+  EXPECT_TRUE(IsVolatileSpecializedPlan("globally-cached-stale-plan"));
+  EXPECT_TRUE(session.volatile_fingerprints.empty());
+  PreparedPlanSessionCache other;
+  ScopedPreparedPlanSession other_scope(&other);
+  EXPECT_FALSE(IsVolatileSpecializedPlan("fold-0"));
+  EXPECT_TRUE(MarkFingerprintVolatile("temporary"));
+  DemoteVolatileFingerprint("temporary", true);
+  EXPECT_FALSE(IsVolatileSpecializedPlan("temporary"));
+}
+
 TEST(ParameterSlotTest, EvaluateReturnsSlotValue) {
   auto values = Vals({Value(int64_t{7}), Value(std::string("s"))});
   const ParameterSlot slot(1, ValueType::kVarChar, values);

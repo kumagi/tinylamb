@@ -14,6 +14,31 @@
 
 namespace tinylamb {
 
+TEST(GoogleSqlFrontendTest, AuditDistinctOnInjectionFailsClosed) {
+  const std::string keys =
+      "Select [0-8]\n  SelectList [7-8]\n    SelectColumn\n      "
+      "IntLiteral(1)\n";
+  for (const std::string main : {"QueryStatement\n", "Select [0-10]"}) {
+    std::string ast = main;
+    EXPECT_FALSE(frontend_detail::InjectDistinctOnKeys(ast, keys));
+    EXPECT_EQ(ast, main);
+  }
+  const std::string main = "Select [0-10]\n  SelectList\n    SelectColumn\n";
+  for (const std::string malformed_keys :
+       {"", "Select [0-8]\n", "SelectList", "SelectList\n"}) {
+    std::string ast = main;
+    EXPECT_FALSE(frontend_detail::InjectDistinctOnKeys(ast, malformed_keys));
+    EXPECT_EQ(ast, main);
+  }
+  std::string ast = main;
+  ASSERT_TRUE(frontend_detail::InjectDistinctOnKeys(ast, keys));
+  EXPECT_NE(ast.find("DistinctOn\n    SelectColumn"), std::string::npos);
+  auto parsed =
+      GoogleSqlFrontend::Parse("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a");
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  EXPECT_NE(parsed.ast.find("DistinctOn"), std::string::npos);
+}
+
 TEST(GoogleSqlFrontendTest, ReturnsParserAst) {
   GoogleSqlParseResult result = GoogleSqlFrontend::Parse(
       "select c_id from customer where c_w_id=1 order by c_id limit 1");

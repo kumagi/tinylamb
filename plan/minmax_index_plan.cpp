@@ -30,7 +30,9 @@ MinMaxIndexPlan::MinMaxIndexPlan(Plan child, NamedExpression aggregate,
               aggregate_.expression->AsAggregateExpression();
           try {
             const Type result =
-                expression.Child()->ResultType(child_->GetSchema());
+                expression.Child()
+                    ? expression.Child()->ResultType(child_->GetSchema())
+                    : Type(TypeTag::kBigInt);
             switch (result.GetType()) {
               case TypeTag::kDouble:
                 value_type = ValueType::kDouble;
@@ -58,6 +60,10 @@ void MinMaxIndexPlan::Dump(std::ostream& output, int indent) const {
 }
 
 std::string MinMaxIndexPlan::ToString() const {
+  if (!aggregate_.expression ||
+      aggregate_.expression->Type() != TypeTag::kAggregateExp) {
+    return "MinMaxIndexScan invalid aggregate";
+  }
   const auto& aggregate = aggregate_.expression->AsAggregateExpression();
   const bool is_max = aggregate.GetType() == AggregationType::kMax;
   std::string result = "MinMaxIndexScan ";

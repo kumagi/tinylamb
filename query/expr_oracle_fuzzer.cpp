@@ -52,9 +52,10 @@ struct EngineOutcome {
 };
 
 EngineOutcome RunScalar(Database& db, TransactionContext& ctx,
-                        const std::string& sql) {
+                        const std::string& sql, bool force_relational = false) {
   EngineOutcome outcome;
   SqlEngine engine(db);
+  engine.SetForceRelationalFallback(force_relational);
   StatusOr<QueryResult> result = engine.Execute(ctx, sql);
   if (!result.HasValue()) {
     return outcome;  // rejected: ran stays false
@@ -64,6 +65,13 @@ EngineOutcome RunScalar(Database& db, TransactionContext& ctx,
     Row row;
     while (result.Value().Next(&row)) {
       rows.push_back(row);
+    }
+    const Status st = result.Value().GetStatus();
+    if (!st.ok()) {
+      outcome.ran = true;
+      outcome.threw = true;
+      outcome.error = st.GetMessage();
+      return outcome;
     }
     if (rows.size() != 1 || rows[0].Size() < 1) {
       return outcome;  // unexpected shape: skip rather than misreport
@@ -184,6 +192,47 @@ std::string RunExprOracleIteration(std::mt19937& rng, bool verbose,
               "\n  reference(AST): " + DescribeReference(reference) +
               "\n  actual(engine): " + DescribeEngine(engine) + "\n";
   }
+
+  // Oracle (c): RelationalExecutor (`force_relational = true`) over a 1-row
+  // table so `executor/detail/expression_eval.cpp` and
+  // `executor/detail/function_eval.cpp` are differential-tested against the
+  // AST reference and default projection path on every scalar expression.
+  {
+    SqlEngine setup_eng(db);
+    if (auto ddl =
+            setup_eng.Execute(ctx, "CREATE TABLE _one_row (dummy INT64);");
+        ddl.HasValue()) {
+      ddl.Value().Drain();
+      if (auto ins = setup_eng.Execute(ctx, "INSERT INTO _one_row VALUES (1);");
+          ins.HasValue()) {
+        ins.Value().Drain();
+        const std::string rel_sql =
+            "SELECT " + generated.sql + " FROM _one_row WHERE dummy = 1;";
+        const EngineOutcome rel_engine =
+            RunScalar(db, ctx, rel_sql, /*force_relational=*/true);
+        if (rel_engine.ran) {
+          const bool rel_agrees =
+              (reference.threw && rel_engine.threw) ||
+              (!reference.threw && !rel_engine.threw &&
+               SimplifyValuesEqual(reference.value, rel_engine.value) &&
+               (reference.value.IsNull() ||
+                reference.value.type == rel_engine.value.type));
+          if (!rel_agrees) {
+            t.actual += " | rel_engine=" + DescribeEngine(rel_engine);
+            t.failure = t.failure.empty()
+                            ? "relational engine mismatch vs AST reference"
+                            : t.failure + " + relational engine mismatch";
+            report += "[EXPR-RELATIONAL-ENGINE MISMATCH]\n  sql: " + rel_sql +
+                      "\n  sexpr: " + t.sexpr +
+                      "\n  reference(AST): " + DescribeReference(reference) +
+                      "\n  actual(relational): " + DescribeEngine(rel_engine) +
+                      "\n";
+          }
+        }
+      }
+    }
+  }
+
   if (verbose && report.empty()) {
     std::cerr << "[expr_oracle_fuzz][ok] " << t.sql << " => " << t.reference
               << "\n";
@@ -308,7 +357,11 @@ void ExprOracleFuzzTry(const uint8_t* data, size_t size, bool verbose) {
   std::mt19937 run_rng(seed32);
   std::string report = RunExprOracleIteration(run_rng, verbose, &trace);
   if (report.empty()) {
-    if (std::getenv("TINYLAMB_EXPR_ROW_ORACLE") != nullptr) {
+    const char* row_env = std::getenv("TINYLAMB_EXPR_ROW_ORACLE");
+    const bool run_row_oracle = (row_env != nullptr)
+                                    ? (std::string_view(row_env) != "0")
+                                    : ((seed32 & 3U) == 0U);
+    if (run_row_oracle) {
       std::mt19937 row_rng(seed32);
       RowExprOracleTrace row_trace;
       row_trace.seed = trace.seed;
@@ -990,6 +1043,141 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
         "  Actual IDs   (SQL Engine):       " +
         fmt(engine_ids) + "\n";
     t.failure = "engine differential mismatch";
+    return report;
+  }
+
+  // Oracle 4: RelationalExecutor (`force_relational = true`) differential check
+  // on the same row predicate, plus targeted multi-tier expression probes
+  // inspired by the 2026-11-10 audit.
+  {
+    SqlEngine rel_engine(db);
+    rel_engine.SetForceRelationalFallback(true);
+    StatusOr<QueryResult> rel_qr = rel_engine.Execute(read_ctx, sql);
+    if (rel_qr.HasValue()) {
+      std::vector<int64_t> rel_ids;
+      Row r;
+      while (rel_qr.Value().Next(&r)) {
+        if (r.Size() >= 1 && !r[0].IsNull()) {
+          rel_ids.push_back(r[0].value.int_value);
+        }
+      }
+      const Status rel_st = rel_qr.Value().GetStatus();
+      std::sort(rel_ids.begin(), rel_ids.end());
+      if (rel_st != Status::kSuccess || rel_ids != expected_ids) {
+        report +=
+            "[RELATIONAL ENGINE DIFFERENTIAL MISMATCH]\n"
+            "  Query SQL: " +
+            sql + "\n";
+        t.failure = "relational engine differential mismatch";
+        return report;
+      }
+    }
+
+    auto check_dual_query = [&](const std::string& probe_sql,
+                                const char* tag) -> bool {
+      StatusOr<QueryResult> q0 = read_engine.Execute(read_ctx, probe_sql);
+      StatusOr<QueryResult> q1 = rel_engine.Execute(read_ctx, probe_sql);
+      if (!q0.HasValue() || !q1.HasValue()) {
+        if (q0.HasValue() != q1.HasValue()) {
+          report += std::string("[") + tag +
+                    " PREPARE MISMATCH]\n  SQL: " + probe_sql + "\n";
+          t.failure = std::string(tag) + " prepare mismatch";
+          return false;
+        }
+        return true;
+      }
+      std::vector<Row> r0, r1;
+      Row tmp;
+      while (q0.Value().Next(&tmp)) {
+        r0.push_back(tmp);
+      }
+      while (q1.Value().Next(&tmp)) {
+        r1.push_back(tmp);
+      }
+      const Status s0 = q0.Value().GetStatus();
+      const Status s1 = q1.Value().GetStatus();
+      if (s0.ok() != s1.ok()) {
+        report += std::string("[") + tag +
+                  " STATUS MISMATCH]\n  SQL: " + probe_sql +
+                  "\n  default=" + s0.GetMessage() +
+                  " relational=" + s1.GetMessage() + "\n";
+        t.failure = std::string(tag) + " status mismatch";
+        return false;
+      }
+      if (!s0.ok()) {
+        return true;
+      }
+      if (r0.size() != r1.size()) {
+        report += std::string("[") + tag +
+                  " ROW COUNT MISMATCH]\n  SQL: " + probe_sql + "\n";
+        t.failure = std::string(tag) + " row count mismatch";
+        return false;
+      }
+      for (size_t idx = 0; idx < r0.size(); ++idx) {
+        if (r0[idx].Count() != r1[idx].Count()) {
+          report += std::string("[") + tag +
+                    " COL COUNT MISMATCH]\n  SQL: " + probe_sql + "\n";
+          t.failure = std::string(tag) + " col count mismatch";
+          return false;
+        }
+        for (size_t c = 0; c < r0[idx].Count(); ++c) {
+          const Value& v0 = r0[idx][c];
+          const Value& v1 = r1[idx][c];
+          if (!SimplifyValuesEqual(v0, v1) ||
+              (!v0.IsNull() && v0.type != v1.type)) {
+            report += std::string("[") + tag +
+                      " VALUE/TYPE MISMATCH]\n  SQL: " + probe_sql +
+                      "\n  default=" + FormatSimplifyValue(v0) +
+                      " relational=" + FormatSimplifyValue(v1) + "\n";
+            t.failure = std::string(tag) + " value/type mismatch";
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    // Short-circuit evaluation when first branch is decisive (Medium #38).
+    if (!check_dual_query(
+            "SELECT id, IFNULL(i, 1 / (id - id)), COALESCE(i, 1 / (id - id)), "
+            "IF(i IS NOT NULL, i, 1 / (id - id)) FROM " +
+                tab + " WHERE i IS NOT NULL ORDER BY id;",
+            "SHORT-CIRCUIT")) {
+      return report;
+    }
+    // Mixed INT64/FLOAT64 promotion in IF / IFERROR (Medium #35, #67).
+    if (!check_dual_query(
+            "SELECT id, IF(b, i, f), IFERROR(1 / NULLIF(i, 0), 0.5) FROM " +
+                tab + " ORDER BY id;",
+            "IF-TYPE-PROMOTION")) {
+      return report;
+    }
+    // 5-digit year DATE EXTRACT and JSON 64-bit index overflow (Medium #66,
+    // #69).
+    if (!check_dual_query(
+            "SELECT EXTRACT(YEAR FROM CAST('10000-03-15' AS DATE)), "
+            "EXTRACT(MONTH FROM CAST('10000-03-15' AS DATE)), "
+            "EXTRACT(DAY FROM CAST('10000-03-15' AS DATE)), "
+            "JSON_EXTRACT('[10,20,30]', '$[4294967297]') FROM " +
+                tab + " LIMIT 1;",
+            "DATE5-JSON-IDX")) {
+      return report;
+    }
+    // STRUCT JSON formatting consistency (Medium #39).
+    if (!check_dual_query(
+            "SELECT id, TO_JSON_STRING(STRUCT(s AS a, COALESCE(s, 'null') AS "
+            "b, i AS c)) FROM " +
+                tab + " ORDER BY id;",
+            "STRUCT-JSON")) {
+      return report;
+    }
+    // Cross-type subquery IN error preservation (High #1).
+    if (!check_dual_query("SELECT id FROM " + tab +
+                              " WHERE 1 IN (SELECT s FROM " + tab +
+                              " WHERE s IS NOT NULL) ORDER BY id;",
+                          "SUBQUERY-IN-TYPE-ERROR")) {
+      return report;
+    }
   }
 
   return report;

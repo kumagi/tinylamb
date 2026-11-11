@@ -194,6 +194,31 @@ class SyncGate {
   std::shared_ptr<State> state_;
 };
 
+TEST(PostgresServerExtraTest, AuditExplicitWorkerCountRespectsBucketCapacity) {
+  for (size_t workers : {size_t{17}, size_t{1024}}) {
+    PostgresServerOptions options;
+    options.port = 0;
+    options.read_worker_threads = workers;
+    PostgresServer server("postgres_worker_audit-" + RandomString(), options);
+    std::string error;
+    ASSERT_TRUE(server.Listen(&error)) << error;
+    std::jthread thread([&] { EXPECT_EQ(server.Run(&error), 0) << error; });
+    StopGuard stop{&server};
+    std::vector<int> clients;
+    for (int i = 0; i < 24; ++i) {
+      const int client = ConnectClient(server.BoundPort());
+      ASSERT_GE(client, 0);
+      clients.push_back(client);
+      EXPECT_TRUE(SendAll(client, QueryMessage("SELECT 1 + 2")));
+    }
+    for (int client : clients) {
+      const std::string reply = ReadUntilReady(client);
+      EXPECT_EQ(ReadyForQueryStatus(reply), 'I');
+      close(client);
+    }
+  }
+}
+
 TEST(PostgresServerExtraTest, PendingDurableRepliesDoNotOccupySqlWorkers) {
   const std::string path = "postgres_durable_replies-" + RandomString();
   {
@@ -559,6 +584,84 @@ TEST(PostgresServerExtraTest, DistinctKeyChurnKeepsOtherSessionsIndependent) {
   auto database = Database::Create(path).MoveValue();
   ASSERT_NE(database, nullptr);
   database->DeleteAll();
+}
+
+TEST(PostgresServerExtraTest, AuditStartupAdvertisesBackslashEscapes) {
+  const std::string path = "postgres_server_extra_test-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread server_thread([&] { server.Run(&error); });
+  StopGuard guard(&server);
+  const int fd = platform::OpenSocket(AF_INET, SOCK_STREAM, 0, {});
+  ASSERT_GE(fd, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.BoundPort());
+  ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
+            0);
+  ASSERT_TRUE(SendAll(fd, StartupMessage()));
+  const auto startup = ReadUntilReady(fd);
+  EXPECT_NE(startup.find(
+                pgwire::ParameterStatus("standard_conforming_strings", "off")),
+            std::string::npos);
+  ASSERT_TRUE(SendAll(fd, QueryMessage(R"(SELECT 'a\nb')")));
+  EXPECT_NE(ReadUntilReady(fd).find(pgwire::DataRow(Row({Value("a\nb")}))),
+            std::string::npos);
+  close(fd);
+}
+
+TEST(PostgresServerExtraTest, AuditCommitStartsAnotherImplicitBlock) {
+  const std::string path = "postgres_server_extra_test-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread server_thread([&] { server.Run(&error); });
+  StopGuard guard(&server);
+  const int fd = ConnectClient(server.BoundPort());
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(
+      SendAll(fd, QueryMessage("CREATE TABLE audit_blocks (id INT64)")));
+  ASSERT_NE(ReadUntilReady(fd).find(pgwire::CommandComplete("CREATE TABLE")),
+            std::string::npos);
+  for (const std::string& boundary : {"COMMIT", "ROLLBACK"}) {
+    ASSERT_TRUE(SendAll(
+        fd, QueryMessage("INSERT INTO audit_blocks VALUES (1); " + boundary +
+                         "; INSERT INTO audit_blocks VALUES (2); SELECT "
+                         "missing FROM audit_blocks")));
+    EXPECT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
+    ASSERT_TRUE(
+        SendAll(fd, QueryMessage("SELECT id FROM audit_blocks ORDER BY id")));
+    const auto wire = ReadUntilReady(fd);
+    EXPECT_EQ(wire.find(pgwire::DataRow(Row({Value(2)}))), std::string::npos);
+    EXPECT_NE(wire.find(pgwire::DataRow(Row({Value(1)}))), std::string::npos);
+  }
+  close(fd);
+}
+
+TEST(PostgresServerExtraTest, AuditNestedCommentRoutesTransactionControl) {
+  const std::string path = "postgres_server_extra_test-" + RandomString();
+  PostgresServerOptions options;
+  options.port = 0;
+  PostgresServer server(path, options);
+  std::string error;
+  ASSERT_TRUE(server.Listen(&error)) << error;
+  std::jthread server_thread([&] { server.Run(&error); });
+  StopGuard guard(&server);
+  const int fd = ConnectClient(server.BoundPort());
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(
+      SendAll(fd, QueryMessage("/* outer /* inner */ still outer */ BEGIN")));
+  EXPECT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'T');
+  ASSERT_TRUE(SendAll(
+      fd, QueryMessage("/* outer /* inner */ still outer */ ROLLBACK")));
+  EXPECT_EQ(ReadyForQueryStatus(ReadUntilReady(fd)), 'I');
+  close(fd);
 }
 
 // A comment prepended to BEGIN must not defeat transaction routing: the
@@ -958,23 +1061,41 @@ TEST(PostgresServerExtraTest,
     EXPECT_TRUE(SendAll(fd, QueryMessage(sql)));
     return ReadUntilReady(fd);
   };
+  // A worker may send ReadyForQuery before epoll retires its completion.
+  // DDL on another session must honor the documented quiescence admission:
+  // retry only that transient SQLSTATE, never syntax/execution failures.
+  const auto catalog_query = [&](const std::string& sql) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+      std::string response = query(admin, sql);
+      if (!response.starts_with("E") ||
+          response.find("C55006") == std::string::npos ||
+          std::chrono::steady_clock::now() >= deadline) {
+        EXPECT_FALSE(response.starts_with("E")) << response;
+        return response;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
   EXPECT_NE(
-      query(admin, "CREATE TABLE pooled_base (v INT64)").find("CREATE TABLE"),
+      catalog_query("CREATE TABLE pooled_base (v INT64)").find("CREATE TABLE"),
       std::string::npos);
   EXPECT_NE(query(admin, "INSERT INTO pooled_base VALUES (7)").find("INSERT"),
             std::string::npos);
-  EXPECT_NE(query(admin, "CREATE VIEW pooled_view AS SELECT v FROM pooled_base")
-                .find("CREATE VIEW"),
-            std::string::npos);
+  EXPECT_NE(
+      catalog_query("CREATE VIEW pooled_view AS SELECT v FROM pooled_base")
+          .find("CREATE VIEW"),
+      std::string::npos);
   for (int i = 0; i < 4; ++i) {
     EXPECT_NE(query(reader, "SELECT v FROM pooled_view")
                   .find(pgwire::DataRow(Row({Value(7)}))),
               std::string::npos);
   }
-  EXPECT_NE(query(admin, "DROP VIEW pooled_view").find("DROP VIEW"),
+  EXPECT_NE(catalog_query("DROP VIEW pooled_view").find("DROP VIEW"),
             std::string::npos);
-  EXPECT_NE(query(admin,
-                  "CREATE VIEW pooled_view AS SELECT v+1 AS v FROM pooled_base")
+  EXPECT_NE(catalog_query(
+                "CREATE VIEW pooled_view AS SELECT v+1 AS v FROM pooled_base")
                 .find("CREATE VIEW"),
             std::string::npos);
   for (int i = 0; i < 4; ++i) {
@@ -1088,8 +1209,22 @@ TEST(PostgresServerExtraTest, CompletionBurstsKeepEveryReplyAndCommitBarrier) {
               std::string::npos);
     close(fd);
   }
-  ASSERT_TRUE(SendAll(admin, QueryMessage("DROP TABLE bursts")));
-  EXPECT_NE(ReadUntilReady(admin).find("DROP TABLE"), std::string::npos);
+  // ReadyForQuery can arrive directly from a worker before epoll retires
+  // that completion. DDL must wait for the documented quiescence barrier.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  std::string drop_response;
+  do {
+    ASSERT_TRUE(SendAll(admin, QueryMessage("DROP TABLE bursts")));
+    drop_response = ReadUntilReady(admin);
+    if (!drop_response.starts_with("E") ||
+        drop_response.find("C55006") == std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < deadline);
+  EXPECT_NE(drop_response.find("DROP TABLE"), std::string::npos)
+      << drop_response;
   close(admin);
 }
 

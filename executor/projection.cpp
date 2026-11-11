@@ -84,17 +84,26 @@ bool Affine(  // NOLINT(misc-no-recursion)
   }
   const auto& binary = expression->AsBinaryExpression();
   int64_t constant = 0;
-  if (binary.Op() == tinylamb::BinaryOperation::kMultiply &&
-      IntConstant(binary.Right(), &constant) &&
+  if (!IntConstant(binary.Right(), &constant)) {
+    return false;
+  }
+  // The kernel checks multiply and add in that order. Folding a longer
+  // chain can erase an intermediate overflow (for example (x * MAX) * 0).
+  const bool bare_left =
+      binary.Left()->Type() == tinylamb::TypeTag::kColumnValue;
+  if (binary.Op() == tinylamb::BinaryOperation::kMultiply && bare_left &&
       Affine(binary.Left(), schema, column, multiplier, addend)) {
-    *multiplier *= constant;
-    *addend *= constant;
+    *multiplier = constant;
     return true;
   }
+  const bool multiply_left =
+      binary.Left()->Type() == tinylamb::TypeTag::kBinaryExp &&
+      binary.Left()->AsBinaryExpression().Op() ==
+          tinylamb::BinaryOperation::kMultiply;
   if (binary.Op() == tinylamb::BinaryOperation::kAdd &&
-      IntConstant(binary.Right(), &constant) &&
+      (bare_left || multiply_left) &&
       Affine(binary.Left(), schema, column, multiplier, addend)) {
-    *addend += constant;
+    *addend = constant;
     return true;
   }
   return false;

@@ -329,7 +329,7 @@ int FuzzSchemaOneInput(const uint8_t* data, size_t size) {
     }
 
     const SortedRun run = BuildRun(pairs, sc, 1);
-    const PaxChunk chunk = PaxChunk::BuildFromSortedRun(run, sc);
+    const PaxChunk chunk = PaxChunk::BuildFromSortedRun(run, sc).MoveValue();
     if (PaxChunk::ValidateChunkBytes(chunk.Data()) != Status::kSuccess) {
       FAIL("writer emitted structurally invalid bytes");
     }

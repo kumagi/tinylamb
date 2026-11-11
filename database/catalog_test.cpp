@@ -74,6 +74,53 @@ class CatalogTest : public ::testing::Test {
   std::unique_ptr<Database> rs_;
 };
 
+TEST_F(CatalogTest, AuditViewIndexSurvivesReplaceDeleteAndReopen) {
+  {
+    auto ctx = rs_->BeginContext();
+    ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "First", "SELECT 1"));
+    ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "Second", "SELECT 2"));
+    ASSERT_SUCCESS(rs_->PutViewDefinition(ctx, "FIRST", "SELECT 3"));
+    ASSIGN_OR_ASSERT_FAIL(std::vector<std::string>, names,
+                          rs_->ListViewDefinitions(ctx));
+    EXPECT_EQ(names, (std::vector<std::string>{"first", "second"}));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  Recover();
+  {
+    auto ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::string, definition,
+                          rs_->GetViewDefinition(ctx, "first"));
+    EXPECT_EQ(definition, "SELECT 3");
+    ASSERT_SUCCESS(rs_->DeleteViewDefinition(ctx, "first"));
+    ASSERT_SUCCESS(rs_->DeleteViewDefinition(ctx, "missing"));
+    ASSIGN_OR_ASSERT_FAIL(std::vector<std::string>, names,
+                          rs_->ListViewDefinitions(ctx));
+    EXPECT_EQ(names, (std::vector<std::string>{"second"}));
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+}
+
+TEST_F(CatalogTest, AuditDropRejectsUnexpectedPageType) {
+  page_id_t pid = 0;
+  {
+    auto ctx = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(
+        Table, table,
+        rs_->CreateTable(
+            ctx, Schema("wrong_type", {Column("v", ValueType::kInt64)})));
+    pid = table.FirstPageId();
+    ASSERT_SUCCESS(ctx.PreCommit());
+  }
+  auto ctx = rs_->BeginContext();
+  {
+    ASSIGN_OR_ASSERT_FAIL(PageRef, page,
+                          ctx.txn_.GetPageManager()->GetPage(pid));
+    page->type_ = PageType::kUnknown;
+  }
+  EXPECT_EQ(rs_->DropTable(ctx, "wrong_type"), Status::kNotExists);
+  EXPECT_TRUE(ctx.txn_.IsFailed());
+}
+
 TEST_F(CatalogTest, Construction) {
   // Arrange -- nothing to set up; default database created by SetUp()
   // Act -- nothing to execute; default constructed via SetUp()

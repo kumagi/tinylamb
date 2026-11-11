@@ -852,6 +852,12 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       // DOUBLE, and returning a kInt64 value under a declared-kDouble result
       // makes typed column appends abort.  It falls through to the double
       // path below.
+      if (op == BinaryOperation::kModulo &&
+          left.IsUnsigned() != right.IsUnsigned() &&
+          ((!left.IsUnsigned() && left.value.int_value < 0) ||
+           (!right.IsUnsigned() && right.value.int_value < 0))) {
+        return left.TryArithmetic(right, op);
+      }
       const auto lhs = static_cast<uint64_t>(left.value.int_value);
       const auto rhs = static_cast<uint64_t>(right.value.int_value);
       // Keep ordinary signed-looking results signed when a UINT64 value is
@@ -1017,7 +1023,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       ASSIGN_OR_RETURN(IntervalValue, scaled,
                        iv.TryMultiply(right.value.int_value));
       ASSIGN_OR_RETURN(std::string, text, scaled.TryToString());
-      return Value(std::move(text));
+      return Value(std::move(text)).WithInterval();
     }
     if (left.type == ValueType::kInt64 && right.type == ValueType::kVarChar &&
         is_iv(right.value.varchar_value) && op == BinaryOperation::kMultiply) {
@@ -1026,7 +1032,7 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       ASSIGN_OR_RETURN(IntervalValue, scaled,
                        iv.TryMultiply(left.value.int_value));
       ASSIGN_OR_RETURN(std::string, text, scaled.TryToString());
-      return Value(std::move(text));
+      return Value(std::move(text)).WithInterval();
     }
     if (left.type == ValueType::kDate && right.type == ValueType::kVarChar) {
       auto days = TryParseDateDays(right.value.varchar_value);
@@ -1059,7 +1065,29 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     }
     return StatusError(StatusCode::kInvalidArgument, "type mismatch");
   }
-  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
+  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
+      left.IsInterval() != right.IsInterval() && IsComparisonOp(op)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "INTERVAL/STRING type mismatch");
+  }
+  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
+      left.IsInterval() != right.IsInterval() &&
+      (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract)) {
+    const std::string_view text = left.IsInterval() ? right.value.varchar_value
+                                                    : left.value.varchar_value;
+    // The legacy text interval parser is permissive: a timestamp must not be
+    // interpreted as an interval's year/month/day fields or concatenated.
+    if (text.size() >= 19 && text[4] == '-' && text[7] == '-' &&
+        (text[10] == ' ' || text[10] == 'T') && text[13] == ':' &&
+        text[16] == ':') {
+      return StatusError(StatusCode::kNotImplemented,
+                         "timestamp/INTERVAL operators require TIMESTAMP_ADD "
+                         "or TIMESTAMP_SUB");
+    }
+  }
+  if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar &&
+      ((left.IsInterval() && right.IsInterval()) ||
+       op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract)) {
     auto is_iv = [](std::string_view s) {
       return s.find('-') != std::string_view::npos &&
              s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
@@ -1082,12 +1110,12 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           case BinaryOperation::kAdd: {
             ASSIGN_OR_RETURN(IntervalValue, sum, iv1->TryPlus(*iv2));
             ASSIGN_OR_RETURN(std::string, text, sum.TryToString());
-            return Value(std::move(text));
+            return Value(std::move(text)).WithInterval();
           }
           case BinaryOperation::kSubtract: {
             ASSIGN_OR_RETURN(IntervalValue, diff, iv1->TryMinus(*iv2));
             ASSIGN_OR_RETURN(std::string, text, diff.TryToString());
-            return Value(std::move(text));
+            return Value(std::move(text)).WithInterval();
           }
           case BinaryOperation::kEquals:
             return Value(*iv1 == *iv2);

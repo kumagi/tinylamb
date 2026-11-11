@@ -35,40 +35,26 @@
 | D7 | 実装完了 | 2026-09-02 | Bytecode VM に短絡制御フローを実装する |
 | D8 | 実装完了 | 2026-09-02 | null-safe / RIGHT / FULL を含む spill 対応 hybrid join を実装する |
 | D9 | 実装完了 | 2026-09-02 | WAL レコード末尾に CRC32C を追加し、旧形式を読み取る |
-| D10 | 実装完了 | 2026-09-02 | ディレクトリ走査で LSM run を復元する |
-| D11 | 実装完了 | 2026-09-02 | root lift-up の前提を厳密化し、subtree を再接続してから回収する |
+| D10 | 旧方式を廃止・snapshot/WAL 復元へ置換 | 2026-11-11 更新 | PageManager が committed 状態を永続化する |
+| D11 | 旧 B+Tree 実装の記録 | 2026-09-02 | root lift-up の前提を厳密化し、subtree を再接続してから回収する |
 
 決定者は本タスクのプロジェクトオーナーによる指示とする。決定を実装へ落と
 際は、決定IDをコミットメッセージ、テスト名、関連ドキュメントに付ける。
 
-### 実装状況(2026-09-02 記録)
+### 実装状況の読み方（2026-11-11 更新）
 
-D1〜D11 の受け入れ条件はすべて対応テスト付きで実装済みであり、フルテスト
-(2125 件)と `scripts/check_layering.py` の通過を確認した。テスト名の対応
-関係は各決定の docs 参照先と次の文書に記録する。
+2026-09-02 の「D1〜D11 全件実装・2125 テスト通過」は当時の記録であり、現在のツリーの検証結果ではない。B+Tree/PagePool と旧 LSM run の廃止により、当時のテスト名と実装範囲はそのまま適用できない。
 
-- D1: `docs/lock_order.md`、`LoggerTest.D1*`
-- D2/D3: `docs/recovery_invariants.md`、`recovery_manager_test`、
-  `page/*_test.cpp` の `*ImplOperationsAreIdempotent*`・
-  `*DestroyPage*`、`CatalogTest.DropTableCrashRecoveryReclaimsPages`、
-  `BPlusTreeTest.NodeReclaimWALReplaysAfterCrash`
-- D4: `docs/commit_durability.md`、`DurabilityBarrierTest.*`
-- D5: `docs/cascades_optimizer.md` のゲート台帳、`CascadesTest`
-  の counterexample 群、`ExecutorTest.OptimizerAndRelationalPathsAgree`
-- D6: `ExpressionRewriteTest.NotNullInferenceIdempotentAndRootScoped`、
-  `ShortPassCapReturnsLastFormWithoutThrowing`、
-  `NonConvergingRewriteReturnsLastStableForm`
-- D7: `docs/expression_evaluation.md`、`BytecodeTest.D7_*`、
-  `DifferentialTest.Evaluate_LogicalShortCircuitErrors_MatchAcrossPaths`
-- D8: `ExecutorTest.RelationalNullSafeInnerJoinSpillMatchesUnbudgeted`、
-  `RelationalRightOuterJoinSpillMatchesUnbudgeted`、
-  `RelationalFullOuterJoinSpillMatchesUnbudgeted`
-- D9: `docs/wal_format.md`、`RecoveryManagerTest.MidRecordBitFlip*`、
-  `MixedLegacyAndCurrentVersionLogsScanCleanly`、
-  `LegacyV1DestroyRecordStillParses`
-- D10: `LSMTreeTest.Reopen*`
-- D11: `BPlusTreeTest.LiftUpBranchOrphansSiblingRows`(有効化済み)、
-  `BPlusTreeTest.RandomChurnTenThousandOpsKeepsStructure`
+現在の回帰テストの入口は次のとおり。実行した結果は変更ごとの検証ログで確認する。
+
+- D1: `LoggerTest.D1NoRecordsInterleavedAcrossProducers` / `D1RejectsRecordOverMaxSize`
+- D2/D3/D10: `RecoveryManagerTest.ReplaysCommittedAndIgnoresUncommittedLosers`、`PageManagerTest.UnboundedRowBlockInsertUpdateDeleteAndFuzzyCheckpoint`、`CheckpointManagerTest.FuzzyCheckpointWithInFlightAndPostCheckpointTxns`、`CatalogTest.DropTableCrashRecoveryReclaimsPages`
+- D4: `docs/commit_durability.md` と `LoggerTest.WaitForDurableObservesFsync`
+- D5: `plan/cascades_test.cpp` と `executor/relational_regression_test.cpp`
+- D6/D7: `expression/rewrite_test.cpp` / `bytecode_test.cpp` / `differential_test.cpp`
+- D8: `executor/relational_regression_test.cpp`
+- D9: `LogRecordTest.RoundTripSerialization` と `recovery/logger_test.cpp`。旧形式互換・旧 B+Tree の削除済みテストを現行の検証根拠に数えない。
+- D11: 旧 B+Tree の構造変更に関する記録。現行 `LsmIndex` の検証は `index/lsm_index_test.cpp` を参照。
 
 ## 実装順序
 
@@ -391,7 +377,11 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
 
 ## D10. LSM run の再起動復元
 
-**決定記録**
+**現行方式（2026-11-11 更新）**
+
+旧 `index/lsm_tree.cpp` のディレクトリ走査復元は撤去済み。現在は `PageManager::WriteFuzzyCheckpoint` が committed な行ページと LSM tree の状態を `<db>.db` に書き、`LoadFuzzyCheckpoint` と WAL replay で復元する。個別 SortedRun / BlobFile のファイル名走査で再起動する方式ではない。耐久性の不変条件は維持するが、下の旧実装範囲・受け入れ条件は歴史的記録であり、現在の完了証拠にはしない。
+
+**旧決定記録**
 
 - 状態: 承認済み
 - 決定日: 2026-09-02

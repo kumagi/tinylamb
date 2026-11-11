@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -36,6 +38,7 @@
 #include "common/constants.hpp"
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/json_string.hpp"
 #include "common/log_message.hpp"
 #include "common/platform/endian.hpp"
 #include "common/serdes.hpp"
@@ -46,10 +49,142 @@
 
 namespace tinylamb {
 
-struct ArrayPayload {
+struct ValuePayload {
+  explicit ValuePayload(bool is_array) : is_array(is_array) {}
+  std::atomic<size_t> references{1};
+  bool is_array;
+};
+
+struct StringPayload : ValuePayload {
+  explicit StringPayload(std::string text)
+      : ValuePayload(false), text(std::move(text)) {}
+  std::string text;
+  // Zero means uncomputed. UINT64_MAX disables caching after exposing a
+  // mutable string reference, which a caller may retain across hash calls.
+  // Shared immutable strings may be hashed by several execution workers.
+  std::atomic<uint64_t> hash{0};
+};
+
+struct ArrayPayload : ValuePayload {
+  ArrayPayload() : ValuePayload(true) {}
   std::string element_sql_type;
   std::vector<Value> elements;
 };
+
+OwnedValuePayload::OwnedValuePayload(std::string text) {
+  if (!text.empty()) {
+    payload_ = std::make_unique<StringPayload>(std::move(text)).release();
+  }
+}
+
+OwnedValuePayload::OwnedValuePayload(const OwnedValuePayload& other)
+    : payload_(other.payload_) {
+  if (payload_ != nullptr) {
+    payload_->references.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+OwnedValuePayload& OwnedValuePayload::operator=(
+    const OwnedValuePayload& other) {
+  if (this == &other) {
+    return *this;
+  }
+  if (payload_ != other.payload_) {
+    ValuePayload* next = other.payload_;
+    if (next != nullptr) {
+      next->references.fetch_add(1, std::memory_order_relaxed);
+    }
+    clear();
+    payload_ = next;
+  }
+  return *this;
+}
+
+OwnedValuePayload& OwnedValuePayload::operator=(std::string text) {
+  Mutable() = std::move(text);
+  return *this;
+}
+
+void OwnedValuePayload::Release() noexcept {
+  ValuePayload* previous = std::exchange(payload_, nullptr);
+  if (previous->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    if (previous->is_array) {
+      const std::unique_ptr<ArrayPayload> last_owner(
+          static_cast<ArrayPayload*>(previous));
+    } else {
+      const std::unique_ptr<StringPayload> last_owner(
+          static_cast<StringPayload*>(previous));
+    }
+  }
+}
+
+bool OwnedValuePayload::empty() const {
+  return payload_ == nullptr || payload_->is_array ||
+         static_cast<const StringPayload*>(payload_)->text.empty();
+}
+
+OwnedValuePayload::operator std::string_view() const {
+  return payload_ == nullptr || payload_->is_array
+             ? std::string_view("")
+             : static_cast<const StringPayload*>(payload_)->text;
+}
+
+std::string& OwnedValuePayload::Mutable() {
+  if (payload_ == nullptr || payload_->is_array) {
+    auto next = std::make_unique<StringPayload>(std::string{});
+    clear();
+    payload_ = next.release();
+  } else if (payload_->references.load(std::memory_order_acquire) != 1) {
+    auto next = std::make_unique<StringPayload>(
+        static_cast<const StringPayload*>(payload_)->text);
+    Release();
+    payload_ = next.release();
+  }
+  auto* string = static_cast<StringPayload*>(payload_);
+  string->hash.store(UINT64_MAX, std::memory_order_relaxed);
+  return string->text;
+}
+
+void OwnedValuePayload::assign(std::string_view text) {
+  // Copy before releasing shared storage: text can refer to our old buffer,
+  // including a string nested inside an array being overwritten.
+  if (payload_ != nullptr && !payload_->is_array &&
+      payload_->references.load(std::memory_order_acquire) == 1) {
+    auto* string = static_cast<StringPayload*>(payload_);
+    if (string->hash.load(std::memory_order_relaxed) != UINT64_MAX) {
+      string->hash.store(0, std::memory_order_relaxed);
+    }
+    string->text.assign(text);
+  } else {
+    OwnedValuePayload next{std::string(text)};
+    *this = std::move(next);
+  }
+}
+
+std::string OwnedValuePayload::Take() {
+  if (payload_ == nullptr || payload_->is_array) {
+    return {};
+  }
+  auto& text = static_cast<StringPayload*>(payload_)->text;
+  if (payload_->references.load(std::memory_order_acquire) == 1) {
+    static_cast<StringPayload*>(payload_)->hash.store(
+        UINT64_MAX, std::memory_order_relaxed);
+    return std::move(text);
+  }
+  return text;
+}
+
+void OwnedValuePayload::SetArray(
+    std::unique_ptr<ArrayPayload> payload) noexcept {
+  clear();
+  payload_ = payload.release();
+}
+
+ArrayPayload* OwnedValuePayload::Array() const noexcept {
+  return payload_ != nullptr && payload_->is_array
+             ? static_cast<ArrayPayload*>(payload_)
+             : nullptr;
+}
 
 namespace {
 const std::vector<Value> kEmptyArrayElements{};
@@ -293,25 +428,25 @@ int64_t Value::DateDays() const {
 Value Value::Array(std::vector<Value> elements, std::string element_sql_type) {
   Value result;
   result.type = ValueType::kArray;
-  result.array_ = std::make_shared<ArrayPayload>();
-  result.array_->element_sql_type = std::move(element_sql_type);
-  result.array_->elements = std::move(elements);
+  result.owned_data.SetArray(std::make_unique<ArrayPayload>());
+  result.owned_data.Array()->element_sql_type = std::move(element_sql_type);
+  result.owned_data.Array()->elements = std::move(elements);
   return result;
 }
 
 const std::vector<Value>& Value::ArrayElements() const {
-  if (array_ == nullptr) {
+  if (owned_data.Array() == nullptr) {
     return kEmptyArrayElements;
   }
-  return array_->elements;
+  return owned_data.Array()->elements;
 }
 
 const std::string& Value::ArrayElementSqlType() const {
   static const std::string kEmpty;
-  if (array_ == nullptr) {
+  if (owned_data.Array() == nullptr) {
     return kEmpty;
   }
-  return array_->element_sql_type;
+  return owned_data.Array()->element_sql_type;
 }
 
 // The scalar halves of the copy/move quartet are always_inline in value.hpp;
@@ -321,7 +456,6 @@ const std::string& Value::ArrayElementSqlType() const {
 // in owned_data here.
 
 void Value::InitCopySlow(const Value& o) {
-  array_ = o.array_;
   collation_ = o.collation_;
   if (type == ValueType::kVarChar) {
     if (!o.owned_data.empty()) {
@@ -330,6 +464,8 @@ void Value::InitCopySlow(const Value& o) {
       owned_data.assign(o.value.varchar_value);
     }
     value.varchar_value = owned_data;
+  } else {
+    owned_data = o.owned_data;
   }
 }
 
@@ -341,9 +477,8 @@ void Value::InitMoveSlow(Value& o) noexcept {
       owned_data.assign(o.value.varchar_value);
     }
     value.varchar_value = owned_data;
-    array_ = std::move(o.array_);
   } else {
-    array_ = std::move(o.array_);
+    owned_data = std::move(o.owned_data);
   }
   o.type = ValueType::kNull;
 }
@@ -351,7 +486,6 @@ void Value::InitMoveSlow(Value& o) noexcept {
 Value& Value::CopyAssignSlow(const Value& rhs) {
   type = rhs.type;
   value = rhs.value;
-  array_ = rhs.array_;
   collation_ = rhs.collation_;
   if (rhs.type == ValueType::kVarChar) {
     if (!rhs.owned_data.empty()) {
@@ -360,6 +494,8 @@ Value& Value::CopyAssignSlow(const Value& rhs) {
       owned_data.assign(rhs.value.varchar_value);
     }
     value.varchar_value = owned_data;
+  } else {
+    owned_data = rhs.owned_data;
   }
   return *this;
 }
@@ -374,13 +510,27 @@ Value& Value::MoveAssignSlow(Value& o) noexcept {
       owned_data.assign(o.value.varchar_value);
     }
     value.varchar_value = owned_data;
-    array_.reset();
   } else {
-    array_ = std::move(o.array_);
-    owned_data.clear();
+    owned_data = std::move(o.owned_data);
   }
   o.type = ValueType::kNull;
   return *this;
+}
+
+std::string Value::MoveString() {
+  if (type != ValueType::kVarChar) {
+    ThrowAsStringView();
+  }
+  const std::string_view owned = owned_data;
+  const std::string_view visible = value.varchar_value;
+  std::string result =
+      owned.data() == visible.data() && owned.size() == visible.size()
+          ? owned_data.Take()
+          : std::string(visible);
+  type = ValueType::kNull;
+  collation_ = 0;
+  value.int_value = 0;
+  return result;
 }
 
 bool Value::Truthy() const {
@@ -476,7 +626,8 @@ size_t Value::Serialize(char* dst) const {
           continue;
         }
         *cursor++ = 1;
-        *cursor++ = static_cast<char>(element.type);
+        *cursor++ = static_cast<char>(static_cast<uint8_t>(element.type) |
+                                      (element.Collation() << 3));
         cursor += element.Serialize(cursor);
       }
       return static_cast<size_t>(cursor - dst);
@@ -515,10 +666,14 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
         return 0;
       }
       struct DepthGuard {
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard(DepthGuard&&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+        DepthGuard& operator=(DepthGuard&&) = delete;
         DepthGuard() { ++deserialize_depth; }
         ~DepthGuard() { --deserialize_depth; }
       } guard;
-      array_.reset();
+      owned_data.clear();
       const char* cursor = src;
       uint32_t count = 0;
       cursor += DeserializeU32(cursor, &count);
@@ -538,18 +693,24 @@ size_t Value::DeserializeInto(const char* src, ValueType as_type,
           elements.emplace_back();
           continue;
         }
-        const auto elem_type = static_cast<ValueType>(*cursor++);
+        const auto encoded_type = static_cast<uint8_t>(*cursor++);
+        if ((encoded_type >> 3) > 4) {
+          *out_status = Status::kCorrupt;
+          return 0;
+        }
+        const auto elem_type = static_cast<ValueType>(encoded_type & 7);
         Value& element = elements.emplace_back();
         const size_t consumed =
             element.DeserializeInto(cursor, elem_type, out_status);
+        element.SetCollation(encoded_type >> 3);
         if (*out_status != Status::kSuccess) {
           return 0;
         }
         cursor += consumed;
       }
-      array_ = std::make_shared<ArrayPayload>();
-      array_->element_sql_type = std::string(sql_type);
-      array_->elements = std::move(elements);
+      owned_data.SetArray(std::make_unique<ArrayPayload>());
+      owned_data.Array()->element_sql_type = std::string(sql_type);
+      owned_data.Array()->elements = std::move(elements);
       return static_cast<size_t>(cursor - src);
     }
   }
@@ -591,6 +752,10 @@ size_t Value::SkipSerializedInto(const char* src, ValueType as_type,
         return 0;
       }
       struct DepthGuard {
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard(DepthGuard&&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+        DepthGuard& operator=(DepthGuard&&) = delete;
         DepthGuard() { ++skip_depth; }
         ~DepthGuard() { --skip_depth; }
       } guard;
@@ -610,7 +775,12 @@ size_t Value::SkipSerializedInto(const char* src, ValueType as_type,
         if (!present) {
           continue;
         }
-        const auto elem_type = static_cast<ValueType>(*cursor++);
+        const auto encoded_type = static_cast<uint8_t>(*cursor++);
+        if ((encoded_type >> 3) > 4) {
+          *out_status = Status::kCorrupt;
+          return 0;
+        }
+        const auto elem_type = static_cast<ValueType>(encoded_type & 7);
         const size_t consumed =
             SkipSerializedInto(cursor, elem_type, out_status);
         if (*out_status != Status::kSuccess) {
@@ -679,12 +849,16 @@ std::string FormatDoubleShortest(double value) {
     case ValueType::kArray: {
       std::string out = "ARRAY<" + ArrayElementSqlType() + ">[";
       const auto& elements = ArrayElements();
-      out.reserve(out.size() + elements.size() * 8 + 2);
+      out.reserve(out.size() + (elements.size() * 8) + 2);
       for (size_t i = 0; i < elements.size(); ++i) {
         if (i != 0) {
           out += ", ";
         }
-        out += elements[i].IsNull() ? "NULL" : elements[i].AsString();
+        if (elements[i].type == ValueType::kVarChar) {
+          json_text::AppendJsonString(out, elements[i].AsStringView());
+        } else {
+          out += elements[i].IsNull() ? "NULL" : elements[i].AsString();
+        }
       }
       out += "]";
       return out;
@@ -695,37 +869,6 @@ std::string FormatDoubleShortest(double value) {
 }
 
 namespace {
-// VARCHAR values shaped like the interval text encoding are interpreted as
-// intervals by ==/<</>>/std::hash so a stored interval survives a varchar
-// detour.  The shape test admits strings that are not intervals ("P-100
-// model" carries a single-hyphen pre-space token), so a failing parse falls
-// back to byte-exact treatment instead of throwing out of an equality or
-// hash -- a throw here aborts GROUP BY/DISTINCT/hash joins over ordinary
-// text columns.
-bool LooksLikeIntervalText(std::string_view s) {
-  // Interval text carries a single-hyphen month token ("2014-1 0 ..."); a
-  // leading token shaped like an ISO date ("2014-01-01 ...") is a timestamp
-  // string and must compare byte-exact instead.
-  if (s.size() < 3 || ((s[0] < '0' || s[0] > '9') && s[0] != '-' &&
-                       s[0] != '+' && s[0] != ' ')) {
-    return false;
-  }
-  const size_t sp = s.find(' ');
-  if (sp == std::string_view::npos) {
-    return false;
-  }
-  size_t first_hyphen = std::string_view::npos;
-  for (size_t i = 0; i < sp; ++i) {
-    if (s[i] == '-') {
-      if (first_hyphen != std::string_view::npos) {
-        return false;  // a second hyphen before the space: not interval text
-      }
-      first_hyphen = i;
-    }
-  }
-  return first_hyphen != std::string_view::npos;
-}
-
 std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
   if (auto parsed = IntervalValue::TryParse(s); parsed.HasValue()) {
     return parsed.MoveValue();
@@ -735,6 +878,31 @@ std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
   }
 }
 }  // namespace
+
+uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
+  StringPayload* owned = payload_ != nullptr && !payload_->is_array
+                             ? static_cast<StringPayload*>(payload_)
+                             : nullptr;
+  // Values can carry borrowed views (including slices of another value).
+  // Only cache a hash when the view denotes this owner's complete string.
+  if (owned != nullptr && (owned->text.data() != text.data() ||
+                           owned->text.size() != text.size())) {
+    owned = nullptr;
+  }
+  if (owned != nullptr) {
+    const uint64_t cached = owned->hash.load(std::memory_order_relaxed);
+    if (cached == UINT64_MAX) {
+      owned = nullptr;
+    } else if (cached != 0) {
+      return cached;
+    }
+  }
+  const uint64_t hash = std::hash<std::string_view>()(text);
+  if (owned != nullptr && hash != UINT64_MAX) {
+    owned->hash.store(hash, std::memory_order_relaxed);
+  }
+  return hash;
+}
 
 bool Value::EqualsSlow(const Value& rhs) const {
   if (type != rhs.type) {
@@ -755,16 +923,18 @@ bool Value::EqualsSlow(const Value& rhs) const {
     case ValueType::kVarChar: {
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
+      if (IsInterval() != rhs.IsInterval()) {
+        return false;
+      }
       if (sv1 == sv2) {
         return true;
       }
-      // Interval equivalence needs interval-shaped text on both sides, and
-      // every interval rendering embeds a space; a space-free side settles
-      // the comparison before the interval parser is touched.
+      // Only tagged INTERVAL values use interval equivalence. Canonical
+      // renderings contain a space; ordinary strings retain byte equality.
       if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
         return false;
       }
-      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+      if (IsInterval() && rhs.IsInterval()) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
         if (iv1 && iv2) {
@@ -806,6 +976,7 @@ std::string EncodeMemcomparableFormatInteger(int64_t in) {
 }
 
 constexpr uint8_t kMemcomparableUint64 = 6;
+constexpr uint8_t kMemcomparableInterval = 7;
 
 std::string EncodeMemcomparableFormatUint64(int64_t in) {
   std::string ret(1 + 8, '\0');
@@ -971,6 +1142,15 @@ StatusOr<std::string> Value::TryEncodeMemcomparableFormat() const {
       return encoded;
     }
     case ValueType::kVarChar:
+      if (IsInterval()) {
+        ASSIGN_OR_RETURN(IntervalValue, interval,
+                         IntervalValue::TryParse(value.varchar_value));
+        std::string encoded(1, static_cast<char>(kMemcomparableInterval));
+        for (int64_t part : {interval.months, interval.days, interval.nanos}) {
+          encoded += EncodeMemcomparableFormatInteger(part).substr(1);
+        }
+        return encoded;
+      }
       return EncodeMemcomparableFormatVarchar(value.varchar_value);
     case ValueType::kDouble:
       return EncodeMemcomparableFormatDouble(value.double_value);
@@ -1066,7 +1246,8 @@ size_t VarcharMemcomparableLength(const char* src, size_t avail) {
 size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
   switch (type) {
     case ValueType::kNull:
-      throw std::runtime_error("Cannot encode unknown type.");
+      dst[0] = static_cast<char>(ValueType::kNull);
+      return 1;
     case ValueType::kInt64:
       if (IsUnsigned()) {
         return EncodeMemcomparableFormatUint64To(dst, value.int_value);
@@ -1078,11 +1259,33 @@ size_t Value::EncodeMemcomparableFormatTo(char* dst) const {
       return n;
     }
     case ValueType::kVarChar:
+      if (IsInterval()) {
+        const auto encoded = EncodeMemcomparableFormat();
+        std::copy(encoded.begin(), encoded.end(), dst);
+        return encoded.size();
+      }
       return EncodeMemcomparableFormatVarcharTo(dst, value.varchar_value);
     case ValueType::kDouble:
       return EncodeMemcomparableFormatDoubleTo(dst, value.double_value);
-    default:
-      break;
+    case ValueType::kArray: {
+      char* cursor = dst;
+      *cursor++ = static_cast<char>(ValueType::kArray);
+      const auto& elements = ArrayElements();
+      const uint32_t count = htobe32(static_cast<uint32_t>(elements.size()));
+      std::memcpy(cursor, &count, sizeof(count));
+      cursor += sizeof(count);
+      const auto& sql_type = ArrayElementSqlType();
+      std::memcpy(cursor, sql_type.data(), sql_type.size());
+      cursor += sql_type.size();
+      *cursor++ = '\0';
+      for (const Value& element : elements) {
+        *cursor++ = element.IsNull() ? 0 : 1;
+        if (!element.IsNull()) {
+          cursor += element.EncodeMemcomparableFormatTo(cursor);
+        }
+      }
+      return static_cast<size_t>(cursor - dst);
+    }
   }
   throw std::runtime_error("undefined type");
 }
@@ -1094,6 +1297,12 @@ size_t Value::DecodeMemcomparableFormatBounded(const char* src, size_t avail) {
   const auto raw_tag = static_cast<uint8_t>(src[0]);
   if (raw_tag == static_cast<uint8_t>(ValueType::kNull)) {
     return 1;
+  }
+  if (raw_tag == kMemcomparableInterval) {
+    if (avail < 25) {
+      throw std::runtime_error("truncated interval key");
+    }
+    return 25;
   }
   if (raw_tag == kMemcomparableUint64) {
     if (avail < 1 + 8) {
@@ -1156,6 +1365,18 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
           DecodeMemcomparableFormatInteger(cursor, end, &value.int_value));
       return len + 1;
     }
+    case kMemcomparableInterval: {
+      IntervalValue interval;
+      for (int64_t* part :
+           {&interval.months, &interval.days, &interval.nanos}) {
+        ASSIGN_OR_RETURN(size_t, consumed,
+                         DecodeMemcomparableFormatInteger(cursor, end, part));
+        cursor += consumed;
+      }
+      ASSIGN_OR_RETURN(std::string, text, interval.TryToString());
+      *this = Value(std::move(text)).WithInterval();
+      return static_cast<size_t>(cursor - src.data());
+    }
     case kMemcomparableUint64: {
       type = ValueType::kInt64;
       collation_ = 3;
@@ -1179,7 +1400,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       type = ValueType::kVarChar;
       ASSIGN_OR_RETURN(
           size_t, len,
-          DecodeMemcomparableFormatVarchar(cursor, end, &owned_data));
+          DecodeMemcomparableFormatVarchar(cursor, end, &owned_data.Mutable()));
       value.varchar_value = owned_data;
       return len + 1;
     }
@@ -1198,6 +1419,10 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
             "corrupt memcomparable array: nesting depth exceeded");
       }
       struct DepthGuard {
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard(DepthGuard&&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+        DepthGuard& operator=(DepthGuard&&) = delete;
         DepthGuard() { ++memcmp_decode_depth; }
         ~DepthGuard() { --memcmp_decode_depth; }
       } guard;
@@ -1234,7 +1459,7 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
       // allocation per nested frame.
       constexpr uint32_t kMaxEncodedArrayElements = 1U << 20;
       if (count > kMaxEncodedArrayElements ||
-          count > static_cast<size_t>(end - p)) {
+          std::cmp_greater(count, end - p)) {
         return StatusError(StatusCode::kCorrupt,
                            "corrupt memcomparable array element count");
       }
@@ -1266,9 +1491,9 @@ StatusOr<size_t> Value::TryDecodeMemcomparableFormat(std::string_view src) {
         p += advanced;
         elements.push_back(std::move(element));
       }
-      array_ = std::make_shared<ArrayPayload>();
-      array_->element_sql_type = std::move(sql_type);
-      array_->elements = std::move(elements);
+      owned_data.SetArray(std::make_unique<ArrayPayload>());
+      owned_data.Array()->element_sql_type = std::move(sql_type);
+      owned_data.Array()->elements = std::move(elements);
       return static_cast<size_t>(p - cursor) + 1;
     }
     default:
@@ -1313,19 +1538,21 @@ StatusOr<bool> Value::TryLess(const Value& rhs) const {
     case ValueType::kDate:
       return value.int_value < rhs.value.int_value;
     case ValueType::kVarChar: {
+      if (IsInterval() != rhs.IsInterval()) {
+        return !IsInterval();
+      }
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       const int cmp = sv1.compare(sv2);
       if (cmp == 0) {
         return false;
       }
-      // Interval equivalence can only reorder interval-shaped texts and
-      // every interval rendering embeds a space; a space-free side makes
-      // the byte order final without touching the interval parser.
+      // Only tagged INTERVAL values use field ordering. Canonical
+      // renderings contain a space; ordinary strings retain byte ordering.
       if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
         return cmp < 0;
       }
-      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+      if (IsInterval() && rhs.IsInterval()) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
         if (iv1 && iv2) {
@@ -1388,19 +1615,21 @@ StatusOr<bool> Value::TryGreater(const Value& rhs) const {
     case ValueType::kDate:
       return value.int_value > rhs.value.int_value;
     case ValueType::kVarChar: {
+      if (IsInterval() != rhs.IsInterval()) {
+        return IsInterval();
+      }
       std::string_view sv1 = value.varchar_value;
       std::string_view sv2 = rhs.value.varchar_value;
       const int cmp = sv2.compare(sv1);
       if (cmp == 0) {
         return false;
       }
-      // Interval equivalence can only reorder interval-shaped texts and
-      // every interval rendering embeds a space; a space-free side makes
-      // the byte order final without touching the interval parser.
+      // Only tagged INTERVAL values use field ordering. Canonical
+      // renderings contain a space; ordinary strings retain byte ordering.
       if (!ViewContainsSpace(sv1) || !ViewContainsSpace(sv2)) {
         return cmp < 0;
       }
-      if (LooksLikeIntervalText(sv1) && LooksLikeIntervalText(sv2)) {
+      if (IsInterval() && rhs.IsInterval()) {
         const auto iv1 = ParseAsInterval(sv1);
         const auto iv2 = ParseAsInterval(sv2);
         if (iv1 && iv2) {
@@ -1432,6 +1661,34 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
   const auto invalid = [](std::string_view message) -> Status {
     return StatusError(StatusCode::kInvalidArgument, std::string(message));
   };
+  // Mixed signed/unsigned division uses mathematical signs, not a cast of
+  // the negative operand to UINT64. Magnitudes avoid INT64_MIN negation and
+  // keep the full UINT64 range without a floating-point conversion.
+  if (type == ValueType::kInt64 && rhs.type == ValueType::kInt64 &&
+      IsUnsigned() != rhs.IsUnsigned() &&
+      (op == BinaryOperation::kDivide || op == BinaryOperation::kModulo)) {
+    const bool left_negative = !IsUnsigned() && value.int_value < 0;
+    const bool right_negative = !rhs.IsUnsigned() && rhs.value.int_value < 0;
+    const auto left_bits = static_cast<uint64_t>(value.int_value);
+    const auto right_bits = static_cast<uint64_t>(rhs.value.int_value);
+    const uint64_t left = left_negative ? uint64_t{0} - left_bits : left_bits;
+    const uint64_t right =
+        right_negative ? uint64_t{0} - right_bits : right_bits;
+    if (right == 0) {
+      return StatusError(StatusCode::kIsInfinity, "division by zero");
+    }
+    const bool divide = op == BinaryOperation::kDivide;
+    const uint64_t magnitude = divide ? left / right : left % right;
+    const bool negative =
+        divide ? left_negative != right_negative : left_negative;
+    if (negative && magnitude != 0) {
+      if (magnitude > (uint64_t{1} << 63)) {
+        return invalid("integer overflow on mixed signed/unsigned division");
+      }
+      return Value(std::bit_cast<int64_t>(uint64_t{0} - magnitude));
+    }
+    return Value(std::bit_cast<int64_t>(magnitude)).WithUnsigned();
+  }
   switch (op) {
     case BinaryOperation::kAdd:
       if (type != rhs.type) {
@@ -1670,6 +1927,16 @@ int CompareForOrderBy(const Value& a, const Value& b) {
       return x < y ? -1 : (y < x ? 1 : 0);
     }
     case ValueType::kVarChar:
+      if (a.IsInterval() != b.IsInterval()) {
+        return a.IsInterval() ? 1 : -1;
+      }
+      if (a.IsInterval()) {
+        const auto lhs = ParseAsInterval(a.value.varchar_value);
+        const auto rhs = ParseAsInterval(b.value.varchar_value);
+        if (lhs && rhs) {
+          return *lhs < *rhs ? -1 : (*rhs < *lhs ? 1 : 0);
+        }
+      }
       // Binary (engine default) VARCHAR order. The case-insensitive variant
       // and the shared ENUM ranking live in type/collation.hpp so ORDER BY,
       // filtering and grouping cannot disagree about the ordering.
@@ -1699,7 +1966,8 @@ std::ostream& operator<<(std::ostream& o, const Value& v) {
 }
 
 Encoder& operator<<(Encoder& a, const Value& v) {
-  a << v.type;
+  a << static_cast<uint8_t>(static_cast<uint8_t>(v.type) |
+                            (v.Collation() << 3));
   switch (v.type) {
     case tinylamb::ValueType::kNull:
       break;
@@ -1721,8 +1989,14 @@ Encoder& operator<<(Encoder& a, const Value& v) {
 }
 
 Decoder& operator>>(Decoder& e, Value& v) {
-  v.collation_ = 0;
-  e >> v.type;
+  uint8_t encoded_type = 0;
+  e >> encoded_type;
+  v.type = static_cast<ValueType>(encoded_type & 7);
+  v.collation_ = encoded_type >> 3;
+  if (v.collation_ > 4) {
+    e.Fail();
+    return e;
+  }
   switch (v.type) {
     case tinylamb::ValueType::kNull:
       break;
@@ -1731,7 +2005,7 @@ Decoder& operator>>(Decoder& e, Value& v) {
       e >> v.value.int_value;
       break;
     case tinylamb::ValueType::kVarChar:
-      e >> v.owned_data;
+      e >> v.owned_data.Mutable();
       v.value.varchar_value = v.owned_data;
       break;
     case tinylamb::ValueType::kDouble:
@@ -1763,20 +2037,18 @@ uint64_t std::hash<tinylamb::Value>::operator()(
     case tinylamb::ValueType::kInt64:
     case tinylamb::ValueType::kDate:
       return std::hash<int64_t>()(v.value.int_value);
-    case tinylamb::ValueType::kVarChar: {
-      std::string_view sv = v.value.varchar_value;
-      if (tinylamb::LooksLikeIntervalText(sv)) {
-        if (const auto iv = tinylamb::ParseAsInterval(sv)) {
-          // Field-wise, matching IntervalValue::== / <=> (TotalNanos()
-          // throws for valid intervals beyond ~3558 years).
-          const uint64_t h1 = std::hash<int64_t>()(iv->nanos);
-          const uint64_t h2 = std::hash<int64_t>()(iv->days);
-          const uint64_t h3 = std::hash<int64_t>()(iv->months);
-          return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL) ^ (h3 << 1);
+    case tinylamb::ValueType::kVarChar:
+      if (v.IsInterval()) {
+        const auto interval =
+            tinylamb::IntervalValue::TryParse(v.value.varchar_value);
+        if (interval.HasValue()) {
+          const auto& iv = interval.Value();
+          return std::hash<int64_t>()(iv.nanos) ^
+                 (std::hash<int64_t>()(iv.days) * 0x9e3779b97f4a7c15ULL) ^
+                 (std::hash<int64_t>()(iv.months) << 1);
         }
       }
-      return std::hash<std::string_view>()(sv);
-    }
+      return v.owned_data.StringHash(v.value.varchar_value);
     case tinylamb::ValueType::kDouble: {
       // Canonicalize before hashing so group-key buckets agree with SQL
       // equality: every NaN folds to one pattern and -0/+0 share a bucket.

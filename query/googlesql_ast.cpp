@@ -33,8 +33,11 @@ bool ParseLocation(std::string& label, size_t* start, size_t* end) {
   const char* last = label.data() + label.size() - 1;
   size_t parsed_start = 0;
   size_t parsed_end = 0;
-  if (std::from_chars(first, middle, parsed_start).ec != std::errc() ||
-      std::from_chars(middle + 1, last, parsed_end).ec != std::errc()) {
+  const auto start_result = std::from_chars(first, middle, parsed_start);
+  const auto end_result = std::from_chars(middle + 1, last, parsed_end);
+  if (start_result.ec != std::errc() || start_result.ptr != middle ||
+      end_result.ec != std::errc() || end_result.ptr != last ||
+      parsed_end < parsed_start) {
     return false;
   }
   *start = parsed_start;
@@ -62,19 +65,48 @@ std::unique_ptr<GoogleSqlAstNode> ParseNode(std::string label) {
   return node;
 }
 
-// A node whose parenthesis never closes continues onto the next line: the
-// ZetaSQL parser emits multi-line labels only for literals that embed raw
-// newlines (e.g. a triple-quoted string). Everything else stays one node per
-// line so indentation keeps encoding the tree structure.
-bool HasUnclosedParen(const std::string& label) {
+// Literal contents may contain parentheses and text resembling a location.
+// Find their SQL closing quote before interpreting the dump's suffix.
+bool LabelContinues(std::string_view label) {
+  const size_t first = label.find_first_not_of(' ');
+  if (first == std::string_view::npos) return false;
+  label.remove_prefix(first);
+  if (label.starts_with("StringLiteral(") ||
+      label.starts_with("StringLiteralComponent(") ||
+      label.starts_with("BytesLiteral(") ||
+      label.starts_with("BytesLiteralComponent(")) {
+    size_t cursor = label.find('(') + 1;
+    while (cursor < label.size() &&
+           (label[cursor] == 'r' || label[cursor] == 'R' ||
+            label[cursor] == 'b' || label[cursor] == 'B'))
+      ++cursor;
+    if (cursor >= label.size()) return true;
+    const char quote = label[cursor];
+    if (quote != '\'' && quote != '"') return false;
+    const bool triple = cursor + 2 < label.size() &&
+                        label[cursor + 1] == quote &&
+                        label[cursor + 2] == quote;
+    const size_t quote_size = triple ? 3 : 1;
+    cursor += quote_size;
+    for (; cursor < label.size(); ++cursor) {
+      if (label[cursor] == '\\') {
+        ++cursor;
+      } else if (label[cursor] == quote &&
+                 (!triple ||
+                  (cursor + 2 < label.size() && label[cursor + 1] == quote &&
+                   label[cursor + 2] == quote))) {
+        return false;
+      }
+    }
+    return true;
+  }
   size_t open = 0;
   size_t close = 0;
   for (const char c : label) {
-    if (c == '(') {
+    if (c == '(')
       ++open;
-    } else if (c == ')') {
+    else if (c == ')')
       ++close;
-    }
   }
   return open > close;
 }
@@ -122,11 +154,7 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       continue;
     }
 
-    size_t tmp_start = 0;
-    size_t tmp_end = 0;
-    std::string test_label = full_line;
-    while (!ParseLocation(test_label, &tmp_start, &tmp_end) &&
-           HasUnclosedParen(test_label) && cursor < dump.size()) {
+    while (LabelContinues(full_line) && cursor < dump.size()) {
       size_t next_line_end = dump.find('\n', cursor);
       if (next_line_end == std::string_view::npos) {
         next_line_end = dump.size();
@@ -138,7 +166,6 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       cursor = next_line_end + 1;
       full_line.push_back('\n');
       full_line.append(next_line);
-      test_label = full_line;
     }
 
     size_t spaces = 0;
@@ -149,6 +176,10 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       return Status::kUnknown;
     }
     const size_t depth = spaces / 2;
+    if (depth >= kMaxGoogleSqlAstDepth) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "GoogleSQL AST depth limit exceeded");
+    }
     auto node = ParseNode(full_line.substr(spaces));
     GoogleSqlAstNode* raw = node.get();
     if (depth == 0) {

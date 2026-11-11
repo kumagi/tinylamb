@@ -14,7 +14,7 @@ namespace tinylamb {
 
 StatusOr<Value> IntervalExpression::TryEvaluate(
     const Row& /*row*/, const Schema& /*schema*/) const {
-  return Value(std::string(text_));
+  return Value(std::string(text_)).WithInterval();
 }
 
 Value IntervalExpression::Evaluate(const Row& /*row*/,
@@ -25,7 +25,7 @@ Value IntervalExpression::Evaluate(const Row& /*row*/,
 StatusOr<Value> IntervalExpression::TryEvaluate(
     const Row* /*unused*/, const Schema& /*unused*/, const Row* /*unused*/,
     const Schema& /*unused*/) const {
-  return Value(std::string(text_));
+  return Value(std::string(text_)).WithInterval();
 }
 
 Value IntervalExpression::Evaluate(const Row* /*unused*/,

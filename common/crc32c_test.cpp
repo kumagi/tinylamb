@@ -105,4 +105,13 @@ TEST(Crc32CTest, Crc32CExtend_ComposesAcrossSlices) {
   }
 }
 
+TEST(Crc32CTest, AuditPaxChecksumUsesRawRegisterConvention) {
+  const char* text = "123456789";
+  Crc32c checksum;
+  checksum.Update(text, 4);
+  checksum.Update(text + 4, 5);
+  EXPECT_EQ(checksum.Finalize(), 0x1cf96d7cU);
+  EXPECT_EQ(Crc32cOf(text, 9), Crc32C(text, 9) ^ 0xffffffffU);
+}
+
 }  // namespace tinylamb

@@ -31,6 +31,11 @@ void ParallelScan::SetRowFilter(
     std::vector<Expression> conjuncts,
     relational_detail::CompiledScanFilter filter,
     relational_detail::WorkerScanFilterPrograms programs) {
+  if (!projection_) {
+    const auto peeks = relational_detail::BuildIntegerPeeks(
+        filter, nullptr, table_->GetSchema());
+    peek_compares_.insert(peek_compares_.end(), peeks.begin(), peeks.end());
+  }
   row_filter_conjuncts_ = std::move(conjuncts);
   row_filter_ = std::make_unique<relational_detail::CompiledScanFilter>(
       std::move(filter));
@@ -98,6 +103,16 @@ ParallelScan::~ParallelScan() {
   workers_.clear();
 }
 
+bool ParallelScan::RejectedByIntegerMembership() const {
+  return lstable_store_ != nullptr && !txn_->HasAnyPageVersionChains() &&
+         lstable_store_->layout_generation == table_->LayoutGeneration() &&
+         std::ranges::any_of(peek_compares_, [&](const auto& compare) {
+           return compare.op == BinaryOperation::kEquals &&
+                  !lstable_store_->MayContainInteger(compare.column,
+                                                     compare.constant);
+         });
+}
+
 StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
     const std::function<Status(size_t, const TypedCellBatch&)>& consume,
     bool capture_positions) {
@@ -130,6 +145,9 @@ StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
   }
   started_ = true;
   typed_folded_ = true;
+  if (RejectedByIntegerMembership()) {
+    return true;
+  }
   std::atomic<size_t> next{0};
   std::atomic<bool> failed{false};
   Status error = Status::kSuccess;
@@ -203,6 +221,40 @@ StatusOr<bool> ParallelScan::TryFoldTypedMorsels(
   return true;
 }
 
+StatusOr<bool> ParallelScan::TryFoldLSTableStore(
+    const std::function<Status(const LSTableStore&)>& consume) {
+  if (started_ || lstable_store_ == nullptr || row_filter_ != nullptr ||
+      !peek_compares_.empty() || txn_->HasAnyPageVersionChains() ||
+      !txn_->WriteSetEmpty() || lstable_store_->uncommitted_owner_txn != 0 ||
+      lstable_store_->layout_generation != table_->LayoutGeneration() ||
+      lstable_store_->first_pid != table_->FirstPageId()) {
+    return false;
+  }
+  if (worker_status_ != Status::kSuccess) {
+    return worker_status_;
+  }
+  if (projection_ && std::ranges::any_of(*projection_, [&](slot_t slot) {
+        return slot >= table_->GetSchema().ColumnCount();
+      })) {
+    return false;
+  }
+  started_ = true;
+  typed_folded_ = true;
+  Status status;
+  try {
+    status = consume(*lstable_store_);
+  } catch (const std::exception& exception) {
+    status = StatusError(StatusCode::kRuntimeError, exception.what());
+  } catch (...) {
+    status = StatusError(StatusCode::kRuntimeError, "column store fold failed");
+  }
+  if (status != Status::kSuccess) {
+    FailWith(status);
+    return status;
+  }
+  return true;
+}
+
 StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
     size_t worker_count,
     const std::function<Status(size_t, const LSTablePageBlock&, const uint32_t*,
@@ -247,14 +299,21 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                            col_def.Type() == ValueType::kDate) &&
                           !col_def.IsUnsigned() && pred.int_payload &&
                           !pred.constant.IsUnsigned();
-      if (!ok_double && !ok_int) {
+      const bool ok_string =
+          col_def.Type() == ValueType::kVarChar &&
+          pred.constant.type == ValueType::kVarChar &&
+          !pred.constant.IsCaseInsensitive() &&
+          (pred.plain_string_payload || pred.op == BinaryOperation::kLike ||
+           pred.op == BinaryOperation::kNotLike);
+      if (!ok_double && !ok_int && !ok_string) {
         return false;
       }
     }
   }
   started_ = true;
   typed_folded_ = true;
-  if (row_filter_ != nullptr && row_filter_->compile_decided_reject) {
+  if (RejectedByIntegerMembership() ||
+      (row_filter_ != nullptr && row_filter_->compile_decided_reject)) {
     return true;
   }
   const size_t total_blocks = lstable_store_->blocks.size();
@@ -316,8 +375,17 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           bool zone_rejected = false;
           for (const auto& pred : row_filter_->simple) {
             const LSTableColumnBlock& col = blk.columns[pred.column];
+            if (col.type == ValueType::kVarChar) {
+              all_rows_pass = false;
+              continue;
+            }
             const bool is_double_cmp = col.type == ValueType::kDouble;
             if (is_double_cmp) {
+              if (col.has_nan ||
+                  (pred.double_payload && std::isnan(pred.double_constant))) {
+                all_rows_pass = false;
+                continue;
+              }
               if (!col.has_double_min_max) {
                 zone_rejected = true;
                 break;
@@ -451,7 +519,8 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
             row_filter_->simple.size() == 1) {
           const auto& pred = row_filter_->simple[0];
           const LSTableColumnBlock& col = blk.columns[pred.column];
-          if (!col.has_null && col.type != ValueType::kDouble) {
+          if (!col.has_null &&
+              (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
             matched_rows.resize(blk.row_count);
             uint32_t* __restrict out = matched_rows.data();
             const int64_t* __restrict vals = col.int_cells.data();
@@ -545,7 +614,43 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                 simple_ok = false;
                 break;
               }
-              if (col.type == ValueType::kDouble) {
+              if (col.type == ValueType::kVarChar) {
+                const std::string_view value = col.VarcharAt(r);
+                const std::string_view constant =
+                    pred.constant.value.varchar_value;
+                bool ok = false;
+                switch (pred.op) {
+                  case BinaryOperation::kEquals:
+                    ok = value == constant;
+                    break;
+                  case BinaryOperation::kNotEquals:
+                    ok = value != constant;
+                    break;
+                  case BinaryOperation::kLessThan:
+                    ok = value < constant;
+                    break;
+                  case BinaryOperation::kLessThanEquals:
+                    ok = value <= constant;
+                    break;
+                  case BinaryOperation::kGreaterThan:
+                    ok = value > constant;
+                    break;
+                  case BinaryOperation::kGreaterThanEquals:
+                    ok = value >= constant;
+                    break;
+                  case BinaryOperation::kLike:
+                  case BinaryOperation::kNotLike:
+                    ok = relational_detail::FastLikeMatch(value, constant) ==
+                         (pred.op == BinaryOperation::kLike);
+                    break;
+                  default:
+                    break;
+                }
+                if (!ok) {
+                  simple_ok = false;
+                  break;
+                }
+              } else if (col.type == ValueType::kDouble) {
                 const auto v = std::bit_cast<double>(col.int_cells[r]);
                 const double c = pred.double_payload
                                      ? pred.double_constant
@@ -650,6 +755,10 @@ void ParallelScan::Start(size_t batch_size) {
     return;
   }
   started_ = true;
+  if (RejectedByIntegerMembership()) {
+    next_out_morsel_ = morsels_.size();
+    return;
+  }
   if (morsels_.empty()) {
     return;
   }
@@ -795,6 +904,10 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
                                       !col.is_unsigned && pred.int_payload &&
                                       !pred.constant.IsUnsigned();
               if (is_double_cmp) {
+                if (col.has_nan ||
+                    (pred.double_payload && std::isnan(pred.double_constant))) {
+                  continue;
+                }
                 if (!col.has_double_min_max) {
                   zone_rejected = true;
                   break;

@@ -65,15 +65,12 @@ enum class LogicalOperator : uint8_t {
   kCrossJoin,
   kSemiJoin,
   kAntiJoin,
-  kSingleJoin,
-  kMarkJoin,
   kSelection,
   kProjection,
   kAggregation,
   kSort,
   kTopN,
   kDistinct,
-  kMax1Row,
   kUnion,
   kUnionAll,
   kIntersect,
@@ -83,18 +80,23 @@ enum class LogicalOperator : uint8_t {
   kLimit,
   kEmpty,
   kValues,
-  kConstantTable,
   kDummyScan,
-  // ...(省略: kWindow / kUnnest / kGenerateSeries / kRecursiveCte 等)...
+  kWindow,
+  kUnnest,
+  kRecursiveCte,
+  kApply,
+  kSample,
+  // Opaque relational IR (outer/semi/anti joins, subqueries and CTEs). The
+  // memo can cost/select it while its internal lowering remains specialized.
   kRelational,
 };
 ```
 
 これらは役割ごとに以下の系統に整理できます。
 
-- **データソース**: `kScan` / `kValues` / `kConstantTable` / `kDummyScan` / `kGenerateSeries` / `kWorkTableScan`（葉ノードであり子を持たない）
-- **結合演算**: `kJoin`（内側結合）/ `kCrossJoin` / `kSemiJoin` / `kAntiJoin` / `kSingleJoin` / `kMarkJoin` / `kOuterJoin`（LEFT / RIGHT / FULL を `join_type` で区別）
-- **単項の変換演算**: `kSelection` / `kProjection` / `kAggregation` / `kSort` / `kTopN` / `kDistinct` / `kMax1Row` / `kLimit` / `kEmpty` / `kWindow` / `kUnnest`（子を 1 つ持つ）
+- **データソース**: `kScan` / `kValues` / `kDummyScan`（葉ノードであり子を持たない）
+- **結合演算**: `kJoin`（内側結合）/ `kCrossJoin` / `kSemiJoin` / `kAntiJoin` / `kOuterJoin`（LEFT / RIGHT / FULL を `join_type` で区別）
+- **単項の変換演算**: `kSelection` / `kProjection` / `kAggregation` / `kSort` / `kTopN` / `kDistinct` / `kLimit` / `kEmpty` / `kWindow` / `kUnnest`（子を 1 つ持つ）
 - **集合演算**: `kUnion` / `kUnionAll` / `kIntersect` / `kIntersectAll` / `kExcept` / `kExceptAll`（子を 2 つ以上持つ）
 - **中間表現**: `kRelational`（外部結合や CTE 等を含む未分解の関係式を包括する特殊演算子）
 

@@ -169,6 +169,7 @@ class SharedBuildParallelHashJoin : public ExecutorBase,
   // mistake a join can make. Non-inner kinds keep the right-build contract
   // their emit paths assume. Output stays left-then-right either way.
   bool build_left_{false};
+  bool build_empty_{true};
   // The non-build side, drained alongside the build side in
   // BuildSharedHashTable and consumed by ParallelProbe.
   std::vector<std::pair<Row, RowPosition>> probe_tuples_;

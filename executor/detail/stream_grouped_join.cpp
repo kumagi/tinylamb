@@ -57,7 +57,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
     const std::vector<std::vector<slot_t>>& projections,
     const std::vector<Relation>& schemas, GroupedJoinFusionSpec* fusion) {
   const auto decline = [] { return std::optional<Relation>{}; };
-  if ((fusion == nullptr) || !fusion->eligible ||
+  if ((fusion == nullptr) || !fusion->eligible || fusion->having ||
       statement.Sources().size() != 2 || (outer != nullptr) || !ctes.empty() ||
       fusion->group_keys.size() > 1 || fusion->aggregates.empty() ||
       (std::getenv("TINYLAMB_DISABLE_STREAM_GROUPED_JOIN") != nullptr)) {
@@ -288,7 +288,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
       if (sv.size() < lf.sub0.size() + lf.sub1.size()) {
         return false;
       }
-#if defined(_WIN32)
+#ifdef _WIN32
       const size_t p0 = sv.find(lf.sub0);
       if (p0 == std::string_view::npos) {
         return false;
@@ -1092,7 +1092,7 @@ StatusOr<std::optional<Relation>> TryStreamGroupedBaseJoin(
                   const size_t dsize = dense_match_mask.size();
                   const uint32_t nrows = blk->row_count;
                   uint64_t blk_matched = 0;
-                  int64_t blk_sum = 0;
+                  __int128 blk_sum = 0;
                   for (uint32_t r = 0; r < nrows; ++r) {
                     const uint64_t offset = static_cast<uint64_t>(kcells[r]) -
                                             static_cast<uint64_t>(dense_min);

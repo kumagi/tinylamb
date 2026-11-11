@@ -349,6 +349,8 @@ inline thread_local std::unordered_map<std::string, CompiledPlanPtr>
 inline thread_local std::unordered_set<std::string>
     thread_volatile_specialized_plans;
 inline constexpr size_t kThreadCompiledPlanCapacity = 256;
+inline constexpr size_t kVolatileFingerprintCapacity = 1024;
+inline thread_local bool thread_volatile_fingerprints_saturated = false;
 
 // A migrating SQL session exclusively owns its mutable parameter slots.
 // The scheduler must allow at most one active scope per session; unrelated
@@ -356,6 +358,7 @@ inline constexpr size_t kThreadCompiledPlanCapacity = 256;
 struct PreparedPlanSessionCache {
   std::unordered_map<std::string, CompiledPlanPtr> plans;
   std::unordered_set<std::string> volatile_fingerprints;
+  bool volatile_fingerprints_saturated = false;
 };
 inline thread_local PreparedPlanSessionCache* active_plan_session = nullptr;
 class ScopedPreparedPlanSession {
@@ -368,17 +371,26 @@ class ScopedPreparedPlanSession {
   ScopedPreparedPlanSession(const ScopedPreparedPlanSession&) = delete;
   ScopedPreparedPlanSession& operator=(const ScopedPreparedPlanSession&) =
       delete;
+  ScopedPreparedPlanSession(ScopedPreparedPlanSession&&) = delete;
+  ScopedPreparedPlanSession& operator=(ScopedPreparedPlanSession&&) = delete;
 
  private:
   PreparedPlanSessionCache* previous_;
 };
 inline auto& CurrentCompiledPlans() {
-  return active_plan_session ? active_plan_session->plans
-                             : thread_compiled_plans;
+  return (active_plan_session != nullptr) ? active_plan_session->plans
+                                          : thread_compiled_plans;
 }
 inline auto& CurrentVolatileFingerprints() {
-  return active_plan_session ? active_plan_session->volatile_fingerprints
-                             : thread_volatile_specialized_plans;
+  return (active_plan_session != nullptr)
+             ? active_plan_session->volatile_fingerprints
+             : thread_volatile_specialized_plans;
+}
+
+inline bool& CurrentVolatileFingerprintsSaturated() {
+  return active_plan_session != nullptr
+             ? active_plan_session->volatile_fingerprints_saturated
+             : thread_volatile_fingerprints_saturated;
 }
 
 // A reused SELECT is planned again when a later execution is slower than
@@ -396,14 +408,30 @@ inline bool SelectReuseExceededThreshold(uint64_t elapsed_ns,
 }
 
 inline bool IsVolatileSpecializedPlan(const std::string& fingerprint) {
-  return CurrentVolatileFingerprints().contains(fingerprint);
+  return CurrentVolatileFingerprintsSaturated() ||
+         CurrentVolatileFingerprints().contains(fingerprint);
 }
 
 // Prepends a fingerprint to the volatile set for the duration of one
 // statement compile (used by the DML subquery fold path), returning true
 // when the entry was freshly added so the caller can demote it later.
 inline bool MarkFingerprintVolatile(const std::string& fingerprint) {
-  return CurrentVolatileFingerprints().insert(fingerprint).second;
+  if (CurrentVolatileFingerprintsSaturated()) {
+    return false;
+  }
+  auto& fingerprints = CurrentVolatileFingerprints();
+  if (fingerprints.contains(fingerprint)) {
+    return false;
+  }
+  if (fingerprints.size() >= kVolatileFingerprintCapacity) {
+    // Forgetting one mark could resurrect a stale globally cached DML fold.
+    // Saturation therefore disables compiled-plan reuse for this session.
+    // The flag costs constant space and survives every temporary demotion.
+    CurrentVolatileFingerprintsSaturated() = true;
+    fingerprints.clear();
+    return false;
+  }
+  return fingerprints.insert(fingerprint).second;
 }
 
 inline void DemoteVolatileFingerprint(const std::string& fingerprint,
@@ -432,8 +460,9 @@ inline CompiledPlanPtr FindThreadCompiledPlan(const std::string& fingerprint,
 
 inline void RememberThreadCompiledPlan(const std::string& fingerprint,
                                        CompiledPlanPtr plan) {
-  if (CurrentCompiledPlans().size() >=
-          (active_plan_session ? 64 : kThreadCompiledPlanCapacity) &&
+  if (CurrentCompiledPlans().size() >= ((active_plan_session != nullptr)
+                                            ? 64
+                                            : kThreadCompiledPlanCapacity) &&
       !CurrentCompiledPlans().contains(fingerprint)) {
     CurrentCompiledPlans().clear();
   }

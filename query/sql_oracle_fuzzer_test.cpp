@@ -13,8 +13,11 @@
 #include <string>
 #include <vector>
 
+#include "database/transaction_context.hpp"
 #include "gtest/gtest.h"
 #include "query/fuzz_scoped_db.hpp"
+#include "query/sql_engine.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 
@@ -47,6 +50,13 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 // executor.  Skips (unsupported generated syntax) are allowed but counted so
 // a silently-all-skipping harness fails this test.
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
+  int iterations = 64;
+  if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
+    const int parsed = std::atoi(env);
+    if (parsed > 0) {
+      iterations = parsed;
+    }
+  }
   int tlp_ran = 0;
   int tlp_agg_ran = 0;
   [[maybe_unused]] int unionall_ran = 0;
@@ -64,13 +74,18 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int ordinal_setop_ran = 0;
   int dqe_ran = 0;
   int troc_ran = 0;
-  constexpr int kIterations = 64;
-  for (uint32_t seed = 0; seed < kIterations; ++seed) {
+  const int kIterations = iterations;
+  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     OracleTrace trace;
-    std::string report = RunOracleIteration(rng, false, &stats, &trace);
-    ASSERT_EQ(report, "") << (seed != 0U) << report;
+    const bool verbose = std::getenv("TINYLAMB_FUZZ_VERBOSE") != nullptr;
+    std::string report = RunOracleIteration(rng, verbose, &stats, &trace);
+    ASSERT_EQ(report, "") << "seed " << seed << "\n" << report;
+    EXPECT_GE(trace.norec.size(), 32U) << "seed " << seed;
+    EXPECT_GE(trace.norec_content.size(), 4U) << "seed " << seed;
+    EXPECT_EQ(trace.norec.size() % 2, 0U);
+    EXPECT_EQ(trace.norec_content.size() % 2, 0U);
     if (!trace.ordinal_order.empty()) {
       const std::string& query = trace.ordinal_order.front();
       if (query.find("WITH q AS") != std::string::npos) {
@@ -138,9 +153,195 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   }
 }
 
-// End-to-end check of the failure->file->replay pipeline: a hand-crafted
-// trace with a deliberately inconsistent oracle must serialize, parse and
-// replay into a mismatch, and its consistent twin must replay clean.
+// Drains `sql`.  NoREC skips a rejected spelling, so a shape test that only
+// replays would stay green while checking nothing.
+::testing::AssertionResult ExpectRuns(Database& db, TransactionContext& ctx,
+                                      const std::string& sql) {
+  SqlEngine engine(db);
+  StatusOr<QueryResult> result = engine.Execute(ctx, sql);
+  if (!result.HasValue()) {
+    return ::testing::AssertionFailure() << engine.LastError() << "\n" << sql;
+  }
+  Row row;
+  while (result.Value().Next(&row)) {
+  }
+  if (result.Value().GetStatus() != Status::kSuccess) {
+    return ::testing::AssertionFailure()
+           << result.Value().GetStatus().GetMessage() << "\n"
+           << sql;
+  }
+  return ::testing::AssertionSuccess();
+}
+
+// The canonical NoREC identities (single-table rewrites, joins, GROUP BY,
+// subquery decorrelation, row contents) must execute and agree, including
+// after the indexes that make the WHERE side a range or lookup.
+TEST(SqlOracleFuzzer, NoRecCanonicalShapesAgree) {
+  OracleTrace trace;
+  trace.table = "norec_t";
+  trace.predicate = "(a > 0)";
+  trace.setup = {
+      "CREATE TABLE norec_t (u INT64, a INT64, b INT64, flag BOOL, s "
+      "VARCHAR(8));",
+      "CREATE TABLE norec_t_s (u INT64, a INT64, b INT64, flag BOOL, s "
+      "VARCHAR(8));",
+      "CREATE TABLE norec_t_j (x INT64, y VARCHAR(8));",
+      "INSERT INTO norec_t VALUES (0, 1, NULL, TRUE, 'a');",
+      "INSERT INTO norec_t VALUES (1, NULL, 2, FALSE, NULL);",
+      "INSERT INTO norec_t VALUES (2, -1, 0, NULL, 'bb');",
+      "INSERT INTO norec_t VALUES (3, 2, 2, TRUE, '');",
+      "INSERT INTO norec_t_s VALUES (10, 1, 0, TRUE, 'a');",
+      "INSERT INTO norec_t_s VALUES (11, NULL, NULL, NULL, 'zz');",
+      "INSERT INTO norec_t_j VALUES (1, 'a');",
+      "INSERT INTO norec_t_j VALUES (NULL, 'bb');",
+      "INSERT INTO norec_t_j VALUES (4, NULL);",
+  };
+  const std::string t = "norec_t";
+  const std::string p = "(a > 0)";
+  trace.norec = {
+      "SELECT COUNT(*) FROM " + t + " WHERE (" + p + ");",
+      "SELECT COALESCE(SUM(CASE WHEN (" + p + ") THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM (SELECT u FROM " + t + " WHERE (" + p + ")) q;",
+      "SELECT COALESCE(SUM(CASE WHEN (" + p + ") THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM (SELECT u, a, b, flag, s FROM " + t +
+          ") d WHERE (" + p + ");",
+      "SELECT COALESCE(SUM(CASE WHEN (" + p +
+          ") THEN 1 ELSE 0 END), 0) FROM (SELECT u, a, b, flag, s FROM " + t +
+          ") d;",
+      "SELECT COALESCE(SUM(c), 0) FROM (SELECT COUNT(*) AS c FROM " + t +
+          " WHERE (" + p + ") GROUP BY a) g;",
+      "SELECT COALESCE(SUM(c), 0) FROM (SELECT SUM(CASE WHEN (" + p +
+          ") THEN 1 ELSE 0 END) AS c FROM " + t + " GROUP BY a) g;",
+      "SELECT COUNT(*) FROM (SELECT u, a FROM " + t + " WHERE (" + p +
+          ") ORDER BY a, u) q;",
+      "SELECT COALESCE(SUM(CASE WHEN (" + p + ") THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE 0 < a;",
+      "SELECT COALESCE(SUM(CASE WHEN a > 0 THEN 1 ELSE 0 END), 0) FROM " + t +
+          ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE a IN (1, 2, -1);",
+      "SELECT COALESCE(SUM(CASE WHEN (a = 1) OR (a = 2) OR (a = -1) THEN 1 "
+      "ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE a BETWEEN -1 AND 1;",
+      "SELECT COALESCE(SUM(CASE WHEN (a >= -1) AND (a <= 1) THEN 1 ELSE 0 "
+      "END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE s LIKE 'a%';",
+      "SELECT COALESCE(SUM(CASE WHEN s LIKE 'a%' THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE a IS NULL;",
+      "SELECT COALESCE(SUM(CASE WHEN a IS NULL THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE flag IS NOT TRUE;",
+      "SELECT COALESCE(SUM(CASE WHEN flag IS NOT TRUE THEN 1 ELSE 0 END), 0) "
+      "FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE (a + 1) > 1;",
+      "SELECT COALESCE(SUM(CASE WHEN (a + 1) > 1 THEN 1 ELSE 0 END), 0) FROM " +
+          t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE u = 2;",
+      "SELECT COALESCE(SUM(CASE WHEN u = 2 THEN 1 ELSE 0 END), 0) FROM " + t +
+          ";",
+      "SELECT COUNT(*) FROM " + t + " AS l JOIN " + t +
+          " AS r ON l.a = r.a WHERE (l.a > 0);",
+      "SELECT COALESCE(SUM(CASE WHEN (l.a > 0) THEN 1 ELSE 0 END), 0) FROM " +
+          t + " AS l JOIN " + t + " AS r ON l.a = r.a;",
+      "SELECT COUNT(*) FROM " + t + " AS l JOIN " + t +
+          "_s AS r ON l.a = r.a AND (l.a > 0);",
+      "SELECT COALESCE(SUM(CASE WHEN (l.a = r.a) AND (l.a > 0) THEN 1 ELSE 0 "
+      "END), 0) FROM " +
+          t + " AS l CROSS JOIN " + t + "_s AS r;",
+      "SELECT COUNT(*) FROM " + t + " AS l LEFT JOIN " + t +
+          "_s AS r ON l.a = r.a WHERE (l.b IS NULL);",
+      "SELECT COALESCE(SUM(CASE WHEN (l.b IS NULL) THEN 1 ELSE 0 END), 0) "
+      "FROM " +
+          t + " AS l LEFT JOIN " + t + "_s AS r ON l.a = r.a;",
+      "SELECT COUNT(*) FROM " + t + " WHERE a IN (SELECT x FROM " + t + "_j);",
+      "SELECT COALESCE(SUM(CASE WHEN a IN (SELECT x FROM " + t +
+          "_j) THEN 1 ELSE 0 END), 0) FROM " + t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE a NOT IN (SELECT x FROM " + t +
+          "_j);",
+      "SELECT COALESCE(SUM(CASE WHEN a NOT IN (SELECT x FROM " + t +
+          "_j) THEN 1 ELSE 0 END), 0) FROM " + t + ";",
+      "SELECT COUNT(*) FROM " + t + " WHERE EXISTS (SELECT 1 FROM " + t +
+          "_j WHERE " + t + "_j.x = " + t + ".a);",
+      "SELECT COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM " + t + "_j WHERE " +
+          t + "_j.x = " + t + ".a) THEN 1 ELSE 0 END), 0) FROM " + t + ";",
+  };
+  trace.norec_content = {
+      "SELECT u, a, b, flag, s FROM " + t + " WHERE (" + p + ");",
+      "SELECT u, a, b, flag, s, CASE WHEN (" + p + ") THEN 1 ELSE 0 END FROM " +
+          t + ";",
+      "SELECT u, a, b FROM " + t + " WHERE (a >= -1) AND (a <= 1);",
+      "SELECT u, a, b, CASE WHEN (a >= -1) AND (a <= 1) THEN 1 ELSE 0 END "
+      "FROM " +
+          t + ";",
+  };
+  trace.index_ddl = {
+      "CREATE INDEX idx_norec_a ON norec_t(a);",
+      "CREATE INDEX idx_norec_b ON norec_t(b);",
+      "CREATE INDEX idx_norec_s ON norec_t(s);",
+      "CREATE UNIQUE INDEX idx_norec_u ON norec_t(u);",
+      "CREATE INDEX idx_norec_sa ON norec_t_s(a);",
+      "CREATE INDEX idx_norec_jx ON norec_t_j(x);",
+  };
+  trace.index_probe = "SELECT COUNT(*) FROM norec_t WHERE (a > 0);";
+
+  EXPECT_EQ(ReplayOracleTrace(trace, true), "");
+
+  const std::string text = SerializeOracleTest(11, trace, "");
+  uint64_t seed = 0;
+  OracleTrace parsed;
+  std::string summary;
+  ASSERT_TRUE(ParseOracleTest(text, &seed, &parsed, &summary)) << text;
+  EXPECT_EQ(parsed, trace);
+
+  ScopedDb sdb("norec_shapes");
+  ASSERT_NE(sdb.get(), nullptr);
+  Database& db = *sdb;
+  TransactionContext ctx = db.BeginContext();
+  for (const std::string& sql : trace.setup) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, sql));
+  }
+  (void)ctx.txn_.PreCommit();
+  ctx = db.BeginContext();
+  for (const std::string& sql : trace.norec) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, sql));
+  }
+  for (const std::string& sql : trace.norec_content) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, sql));
+  }
+  for (const std::string& ddl : trace.index_ddl) {
+    ASSERT_TRUE(ApplyIndexSpec(db, ctx, ddl)) << ddl;
+  }
+  for (const char* table : {"norec_t", "norec_t_s", "norec_t_j"}) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, std::string("ANALYZE ") + table + ";"));
+  }
+  for (const std::string& sql : trace.norec) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, sql));
+  }
+  for (const std::string& sql : trace.norec_content) {
+    ASSERT_TRUE(ExpectRuns(db, ctx, sql));
+  }
+
+  OracleTrace broken = trace;
+  broken.norec[1] =
+      "SELECT COALESCE(SUM(CASE WHEN a > 100 THEN 1 ELSE 0 END), 0) FROM "
+      "norec_t;";
+  const std::string scalar = ReplayOracleTrace(broken, false);
+  EXPECT_NE(scalar.find("[NoREC MISMATCH]"), std::string::npos) << scalar;
+
+  OracleTrace rows = trace;
+  rows.norec_content[1] =
+      "SELECT u, a, b, flag, s, CASE WHEN a > 100 THEN 1 ELSE 0 END FROM "
+      "norec_t;";
+  const std::string content = ReplayOracleTrace(rows, false);
+  EXPECT_NE(content.find("kind: rows"), std::string::npos) << content;
+}
+
 TEST(SqlOracleFuzzer, DerivedTableOrderByOrdinalUsesProjectedColumn) {
   OracleTrace trace;
   trace.setup = {
@@ -154,6 +355,9 @@ TEST(SqlOracleFuzzer, DerivedTableOrderByOrdinalUsesProjectedColumn) {
   EXPECT_EQ(ReplayOracleTrace(trace, true), "");
 }
 
+// End-to-end check of the failure->file->replay pipeline: a hand-crafted
+// trace with a deliberately inconsistent oracle must serialize, parse and
+// replay into a mismatch, and its consistent twin must replay clean.
 TEST(SqlOracleFuzzer, TestFileRoundTripDetectsMismatch) {
   OracleTrace broken;
   broken.setup = {

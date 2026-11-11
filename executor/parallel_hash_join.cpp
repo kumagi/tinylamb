@@ -276,6 +276,7 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
       build_left_ ? left_cols_ : right_cols_;
 
   const size_t total_build = build_tuples.size();
+  build_empty_ = total_build == 0;
   const size_t num_threads =
       std::min(worker_count_, std::max<size_t>(1, total_build / 16));
 
@@ -457,7 +458,8 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
   // one, so the concatenation order flips with it.
   auto emit_combined = [](std::vector<std::pair<Row, RowPosition>>& out,
                           const Row& probe_row, const RowPosition& probe_rp,
-                          const Row& build_row, bool build_is_left) {
+                          const Row& build_row, const RowPosition& build_rp,
+                          bool build_is_left) {
     const Row& left_row = build_is_left ? build_row : probe_row;
     const Row& right_row = build_is_left ? probe_row : build_row;
     std::vector<Value> joined_values;
@@ -468,7 +470,8 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
     for (size_t c = 0; c < right_row.values_.size(); ++c) {
       joined_values.push_back(right_row[c]);
     }
-    out.emplace_back(Row(std::move(joined_values)), probe_rp);
+    out.emplace_back(Row(std::move(joined_values)),
+                     build_is_left ? build_rp : probe_rp);
   };
 
   auto probe_worker = [&](size_t thread_id) {
@@ -512,23 +515,25 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
         }
         if (probe_int) {
           shared_hash_table_.FindIntMatches(
-              int_hash, parts.data(), [&](const Row& m, const RowPosition&) {
+              int_hash, parts.data(),
+              [&](const Row& m, const RowPosition& position) {
                 found = true;
-                emit(m);
+                emit(m, position);
               });
         } else {
-          shared_hash_table_.FindMatches(byte_hash, byte_key,
-                                         [&](const Row& m, const RowPosition&) {
-                                           found = true;
-                                           emit(m);
-                                         });
+          shared_hash_table_.FindMatches(
+              byte_hash, byte_key,
+              [&](const Row& m, const RowPosition& position) {
+                found = true;
+                emit(m, position);
+              });
         }
         return found;
       };
       // Emits probe+build concatenated in left-then-right schema order.
-      auto emit_for = [&](const Row& build_row) {
+      auto emit_for = [&](const Row& build_row, const RowPosition& build_rp) {
         emit_combined(out, probe_tuple.first, probe_tuple.second, build_row,
-                      build_left_);
+                      build_rp, build_left_);
       };
 
       if (kind_ == JoinKind::kNullAwareAnti && build_has_null_key_) {
@@ -542,22 +547,23 @@ Status SharedBuildParallelHashJoin::ParallelProbe() {
           lookup(emit_for);
           break;
         case JoinKind::kSemi:
-          if (lookup([](const Row&) {})) {
+          if (lookup([](const Row&, const RowPosition&) {})) {
             out.emplace_back(probe_tuple.first, probe_tuple.second);
           }
           break;
         case JoinKind::kAnti:
           // NOT EXISTS decorrelation: a NULL probe key can never match, so
           // it takes the no-match path like the nested-loop/merge joins.
-          if (!lookup([](const Row&) {})) {
+          if (!lookup([](const Row&, const RowPosition&) {})) {
             out.emplace_back(probe_tuple.first, probe_tuple.second);
           }
           break;
         case JoinKind::kNullAwareAnti:
-          // NOT IN three-valued semantics: a NULL probe key is UNKNOWN and
-          // is filtered out, never emitted (matches probe_survives in the
-          // serial HashJoin).
-          if (!probe_has_null && !lookup([](const Row&) {})) {
+          // NOT IN over an empty set is TRUE even for a NULL probe.
+          // Otherwise a NULL probe is UNKNOWN and cannot pass.
+          if (build_empty_ ||
+              (!probe_has_null &&
+               !lookup([](const Row&, const RowPosition&) {}))) {
             out.emplace_back(probe_tuple.first, probe_tuple.second);
           }
           break;

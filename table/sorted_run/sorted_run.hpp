@@ -34,8 +34,6 @@
 
 namespace tinylamb {
 
-class BlobFile;
-
 // A serialized buffer of row payloads plus a sorted array of
 // (key_offset, row_offset) pointer-entries. Sorting moves only pointers, not
 // row data, so write amplification stays at O(N log N) pointer moves plus one

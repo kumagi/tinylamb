@@ -88,7 +88,7 @@ int DataSync(int fd);
 
 // Whether AdviseDontNeed actually reaches the kernel. Callers that would do
 // extra work (opening files) only to issue the hint can skip it when false.
-#if defined(__linux__)
+#ifdef __linux__
 inline constexpr bool kSupportsAdviseDontNeed = true;
 #else
 inline constexpr bool kSupportsAdviseDontNeed = false;

@@ -1510,45 +1510,7 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   if (qualify_window_fn != nullptr) {
     window_fns.push_back(qualify_window_fn);
   }
-  // Detect singleton partition elimination: PARTITION BY event_id where
-  // event_id is the primary key — each partition has exactly one row, so
-  // ROW_NUMBER() is always 1 and the window can be eliminated.
-  bool window_eliminated = false;
-  bool singleton_constant = false;
-  if (!window_fns.empty() && statement.Sources().size() == 1) {
-    const SelectSource& src = statement.Sources()[0];
-    const std::string table_name = src.alias.empty() ? src.table : src.alias;
-    for (const WindowFunctionCallExpression* wf : window_fns) {
-      if (wf->function == "ROW_NUMBER" && wf->partition_by.size() == 1) {
-        const std::string part_col = wf->partition_by[0]->ToString();
-        // Check if partition column matches the source table's primary key
-        // column (format: "table.column" or just "column").
-        if (part_col.find(table_name + ".event_id") != std::string::npos ||
-            part_col == "event_id") {
-          window_eliminated = true;
-          // Check if the query has no other window functions
-          if (window_fns.size() == 1) {
-            singleton_constant = true;
-          }
-        }
-      }
-    }
-  }
-  if (singleton_constant) {
-    // Check if the window has no ORDER BY — if so, ROW_NUMBER() over
-    // a singleton partition is always 1, so it becomes a constant.
-    const bool has_order =
-        !window_fns.empty() && !window_fns[0]->order_by.empty();
-    if (!has_order) {
-      // ROW_NUMBER() OVER (PARTITION BY pk) — always 1, constant projection
-      output << pad << "Project constant 1" << '\n';
-    } else {
-      // ROW_NUMBER() OVER (PARTITION BY pk ORDER BY ...) — eliminated
-      output << pad << "Window eliminated constant_partition=true" << '\n';
-    }
-  } else if (window_eliminated) {
-    output << pad << "Window eliminated constant_partition=true" << '\n';
-  } else if (!window_fns.empty()) {
+  if (!window_fns.empty()) {
     // Count distinct sort orders among window functions.
     // Two window functions have the same sort if they share the same
     // partition-by and order-by keys.

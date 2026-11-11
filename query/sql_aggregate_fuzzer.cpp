@@ -1864,10 +1864,19 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       bool ungrouped;
     };
     const std::array<SelProbe, 4> kSelProbes = {{
-        {"u >= 4000 AND u < 4180", 4000, 4180, false},
-        {"u < 5000", 0, 5000, false},
-        {"u >= 400", 400, row_count, false},
-        {"u >= 4000 AND u < 4200 AND a BETWEEN -2 AND 2", 4000, 4200, true},
+        {.where_sql = "u >= 4000 AND u < 4180",
+         .u_lo = 4000,
+         .u_hi = 4180,
+         .ungrouped = false},
+        {.where_sql = "u < 5000", .u_lo = 0, .u_hi = 5000, .ungrouped = false},
+        {.where_sql = "u >= 400",
+         .u_lo = 400,
+         .u_hi = row_count,
+         .ungrouped = false},
+        {.where_sql = "u >= 4000 AND u < 4200 AND a BETWEEN -2 AND 2",
+         .u_lo = 4000,
+         .u_hi = 4200,
+         .ungrouped = true},
     }};
     for (const SelProbe& sp : kSelProbes) {
       std::string sql;
@@ -1885,13 +1894,31 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           }
         }
         std::string row;
+        row += ComputeAgg({.sql = "COUNT(*)",
+                           .col = -1,
+                           .kind = AggSpec::Kind::kCountStar},
+                          surv) +
+               ",";
+        row += ComputeAgg(
+                   {.sql = "COUNT(a)", .col = 0, .kind = AggSpec::Kind::kCount},
+                   surv) +
+               ",";
         row +=
-            ComputeAgg({"COUNT(*)", -1, AggSpec::Kind::kCountStar}, surv) + ",";
-        row += ComputeAgg({"COUNT(a)", 0, AggSpec::Kind::kCount}, surv) + ",";
-        row += ComputeAgg({"SUM(a)", 0, AggSpec::Kind::kSum}, surv) + ",";
-        row += ComputeAgg({"SUM(f)", 3, AggSpec::Kind::kSum}, surv) + ",";
-        row += ComputeAgg({"MIN(b)", 1, AggSpec::Kind::kMin}, surv) + ",";
-        row += ComputeAgg({"MAX(b)", 1, AggSpec::Kind::kMax}, surv) + ",";
+            ComputeAgg({.sql = "SUM(a)", .col = 0, .kind = AggSpec::Kind::kSum},
+                       surv) +
+            ",";
+        row +=
+            ComputeAgg({.sql = "SUM(f)", .col = 3, .kind = AggSpec::Kind::kSum},
+                       surv) +
+            ",";
+        row +=
+            ComputeAgg({.sql = "MIN(b)", .col = 1, .kind = AggSpec::Kind::kMin},
+                       surv) +
+            ",";
+        row +=
+            ComputeAgg({.sql = "MAX(b)", .col = 1, .kind = AggSpec::Kind::kMax},
+                       surv) +
+            ",";
         expected.push_back(row);
       } else {
         sql =
@@ -1907,12 +1934,28 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
         }
         for (const auto& [k, rows] : groups) {
           std::string row = FmtInt(rows[0].a) + "," + FmtStr(rows[0].s) + ",";
-          row += ComputeAgg({"COUNT(*)", -1, AggSpec::Kind::kCountStar}, rows) +
+          row += ComputeAgg({.sql = "COUNT(*)",
+                             .col = -1,
+                             .kind = AggSpec::Kind::kCountStar},
+                            rows) +
                  ",";
-          row += ComputeAgg({"COUNT(a)", 0, AggSpec::Kind::kCount}, rows) + ",";
-          row += ComputeAgg({"SUM(a)", 0, AggSpec::Kind::kSum}, rows) + ",";
-          row += ComputeAgg({"SUM(f)", 3, AggSpec::Kind::kSum}, rows) + ",";
-          row += ComputeAgg({"AVG(f)", 3, AggSpec::Kind::kAvg}, rows) + ",";
+          row +=
+              ComputeAgg(
+                  {.sql = "COUNT(a)", .col = 0, .kind = AggSpec::Kind::kCount},
+                  rows) +
+              ",";
+          row += ComputeAgg(
+                     {.sql = "SUM(a)", .col = 0, .kind = AggSpec::Kind::kSum},
+                     rows) +
+                 ",";
+          row += ComputeAgg(
+                     {.sql = "SUM(f)", .col = 3, .kind = AggSpec::Kind::kSum},
+                     rows) +
+                 ",";
+          row += ComputeAgg(
+                     {.sql = "AVG(f)", .col = 3, .kind = AggSpec::Kind::kAvg},
+                     rows) +
+                 ",";
           expected.push_back(row);
         }
         std::sort(expected.begin(), expected.end());
@@ -1920,8 +1963,11 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       std::string error;
       auto got = RunQuery(db, ctx, sql, &error);
       if (!got.has_value()) {
-        report += "[AGGREGATE MISMATCH] selectivity probe failed: " + sql +
-                  " :: " + error + "\n";
+        report.append("[AGGREGATE MISMATCH] selectivity probe failed: ")
+            .append(sql)
+            .append(" :: ")
+            .append(error)
+            .append("\n");
         return report;
       }
       const std::vector<std::string> actual = FormatRows(*got);
@@ -2006,6 +2052,89 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   } else {
     platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
   }
+
+  // IEEE-754 NaN + constant-value LSTable zone-map & window APPROX_QUANTILES
+  // differential oracle (targeting 2026-11-10 audit High #4, #8, #9):
+  // When all non-NaN values in a FLOAT64 column equal a single constant `c`,
+  // `WHERE f <> c` must still retain the `NaN` rows (`NaN != c` is TRUE), and
+  // `APPROX_QUANTILES(f, 2) OVER (PARTITION BY a)` must not violate strict
+  // weak ordering or diverge between heap and LSTable.
+  if (report.empty() && !large) {
+    const double c_val = static_cast<double>(g.Pick(-5, 5));
+    const std::string c_lit = std::to_string(c_val) + ".0";
+    const std::array<std::string, 5> nan_setup = {
+        "CREATE TABLE t_nan_heap (u INT64 PRIMARY KEY, a INT64, f FLOAT64);",
+        "CREATE TABLE t_nan_lst (u INT64 PRIMARY KEY, a INT64, f FLOAT64) "
+        "USING lstable;",
+        "INSERT INTO t_nan_heap VALUES "
+        "(1, 10, " +
+            c_lit +
+            "), (2, 10, CAST('NaN' AS FLOAT64)), "
+            "(3, 10, " +
+            c_lit +
+            "), (4, 20, CAST('NaN' AS FLOAT64)), "
+            "(5, 20, CAST('NaN' AS FLOAT64)), (6, 20, NULL);",
+        "INSERT INTO t_nan_lst VALUES "
+        "(1, 10, " +
+            c_lit +
+            "), (2, 10, CAST('NaN' AS FLOAT64)), "
+            "(3, 10, " +
+            c_lit +
+            "), (4, 20, CAST('NaN' AS FLOAT64)), "
+            "(5, 20, CAST('NaN' AS FLOAT64)), (6, 20, NULL);",
+        "ANALYZE t_nan_heap;"};
+    bool nan_ok = true;
+    for (const std::string& s : nan_setup) {
+      auto r = engine.Execute(ctx, s);
+      if (!r.HasValue()) {
+        nan_ok = false;
+        break;
+      }
+      r.Value().Drain();
+    }
+    if (nan_ok) {
+      if (auto r = engine.Execute(ctx, "ANALYZE t_nan_lst;"); r.HasValue()) {
+        r.Value().Drain();
+      }
+      if (ctx.txn_.PreCommit() == Status::kSuccess) {
+        ctx = db.BeginContext();
+        const std::array<std::pair<std::string, std::string>, 4> nan_probes = {{
+            {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " + c_lit +
+                 ";",
+             "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit +
+                 ";"},
+            {"SELECT a, COUNT(*), COUNT(f) FROM t_nan_heap WHERE f <> " +
+                 c_lit + " GROUP BY a ORDER BY a;",
+             "SELECT a, COUNT(*), COUNT(f) FROM t_nan_lst WHERE f <> " + c_lit +
+                 " GROUP BY a ORDER BY a;"},
+            {"SELECT COUNT(*), COUNT(f) FROM t_nan_heap WHERE f = " + c_lit +
+                 ";",
+             "SELECT COUNT(*), COUNT(f) FROM t_nan_lst WHERE f = " + c_lit +
+                 ";"},
+            {"SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
+             "t_nan_heap ORDER BY u;",
+             "SELECT u, a, APPROX_QUANTILES(f, 2) OVER (PARTITION BY a) FROM "
+             "t_nan_lst ORDER BY u;"},
+        }};
+        for (const auto& [q_heap, q_lst] : nan_probes) {
+          std::string err_h, err_l;
+          auto got_h = RunQuery(db, ctx, q_heap, &err_h);
+          auto got_l = RunQuery(db, ctx, q_lst, &err_l);
+          if (!got_h.has_value() || !got_l.has_value()) {
+            continue;
+          }
+          const std::vector<std::string> rows_h = FormatRows(*got_h);
+          const std::vector<std::string> rows_l = FormatRows(*got_l);
+          if (rows_h != rows_l) {
+            report += "[NAN-ZONEMAP/WINDOW MISMATCH]\n  heap: " + q_heap +
+                      "\n  lst:  " + q_lst + "\n";
+            return report;
+          }
+        }
+      }
+    }
+  }
+
   return report;
 }
 

@@ -280,6 +280,32 @@ TEST_F(SortShapeTest, OffsetOnlyLimitDoesNotProveDistinctness) {
   EXPECT_TRUE(std::make_shared<LimitPlan>(limited, 1, 0)->EnforcesDistinct());
 }
 
+TEST_F(SortShapeTest, AuditLimitFoldPreservesExplicitSortCollation) {
+  const SortKey folded{.expression = NameKey(),
+                       .ascending = true,
+                       .nulls_first = std::nullopt,
+                       .collation = Collation::kCaseInsensitive};
+  const Plan sorted = std::make_shared<BufferedSortPlan>(
+      LeafWith({Row({Value(1), Value("a")}), Row({Value(2), Value("B")})}),
+      KeysOf({folded}));
+  cascades::Memo memo;
+  const auto root = memo.Build({"leaf"});
+  LogicalExpression limit;
+  limit.operation = LogicalOperator::kLimit;
+  limit.children = {root};
+  limit.limit_count = 1;
+  const auto alternatives = RuleByName("limit").Apply(
+      memo, root, limit, {BestPlan{.plan = sorted, .estimated_rows = 2}},
+      PhysicalProperties{}, RuleContext::Empty());
+  ASSERT_EQ(alternatives.size(), 1U);
+  EXPECT_EQ(alternatives[0].plan->OrderCollation(),
+            Collation::kCaseInsensitive);
+  TransactionContext context = database_->BeginContext();
+  const Executor executor = alternatives[0].plan->EmitExecutor(context);
+  EXPECT_EQ(Drain(executor), (std::vector<Row>{Row({Value(1), Value("a")})}));
+  EXPECT_EQ(executor->GetStatus(), Status::kSuccess);
+}
+
 TEST_F(SortShapeTest, OrderedWrappersKeepTheChildCollation) {
   const SortKey folded{.expression = NameKey(),
                        .ascending = true,

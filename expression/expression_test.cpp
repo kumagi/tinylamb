@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
@@ -792,6 +794,33 @@ TEST(ExpressionTest, CaseExpression_ResultType_InfersCorrectType) {
             TypeTag::kInvalid);
 }
 
+TEST(ExpressionTest, CaseResultTypeIgnoresOnlyLiteralNullBranches) {
+  const Schema schema("", {Column("k", ValueType::kDouble)});
+  const auto yes = ConstantValueExp(Value(true));
+  const auto null = ConstantValueExp(Value());
+  const auto number = ColumnValueExp("k");
+  for (const auto& expression :
+       {CaseExpressionExp({{yes, number}}, null),
+        CaseExpressionExp({{yes, null}}, number),
+        CaseExpressionExp({{yes, null}, {yes, number}}, nullptr)}) {
+    EXPECT_EQ(expression->ResultType(schema).GetType(), TypeTag::kDouble);
+    EXPECT_EQ(expression->ResultType(schema, Schema()).GetType(),
+              TypeTag::kDouble);
+  }
+  const auto parameter = std::make_shared<ParameterSlot>(0, Value());
+  const auto parameter_case = CaseExpressionExp({{yes, number}}, parameter);
+  EXPECT_EQ(parameter_case->ResultType(schema).GetType(), TypeTag::kInvalid);
+  parameter->Bind(Value("text"));
+  EXPECT_EQ(parameter_case->ResultType(schema).GetType(), TypeTag::kInvalid);
+  EXPECT_EQ(
+      CaseExpressionExp({{yes, null}}, null)->ResultType(schema).GetType(),
+      TypeTag::kInvalid);
+  EXPECT_EQ(CaseExpressionExp({{yes, number}}, ConstantValueExp(Value(0)))
+                ->ResultType(schema)
+                .GetType(),
+            TypeTag::kInvalid);
+}
+
 TEST(ExpressionTest, CaseExpression_Inspect_ReturnsTouchedColumnsAndString) {
   Row row;
   Schema schema;
@@ -814,9 +843,10 @@ TEST(ExpressionTest,
   Expression interval = IntervalExpressionExp(3, "day");
 
   EXPECT_EQ(interval->Type(), TypeTag::kIntervalExp);
-  EXPECT_EQ(interval->Evaluate(row, schema), Value("0-0 3 0:0:0"));
+  EXPECT_EQ(interval->Evaluate(row, schema),
+            Value("0-0 3 0:0:0").WithInterval());
   EXPECT_EQ(interval->Evaluate(&row, schema, &row, schema),
-            Value("0-0 3 0:0:0"));
+            Value("0-0 3 0:0:0").WithInterval());
   EXPECT_EQ(interval->ResultType(schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ResultType(schema, schema).GetType(), TypeTag::kVarChar);
   EXPECT_EQ(interval->ToString(), "INTERVAL 0-0 3 0:0:0");
@@ -1587,6 +1617,28 @@ TEST(ExpressionTest, ExpressionBase_DynamicCasts_CastSuccessfully) {
   Expression query =
       QueryExpressionExp(std::shared_ptr<SelectStatement>(), constant);
   EXPECT_NO_THROW((void)query->AsQueryExpression());
+}
+
+TEST(ExpressionTest, ExpressionCastsKeepDerivedNodesAndRejectFalseTags) {
+  Expression column = ColumnValueExp("c");
+  const ExpressionBase& constant_view = *column;
+  EXPECT_EQ(&column->AsColumnValue(), &constant_view.AsColumnValue());
+  EXPECT_THROW((void)column->AsConstantValue(), std::bad_cast);
+
+  const auto parameter = std::make_shared<ParameterSlot>(0, Value(42));
+  const ExpressionBase& parameter_view = *parameter;
+  EXPECT_EQ(&parameter_view.AsConstantValue(),
+            static_cast<const ConstantValue*>(parameter.get()));
+  EXPECT_EQ(parameter_view.AsConstantValue().Evaluate(Row(), Schema()),
+            Value(42));
+  EXPECT_THROW((void)parameter_view.AsBinaryExpression(), std::bad_cast);
+
+  // The public TypeTag alone is not evidence for a downcast: extensions may
+  // report the same semantic category without inheriting its concrete class.
+  BareExpression extension;
+  EXPECT_EQ(extension.Type(), TypeTag::kConstantValue);
+  EXPECT_THROW((void)extension.AsConstantValue(), std::bad_cast);
+  EXPECT_THROW((void)extension.AsColumnValue(), std::bad_cast);
 }
 
 TEST(ExpressionTest, ExpressionBase_DefaultImplementations_ThrowRuntimeError) {

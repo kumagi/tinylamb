@@ -34,6 +34,28 @@
 
 namespace tinylamb {
 
+TEST(RowTest, AuditIntervalSchemaRetainsDomainAcrossRowDecoding) {
+  Column interval("iv", ValueType::kVarChar);
+  interval.SetInterval(true);
+  const Schema schema("t", {interval, Column("text", ValueType::kVarChar),
+                            Column("items", ValueType::kArray)});
+  const Value typed = Value("2-0 0 0:0:0").WithInterval();
+  const Row original(
+      {typed, Value("2-0 0 0:0:0"), Value::Array({typed}, "INTERVAL")});
+  std::vector<char> bytes(original.Size());
+  original.Serialize(bytes.data());
+  Row restored;
+  restored.DeserializeBounded(bytes.data(), bytes.size(), schema);
+  EXPECT_EQ(restored, original);
+  EXPECT_TRUE(restored[0].IsInterval());
+  EXPECT_FALSE(restored[1].IsInterval());
+  EXPECT_TRUE(restored[2].ArrayElements()[0].IsInterval());
+  ASSERT_TRUE(restored.TryDeserializeProjected(bytes.data(), schema, {0, 1})
+                  .HasValue());
+  EXPECT_TRUE(restored[0].IsInterval());
+  EXPECT_FALSE(restored[1].IsInterval());
+}
+
 TEST(RowTest, DefaultConstructor_WhenCalled_CreatesEmptyRow) {
   Row r;
 
@@ -179,6 +201,19 @@ TEST(RowTest, UnorderedMap_WithNullKeyRows_SupportsInsertionAndLookup) {
   EXPECT_EQ(groups[Row({Value(), Value("a")})], 2U);
 }
 
+TEST(RowTest, AuditIntegerPeekCorruptPrefixDoesNotThrow) {
+  const Schema schema("s", {Column("array", ValueType::kArray),
+                            Column("id", ValueType::kInt64)});
+  const Row row({Value::Array({}, "INT64"), Value(42)});
+  std::vector<char> bytes(row.Size());
+  row.Serialize(bytes.data());
+  // The ARRAY element count follows the row's two-byte column count.
+  std::fill(bytes.begin() + 2, bytes.begin() + 6, static_cast<char>(0xff));
+  EXPECT_NO_THROW(std::ignore = Row::TryPeekInteger(bytes.data(), schema, 1));
+  EXPECT_EQ(Row::TryPeekInteger(bytes.data(), schema, 1).GetStatus(),
+            Status::kCorrupt);
+}
+
 TEST(RowTest, TryPeekInteger_ForIntAndNonIntColumns_ReturnsValueOrNullopt) {
   const Schema schema("s", {Column("name", ValueType::kVarChar),
                             Column("id", ValueType::kInt64)});
@@ -190,17 +225,23 @@ TEST(RowTest, TryPeekInteger_ForIntAndNonIntColumns_ReturnsValueOrNullopt) {
   const auto peek_int = Row::TryPeekInteger(buf.data(), schema, 1);
   const auto peek_oob = Row::TryPeekInteger(buf.data(), schema, 5);
 
-  EXPECT_EQ(peek_str, std::nullopt);
-  EXPECT_EQ(peek_int, 42);
-  EXPECT_EQ(peek_oob, std::nullopt);
+  ASSERT_TRUE(peek_str.HasValue());
+  ASSERT_TRUE(peek_int.HasValue());
+  EXPECT_EQ(peek_str.Value(), std::nullopt);
+  EXPECT_EQ(peek_int.Value(), 42);
+  EXPECT_EQ(peek_oob.GetStatus(), Status::kInvalidArgument);
 }
 
-TEST(RowTest, Extract_WithOutOfBoundsIndices_ReturnsEmptyRow) {
+TEST(RowTest, Extract_WithOutOfBoundsIndices_ReportsError) {
   const Row row({Value(1), Value(2)});
-
-  const Row extracted = row.Extract({5});
-
-  EXPECT_EQ(extracted.values_.size(), 0U);
+  EXPECT_EQ(row.TryExtract({5}).GetStatus(), Status::kInvalidArgument);
+  EXPECT_THROW(std::ignore = row.Extract({5}), std::runtime_error);
+  auto empty = row.TryExtract({});
+  ASSERT_TRUE(empty.HasValue());
+  EXPECT_TRUE(empty.Value().values_.empty());
+  auto reordered = row.TryExtract({1, 0, 1});
+  ASSERT_TRUE(reordered.HasValue());
+  EXPECT_EQ(reordered.Value(), Row({Value(2), Value(1), Value(2)}));
 }
 
 TEST(RowTest, Deserialize_WithMismatchedColumnCount_ThrowsInsteadOfOob) {
@@ -219,9 +260,9 @@ TEST(RowTest, Deserialize_WithMismatchedColumnCount_ThrowsInsteadOfOob) {
   EXPECT_THROW(
       std::ignore = projected.DeserializeProjected(buf.data(), schema, {0}),
       std::runtime_error);
-  // TryPeekInteger with a forged wide image also returns nullopt instead of
-  // reading past the schema.
-  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 0), std::nullopt);
+  // A schema mismatch must not turn a corrupt row into a NULL-filter rejection.
+  EXPECT_EQ(Row::TryPeekInteger(buf.data(), schema, 0).GetStatus(),
+            Status::kCorrupt);
 }
 TEST(RowTest, Serialize_WithTooManyColumns_ThrowsInsteadOfCorrupting) {
   // Fixed: slot_t (u16) wrapped for >= 32768 columns and the top bit

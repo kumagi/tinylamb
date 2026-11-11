@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -15,15 +16,21 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "common/platform/process.hpp"
+#include "common/random_string.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/batch_nested_loop_join.hpp"
 #include "executor/cross_join.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/expression_eval.hpp"
+#include "executor/detail/planning_heuristics.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/hash_join.hpp"
 #include "executor/minmax_index.hpp"
 #include "executor/parallel_aggregation.hpp"
 #include "executor/parallel_hash_join.hpp"
 #include "executor/pdqsort.hpp"
+#include "executor/projection.hpp"
 #include "executor/sort.hpp"
 #include "executor/topn.hpp"
 #include "executor/values.hpp"
@@ -999,6 +1006,244 @@ TEST(DrainErrorPropagationTest, CrossJoinForwardsLeftError) {
   // instead of ending as a clean EOF with a truncated right pairing.
   EXPECT_FALSE(join.Next(&row, nullptr));
   EXPECT_NE(join.GetStatus(), Status::kSuccess);
+}
+
+TEST(DrainErrorPropagationTest, AuditHashJoinReportsSpillReadErrorAtEof) {
+  struct Restore {
+    size_t budget = QueryMemoryBudget::Global().Limit();
+    std::optional<std::string> temp;
+    std::filesystem::path directory;
+    Restore() {
+      if (const char* current = std::getenv("TINYLAMB_TEMP")) temp = current;
+      directory = std::filesystem::temp_directory_path() /
+                  ("tinylamb-audit-spill-" + RandomString());
+      platform::SetEnv("TINYLAMB_TEMP", directory.c_str());
+      QueryMemoryBudget::Global().ResetForTest(65536);
+    }
+    ~Restore() {
+      QueryMemoryBudget::Global().ResetForTest(budget);
+      if (temp)
+        platform::SetEnv("TINYLAMB_TEMP", temp->c_str());
+      else
+        platform::UnsetEnv("TINYLAMB_TEMP");
+      std::error_code error;
+      std::filesystem::remove_all(directory, error);
+    }
+  } restore;
+  std::vector<Row> probe;
+  std::vector<Row> build;
+  for (int64_t i = 0; i < 10000; ++i)
+    probe.emplace_back(Row({Value(i % 32), Value(std::string(128, 'x'))}));
+  for (int64_t i = 0; i < 32; ++i) build.emplace_back(Row({Value(i)}));
+  HashJoin join(std::make_shared<ValuesExecutor>(std::move(probe)), {0},
+                std::make_shared<ValuesExecutor>(std::move(build)), {0},
+                HashJoinMode::kInMemory, 1);
+  Row row;
+  ASSERT_TRUE(join.Next(&row, nullptr));
+  size_t files = 0;
+  for (const auto& file :
+       std::filesystem::directory_iterator(restore.directory)) {
+    std::filesystem::remove(file.path());
+    ++files;
+  }
+  ASSERT_GT(files, 0U);
+  size_t emitted = 1;
+  while (join.Next(&row, nullptr)) ++emitted;
+  EXPECT_LT(emitted, 10000U);
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+}
+
+TEST(AggregateAuditTest, TypedOverflowStopsWithoutReplayingTheBatch) {
+  const Schema schema("t", {Column("v", ValueType::kInt64)});
+  for (bool floating : {false, true}) {
+    const Expression argument =
+        floating ? ConstantValueExp(Value(1e308)) : ColumnValueExp("v");
+    AggregationExecutor aggregate(
+        std::make_shared<ValuesExecutor>(
+            std::vector<Row>{Row({Value(std::numeric_limits<int64_t>::max())}),
+                             Row({Value(1)})}),
+        schema,
+        {NamedExpression("n", AggregateExpressionExp(AggregationType::kCount,
+                                                     ColumnValueExp("*"))),
+         NamedExpression(
+             "s", AggregateExpressionExp(AggregationType::kSum, argument))});
+    Row row;
+    EXPECT_NO_THROW(EXPECT_FALSE(aggregate.Next(&row, nullptr)));
+    EXPECT_NE(aggregate.GetStatus(), Status::kSuccess);
+  }
+}
+
+TEST(AggregateAuditTest, MixedSignedUnsignedSumsKeepBothPartialTotals) {
+  const auto sum =
+      AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("v"));
+  for (bool reverse : {false, true}) {
+    relational_detail::AggregateAccumulator sequential(
+        &sum->AsAggregateExpression());
+    relational_detail::AggregateAccumulator left(&sum->AsAggregateExpression());
+    relational_detail::AggregateAccumulator right(
+        &sum->AsAggregateExpression());
+    const Value a = reverse ? Value(7).WithUnsigned() : Value(5);
+    const Value b = reverse ? Value(5) : Value(7).WithUnsigned();
+    ASSERT_EQ(sequential.Add(a), Status::kSuccess);
+    ASSERT_EQ(sequential.Add(b), Status::kSuccess);
+    ASSERT_EQ(left.Add(a), Status::kSuccess);
+    ASSERT_EQ(right.Add(b), Status::kSuccess);
+    ASSERT_EQ(left.Merge(right), Status::kSuccess);
+    const auto sequential_result = sequential.TryFinish();
+    const auto merged_result = left.TryFinish();
+    ASSERT_TRUE(sequential_result.HasValue());
+    ASSERT_TRUE(merged_result.HasValue());
+    EXPECT_EQ(sequential_result.Value(), Value(12).WithUnsigned());
+    EXPECT_EQ(merged_result.Value(), Value(12).WithUnsigned());
+  }
+}
+
+TEST(AggregateAuditTest, ColumnSpellingDoesNotChangeSignedSumDomain) {
+  for (const char* name : {"uint64_label", "x"}) {
+    for (bool distinct : {false, true}) {
+      const Schema schema("t", {Column(name, ValueType::kInt64)});
+      auto sum = std::make_shared<AggregateExpression>(
+          AggregationType::kSum, ColumnValueExp(name), distinct);
+      relational_detail::AggregateAccumulator accumulator(sum.get(), &schema);
+      ASSERT_EQ(accumulator.Add(Value(-1)), Status::kSuccess);
+      EXPECT_EQ(accumulator.Add(Value(2)), Status::kSuccess);
+      const auto result = accumulator.TryFinish();
+      ASSERT_TRUE(result.HasValue());
+      EXPECT_EQ(result.Value(), Value(1));
+      EXPECT_FALSE(result.Value().IsUnsigned());
+    }
+  }
+}
+
+TEST(AggregateAuditTest, ParallelSumOverflowReturnsStatus) {
+  const Schema schema("s", {Column("v", ValueType::kInt64)});
+  std::vector<Row> rows(8192, Row({Value(int64_t{1} << 50)}));
+  ParallelAggregationExecutor aggregate(
+      std::make_shared<ValuesExecutor>(rows), schema,
+      {NamedExpression("sum", AggregateExpressionExp(AggregationType::kSum,
+                                                     ColumnValueExp("v")))},
+      2);
+  DataChunk output;
+  EXPECT_NO_THROW(EXPECT_EQ(aggregate.NextBatch(&output), 0U));
+  EXPECT_EQ(aggregate.GetStatus(), Status::kIsInfinity);
+}
+
+TEST(ProjectionAuditTest, AffineFoldingPreservesIntermediateOverflow) {
+  const Schema schema("s", {Column("v", ValueType::kInt64)});
+  const int64_t max = std::numeric_limits<int64_t>::max();
+  for (const int64_t outer : {max, int64_t{0}}) {
+    SCOPED_TRACE(outer);
+    const Expression expr = BinaryExpressionExp(
+        BinaryExpressionExp(ColumnValueExp("v"), BinaryOperation::kMultiply,
+                            ConstantValueExp(Value(max))),
+        BinaryOperation::kMultiply, ConstantValueExp(Value(outer)));
+    // Promote the kernel on safe input, then cross the intermediate bound.
+    std::vector<Row> rows(2048, Row({Value(0)}));
+    rows.emplace_back(Row({Value(2)}));
+    Projection projection({NamedExpression("p", expr)}, schema,
+                          std::make_shared<ValuesExecutor>(rows), 1);
+    DataChunk output;
+    while (projection.NextBatch(&output) != 0) {
+    }
+    EXPECT_EQ(projection.GetStatus(),
+              expr->TryEvaluate(Row({Value(2)}), schema).GetStatus());
+  }
+}
+
+TEST(JoinAuditTest, BiasedKeysRequireBothSignedIntegerDomains) {
+  const Expression predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("l", "v")),
+                          BinaryOperation::kAdd, ConstantValueExp(Value(5))),
+      BinaryOperation::kEquals, ColumnValueExp(ColumnName("r", "v")));
+  const Schema right("r", {Column("v", ValueType::kInt64)});
+  Column unsigned_column("v", ValueType::kInt64);
+  unsigned_column.SetUnsigned(true);
+  for (const Column& column : {unsigned_column, Column("v", ValueType::kDouble),
+                               Column("v", ValueType::kVarChar)}) {
+    const Schema left("l", {column});
+    EXPECT_TRUE(
+        relational_detail::EqualityKeys(left, right, {predicate}).empty());
+  }
+  EXPECT_EQ(
+      relational_detail::EqualityKeys(
+          Schema("l", {Column("v", ValueType::kInt64)}), right, {predicate})
+          .size(),
+      1U);
+}
+
+class AuditPositionedRows final : public ExecutorBase {
+ public:
+  AuditPositionedRows(size_t count, page_id_t page)
+      : count_(count), page_(page) {}
+  size_t NextBatch(DataChunk* output,
+                   size_t max_rows = kDefaultVectorSize) override {
+    output->Reset();
+    while (offset_ < count_ && output->Size() < max_rows) {
+      output->Append(Row({Value(1)}),
+                     RowPosition(page_, static_cast<slot_t>(offset_++)));
+    }
+    return output->Size();
+  }
+  void Dump(std::ostream& output, int) const override {
+    output << "AuditPositionedRows";
+  }
+
+ private:
+  size_t count_;
+  page_id_t page_;
+  size_t offset_ = 0;
+};
+
+TEST(JoinAuditTest, NullAwareAntiIncludesNullProbeForEmptyBuild) {
+  const std::vector<Row> rows{Row({Value()}), Row({Value(7)})};
+  SharedBuildParallelHashJoin join(
+      std::make_shared<ValuesExecutor>(rows), {0},
+      std::make_shared<ValuesExecutor>(std::vector<Row>{}), {0}, 2,
+      JoinKind::kNullAwareAnti);
+  std::vector<Row> result;
+  Row row;
+  while (join.Next(&row, nullptr)) result.push_back(row);
+  EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(result, rows);
+}
+
+TEST(JoinAuditTest, SharedBuildKeepsLeftRowPositionsWhenBuildSideFlips) {
+  for (const size_t left_count : {size_t{1}, size_t{100}}) {
+    SharedBuildParallelHashJoin join(
+        std::make_shared<AuditPositionedRows>(left_count, 11), {0},
+        std::make_shared<AuditPositionedRows>(100, 22), {0}, 2,
+        JoinKind::kInner);
+    Row row;
+    RowPosition position;
+    size_t count = 0;
+    while (join.Next(&row, &position)) {
+      EXPECT_EQ(position.page_id, 11U);
+      ++count;
+    }
+    EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+    EXPECT_EQ(count, left_count * 100);
+  }
+}
+
+class AuditThrowingRows final : public ExecutorBase {
+ public:
+  size_t NextBatch(DataChunk*, size_t) override {
+    throw std::runtime_error("injected worker allocation failure");
+  }
+  void Dump(std::ostream& output, int) const override {
+    output << "AuditThrowingRows";
+  }
+};
+
+TEST(JoinAuditTest, HashJoinConvertsExceptionsToStickyStatus) {
+  HashJoin join(
+      std::make_shared<ValuesExecutor>(std::vector<Row>{Row({Value(1)})}), {0},
+      std::make_shared<AuditThrowingRows>(), {0});
+  DataChunk output;
+  EXPECT_NO_THROW(EXPECT_EQ(join.NextBatch(&output), 0U));
+  EXPECT_EQ(join.GetStatus(), Status::kRuntimeError);
+  EXPECT_NO_THROW(EXPECT_EQ(join.NextBatch(&output), 0U));
+  EXPECT_EQ(join.GetStatus(), Status::kRuntimeError);
 }
 
 }  // namespace tinylamb

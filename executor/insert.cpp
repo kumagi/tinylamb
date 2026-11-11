@@ -165,7 +165,11 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
             continue;
           case InsertExecutionMode::kUpsert: {
             const RowPosition& pos = existing_positions[key];
-            Row updated = target_->Read(*txn_, pos).Value();
+            StatusOr<Row> existing = target_->Read(*txn_, pos);
+            if (!existing.HasValue()) {
+              return FailWith(existing.GetStatus());
+            }
+            Row updated = existing.MoveValue();
             if (!upsert_offsets_.empty()) {
               for (const size_t offset : upsert_offsets_) {
                 if (offset < updated.values_.size()) {

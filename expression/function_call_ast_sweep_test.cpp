@@ -19,11 +19,100 @@
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/sql_udf.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
+
+TEST(FunctionCallAuditTest, CurrentUserMatchesSessionUser) {
+  auto expected =
+      FunctionCallExp("session_user", {})->TryEvaluate(Row(), Schema());
+  ASSERT_TRUE(expected.HasValue());
+  for (const char* name : {"user", "current_user"}) {
+    auto value = FunctionCallExp(name, {})->TryEvaluate(Row(), Schema());
+    ASSERT_TRUE(value.HasValue()) << name << ": " << value.GetStatus();
+    EXPECT_EQ(value.Value(), expected.Value());
+    EXPECT_FALSE(FunctionCallExp(name, {ConstantValueExp(Value(1))})
+                     ->TryEvaluate(Row(), Schema())
+                     .HasValue());
+  }
+}
+
+TEST(FunctionCallAuditTest, InvalidTimeZonesAreRejected) {
+  for (const char* zone : {"Audit/No_Such_Zone", "+garbage", "UTC+999999999999",
+                           "+12:60", "+01:00junk", ""}) {
+    for (const char* name : {"current_date", "current_datetime"}) {
+      SCOPED_TRACE(std::string(name) + ":" + zone);
+      const auto expression =
+          FunctionCallExp(name, {ConstantValueExp(Value(zone))});
+      EXPECT_FALSE(expression->TryEvaluate(Row(), Schema()).HasValue());
+    }
+    for (const char* name : {"string", "format_timestamp", "parse_timestamp"}) {
+      std::vector<Expression> args;
+      if (std::string_view(name) != "string")
+        args.push_back(ConstantValueExp(Value("%Y-%m-%d")));
+      args.push_back(ConstantValueExp(Value("2020-01-01")));
+      args.push_back(ConstantValueExp(Value(zone)));
+      EXPECT_FALSE(
+          FunctionCallExp(name, args)->TryEvaluate(Row(), Schema()).HasValue())
+          << name << ":" << zone;
+    }
+  }
+  for (const char* zone : {"UTC", "America/Los_Angeles", "Asia/Tokyo", "+05:30",
+                           "-0800", "UTC+9"}) {
+    EXPECT_TRUE(FunctionCallExp("current_date", {ConstantValueExp(Value(zone))})
+                    ->TryEvaluate(Row(), Schema())
+                    .HasValue())
+        << zone;
+  }
+}
+
+TEST(FunctionCallAuditTest, EmptyDateArithmeticHasInvalidResultType) {
+  for (const char* name : {"date_add", "date_sub"}) {
+    const auto expression = FunctionCallExp(name, {});
+    EXPECT_EQ(expression->ResultType(Schema()).GetType(), TypeTag::kInvalid);
+    EXPECT_EQ(expression->ResultType(Schema(), Schema()).GetType(),
+              TypeTag::kInvalid);
+    EXPECT_FALSE(expression->TryEvaluate(Row(), Schema()).HasValue());
+  }
+}
+
+TEST(FunctionCallAuditTest, UdfOnlyPadsOptionalTrailingParameters) {
+  SqlScalarFunction function;
+  function.name = "audit_udf";
+  function.params = {"optional", "required"};
+  function.defaults = {ConstantValueExp(Value(1)), nullptr};
+  EXPECT_EQ(function.RequiredArgs(), 2U);
+  EXPECT_FALSE(BindSqlUdfArguments(function, {Value(4)}).HasValue());
+  EXPECT_TRUE(BindSqlUdfArguments(function, {Value(4), Value(5)}).HasValue());
+  function.defaults = {nullptr, ConstantValueExp(Value(9))};
+  auto binding = BindSqlUdfArguments(function, {Value(4)});
+  ASSERT_TRUE(binding.HasValue());
+  EXPECT_EQ(binding.Value().row, Row({Value(4), Value(9)}));
+  function.defaults.clear();
+  EXPECT_FALSE(BindSqlUdfArguments(function, {Value(4)}).HasValue());
+}
+
+TEST(FunctionCallAuditTest, ChrRejectsNonIntegerArguments) {
+  for (const Value& value :
+       {Value(65.5), Value("65"), Value::DateFromDays(65)}) {
+    const auto expression = FunctionCallExp("chr", {ConstantValueExp(value)});
+    EXPECT_FALSE(expression->TryEvaluate(Row(), Schema()).HasValue());
+  }
+  EXPECT_EQ(FunctionCallExp("chr", {ConstantValueExp(Value(65))})
+                ->TryEvaluate(Row(), Schema())
+                .Value(),
+            Value("A"));
+}
+
+TEST(FunctionCallAuditTest, StructUpdateRejectsMalformedNestedValue) {
+  EXPECT_FALSE(
+      TryStructSetField(Value(R"({"a":garbage})"), "a.b", Value(2)).HasValue());
+  EXPECT_TRUE(
+      TryStructSetField(Value(R"({"a":{"b":1}})"), "a.b", Value(2)).HasValue());
+}
 
 namespace {
 
@@ -116,7 +205,7 @@ TEST(FunctionCallAstSweepTest, EvaluateEveryDispatchedFunction) {
       {"ascii", {Value(int64_t{4})}, 1},
       {"unicode", {Value(2.5)}, 1},
       {"unicode", {Value(int64_t{4})}, 1},
-      {"chr", {Value(2.5)}, 1},
+      {"chr", {Value(2.5)}, 0},
       {"chr", {Value(int64_t{4})}, 1},
       {"to_hex", {Value(2.5)}, 0},
       {"to_hex", {Value(int64_t{4})}, 0},

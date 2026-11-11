@@ -55,13 +55,13 @@ Narrow NearlyDivisionless(Engine& engine, Narrow range) {
 // offset range [0, urange].
 template <typename Engine>
 uint64_t UniformOffset(Engine& engine, uint64_t urange) {
-  constexpr uint64_t kMin = static_cast<uint64_t>(Engine::min());
-  constexpr uint64_t kMax = static_cast<uint64_t>(Engine::max());
+  constexpr auto kMin = static_cast<uint64_t>(Engine::min());
+  constexpr auto kMax = static_cast<uint64_t>(Engine::max());
   static_assert(kMin < kMax);
   constexpr uint64_t kEngineRange = kMax - kMin;
   if (kEngineRange > urange) {
     const uint64_t uerange = urange + 1;
-#if defined(__SIZEOF_INT128__)
+#ifdef __SIZEOF_INT128__
     if constexpr (kEngineRange == UINT64_MAX) {
       __extension__ using uint128_t = unsigned __int128;
       return NearlyDivisionless<uint128_t, uint64_t>(engine, uerange);
@@ -104,7 +104,7 @@ template <typename Int, typename Engine>
 Int UniformInt(Engine& engine, Int lo, Int hi) {
   static_assert(std::is_integral_v<Int> && sizeof(Int) <= sizeof(uint64_t));
   using Unsigned = std::make_unsigned_t<Int>;
-  const uint64_t urange = static_cast<uint64_t>(static_cast<Unsigned>(
+  const auto urange = static_cast<uint64_t>(static_cast<Unsigned>(
       static_cast<Unsigned>(hi) - static_cast<Unsigned>(lo)));
   const uint64_t offset = random_detail::UniformOffset(engine, urange);
   return static_cast<Int>(static_cast<Unsigned>(static_cast<Unsigned>(offset) +
@@ -115,7 +115,9 @@ Int UniformInt(Engine& engine, Int lo, Int hi) {
 // its "two positions per draw" optimization.
 template <typename RandomIt, typename Engine>
 void Shuffle(RandomIt first, RandomIt last, Engine& engine) {
-  if (first == last) return;
+  if (first == last) {
+    return;
+  }
   using std::iter_swap;
   constexpr uint64_t kEngineRange = static_cast<uint64_t>(Engine::max()) -
                                     static_cast<uint64_t>(Engine::min());

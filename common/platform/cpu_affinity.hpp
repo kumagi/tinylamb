@@ -19,7 +19,7 @@
 
 #include <optional>
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sched.h>
 #endif
 
@@ -32,7 +32,7 @@ class CpuSet {
  public:
   // Whether this platform can pin threads to CPUs at all.
   static constexpr bool Supported() {
-#if defined(__linux__)
+#ifdef __linux__
     return true;
 #else
     return false;
@@ -47,16 +47,16 @@ class CpuSet {
 
   // Restricts the calling thread to this set. Returns false on failure (and
   // always where unsupported).
-  bool ApplyToCurrentThread() const;
+  [[nodiscard]] bool ApplyToCurrentThread() const;
 
-  int Count() const;
+  [[nodiscard]] int Count() const;
   // The lowest CPU id in the set, or -1 when empty.
-  int First() const;
+  [[nodiscard]] int First() const;
 
   bool operator==(const CpuSet& other) const;
 
  private:
-#if defined(__linux__)
+#ifdef __linux__
   cpu_set_t set_{};
 #endif
 };

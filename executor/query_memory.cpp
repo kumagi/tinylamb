@@ -88,7 +88,10 @@ void QueryMemoryBudget::Release(size_t bytes) {
   }
 }
 
-size_t EstimateValueBytes(const Value& value) {
+namespace {
+// Keep recursive ARRAY accounting out of the scalar loop, so the common
+// fixed-width row estimate can be inlined without a recursive call per cell.
+size_t EstimateScalarBytes(const Value& value) {
   constexpr size_t kBase = 32;
   switch (value.type) {
     case ValueType::kNull:
@@ -99,22 +102,28 @@ size_t EstimateValueBytes(const Value& value) {
       return kBase + 8;
     case ValueType::kVarChar:
       return kBase + value.value.varchar_value.size();
-    case ValueType::kArray: {
-      size_t bytes = kBase + value.ArrayElementSqlType().size();
-      for (const Value& element : value.ArrayElements()) {
-        bytes += EstimateValueBytes(element);
-      }
-      return bytes;
-    }
     default:
       return kBase + 16;
   }
+}
+}  // namespace
+
+size_t EstimateValueBytes(const Value& value) {
+  if (value.type != ValueType::kArray) {
+    return EstimateScalarBytes(value);
+  }
+  size_t bytes = 32 + value.ArrayElementSqlType().size();
+  for (const Value& element : value.ArrayElements()) {
+    bytes += EstimateValueBytes(element);
+  }
+  return bytes;
 }
 
 size_t EstimateRowBytes(const Row& row) {
   size_t total = 64;  // vector / Row overhead
   for (const Value& value : row.values_) {
-    total += EstimateValueBytes(value);
+    total += value.type == ValueType::kArray ? EstimateValueBytes(value)
+                                             : EstimateScalarBytes(value);
   }
   return total;
 }

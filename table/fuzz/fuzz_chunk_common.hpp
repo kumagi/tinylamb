@@ -96,9 +96,13 @@ class PaxChunkScanIterator {
   }
 
   [[nodiscard]] StatusOr<Row> TryValue() {
-    if (!IsValid()) return Status::kNotExists;
+    if (!IsValid()) {
+      return Status::kNotExists;
+    }
     Status st = chunk_->ReadRowIntoCached(idx_, *sc_, &cache_, &cur_);
-    if (st != Status::kSuccess) return st;
+    if (st != Status::kSuccess) {
+      return st;
+    }
     decoded_ = true;
     return cur_;
   }
@@ -106,7 +110,9 @@ class PaxChunkScanIterator {
   [[nodiscard]] const Row& ValueRef() {
     if (!decoded_ && IsValid()) {
       Status st = chunk_->ReadRowIntoCached(idx_, *sc_, &cache_, &cur_);
-      if (st != Status::kSuccess) cur_ = Row{};
+      if (st != Status::kSuccess) {
+        cur_ = Row{};
+      }
       decoded_ = true;
     }
     return cur_;
@@ -140,11 +146,13 @@ inline StatusOr<PaxChunk> MergeAllSortedRuns(
   cursors.reserve(runs.size());
   uint64_t max_gen = 0;
   for (const SortedRun* run : runs) {
-    if (run == nullptr) continue;
+    if (run == nullptr) {
+      continue;
+    }
     max_gen = std::max<uint64_t>(max_gen, run->Generation());
     SortedRun::Iterator it = run->Begin(sc);
     if (it.IsValid()) {
-      cursors.push_back(Cursor{std::move(it), run->Generation()});
+      cursors.push_back(Cursor{.it = it, .generation = run->Generation()});
     }
   }
 
@@ -203,28 +211,31 @@ inline StatusOr<PaxChunk> MergeAllSortedRuns(
 
   SortedRun merged_run(std::move(merged_blob), std::move(merged_index),
                        max_gen);
-  return PaxChunk::BuildFromSortedRun(merged_run, sc);
+  return PaxChunk::BuildFromSortedRun(merged_run, sc).MoveValue();
 }
 
 // ---- byte helpers ---------------------------------------------------------
 
 inline uint32_t LoadBE32(const std::vector<char>& b, size_t off) {
   uint32_t v = 0;
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < 4; ++i) {
     v = (v << 8) | static_cast<unsigned char>(b[off + static_cast<size_t>(i)]);
+  }
   return v;
 }
 
 inline void StoreBE32(std::vector<char>& b, size_t off, uint32_t v) {
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < 4; ++i) {
     b[off + static_cast<size_t>(i)] =
         static_cast<char>((v >> (8 * (3 - i))) & 0xFF);
+  }
 }
 
 inline uint64_t LoadBE64(const std::vector<char>& b, size_t off) {
   uint64_t v = 0;
-  for (int i = 0; i < 8; ++i)
+  for (int i = 0; i < 8; ++i) {
     v = (v << 8) | static_cast<unsigned char>(b[off + static_cast<size_t>(i)]);
+  }
   return v;
 }
 
@@ -239,9 +250,13 @@ inline uint16_t LoadBE16(const std::vector<char>& b, size_t off) {
 // [footer_size u32]. Returns false for images too short to hold a trailer.
 inline bool WireLayout(const std::vector<char>& b, size_t* footer_off,
                        size_t* footer_size) {
-  if (b.size() < 4) return false;
+  if (b.size() < 4) {
+    return false;
+  }
   const size_t fsz = LoadBE32(b, b.size() - 4);
-  if (fsz < 34 || fsz > b.size() || b.size() - fsz < 4) return false;
+  if (fsz < 34 || fsz > b.size() || b.size() - fsz < 4) {
+    return false;
+  }
   *footer_size = fsz;
   *footer_off = b.size() - fsz - 4;
   return true;
@@ -254,9 +269,13 @@ inline bool WireLayout(const std::vector<char>& b, size_t* footer_off,
 inline void ResignChunkCrc(std::vector<char>& b) {
   size_t fo = 0;
   size_t fs = 0;
-  if (!WireLayout(b, &fo, &fs)) return;
+  if (!WireLayout(b, &fo, &fs)) {
+    return;
+  }
   const uint32_t fmtver = LoadBE32(b, fo + 8);
-  if (fmtver < 2 || fs < 8) return;
+  if (fmtver < 2 || fs < 8) {
+    return;
+  }
   StoreBE32(b, fo + fs - 8, Crc32cOf(b.data(), fo));
   StoreBE32(b, fo + fs - 4, Crc32cOf(b.data() + fo, fs - 4));
 }
@@ -297,7 +316,7 @@ inline SortedRun MakeRun(const std::vector<Row>& rows, const Schema& sc,
     blob.insert(blob.end(), buf.begin(), buf.end());
     index.emplace_back(key_off, row_off, false);
   }
-  return SortedRun(std::move(blob), std::move(index), generation);
+  return {std::move(blob), std::move(index), generation};
 }
 
 // 1200 rows => 2 row groups (1024 + 176), so every per-row-group
@@ -341,7 +360,9 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
               1.0 / std::pow(static_cast<double>(k), 1.5);
           t += v[static_cast<size_t>(k - 1)];
         }
-        for (double& x : v) x /= t;
+        for (double& x : v) {
+          x /= t;
+        }
         return v;
       }();
       double acc = 0.0;
@@ -352,7 +373,7 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
       for (int64_t k = 0; k < kSkewD; ++k) {
         acc += weights[static_cast<size_t>(k)];
         if (acc >= target) {
-          vals.emplace_back(INT64_C(1000000000000) + k * 7919);
+          vals.emplace_back(INT64_C(1000000000000) + (k * 7919));
           break;
         }
       }
@@ -363,8 +384,8 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
           (static_cast<uint64_t>(i) * 2654435761ULL + tile * 40503ULL) %
           kLocalD;
       vals.emplace_back(INT64_C(1000000000000) +
-                        static_cast<int64_t>(tile) * INT64_C(1048576) +
-                        static_cast<int64_t>(slot) * 7919);
+                        (static_cast<int64_t>(tile) * INT64_C(1048576)) +
+                        (static_cast<int64_t>(slot) * 7919));
     } else if ((shape & 128) != 0) {
       vals.emplace_back(i % 97);
     } else if (ramp) {
@@ -372,13 +393,13 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
     } else if ((i % 7) == 3) {
       vals.emplace_back();  // explicit NULL: the footer null bitmap
     } else {
-      vals.emplace_back(i * 3 + 1);
+      vals.emplace_back((i * 3) + 1);
     }
     vals.emplace_back("name-" + std::to_string(i % 61));
     if (ramp) {
-      vals.emplace_back(3.0 + static_cast<double>(i) * 0.25);
+      vals.emplace_back(3.0 + (static_cast<double>(i) * 0.25));
     } else {
-      vals.emplace_back(12.5 + static_cast<double>(i % 97) * 0.5);
+      vals.emplace_back(12.5 + (static_cast<double>(i % 97) * 0.5));
     }
     if (const_flag) {
       vals.emplace_back(int64_t{7});
@@ -401,18 +422,23 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
 
 inline PaxChunk BuildStorageChunk(uint8_t shape = 0) {
   const Schema sc = MakeStorageSchema();
-  return PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc);
+  return PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc)
+      .MoveValue();
 }
 
 // Deserialize(chunk.Data()) must reproduce the in-memory chunk exactly --
 // same footer fields, same rows.
 inline bool DeserializeRoundTrips(const PaxChunk& src, const Schema& sc) {
   auto rt = PaxChunk::Deserialize(src.Data());
-  if (!rt.HasValue()) return false;
+  if (!rt.HasValue()) {
+    return false;
+  }
   const PaxChunk& d = rt.Value();
   const PaxChunk::Footer& a = src.GetFooter();
   const PaxChunk::Footer& b = d.GetFooter();
-  if (src.TotalRowCount() != d.TotalRowCount()) return false;
+  if (src.TotalRowCount() != d.TotalRowCount()) {
+    return false;
+  }
   if (a.column_offsets != b.column_offsets || a.row_counts != b.row_counts ||
       a.encodings != b.encodings || a.params != b.params ||
       a.null_present != b.null_present ||
@@ -439,8 +465,12 @@ inline bool DeserializeRoundTrips(const PaxChunk& src, const Schema& sc) {
   for (size_t i = 0; i < src.TotalRowCount(); ++i) {
     auto ra = src.ReadRow(i, sc);
     auto rb = d.ReadRow(i, sc);
-    if (ra.HasValue() != rb.HasValue()) return false;
-    if (ra.HasValue() && ra.Value() != rb.Value()) return false;
+    if (ra.HasValue() != rb.HasValue()) {
+      return false;
+    }
+    if (ra.HasValue() && ra.Value() != rb.Value()) {
+      return false;
+    }
   }
   return true;
 }
@@ -452,7 +482,9 @@ enum class MutOp : uint8_t { kXorByte, kOnesWord, kZeroWord, kNarrowByte };
 inline void ApplyMutation(std::vector<char>& bytes, size_t site, size_t limit,
                           uint8_t op_mask, uint8_t index, uint32_t roll,
                           uint8_t narrow) {
-  if (site >= limit) return;
+  if (site >= limit) {
+    return;
+  }
   switch (static_cast<MutOp>((op_mask >> (index & 3)) & 0x3)) {
     case MutOp::kXorByte:
       bytes[site] = static_cast<char>(
@@ -460,12 +492,14 @@ inline void ApplyMutation(std::vector<char>& bytes, size_t site, size_t limit,
           (roll >> 24));
       return;
     case MutOp::kOnesWord:
-      if (site + 4 <= limit)
+      if (site + 4 <= limit) {
         StoreBE32(bytes, site & ~static_cast<size_t>(3), 0xFFFFFFFFU);
+      }
       return;
     case MutOp::kZeroWord:
-      if (site + 4 <= limit)
+      if (site + 4 <= limit) {
         StoreBE32(bytes, site & ~static_cast<size_t>(3), 0x00000000U);
+      }
       return;
     case MutOp::kNarrowByte:
       bytes[site] = static_cast<char>(narrow);
@@ -483,14 +517,18 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
   const size_t stride = total > 64 ? total / 64 : 1;
   for (size_t i = 0; i < total; i += stride) {
     auto r = chunk.ReadRow(i, sc);
-    if (r.HasValue() && r.Value().Count() != ncols) std::abort();
+    if (r.HasValue() && r.Value().Count() != ncols) {
+      std::abort();
+    }
     for (slot_t c = 0; c < ncols; ++c) {
       (void)chunk.ReadColumnValue(i, c, sc);
     }
   }
   for (size_t over : {total, total + 1, total + 1000, SIZE_MAX}) {
     auto r = chunk.ReadRow(over, sc);
-    if (r.HasValue()) std::abort();
+    if (r.HasValue()) {
+      std::abort();
+    }
     (void)chunk.ReadColumnValue(over, 0, sc);
   }
 
@@ -521,9 +559,10 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
   }
   (void)PgmPredict(chunk.GetFooter(), key_probe, static_cast<uint64_t>(total));
 
-  static const ScanOp kOps[] = {ScanOp::kEq, ScanOp::kLe, ScanOp::kLt,
-                                ScanOp::kGe, ScanOp::kGt};
-  const int64_t lits[] = {0, 1, key_probe, INT64_MIN, INT64_MAX, -1};
+  static const std::array kOps = {ScanOp::kEq, ScanOp::kLe, ScanOp::kLt,
+                                  ScanOp::kGe, ScanOp::kGt};
+  const std::array<int64_t, 6> lits = {0,         1,         key_probe,
+                                       INT64_MIN, INT64_MAX, -1};
   for (slot_t c = 0; c < ncols; ++c) {
     for (ScanOp op : kOps) {
       (void)VectorizedScanColumn(chunk, c, op, key_probe, false, 0, 1, &sc);
@@ -543,7 +582,7 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
   for (ScanOp op : kOps) {
     AggPlan plan;
     plan.count_only = true;
-    plan.preds.push_back(Predicate{0, op, key_probe});
+    plan.preds.push_back(Predicate{.col = 0, .op = op, .lit = key_probe});
     if (ncols > 1) {
       AggTerm t;
       t.coeff = 3;
@@ -557,7 +596,7 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
       ReducePlan rp;
       rp.op = aop;
       rp.col = static_cast<slot_t>(ncols > 1 ? 1 : 0);
-      rp.preds.push_back(Predicate{0, op, key_probe});
+      rp.preds.push_back(Predicate{.col = 0, .op = op, .lit = key_probe});
       (void)ReduceColumn(chunk, rp, false, 0, 1, &sc);
     }
   }
@@ -565,15 +604,16 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
   for (slot_t c = 0; c < ncols; ++c) {
     uint64_t cnt = 0;
     (void)InvertedEqCount(chunk, c, key_probe, &cnt);
-    const int64_t vals[] = {key_probe, 0, 1};
-    (void)InvertedInCount(chunk, c, vals, 3, &cnt);
-    if (c + 1 < ncols)
+    const std::array<int64_t, 3> vals = {key_probe, 0, 1};
+    (void)InvertedInCount(chunk, c, vals.data(), vals.size(), &cnt);
+    if (c + 1 < ncols) {
       (void)InvertedAndCount(chunk, c, key_probe, c + 1, 0, &cnt);
+    }
   }
 
-  static const StrScanOp kStrOps[] = {StrScanOp::kEq, StrScanOp::kNe,
-                                      StrScanOp::kLt, StrScanOp::kLe,
-                                      StrScanOp::kGt, StrScanOp::kGe};
+  static const std::array kStrOps = {StrScanOp::kEq, StrScanOp::kNe,
+                                     StrScanOp::kLt, StrScanOp::kLe,
+                                     StrScanOp::kGt, StrScanOp::kGe};
   for (slot_t c = 0; c < ncols; ++c) {
     for (StrScanOp op : kStrOps) {
       (void)VarcharFilterCount(chunk, c, op, "name-7", &sc);
@@ -600,7 +640,8 @@ inline void HammerChunk(const PaxChunk& chunk, const Schema& sc,
       int64_t sum = 0;
       (void)ByteSliceColumnSum(chunk, c, g, &sum);
       (void)PBitSColumnSum(chunk, c, g, &sum);
-      std::vector<Predicate> preds{Predicate{0, ScanOp::kLe, key_probe}};
+      std::vector<Predicate> preds{
+          Predicate{.col = 0, .op = ScanOp::kLe, .lit = key_probe}};
       (void)BuildSelectionVector(chunk, preds, g);
     }
     uint64_t cnt = 0;

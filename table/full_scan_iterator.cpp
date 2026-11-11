@@ -284,7 +284,7 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
   return {.kind = PeekOutcome::Kind::kValue, .value = key};
 }
 
-bool FullScanIterator::PassesPeekFilters(std::string_view row) const {
+StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
   if (peek_compares_ == nullptr || peek_compares_->empty()) {
     return true;
   }
@@ -314,16 +314,24 @@ bool FullScanIterator::PassesPeekFilters(std::string_view row) const {
           case PeekOutcome::Kind::kNull:
             cached_value = std::nullopt;
             break;
-          case PeekOutcome::Kind::kFallback:
-            cached_value = Row::TryPeekInteger(
-                row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-                table_->GetSchema(), pred.column);
-            break;
+          case PeekOutcome::Kind::kFallback: {
+            ASSIGN_OR_RETURN(
+                std::optional<int64_t>, peeked,
+                Row::TryPeekInteger(
+                    row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+                    table_->GetSchema(), pred.column));
+            cached_value = peeked;
+          } break;
         }
       } else {
-        cached_value = Row::TryPeekInteger(
-            row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
-            table_->GetSchema(), pred.column);
+        {
+          ASSIGN_OR_RETURN(
+              std::optional<int64_t>, peeked,
+              Row::TryPeekInteger(
+                  row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
+                  table_->GetSchema(), pred.column));
+          cached_value = peeked;
+        }
       }
     }
     if (!cached_value ||
@@ -443,29 +451,36 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
             key_peek_plan_ = BuildPeek(*key_column_);
             key_peek_built_ = true;
           }
-          std::optional<int64_t> key;
+          StatusOr<std::optional<int64_t>> peeked = std::nullopt;
           if (key_peek_plan_.valid) {
             const PeekOutcome outcome = PeekIntegerPlanned(
                 key_peek_plan_,
                 row->data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
             switch (outcome.kind) {
               case PeekOutcome::Kind::kValue:
-                key = outcome.value;
+                peeked = std::optional<int64_t>{outcome.value};
                 break;
               case PeekOutcome::Kind::kNull:
-                key = std::nullopt;
+                peeked = std::nullopt;
                 break;
               case PeekOutcome::Kind::kFallback:
-                key = Row::TryPeekInteger(
+                peeked = Row::TryPeekInteger(
                     row->data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                     table_->GetSchema(), *key_column_);
                 break;
             }
           } else {
-            key = Row::TryPeekInteger(
+            peeked = Row::TryPeekInteger(
                 row->data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                 table_->GetSchema(), *key_column_);
           }
+          if (!peeked.HasValue()) {
+            status_ = peeked.GetStatus();
+            txn_->MarkFailed();
+            pos_.page_id = ~0ULL;
+            return std::nullopt;
+          }
+          const std::optional<int64_t> key = peeked.Value();
           const bool rejected = !key || (runtime_filter_ != nullptr
                                              ? runtime_filter_->Reject(*key)
                                              : !key_filter_->contains(*key));
@@ -477,7 +492,14 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
             continue;
           }
         }
-        if (!PassesPeekFilters(*row)) {
+        auto passed = PassesPeekFilters(*row);
+        if (!passed.HasValue()) {
+          status_ = passed.GetStatus();
+          txn_->MarkFailed();
+          pos_.page_id = ~0ULL;
+          return std::nullopt;
+        }
+        if (!passed.Value()) {
           if (lock_rows_ && !already_reserved) {
             txn_->ReleaseWriteIntent(pos_);
           }
@@ -606,6 +628,12 @@ const RowDecodePlan* FullScanIterator::RowPlan() {
     return &*row_plan_;
   }
   const Schema& schema = table_->schema_;
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    if (schema.GetColumn(i).IsInterval()) {
+      row_plan_failed_ = true;
+      return nullptr;
+    }
+  }
   const std::vector<slot_t>& kept = *projection_;
   // Every kept column must be in range and strictly ascending; the single-
   // element case in particular used to skip the range check and let
@@ -685,8 +713,9 @@ void FullScanIterator::BuildTypedDecodePlan() {
     const bool keep = kept == nullptr ||
                       (kept_cursor < kept->size() && (*kept)[kept_cursor] == i);
     const ValueType type = schema.GetColumn(i).Type();
-    if (keep && type != ValueType::kInt64 && type != ValueType::kDate &&
-        type != ValueType::kDouble && type != ValueType::kVarChar) {
+    if (keep && (schema.GetColumn(i).IsInterval() ||
+                 (type != ValueType::kInt64 && type != ValueType::kDate &&
+                  type != ValueType::kDouble && type != ValueType::kVarChar))) {
       // ARRAY (and any future variable-shape type) has no cell payload; the
       // caller falls back to the Row loop when projected.
       typed_keep_slots_.clear();
@@ -994,9 +1023,10 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
   // The pre-decode peek reads its column from key_column_, so a filter
   // installed after construction has to publish the column there too. A
   // legacy exact-set filter on the same column is superseded, not combined.
-  key_column_ = runtime_filter_column_;
   if (runtime_filter_ != nullptr) {
+    key_column_ = runtime_filter_column_;
     key_filter_ = nullptr;
+    key_peek_built_ = false;
   }
   if (runtime_filter_ == nullptr || !pos_.IsValid()) {
     return;
@@ -1325,7 +1355,8 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
           for (size_t r = 0; r < take; ++r) {
             out_ends[r] = dst_base + static_cast<uint32_t>(r + 1);
           }
-        } else if (col.dict != nullptr && col.dict->active) {
+        } else if (col.dict != nullptr &&
+                   (col.dict->active || col.dict->wide_code_bytes != 0)) {
           auto& dst_bytes = batch->varchar_bytes[vslot];
           auto& dst_ends = batch->varchar_ends[vslot];
           for (size_t r = 0; r < take; ++r) {

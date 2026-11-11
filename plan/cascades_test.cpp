@@ -478,6 +478,17 @@ TEST(CascadesTest, OptimizeWithOrderingPropertyKeysOrderingColumns) {
   EXPECT_FALSE(plan.has_value());
 }
 
+TEST(CascadesTest, AuditDefaultOrderDirectionIsAscendingInMemoKey) {
+  PhysicalProperties implicit;
+  implicit.ordering = {ColumnName("t.x")};
+  PhysicalProperties ascending = implicit;
+  ascending.sort_ascending = {true};
+  PhysicalProperties descending = implicit;
+  descending.sort_ascending = {false};
+  EXPECT_EQ(implicit.Key(), ascending.Key());
+  EXPECT_NE(implicit.Key(), descending.Key());
+}
+
 TEST(CascadesTest, PhysicalPropertiesKeyIncludesDistinctAndNullPlacement) {
   PhysicalProperties base;
   base.ordering = {ColumnName("a", "k")};
@@ -649,6 +660,30 @@ TEST(CascadesTest, StructuralFingerprintSeparatesTypedConstants) {
       BinaryExpressionExp(ColumnValueExp("a.x"), BinaryOperation::kEquals,
                           ConstantValueExp(Value(1.0)));
   EXPECT_NE(integer.Fingerprint(), real.Fingerprint());
+}
+
+TEST(CascadesTest, StructuralFingerprintKeepsExactScalarEncoding) {
+  const auto identity = [](const Value& value) {
+    LogicalExpression expression;
+    expression.operation = LogicalOperator::kProjection;
+    expression.target_list = {NamedExpression("v", ConstantValueExp(value))};
+    return expression.Fingerprint();
+  };
+  const auto minimum = identity(Value(std::numeric_limits<int64_t>::min()));
+  EXPECT_NE(minimum.find("-9223372036854775808"), std::string::npos);
+  EXPECT_NE(minimum.find("#t:v=e"), std::string::npos);
+  const auto maximum = identity(Value(std::numeric_limits<int64_t>::max()));
+  EXPECT_NE(maximum.find("9223372036854775807"), std::string::npos);
+  EXPECT_NE(minimum, maximum);
+  EXPECT_EQ(minimum, identity(Value(std::numeric_limits<int64_t>::min())));
+  const std::string embedded("x:;\0y", 5);
+  EXPECT_NE(identity(Value(std::string(embedded))).find(embedded),
+            std::string::npos);
+  EXPECT_NE(identity(Value(std::string(embedded))), identity(Value("x:;")));
+  EXPECT_NE(identity(Value()), identity(Value("")));
+  EXPECT_NE(identity(Value(0.0)), identity(Value(-0.0)));
+  EXPECT_NE(identity(Value::Array({Value(1), Value()}, "INT64")),
+            identity(Value::Array({Value(1), Value()}, "DOUBLE")));
 }
 
 TEST(CascadesTest, MemoAddExpressionValidatesSingleChildOperators) {
@@ -2954,6 +2989,52 @@ TEST(CascadesTest, CumeDistWindowKeepsLimitAbove) {
   EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
 }
 
+TEST(CascadesTest, AuditFrameIgnoringWindowsKeepLimitAbove) {
+  for (const std::string function :
+       {"CUME_DIST", "PERCENT_RANK", "NTILE", "LEAD", "LAG", "PERCENTILE_CONT",
+        "PERCENTILE_DISC"}) {
+    SCOPED_TRACE(function);
+    Memo memo;
+    (void)memo.Build({"t1"});
+    const GroupId scan = memo.EnsureGroup({"t1"});
+    const GroupId sort_group = memo.EnsureDerivedGroup({"t1"}, "sort_below");
+    memo.AddExpression(
+        sort_group,
+        LogicalExpression{.operation = LogicalOperator::kSort,
+                          .children = {scan},
+                          .target_list = {NamedExpression(
+                              "", ColumnValueExp(ColumnName("t1", "id")))},
+                          .sort_ascending = {true}});
+    const GroupId win_group = memo.EnsureDerivedGroup({"t1"}, "win_node");
+    memo.AddExpression(
+        win_group,
+        LogicalExpression{
+            .operation = LogicalOperator::kWindow,
+            .children = {sort_group},
+            .target_list = {NamedExpression(
+                "cd",
+                Expression(PrefixWindowCall(
+                    function, {}, {},
+                    {{.expression = ColumnValueExp(ColumnName("t1", "id")),
+                      .ascending = true}},
+                    true)))},
+            .output_schema = Schema("t1", {Column("id", ValueType::kInt64)})});
+    const GroupId limit_group =
+        memo.EnsureDerivedGroup({"t1"}, "limit_over_win");
+    memo.AddExpression(limit_group,
+                       LogicalExpression{.operation = LogicalOperator::kLimit,
+                                         .children = {win_group},
+                                         .limit_count = 3});
+
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(limit_group);
+
+    // CUME_DIST divides by the partition size, so truncating the input
+    // changes the surviving values even though the sort delivers the spec.
+    EXPECT_FALSE(AnyWindowHasLimitedChild(search.GetMemo()));
+  }
+}
+
 TEST(CascadesTest, OrderedWindowRejectsMismatchedSortKeys) {
   Memo memo;
   (void)memo.Build({"t1"});
@@ -4401,6 +4482,62 @@ TEST(CascadesTest, NotNullIsNotNullElimination) {
   EXPECT_TRUE(found_true_or_scan);
 }
 
+TEST(CascadesTest, AuditUnknownRelationConjunctRemainsResidual) {
+  for (bool disjunction : {false, true}) {
+    Memo memo;
+    const GroupId input = memo.Build({"a", "b"});
+    const GroupId root = memo.EnsureDerivedGroup({"a", "b"}, "audit_selection");
+    Expression predicate = EqExp("outside.x", Value(1));
+    if (disjunction) {
+      predicate = BinaryExpressionExp(
+          BinaryExpressionExp(predicate, BinaryOperation::kAnd,
+                              EqExp("a.x", Value(1))),
+          BinaryOperation::kOr,
+          BinaryExpressionExp(EqExp("outside.x", Value(2)),
+                              BinaryOperation::kAnd, EqExp("a.x", Value(2))));
+    }
+    ASSERT_TRUE(
+        memo.AddExpression(root, {.operation = LogicalOperator::kSelection,
+                                  .children = {input},
+                                  .predicate = predicate}));
+    SearchEngine search(std::move(memo), RuleSet::Default());
+    search.Explore(root);
+    EXPECT_FALSE(search.GetMemo().ContainsRelation({"outside"}));
+  }
+}
+
+TEST(CascadesTest, AuditJoinInferenceDoesNotStrengthenBranchLocalScans) {
+  for (bool inequality : {false, true}) {
+    Memo memo;
+    (void)memo.Build({"a", "b"});
+    const auto a = memo.EnsureGroup({"a"});
+    const auto b = memo.EnsureGroup({"b"});
+    const auto branch = memo.EnsureDerivedGroup({"a", "b"}, "branch");
+    memo.Get(branch).branch_local = true;
+    memo.MergeScanFilter(
+        a, BinaryExpressionExp(ColumnValueExp("a.x"),
+                               inequality ? BinaryOperation::kGreaterThan
+                                          : BinaryOperation::kEquals,
+                               ConstantValueExp(Value(10))));
+    ASSERT_TRUE(memo.AddExpression(
+        branch, {.operation = LogicalOperator::kJoin,
+                 .children = {a, b},
+                 .predicate = BinaryExpressionExp(ColumnValueExp("a.x"),
+                                                  BinaryOperation::kEquals,
+                                                  ColumnValueExp("b.x"))}));
+    RuleSet rules;
+    for (const auto& rule : RuleSet::Default().Rules()) {
+      if (rule.Name() == (inequality ? "inferred_inequality_pushdown"
+                                     : "infer_join_predicates"))
+        rules.Add(rule);
+    }
+    ASSERT_EQ(rules.Rules().size(), 1U);
+    SearchEngine search(std::move(memo), rules);
+    search.Explore(branch);
+    EXPECT_FALSE(search.GetMemo().Get(b).filter);
+  }
+}
+
 TEST(CascadesTest, SplitSelectionOverJoinPushesConjunctsOfBothSides) {
   // split_selection_over_join: unlike push_selection_through_join (left side
   // only), every single-relation conjunct may land in its own scan group.
@@ -5313,6 +5450,45 @@ TEST(CascadesTest, PushDownLimitThroughJoinOnUniqueKey) {
   EXPECT_FALSE(found_limit_pushed);
 }
 
+TEST(CascadesTest, AuditOuterJoinProofKeepsSuffixedRelationsDistinct) {
+  Memo memo;
+  (void)memo.Build({"audit_t", "audit_t_1"});
+  const GroupId left = memo.EnsureGroup({"audit_t"});
+  const GroupId right = memo.EnsureGroup({"audit_t_1"});
+  const GroupId joined =
+      memo.EnsureDerivedGroup({"audit_t", "audit_t_1"}, "outer");
+  memo.AddExpression(
+      joined,
+      LogicalExpression{.operation = LogicalOperator::kOuterJoin,
+                        .children = {left, right},
+                        .predicate = BinaryExpressionExp(
+                            ColumnValueExp(ColumnName("audit_t", "id")),
+                            BinaryOperation::kEquals,
+                            ColumnValueExp(ColumnName("audit_t_1", "id"))),
+                        .join_type = 0});
+  const GroupId selected =
+      memo.EnsureDerivedGroup({"audit_t", "audit_t_1"}, "filtered");
+  memo.AddExpression(
+      selected,
+      LogicalExpression{
+          .operation = LogicalOperator::kSelection,
+          .children = {joined},
+          .predicate = BinaryExpressionExp(
+              ColumnValueExp(ColumnName("audit_t", "val")),
+              BinaryOperation::kGreaterThan, ConstantValueExp(Value(10)))});
+  RuleSet rules;
+  for (const auto& rule : RuleSet::Default().Rules()) {
+    if (rule.Name() == "outer_to_inner_join_on_null_rejecting_filter")
+      rules.Add(rule);
+  }
+  ASSERT_EQ(rules.Rules().size(), 1U);
+  const size_t before = memo.GroupCount();
+  SearchEngine search(std::move(memo), rules);
+  search.Explore(selected);
+  EXPECT_EQ(search.GetMemo().GroupCount(), before);
+  EXPECT_EQ(search.GetMemo().Get(selected).expressions.size(), 1U);
+}
+
 TEST(CascadesTest, OuterToInnerJoinOnNullRejectingFilter) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
@@ -5995,7 +6171,7 @@ TEST(CascadesTest, PushSemiJoinThroughInnerJoin) {
   EXPECT_TRUE(found_pushed_semi);
 }
 
-TEST(CascadesTest, PushLimitThroughLeftJoin) {
+TEST(CascadesTest, PushLimitThroughLeftJoinRejectsUnprovenComparisonTypes) {
   Memo memo;
   (void)memo.Build({"t1", "t2"});
   const Schema keyed("t2", {Column("id", ValueType::kInt64,
@@ -6050,7 +6226,9 @@ TEST(CascadesTest, PushLimitThroughLeftJoin) {
       }
     }
   }
-  EXPECT_TRUE(found_pushed_limit);
+  // Schema-free comparison analysis cannot prove compatible operand types.
+  // Reducing input evaluation must not erase an error in a later join row.
+  EXPECT_FALSE(found_pushed_limit);
 }
 
 TEST(CascadesTest, PushLimitThroughLeftJoinRequiresContainmentProof) {
@@ -6919,13 +7097,11 @@ TEST(CascadesTest, OrToUnionSplitsTwoBranchDisjunction) {
   const GroupId base = memo.EnsureGroup({"t"});
   const GroupId sel = memo.EnsureDerivedGroup({"t"}, "or_sel");
   Expression predicate = BinaryExpressionExp(
-      BinaryExpressionExp(ColumnValueExp(ColumnName("t", "a")),
-                          BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{1}))),
+      UnaryExpressionExp(ColumnValueExp(ColumnName("t", "a")),
+                         UnaryOperation::kIsNull),
       BinaryOperation::kOr,
-      BinaryExpressionExp(ColumnValueExp(ColumnName("t", "b")),
-                          BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{2}))));
+      UnaryExpressionExp(ColumnValueExp(ColumnName("t", "b")),
+                         UnaryOperation::kIsNull));
   memo.AddExpression(sel,
                      LogicalExpression{.operation = LogicalOperator::kSelection,
                                        .children = {base},
@@ -6982,14 +7158,13 @@ TEST(CascadesTest, OrToUnionSplitsThreeBranchDisjunction) {
   (void)memo.Build({"t"});
   const GroupId base = memo.EnsureGroup({"t"});
   const GroupId sel = memo.EnsureDerivedGroup({"t"}, "or_three");
-  auto eq = [](const char* column, int64_t value) {
-    return BinaryExpressionExp(ColumnValueExp(ColumnName("t", column)),
-                               BinaryOperation::kEquals,
-                               ConstantValueExp(Value(value)));
+  auto is_null = [](const char* column) {
+    return UnaryExpressionExp(ColumnValueExp(ColumnName("t", column)),
+                              UnaryOperation::kIsNull);
   };
   Expression predicate = BinaryExpressionExp(
-      BinaryExpressionExp(eq("a", 1), BinaryOperation::kOr, eq("b", 2)),
-      BinaryOperation::kOr, eq("c", 3));
+      BinaryExpressionExp(is_null("a"), BinaryOperation::kOr, is_null("b")),
+      BinaryOperation::kOr, is_null("c"));
   memo.AddExpression(sel,
                      LogicalExpression{.operation = LogicalOperator::kSelection,
                                        .children = {base},
@@ -7030,13 +7205,11 @@ TEST(CascadesTest, OrToUnionSplitsMultiRelationDisjunction) {
   const GroupId selection =
       memo.EnsureDerivedGroup({"left_table", "right_table"}, "multi_or_filter");
   const Expression predicate = BinaryExpressionExp(
-      BinaryExpressionExp(ColumnValueExp(ColumnName("left_table", "a")),
-                          BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{1}))),
+      UnaryExpressionExp(ColumnValueExp(ColumnName("left_table", "a")),
+                         UnaryOperation::kIsNull),
       BinaryOperation::kOr,
-      BinaryExpressionExp(ColumnValueExp(ColumnName("right_table", "b")),
-                          BinaryOperation::kEquals,
-                          ConstantValueExp(Value(int64_t{2}))));
+      UnaryExpressionExp(ColumnValueExp(ColumnName("right_table", "b")),
+                         UnaryOperation::kIsNull));
   ASSERT_TRUE(memo.AddExpression(
       selection, LogicalExpression{.operation = LogicalOperator::kSelection,
                                    .children = {join_group},

@@ -44,7 +44,7 @@ LsmIndexIterator::LsmIndexIterator(LsmIndex* tree, Transaction* txn,
     return;
   }
   entries_ = txn_->GetPageManager()->LsmScanRange(tree_->Root(), begin, end,
-                                                  true, txn_->ID());
+                                                  true, txn_);
   if (entries_.empty()) {
     valid_ = false;
     return;
@@ -157,7 +157,7 @@ StatusOr<std::vector<std::string>> LsmIndex::ScanPartitionBoundaries(
     Transaction& txn, std::string_view begin, std::string_view end,
     size_t leaves_per_partition) const {
   const std::vector<std::pair<std::string, std::string>> entries =
-      txn.GetPageManager()->LsmScanRange(root_, begin, end, true, txn.ID());
+      txn.GetPageManager()->LsmScanRange(root_, begin, end, true, &txn);
   constexpr size_t kKeysPerVirtualLeaf = 128;
   const size_t step =
       std::max<size_t>(1, leaves_per_partition) * kKeysPerVirtualLeaf;

@@ -16,8 +16,8 @@ Strict-2PL + MVCC version chains + write intents. Normative doc:
   O(1) per shard).
 - `transaction_manager.{hpp,cpp}` — `Begin(read_only)` / `PreCommit` /
   commit (`COMMIT` record → publish versions/release intents → durability
-  barrier → reply) / abort (backward
-  chain walk + CLR, idempotent). All locks held to commit/abort (Strict 2PL).
+  barrier → reply) / abort (reverse staged in-memory records, discard pending
+  versions, append `kAbort`; no restart undo chain). All locks held to commit/abort (Strict 2PL).
   `PrepareCommitForDurableReply` can return the explicit own+dependency
   barrier after publication; its caller MUST wait and surface failures before
   external results/acknowledgements. GC retains undurable committed versions.

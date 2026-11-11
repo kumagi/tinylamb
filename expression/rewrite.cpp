@@ -39,6 +39,7 @@
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "expression/window_function_expression.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/interval.hpp"
 #include "type/row.hpp"
@@ -292,19 +293,20 @@ bool ExpressionCannotThrow(const Expression& expression) {  // NOLINT
           if (!children_total) {
             return false;
           }
-          // Two constants of different types raise a comparison type error;
-          // anything involving a column is treated as total by design (the
-          // absorption/pullup expectation files pin those rewrites, and the
-          // expr oracle fuzzers exercise them on well-typed trees).
-          if (IsConstant(binary.Left()) && IsConstant(binary.Right())) {
-            const auto lt = binary.Left()->AsConstantValue().GetValue().type;
-            const auto rt = binary.Right()->AsConstantValue().GetValue().type;
-            const bool numeric =
-                (lt == ValueType::kInt64 || lt == ValueType::kDouble) &&
-                (rt == ValueType::kInt64 || rt == ValueType::kDouble);
-            return lt == rt || numeric;
+          if (binary.Op() == BinaryOperation::kAnd ||
+              binary.Op() == BinaryOperation::kOr ||
+              binary.Op() == BinaryOperation::kXor) {
+            return true;
           }
-          return true;
+          if (IsConstant(binary.Left()) && IsConstant(binary.Right())) {
+            return TryEvaluateBinary(
+                       binary.Op(), binary.Left()->AsConstantValue().GetValue(),
+                       binary.Right()->AsConstantValue().GetValue())
+                .HasValue();
+          }
+          // A schema-free comparison of columns is not proven compatible.
+          // IN can be rewritten to equality before this proof runs.
+          return false;
         }
         default:
           return false;  // arithmetic, shifts, LIKE
@@ -326,12 +328,23 @@ bool ExpressionCannotThrow(const Expression& expression) {  // NOLINT
       if (!ExpressionCannotThrow(in.child_)) {
         return false;
       }
-      // NULL items never reach the membership comparison (Matches is gated
-      // on both sides being non-NULL), so they cannot raise.  Typed items
-      // against a column child are treated as total by design, matching the
-      // binary-comparison policy above.
-      return std::ranges::all_of(in.list_, [](const Expression& item) {
-        return ExpressionCannotThrow(item);
+      // Without a bound schema a column/list comparison may raise a type
+      // error. Prove constant comparisons instead of assuming compatible types.
+      if (!IsConstant(in.child_)) {
+        return in.list_.empty();
+      }
+      const Value child = in.child_->AsConstantValue().GetValue();
+      return std::ranges::all_of(in.list_, [&](const Expression& item) {
+        if (!IsConstant(item)) {
+          return false;
+        }
+        const Value candidate = item->AsConstantValue().GetValue();
+        if (HaveConflictingCollations(child, candidate)) {
+          return false;
+        }
+        return child.IsNull() || candidate.IsNull() ||
+               TryEvaluateBinary(BinaryOperation::kEquals, child, candidate)
+                   .HasValue();
       });
     }
     default:
@@ -942,6 +955,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               in.list_.front()->AsConstantValue().GetValue().IsNull()) {
             return Expression{};
           }
+          const auto non_string_constant = [](const Expression& operand) {
+            return IsConstant(operand) &&
+                   operand->AsConstantValue().GetValue().type !=
+                       ValueType::kVarChar;
+          };
+          if (!non_string_constant(in.child_) &&
+              !non_string_constant(in.list_.front())) {
+            return Expression{};
+          }
           return BinaryExpressionExp(in.child_, BinaryOperation::kEquals,
                                      in.list_.front());
         }));
@@ -1323,12 +1345,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           if (!IsOne(bindings.at("right"))) {
             return Expression{};
           }
-          // INT64 `/` promotes to FLOAT64 (INT64_MAX/1 saturates), so an
-          // int-typed `x / 1` is NOT an identity; the guard is therefore
-          // "left is statically non-numeric" (fire only for NULL/unknown
-          // typed columns), NOT "left is double".  Mirrors the AST ground
-          // truth's promotion contract.
-          if (StaticallyNonNumeric(bindings.at("left"))) {
+          // Unknown columns may be text, and INT64 division promotes to
+          // DOUBLE. Only a proven DOUBLE result can keep its type and errors.
+          if (!StaticallyDouble(bindings.at("left"))) {
             return Expression{};
           }
           return bindings.at("left");
@@ -1546,6 +1565,11 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           bool changed = false;
           for (const Expression& item : in.list_) {
             if (std::ranges::any_of(items, [&](const Expression& kept) {
+                  if (IsConstant(kept) && IsConstant(item) &&
+                      kept->AsConstantValue().GetValue().Collation() !=
+                          item->AsConstantValue().GetValue().Collation()) {
+                    return false;
+                  }
                   return Same(kept, item);
                 })) {
               changed = true;
@@ -2537,10 +2561,9 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           // Safety rules:
           // 1. Target expression must be safe to reduce evaluation count
           //    (volatiles like RAND() must not collapse evaluations).
-          // 2. An intervening disjunct that can throw (!ExpressionCannotThrow)
-          //    is a barrier: moving a later disjunct before it could evaluate
-          //    to TRUE and short-circuit the throw away. All active groups
-          //    must be sealed at the barrier.
+          // 2. Merge only consecutive alternatives of the same target.
+          //    Their comparisons retain order even when a type error is
+          //    possible; never move one across another target or predicate.
           // 3. Only mark `changed = true` when multiple disjuncts actually
           //    merge into a single slot.
           // 4. Empty IN lists (x IN ()) are not equality ranges and must
@@ -2586,11 +2609,6 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           };
 
           for (const Expression& d : disjuncts) {
-            if (!ExpressionCannotThrow(d)) {
-              seal_groups();
-              kept.push_back(d);
-              continue;
-            }
             if (d->Type() == TypeTag::kBinaryExp &&
                 d->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
               const auto& bin = d->AsBinaryExpression();
@@ -2606,6 +2624,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 if (SafeToReduceEvaluationCount(target)) {
                   Group* g = find_group(target);
                   if (g == nullptr) {
+                    seal_groups();
                     const size_t slot = kept.size();
                     kept.push_back(Expression{});
                     active_groups.push_back(Group{
@@ -2634,6 +2653,7 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                   SafeToReduceEvaluationCount(in.child_)) {
                 Group* g = find_group(in.child_);
                 if (g == nullptr) {
+                  seal_groups();
                   const size_t slot = kept.size();
                   kept.push_back(Expression{});
                   active_groups.push_back(Group{
@@ -2658,7 +2678,8 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
               }
             }
 
-            // Non-grouped disjunct
+            // Non-grouped disjunct is an evaluation-order barrier.
+            seal_groups();
             kept.push_back(d);
           }
 

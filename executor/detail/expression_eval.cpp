@@ -855,7 +855,7 @@ bool JsonObjectFieldTexts(std::string_view json,
 }
 
 // 1 = TRUE, 0 = FALSE, -1 = UNKNOWN.
-int ThreeValuedEqualsImpl(const Value& left, const Value& right);
+StatusOr<int> ThreeValuedEqualsImpl(const Value& left, const Value& right);
 
 int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
   auto trim = [](std::string_view s) {
@@ -927,7 +927,7 @@ int CompareEncodedField(std::string_view raw_left, std::string_view raw_right) {
   }
 }
 
-int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
+StatusOr<int> ThreeValuedEqualsImpl(const Value& left, const Value& right) {
   if (left.IsNull() || right.IsNull()) {
     return -1;
   }
@@ -939,7 +939,7 @@ int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
     }
     bool saw_unknown = false;
     for (size_t i = 0; i < le.size(); ++i) {
-      const int element = ThreeValuedEqualsImpl(le[i], re[i]);
+      ASSIGN_OR_RETURN(int, element, ThreeValuedEqualsImpl(le[i], re[i]));
       if (element == 0) {
         return 0;
       }
@@ -973,12 +973,11 @@ int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
   }
   // Mixed types take the canonical `=` path: numeric promotion decides
   // INT64-vs-DOUBLE (1 IN (SELECT 1.0) is TRUE, mirroring `1 = 1.0`), and
-  // genuinely incomparable operands error, which maps to UNKNOWN here —
-  // never to a decisive FALSE.
+  // genuinely incomparable operands retain their comparison error.
   {
     StatusOr<Value> eq = TryBinary(BinaryOperation::kEquals, left, right);
     if (!eq.HasValue()) {
-      return -1;
+      return eq.GetStatus();
     }
     return Truthy(eq.Value()) ? 1 : 0;
   }
@@ -990,7 +989,8 @@ int ThreeValuedEqualsImpl(const Value& left, const Value& right) {
 // comparisons.  Struct-shaped operands take the positional JSON path; plain
 // strings keep ordinary (never JSON-parsed) equality.
 int ThreeValuedEquals(const Value& left, const Value& right) {
-  return ThreeValuedEqualsImpl(left, right);
+  const auto compared = ThreeValuedEqualsImpl(left, right);
+  return compared.HasValue() ? compared.Value() : -1;
 }
 
 StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
@@ -1666,6 +1666,10 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         ASSIGN_OR_RETURN(Value, candidate,
                          (TryEvaluate(item, scope, aggregates, context, ctes)));
 
+        if (HaveConflictingCollations(test, candidate)) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "Collation conflict between the IN operands");
+        }
         saw_null = saw_null || candidate.IsNull();
         if (!found && !test.IsNull() && !candidate.IsNull()) {
           // The AST reference (InExpression::TryMembership -> TryMatches)
@@ -1905,9 +1909,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         // Canonical three-valued IN membership: a match decides TRUE, any
         // NULL (test value or row value) turns a miss into UNKNOWN.
         auto collation_conflict = [&](const Value& projected) {
-          return !test.IsNull() && !projected.IsNull() &&
-                 test.Collation() != 0 && projected.Collation() != 0 &&
-                 test.Collation() != projected.Collation();
+          return HaveConflictingCollations(test, projected);
         };
         bool found = false;
         bool saw_null = test.IsNull();
@@ -1921,7 +1923,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
         // domain must take the rescan path where `=` promotion decides.
         auto same_domain = [](const Value& probe, const Value& stored) {
           return probe.type == stored.type &&
-                 probe.IsUnsigned() == stored.IsUnsigned();
+                 probe.IsUnsigned() == stored.IsUnsigned() &&
+                 probe.Collation() == stored.Collation();
         };
         if (relation->TotalRows() == 0) {
           // An empty candidate set is decisive: `x IN ()` is FALSE and
@@ -1942,20 +1945,9 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
                       membership_node);
           if (inserted) {
             cached->second.values.reserve(relation->TotalRows());
-            Status collation_error = Status::kSuccess;
-            row_source.ForEachRow([&](const Row& row) {
-              if (collation_error != Status::kSuccess) {
-                return;
-              }
+            const Status iterated = row_source.ForEachRow([&](const Row& row) {
               const Value projected =
                   ProjectSubqueryRow(row, as_struct, &subquery_schema);
-              if (collation_conflict(projected)) {
-                collation_error =
-                    StatusError(StatusCode::kInvalidArgument,
-                                "Collation conflict between the IN "
-                                "operands");
-                return;
-              }
               if (projected.IsNull()) {
                 cached->second.contains_null = true;
               } else {
@@ -1969,8 +1961,10 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
                 cached->second.values.insert(projected);
               }
             });
-            if (collation_error != Status::kSuccess) {
-              return collation_error;
+            if (iterated != Status::kSuccess) {
+              context.execution_runtime()
+                  ->uncorrelated_membership_by_node.erase(cached);
+              return iterated;
             }
             if (cached->second.contains_null && value.Negated()) {
               context.execution_runtime()->null_aware_anti_build_contains_null =
@@ -1991,7 +1985,7 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           // may trigger the rescan -- Q22-sized builds make a per-miss rescan
           // quadratic (filter_ms 0.8s -> 246s at SF=1).
           const bool hash_is_exact =
-              cached->second.uniform_domain &&
+              cached->second.uniform_domain && !test.IsCaseInsensitive() &&
               (test.IsNull() ||
                (cached->second.has_domain &&
                 same_domain(test, cached->second.domain_sample) &&
@@ -2008,27 +2002,34 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           }
         }
         if (!hash_decided && relation->TotalRows() != 0) {
-          Status collation_error = Status::kSuccess;
-          row_source.ForEachRow([&](const Row& row) {
+          Status comparison_error = Status::kSuccess;
+          RETURN_IF_FAIL(row_source.ForEachRow([&](const Row& row) {
             if (found || row.values_.empty() ||
-                collation_error != Status::kSuccess) {
+                comparison_error != Status::kSuccess) {
               return;
             }
             const Value projected =
                 ProjectSubqueryRow(row, as_struct, &subquery_schema);
             if (collation_conflict(projected)) {
-              collation_error = StatusError(StatusCode::kInvalidArgument,
-                                            "Collation conflict between the IN "
-                                            "operands");
+              comparison_error =
+                  StatusError(StatusCode::kInvalidArgument,
+                              "Collation conflict between the IN "
+                              "operands");
               return;
             }
-            const int tri = ThreeValuedEquals(test, projected);
+            const auto compared = ThreeValuedEqualsImpl(test, projected);
+            if (!compared.HasValue()) {
+              comparison_error = compared.GetStatus();
+              return;
+            }
+            const int tri = compared.Value();
             if (tri < 0) {
               saw_null = true;
             } else if (tri == 1) {
               found = true;
             }
-          });
+          }));
+          RETURN_IF_FAIL(comparison_error);
         }
         Value membership =
             found ? Value(true) : (saw_null ? Value() : Value(false));
@@ -2094,13 +2095,8 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       return scalar;
     }
     case TypeTag::kIntervalExp: {
-      // Relational execution exposes interval literals as their logical
-      // amount/unit value.  The standalone AST evaluator intentionally keeps
-      // the encoded wire representation for compatibility with its direct
-      // expression tests.
-      const auto& interval = expression->AsIntervalExpression();
-      return Value(std::to_string(interval.Amount()) + " " +
-                   std::string(interval.Unit()));
+      // Preserve the AST's interval domain through folding, batches and spills.
+      return expression->TryEvaluate(Row(), Schema());
     }
     default:
       return StatusError(StatusCode::kInvalidArgument,
@@ -2117,9 +2113,8 @@ Schema QualifySchema(const Schema& schema, std::string_view qualifier) {
         (col_name.starts_with("$expr") && schema.ColumnCount() == 1)) {
       col_name = std::string(qualifier);
     }
-    Column qualified(ColumnName(qualifier, col_name), column.Type(),
-                     column.GetConstraint());
-    qualified.SetUnsigned(column.IsUnsigned());
+    Column qualified = column;
+    qualified.Name() = ColumnName(qualifier, col_name);
     columns.push_back(std::move(qualified));
   }
   return {"", std::move(columns)};

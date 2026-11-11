@@ -8,12 +8,14 @@
 // executor/detail/) include this header so a text accepted by one route is
 // accepted by the other.
 
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 
+#include "common/json_string.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
@@ -299,54 +301,6 @@ class Validator {
 };
 
 inline bool IsValid(std::string_view text) { return Validator(text).Valid(); }
-
-// Appends `text` as a quoted, escaped JSON string literal to `out`.
-inline void AppendJsonString(std::string& out, std::string_view text) {
-  out.push_back('"');
-  char buffer[8];
-  for (const char c : text) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\b':
-        out += "\\b";
-        break;
-      case '\f':
-        out += "\\f";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          std::snprintf(buffer, sizeof(buffer), "\\u%04x",
-                        static_cast<unsigned>(static_cast<unsigned char>(c)));
-          out += buffer;
-        } else {
-          out.push_back(c);
-        }
-        break;
-    }
-  }
-  out.push_back('"');
-}
-
-inline std::string EncodeJsonString(std::string_view text) {
-  std::string out;
-  out.reserve(text.size() + 2);
-  AppendJsonString(out, text);
-  return out;
-}
 
 // Renders a Value in JSON text form (TO_JSON semantics). VARCHAR is either a
 // struct payload (leading '{' — kept verbatim so TO_JSON over the engine's

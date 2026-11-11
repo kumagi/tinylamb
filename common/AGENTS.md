@@ -26,7 +26,7 @@ enum header `type/value_type.hpp`, allowlisted).
   iterator (table/full_scan_iterator.cpp) can reject a probe row before row
   decode.
 
-## `platform/` — OS abstraction (Linux + macOS)
+## `platform/` — OS abstraction (Linux + macOS + Windows)
 
 All OS- and libc-specific code goes through `common/platform/`; the rest of
 the tree must not include Linux-only headers (`<sys/epoll.h>`,
@@ -43,8 +43,8 @@ rely on libstdc++-only library features (`std::chrono::locate_zone`,
 - `socket.hpp` — `OpenSocket`/`AcceptSocket`/`OpenPipe` with atomic or
   fcntl-applied `FdFlags`, `SendNoSignal`, `InitSpawnAttributes`
   (`POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS).
-- `event_poller.hpp` — level-triggered `EventPoller` (epoll / kqueue) and the
-  cross-thread `Waker` (eventfd / pipe).
+- `event_poller.hpp` — level-triggered `EventPoller` (epoll / kqueue / WSAPoll) and the
+  cross-thread `Waker` (eventfd / pipe / Windows loopback socket pair).
 - `cpu_affinity.hpp` — `CpuSet` thread pinning; unsupported (no-op) on macOS.
 - `time_zone.hpp` — IANA zone lookup (C++20 tzdb on Linux, `CFTimeZone` on
   macOS; links CoreFoundation).

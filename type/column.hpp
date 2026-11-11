@@ -52,6 +52,12 @@ class Column {
   [[nodiscard]] ValueType Type() const { return type_; }
   void SetType(ValueType type) { type_ = type; }
   [[nodiscard]] bool IsUnsigned() const { return unsigned_; }
+  [[nodiscard]] bool IsInterval() const { return interval_; }
+  void SetInterval(bool value) { interval_ = value; }
+  [[nodiscard]] uint8_t IntegerBits() const { return integer_bits_; }
+  // Width of the declared integer domain: 8, 16, 32, or 64.
+  void SetIntegerBits(uint8_t bits) { integer_bits_ = bits; }
+  [[nodiscard]] bool IntegerValueFits(const Value& value) const;
   void SetUnsigned(bool value) { unsigned_ = value; }
   [[nodiscard]] Constraint GetConstraint() const { return constraint_; }
   [[nodiscard]] AccessHint GetHint() const { return hint_; }
@@ -68,6 +74,8 @@ class Column {
   ColumnName col_name_;
   ValueType type_{};
   bool unsigned_{false};
+  bool interval_{false};
+  uint8_t integer_bits_{64};
   Constraint constraint_{Constraint::kNothing};
   AccessHint hint_{AccessHint::kUnknown};
   uint8_t scale_{0};

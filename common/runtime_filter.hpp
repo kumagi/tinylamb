@@ -68,6 +68,8 @@ class RuntimeFilter {
   RuntimeFilter() = default;
   RuntimeFilter(const RuntimeFilter&) = delete;
   RuntimeFilter& operator=(const RuntimeFilter&) = delete;
+  RuntimeFilter(RuntimeFilter&&) = delete;
+  RuntimeFilter& operator=(RuntimeFilter&&) = delete;
   virtual ~RuntimeFilter() = default;
 
   [[nodiscard]] virtual RuntimeFilterKind Kind() const = 0;
@@ -103,8 +105,8 @@ class ExactSetRuntimeFilter final : public RuntimeFilter {
         table_slots <<= 1U;
       }
     }
-    return sizeof(*this) + keys_.size() * sizeof(int64_t) +
-           table_slots * sizeof(uint32_t);
+    return sizeof(*this) + (keys_.size() * sizeof(int64_t)) +
+           (table_slots * sizeof(uint32_t));
   }
   [[nodiscard]] const std::vector<int64_t>& Keys() const { return keys_; }
   [[nodiscard]] int64_t Min() const { return keys_.front(); }
@@ -140,7 +142,7 @@ class MinMaxRuntimeFilter final : public RuntimeFilter {
 };
 
 // Bloom filter over the build keys. kHashProbes independent bit positions are
-// set per key; a key is rejected only when every probe bit is clear.
+// set per key; a key is rejected when any required probe bit is clear.
 class BloomRuntimeFilter final : public RuntimeFilter {
  public:
   // `distinct_keys` sizes the bitset at ~10 bits/key (false-positive rate
@@ -156,7 +158,7 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] size_t MemoryBytes() const override {
     const size_t words =
         nominal_bit_count_ != 0 ? (nominal_bit_count_ / 64) : bits_.size();
-    return sizeof(*this) + words * sizeof(uint64_t);
+    return sizeof(*this) + (words * sizeof(uint64_t));
   }
   [[nodiscard]] size_t BitCount() const { return bit_count_; }
   // A malformed bitset (non power-of-two size, or fewer words than the bit
@@ -253,8 +255,8 @@ class RuntimeFilterGroup final {
           static_cast<uint64_t>(clamped_min) - static_cast<uint64_t>(lo_);
       const uint64_t off_hi =
           static_cast<uint64_t>(clamped_max) - static_cast<uint64_t>(lo_);
-      const size_t word_lo = static_cast<size_t>(off_lo >> 6);
-      const size_t word_hi = static_cast<size_t>(off_hi >> 6);
+      const auto word_lo = static_cast<size_t>(off_lo >> 6);
+      const auto word_hi = static_cast<size_t>(off_hi >> 6);
       if (word_hi - word_lo <= 8) {
         const uint64_t low_mask = ~uint64_t{0} << (off_lo & 63);
         const uint64_t high_mask = (~uint64_t{0}) >> (63 - (off_hi & 63));

@@ -18,7 +18,7 @@
 
 #include <cerrno>
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 #include <mutex>
 #include <unordered_map>
 #else
@@ -29,7 +29,7 @@
 
 namespace tinylamb::platform {
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 
 namespace {
 
@@ -429,7 +429,7 @@ int SetSocketOptInt(int fd, int level, int optname, int value) {
 int SetSocketTimeout(int fd, int optname, int timeout_ms) {
   timeval tv{};
   tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(timeout_ms % 1000) * 1000;
   return ::setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
 }
 

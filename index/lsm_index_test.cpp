@@ -205,9 +205,28 @@ TEST_F(LsmIndexTest, AbortRevertsUncommittedMutations) {
     std::ostringstream oss;
     idx.Dump(oss, 2);
     EXPECT_NE(oss.str().find("LsmIndex"), std::string::npos);
-    EXPECT_TRUE(idx.CheckSanity(txn));
+    EXPECT_TRUE(LsmIndex::CheckSanity(txn));
     ASSERT_SUCCESS(txn.PreCommit());
   }
+}
+
+TEST_F(LsmIndexTest, AuditForeignUpdateCannotReplaceCommittedRangeValue) {
+  auto setup = tm_->Begin();
+  ASSIGN_OR_ASSERT_FAIL(LsmIndex, index, LsmIndex::Open(setup));
+  ASSERT_SUCCESS(index.Insert(setup, "key", "committed"));
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto writer = tm_->Begin();
+  ASSERT_SUCCESS(index.Update(writer, "key", "pending"));
+  auto reader = tm_->Begin();
+  auto scan = index.Begin(reader, "key", "key");
+  ASSERT_TRUE(scan.IsValid());
+  scan.EnableStableLeafCache();
+  EXPECT_EQ(scan.Value(), "committed");
+  auto own = index.Begin(writer, "key", "key");
+  own.EnableStableLeafCache();
+  EXPECT_EQ(own.Value(), "pending");
+  ASSERT_SUCCESS(writer.Abort());
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 }  // namespace

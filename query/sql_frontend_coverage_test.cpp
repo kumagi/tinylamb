@@ -208,8 +208,11 @@ TEST_F(SqlFrontendCoverageTest, UnnestForms) {
 // ---------------------------------------------------------------- PIVOT ----
 
 TEST_F(SqlFrontendCoverageTest, PivotForms) {
-  ExpectQuery("SELECT s, k FROM t PIVOT(SUM(k) FOR s IN ('a', 'b'))",
-              {Row({Value(R"({"a":4,"b":2})"), Value(R"({"a":4,"b":2})")})});
+  auto rejected = engine_->Prepare(
+      *context_, "SELECT * FROM t PIVOT(SUM(k) FOR s IN ('a', 'b'))");
+  EXPECT_FALSE(rejected.HasValue());
+  EXPECT_NE(engine_->LastError().find("explicit named columns"),
+            std::string::npos);
   ExpectScalar(
       "SELECT * FROM (SELECT k, s FROM t WHERE k < 3) "
       "PIVOT(COUNT(k) FOR s IN ('a'))",

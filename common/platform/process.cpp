@@ -30,7 +30,7 @@
 
 #include "common/platform/os.hpp"
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -43,9 +43,11 @@
 #elif defined(__APPLE__)
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern "C" {
@@ -56,7 +58,7 @@ extern char** environ;  // NOLINT(readability-redundant-declaration)
 namespace tinylamb::platform {
 
 std::filesystem::path CurrentExecutablePath() {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   std::array<wchar_t, 4096> buf{};
   const DWORD len =
       ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
@@ -87,7 +89,7 @@ std::filesystem::path CurrentExecutablePath() {
 }
 
 char** Environment() {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   return _environ;
 #elif defined(__APPLE__)
   return *::_NSGetEnviron();
@@ -97,7 +99,7 @@ char** Environment() {
 }
 
 int GetPid() {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   return ::_getpid();
 #else
   return static_cast<int>(::getpid());
@@ -105,7 +107,7 @@ int GetPid() {
 }
 
 int SetEnv(const char* name, const char* value, int overwrite) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   if (name == nullptr || *name == '\0' || std::strchr(name, '=') != nullptr ||
       value == nullptr) {
     errno = EINVAL;
@@ -127,7 +129,7 @@ int SetEnv(const char* name, const char* value, int overwrite) {
 }
 
 int UnsetEnv(const char* name) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   if (name == nullptr || *name == '\0' || std::strchr(name, '=') != nullptr) {
     errno = EINVAL;
     return -1;
@@ -149,7 +151,7 @@ int RunProcess(
     const std::vector<std::string>& args,
     const std::vector<std::pair<std::string, std::string>>& env_overrides,
     std::string* error_out) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   auto quote_arg = [](std::wstring_view arg) -> std::wstring {
     if (!arg.empty() &&
         arg.find_first_of(L" \t\n\v\"") == std::wstring_view::npos) {
@@ -223,28 +225,52 @@ int RunProcess(
   ::CloseHandle(pi.hProcess);
   return static_cast<int>(exit_code);
 #else
-  const pid_t child = ::fork();
-  if (child < 0) {
+  // Construct all storage in the parent. Calling setenv or allocating after
+  // fork can deadlock on locks inherited from other application threads.
+  std::string exe_str = executable.string();
+  std::vector<std::string> owned = args;
+  std::vector<char*> argv;
+  argv.reserve(owned.size() + 2);
+  argv.push_back(exe_str.data());
+  for (std::string& arg : owned) {
+    argv.push_back(arg.data());
+  }
+  argv.push_back(nullptr);
+
+  std::vector<std::string> environment;
+  for (char** entry = Environment(); entry != nullptr && *entry != nullptr;
+       ++entry) {
+    environment.emplace_back(*entry);
+  }
+  for (const auto& [key, value] : env_overrides) {
+    if (key.empty() || key.find('=') != std::string::npos ||
+        key.find('\0') != std::string::npos ||
+        value.find('\0') != std::string::npos) {
+      if (error_out != nullptr) {
+        *error_out = "invalid environment override";
+      }
+      return -1;
+    }
+    const std::string prefix = key + "=";
+    std::erase_if(environment, [&](const std::string& entry) {
+      return entry.starts_with(prefix);
+    });
+    environment.push_back(prefix + value);
+  }
+  std::vector<char*> envp;
+  envp.reserve(environment.size() + 1);
+  for (std::string& entry : environment) {
+    envp.push_back(entry.data());
+  }
+  envp.push_back(nullptr);
+  pid_t child = 0;
+  const int spawned = ::posix_spawn(&child, exe_str.c_str(), nullptr, nullptr,
+                                    argv.data(), envp.data());
+  if (spawned != 0) {
     if (error_out != nullptr) {
-      *error_out = "fork failed";
+      *error_out = "posix_spawn failed: " + std::string(std::strerror(spawned));
     }
     return -1;
-  }
-  if (child == 0) {
-    for (const auto& [k, v] : env_overrides) {
-      ::setenv(k.c_str(), v.c_str(), 1);
-    }
-    std::string exe_str = executable.string();
-    std::vector<std::string> owned = args;
-    std::vector<char*> argv;
-    argv.reserve(owned.size() + 2);
-    argv.push_back(exe_str.data());
-    for (std::string& s : owned) {
-      argv.push_back(s.data());
-    }
-    argv.push_back(nullptr);
-    ::execv(exe_str.c_str(), argv.data());
-    ::_exit(127);
   }
   int status = 0;
   while (::waitpid(child, &status, 0) < 0) {
@@ -266,7 +292,7 @@ int RunProcess(
 }
 
 int OpenWriteFailingDescriptor() {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   std::array<wchar_t, MAX_PATH + 1> temp_dir{};
   const DWORD dir_len =
       ::GetTempPathW(static_cast<DWORD>(temp_dir.size()), temp_dir.data());

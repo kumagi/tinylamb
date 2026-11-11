@@ -39,6 +39,8 @@ class SelectionPlan final : public PlanBase {
   ~SelectionPlan() override = default;
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
+  // Preserve logical selectivity while avoiding a repeated scan residual.
+  [[nodiscard]] bool ChildAppliesPredicate() const;
   [[nodiscard]] bool ContainsParameterSlots() const override;
   bool InstallParameterSlots(const std::vector<Value>& parameters,
                              size_t* cursor,
@@ -84,6 +86,7 @@ class SelectionPlan final : public PlanBase {
   [[nodiscard]] std::string ToString() const override;
 
  private:
+  [[nodiscard]] Expression ChildScanPredicate() const;
   Plan src_;
   Expression exp_;
   TableStatistics stats_;

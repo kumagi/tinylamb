@@ -70,6 +70,11 @@ class ParallelScan final : public ExecutorBase {
       size_t worker_count,
       const std::function<Status(size_t, const LSTablePageBlock&,
                                  const uint32_t*, size_t)>& consume);
+  // Consume the entire immutable snapshot once, without page metadata walks.
+  // Only an unstarted, unfiltered, chain-free scan is eligible. Projection
+  // offsets still map through TableColumnSlot; the callback sees table columns.
+  StatusOr<bool> TryFoldLSTableStore(
+      const std::function<Status(const LSTableStore&)>& consume);
   [[nodiscard]] bool WasTypedFolded() const { return typed_folded_; }
 
   // Attach a full row predicate to be decided inside the decode workers
@@ -103,6 +108,7 @@ class ParallelScan final : public ExecutorBase {
   }
 
  private:
+  [[nodiscard]] bool RejectedByIntegerMembership() const;
   void Start(size_t batch_size);
   void RunWorker(size_t batch_size, size_t worker_index);
   bool Enqueue(size_t morsel_index, DataChunk chunk);

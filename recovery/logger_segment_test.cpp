@@ -399,6 +399,31 @@ TEST_F(LoggerSegmentTest, RecoveryFailsClosedWhenPreRollSuccessorMissing) {
   EXPECT_EQ(recovery.RecoverFrom(0, nullptr), Status::kIOError);
 }
 
+TEST_F(LoggerSegmentTest, AuditLegacyRollCrashBeforeSuccessorIsZeroTail) {
+  constexpr size_t kSegmentSize = 64;
+  const std::string record = LogRecord::BeginCheckpointLogRecord().Serialize();
+  ASSERT_LT(record.size(), kSegmentSize);
+  std::string padded = record;
+  padded.resize(kSegmentSize, '\0');
+  WriteFile(base_, padded);
+  {
+    RecoveryManager recovery(base_, nullptr, kSegmentSize);
+    EXPECT_EQ(recovery.ValidLogEnd(0), record.size());
+    EXPECT_SUCCESS(recovery.RecoverFrom(0, nullptr));
+  }
+  // A later segment proves this is an actual missing middle segment.
+  WriteFile(Logger::SegmentPath(base_, 2), record);
+  {
+    RecoveryManager recovery(base_, nullptr, kSegmentSize);
+    EXPECT_EQ(recovery.RecoverFrom(0, nullptr), Status::kIOError);
+  }
+  ASSERT_TRUE(std::filesystem::remove(Logger::SegmentPath(base_, 2)));
+  padded.back() = 'x';
+  WriteFile(base_, padded);
+  RecoveryManager damaged(base_, nullptr, kSegmentSize);
+  EXPECT_EQ(damaged.RecoverFrom(0, nullptr), Status::kCorrupt);
+}
+
 TEST_F(LoggerSegmentTest, RejectsRecordLargerThanSegment) {
   constexpr size_t kSegmentSize = 64;
   auto logger = Logger::Create(base_, 13, 1, kSegmentSize).MoveValue();

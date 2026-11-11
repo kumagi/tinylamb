@@ -629,7 +629,7 @@ std::string CheckComplexMemoEquivalence(const GeneratedComplexMemo& gen) {
     }
   }
 
-  // 2. Exploration with Default rule set (all 105 rules)
+  // 2. Exploration with the default transformation rule set
   {
     cascades::Memo memo(kFuzzCap);
     const cascades::GroupId root = gen.builder(memo);

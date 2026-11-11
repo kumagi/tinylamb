@@ -1,8 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache License 2.0. */
 #include "executor/merge_append.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <utility>
@@ -11,9 +13,11 @@
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/sort.hpp"
+#include "executor/values.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -67,6 +71,40 @@ std::vector<int64_t> RunMerge(std::vector<std::vector<int64_t>> inputs) {
     out.push_back(row.values_[0].value.int_value);
   }
   return out;
+}
+
+TEST(MergeAppendExecutorTest, AuditNaNOrderMatchesSortInBothDirections) {
+  const Schema schema("", {Column("k", ValueType::kDouble)});
+  for (const bool ascending : {true, false}) {
+    const SortKeyOrder order(ascending);
+    std::vector<Value> first{Value(0.0),
+                             Value(std::numeric_limits<double>::infinity())};
+    std::vector<Value> second{Value(std::numeric_limits<double>::quiet_NaN()),
+                              Value(1.0), Value()};
+    auto before = [&](const Value& a, const Value& b) {
+      return order.Precedes(a, b);
+    };
+    std::ranges::sort(first, before);
+    std::ranges::sort(second, before);
+    std::vector<Executor> sources;
+    for (const auto& values : {first, second}) {
+      std::vector<Row> rows;
+      for (const auto& value : values)
+        rows.emplace_back(std::vector<Value>{value});
+      sources.push_back(std::make_shared<ValuesExecutor>(std::move(rows)));
+    }
+    MergeAppendExecutor merge(
+        std::move(sources), {schema, schema}, schema,
+        {{.expression = ColumnValueExp("k"), .ascending = ascending}});
+    std::vector<Value> result;
+    Row row;
+    while (merge.Next(&row, nullptr)) result.push_back(row[0]);
+    EXPECT_EQ(merge.GetStatus(), Status::kSuccess);
+    ASSERT_EQ(result.size(), 5U);
+    for (size_t i = 1; i < result.size(); ++i) {
+      EXPECT_LE(order.Compare(result[i - 1], result[i]), 0) << "position=" << i;
+    }
+  }
 }
 
 TEST(MergeAppendExecutorTest, MergesTwoSortedStreams) {

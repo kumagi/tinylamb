@@ -11,6 +11,7 @@
 #include "common/random_string.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
@@ -18,7 +19,9 @@
 #include "query/statement.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
+#include "type/row.hpp"
 #include "type/schema.hpp"
+#include "type/value.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
@@ -56,11 +59,13 @@ class SelectRewritesTest : public ::testing::Test {
                               "CREATE TABLE items (id INT64 PRIMARY KEY, "
                               "category INT64, price INT64, name STRING);")
                     .HasValue());
-    ASSERT_TRUE(engine_
-                    ->Execute(*ctx_,
-                              "INSERT INTO items VALUES (1, 10, 100, 'a'), "
-                              "(2, 10, 200, 'b'), (3, 20, 300, 'c');")
-                    .HasValue());
+    auto inserted =
+        engine_->Execute(*ctx_,
+                         "INSERT INTO items VALUES (1, 10, 100, 'a'), "
+                         "(2, 10, 200, 'b'), (3, 20, 300, 'c');");
+    ASSERT_TRUE(inserted.HasValue());
+    inserted.Value().Drain();
+    ASSERT_EQ(inserted.Value().GetStatus(), Status::kSuccess);
   }
 
   void TearDown() override {
@@ -95,6 +100,171 @@ TEST_F(SelectRewritesTest, InlineSingleUseCtesReplacesSingleReference) {
   ASSERT_NE(multi, nullptr);
   EXPECT_FALSE(InlineSingleUseCtes(multi.get()));
   EXPECT_EQ(multi->WithQueries().size(), 1U);
+}
+
+TEST_F(SelectRewritesTest, SingleUseGroupedCtesRetainFiltersAndSharedBodies) {
+  auto statement = ParseSelect(
+      "WITH a AS (SELECT category AS ak,SUM(price) AS n FROM items GROUP BY "
+      "category),"
+      "b AS (SELECT category AS bk,COUNT(*) AS n FROM items GROUP BY category) "
+      "SELECT ak,a.n,b.n FROM a LEFT JOIN b ON ak=bk WHERE ak=10");
+  ASSERT_NE(statement, nullptr);
+  auto original_body = statement->WithQueries().at("a");
+  EXPECT_TRUE(InlineSingleUseGroupedCtes(statement.get(), *ctx_));
+  EXPECT_TRUE(statement->WithQueries().empty());
+  ASSERT_EQ(statement->Sources().size(), 2U);
+  for (const auto& source : statement->Sources()) {
+    ASSERT_NE(source.query, nullptr);
+    EXPECT_NE(source.query->WhereClause(), nullptr);
+    EXPECT_FALSE(source.is_lateral);
+  }
+  EXPECT_EQ(original_body->WhereClause(), nullptr);
+  auto execution =
+      relational_detail::ExecuteQuery(*ctx_, *statement, nullptr, {});
+  ASSERT_TRUE(execution.HasValue()) << execution.GetStatus();
+  EXPECT_EQ(execution.Value().rows,
+            std::vector<Row>({Row({Value(10), Value(300), Value(2)})}));
+  for (const auto& sql : {"WITH c AS (SELECT category,SUM(price) AS n FROM "
+                          "items GROUP BY category) "
+                          "SELECT a.n,b.n FROM c a,c b",
+                          "WITH c AS (SELECT category,SUM(price) AS n FROM "
+                          "items GROUP BY category LIMIT 1) "
+                          "SELECT n FROM c",
+                          "WITH c AS (SELECT category,SUM(price) AS n FROM "
+                          "items GROUP BY ROLLUP(category)) "
+                          "SELECT n FROM c"}) {
+    auto fenced = ParseSelect(sql);
+    ASSERT_NE(fenced, nullptr);
+    EXPECT_FALSE(InlineSingleUseGroupedCtes(fenced.get(), *ctx_));
+  }
+}
+
+TEST_F(SelectRewritesTest, NestedSingleUseWindowCtesKeepPartitionsAndTrees) {
+  const std::string body =
+      "SELECT id, SUM(SUM(price)) OVER (PARTITION BY category ORDER BY id) "
+      "AS running FROM items GROUP BY id,category";
+  auto statement = ParseSelect(
+      "WITH totals AS (" + body +
+      ") SELECT * FROM (SELECT id,running FROM totals WHERE id=2) q");
+  ASSERT_NE(statement, nullptr);
+  const auto original_consumer = statement->Sources().front().query;
+  const auto original_body = statement->WithQueries().at("totals");
+  ASSERT_TRUE(InlineSingleUseGroupedCtes(statement.get(), *ctx_));
+  EXPECT_TRUE(statement->WithQueries().empty());
+  EXPECT_EQ(original_consumer->Sources().front().table, "totals");
+  EXPECT_EQ(original_consumer->Sources().front().query, nullptr);
+  EXPECT_EQ(original_body->WhereClause(), nullptr);
+  const auto& nested = statement->Sources().front().query;
+  ASSERT_NE(nested, original_consumer);
+  ASSERT_NE(nested->Sources().front().query, nullptr);
+  EXPECT_EQ(nested->Sources().front().query->WhereClause(), nullptr);
+  auto result = relational_detail::ExecuteQuery(*ctx_, *statement, nullptr, {});
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  EXPECT_EQ(result.Value().rows,
+            std::vector<Row>({Row({Value(2), Value(300)})}));
+  auto shared = ParseSelect("WITH totals AS (" + body +
+                            ") SELECT a.id FROM totals a JOIN "
+                            "(SELECT id FROM totals) b ON a.id=b.id");
+  ASSERT_NE(shared, nullptr);
+  EXPECT_FALSE(InlineSingleUseGroupedCtes(shared.get(), *ctx_));
+  EXPECT_EQ(shared->WithQueries().size(), 1U);
+  // An intervening WITH scope is not rewritten through the outer map.
+  auto shadowed =
+      ParseSelect("WITH totals AS (" + body +
+                  ") SELECT * FROM (WITH totals AS (SELECT 9 AS id) "
+                  "SELECT id FROM totals) q");
+  ASSERT_NE(shadowed, nullptr);
+  EXPECT_FALSE(InlineSingleUseGroupedCtes(shadowed.get(), *ctx_));
+}
+
+TEST_F(SelectRewritesTest, PresenceOnlyCteDropsUnusedColumnsAndDuplicates) {
+  const std::string body =
+      "SELECT a.category AS k,a.id AS unused FROM items a JOIN items b "
+      "ON a.category=b.category WHERE a.id<>b.id";
+  const std::string sql =
+      "WITH candidates AS (" + body +
+      ") SELECT id FROM items WHERE category IN (SELECT k FROM candidates) "
+      "AND category IN (SELECT c.k FROM candidates c JOIN items x "
+      "ON c.k=x.category) ORDER BY id";
+  auto statement = ParseSelect(sql);
+  ASSERT_NE(statement, nullptr);
+  auto grouped =
+      relational_detail::GroupPresenceOnlyCte(*statement, "candidates");
+  ASSERT_NE(grouped, nullptr);
+  ASSERT_EQ(grouped->SelectList().size(), 1U);
+  EXPECT_EQ(grouped->SelectList()[0].name, "k");
+  EXPECT_EQ(grouped->GroupBy().size(), 1U);
+  EXPECT_EQ(statement->WithQueries().at("candidates")->SelectList().size(), 2U);
+  auto cell = relational_detail::ExecuteQuery(*ctx_, *grouped, nullptr, {});
+  ASSERT_TRUE(cell.HasValue()) << cell.GetStatus();
+  EXPECT_EQ(cell.Value().rows, std::vector<Row>({Row({Value(10)})}));
+  auto result = engine_->Execute(*ctx_, sql);
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  EXPECT_EQ(result.Value().Collect(),
+            std::vector<Row>({Row({Value(1)}), Row({Value(2)})}));
+  for (const auto& consumer :
+       {"SELECT COUNT(*) FROM candidates",
+        "SELECT id FROM items WHERE category IN (SELECT SUM(k) FROM "
+        "candidates)",
+        "SELECT id FROM items WHERE category IN (SELECT k FROM candidates "
+        "LIMIT 100 OFFSET 1)",
+        "SELECT ARRAY(SELECT k FROM candidates)",
+        "SELECT (SELECT k FROM candidates)",
+        "SELECT k FROM candidates WHERE k IN (SELECT k FROM candidates)"}) {
+    auto sensitive =
+        ParseSelect("WITH candidates AS (" + body + ") " + consumer);
+    ASSERT_NE(sensitive, nullptr) << consumer;
+    EXPECT_EQ(relational_detail::GroupPresenceOnlyCte(*sensitive, "candidates"),
+              nullptr)
+        << consumer;
+  }
+}
+
+TEST_F(SelectRewritesTest, SingleUseUnionInsideCteClonesItsConsumer) {
+  const std::string sql =
+      "WITH raw AS (SELECT category,price FROM ("
+      "SELECT category,price FROM items UNION ALL SELECT category,price FROM "
+      "items) u),"
+      "totals AS (SELECT category,SUM(price) AS total FROM raw GROUP BY "
+      "category) "
+      "SELECT a.category,a.total FROM totals a JOIN totals b ON "
+      "a.category=b.category "
+      "ORDER BY a.category";
+  auto statement = ParseSelect(sql);
+  ASSERT_NE(statement, nullptr);
+  const auto original_consumer = statement->WithQueries().at("totals");
+  ASSERT_EQ(original_consumer->Sources()[0].table, "raw");
+  EXPECT_TRUE(InlineSingleUseCtes(statement.get()));
+  EXPECT_FALSE(statement->WithQueries().contains("raw"));
+  const auto rewritten = statement->WithQueries().at("totals");
+  EXPECT_NE(rewritten.get(), original_consumer.get());
+  EXPECT_EQ(original_consumer->Sources()[0].table, "raw");
+  EXPECT_EQ(original_consumer->Sources()[0].query, nullptr);
+  EXPECT_NE(rewritten->Sources()[0].query, nullptr);
+  EXPECT_EQ(rewritten->Sources()[0].alias, "raw");
+  auto result = engine_->Execute(*ctx_, sql);
+  ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+  EXPECT_EQ(result.Value().Collect(),
+            std::vector<Row>(
+                {Row({Value(10), Value(600)}), Row({Value(20), Value(600)})}));
+  EXPECT_EQ(result.Value().GetStatus(), Status::kSuccess);
+  for (const auto& body :
+       {"SELECT id FROM items LIMIT 1",
+        "SELECT id FROM items UNION DISTINCT SELECT id FROM items"}) {
+    auto fenced = ParseSelect(
+        std::string("WITH raw AS (") + body +
+        "), totals AS (SELECT SUM(id) AS n FROM raw) SELECT n FROM totals");
+    ASSERT_NE(fenced, nullptr);
+    InlineSingleUseCtes(fenced.get());
+    EXPECT_TRUE(fenced->WithQueries().contains("raw"));
+  }
+  auto shared = ParseSelect(
+      "WITH raw AS (SELECT id FROM items), totals AS (SELECT SUM(id) AS n FROM "
+      "raw) "
+      "SELECT r.id,t.n FROM raw r,totals t");
+  ASSERT_NE(shared, nullptr);
+  InlineSingleUseCtes(shared.get());
+  EXPECT_TRUE(shared->WithQueries().contains("raw"));
 }
 
 TEST_F(SelectRewritesTest, ExpandStarWithModifiersAppliesExceptAndReplace) {

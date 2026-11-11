@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "common/random_string.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
+#include "expression/bytecode.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
@@ -60,11 +62,10 @@ class ScalarFunctionSqlTest : public ::testing::Test {
 
   Value Scalar(std::string_view sql) {
     auto rows = RunSql(sql);
-    EXPECT_EQ(rows.size(), 1U) << sql;
-    if (rows.empty()) {
-      return {};
+    if (rows.size() != 1 || rows[0].values_.size() != 1) {
+      throw std::runtime_error("expected one scalar result for " +
+                               std::string(sql));
     }
-    EXPECT_EQ(rows[0].values_.size(), 1U) << sql;
     return rows[0].values_[0];
   }
 
@@ -204,6 +205,56 @@ TEST_F(ScalarFunctionSqlTest, RegexpFunctions) {
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('hello', 'ell')"), Value(true));
   EXPECT_EQ(Scalar("SELECT REGEXP_CONTAINS('hello', 'xyz')"), Value(false));
   EXPECT_EQ(Scalar("SELECT REGEXP_REPLACE('hello', 'l', 'L')"), Value("heLLo"));
+}
+
+TEST_F(ScalarFunctionSqlTest, RegexpReplacementCapturesAndLiteralDollar) {
+  EXPECT_EQ(
+      Scalar(
+          R"(SELECT REGEXP_REPLACE('abc123', '([a-z]+)([0-9]+)', r'\2-\1-$1'))"),
+      Value("123-abc-$1"));
+  EXPECT_EQ(Scalar(R"(SELECT REGEXP_REPLACE('x', '(x)', r'\19'))"),
+            Value("x9"));
+  EXPECT_TRUE(SqlFails(R"(SELECT REGEXP_REPLACE('x', '(x)', r'\2'))"));
+}
+
+TEST(FunctionCallAstTest, RegexpReplacementViewsPreserveValuesAndNulls) {
+  struct Case {
+    std::vector<Value> arguments;
+    Value expected;
+  };
+  const std::vector<Case> cases{
+      {{Value(std::string("a\0b", 3)), Value("(a)"), Value(R"(\1$)")},
+       Value(std::string("a$\0b", 4))},
+      {{Value(std::string("\xff"
+                          "a\0",
+                          3)),
+        Value("a"), Value("A")},
+       Value(std::string("\xff"
+                         "A\0",
+                         3))},
+      {{Value(123), Value(2), Value(9)}, Value("193")},
+      {{Value("b"), Value("(a)?b"), Value(R"(\1X)")}, Value("X")},
+      {{Value(""), Value(""), Value("x")}, Value("x")},
+      {{Value(), Value("["), Value(R"(\9)")}, Value()},
+      {{Value("a"), Value(), Value(R"(\9)")}, Value()},
+      {{Value("a"), Value("["), Value()}, Value()}};
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const auto& item : cases) {
+      std::vector<Expression> args;
+      args.reserve(item.arguments.size());
+      for (const Value& value : item.arguments) {
+        args.push_back(ConstantValueExp(value));
+      }
+      const auto call = FunctionCallExp("regexp_replace", std::move(args));
+      ASSIGN_OR_ASSERT_FAIL(Value, actual, call->TryEvaluate(Row{}, Schema{}));
+      EXPECT_EQ(actual, item.expected);
+      if (const auto program =
+              BytecodeCompiler::CompileRowCached(call, Schema{})) {
+        ASSIGN_OR_ASSERT_FAIL(Value, bytecode, program->TryEvaluateRow(Row{}));
+        EXPECT_EQ(bytecode, item.expected);
+      }
+    }
+  }
 }
 
 TEST_F(ScalarFunctionSqlTest, RegexpNestedRepetitionRejected) {
@@ -684,6 +735,25 @@ TEST(FunctionCallTest, UnsignedInt64_MathematicalFunctions) {
   EXPECT_EQ(trunc_res, umax);
 }
 
+TEST(FunctionCallTest, RoundAcceptsMinimumSignedPrecision) {
+  const Value precision(std::numeric_limits<int64_t>::min());
+  for (const auto& input :
+       {Value(int64_t{123}), Value(int64_t{-1}).WithUnsigned()}) {
+    const auto rounded = FunctionCallExp("round", {ConstantValueExp(input),
+                                                   ConstantValueExp(precision)})
+                             ->TryEvaluate(Row(), Schema());
+    ASSERT_TRUE(rounded.HasValue());
+    EXPECT_EQ(rounded.Value().AsInt64(), 0);
+    EXPECT_EQ(rounded.Value().IsUnsigned(), input.IsUnsigned());
+  }
+}
+
+TEST_F(ScalarFunctionSqlTest, RoundMinimumPrecisionMatchesScalarEvaluator) {
+  EXPECT_EQ(Scalar("SELECT ROUND(123, -9223372036854775807-1)"), Value(0));
+  EXPECT_EQ(Scalar("SELECT ROUND(CAST(123 AS UINT64), -9223372036854775807-1)"),
+            Value(0).WithUnsigned());
+}
+
 TEST(FunctionCallTest, GenerateArrayKeepsExactIntegerBounds) {
   for (const int64_t start :
        {INT64_MIN, int64_t{9007199254740993}, INT64_MAX - 2}) {
@@ -1158,6 +1228,56 @@ TEST(FunctionCallTest, DateAddRejectsNonDateOperand) {
 // Regression for the fuzz-found ParseJsonSimple non-progress loop:
 // a '[' array whose first token is unrecognized consumed no input, so the
 // element loop pushed JVals forever -> OOM. Malformed JSON must terminate.
+TEST(FunctionCallTest, TypedIntervalExtractUsesSignedComponents) {
+  const Schema schema("t", {Column("v", ValueType::kVarChar)});
+  const std::vector<std::pair<std::string, int64_t>> parts{
+      {"year", 1},
+      {"month", 2},
+      {"day", 3},
+      {"hour", 4},
+      {"minute", 5},
+      {"second", 6},
+      {"millisecond", 123},
+      {"microsecond", 123456},
+      {"nanosecond", 123456789}};
+  for (const int64_t sign : {int64_t{1}, int64_t{-1}}) {
+    const Value interval =
+        Value(sign == 1 ? "1-2 3 4:5:6.123456789" : "-1-2 -3 -4:5:6.123456789")
+            .WithInterval();
+    for (const auto& [part, expected] : parts) {
+      const auto expression =
+          FunctionCallExp("extract_" + part, {ColumnValueExp("v")});
+      ASSIGN_OR_ASSERT_FAIL(Value, actual,
+                            expression->TryEvaluate(Row({interval}), schema));
+      EXPECT_EQ(actual, Value(sign * expected)) << part;
+      const auto program =
+          BytecodeCompiler::CompileRowCached(expression, schema);
+      // The VM has dedicated opcodes for calendar parts; other EXTRACT
+      // components retain its documented AST fallback.
+      EXPECT_EQ(program.has_value(),
+                part == "year" || part == "month" || part == "day");
+      if (!program.has_value()) {
+        continue;
+      }
+      ASSIGN_OR_ASSERT_FAIL(Value, bytecode,
+                            program->TryEvaluateRow(Row({interval})));
+      EXPECT_EQ(bytecode, actual) << part;
+      ASSIGN_OR_ASSERT_FAIL(Value, automatic,
+                            TryEvaluateRowAuto(*program, Row({interval})));
+      EXPECT_EQ(automatic, actual) << part;
+    }
+  }
+  EXPECT_FALSE(ExecuteFunction("extract_minute", {Value("bad").WithInterval()})
+                   .HasValue());
+  EXPECT_FALSE(
+      ExecuteFunction("extract_week", {Value("1-2 3 4:5:6").WithInterval()})
+          .HasValue());
+  EXPECT_FALSE(
+      ExecuteFunction("extract_year",
+                      {Value("1-2 3 4:5:6").WithInterval(), Value("UTC")})
+          .HasValue());
+}
+
 TEST(FunctionCallTest, JsonExtractMalformedArrayTerminates) {
   Row dummy_row;
   Schema dummy_schema;

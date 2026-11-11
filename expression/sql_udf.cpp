@@ -67,15 +67,16 @@ StatusOr<SqlUdfBinding> BindSqlUdfArguments(const SqlScalarFunction& function,
                            " arguments but got " +
                            std::to_string(arguments.size()));
   }
-  while (arguments.size() < function.defaults.size()) {
-    const Expression& default_value = function.defaults[arguments.size()];
-    if (default_value) {
-      ASSIGN_OR_RETURN(Value, evaluated,
-                       default_value->TryEvaluate(Row(), Schema()));
-      arguments.push_back(std::move(evaluated));
-    } else {
-      arguments.emplace_back();
+  while (arguments.size() < function.params.size()) {
+    const size_t position = arguments.size();
+    if (position >= function.defaults.size() || !function.defaults[position]) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "missing required argument to function " + function.name);
     }
+    ASSIGN_OR_RETURN(Value, evaluated,
+                     function.defaults[position]->TryEvaluate(Row(), Schema()));
+    arguments.push_back(std::move(evaluated));
   }
   std::vector<Column> columns;
   columns.reserve(function.params.size());

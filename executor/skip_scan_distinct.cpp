@@ -109,6 +109,9 @@ void SkipScanDistinct::ResolveCurrentRow() const {
   }
   StatusOr<std::string_view> row = ref.Value()->Read(txn_, current_pos_.slot);
   if (!row.HasValue()) {
+    // Stale index entries may legitimately name a row invisible to this
+    // snapshot. Other storage failures must not turn into missing groups.
+    if (row.GetStatus() != Status::kNotExists) status_ = row.GetStatus();
     current_row_.Clear();
     current_row_resolved_ = true;
     return;

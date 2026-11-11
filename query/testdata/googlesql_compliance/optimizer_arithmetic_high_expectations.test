@@ -16,11 +16,12 @@ ARRAY<STRUCT<id INT64, a INT64, b INT64, f FLOAT64>>[]
 ==
 
 [mode=explain]
-[plan_not_contains=/ 1]
-[name=division_by_one_identity]
+# Division produces FLOAT64: dropping it would change the value domain.
+[plan_contains=/ 1]
+[name=division_by_one_preserves_result_domain]
 SELECT id, a / 1 AS d, a / 1.0 AS fd FROM arithmetic_input ORDER BY id
 --
-ARRAY<STRUCT<id INT64, d INT64, fd FLOAT64>>[
+ARRAY<STRUCT<id INT64, d FLOAT64, fd FLOAT64>>[
   {1, 10, 10}, {2, 0, 0}, {3, NULL, NULL}
 ]
 ==
@@ -77,8 +78,9 @@ ARRAY<STRUCT<id INT64>>[{1}]
 ==
 
 [mode=explain]
-[plan_contains=(arithmetic_input.a = 10)]
-[name=filter_division_identity_removed_for_sargability]
+# Preserve floating division rounding rather than inventing an integer range.
+[plan_contains=/ 1]
+[name=filter_division_preserves_rounding]
 SELECT id FROM arithmetic_input WHERE a / 1 = 10 ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}]

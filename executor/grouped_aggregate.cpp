@@ -610,6 +610,7 @@ Status HashAggregateExecutor::BuildSerial() {
       ASSIGN_OR_RETURN(size_t, scalar_group,
                        (table_.FindOrCreate(std::vector<Value>{})));
       static_cast<void>(scalar_group);
+      NoteResidentGroups(table_);
     }
     return EmitTable(&table_);
   }

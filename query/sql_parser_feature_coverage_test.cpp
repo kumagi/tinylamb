@@ -184,7 +184,7 @@ TEST_F(SqlParserFeatureCoverageTest, MalformedInputProducesDiagnostics) {
   // GROUPING SETS / ROLLUP / CUBE now lower through the UNION-ALL expansion;
   // their malformed shapes still reject with a dedicated diagnostic.
   EXPECT_THROW(Run("SELECT a FROM p GROUP BY GROUPING SETS ((a), ()) ORDER BY "
-                   "GROUPING(a)"),
+                   "GROUPING(s)"),
                std::runtime_error);
   EXPECT_THROW(Run("SELECT a FROM missing_table"), std::runtime_error);
   EXPECT_THROW(Run("INSERT INTO p VALUES ('x')"), std::runtime_error);

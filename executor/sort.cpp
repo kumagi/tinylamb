@@ -48,6 +48,10 @@ uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
 
 void AppendMemComparableValue(const Value& v, std::string* out,
                               bool is_unsigned = false) {
+  if (v.IsInterval()) {
+    out->append(v.EncodeMemcomparableFormat());
+    return;
+  }
   switch (v.type) {
     case ValueType::kInt64:
     case ValueType::kDate: {

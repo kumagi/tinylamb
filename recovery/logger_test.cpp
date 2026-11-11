@@ -17,6 +17,7 @@
 #include "logger.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -40,6 +41,7 @@
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "recovery/log_record.hpp"
+#include "recovery/logger_fuzzer.hpp"
 
 namespace tinylamb {
 class LoggerTest : public ::testing::Test {
@@ -93,6 +95,25 @@ TEST_F(LoggerTest, CommitDrivenSyncStillHasBoundedBackgroundProgress) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   EXPECT_GE(l_->DurableLSN(), target);
+}
+
+TEST_F(LoggerTest, AuditFuzzerReturnsWhenLoggerRejectsAppend) {
+  ASSERT_SUCCESS(l_->Finish());
+  const std::array<uint8_t, 4> input{3, 'a', 'b', 'c'};
+  ByteStream stream(input.data(), input.size());
+  std::vector<std::string> written;
+  EXPECT_NE(AppendLoggerFuzzInput(*l_, stream, &written, false),
+            Status::kSuccess);
+  EXPECT_TRUE(written.empty());
+}
+
+TEST_F(LoggerTest, AuditFuzzerWaitsForAcknowledgedPayloads) {
+  const std::array<uint8_t, 7> input{3, 'a', 'b', 'c', 2, 'd', 'e'};
+  ByteStream stream(input.data(), input.size());
+  std::vector<std::string> written;
+  ASSERT_SUCCESS(AppendLoggerFuzzInput(*l_, stream, &written, false));
+  EXPECT_EQ(written, (std::vector<std::string>{"abc", "de"}));
+  EXPECT_GE(l_->DurableLSN(), 5U);
 }
 
 TEST_F(LoggerTest, Construct) {

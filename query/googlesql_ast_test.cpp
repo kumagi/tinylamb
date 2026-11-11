@@ -55,9 +55,8 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
   EXPECT_TRUE(parsed.ok) << parsed.error;
   StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
       GoogleSqlAstParser::Parse(parsed.ast);
-  EXPECT_EQ(ast.GetStatus(), Status::kSuccess);
   if (!ast.HasValue()) {
-    return nullptr;
+    throw std::runtime_error(ast.GetStatus().GetMessage());
   }
   auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
   if (!visited.HasValue()) {
@@ -67,6 +66,108 @@ std::unique_ptr<Statement> VisitSqlOrThrow(std::string_view sql) {
 }
 
 }  // namespace
+
+TEST(GoogleSqlAstAuditTest, BoundsDepthBeforeRecursiveWalks) {
+  std::string dump;
+  GoogleSqlAstNode root;
+  root.kind = "QueryStatement";
+  GoogleSqlAstNode* leaf = &root;
+  for (size_t depth = 0; depth < 512; ++depth) {
+    dump += std::string(depth * 2, ' ') + "Query\n";
+    leaf->children.push_back(std::make_unique<GoogleSqlAstNode>());
+    leaf = leaf->children.back().get();
+    leaf->kind = "Query";
+  }
+  EXPECT_FALSE(GoogleSqlAstParser::Parse(dump).HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(root);
+  ASSERT_FALSE(visited.HasValue());
+  EXPECT_NE(visited.GetStatus().GetMessage().find("depth"), std::string::npos);
+}
+
+TEST(GoogleSqlAstAuditTest, MultilineLiteralIgnoresFakeLocationsAndParens) {
+  for (std::string text :
+       {"first [1-2]\nsecond", "first ) [1-2]\nsecond", "first )\nsecond",
+        "first (\nsecond", "first [1x-2y]\nsecond"}) {
+    const auto statement = VisitSql("SELECT '''" + text + "'''");
+    ASSERT_NE(statement, nullptr) << text;
+    const auto* select = dynamic_cast<const SelectStatement*>(statement.get());
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->SelectList().size(), 1U);
+    auto value =
+        select->SelectList()[0].expression->TryEvaluate(Row(), Schema());
+    ASSERT_TRUE(value.HasValue()) << value.GetStatus();
+    EXPECT_EQ(value.Value(), Value(std::string(text)));
+  }
+}
+
+TEST(GoogleSqlAstAuditTest, SourceLessUnionKeepsDistinctMode) {
+  for (const auto& [mode, expected] :
+       std::vector<std::pair<std::string, SetOperationKind>>{
+           {"", SetOperationKind::kUnion},
+           {" ALL", SetOperationKind::kUnionAll},
+           {" DISTINCT", SetOperationKind::kUnion}}) {
+    const std::string dump =
+        "QueryStatement\n  Query\n    SetOperation(UNION" + mode +
+        ")\n      Select\n        SelectList\n          SelectColumn\n         "
+        "   IntLiteral(1)\n      Select\n        SelectList\n          "
+        "SelectColumn\n            IntLiteral(1)\n";
+    const auto ast = GoogleSqlAstParser::Parse(dump);
+    ASSERT_TRUE(ast.HasValue());
+    const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value());
+    ASSERT_TRUE(visited.HasValue()) << visited.GetStatus();
+    const auto* select =
+        dynamic_cast<const SelectStatement*>(visited.Value().get());
+    ASSERT_NE(select, nullptr);
+    ASSERT_EQ(select->SetOperationKinds().size(), 1U);
+    EXPECT_EQ(select->SetOperationKinds()[0], expected) << mode;
+  }
+}
+
+TEST(GoogleSqlAstAuditTest, StructCastAndRequiredProtoValidationPropagate) {
+  for (std::string_view sql :
+       {"SELECT CAST(STRUCT('not-an-int' AS n) AS STRUCT<n INT64>)",
+        "SELECT AS "
+        "googlesql_test.KitchenSinkPB.NestedWithRequiredNumericFields 1 AS "
+        "nested_int64"}) {
+    const auto parsed = GoogleSqlFrontend::Parse(sql);
+    ASSERT_TRUE(parsed.ok) << parsed.error;
+    const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+    ASSERT_TRUE(ast.HasValue());
+    EXPECT_FALSE(GoogleSqlAstVisitor::Visit(*ast.Value(), sql).HasValue())
+        << sql;
+  }
+}
+
+TEST(GoogleSqlAstAuditTest, SetOperationOffsetFoldsExpression) {
+  const std::string sql =
+      "SELECT 1 UNION ALL SELECT 2 LIMIT 2 OFFSET CAST(1 AS INT64)";
+  const auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  const auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+  ASSERT_TRUE(ast.HasValue());
+  const auto visited = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_TRUE(visited.HasValue()) << visited.GetStatus();
+  const auto* select =
+      dynamic_cast<const SelectStatement*>(visited.Value().get());
+  ASSERT_NE(select, nullptr);
+  EXPECT_EQ(select->Offset(), 1U);
+  auto* query = ast.Value()->children[0].get();
+  for (auto& child : query->children) {
+    if (child->kind != "LimitOffset") continue;
+    for (auto& operand : child->children) {
+      if (operand->kind != "CastExpression") continue;
+      auto wrapper = std::make_unique<GoogleSqlAstNode>();
+      wrapper->kind = "Offset";
+      wrapper->children.push_back(std::move(operand));
+      operand = std::move(wrapper);
+    }
+  }
+  const auto wrapped = GoogleSqlAstVisitor::Visit(*ast.Value(), sql);
+  ASSERT_TRUE(wrapped.HasValue()) << wrapped.GetStatus();
+  EXPECT_EQ(
+      dynamic_cast<const SelectStatement*>(wrapped.Value().get())->Offset(),
+      1U);
+}
 
 // The dump parser must reject a depth jump deeper than one level per line
 // instead of grafting the node onto a stale ancestor (depths 0,1,2,1,3).
@@ -647,9 +748,8 @@ TEST(GoogleSqlAstTest, UnsupportedExpressionKindsThrow) {
 }
 
 TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
-  // The parser accepts arbitrarily deep expressions; visitation must reject
-  // nesting beyond the depth cap with an exception instead of overflowing
-  // the C++ stack (a stack overflow is unrecoverable).
+  // Reject excessive depth in dump parsing or visitation before recursive
+  // walks and tree destruction can exhaust the native stack.
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP() << "skipped";
   }
@@ -663,7 +763,8 @@ TEST(GoogleSqlAstTest, DeeplyNestedExpressionsFailWithDiagnostic) {
   // ZetaSQL parser ("binary expression arity") or the visitor depth cap
   // ("nesting exceeds").
   EXPECT_TRUE(message.find("nesting exceeds") != std::string::npos ||
-              message.find("arity") != std::string::npos)
+              message.find("arity") != std::string::npos ||
+              message.find("depth limit") != std::string::npos)
       << message;
 }
 
@@ -715,12 +816,11 @@ TEST(GoogleSqlAstTest, LabelsWithoutRangeSuffixAreAcceptedLeniently) {
 }
 
 TEST(GoogleSqlAstTest, DeeplyIndentedDumpParsesIteratively) {
-  // The fuzzer explores very deep trees; parsing must stay iterative so a
-  // deep dump cannot exhaust the stack. Depth 2000 is well beyond anything
-  // the real parser emits but cheap here.
+  // Iterative construction accepts the maximum supported depth. The next
+  // level is rejected by BoundsDepthBeforeRecursiveWalks.
   std::string dump = "root\n";
-  for (int i = 0; i < 2000; ++i) {
-    dump.append(static_cast<size_t>(i + 1) * 2, ' ');
+  for (size_t i = 1; i < kMaxGoogleSqlAstDepth; ++i) {
+    dump.append(i * 2, ' ');
     dump.append("node\n");
   }
   const StatusOr<std::unique_ptr<GoogleSqlAstNode>> ast =
@@ -963,7 +1063,8 @@ TEST(GoogleSqlAstTest, QualifyAstVisitor) {
 
 TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
   const std::string pivot_sql =
-      "SELECT * FROM sales PIVOT(sum(amount) FOR quarter IN ('Q1', 'Q2')) AS "
+      "SELECT * FROM (SELECT amount AS amount, quarter AS quarter FROM sales) "
+      "PIVOT(sum(amount) FOR quarter IN ('Q1', 'Q2')) AS "
       "p;";
   GoogleSqlParseResult parsed_p = GoogleSqlFrontend::Parse(pivot_sql);
   ASSERT_TRUE(parsed_p.ok) << parsed_p.error;
@@ -992,6 +1093,59 @@ TEST(GoogleSqlAstTest, PivotAndUnpivotAstVisitor) {
   ASSERT_NE(select_u, nullptr);
   ASSERT_FALSE(select_u->Sources().empty());
   EXPECT_NE(select_u->Sources()[0].query, nullptr);
+}
+
+TEST(GoogleSqlAstTest, AuditRejectsInvalidUnicodeEscapeScalars) {
+  auto parsed = GoogleSqlFrontend::Parse("SELECT 'valid'");
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  for (const char* bad : {R"('\uD800')", R"('\uDFFF')", R"('\U00110000')",
+                          R"('\UFFFFFFFF')", R"('\u12xz')", R"('\u123')"}) {
+    auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+    ASSERT_TRUE(ast.HasValue());
+    std::vector<GoogleSqlAstNode*> pending{ast.Value().get()};
+    bool mutated = false;
+    while (!pending.empty()) {
+      auto* node = pending.back();
+      pending.pop_back();
+      if (node->kind == "StringLiteralComponent") {
+        node->detail = bad;
+        mutated = true;
+        break;
+      }
+      for (auto& child : node->children) pending.push_back(child.get());
+    }
+    ASSERT_TRUE(mutated);
+    EXPECT_FALSE(GoogleSqlAstVisitor::Visit(*ast.Value()).HasValue()) << bad;
+  }
+}
+
+TEST(GoogleSqlAstTest, AuditRejectsEmptyOrMalformedUnpivotItems) {
+  const std::string sql =
+      "SELECT * FROM widetab UNPIVOT(val FOR col IN (q1, q2)) AS u";
+  auto parsed = GoogleSqlFrontend::Parse(sql);
+  ASSERT_TRUE(parsed.ok) << parsed.error;
+  for (bool missing_expression : {false, true}) {
+    auto ast = GoogleSqlAstParser::Parse(parsed.ast);
+    ASSERT_TRUE(ast.HasValue());
+    std::vector<GoogleSqlAstNode*> pending{ast.Value().get()};
+    bool mutated = false;
+    while (!pending.empty()) {
+      auto* node = pending.back();
+      pending.pop_back();
+      if (node->kind == "UnpivotInItemList") {
+        if (missing_expression) {
+          for (auto& child : node->children) child->children.clear();
+        } else {
+          node->children.clear();
+        }
+        mutated = true;
+        break;
+      }
+      for (auto& child : node->children) pending.push_back(child.get());
+    }
+    ASSERT_TRUE(mutated);
+    EXPECT_FALSE(GoogleSqlAstVisitor::Visit(*ast.Value(), sql).HasValue());
+  }
 }
 
 TEST(GoogleSqlAstTest, UnitlessIntervalLiteralsReturnStatusNotThrow) {

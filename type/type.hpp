@@ -69,6 +69,11 @@ class Type {
   friend Decoder& operator>>(Decoder& d, Type& t) {
     uint8_t type_val = 0;
     d >> type_val;
+    if (type_val > static_cast<uint8_t>(TypeTag::kLambdaExp)) {
+      d.Fail();
+      t.type_ = TypeTag::kInvalid;
+      return d;
+    }
     t.type_ = static_cast<TypeTag>(type_val);
     return d;
   }

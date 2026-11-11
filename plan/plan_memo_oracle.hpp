@@ -77,8 +77,9 @@ GeneratedJoinGraph ShrinkJoinGraph(const GeneratedJoinGraph& graph);
 // Synthesizes rich Cascades Memos with schemas,
 // candidate-key/not-null/foreign-key constraints, and multi-operator pipelines
 // (Selection, Projection, Aggregation, Distinct, Sort, Limit, Window,
-// OuterJoin, SemiJoin, AntiJoin) so all 105 transformation rules are actively
-// exercised during exploration.
+// OuterJoin, SemiJoin, AntiJoin) to exercise the applicable default
+// transformation rules during exploration; generator coverage is not proof that
+// every rule fires.
 // ---------------------------------------------------------------------------
 
 struct ComplexMemoGenConfig {

@@ -261,6 +261,30 @@ TEST(RuntimeFilterTest, BloomNeverProducesAFalseNegative) {
   EXPECT_LT(false_positives, 2000U);
 }
 
+TEST(RuntimeFilterTest, SparseBloomDomainUsesBothProbes) {
+  constexpr int64_t kCount = 20000;
+  constexpr int64_t kStride = 104729;
+  RuntimeFilterBuilder builder;
+  for (int64_t i = 0; i < kCount; ++i) {
+    builder.Observe(i * kStride);
+  }
+  const auto group = builder.Build(false, 0);
+  ASSERT_NE(group, nullptr);
+  ASSERT_TRUE(group->Has(RuntimeFilterKind::kBloom));
+  ASSERT_FALSE(group->has_dense_bits());
+  size_t false_positives = 0;
+  for (int64_t i = 0; i < kCount; ++i) {
+    ASSERT_FALSE(group->Reject(i * kStride));
+    if (!group->Reject((i * kStride) + 1)) {
+      ++false_positives;
+    }
+  }
+  // A fixed offset between probes makes a collision at the first bit collide
+  // at the second as well. This sparse domain cannot use an exact dense map
+  // to hide the resulting roughly 7% false-positive rate.
+  EXPECT_LT(false_positives, static_cast<size_t>(kCount / 25));
+}
+
 TEST(RuntimeFilterTest, BloomConformsToAnArbitraryBitCount) {
   // A non power-of-two / undersized bitset would index out of bounds. The
   // repair stops pruning instead of inventing bits: zeroing the bits would

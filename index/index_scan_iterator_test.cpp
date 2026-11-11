@@ -1300,4 +1300,26 @@ TEST_F(IndexScanIteratorTest, CompactPositionDecoderRejectsTruncatedPayloads) {
     }
   }
 }
+TEST_F(IndexScanIteratorTest, AuditPointLookupKeepsSnapshotIndexValue) {
+  auto setup = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        setup.GetTable(kTableName));
+  ASSERT_SUCCESS(
+      table->Insert(setup.txn_, Row({Value(7), Value("old"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(setup.PreCommit());
+  auto writer = db_->BeginContext();
+  BPlusTree tree(table->GetIndex(0).Root());
+  const std::string key = Value(7).EncodeMemcomparableFormat();
+  ASSIGN_OR_ASSERT_FAIL(std::string, original, tree.Read(writer.txn_, key));
+  ASSERT_SUCCESS(tree.Delete(writer.txn_, key));
+  auto reader = db_->BeginReadOnlyContext();
+  IndexScanIterator scan(*table, table->GetIndex(0), reader.txn_, Value(7),
+                         Value(7));
+  EXPECT_TRUE(scan.IsValid());
+  EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+  EXPECT_EQ(scan.GetValue(), original);
+  writer.Abort();
+}
+
 }  // namespace tinylamb

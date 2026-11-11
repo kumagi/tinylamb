@@ -90,7 +90,9 @@ TINYLAMB_ALWAYS_INLINE char* BufTail(std::vector<char>& buf, size_t n) {
     // resize routes a memset PLT call for the 2-8 value-init bytes
     // (~190 ir per append on the encoder trial loops), and the caller
     // overwrites every byte anyway.
-    for (size_t i = 0; i < n; ++i) buf.push_back(static_cast<char>(0));
+    for (size_t i = 0; i < n; ++i) {
+      buf.push_back(static_cast<char>(0));
+    }
   } else {
     // Bulk planes (AppendPackBits appends whole bit-planes): one memset
     // beats per-byte stores by orders of magnitude.
@@ -118,19 +120,19 @@ TINYLAMB_ALWAYS_INLINE void AppendBE64(std::vector<char>& buf, uint64_t v) {
 }
 
 inline uint32_t ReadBE32(const char* p) {
-  uint32_t v;
+  uint32_t v{};
   memcpy(&v, p, sizeof(uint32_t));
   return be32toh(v);
 }
 
 inline uint16_t ReadBE16(const char* p) {
-  uint16_t v;
+  uint16_t v{};
   memcpy(&v, p, sizeof(uint16_t));
   return be16toh(v);
 }
 
 inline uint64_t ReadBE64(const char* p) {
-  uint64_t v;
+  uint64_t v{};
   memcpy(&v, p, sizeof(uint64_t));
   return be64toh(v);
 }
@@ -151,8 +153,10 @@ inline int BitsNeeded(uint64_t maxv) {
 // nearly every candidate on every row group of every column.
 inline void AppendPackBits(std::vector<char>& out,
                            const std::vector<uint64_t>& vals, int w) {
-  if (w <= 0 || w > 64 || vals.empty()) return;
-  const uint32_t width = static_cast<uint32_t>(w);
+  if (w <= 0 || w > 64 || vals.empty()) {
+    return;
+  }
+  const auto width = static_cast<uint32_t>(w);
   const size_t total_bits = vals.size() * static_cast<size_t>(width);
   // Same MSB-first bit stream as the old __int128 shift register, but the
   // accumulator lives in one u64 kept left-aligned so a full word flushes
@@ -188,7 +192,9 @@ inline void AppendPackBits(std::vector<char>& out,
 }
 
 inline uint64_t UnpackBitAt(const char* base, uint64_t bit_off, int w) {
-  if (w <= 0) return 0;
+  if (w <= 0) {
+    return 0;
+  }
   // Byte-window fast path: assemble only the bytes the value occupies
   // (never touching a byte the bit-at-a-time loop would not have read, so
   // tail regions stay safe) and extract with one shift. This sits on the
@@ -269,13 +275,11 @@ struct RleDeltaRun {
   int64_t value;
 };
 struct RleDeltaRegion {
-  RleDeltaRegion() = default;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-
   uint32_t n{0};
   uint32_t run_count{0};
   uint32_t value_width{0};
   uint32_t length_width{0};
-  std::array<RleDeltaRun, PaxChunk::kRowGroupSize> runs;
+  std::array<RleDeltaRun, PaxChunk::kRowGroupSize> runs{};
 };
 constexpr uint32_t kDeltaCheckpointEvery = 128;
 constexpr uint32_t kInterpBlockRows = kDeltaCheckpointEvery;
@@ -345,7 +349,7 @@ inline uint64_t XorMix64(uint64_t h) {
 }
 inline uint64_t XorHash64(int64_t v, uint32_t seed) {
   return XorMix64(static_cast<uint64_t>(v) +
-                  static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL);
+                  (static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL));
 }
 inline uint64_t XorRotL(uint64_t x, int r) {
   return (x << r) | (x >> (64 - r));
@@ -356,11 +360,15 @@ class FastMod64 {
   explicit FastMod64(uint64_t m)
       : divisor_(m), reciprocal_(m <= 1 ? 0 : (~0ULL / m)) {}
   uint32_t operator()(uint64_t n) const {
-    if (divisor_ <= 1) return 0;
-    const uint64_t quotient = static_cast<uint64_t>(
+    if (divisor_ <= 1) {
+      return 0;
+    }
+    const auto quotient = static_cast<uint64_t>(
         (static_cast<unsigned __int128>(reciprocal_) * n) >> 64);
-    uint64_t remainder = n - quotient * divisor_;
-    if (remainder >= divisor_) remainder -= divisor_;
+    uint64_t remainder = n - (quotient * divisor_);
+    if (remainder >= divisor_) {
+      remainder -= divisor_;
+    }
     return static_cast<uint32_t>(remainder);
   }
 
@@ -371,6 +379,9 @@ class FastMod64 {
 class FlatMapI64 {
  public:
   explicit FlatMapI64(size_t max_entries) : max_entries_(max_entries) {}
+  ~FlatMapI64() = default;
+  FlatMapI64(const FlatMapI64&) = delete;
+  FlatMapI64& operator=(const FlatMapI64&) = delete;
   FlatMapI64(FlatMapI64&&) = default;
   FlatMapI64& operator=(FlatMapI64&&) = default;
 
@@ -395,7 +406,9 @@ class FlatMapI64 {
   // sets). Grows the table at the 50% load factor, so unlike max_entries_
   // construction this path never saturates the probe space.
   uint64_t* UpsertSlot(uint64_t key) {
-    if (used_.empty() || (count_ + 1) * 2 > used_.size()) GrowForUpsert();
+    if (used_.empty() || (count_ + 1) * 2 > used_.size()) {
+      GrowForUpsert();
+    }
     const size_t i = ProbeU(key);
     if (used_[i] == 0) {
       used_[i] = 1;
@@ -411,7 +424,9 @@ class FlatMapI64 {
   // the 2-multiply mix chain once or twice more per cell. `h` must be exactly
   // XorMix64(key); GrowForUpsert still rehashes with its own hashes.
   uint64_t* UpsertSlotPrehashed(uint64_t key, uint64_t h) {
-    if (used_.empty() || (count_ + 1) * 2 > used_.size()) GrowForUpsert();
+    if (used_.empty() || (count_ + 1) * 2 > used_.size()) {
+      GrowForUpsert();
+    }
     const size_t i = ProbeUH(key, h);
     if (used_[i] == 0) {
       used_[i] = 1;
@@ -422,7 +437,9 @@ class FlatMapI64 {
     return &slots_[i].val;
   }
   uint64_t* FindPrehashed(uint64_t key, uint64_t h) {
-    if (used_.empty()) return nullptr;
+    if (used_.empty()) {
+      return nullptr;
+    }
     const size_t i = ProbeUH(key, h);
     return used_[i] != 0 ? &slots_[i].val : nullptr;
   }
@@ -433,7 +450,9 @@ class FlatMapI64 {
   // zero-fill traffic (two 96 KiB tables per int64 column) disappears.
   void Reset() {
     count_ = 0;
-    if (!used_.empty()) std::memset(used_.data(), 0, used_.size());
+    if (!used_.empty()) {
+      std::memset(used_.data(), 0, used_.size());
+    }
   }
   // Reset plus a capacity contract: after this, inserting up to max_entries
   // distinct keys cannot exceed the 50% load factor (the same guarantee the
@@ -444,23 +463,29 @@ class FlatMapI64 {
     count_ = 0;
     const size_t want = CapacityFor(max_entries);
     if (used_.size() < want) {
-      slots_.reset(new Slot[want]);
+      slots_.resize(want);
       used_.assign(want, 0);
       return;
     }
-    if (!used_.empty()) std::memset(used_.data(), 0, used_.size());
+    if (!used_.empty()) {
+      std::memset(used_.data(), 0, used_.size());
+    }
   }
   // Slots are materialised on the first insert: a map that is only ever
   // Find()-ed (or never used at all) costs no 64 KiB table.
   void EnsureSlots() {
-    if (!used_.empty()) return;
+    if (!used_.empty()) {
+      return;
+    }
     const size_t cap = CapacityFor(max_entries_);
-    slots_.reset(new Slot[cap]);
+    slots_.resize(cap);
     used_.assign(cap, 0);
   }
   template <class Fn>
   void ForEach(Fn&& fn) const {
-    if (used_.empty()) return;
+    if (used_.empty()) {
+      return;
+    }
     // Forward once into a reference binding (a bind is not a move) and
     // invoke through it: calling std::forward<Fn>(fn) per iteration would
     // move an rvalue callable on the first slot and then use it again.
@@ -474,9 +499,11 @@ class FlatMapI64 {
     // same sequence.
     const uint8_t* const used = used_.data();
     const size_t n = used_.size();
-    const Slot* const slots = slots_.get();
+    const Slot* const slots = slots_.data();
     for (size_t i = 0; i < n; ++i) {
-      if (used[i] != 0) fn_ref(slots[i].key, slots[i].val);
+      if (used[i] != 0) {
+        fn_ref(slots[i].key, slots[i].val);
+      }
     }
   }
 
@@ -490,12 +517,16 @@ class FlatMapI64 {
     uint64_t val = 0;
   };
   uint64_t* FindU(uint64_t key) {
-    if (used_.empty()) return nullptr;
+    if (used_.empty()) {
+      return nullptr;
+    }
     const size_t i = ProbeU(key);
     return used_[i] != 0 ? &slots_[i].val : nullptr;
   }
-  const uint64_t* FindU(uint64_t key) const {
-    if (used_.empty()) return nullptr;
+  [[nodiscard]] const uint64_t* FindU(uint64_t key) const {
+    if (used_.empty()) {
+      return nullptr;
+    }
     const size_t i = ProbeU(key);
     return used_[i] != 0 ? &slots_[i].val : nullptr;
   }
@@ -509,7 +540,9 @@ class FlatMapI64 {
   }
   static size_t CapacityFor(size_t max_entries) {
     size_t cap = 16;
-    while (cap < (max_entries + 1) * 2) cap <<= 1;
+    while (cap < (max_entries + 1) * 2) {
+      cap <<= 1;
+    }
     return cap;
   }
   // Rehash into a table twice the size (fresh tables start at 1 Ki slots:
@@ -518,51 +551,58 @@ class FlatMapI64 {
   // cache-hostile). Frequencies are copied verbatim, so counters are exact.
   void GrowForUpsert() {
     const size_t next = used_.empty() ? CapacityFor(512) : used_.size() * 2;
-    auto ns = std::make_unique<Slot[]>(next);
+    std::vector<Slot> ns(next);
     std::vector<uint8_t> nu(next, 0);
     const size_t mask = next - 1;
     for (size_t i = 0; i < used_.size(); ++i) {
-      if (used_[i] == 0) continue;
+      if (used_[i] == 0) {
+        continue;
+      }
       size_t j = XorMix64(slots_[i].key) & mask;
-      while (nu[j] != 0) j = (j + 1) & mask;
+      while (nu[j] != 0) {
+        j = (j + 1) & mask;
+      }
       nu[j] = 1;
       ns[j] = slots_[i];
     }
     slots_ = std::move(ns);
     used_ = std::move(nu);
   }
-  size_t slots_size() const { return used_.size(); }
+  [[nodiscard]] size_t slots_size() const { return used_.size(); }
   size_t ProbeU(uint64_t key) {
     const uint8_t* used = used_.data();
-    const Slot* base = slots_.get();
+    const Slot* base = slots_.data();
     const size_t mask = used_.size() - 1;
     size_t i = XorMix64(key) & mask;
-    while (used[i] != 0 && base[i].key != key) i = (i + 1) & mask;
+    while (used[i] != 0 && base[i].key != key) {
+      i = (i + 1) & mask;
+    }
     return i;
   }
   // ProbeU with the caller's XorMix64(key) already in hand.
   size_t ProbeUH(uint64_t key, uint64_t h) {
     const uint8_t* used = used_.data();
-    const Slot* base = slots_.get();
+    const Slot* base = slots_.data();
     const size_t mask = used_.size() - 1;
     size_t i = h & mask;
-    while (used[i] != 0 && base[i].key != key) i = (i + 1) & mask;
+    while (used[i] != 0 && base[i].key != key) {
+      i = (i + 1) & mask;
+    }
     return i;
   }
-  size_t ProbeU(uint64_t key) const {
+  [[nodiscard]] size_t ProbeU(uint64_t key) const {
     const uint8_t* used = used_.data();
-    const Slot* base = slots_.get();
+    const Slot* base = slots_.data();
     const size_t mask = used_.size() - 1;
     size_t i = XorMix64(key) & mask;
-    while (used[i] != 0 && base[i].key != key) i = (i + 1) & mask;
+    while (used[i] != 0 && base[i].key != key) {
+      i = (i + 1) & mask;
+    }
     return i;
   }
-  // Slot contents are don't-care whenever used_[i] == 0 (every read and
-  // every probe step consults the occupancy byte first), so the slot array
-  // is allocated raw: vector's value-init would zero-fill 16 bytes per slot
-  // on every construction, and the dict-family encoders construct one of
-  // these per row-group attempt (32 KiB of dead memset per call).
-  std::unique_ptr<Slot[]> slots_;
+  // Reuse slot capacity across row groups. Only occupied slots are inspected;
+  // Reset clears the occupancy bytes without rewriting every key/value.
+  std::vector<Slot> slots_;
   std::vector<uint8_t> used_;
   size_t max_entries_ = 0;
   size_t count_ = 0;
@@ -608,28 +648,34 @@ struct BitWriter {
   std::vector<char> buf;
   uint64_t acc{0};
   int cnt{0};
-  inline void put1(int bit) {
+  void put1(int bit) {
     acc = (acc << 1) | (bit & 1);
     if (++cnt == 64) {
-      for (int i = 7; i >= 0; --i)
+      for (int i = 7; i >= 0; --i) {
         buf.push_back((char)((acc >> (i * 8)) & 0xFF));
+      }
       acc = 0;
       cnt = 0;
     }
   }
-  inline void put(uint64_t v, int w) {
-    for (int i = w - 1; i >= 0; --i) put1((int)((v >> i) & 1));
+  void put(uint64_t v, int w) {
+    for (int i = w - 1; i >= 0; --i) {
+      put1((int)((v >> i) & 1));
+    }
   }
   void finish() {
     // Pad to the next BYTE boundary (not 64): driving cnt to a full 64-bit
     // flush here would bloat every Gorilla stream that is not a multiple of
     // 64 bits by up to 7 bytes. Pad to 8-bit alignment instead so the
     // stream ends at the first byte boundary.
-    while (cnt % 8 != 0) put1(0);
+    while (cnt % 8 != 0) {
+      put1(0);
+    }
     // cnt is now a multiple of 8 in [0, 64): flush the remaining bytes
     // (MSB-first), not just full 64-bit groups.
-    for (int k = cnt / 8; k >= 1; --k)
+    for (int k = cnt / 8; k >= 1; --k) {
       buf.push_back((char)((acc >> ((k - 1) * 8)) & 0xFF));
+    }
     acc = 0;
     cnt = 0;
   }
@@ -644,9 +690,11 @@ struct BitReader {
   uint64_t bitbuf{0};
   int bits{0};
   BitReader(const char* ptr, const char* e = nullptr) : p(ptr), end(e) {}
-  inline int get1() {
+  int get1() {
     if (bits == 0) {
-      if (end != nullptr && p >= end) return 0;
+      if (end != nullptr && p >= end) {
+        return 0;
+      }
       bitbuf = static_cast<uint8_t>(*p++);
       bits = 8;
     }
@@ -654,9 +702,11 @@ struct BitReader {
     --bits;
     return b;
   }
-  inline uint64_t get(int w) {
+  uint64_t get(int w) {
     uint64_t v = 0;
-    for (int i = 0; i < w; ++i) v = (v << 1) | static_cast<uint64_t>(get1());
+    for (int i = 0; i < w; ++i) {
+      v = (v << 1) | static_cast<uint64_t>(get1());
+    }
     return v;
   }
 };
@@ -668,16 +718,19 @@ struct WordBitReader {
   WordBitReader(const char* base, const char* e)
       : p(reinterpret_cast<const uint8_t*>(base)),
         end(reinterpret_cast<const uint8_t*>(e)) {}
-  __attribute__((always_inline)) inline uint64_t get(int w) {
-    if (w <= 0) return 0;
+  __attribute__((always_inline)) uint64_t get(int w) {
+    if (w <= 0) {
+      return 0;
+    }
     const uint64_t byte = bitpos >> 3;
     const int sh = static_cast<int>(bitpos & 7);
     // Fast path: the whole field fits in one aligned window fully inside
     // [p, end) -- the shape of every steady-state decode loop.
-    if (__builtin_expect(sh + w <= 64 && p + byte + 8 <= end, 1)) {
-      uint64_t word;
+    if (__builtin_expect(static_cast<long>(sh + w <= 64 && p + byte + 8 <= end),
+                         1) != 0) {
+      uint64_t word{};
       std::memcpy(&word, p + byte, sizeof(word));
-      const int drop = 64 - sh - static_cast<int>(w);
+      const int drop = 64 - sh - w;
       bitpos += static_cast<unsigned>(w);
       return (be64toh(word) >> drop) &
              ((w >= 64) ? ~static_cast<uint64_t>(0)
@@ -691,7 +744,9 @@ struct WordBitReader {
     uint64_t v = 0;
     while (w > 0) {
       const uint64_t byte = bitpos >> 3;
-      if (p + byte >= end) return v;  // zero bits past the physical end
+      if (p + byte >= end) {
+        return v;  // zero bits past the physical end
+      }
       const int avail = 8 - static_cast<int>(bitpos & 7);
       const int take = (w < avail) ? w : avail;
       v = (v << take) | ((static_cast<uint64_t>(p[byte]) >> (avail - take)) &
@@ -701,10 +756,10 @@ struct WordBitReader {
     }
     return v;
   }
-  inline int get1() {
+  int get1() {
     const uint64_t byte = bitpos >> 3;
     if (p + byte + 8 <= end) {
-      uint64_t word;
+      uint64_t word{};
       std::memcpy(&word, p + byte, sizeof(word));
       const uint64_t v = (be64toh(word) >> (63 - (bitpos & 7))) & 1ULL;
       ++bitpos;
@@ -729,13 +784,14 @@ struct HuffDictRegion {
   const uint8_t* stream{nullptr};  // stream_len B
 };
 struct HuffDictTables {
-  uint16_t count[kHuffDictMaxLen + 1]{};
-  uint16_t offset[kHuffDictMaxLen + 1]{};  // first sym_sorted index per length
-  uint16_t sym_sorted[kHuffDictMaxCodes]{};
+  std::array<uint16_t, kHuffDictMaxLen + 1> count{};
+  std::array<uint16_t, kHuffDictMaxLen + 1>
+      offset{};  // first sym_sorted index per length
+  std::array<uint16_t, kHuffDictMaxCodes> sym_sorted{};
   // Peek LUT: entry = high 8 bits of the stream; len != 0 marks a resolved
   // code (len <= 8), len == 0 = "walk" (8-bit prefix is ambiguous).
-  uint8_t lut_len[256]{};
-  uint16_t lut_sym[256]{};
+  std::array<uint8_t, 256> lut_len{};
+  std::array<uint16_t, 256> lut_sym{};
 };
 constexpr uint32_t kS4Block = 64;
 struct S4Region {
@@ -812,8 +868,10 @@ struct PostingsBitCursor {
   // zero that is still inside `held`, and the validator's consumption
   // check rules a zero padding tail out on valid regions).
   bool Refill() {
-    if (p >= end) return false;
-    const size_t avail = static_cast<size_t>(end - p);
+    if (p >= end) {
+      return false;
+    }
+    const auto avail = static_cast<size_t>(end - p);
     const size_t take = avail < 8 ? avail : 8;
     uint64_t raw = 0;
     std::memcpy(&raw, p, take);
@@ -831,11 +889,13 @@ struct PostingsBitCursor {
     uint64_t q = 0;
     for (;;) {
       if (held == 0) {
-        if (!Refill()) return false;  // unary run with no stop bit
+        if (!Refill()) {
+          return false;  // unary run with no stop bit
+        }
       }
       const uint64_t inv = ~window;
       if (inv != 0) {
-        const uint32_t zeros = static_cast<uint32_t>(__builtin_clzll(inv));
+        const auto zeros = static_cast<uint32_t>(__builtin_clzll(inv));
         if (zeros < held) {
           q += zeros;  // the stop bit consumed below
           // Drop (zeros + 1) bits: the ones and their stop.
@@ -849,7 +909,9 @@ struct PostingsBitCursor {
         }
         q += held;  // all-ones window: refill and keep counting
       }
-      if (!Refill()) return false;
+      if (!Refill()) {
+        return false;
+      }
     }
     // Remainder: k bits taken from the top of the window, refilling as
     // needed (the window is top-aligned -- bit63 is the next bit -- so a
@@ -858,9 +920,13 @@ struct PostingsBitCursor {
     uint64_t rem = 0;
     uint32_t got = 0;
     while (got < k) {
-      if (held == 0 && !Refill()) return false;
+      if (held == 0 && !Refill()) {
+        return false;
+      }
       const uint32_t take = held < (k - got) ? held : (k - got);
-      if (take == 0 || take >= 64) return false;
+      if (take == 0 || take >= 64) {
+        return false;
+      }
       rem = (rem << take) | (window >> (64 - take));
       window <<= take;
       held -= take;
@@ -884,9 +950,11 @@ struct CachedBitReader {
         limit(bits),
         bytes((bits + 7) / 8) {}
 
-  __attribute__((always_inline)) inline bool refill() {
+  __attribute__((always_inline)) bool refill() {
     const uint64_t byte = pos >> 3;
-    if (byte >= bytes) return false;
+    if (byte >= bytes) {
+      return false;
+    }
     const uint64_t available = bytes - byte;
     uint64_t word = 0;
     const size_t load = available < 8 ? available : 8;
@@ -894,18 +962,26 @@ struct CachedBitReader {
     const int sh = static_cast<int>(pos & 7);
     cache = be64toh(word);
     cache_start = pos - static_cast<uint64_t>(sh);
-    const uint64_t held = load * 8 - static_cast<uint64_t>(sh);
+    const uint64_t held = (load * 8) - static_cast<uint64_t>(sh);
     const uint64_t remaining = limit - cache_start;
     cache_end = cache_start + (held < remaining ? held : remaining);
     return true;
   }
 
-  __attribute__((always_inline)) inline uint64_t get(int w) {
-    if (w <= 0) return 0;
-    if (static_cast<uint64_t>(w) > limit - pos) return 0;
+  __attribute__((always_inline)) uint64_t get(int w) {
+    if (w <= 0) {
+      return 0;
+    }
+    if (static_cast<uint64_t>(w) > limit - pos) {
+      return 0;
+    }
     if (pos + static_cast<uint64_t>(w) > cache_end) {
-      if (!refill()) return 0;
-      if (w > 64 - static_cast<int>(pos - cache_start)) return get_slow(w);
+      if (!refill()) {
+        return 0;
+      }
+      if (w > 64 - static_cast<int>(pos - cache_start)) {
+        return get_slow(w);
+      }
     }
     const int drop = 64 - static_cast<int>(pos - cache_start) - w;
     const uint64_t value = cache >> drop;
@@ -917,7 +993,9 @@ struct CachedBitReader {
     uint64_t value = 0;
     while (w > 0) {
       const uint64_t byte = pos >> 3;
-      if (byte >= bytes) return value;
+      if (byte >= bytes) {
+        return value;
+      }
       const int available = 8 - static_cast<int>(pos & 7);
       const int take = w < available ? w : available;
       value = (value << take) |
@@ -929,9 +1007,13 @@ struct CachedBitReader {
     return value;
   }
 
-  __attribute__((always_inline)) inline int get1() {
-    if (pos >= limit) return 0;
-    if (pos + 1 > cache_end && !refill()) return 0;
+  __attribute__((always_inline)) int get1() {
+    if (pos >= limit) {
+      return 0;
+    }
+    if (pos + 1 > cache_end && !refill()) {
+      return 0;
+    }
     const uint64_t value = cache >> (63 - static_cast<int>(pos - cache_start));
     ++pos;
     return static_cast<int>(value & 1U);
@@ -1050,7 +1132,7 @@ class PatasHistory {
   uint32_t head_{0};
   uint32_t generation_{0};
 };
-constexpr uint32_t kAnsL = 1u << 23;
+constexpr uint32_t kAnsL = 1U << 23;
 constexpr uint32_t kAnsPrec = 12;
 constexpr uint32_t kAnsCkptRows = 64;
 struct AnsForRegion {
@@ -1059,10 +1141,11 @@ struct AnsForRegion {
   uint32_t prec = 0;
   uint32_t M = 0;
   uint32_t nsym = 0;
-  uint32_t f[256] = {};
-  uint32_t cum[256] = {};
-  uint32_t ck_sym[256] = {};  // slot-order search keys (cum per entry)
-  uint8_t ck_id[256] = {};    // symbol at each entry, ascending cum
+  std::array<uint32_t, 256> f = {};
+  std::array<uint32_t, 256> cum = {};
+  std::array<uint32_t, 256> ck_sym =
+      {};  // slot-order search keys (cum per entry)
+  std::array<uint8_t, 256> ck_id = {};  // symbol at each entry, ascending cum
   uint32_t ncp = 0;
   const char* ckpt = nullptr;  // ncp x 8B (state u32 BE, pos u32 BE)
   const uint8_t* stream = nullptr;
@@ -1106,11 +1189,11 @@ struct FastPforBlock {
 struct FastPforRegion {
   uint32_t n{0};
   uint32_t block_count{0};
-  FastPforBlock blocks[kFastPforMaxBlocks];
+  std::array<FastPforBlock, kFastPforMaxBlocks> blocks{};
   size_t encoded_size{0};
 };
 struct FastPforBitmap {
-  uint64_t w[2]{0, 0};
+  std::array<uint64_t, 2> w{0, 0};
 };
 constexpr uint32_t kDeltaFastPforBlockRows = 128;
 constexpr uint32_t kDeltaFastPforMaxBlocks =
@@ -1133,11 +1216,11 @@ struct DeltaFastPforBlock {
 struct DeltaFastPforRegion {
   uint32_t n{0};
   uint32_t block_count{0};
-  DeltaFastPforBlock blocks[kDeltaFastPforMaxBlocks];
+  std::array<DeltaFastPforBlock, kDeltaFastPforMaxBlocks> blocks{};
   size_t encoded_size{0};
 };
 struct DeltaFastPforBitmap {
-  uint64_t w[2]{0, 0};
+  std::array<uint64_t, 2> w{0, 0};
 };
 struct PlaRegion {
   uint32_t nseg{0};
@@ -1145,10 +1228,10 @@ struct PlaRegion {
   const char* hdr{nullptr};   // [ischeme u8][iparam u32 BE][nexc u16 BE]
   const char* bmp{nullptr};   // ceil(n/8) bytes MSB-first
 };
-constexpr uint32_t kSimple8bSelBits[16] = {0, 0, 1,  2,  3,  4,  5,  6,
-                                           7, 8, 10, 12, 15, 20, 30, 60};
-constexpr uint32_t kSimple8bSelCount[16] = {240, 120, 60, 30, 20, 15, 12, 10,
-                                            8,   7,   6,  5,  4,  3,  2,  1};
+constexpr std::array<uint32_t, 16> kSimple8bSelBits = {
+    0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 30, 60};
+constexpr std::array<uint32_t, 16> kSimple8bSelCount = {
+    240, 120, 60, 30, 20, 15, 12, 10, 8, 7, 6, 5, 4, 3, 2, 1};
 constexpr uint64_t kSimple8bMaxOffset = (UINT64_C(1) << 60) - 1;
 enum class Simple8bVerdict : uint8_t { kNone, kAll, kSome };
 struct ModRegion {
@@ -1186,16 +1269,16 @@ struct TemplateRegion {
   uint32_t n{0};
   uint32_t nseg{0};
   uint32_t nexc{0};
-  uint32_t widths[kTemplateMaxSegments]{};
+  std::array<uint32_t, kTemplateMaxSegments> widths{};
   // Literals: base pointers into the region (not NUL-terminated).
-  const char* lit[kTemplateMaxSegments + 1]{};
-  uint32_t lit_len[kTemplateMaxSegments + 1]{};
+  std::array<const char*, kTemplateMaxSegments + 1> lit{};
+  std::array<uint32_t, kTemplateMaxSegments + 1> lit_len{};
   const uint8_t* bmp{nullptr};
   // Per digit segment: the self-contained inner region and its end.
-  const char* seg[kTemplateMaxSegments]{};
-  Scheme seg_scheme[kTemplateMaxSegments]{};
-  uint32_t seg_param[kTemplateMaxSegments]{};
-  const char* seg_end[kTemplateMaxSegments]{};
+  std::array<const char*, kTemplateMaxSegments> seg{};
+  std::array<Scheme, kTemplateMaxSegments> seg_scheme{};
+  std::array<uint32_t, kTemplateMaxSegments> seg_param{};
+  std::array<const char*, kTemplateMaxSegments> seg_end{};
   const char* exc{nullptr};  // first exception entry
   uint32_t nconf{0};         // == n - nexc
 };
@@ -1210,8 +1293,8 @@ struct DStreamRegion {
   uint32_t ndir{0};
   uint32_t stream_len{0};
   // Symbol table: code c (1-based) is sym[c - 1] for sym_len[c - 1] bytes.
-  const char* sym[kDStreamMaxSymbols]{};
-  uint8_t sym_len[kDStreamMaxSymbols]{};
+  std::array<const char*, kDStreamMaxSymbols> sym{};
+  std::array<uint8_t, kDStreamMaxSymbols> sym_len{};
   const uint8_t* bmp{nullptr};
   const char* dir{nullptr};     // ndir x u32 BE stream offsets
   const char* stream{nullptr};  // nconf x (u8 clen + clen code bytes)
@@ -1229,15 +1312,20 @@ struct RgColumnProfile {
   ValueType type = ValueType::kNull;
   bool is_i64 = false;
   bool is_double = false;
+  bool mono = true;
+  bool has_null = false;
+  bool postings_big = false;
+  // Key-column cell hygiene: false once a non-null, non-int64 cell appears
+  // (the historical hash-index loop throws on such cells; the fused array
+  // loop runs only while this stays true).
+  bool typed_clean = true;
   // Encode domain (numeric columns): cell raw, null -> 0.
   std::vector<int64_t> vals;
   std::vector<uint64_t> ubits;
   int64_t emin = INT64_MAX, emax = INT64_MIN;
-  bool mono = true;
   FlatMapI64 distinct{PaxChunk::kRowGroupSize};
   // Null bitmap (all columns), MSB-first.
   std::vector<uint8_t> null_bmp;
-  bool has_null = false;
   // Stats domain accumulators.
   uint64_t count = 0;
   int64_t sum = 0;
@@ -1245,27 +1333,22 @@ struct RgColumnProfile {
   uint64_t bloom = 0;
   uint64_t null_count = 0;
   int64_t cmin = INT64_MAX, cmax = INT64_MIN;
-  uint8_t hll[64] = {};
+  std::array<uint8_t, 64> hll = {};
   // Inverted postings (int64 columns), CSR over the <= kMaxIdxDistinct key
   // set: row ids per key in one flat array with per-key offsets. The
   // historical per-key unordered_map paid a hash-bucket walk per CELL and a
   // node+vector pair per distinct key per row group; the CSR fills both from
   // one row sweep (counts already live in `xorset`).
   struct PostingsCsr {
-    int64_t keys[kMaxIdxDistinct] = {};
-    uint32_t offsets[kMaxIdxDistinct + 1] = {};
+    std::array<int64_t, kMaxIdxDistinct> keys = {};
+    std::array<uint32_t, kMaxIdxDistinct + 1> offsets = {};
     std::vector<uint16_t> rows;
     size_t key_count = 0;
     void Clear() { key_count = 0; }
   };
   PostingsCsr postings;
-  bool postings_big = false;
   // Xor key set (int64 columns).
   FlatMapI64 xorset{PaxChunk::kRowGroupSize};
-  // Key-column cell hygiene: false once a non-null, non-int64 cell appears
-  // (the historical hash-index loop throws on such cells; the fused array
-  // loop runs only while this stays true).
-  bool typed_clean = true;
 
   // Restore the just-constructed state in place. BuildFromSortedRun keeps one
   // profile vector for the whole chunk and calls this per row group, so the
@@ -1294,7 +1377,7 @@ struct RgColumnProfile {
     null_count = 0;
     cmin = INT64_MAX;
     cmax = INT64_MIN;
-    std::memset(hll, 0, sizeof(hll));
+    hll.fill(0);
     // The inverted-index builder copies each postings run out into the
     // footer cell, so the key count must drop too: a stale key range from
     // the previous row group would publish a value this group never had.
@@ -1335,21 +1418,23 @@ void DictSelectedCodeFold(const char* region, uint32_t n, uint32_t cw,
     // Generic (runtime per_byte) on purpose: see the note on
     // DictSelectedCodeHistogramRun for why the MIN/MAX fold is not
     // specialised the way the SUM histogram is.
-    const uint32_t per_byte = 8u / cw;
-    const uint32_t code_mask = (1u << cw) - 1u;
+    const uint32_t per_byte = 8U / cw;
+    const uint32_t code_mask = (1U << cw) - 1U;
     const uint8_t* src = reinterpret_cast<const uint8_t*>(region) + 2;
     for (uint32_t base = 0; base < n; base += 64) {
       const uint32_t take = (n - base) < 64 ? (n - base) : 64;
       const uint64_t sel_word = sel_bits[base >> 6];
       for (uint32_t j = 0; j < take; ++j) {
-        if (((sel_word >> j) & 1ULL) == 0) continue;
+        if (((sel_word >> j) & 1ULL) == 0) {
+          continue;
+        }
         // 64 is a multiple of every per_byte in {1,2,4,8}, so a full block
         // never straddles a byte. The final block may: the last byte is
         // shared by its few remaining codes, and the same shift expression
         // yields the partial final slice without reading past the region.
-        const uint32_t byte = src[base / per_byte + j / per_byte];
+        const uint32_t byte = src[(base / per_byte) + (j / per_byte)];
         const uint32_t code =
-            (byte >> (8u - cw * ((j % per_byte) + 1u))) & code_mask;
+            (byte >> (8U - cw * ((j % per_byte) + 1U))) & code_mask;
         emit(base + j, code < ncodes ? code : static_cast<uint32_t>(ncodes));
       }
     }
@@ -1362,8 +1447,10 @@ void DictSelectedCodeFold(const char* region, uint32_t n, uint32_t cw,
     const uint32_t take = (n - base) < 64 ? (n - base) : 64;
     const uint64_t sel_word = sel_bits[base >> 6];
     for (uint32_t j = 0; j < take; ++j) {
-      const uint32_t code = static_cast<uint32_t>(br.get(static_cast<int>(cw)));
-      if (((sel_word >> j) & 1ULL) == 0) continue;
+      const auto code = static_cast<uint32_t>(br.get(static_cast<int>(cw)));
+      if (((sel_word >> j) & 1ULL) == 0) {
+        continue;
+      }
       emit(base + j, code < ncodes ? code : static_cast<uint32_t>(ncodes));
     }
   }
@@ -1374,16 +1461,18 @@ inline void DictSelectedCodeHistogramRun(const uint8_t* src, uint32_t n,
                                          uint16_t ncodes,
                                          const uint64_t* sel_bits,
                                          uint64_t* freq) {
-  constexpr uint32_t kCw = 8u / kPerByte;
-  constexpr uint32_t kCodeMask = (1u << kCw) - 1u;
+  constexpr uint32_t kCw = 8U / kPerByte;
+  constexpr uint32_t kCodeMask = (1U << kCw) - 1U;
   for (uint32_t base = 0; base < n; base += 64) {
     const uint32_t take = (n - base) < 64 ? (n - base) : 64;
     const uint64_t sel_word = sel_bits[base >> 6];
     for (uint32_t j = 0; j < take; ++j) {
-      if (((sel_word >> j) & 1ULL) == 0) continue;
+      if (((sel_word >> j) & 1ULL) == 0) {
+        continue;
+      }
       const uint32_t byte = src[(base + j) / kPerByte];
       const uint32_t code =
-          (byte >> (8u - kCw * ((j % kPerByte) + 1u))) & kCodeMask;
+          (byte >> (8U - kCw * ((j % kPerByte) + 1U))) & kCodeMask;
       ++freq[code < ncodes ? code : static_cast<uint32_t>(ncodes)];
     }
   }
@@ -1678,16 +1767,21 @@ void DeltaFastPforDecodeBlock(const DeltaFastPforBlock& blk, int64_t* dst);
 void DecodeDeltaFastPforAll(const DeltaFastPforRegion& p, int64_t* out);
 int64_t DeltaFastPforValueAt(const DeltaFastPforRegion& p, uint32_t idx);
 bool DeltaFastPforMetadataMatches(const DeltaFastPforRegion& p);
-int64_t Int64AtPlain(const char* r, uint32_t, uint32_t, uint32_t idx,
-                     const char* region_end, const uint32_t*);
-int64_t Int64AtConst(const char* r, uint32_t, uint32_t, uint32_t,
-                     const char* region_end, const uint32_t*);
-int64_t Int64AtForBp(const char* r, uint32_t param, uint32_t, uint32_t idx,
-                     const char* region_end, const uint32_t*);
-int64_t Int64AtBitWeave(const char* r, uint32_t, uint32_t, uint32_t idx,
-                        const char* region_end, const uint32_t*);
-int64_t Int64AtEliasFano(const char* r, uint32_t, uint32_t n, uint32_t idx,
-                         const char* region_end, const uint32_t* ef_dir);
+int64_t Int64AtPlain(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                     uint32_t idx, const char* region_end,
+                     const uint32_t* /*unused*/);
+int64_t Int64AtConst(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                     uint32_t /*unused*/, const char* region_end,
+                     const uint32_t* /*unused*/);
+int64_t Int64AtForBp(const char* r, uint32_t param, uint32_t /*unused*/,
+                     uint32_t idx, const char* region_end,
+                     const uint32_t* /*unused*/);
+int64_t Int64AtBitWeave(const char* r, uint32_t /*unused*/, uint32_t /*unused*/,
+                        uint32_t idx, const char* region_end,
+                        const uint32_t* /*unused*/);
+int64_t Int64AtEliasFano(const char* r, uint32_t /*unused*/, uint32_t n,
+                         uint32_t idx, const char* region_end,
+                         const uint32_t* ef_dir);
 bool ParsePlaRegion(const char* r, uint32_t n, uint32_t param,
                     const char* region_end, PlaRegion* out);
 int64_t PlaSegmentValueAt(const PlaRegion& p, uint32_t j, uint32_t start,
@@ -1696,9 +1790,9 @@ bool Simple8bPasses(int64_t v, ScanOp op, int64_t lit);
 Simple8bVerdict Simple8bWordVerdict(uint32_t bits, uint64_t base_u, int64_t lit,
                                     ScanOp op);
 int64_t Int64AtArith(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                     const char* region_end, const uint32_t*);
+                     const char* region_end, const uint32_t* /*unused*/);
 int64_t Int64AtPla(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                   const char* region_end, const uint32_t*);
+                   const char* region_end, const uint32_t* /*unused*/);
 bool ParseModRegion(const char* r, uint32_t n, uint32_t param,
                     const char* region_end, ModRegion* out);
 int64_t ModValueAt(const ModRegion& p, uint32_t idx);
@@ -1707,13 +1801,13 @@ unsigned __int128 ModFloorSum(unsigned __int128 n, unsigned __int128 a,
 uint64_t ModGcd(uint64_t x, uint64_t y);
 uint64_t ModInv(uint64_t u, uint64_t q);
 int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                   const char* region_end, const uint32_t*);
+                   const char* region_end, const uint32_t* /*unused*/);
 size_t LaneHeaderBytes(uint32_t nd);
 bool ParseLaneRegion(const char* r, uint32_t n, uint32_t param,
                      const char* region_end, LaneRegion* out);
 int64_t LaneValueAt(const LaneRegion& p, uint32_t idx);
 int64_t Int64AtLane(const char* r, uint32_t param, uint32_t n, uint32_t idx,
-                    const char* region_end, const uint32_t*);
+                    const char* region_end, const uint32_t* /*unused*/);
 int TileDictWidth(uint32_t d);
 bool TileDictParseTile(const char* p, const char* end, uint32_t n,
                        uint32_t tile_start, TileDictCursor* c);
@@ -2018,6 +2112,11 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
                          const char* region_end, PaxChunk::CompareOp op,
                          int64_t lit, uint64_t* count_out, int64_t* sum_out);
 __int128 DeltaPForBracketSum(const char* bracket);
+
+// Adds coefficient * subtotal if both the product and result fit in signed
+// 128 bits. On overflow, returns false and leaves *total unchanged.
+[[nodiscard]] bool TryAccumulateScaledSum(int64_t coefficient,
+                                          __int128 subtotal, __int128* total);
 
 }  // namespace tinylamb
 

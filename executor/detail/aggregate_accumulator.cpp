@@ -168,42 +168,8 @@ AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
       }
     }
   }
-  if (aggregate->GetType() == AggregationType::kSum &&
-      aggregate->Child()->Type() == TypeTag::kColumnValue) {
-    // Runs once per aggregate (not once per new group), so keep it
-    // allocation-free for ordinary column-name lengths: lowercase into a
-    // stack buffer instead of a heap std::string.
-    const std::string& original =
-        aggregate->Child()->AsColumnValue().GetColumnName().name;
-    std::array<char, 64> lowered{};
-    std::string heap_lowered;
-    std::string_view name;
-    if (original.size() < sizeof(lowered)) {
-      for (size_t i = 0; i < original.size(); ++i) {
-        lowered[i] = static_cast<char>(
-            std::tolower(static_cast<unsigned char>(original[i])));
-      }
-      lowered[original.size()] = '\0';
-      name = std::string_view(lowered.data(), original.size());
-    } else {
-      heap_lowered.resize(original.size());
-      std::ranges::transform(
-          original, heap_lowered.begin(),
-          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-      name = heap_lowered;
-    }
-    // DISTINCT expressions are sometimes rebound through a UNION schema
-    // whose declared unsigned type is unavailable here; their runtime
-    // values are handled by the deferred UINT64_MAX detector below.  Keep
-    // the name-based fast classification for ordinary table columns.
-    shape.sum_is_uint64 =
-        !aggregate->Distinct() && name.find("uint64") != std::string_view::npos;
-    // The compliance overflow UNION exposes its anonymous value as `x`.
-    // Restrict this heuristic to that genuinely untyped shape so a signed
-    // column such as int64_val containing -1 is never reinterpreted as an
-    // unsigned value merely because it is DISTINCT.
-    shape.sum_can_infer_uint64 = aggregate->Distinct() && name == "x";
-  }
+  shape.sum_is_uint64 = aggregate->GetType() == AggregationType::kSum &&
+                        shape.resolved_element_type == "UINT64";
   shape.needs_buffer = aggregate->GetType() == AggregationType::kArrayAgg ||
                        aggregate->GetType() == AggregationType::kStringAgg ||
                        aggregate->NeedsGroupContext();
@@ -215,7 +181,6 @@ AggregateAccumulator::AggregateAccumulator(const AggregateExpression* aggregate,
     : expression(aggregate),
       core_type_(aggregate->GetType()),
       sum_is_uint64(shape.sum_is_uint64),
-      sum_can_infer_uint64(shape.sum_can_infer_uint64),
       distinct_mode_(shape.distinct_mode),
       resolved_element_type_(shape.resolved_element_type) {
   if (shape.needs_buffer) {
@@ -331,37 +296,6 @@ Status AggregateAccumulator::TryApplyCore(
       return Status::kSuccess;
     }
   }
-  // A UINT64 value is represented as an INT64 bit pattern in Value.  For a
-  // DISTINCT subquery the intermediate schema may have forgotten the UINT64
-  // declaration, but UINT64_MAX is still recognizable as -1.  Only promote
-  // when it is paired with a nonnegative distinct value; ordinary signed
-  // SUM(DISTINCT -1) remains a signed sum.
-  if (core_type == AggregationType::kSum && expression->Distinct() &&
-      !sum_is_uint64 && sum_can_infer_uint64 &&
-      value.type == ValueType::kInt64) {
-    if (value.value.int_value == -1) {
-      if (sum_nonnegative_total != 0) {
-        sum_is_uint64 = true;
-        uint_total = sum_nonnegative_total;
-      }
-      sum_saw_minus_one = true;
-    } else if (value.value.int_value >= 0) {
-      const auto unsigned_value = static_cast<uint64_t>(value.value.int_value);
-      if (sum_saw_minus_one) {
-        sum_is_uint64 = true;
-        uint_total = std::numeric_limits<uint64_t>::max();
-      } else {
-        if (sum_nonnegative_total >
-            std::numeric_limits<uint64_t>::max() - unsigned_value) {
-          // Preserve the inference signal; the final SUM check reports the
-          // actual unsigned overflow.
-          sum_nonnegative_total = std::numeric_limits<uint64_t>::max();
-        } else {
-          sum_nonnegative_total += unsigned_value;
-        }
-      }
-    }
-  }
   switch (core_type) {
     case AggregationType::kCount:
       ++count;
@@ -376,15 +310,20 @@ Status AggregateAccumulator::TryApplyCore(
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
         if (sum_is_uint64 || value.IsUnsigned()) {
-          sum_is_uint64 = true;
-          const auto unsigned_value =
-              static_cast<uint64_t>(value.value.int_value);
-          if (uint_total >
-              std::numeric_limits<uint64_t>::max() - unsigned_value) {
+          const __int128 prior =
+              sum_is_uint64 ? static_cast<__int128>(uint_total) : int_total;
+          const __int128 input =
+              value.IsUnsigned() ? static_cast<__int128>(static_cast<uint64_t>(
+                                       value.value.int_value))
+                                 : static_cast<__int128>(value.value.int_value);
+          const __int128 next = prior + input;
+          if (next < 0 || next > std::numeric_limits<uint64_t>::max()) {
             return StatusError(StatusCode::kIsInfinity,
                                "uint64 overflow in SUM");
           }
-          uint_total += unsigned_value;
+          sum_is_uint64 = true;
+          uint_total = static_cast<uint64_t>(next);
+          int_total = 0;
           ++count;
           break;
         }
@@ -1093,8 +1032,9 @@ StatusOr<Value> TryExtractSketchQuantilesStatic(const Value& sketch,
   for (const std::string& entry : entries) {
     values.push_back(SketchEntryToValue(typecode, entry));
   }
-  std::sort(values.begin(), values.end(),
-            [](const Value& a, const Value& b) { return a < b; });
+  std::sort(values.begin(), values.end(), [](const Value& a, const Value& b) {
+    return CompareForOrderBy(a, b) < 0;
+  });
   const auto n = static_cast<int64_t>(values.size());
   std::vector<Value> picked;
   for (int64_t i = 0; i <= number; ++i) {
@@ -1383,12 +1323,18 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
   if (type == AggregationType::kSum) {
     count += other.count;
     if (sum_is_uint64 || other.sum_is_uint64) {
-      sum_is_uint64 = true;
-      if (uint_total >
-          std::numeric_limits<uint64_t>::max() - other.uint_total) {
+      const __int128 left =
+          sum_is_uint64 ? static_cast<__int128>(uint_total) : int_total;
+      const __int128 right = other.sum_is_uint64
+                                 ? static_cast<__int128>(other.uint_total)
+                                 : other.int_total;
+      const __int128 next = left + right;
+      if (next < 0 || next > std::numeric_limits<uint64_t>::max()) {
         return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
       }
-      uint_total += other.uint_total;
+      sum_is_uint64 = true;
+      uint_total = static_cast<uint64_t>(next);
+      int_total = 0;
     } else {
       int64_t updated = 0;
       if (__builtin_add_overflow(int_total, other.int_total, &updated)) {
@@ -1446,8 +1392,7 @@ Status AggregateAccumulator::Add(const Value& value) {
     return Status::kSuccess;
   }
   if (core_type_ == AggregationType::kSum && !distinct_mode_ &&
-      !sum_is_uint64 && !sum_can_infer_uint64 &&
-      value.type == ValueType::kInt64 && !value.IsNull() &&
+      !sum_is_uint64 && value.type == ValueType::kInt64 && !value.IsNull() &&
       !value.IsUnsigned()) {
     // Signed accumulation keeps negative inputs exact (GoogleSQL SUM raises
     // on INT64 overflow rather than wrapping).
@@ -1572,7 +1517,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
       if (count == 0) {
         return Value();
       }
-      if (sum_is_uint64) {
+      if (sum_is_uint64 && !total_is_double) {
         return Value(static_cast<int64_t>(static_cast<uint64_t>(uint_total)))
             .WithUnsigned();
       }
@@ -1580,7 +1525,9 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value(static_cast<int64_t>(int_total));
       }
       {
-        const double sum_result = total + static_cast<double>(int_total);
+        const double sum_result =
+            total + (sum_is_uint64 ? static_cast<double>(uint_total)
+                                   : static_cast<double>(int_total));
         if (!sum_saw_infinite_input_ && std::isinf(sum_result)) {
           // Finite inputs whose sum leaves the double range overflow:
           // GoogleSQL raises instead of returning inf.
@@ -1803,7 +1750,9 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
         return Value();
       }
       std::sort(quantile_values_.begin(), quantile_values_.end(),
-                [](const Value& a, const Value& b) { return a < b; });
+                [](const Value& a, const Value& b) {
+                  return CompareForOrderBy(a, b) < 0;
+                });
       std::vector<Value> picked;
       const auto n = static_cast<int64_t>(quantile_values_.size());
       for (int64_t i = 0; i <= number; ++i) {

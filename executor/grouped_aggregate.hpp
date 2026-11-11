@@ -99,7 +99,7 @@ class AggregateGroupTable {
   // path feeds it directly.
   [[nodiscard]] relational_detail::AggregateAccumulator& StateFor(
       size_t group, size_t index) {
-    return states_[group * aggregates_->size() + index];
+    return states_[(group * aggregates_->size()) + index];
   }
   void Clear();
 
@@ -138,7 +138,7 @@ class GroupedAggregateBase : public ExecutorBase {
         group_keys_(std::move(group_keys)),
         aggregates_(std::move(aggregates)),
         having_(std::move(having)),
-        options_(std::move(options)) {}
+        options_(options) {}
 
   // Builds output_rows_: group keys then aggregate results, HAVING applied.
   // Called at most once; a failure is latched and no row is emitted.

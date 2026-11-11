@@ -2,6 +2,8 @@
 #include "executor/detail/window_eval.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -13,20 +15,26 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -358,6 +366,51 @@ bool CandidateAtLeastKeyMinusOffset(const Value& candidate, const Value& key,
           : static_cast<platform::ExtendedFloat>(NumericOf(candidate));
   return cand >= limit;
 }
+// Computed/multi-column keys use a compact matrix. A single direct numeric
+// key borrows the immutable input rows after the partition permutation is
+// final, avoiding a copied Value matrix for every small partition. Layouts
+// are move-only and all window columns are computed before mutating rows.
+struct WindowOrderValues {
+  WindowOrderValues() = default;
+  WindowOrderValues(size_t rows, size_t columns)
+      : row_count(rows), width(columns), values(rows * columns) {}
+  WindowOrderValues(std::vector<Row>& rows, std::span<const size_t> permutation,
+                    size_t column)
+      : row_count(permutation.size()),
+        width(1),
+        source(&rows),
+        ordered(permutation),
+        source_column(column) {}
+  WindowOrderValues(const WindowOrderValues&) = delete;
+  WindowOrderValues& operator=(const WindowOrderValues&) = delete;
+  WindowOrderValues(WindowOrderValues&&) noexcept = default;
+  WindowOrderValues& operator=(WindowOrderValues&&) noexcept = default;
+  ~WindowOrderValues() = default;
+
+  [[nodiscard]] bool empty() const { return row_count == 0; }
+  std::span<Value> operator[](size_t row) {
+    if (source != nullptr) {
+      return {&(*source)[ordered[row]].values_[source_column], 1};
+    }
+    return width == 0 ? std::span<Value>{}
+                      : std::span<Value>(values.data() + (row * width), width);
+  }
+  std::span<const Value> operator[](size_t row) const {
+    if (source != nullptr) {
+      return {&(*source)[ordered[row]].values_[source_column], 1};
+    }
+    return width == 0
+               ? std::span<const Value>{}
+               : std::span<const Value>(values.data() + (row * width), width);
+  }
+  size_t row_count{0};
+  size_t width{0};
+  std::vector<Value> values;
+  std::vector<Row>* source{nullptr};
+  std::span<const size_t> ordered;
+  size_t source_column{0};
+};
+
 struct WindowRuntime {
   TransactionContext& context;
   const Scope* outer{nullptr};
@@ -375,7 +428,7 @@ struct WindowRuntime {
   [[nodiscard]] static StatusOr<std::pair<size_t, size_t>> ResolveFrame(
       const WindowFunctionCallExpression& window,
       const std::vector<Row>& /*rows*/, const std::vector<size_t>& ordered,
-      const std::vector<std::vector<Value>>& order_values, size_t position,
+      const WindowOrderValues& order_values, size_t position,
       const std::vector<size_t>& peer_end) {
     const size_t m = ordered.size();
     // EXC-SHIM bridge (no-exception-rule-migration.md): the nested bound
@@ -584,8 +637,8 @@ struct WindowRuntime {
     auto first_peer = [&](size_t idx) {
       size_t j = idx;
       while (j > 0) {
-        const std::vector<Value>& above = order_values[j - 1];
-        const std::vector<Value>& mine = order_values[idx];
+        const auto above = order_values[j - 1];
+        const auto mine = order_values[idx];
         bool peer = above.size() == mine.size();
         for (size_t t = 0; peer && t < mine.size(); ++t) {
           peer = ValuesEqual(above[t], mine[t]);
@@ -966,9 +1019,8 @@ struct WindowRuntime {
   // honor identical frame semantics.
   [[nodiscard]] StatusOr<std::vector<size_t>> FrameSurvivors(
       const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
-      const std::vector<size_t>& ordered,
-      const std::vector<std::vector<Value>>& order_values, size_t current,
-      size_t lo, size_t hi) const {
+      const std::vector<size_t>& ordered, const WindowOrderValues& order_values,
+      size_t current, size_t lo, size_t hi) const {
     std::vector<size_t> survivors;
     for (size_t p = lo; p <= hi; ++p) {
       bool excluded = false;
@@ -1031,9 +1083,8 @@ struct WindowRuntime {
 
   [[nodiscard]] StatusOr<Value> AggregateOverFrame(
       const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
-      const std::vector<size_t>& ordered,
-      const std::vector<std::vector<Value>>& order_values, size_t current,
-      size_t lo, size_t hi) const {
+      const std::vector<size_t>& ordered, const WindowOrderValues& order_values,
+      size_t current, size_t lo, size_t hi) const {
     const std::string& fn = window.function;
     if (hi < lo || ordered.empty() || hi >= ordered.size()) {
       if (fn == "COUNT") {
@@ -1174,14 +1225,7 @@ struct WindowRuntime {
       std::vector<Value> sorted = non_null;
       std::sort(sorted.begin(), sorted.end(),
                 [](const Value& a, const Value& b) {
-                  try {
-                    if (a.IsNull() || b.IsNull()) {
-                      return false;
-                    }
-                    return a < b;
-                  } catch (...) {
-                    return false;
-                  }
+                  return CompareForOrderBy(a, b) < 0;
                 });
       // APPROX_QUANTILES returns NUM+1 percentiles including both endpoints.
       std::vector<Value> quantiles;
@@ -1249,9 +1293,16 @@ struct WindowRuntime {
               Value, w,
               (TryEvaluate(window.args[1], scope, nullptr, context, *ctes)));
           if (!w.IsNull()) {
+            if (w.type != ValueType::kDouble && w.type != ValueType::kInt64) {
+              return StatusError(StatusCode::kInvalidArgument,
+                                 "APPROX_TOP_SUM requires a numeric weight");
+            }
             weight = w.type == ValueType::kDouble
                          ? w.value.double_value
-                         : static_cast<double>(w.value.int_value);
+                         : (w.IsUnsigned()
+                                ? static_cast<double>(
+                                      static_cast<uint64_t>(w.value.int_value))
+                                : static_cast<double>(w.value.int_value));
           }
         }
         bool found = false;
@@ -1478,10 +1529,15 @@ struct WindowRuntime {
       }
       return Value(acc);
     }
-    auto numeric_of = [](const Value& v) -> double {
-      return v.type == ValueType::kDouble
-                 ? v.value.double_value
-                 : static_cast<double>(v.value.int_value);
+    const auto numeric_of = [&](const Value& v) -> StatusOr<double> {
+      if (v.type == ValueType::kDouble) return v.value.double_value;
+      if (v.type == ValueType::kInt64) {
+        return v.IsUnsigned() ? static_cast<double>(
+                                    static_cast<uint64_t>(v.value.int_value))
+                              : static_cast<double>(v.value.int_value);
+      }
+      return StatusError(StatusCode::kInvalidArgument,
+                         fn + " requires numeric arguments");
     };
     Status pairs_error{Status::kSuccess};
     struct FramePairStats {
@@ -1517,7 +1573,12 @@ struct WindowRuntime {
         if (x.IsNull()) {
           continue;
         }
-        double xv = numeric_of(x);
+        auto x_numeric = numeric_of(x);
+        if (!x_numeric.HasValue()) {
+          pairs_error = x_numeric.GetStatus();
+          return std::nullopt;
+        }
+        const double xv = x_numeric.Value();
         double yv = xv;
         if (window.args.size() > 1) {
           StatusOr<Value> y_or =
@@ -1530,7 +1591,12 @@ struct WindowRuntime {
           if (y.IsNull()) {
             continue;
           }
-          yv = numeric_of(y);
+          auto y_numeric = numeric_of(y);
+          if (!y_numeric.HasValue()) {
+            pairs_error = y_numeric.GetStatus();
+            return std::nullopt;
+          }
+          yv = y_numeric.Value();
         }
         pairs.emplace_back(xv, yv);
       }
@@ -1557,25 +1623,27 @@ struct WindowRuntime {
       stats.var_arg1 = (syy / static_cast<double>(n)) - (my * my);
       return stats;
     };
-    auto frame_variance = [&](bool samp) -> Value {
+    auto frame_variance = [&](bool samp) -> StatusOr<Value> {
       if (non_null.empty()) {
-        return {};
+        return Value();
       }
       const size_t n = non_null.size();
       double mean = 0.0;
       for (const Value& value : non_null) {
-        mean += numeric_of(value);
+        ASSIGN_OR_RETURN(double, number, numeric_of(value));
+        mean += number;
       }
       mean /= static_cast<double>(n);
       double ss = 0.0;
       for (const Value& value : non_null) {
-        const double d = numeric_of(value) - mean;
+        ASSIGN_OR_RETURN(double, number, numeric_of(value));
+        const double d = number - mean;
         ss += d * d;
       }
       double variance = ss / static_cast<double>(n);
       if (samp) {
         if (n < 2) {
-          return {};
+          return Value();
         }
         variance *= static_cast<double>(n) / static_cast<double>(n - 1);
       }
@@ -1585,7 +1653,7 @@ struct WindowRuntime {
       return frame_variance(fn != "VAR_POP");
     }
     if (fn == "STDDEV_POP" || fn == "STDDEV_SAMP" || fn == "STDDEV") {
-      Value variance = frame_variance(fn != "STDDEV_POP");
+      ASSIGN_OR_RETURN(Value, variance, frame_variance(fn != "STDDEV_POP"));
       if (variance.IsNull()) {
         return variance;
       }
@@ -1860,7 +1928,7 @@ struct WindowRuntime {
 
 struct WindowPartitionLayout {
   std::vector<size_t> ordered;
-  std::vector<std::vector<Value>> order_values;
+  WindowOrderValues order_values;
   std::vector<size_t> peer_end;
 };
 
@@ -1894,6 +1962,33 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     const WindowFunctionCallExpression& window, std::vector<Row>& rows,
     const WindowRuntime& runtime) {
   WindowOrderLayout layout;
+  const auto column_offset =
+      [&](const Expression& expression) -> std::optional<size_t> {
+    if (!expression || expression->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+    const auto& name = expression->AsColumnValue().GetColumnName();
+    if (name.name.find('.') != std::string::npos ||
+        name.schema.find('.') != std::string::npos) {
+      return std::nullopt;
+    }
+    auto offset = LocalColumnOffset(*runtime.schema, name);
+    // Do not turn a row alias or a nested field into a scalar column.
+    if (offset && runtime.schema->GetColumn(*offset).Name().name == name.name) {
+      return offset;
+    }
+    return std::nullopt;
+  };
+  std::vector<std::optional<size_t>> partition_offsets;
+  partition_offsets.reserve(window.partition_by.size());
+  for (const auto& key : window.partition_by) {
+    partition_offsets.push_back(column_offset(key));
+  }
+  std::vector<std::optional<size_t>> order_offsets;
+  order_offsets.reserve(window.order_by.size());
+  for (const auto& term : window.order_by) {
+    order_offsets.push_back(column_offset(term.expression));
+  }
   // Group the rows by their PARTITION BY tuple through a hash table. The
   // groups are appended in first-seen order, so the layout (and therefore every
   // output position) is the same as a scan that searched the groups found so
@@ -1907,12 +2002,94 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
   std::unordered_map<std::vector<Value>, size_t, PartitionKeyHash,
                      PartitionKeyEq>
       groups;
+  bool integer_partition = false;
+  size_t integer_column = 0;
+  const auto single_partition =
+      partition_offsets.size() == 1 ? partition_offsets.front() : std::nullopt;
+  if (single_partition) {
+    integer_column = *single_partition;
+    const auto& column = runtime.schema->GetColumn(integer_column);
+    integer_partition =
+        !column.IsUnsigned() &&
+        (column.Type() == ValueType::kInt64 ||
+         column.Type() == ValueType::kDate) &&
+        std::ranges::all_of(rows, [&](const Row& row) {
+          const auto& value = row[integer_column];
+          return value.IsNull() ||
+                 (value.type == column.Type() && !value.IsUnsigned());
+        });
+  }
+  const bool direct_partition = std::ranges::all_of(
+      partition_offsets, [](const auto& offset) { return offset.has_value(); });
+  std::vector<size_t> direct_partition_columns;
+  for (const auto& offset : partition_offsets) {
+    if (offset) {
+      direct_partition_columns.push_back(*offset);
+    }
+  }
+  // Input rows remain immutable while the partition layout is built. Store a
+  // representative row index, and compare its values, instead of allocating
+  // and copying a key tuple for every input row (including duplicate keys).
+  const auto hash_direct_partition = [&](size_t row) {
+    uint64_t hash = 0x9e3779b97f4a7c15ULL;
+    for (const size_t column : direct_partition_columns) {
+      hash ^= std::hash<Value>{}(rows[row][column]) + 0x9e3779b97f4a7c15ULL +
+              (hash << 6) + (hash >> 2);
+    }
+    return static_cast<size_t>(hash);
+  };
+  const auto equal_direct_partition = [&](size_t a, size_t b) {
+    return std::ranges::all_of(direct_partition_columns, [&](size_t column) {
+      return ValuesEqual(rows[a][column], rows[b][column]);
+    });
+  };
+  std::unordered_map<size_t, size_t, decltype(hash_direct_partition),
+                     decltype(equal_direct_partition)>
+      direct_groups(0, hash_direct_partition, equal_direct_partition);
+  FlatIntKeyMap<size_t> integer_groups;
+  std::optional<size_t> null_partition;
   for (size_t i = 0; i < rows.size(); ++i) {
+    if (integer_partition) {
+      const auto& value = rows[i][integer_column];
+      size_t group = 0;
+      if (value.IsNull()) {
+        if (!null_partition) {
+          null_partition = layout.partitions.size();
+          layout.partitions.emplace_back();
+        }
+        group = *null_partition;
+      } else {
+        bool inserted = false;
+        auto* slot =
+            integer_groups.TryEmplace(value.value.int_value, &inserted);
+        if (inserted) {
+          *slot = layout.partitions.size();
+          layout.partitions.emplace_back();
+        }
+        group = *slot;
+      }
+      layout.partitions[group].ordered.push_back(i);
+      continue;
+    }
+    if (direct_partition) {
+      const auto [entry, inserted] =
+          direct_groups.try_emplace(i, layout.partitions.size());
+      if (inserted) {
+        layout.partitions.emplace_back();
+      }
+      layout.partitions[entry->second].ordered.push_back(i);
+      continue;
+    }
     std::vector<Value> keys;
     keys.reserve(window.partition_by.size());
-    for (const Expression& key : window.partition_by) {
-      ASSIGN_OR_RETURN(Value, partition_key, (runtime.EvalAt(key, rows, i)));
-      keys.push_back(std::move(partition_key));
+    for (size_t k = 0; k < window.partition_by.size(); ++k) {
+      if (const auto offset = partition_offsets[k]) {
+        keys.push_back(rows[i][*offset]);
+      } else {
+        ASSIGN_OR_RETURN(Value, partition_key,
+                         runtime.EvalAt(window.partition_by[k], rows, i));
+        keys.push_back(std::move(partition_key));
+      }
     }
     const auto [entry, inserted] =
         groups.try_emplace(std::move(keys), layout.partitions.size());
@@ -1922,16 +2099,205 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     layout.partitions[entry->second].ordered.push_back(i);
   }
 
+  // Plain numeric ordering keys can be read from the input while sorting
+  // member indices. This avoids building and permuting a second key matrix
+  // (and two index arrays) for every small partition.
+  const bool direct_order =
+      !order_offsets.empty() &&
+      std::ranges::all_of(order_offsets, [&](const auto& offset) {
+        return offset && std::ranges::all_of(rows, [&](const Row& row) {
+                 const auto type = row[*offset].type;
+                 return type == ValueType::kNull || type == ValueType::kInt64 ||
+                        type == ValueType::kDate || type == ValueType::kDouble;
+               });
+      });
+  const auto integer_order_slot = direct_order && order_offsets.size() == 1
+                                      ? order_offsets.front()
+                                      : std::nullopt;
+  const bool integer_order =
+      integer_order_slot && std::ranges::all_of(rows, [&](const Row& row) {
+        const auto& value = row[*integer_order_slot];
+        const auto expected =
+            runtime.schema->GetColumn(*integer_order_slot).Type();
+        return value.IsNull() ||
+               ((expected == ValueType::kInt64 ||
+                 expected == ValueType::kDate) &&
+                value.type == expected && !value.IsUnsigned());
+      });
+  const bool double_order =
+      integer_order_slot && !integer_order &&
+      std::ranges::all_of(rows, [&](const Row& row) {
+        const auto& value = row[*integer_order_slot];
+        return value.IsNull() || value.type == ValueType::kDouble;
+      });
+  // Sorting row indices otherwise follows two pointers to a tagged Value
+  // at every comparison. Encode a proven numeric column once into compact
+  // sortable keys; original row indices break ties in encounter order.
+  std::shared_ptr<QueryMemoryCharge> numeric_order_charge;
+  std::vector<uint64_t> numeric_keys;
+  std::vector<uint8_t> numeric_nulls;
+  bool numeric_has_null = false;
+  if ((integer_order || double_order) &&
+      rows.size() <= SIZE_MAX / (sizeof(uint64_t) + sizeof(uint8_t))) {
+    numeric_order_charge = TryReserveQueryMemory(
+        rows.size() * (sizeof(uint64_t) + sizeof(uint8_t)));
+    if (numeric_order_charge) {
+      numeric_keys.resize(rows.size());
+      numeric_nulls.resize(rows.size());
+      constexpr uint64_t sign = uint64_t{1} << 63;
+      for (size_t r = 0; r < rows.size(); ++r) {
+        const auto& value = rows[r][*integer_order_slot];
+        if (value.IsNull()) {
+          numeric_nulls[r] = 1;
+          numeric_has_null = true;
+        } else if (integer_order) {
+          numeric_keys[r] =
+              std::bit_cast<uint64_t>(value.value.int_value) ^ sign;
+        } else {
+          const double number = value.value.double_value;
+          if (std::isnan(number)) {
+            numeric_keys[r] = 0;  // NaN sorts before every finite value/-inf.
+          } else {
+            const auto bits =
+                std::bit_cast<uint64_t>(number == 0.0 ? 0.0 : number);
+            numeric_keys[r] = (bits & sign) != 0 ? ~bits : (bits ^ sign);
+          }
+        }
+      }
+    }
+  }
+  if (numeric_order_charge) {
+    const auto finish_partition = [&](size_t index) {
+      auto& partition = layout.partitions[index];
+      const bool ascending = window.order_by[0].ascending;
+      const bool nulls_first =
+          window.order_by[0].nulls_first.value_or(ascending);
+      std::sort(partition.ordered.begin(), partition.ordered.end(),
+                [&](size_t a, size_t b) {
+                  if (numeric_has_null &&
+                      (numeric_nulls[a] != 0 || numeric_nulls[b] != 0)) {
+                    return numeric_nulls[a] == numeric_nulls[b]
+                               ? a < b
+                               : (numeric_nulls[a] != 0) == nulls_first;
+                  }
+                  const uint64_t x = numeric_keys[a];
+                  const uint64_t y = numeric_keys[b];
+                  return x == y ? a < b : (ascending ? x < y : x > y);
+                });
+
+      partition.order_values =
+          WindowOrderValues(rows, partition.ordered, *integer_order_slot);
+      const size_t size = partition.ordered.size();
+      partition.peer_end.resize(size);
+      // The encoded domain has exactly the same peers: NULL is separate,
+      // NaNs share one key, and signed zero was normalized before sorting.
+      for (size_t first = 0; first < size;) {
+        const size_t row = partition.ordered[first];
+        size_t end = first + 1;
+        while (end < size) {
+          const size_t next = partition.ordered[end];
+          if (numeric_nulls[row] != numeric_nulls[next] ||
+              numeric_keys[row] != numeric_keys[next]) {
+            break;
+          }
+          ++end;
+        }
+        std::fill(
+            partition.peer_end.begin() + static_cast<std::ptrdiff_t>(first),
+            partition.peer_end.begin() + static_cast<std::ptrdiff_t>(end),
+            end - 1);
+        first = end;
+      }
+    };
+    const size_t workers =
+        rows.size() < 16384
+            ? 1
+            : std::min<size_t>({8, layout.partitions.size(),
+                                QueryParallelWorkerLimit(
+                                    std::thread::hardware_concurrency())});
+    RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+      for (size_t p = worker; p < layout.partitions.size(); p += workers) {
+        finish_partition(p);
+      }
+    }));
+    return layout;
+  }
   for (WindowPartitionLayout& partition : layout.partitions) {
-    partition.order_values.resize(partition.ordered.size());
-    if (!window.order_by.empty()) {
+    if (double_order) {
+      const auto slot = *integer_order_slot;
+      const bool ascending = window.order_by[0].ascending;
+      const bool nulls_first =
+          window.order_by[0].nulls_first.value_or(ascending);
+      std::stable_sort(partition.ordered.begin(), partition.ordered.end(),
+                       [&](size_t a, size_t b) {
+                         const auto& lhs = rows[a][slot];
+                         const auto& rhs = rows[b][slot];
+                         if (lhs.IsNull() || rhs.IsNull()) {
+                           return lhs.IsNull() != rhs.IsNull() &&
+                                  (lhs.IsNull() == nulls_first);
+                         }
+                         const double l = lhs.value.double_value;
+                         const double r = rhs.value.double_value;
+                         if (std::isnan(l) || std::isnan(r)) {
+                           return std::isnan(l) != std::isnan(r) &&
+                                  (ascending ? std::isnan(l) : std::isnan(r));
+                         }
+                         return ascending ? l < r : l > r;
+                       });
+    } else if (integer_order) {
+      const auto slot = *integer_order_slot;
+      const bool ascending = window.order_by[0].ascending;
+      const bool nulls_first =
+          window.order_by[0].nulls_first.value_or(ascending);
+      std::stable_sort(partition.ordered.begin(), partition.ordered.end(),
+                       [&](size_t a, size_t b) {
+                         const auto& lhs = rows[a][slot];
+                         const auto& rhs = rows[b][slot];
+                         if (lhs.IsNull() || rhs.IsNull()) {
+                           return lhs.IsNull() != rhs.IsNull() &&
+                                  (lhs.IsNull() == nulls_first);
+                         }
+                         return ascending
+                                    ? lhs.value.int_value < rhs.value.int_value
+                                    : lhs.value.int_value > rhs.value.int_value;
+                       });
+    } else if (direct_order) {
+      std::stable_sort(partition.ordered.begin(), partition.ordered.end(),
+                       [&](size_t a, size_t b) {
+                         for (size_t t = 0; t < order_offsets.size(); ++t) {
+                           const auto& lhs = rows[a][*order_offsets[t]];
+                           const auto& rhs = rows[b][*order_offsets[t]];
+                           if (ValuesEqual(lhs, rhs)) {
+                             continue;
+                           }
+                           const auto& term = window.order_by[t];
+                           return ValueLess(lhs, rhs, term.ascending,
+                                            term.nulls_first);
+                         }
+                         return false;
+                       });
+    }
+    if (integer_order || double_order) {
+      partition.order_values =
+          WindowOrderValues(rows, partition.ordered, *integer_order_slot);
+    } else {
+      partition.order_values =
+          WindowOrderValues(partition.ordered.size(), window.order_by.size());
+    }
+    if (!window.order_by.empty() && !integer_order && !double_order) {
       for (size_t k = 0; k < partition.ordered.size(); ++k) {
-        auto& values = partition.order_values[k];
-        values.reserve(window.order_by.size());
-        for (const WindowOrderTerm& term : window.order_by) {
-          ASSIGN_OR_RETURN(
-              Value, key,
-              (runtime.EvalAt(term.expression, rows, partition.ordered[k])));
+        auto values = partition.order_values[k];
+        for (size_t t = 0; t < window.order_by.size(); ++t) {
+          const auto& term = window.order_by[t];
+          Value key;
+          if (const auto offset = order_offsets[t]) {
+            key = rows[partition.ordered[k]][*offset];
+          } else {
+            ASSIGN_OR_RETURN(
+                Value, evaluated,
+                runtime.EvalAt(term.expression, rows, partition.ordered[k]));
+            key = std::move(evaluated);
+          }
           // COLLATE-wrapped keys sort case-insensitively ('und:ci'); folding
           // the hidden sort key is sufficient because ValueLess then only
           // sees the folded text. The collation comes from the value's tag
@@ -1940,38 +2306,45 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
           // call — a parameter, a subquery output — folds too, and non-ASCII
           // bytes keep byte order instead of passing through std::tolower.
           key = ApplyKeyCollation(key, CollationOfExpression(term.expression));
-          values.push_back(std::move(key));
+          values[t] = std::move(key);
         }
       }
-      std::vector<size_t> positions(partition.ordered.size());
-      std::iota(positions.begin(), positions.end(), 0);
-      std::stable_sort(positions.begin(), positions.end(),
-                       [&](size_t a, size_t b) {
-                         for (size_t t = 0; t < window.order_by.size(); ++t) {
-                           const WindowOrderTerm& term = window.order_by[t];
-                           if (ValuesEqual(partition.order_values[a][t],
-                                           partition.order_values[b][t])) {
-                             continue;
+      if (!direct_order) {
+        std::vector<size_t> positions(partition.ordered.size());
+        std::iota(positions.begin(), positions.end(), 0);
+        std::stable_sort(positions.begin(), positions.end(),
+                         [&](size_t a, size_t b) {
+                           for (size_t t = 0; t < window.order_by.size(); ++t) {
+                             const WindowOrderTerm& term = window.order_by[t];
+                             if (ValuesEqual(partition.order_values[a][t],
+                                             partition.order_values[b][t])) {
+                               continue;
+                             }
+                             return ValueLess(partition.order_values[a][t],
+                                              partition.order_values[b][t],
+                                              term.ascending, term.nulls_first);
                            }
-                           return ValueLess(partition.order_values[a][t],
-                                            partition.order_values[b][t],
-                                            term.ascending, term.nulls_first);
-                         }
-                         return false;
-                       });
-      std::vector<size_t> sorted_members(partition.ordered.size());
-      std::vector<std::vector<Value>> sorted_values(partition.ordered.size());
-      for (size_t k = 0; k < positions.size(); ++k) {
-        sorted_members[k] = partition.ordered[positions[k]];
-        sorted_values[k] = std::move(partition.order_values[positions[k]]);
+                           return false;
+                         });
+        std::vector<size_t> sorted_members(partition.ordered.size());
+        WindowOrderValues sorted_values(partition.ordered.size(),
+                                        window.order_by.size());
+        for (size_t k = 0; k < positions.size(); ++k) {
+          sorted_members[k] = partition.ordered[positions[k]];
+          auto destination = sorted_values[k];
+          auto source = partition.order_values[positions[k]];
+          std::ranges::move(source, destination.begin());
+        }
+        partition.ordered = std::move(sorted_members);
+        partition.order_values = std::move(sorted_values);
       }
-      partition.ordered = std::move(sorted_members);
-      partition.order_values = std::move(sorted_values);
     }
 
     const size_t m = partition.ordered.size();
     partition.peer_end.resize(m);
-    for (size_t a = 0; a < m; ++a) {
+    // Discover each peer run once. Re-scanning its suffix for every row is
+    // quadratic for constant ORDER BY keys (including an unordered window).
+    for (size_t a = 0; a < m;) {
       size_t end = a;
       while (end + 1 < m) {
         bool equal = true;
@@ -1987,10 +2360,129 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
         }
         ++end;
       }
-      partition.peer_end[a] = end;
+      std::fill(
+          partition.peer_end.begin() + static_cast<std::ptrdiff_t>(a),
+          partition.peer_end.begin() + static_cast<std::ptrdiff_t>(end + 1),
+          end);
+      a = end + 1;
     }
   }
   return layout;
+}
+
+StatusOr<bool> TryComputeColumnPrefix(
+    const WindowFunctionCallExpression& window, const std::vector<Row>& rows,
+    std::optional<size_t> prefix_slot, const WindowPartitionLayout& partition,
+    std::vector<Value>* out) {
+  const std::string& fn = window.function;
+  const bool is_sum = fn == "SUM", is_avg = fn == "AVG";
+  const bool is_min = fn == "MIN", is_max = fn == "MAX",
+             is_count = fn == "COUNT";
+  const auto& ordered = partition.ordered;
+  const auto& peer_end = partition.peer_end;
+  const size_t m = ordered.size();
+  // Prefix frames add rows monotonically. For a plain column argument,
+  // update one state instead of rebuilding every preceding frame. Uniform
+  // numeric types preserve the reference evaluator's summation order and
+  // overflow rules; mixed-type inputs retain the general frame evaluator.
+  const bool whole_partition = !window.has_frame && window.order_by.empty();
+  const bool prefix_frame =
+      !window.has_frame ||
+      (window.frame_start.type == WindowFrameBoundType::kUnboundedPreceding &&
+       window.frame_end.type == WindowFrameBoundType::kCurrentRow &&
+       !window.frame_start.offset && !window.frame_end.offset);
+  if ((whole_partition || prefix_frame) &&
+      (window.frame_unit != WindowFrameUnit::kGroups ||
+       !window.order_by.empty()) &&
+      !window.distinct && !window.where_filter &&
+      window.inner_order_by.empty() && !window.inner_limit &&
+      window.exclusion == WindowFrameExclusion::kNone &&
+      window.args.size() == 1 &&
+      window.args[0]->Type() == TypeTag::kColumnValue &&
+      (is_sum || is_avg || is_min || is_max || is_count)) {
+    const auto slot = prefix_slot;
+    bool uniform = slot.has_value();
+    ValueType numeric_type = ValueType::kNull;
+    if (uniform && !is_count) {
+      for (const auto index : ordered) {
+        const auto& value = rows[index][*slot];
+        if (value.IsNull()) {
+          continue;
+        }
+        const bool numeric = is_sum || is_avg;
+        if ((value.type != ValueType::kInt64 &&
+             value.type != ValueType::kDouble &&
+             (numeric || (value.type != ValueType::kDate &&
+                          value.type != ValueType::kVarChar))) ||
+            (numeric && value.IsUnsigned()) ||
+            (numeric_type != ValueType::kNull && numeric_type != value.type)) {
+          uniform = false;
+          break;
+        }
+        numeric_type = value.type;
+      }
+    }
+    if (uniform) {
+      size_t consumed = 0;
+      int64_t count = 0, int_total = 0;
+      double double_total = 0;
+      Value best;
+      for (size_t k = 0; k < m; ++k) {
+        const size_t end =
+            whole_partition ? m - 1
+            : window.has_frame && window.frame_unit == WindowFrameUnit::kRows
+                ? k
+                : peer_end[k];
+        while (consumed <= end) {
+          const auto& value = rows[ordered[consumed++]][*slot];
+          if (value.IsNull()) {
+            continue;
+          }
+          ++count;
+          if (is_sum || is_avg) {
+            if (numeric_type == ValueType::kDouble) {
+              double_total += value.value.double_value;
+            } else if (__builtin_add_overflow(int_total, value.value.int_value,
+                                              &int_total)) {
+              return StatusError(StatusCode::kIsInfinity,
+                                 "integer overflow in " + fn);
+            }
+          } else if (is_min || is_max) {
+            const bool value_nan = value.type == ValueType::kDouble &&
+                                   std::isnan(value.value.double_value);
+            const bool best_nan = best.type == ValueType::kDouble &&
+                                  std::isnan(best.value.double_value);
+            if (best.IsNull() ||
+                (!best_nan &&
+                 (value_nan || (is_min ? ValueLess(value, best, true)
+                                       : ValueLess(best, value, true))))) {
+              best = value;
+            }
+          }
+        }
+        Value value;
+        if (is_count) {
+          value = Value(count);
+        } else if (is_min || is_max) {
+          value = best;
+        } else if (count != 0) {
+          if (is_avg) {
+            value = Value((numeric_type == ValueType::kDouble
+                               ? double_total
+                               : static_cast<double>(int_total)) /
+                          static_cast<double>(count));
+          } else {
+            value = numeric_type == ValueType::kDouble ? Value(double_total)
+                                                       : Value(int_total);
+          }
+        }
+        (*out)[ordered[k]] = std::move(value);
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 Status ComputeOneWindowImpl(TransactionContext& context,
@@ -2017,14 +2509,56 @@ Status ComputeOneWindowImpl(TransactionContext& context,
     layout = &local_layout;
   }
 
+  const std::string& fn = window.function;
+  const auto prefix_slot =
+      window.args.size() == 1 && window.args[0] &&
+              window.args[0]->Type() == TypeTag::kColumnValue
+          ? LocalColumnOffset(schema,
+                              window.args[0]->AsColumnValue().GetColumnName())
+          : std::nullopt;
+  if (prefix_slot && n >= 16384 && layout->partitions.size() > 1 &&
+      (fn == "SUM" || fn == "AVG" || fn == "MIN" || fn == "MAX" ||
+       fn == "COUNT")) {
+    const auto workers = std::min<size_t>(
+        {8, layout->partitions.size(),
+         QueryParallelWorkerLimit(std::thread::hardware_concurrency())});
+    if (workers > 1) {
+      // Each partition owns disjoint output positions. This helper only reads
+      // column values; contextful expressions stay on the serial evaluator.
+      // Prefix arithmetic retains its exact original order within each
+      // partition.
+      std::vector<Status> errors(workers, Status::kSuccess);
+      std::vector<size_t> error_partitions(workers, SIZE_MAX);
+      std::atomic<bool> unhandled{false};
+      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+        for (size_t p = worker; p < layout->partitions.size(); p += workers) {
+          const auto result = TryComputeColumnPrefix(
+              window, rows, prefix_slot, layout->partitions[p], out);
+          if (!result.HasValue()) {
+            if (errors[worker].ok()) {
+              errors[worker] = result.GetStatus();
+              error_partitions[worker] = p;
+            }
+          } else if (!result.Value()) {
+            unhandled.store(true, std::memory_order_relaxed);
+          }
+        }
+      }));
+      if (!unhandled.load(std::memory_order_relaxed)) {
+        const auto first = std::ranges::min_element(error_partitions);
+        return *first == SIZE_MAX ? Status::kSuccess
+                                  : errors[static_cast<size_t>(
+                                        first - error_partitions.begin())];
+      }
+      // A mixed/unsupported partition needs the general evaluator. Recompute
+      // in partition order so its errors retain the serial precedence, too.
+    }
+  }
   for (const WindowPartitionLayout& partition : layout->partitions) {
     const std::vector<size_t>& ordered = partition.ordered;
-    const std::vector<std::vector<Value>>& order_values =
-        partition.order_values;
+    const WindowOrderValues& order_values = partition.order_values;
     const std::vector<size_t>& peer_end = partition.peer_end;
     const size_t m = ordered.size();
-
-    const std::string& fn = window.function;
 
     if (fn == "ROW_NUMBER") {
       for (size_t k = 0; k < m; ++k) {
@@ -2288,6 +2822,13 @@ Status ComputeOneWindowImpl(TransactionContext& context,
       continue;
     }
 
+    ASSIGN_OR_RETURN(
+        bool, prefix_done,
+        TryComputeColumnPrefix(window, rows, prefix_slot, partition, out));
+    if (prefix_done) {
+      continue;
+    }
+
     // Everything else is treated as an aggregate over the frame.
     // PERCENTILE_CONT/DISC are analytic functions: they ignore the window
     // frame and always see the whole partition.
@@ -2447,44 +2988,24 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
       }
       Expression qualify =
           InlineAliases(statement.Qualify(), aliases, input.schema);
-      Relation filtered(context.execution_runtime());
-      filtered.schema = input.schema;
-      CopyExecutionStats(&filtered, input);
-      input.FinishSpill();
-      Status qualify_error{Status::kSuccess};
-      input.ForEachRow([&](const Row& row) {
-        Scope scope{.row = &row, .schema = &input.schema, .outer = outer};
-        if (qualify_error != Status::kSuccess) {
-          return;
-        }
-        StatusOr<Value> keep =
-            TryEvaluate(qualify, scope, nullptr, context, ctes);
-        if (!keep.HasValue()) {
-          qualify_error = keep.GetStatus();
-          return;
-        }
-        if (Truthy(keep.Value())) {
-          filtered.AddRow(row);
-        }
-      });
-      if (qualify_error != Status::kSuccess) {
-        return qualify_error;
-      }
-      RETURN_IF_FAIL(filtered.FinishSpill());
-      result.input = std::move(filtered);
-    } else {
-      result.input = std::move(input);
+      RETURN_IF_FAIL(FilterRelation(context, &input, {qualify}, outer, ctes));
     }
+    result.input = std::move(input);
     return result;
   }
 
-  input.FinishSpill();
-  // PRODUCTION FIX: Relation::AddRow spills to disk under a memory budget;
-  // moving input.rows alone dropped every spilled row. Collect all rows
-  // (resident + spilled) instead.
+  RETURN_IF_FAIL(input.FinishSpill());
+  RETURN_IF_FAIL(input.GetStatus());
   std::vector<Row> rows;
-  input.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
-  input.ResetContents();
+  if (!input.HasSpill()) {
+    // Keep the input's charge alive while the windows borrow these rows.
+    // Moving the resident rows avoids copying every string and Value twice.
+    rows = std::move(input.rows);
+  } else {
+    rows.reserve(input.TotalRows());
+    RETURN_IF_FAIL(
+        input.ForEachRow([&rows](const Row& row) { rows.push_back(row); }));
+  }
   const Schema base_schema = input.schema;
 
   ReplacementMap replacements;
@@ -2523,8 +3044,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                         &computed.back(), &layout_it->second));
   }
   for (size_t r = 0; r < rows.size(); ++r) {
+    rows[r].values_.reserve(base_width + windows.size());
     for (size_t w = 0; w < windows.size(); ++w) {
-      rows[r].values_.push_back(computed[w][r]);
+      rows[r].values_.push_back(std::move(computed[w][r]));
     }
   }
   // Fix hidden column types from the computed values.
@@ -2541,8 +3063,13 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
 
   Relation extended(context.execution_runtime());
   extended.schema = Schema("", std::move(extended_columns));
-  extended.rows = std::move(rows);
-  extended.FinishSpill();
+  CopyExecutionStats(&extended, input);
+  input.ResetContents();
+  for (Row& row : rows) {
+    extended.AddRow(std::move(row));
+  }
+  RETURN_IF_FAIL(extended.FinishSpill());
+  RETURN_IF_FAIL(extended.GetStatus());
 
   // Rewrite the statement copy on top of a fresh replacement map (the map was
   // consumed by reference above).
@@ -2567,32 +3094,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   if (statement.Qualify()) {
     Expression qualify = InlineAliases(
         Rebuild(statement.Qualify(), replacements), aliases, extended.schema);
-    Relation filtered(context.execution_runtime());
-    filtered.schema = extended.schema;
-    Status qualify_error{Status::kSuccess};
-    extended.ForEachRow([&](const Row& row) {
-      Scope scope{.row = &row, .schema = &extended.schema, .outer = outer};
-      if (qualify_error != Status::kSuccess) {
-        return;
-      }
-      StatusOr<Value> keep =
-          TryEvaluate(qualify, scope, nullptr, context, ctes);
-      if (!keep.HasValue()) {
-        qualify_error = keep.GetStatus();
-        return;
-      }
-      if (Truthy(keep.Value())) {
-        filtered.AddRow(row);
-      }
-    });
-    if (qualify_error != Status::kSuccess) {
-      return qualify_error;
-    }
-    RETURN_IF_FAIL(filtered.FinishSpill());
-    result.input = std::move(filtered);
-  } else {
-    result.input = std::move(extended);
+    RETURN_IF_FAIL(FilterRelation(context, &extended, {qualify}, outer, ctes));
   }
+  result.input = std::move(extended);
   result.hidden_columns = windows.size();
   return result;
 }

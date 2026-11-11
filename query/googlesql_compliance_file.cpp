@@ -378,6 +378,9 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
            std::isspace(static_cast<unsigned char>(result[offset])) != 0) {
       ++offset;
     }
+    if (offset >= result.size() || result[offset] == ']') {
+      break;
+    }
     std::vector<std::string> fields;
     if (result[offset] == '{') {
       if (!ParseStructRow(result, &offset, &fields)) {
@@ -411,9 +414,9 @@ void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
       }
       if (c == '<' || c == '[' || c == '(' || c == '{') {
         ++depth;
-      } else if ((c == '>' || c == ')' || c == '}') && depth > 0) {
+      } else if ((c == '>' || c == ')' || c == '}' || c == ']') && depth > 0) {
         --depth;
-      } else if ((c == ',' && depth == 0) || c == ']') {
+      } else if ((c == ',' || c == ']') && depth == 0) {
         break;
       }
       ++end;

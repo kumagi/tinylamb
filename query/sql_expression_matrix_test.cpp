@@ -3,6 +3,11 @@
 // Operator x operand-type matrix, arrays, structs, JSON, casts, and date-bucket
 // sweep over the relational expression evaluator
 // (executor/detail/expression_eval.cpp).
+// Compatibility limitation: BOOL currently shares INT64's runtime domain.
+// Mixed BOOL/numeric comparisons below characterize tinylamb, not GoogleSQL
+// conformance. GoogleSQL rejects those comparisons; strict rejection requires
+// preserving declared BOOL types through binding, storage and expression tiers.
+// CAST(INT64 AS BOOL), unlike implicit comparison coercion, is intentional.
 
 #include <gtest/gtest.h>
 
@@ -376,8 +381,8 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
        R"sql("1")sql"},
       {R"sql(SELECT JSON_EXTRACT('{"a": true}', '$.a'))sql", R"sql("true")sql"},
       {R"sql(SELECT JSON_EXTRACT('{"a": 1.5}', '$.a'))sql", R"sql("1.5")sql"},
-      // The JSON parser does not yet decode \" escapes inside strings and
-      // yields NULL; pins the current edge behavior.
+      // SQL string decoding removes this single backslash before JSON parsing;
+      // the resulting JSON is malformed. Raw SQL strings preserve the escape.
       {R"(SELECT JSON_EXTRACT('{"a": "quote\" inside"}', '$.a'))", "NULL"},
       {R"(SELECT JSON_EXTRACT('"top"', '$'))", R"(""top"")"},
       {"SELECT JSON_EXTRACT('123', '$')", R"sql("123")sql"},
@@ -391,9 +396,8 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       {"SELECT JSON_EXTRACT_ARRAY('[[1,2],[3]]', '$')",
        R"sql(ARRAY<STRING>["[1,2]", "[3]"])sql"},
       {"SELECT JSON_EXTRACT_SCALAR('[1, 2]', '$[1]')", R"sql("2")sql"},
-      // Bracket form $["key"] is not supported yet (even for plain keys)
-      // and yields NULL; quoted dot access and unicode keys work.
-      {R"(SELECT JSON_EXTRACT('{"a b": 1}', '$["a b"]'))", "NULL"},
+      // Quoted bracket and dot forms select the same object member.
+      {R"(SELECT JSON_EXTRACT('{"a b": 1}', '$["a b"]'))", R"sql("1")sql"},
       {R"(SELECT JSON_EXTRACT('{"a b": 1}', '$."a b"'))", R"sql("1")sql"},
       {"SELECT JSON_EXTRACT('{\"\xe6\x97\xa5\": 1}', '$.\xe6\x97\xa5')",
        R"sql("1")sql"},  // NOLINT(modernize-raw-string-literal)
@@ -499,14 +503,12 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
       {"SELECT TIMESTAMP_TRUNC(TIMESTAMP '2026-05-04 03:04:05+00', MINUTE)",
        R"sql("2026-05-04 03:04:00+00")sql"},
       {"SELECT TIMESTAMP_TRUNC(TIMESTAMP '2026-05-04 03:04:05+00', DAY)",
-       R"sql("2026-05-03 07:00:00+00")sql"},
+       R"sql("2026-05-04 00:00:00+00")sql"},
       {"SELECT TIMESTAMP_TRUNC(TIMESTAMP '2026-05-04 03:04:05+00', SECOND)",
        R"sql("2026-05-04 03:04:05+00")sql"},
       {"SELECT TIMESTAMP(TIMESTAMP '2026-01-02 03:04:05+00', '+05:30')",
        R"sql("2026-01-02 03:04:05+00")sql"},
       {"SELECT TIMESTAMP(TIMESTAMP '2026-01-02 03:04:05+00', '-08')",
-       R"sql("2026-01-02 03:04:05+00")sql"},
-      {"SELECT TIMESTAMP(TIMESTAMP '2026-01-02 03:04:05+00', '0530')",
        R"sql("2026-01-02 03:04:05+00")sql"},
       {"SELECT TIMESTAMP(TIMESTAMP '2026-01-02 03:04:05+00', 'UTC')",
        R"sql("2026-01-02 03:04:05+00")sql"},
@@ -541,9 +543,13 @@ TEST_F(SqlExpressionMatrixTest, PinnedScalarTable) {
   }
 }
 
-// Pinned failures: the statement must raise through the SQL boundary.
+// Literal NULL arithmetic/NOT rejection follows the pinned GoogleSQL corpus
+// (arithmetic_functions.test: arithmetic_functions_3; logical_functions.test:
+// logical_not_null). Typed NULLs still propagate at runtime; see SQL audit
+// tests. Pinned failures: the statement must raise through the SQL boundary.
 TEST_F(SqlExpressionMatrixTest, ErrorTable) {
   const std::vector<std::string> cases = {
+      "SELECT TIMESTAMP(TIMESTAMP '2026-01-02 03:04:05+00', '0530')",
       "SELECT 1 + 'a'",
       "SELECT 1 + NULL",
 
@@ -816,8 +822,9 @@ TEST_F(SqlExpressionMatrixTest, ErrorTable) {
   }
 }
 
-// Executed without value pinning: behavior under review; coverage
-// keeps the branches exercised.
+// Mixed BOOL/numeric arithmetic has the same compatibility limitation as
+// the comparison pins above. This coverage sweep does not claim GoogleSQL
+// conformance or freeze the coercion as a supported SQL contract.
 TEST_F(SqlExpressionMatrixTest, DeviationSweep) {
   const std::vector<std::string> cases = {
       "SELECT 1 + true",   "SELECT 1.5 + true",  "SELECT true + 1",

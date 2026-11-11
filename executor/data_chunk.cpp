@@ -132,6 +132,9 @@ void ColumnVector::PromoteToHeterogeneous() {
 
 void ColumnVector::Append(const Value& value) {
   const bool is_null = value.IsNull();
+  if (value.IsInterval() && !heterogeneous_) {
+    PromoteToHeterogeneous();
+  }
   if (heterogeneous_) {
     EnsureNullBit(size_, is_null);
     nested_.push_back(is_null ? Value() : value);
@@ -182,6 +185,9 @@ void ColumnVector::Append(const Value& value) {
 
 void ColumnVector::Append(Value&& value) {
   const bool is_null = value.IsNull();
+  if (value.IsInterval() && !heterogeneous_) {
+    PromoteToHeterogeneous();
+  }
   if (heterogeneous_) {
     EnsureNullBit(size_, is_null);
     nested_.push_back(is_null ? Value() : std::move(value));
@@ -221,7 +227,7 @@ void ColumnVector::Append(Value&& value) {
         if (value.owned_data.empty()) {
           strings_.emplace_back(value.value.varchar_value);
         } else {
-          strings_.emplace_back(std::move(value.owned_data));
+          strings_.emplace_back(value.MoveString());
         }
         break;
       case ValueType::kArray:
@@ -958,7 +964,12 @@ Value ColumnVector::AggregateBitAnd(const SelectionVector* sel) const {
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #ifdef __clang__
+// Sanitizer checks inhibit this reduction's vectorization. Keep those
+// checks intact and request SIMD only for uninstrumented builds.
+#if !__has_feature(undefined_behavior_sanitizer) && \
+    !__has_feature(address_sanitizer) && !__has_feature(thread_sanitizer)
 #pragma clang loop vectorize(enable)
+#endif
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc &= static_cast<uint64_t>(data[base + i]);
@@ -1010,7 +1021,12 @@ Value ColumnVector::AggregateBitOr(const SelectionVector* sel) const {
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #ifdef __clang__
+// Sanitizer checks inhibit this reduction's vectorization. Keep those
+// checks intact and request SIMD only for uninstrumented builds.
+#if !__has_feature(undefined_behavior_sanitizer) && \
+    !__has_feature(address_sanitizer) && !__has_feature(thread_sanitizer)
 #pragma clang loop vectorize(enable)
+#endif
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc |= static_cast<uint64_t>(data[base + i]);
@@ -1062,7 +1078,12 @@ Value ColumnVector::AggregateBitXor(const SelectionVector* sel) const {
       const uint64_t null_word = w < null_bitmap_.size() ? null_bitmap_[w] : 0;
       if (null_word == 0) {
 #ifdef __clang__
+// Sanitizer checks inhibit this reduction's vectorization. Keep those
+// checks intact and request SIMD only for uninstrumented builds.
+#if !__has_feature(undefined_behavior_sanitizer) && \
+    !__has_feature(address_sanitizer) && !__has_feature(thread_sanitizer)
 #pragma clang loop vectorize(enable)
+#endif
 #endif
         for (size_t i = 0; i < limit; ++i) {
           acc ^= static_cast<uint64_t>(data[base + i]);

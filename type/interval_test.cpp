@@ -318,4 +318,16 @@ TEST(IntervalTest, SessionConstants) {
   EXPECT_FALSE(HasSessionConstant("never_set"));
 }
 
+TEST(IntervalTest, AuditQualifiedTimeRejectsOverflow) {
+  for (const char* text :
+       {"3000000000000000:0:0", "-3000000000000000:0:0", "0:3000000000000000:0",
+        "3000000:0:0", "3000000000000000:0:0 0 0", "3000000:0:0 0 0"}) {
+    EXPECT_FALSE(IntervalValue::TryParse(text, "hour to second").HasValue())
+        << text;
+  }
+  auto valid = IntervalValue::TryParse("1:2:3.000000001", "hour to second");
+  ASSERT_TRUE(valid.HasValue());
+  EXPECT_EQ(valid.Value().nanos, 3723000000001LL);
+}
+
 }  // namespace tinylamb

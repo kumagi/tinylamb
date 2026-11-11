@@ -99,6 +99,21 @@ char Or3vl(char l, char r) {
 }
 char Not3vl(char v) { return v == 'T' ? 'F' : (v == 'F' ? 'T' : 'N'); }
 
+// Qualifies a bare column (`a` → `l.a`) so a predicate can be replayed on
+// one side of a join.  An empty qualifier leaves the name unchanged, which
+// is what every single-table oracle renders.
+std::string QualCol(std::string_view qual, std::string_view name) {
+  if (qual.empty()) {
+    return std::string(name);
+  }
+  std::string out;
+  out.reserve(qual.size() + 1 + name.size());
+  out.append(qual);
+  out.push_back('.');
+  out.append(name);
+  return out;
+}
+
 struct RPred {
   enum class Kind {
     kIntCmp,     // int_col op rhs (constant or other int column)
@@ -354,33 +369,35 @@ struct RPred {
     return 'N';
   }
 
-  [[nodiscard]] std::string Render() const {
+  // `qual` prefixes every column (`l.a`).  Empty keeps the historical
+  // single-table spelling, so existing oracles stay byte-identical.
+  [[nodiscard]] std::string Render(std::string_view qual = {}) const {
+    auto icol = [&](int column) {
+      return QualCol(qual, column == 0 ? "a" : "b");
+    };
     switch (kind) {
       case Kind::kIntCmp: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
-        const std::string rhs = rhs_is_col
-                                    ? kIntCols[static_cast<size_t>(rhs_col)]
-                                    : std::to_string(rhs_const);
-        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) + " " +
-               op + " " + rhs + ")";
+        const std::string rhs =
+            rhs_is_col ? icol(rhs_col) : std::to_string(rhs_const);
+        return "(" + icol(col) + " " + op + " " + rhs + ")";
       }
       case Kind::kIntIsNull: {
-        std::string out = "(";
-        out += (col == 0 ? "a" : "b");
-        out += " IS ";
+        std::string out = "(" + icol(col) + " IS ";
         if (negated) {
           out += "NOT ";
         }
         out += "NULL)";
         return out;
       }
-      case Kind::kBoolCol:
-        return bool_positive ? "flag" : "(NOT flag)";
+      case Kind::kBoolCol: {
+        const std::string flag = QualCol(qual, "flag");
+        return bool_positive ? flag : "(NOT " + flag + ")";
+      }
       case Kind::kStrCmp:
-        return "(s " + op + " '" + kStrPool[static_cast<size_t>(str_const)] +
-               "')";
+        return "(" + QualCol(qual, "s") + " " + op + " '" +
+               kStrPool[static_cast<size_t>(str_const)] + "')";
       case Kind::kStrIsNull: {
-        std::string out = "(s IS ";
+        std::string out = "(" + QualCol(qual, "s") + " IS ";
         if (negated) {
           out += "NOT ";
         }
@@ -388,35 +405,30 @@ struct RPred {
         return out;
       }
       case Kind::kNot:
-        return "(NOT " + left->Render() + ")";
+        return "(NOT " + left->Render(qual) + ")";
       case Kind::kIsNullWrap:
-        return "(" + left->Render() + ") IS NULL";
+        return "(" + left->Render(qual) + ") IS NULL";
       case Kind::kBin:
-        return "(" + left->Render() + " " + op + " " + right->Render() + ")";
+        return "(" + left->Render(qual) + " " + op + " " + right->Render(qual) +
+               ")";
       case Kind::kIsDistinctFrom: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
         const std::string rhs =
-            rhs_is_null ? "NULL"
-                        : (rhs_is_col ? kIntCols[static_cast<size_t>(rhs_col)]
-                                      : std::to_string(rhs_const));
-        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) + " IS " +
-               (negated ? "NOT " : "") + "DISTINCT FROM " + rhs + ")";
+            rhs_is_null
+                ? "NULL"
+                : (rhs_is_col ? icol(rhs_col) : std::to_string(rhs_const));
+        return "(" + icol(col) + " IS " + (negated ? "NOT " : "") +
+               "DISTINCT FROM " + rhs + ")";
       }
       case Kind::kBetween: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
         const std::string lo =
             between_lo_null ? "NULL" : std::to_string(between_lo);
         const std::string hi =
             between_hi_null ? "NULL" : std::to_string(between_hi);
-        return "(" + std::string(kIntCols[static_cast<size_t>(col)]) +
-               (negated ? " NOT BETWEEN " : " BETWEEN ") + lo + " AND " + hi +
-               ")";
+        return "(" + icol(col) + (negated ? " NOT BETWEEN " : " BETWEEN ") +
+               lo + " AND " + hi + ")";
       }
       case Kind::kInList: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
-        std::string out = "(" +
-                          std::string(kIntCols[static_cast<size_t>(col)]) +
-                          (negated ? " NOT IN (" : " IN (");
+        std::string out = "(" + icol(col) + (negated ? " NOT IN (" : " IN (");
         for (size_t i = 0; i < in_list.size(); ++i) {
           if (i > 0) {
             out += ", ";
@@ -429,26 +441,21 @@ struct RPred {
       case Kind::kStrLike: {
         static const std::array<const char*, 5> kPatterns = {
             "'a%'", "'%b'", "'_'", "'%'", "'%z%'"};
-        return std::string("(s ") + (negated ? "NOT LIKE " : "LIKE ") +
+        return "(" + QualCol(qual, "s") + " " +
+               (negated ? "NOT LIKE " : "LIKE ") +
                kPatterns[static_cast<size_t>(str_pattern)] + ")";
       }
-      case Kind::kBitwiseAndCmp: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
-        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " & " +
-               std::to_string(mask) + ") " + op + " " +
+      case Kind::kBitwiseAndCmp:
+        return "(((" + icol(col) + " & " + std::to_string(mask) + ") " + op +
+               " " + std::to_string(rhs_const) + "))";
+      case Kind::kBitwiseNotCmp:
+        return "(((~" + icol(col) + ") " + op + " " +
                std::to_string(rhs_const) + "))";
-      }
-      case Kind::kBitwiseNotCmp: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
-        return "(((~" + std::string(kIntCols[static_cast<size_t>(col)]) + ") " +
-               op + " " + std::to_string(rhs_const) + "))";
-      }
       case Kind::kArithmeticCmp: {
-        static const std::array<const char*, 2> kIntCols = {"a", "b"};
         const std::string op_str = arith_const >= 0 ? "+" : "-";
         const int64_t abs_const = arith_const >= 0 ? arith_const : -arith_const;
-        return "(((" + std::string(kIntCols[static_cast<size_t>(col)]) + " " +
-               op_str + " " + std::to_string(abs_const) + ") " + op + " " +
+        return "(((" + icol(col) + " " + op_str + " " +
+               std::to_string(abs_const) + ") " + op + " " +
                std::to_string(rhs_const) + "))";
       }
     }
@@ -1637,28 +1644,123 @@ bool CheckSubq(Database& db, TransactionContext& ctx,
   return true;
 }
 
-bool CheckNoRec(Database& db, TransactionContext& ctx,
-                const std::vector<std::string>& norec, std::string* report,
-                bool verbose) {
-  if (norec.size() != 2) {
-    return true;
-  }
-  std::string error;
-  auto c = RunScalar(db, ctx, norec[0], &error);
-  auto s = RunScalar(db, ctx, norec[1], &error);
-  if (!(c.has_value() && s.has_value())) {
-    if (verbose) {
-      std::cerr << "[sql_oracle][norec-error] " << error << "\n";
+// Reference projections end with a 0/1 indicator.  Rows whose indicator is 1
+// are the ones the optimized WHERE must have returned.  Comparing the
+// payload (every column but the indicator) catches a wrong row whose
+// cardinality still matches.
+std::vector<std::string> NoRecPayloads(const std::vector<Row>& rows,
+                                       bool drop_indicator) {
+  std::vector<std::string> out;
+  out.reserve(rows.size());
+  for (const Row& row : rows) {
+    if (row.Count() == 0) {
+      continue;
     }
-    return false;
+    // Count() is the cell count.  Size() is the serialized byte length.
+    size_t keep = row.Count();
+    if (drop_indicator) {
+      if (keep < 2) {
+        continue;
+      }
+      const Value& indicator = row[keep - 1];
+      if (indicator.type != ValueType::kInt64 ||
+          indicator.value.int_value != 1) {
+        continue;
+      }
+      --keep;
+    }
+    std::vector<Value> cells;
+    cells.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) {
+      cells.push_back(row[i]);
+    }
+    out.push_back(Row(std::move(cells)).ToString());
   }
-  if (*c == *s) {
-    return true;
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// One NoREC phase.  A pair the engine rejects is skipped (the paper's
+// short-circuit / unsupported-syntax rule): a one-sided error is not a
+// mismatch.  Scalar pairs compare counts; content pairs compare payloads.
+void CheckNoRec(Database& db, TransactionContext& ctx, const OracleTrace& t,
+                const char* phase, std::string* report, bool verbose) {
+  auto note_skip = [&](const char* kind, const std::string& error,
+                       const std::string& sql) {
+    if (verbose) {
+      std::cerr << "[sql_oracle][norec-skip] " << phase << " " << kind << " "
+                << error << " :: " << sql << "\n";
+    }
+  };
+  if (t.norec.size() >= 2 && t.norec.size() % 2 == 0) {
+    for (size_t i = 0; i + 1 < t.norec.size(); i += 2) {
+      std::string error;
+      auto optimized = RunScalar(db, ctx, t.norec[i], &error);
+      if (!optimized.has_value()) {
+        note_skip("opt", error, t.norec[i]);
+        continue;
+      }
+      auto reference = RunScalar(db, ctx, t.norec[i + 1], &error);
+      if (!reference.has_value()) {
+        note_skip("ref", error, t.norec[i + 1]);
+        continue;
+      }
+      if (*optimized == *reference) {
+        continue;
+      }
+      *report += "[NoREC MISMATCH]\n";
+      *report += std::string("  phase: ") + phase + "\n";
+      *report += "  pair: " + std::to_string(i / 2) + "\n";
+      *report += "  optimized: " + t.norec[i] + " => " + *optimized + "\n";
+      *report += "  reference: " + t.norec[i + 1] + " => " + *reference + "\n";
+    }
   }
-  *report += "[NoREC MISMATCH]\n";
-  *report += "  optimized:   " + norec[0] + " => " + *c + "\n";
-  *report += "  reference:   " + norec[1] + " => " + *s + "\n";
-  return true;
+  if (t.norec_content.size() >= 2 && t.norec_content.size() % 2 == 0) {
+    for (size_t i = 0; i + 1 < t.norec_content.size(); i += 2) {
+      std::string error;
+      auto optimized = RunRows(db, ctx, t.norec_content[i], &error);
+      if (!optimized.has_value()) {
+        note_skip("content-opt", error, t.norec_content[i]);
+        continue;
+      }
+      auto reference = RunRows(db, ctx, t.norec_content[i + 1], &error);
+      if (!reference.has_value()) {
+        note_skip("content-ref", error, t.norec_content[i + 1]);
+        continue;
+      }
+      const std::vector<std::string> got = NoRecPayloads(*optimized, false);
+      const std::vector<std::string> expect = NoRecPayloads(*reference, true);
+      if (got == expect) {
+        continue;
+      }
+      *report += "[NoREC MISMATCH]\n";
+      *report += std::string("  phase: ") + phase + "\n";
+      *report += "  kind: rows\n";
+      *report += "  pair: " + std::to_string(i / 2) + "\n";
+      *report += "  optimized: " + t.norec_content[i] + " (" +
+                 std::to_string(got.size()) + " rows)\n" + DumpRows(got);
+      *report += "  reference: " + t.norec_content[i + 1] + " (" +
+                 std::to_string(expect.size()) + " rows)\n" + DumpRows(expect);
+    }
+  }
+}
+
+// ANALYZE every table the trace created so the indexed NoREC phase costs
+// access paths with statistics, not only with the indexes present.
+void AnalyzeCreatedTables(Database& db, TransactionContext& ctx,
+                          const std::vector<std::string>& setup) {
+  static constexpr std::string_view kCreate = "CREATE TABLE ";
+  for (const std::string& sql : setup) {
+    if (!sql.starts_with(kCreate)) {
+      continue;
+    }
+    const size_t begin = kCreate.size();
+    const size_t end = sql.find_first_of(" (", begin);
+    if (end == std::string::npos || end == begin) {
+      continue;
+    }
+    RunUpdate(db, ctx, "ANALYZE " + sql.substr(begin, end - begin) + ";");
+  }
 }
 
 // PQS: the harness-mirror count must match, and the pivot row must appear.
@@ -1957,6 +2059,118 @@ bool CheckXMode(Database& db, TransactionContext& ctx, const OracleTrace& t,
       }
     }
   }
+
+  // Template-cache multi-CTE parameter rebinding oracle (2026-11-10 audit
+  // High #22): warm up a single SqlEngine with non-alphabetical CTEs
+  // (`z_cte` before `a_cte`), then execute a second query with shifted
+  // literals on the SAME SqlEngine instance and compare against a fresh
+  // uncached relational reference engine.
+  {
+    SqlEngine cached_engine(db);
+    const std::string warm_sql =
+        "WITH z_cte AS (SELECT a AS v FROM " + tab +
+        " WHERE a IS NOT NULL UNION ALL SELECT 7), "
+        "a_cte AS (SELECT b AS v FROM " +
+        tab +
+        " WHERE b IS NOT NULL UNION ALL SELECT 8) "
+        "SELECT z_cte.v, a_cte.v FROM z_cte, a_cte WHERE z_cte.v >= -10;";
+    const std::string rebound_sql =
+        "WITH z_cte AS (SELECT a AS v FROM " + tab +
+        " WHERE a IS NOT NULL UNION ALL SELECT 17), "
+        "a_cte AS (SELECT b AS v FROM " +
+        tab +
+        " WHERE b IS NOT NULL UNION ALL SELECT 18) "
+        "SELECT z_cte.v, a_cte.v FROM z_cte, a_cte WHERE z_cte.v >= -5;";
+    if (auto w = cached_engine.Execute(ctx, warm_sql); w.HasValue()) {
+      w.Value().Drain();
+      if (auto r_cached = cached_engine.Execute(ctx, rebound_sql);
+          r_cached.HasValue()) {
+        std::vector<Row> cached_rows = r_cached.Value().Collect();
+        if (r_cached.Value().GetStatus().ok()) {
+          std::string ref_err;
+          ScopedEnv bc("TINYLAMB_DISABLE_BYTECODE", "1");
+          if (auto ref_rows = RunRowsMode(db, ctx, rebound_sql,
+                                          /*force_relational=*/true, &ref_err);
+              ref_rows.has_value()) {
+            const std::vector<std::string> s_cached =
+                SerializeSorted(cached_rows);
+            const std::vector<std::string> s_ref = SerializeSorted(*ref_rows);
+            if (s_cached != s_ref) {
+              *report += "[TEMPLATE-CACHE CTE REBIND MISMATCH]\n";
+              *report += "  warm:    " + warm_sql + "\n";
+              *report += "  rebound: " + rebound_sql + "\n";
+              *report += "  expected:\n" + DumpRows(s_ref);
+              *report += "  actual:\n" + DumpRows(s_cached);
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // `SELECT AS STRUCT s.*` wildcard expansion oracle (2026-11-10 audit
+  // High #18): must match explicit column listing `SELECT AS STRUCT s.u, ...`.
+  {
+    std::string err1, err2;
+    const std::string q_star = "SELECT AS STRUCT s.* FROM " + tab + " s;";
+    const std::string q_expl =
+        "SELECT AS STRUCT s.u, s.a, s.b, s.flag, s.s FROM " + tab + " s;";
+    auto r_star =
+        RunRowsMode(db, ctx, q_star, /*force_relational=*/false, &err1);
+    auto r_expl =
+        RunRowsMode(db, ctx, q_expl, /*force_relational=*/false, &err2);
+    if (r_star.has_value() && r_expl.has_value()) {
+      const std::vector<std::string> s_star = SerializeSorted(*r_star);
+      const std::vector<std::string> s_expl = SerializeSorted(*r_expl);
+      if (s_star != s_expl) {
+        *report += "[SELECT-AS-STRUCT-STAR MISMATCH]\n";
+        *report += "  star: " + q_star + "\n";
+        *report += "  expl: " + q_expl + "\n";
+        return true;
+      }
+    }
+  }
+
+  // Suffixed table name (`<tab>` vs `<tab>_1`) outer-join null-rejection and
+  // anti-join oracle (2026-11-10 audit High #16, Medium #75): `IsSameTable`
+  // must not conflate a real table `<tab>_1` with `<tab>`.
+  {
+    const std::string tab_suf = tab + "_1";
+    if (RunUpdate(db, ctx, "CREATE TABLE " + tab_suf + " (x INT64);") &&
+        RunUpdate(db, ctx, "INSERT INTO " + tab_suf + " VALUES (0), (1);")) {
+      (void)ctx.txn_.PreCommit();
+      ctx = db.BeginContext();
+      const std::array<std::string, 2> suf_probes = {
+          "SELECT " + tab + ".u, " + tab + ".a FROM " + tab + " LEFT JOIN " +
+              tab_suf + " ON " + tab + ".a = " + tab_suf + ".x WHERE " + tab +
+              ".b > 0;",
+          "SELECT " + tab + ".u, " + tab + ".a FROM " + tab + " LEFT JOIN " +
+              tab_suf + " ON " + tab + ".a = " + tab_suf + ".x WHERE " + tab +
+              ".b IS NULL;",
+      };
+      for (const std::string& q_suf : suf_probes) {
+        std::string err_opt, err_ref;
+        auto r_opt =
+            RunRowsMode(db, ctx, q_suf, /*force_relational=*/false, &err_opt);
+        ScopedEnv bc("TINYLAMB_DISABLE_BYTECODE", "1");
+        auto r_ref =
+            RunRowsMode(db, ctx, q_suf, /*force_relational=*/true, &err_ref);
+        if (r_opt.has_value() && r_ref.has_value()) {
+          const std::vector<std::string> s_opt = SerializeSorted(*r_opt);
+          const std::vector<std::string> s_ref = SerializeSorted(*r_ref);
+          if (s_opt != s_ref) {
+            *report += "[SUFFIXED-TABLE OUTER-JOIN MISMATCH]\n";
+            *report += "  query: " + q_suf + "\n";
+            *report += "  expected:\n" + DumpRows(s_ref);
+            *report += "  actual:\n" + DumpRows(s_opt);
+            return true;
+          }
+        }
+      }
+    }
+  }
+
   return true;
 }
 
@@ -2404,6 +2618,206 @@ std::string RunSetup(Database& db, TransactionContext& ctx,
     }
   }
   return {};
+}
+
+// NoREC query constructors.  The optimized side keeps the predicate where
+// the optimizer rewrites it (WHERE, JOIN ON, GROUP BY).  The reference side
+// evaluates that predicate once per joined row and sums the TRUEs, which
+// leaves index ranges, join selection and filter pushdown with nothing to
+// attach to.  COALESCE turns the empty-input SUM NULL into 0 so it matches
+// COUNT(*).
+void PushNoRecPair(std::vector<std::string>* dst, std::string optimized,
+                   std::string reference) {
+  dst->push_back(std::move(optimized));
+  dst->push_back(std::move(reference));
+}
+
+std::string NoRecCount(const std::string& from, const std::string& pred) {
+  return "SELECT COUNT(*) FROM " + from + " WHERE (" + pred + ");";
+}
+
+std::string NoRecSum(const std::string& from, const std::string& pred) {
+  return "SELECT COALESCE(SUM(CASE WHEN (" + pred +
+         ") THEN 1 ELSE 0 END), 0) FROM " + from + ";";
+}
+
+void PushNoRecFilter(std::vector<std::string>* dst, const std::string& from,
+                     const std::string& pred) {
+  PushNoRecPair(dst, NoRecCount(from, pred), NoRecSum(from, pred));
+}
+
+// Paper §3.2–3.3 shapes, plus the rewrites this optimizer actually performs
+// (range extraction, IN/BETWEEN canonicalization, join selection, filter
+// pushdown, stream aggregation).  Every pair is an identity under SQL
+// three-valued logic; a rejected spelling is skipped at check time.
+void AppendNoRec(Gen& g, const std::string& tab, const std::string& stab,
+                 const std::string& jtab, const RPred& pred, int row_count,
+                 OracleTrace* t) {
+  const std::string p = pred.Render();
+  PushNoRecFilter(&t->norec, tab, p);
+  // Paper's non-aggregate optimized form: the WHERE still sits on a scan,
+  // but COUNT(*) is outside it, so a count-only shortcut cannot hide a
+  // filter bug.
+  PushNoRecPair(
+      &t->norec,
+      "SELECT COUNT(*) FROM (SELECT u FROM " + tab + " WHERE (" + p + ")) q;",
+      NoRecSum(tab, p));
+  // Filter above a derived scan: pushdown into the base table is optional.
+  // Doing it wrong changes the count; not doing it still filters outside.
+  PushNoRecFilter(&t->norec, "(SELECT u, a, b, flag, s FROM " + tab + ") d", p);
+  {
+    static const std::array<const char*, 4> kGroupKeys = {"a", "s", "flag",
+                                                          "a, b"};
+    const char* key = kGroupKeys[static_cast<size_t>(g.Pick(0, 3))];
+    PushNoRecPair(
+        &t->norec,
+        "SELECT COALESCE(SUM(c), 0) FROM (SELECT COUNT(*) AS c FROM " + tab +
+            " WHERE (" + p + ") GROUP BY " + key + ") g;",
+        "SELECT COALESCE(SUM(c), 0) FROM (SELECT SUM(CASE WHEN (" + p +
+            ") THEN 1 ELSE 0 END) AS c FROM " + tab + " GROUP BY " + key +
+            ") g;");
+  }
+  // ORDER BY does not change cardinality.  Dropping it on the reference
+  // side still has to match, including when the sort is eliminated.
+  PushNoRecPair(&t->norec,
+                "SELECT COUNT(*) FROM (SELECT u, a FROM " + tab + " WHERE (" +
+                    p + ") ORDER BY a, u) q;",
+                NoRecSum(tab, p));
+  // The paper's canonical unoptimized predicate is `φ IS TRUE`.
+  PushNoRecFilter(&t->norec, tab, "(" + p + ") IS TRUE");
+
+  int lo = g.Pick(-3, 1);
+  int hi = g.Pick(lo, 3);
+  const std::string range =
+      "(a >= " + std::to_string(lo) + ") AND (a <= " + std::to_string(hi) + ")";
+  PushNoRecFilter(&t->norec, tab, range);
+  const int cut = g.Pick(-1, 1);
+  PushNoRecFilter(&t->norec, tab,
+                  "(a < " + std::to_string(cut) + ") OR (a > " +
+                      std::to_string(cut + 1) + ")");
+  // Constant on the left forces a commute before a range can be extracted.
+  {
+    const int k = g.Pick(-2, 2);
+    const char* left = nullptr;
+    const char* right = nullptr;
+    switch (g.Pick(0, 3)) {
+      case 0:
+        left = " < ";
+        right = " > ";
+        break;
+      case 1:
+        left = " <= ";
+        right = " >= ";
+        break;
+      case 2:
+        left = " = ";
+        right = " = ";
+        break;
+      default:
+        left = " != ";
+        right = " != ";
+        break;
+    }
+    PushNoRecPair(&t->norec, NoRecCount(tab, std::to_string(k) + left + "a"),
+                  NoRecSum(tab, std::string("a") + right + std::to_string(k)));
+  }
+  {
+    const int k1 = g.Pick(-2, 2);
+    const int k2 = g.Pick(-2, 2);
+    const int k3 = g.Pick(-2, 2);
+    const std::string ks = std::to_string(k1) + ", " + std::to_string(k2) +
+                           ", " + std::to_string(k3);
+    // Non-null IN-list is the OR of equalities.  The WHERE side may rewrite
+    // IN; the reference spells the OR, so only one side takes that path.
+    PushNoRecPair(&t->norec, NoRecCount(tab, "a IN (" + ks + ")"),
+                  NoRecSum(tab, "(a = " + std::to_string(k1) +
+                                    ") OR (a = " + std::to_string(k2) +
+                                    ") OR (a = " + std::to_string(k3) + ")"));
+    PushNoRecFilter(
+        &t->norec, tab,
+        "b IN (" + std::to_string(k1) + ", NULL, " + std::to_string(k2) + ")");
+  }
+  PushNoRecPair(&t->norec,
+                NoRecCount(tab, "a BETWEEN " + std::to_string(lo) + " AND " +
+                                    std::to_string(hi)),
+                NoRecSum(tab, "(a >= " + std::to_string(lo) +
+                                  ") AND (a <= " + std::to_string(hi) + ")"));
+  {
+    static const std::array<const char*, 5> kPatterns = {"'a%'", "'%b'", "'%'",
+                                                         "'_'", "'%z%'"};
+    const char* pat = kPatterns[static_cast<size_t>(g.Pick(0, 4))];
+    const char* op = g.Chance(40) ? "NOT LIKE " : "LIKE ";
+    PushNoRecFilter(&t->norec, tab, std::string("s ") + op + pat);
+  }
+  PushNoRecFilter(&t->norec, tab, g.Chance(50) ? "a IS NULL" : "a IS NOT NULL");
+  PushNoRecFilter(&t->norec, tab, g.Chance(50) ? "s IS NULL" : "s IS NOT NULL");
+  PushNoRecFilter(&t->norec, tab,
+                  g.Chance(50) ? "flag IS TRUE" : "flag IS NOT TRUE");
+  {
+    const int delta = g.Pick(1, 2);
+    const int k = g.Pick(-2, 2);
+    PushNoRecFilter(
+        &t->norec, tab,
+        "(a + " + std::to_string(delta) + ") > " + std::to_string(k));
+  }
+  {
+    const int ka = g.Pick(-2, 2);
+    const int kb = g.Pick(-2, 2);
+    PushNoRecFilter(&t->norec, tab,
+                    "(a = " + std::to_string(ka) +
+                        ") AND (b >= " + std::to_string(kb) + ")");
+  }
+  PushNoRecFilter(&t->norec, tab,
+                  "u = " + std::to_string(g.Pick(0, row_count - 1)));
+
+  const std::string qualified = pred.Render("l");
+  // Equijoin and inequality join.  The ON clause is copied; only the WHERE
+  // moves.  NULL keys do not match on either side.
+  PushNoRecFilter(&t->norec, tab + " AS l JOIN " + tab + " AS r ON l.a = r.a",
+                  qualified);
+  PushNoRecFilter(&t->norec, tab + " AS l JOIN " + tab + " AS r ON l.u < r.u",
+                  qualified);
+  // Filter after DISTINCT is an identity when the predicate mentions only
+  // the distinct columns.  Pushing it below DISTINCT is the optimized path.
+  PushNoRecFilter(&t->norec, "(SELECT DISTINCT a, b FROM " + tab + ") d",
+                  "a > " + std::to_string(g.Pick(-2, 2)));
+
+  if (!stab.empty()) {
+    static const std::array<const char*, 3> kOuter = {"LEFT JOIN", "RIGHT JOIN",
+                                                      "FULL OUTER JOIN"};
+    const char* kind = kOuter[static_cast<size_t>(g.Pick(0, 2))];
+    PushNoRecFilter(&t->norec,
+                    tab + " AS l " + kind + " " + stab + " AS r ON l.a = r.a",
+                    qualified);
+    // Inner-join ON is a filter of the cross product.  Moving that predicate
+    // into the indicator disables join selection on the reference side.
+    const std::string phi = "(l.a = r.a) AND (" + qualified + ")";
+    PushNoRecPair(&t->norec,
+                  "SELECT COUNT(*) FROM " + tab + " AS l JOIN " + stab +
+                      " AS r ON " + phi + ";",
+                  NoRecSum(tab + " AS l CROSS JOIN " + stab + " AS r", phi));
+  }
+  if (!jtab.empty()) {
+    // IN / EXISTS / NOT IN are unambiguous (no scalar-subquery cardinality
+    // surprise).  Decorrelation applies to the WHERE spelling only.
+    PushNoRecFilter(&t->norec, tab, "a IN (SELECT x FROM " + jtab + ")");
+    PushNoRecFilter(&t->norec, tab,
+                    "EXISTS (SELECT 1 FROM " + jtab + " WHERE " + jtab +
+                        ".x = " + tab + ".a)");
+    PushNoRecFilter(&t->norec, tab, "a NOT IN (SELECT x FROM " + jtab + ")");
+    PushNoRecFilter(&t->norec, tab, "a = (SELECT MAX(x) FROM " + jtab + ")");
+  }
+
+  // §3.3: the rows themselves, not only the count.  The reference has no
+  // WHERE; the checker keeps indicator 1.
+  PushNoRecPair(&t->norec_content,
+                "SELECT u, a, b, flag, s FROM " + tab + " WHERE (" + p + ");",
+                "SELECT u, a, b, flag, s, CASE WHEN (" + p +
+                    ") THEN 1 ELSE 0 END FROM " + tab + ";");
+  PushNoRecPair(&t->norec_content,
+                "SELECT u, a, b FROM " + tab + " WHERE " + range + ";",
+                "SELECT u, a, b, CASE WHEN " + range +
+                    " THEN 1 ELSE 0 END FROM " + tab + ";");
 }
 
 }  // namespace
@@ -3387,10 +3801,8 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     }
   }
 
-  // ---- NoREC ----
-  t.norec = {"SELECT COUNT(*) FROM " + tab + " WHERE " + t.predicate + ";",
-             "SELECT SUM(CASE WHEN " + t.predicate +
-                 " THEN 1 ELSE 0 END) FROM " + tab + ";"};
+  // ---- NoREC (paper translation + index/join/aggregate shapes) ----
+  AppendNoRec(g, tab, stab, jtab, *pred, row_count, &t);
 
   // ---- PQS: adjust the predicate so the pivot row must be included ----
   {
@@ -3468,6 +3880,16 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                             " ORDER BY " + skip_col + ";");
     t.skip_probes.push_back("SELECT COUNT(DISTINCT " + skip_col + ") FROM " +
                             tab + " WHERE " + t.predicate + ";");
+    // Sibling indexes exist only so the indexed NoREC phase can pick a join
+    // or semi-join access path.  They do not change the primary probe.
+    if (!stab.empty()) {
+      t.index_ddl.push_back("CREATE INDEX idx_fuzz_sa ON " + stab + "(a);");
+      t.index_ddl.push_back("CREATE INDEX idx_fuzz_sb ON " + stab + "(b);");
+      t.index_ddl.push_back("CREATE INDEX idx_fuzz_ss ON " + stab + "(s);");
+    }
+    if (!jtab.empty()) {
+      t.index_ddl.push_back("CREATE INDEX idx_fuzz_jx ON " + jtab + "(x);");
+    }
   }
 
   // ---- Window functions + TOP-n WITH TIES (model / permutation / index) ----
@@ -3767,6 +4189,47 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
           ") OR flag IS NOT NULL GROUP BY CUBE(a, flag, s);");
     }
 
+    // Filtered NOT IN over NULL-containing table (stresses
+    // PrebuiltMembershipPredicate / column_has_null on LSTable, High #6).
+    if (!jtab.empty()) {
+      const int k_cut = xg.Pick(-2, 1);
+      candidates.push_back(
+          "SELECT u, a, b FROM " + tab + " WHERE a NOT IN (SELECT x FROM " +
+          jtab + " WHERE x IS NOT NULL AND x >= " + std::to_string(k_cut) +
+          ") AND (" + t.predicate + ");");
+    }
+
+    // Comma-join prefix + filtered derived subquery + RIGHT/FULL OUTER JOIN
+    // (stresses FlattenFilteredDerivedJoins outer-join boundary, High #19).
+    if (!stab.empty() || !jtab.empty()) {
+      const char* oj_kw =
+          xg.Chance(50) ? "RIGHT OUTER JOIN" : "FULL OUTER JOIN";
+      const int b_cut = xg.Pick(-1, 2);
+      if (!stab.empty()) {
+        candidates.push_back(
+            "SELECT r.u, d.a, d.b FROM (SELECT 1 AS one) p, (SELECT u, a, b "
+            "FROM " +
+            tab + " WHERE b > " + std::to_string(b_cut) + ") d " + oj_kw + " " +
+            stab + " r ON d.a = r.a;");
+      } else {
+        candidates.push_back(
+            "SELECT r.x, d.a, d.b FROM (SELECT 1 AS one) p, (SELECT u, a, b "
+            "FROM " +
+            tab + " WHERE b > " + std::to_string(b_cut) + ") d " + oj_kw + " " +
+            jtab + " r ON d.a = r.x;");
+      }
+    }
+
+    // Named WINDOW w AS (PARTITION BY a) + preceding scalar subquery + inline
+    // OVER (w ORDER BY u ...) extension (High #17, Medium #86).
+    {
+      candidates.push_back(
+          "SELECT (SELECT 1) AS c1, u, a, b, SUM(b) OVER (w ORDER BY u ROWS "
+          "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_b, "
+          "COUNT(*) OVER w AS part_cnt FROM " +
+          tab + " WINDOW w AS (PARTITION BY a);");
+    }
+
     // Sample composite probes per iteration to keep per-seed latency low
     // while covering all composite query families uniformly across seeds.
     std::shuffle(candidates.begin(), candidates.end(), xrng);
@@ -3813,7 +4276,7 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
     stats->qualify_ran = t.qualify.size() == 2;
     stats->dso_ran = t.dso.size() == 2;
     stats->notin_ran = t.notin.size() == 1;
-    stats->norec_ran = t.norec.size() == 2;
+    stats->norec_ran = t.norec.size() >= 2 && t.norec.size() % 2 == 0;
     stats->pqs_ran = !t.pqs_count.empty();
     stats->idx_ran = !t.index_ddl.empty() && !t.index_probe.empty();
     stats->skip_ran = !t.skip_probes.empty();
@@ -3858,7 +4321,9 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
   CheckUnionAll(db, ctx, trace.unionall, &report, verbose);
   CheckUnionAll(db, ctx, trace.or_partition, &report, verbose);
   CheckSubq(db, ctx, trace.subq, &report, verbose);
-  CheckNoRec(db, ctx, trace.norec, &report, verbose);
+  // Base phase: no secondary index, so a mismatch here is a logical rewrite
+  // (the access path is a scan on both sides, but WHERE is still rewritten).
+  CheckNoRec(db, ctx, trace, "base", &report, verbose);
   CheckPqs(db, ctx, trace, &report, verbose);
   CheckWindow(db, ctx, trace, &report, verbose);
   CheckSkip(db, ctx, trace, &report, verbose);
@@ -3891,6 +4356,11 @@ std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose) {
                 trace.unnest_ordered, "UNNEST", &report, verbose);
   CheckXMode(db, ctx, trace, &report, verbose);
   CheckIdx(db, ctx, trace, &report, verbose);
+  // Indexed phase: CheckIdx has created the trace's indexes.  Refresh
+  // statistics on every table so join and range choices see them.  The
+  // reference queries have no WHERE, so they still cannot take a range.
+  AnalyzeCreatedTables(db, ctx, trace.setup);
+  CheckNoRec(db, ctx, trace, "indexed", &report, verbose);
   CheckDqe(db, ctx, trace, &report, verbose);
   if (!report.empty() && !trace.predicate.empty()) {
     report = "predicate: " + trace.predicate + "\n" + report;
@@ -3961,6 +4431,9 @@ std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,
   }
   for (const std::string& sql : trace.norec) {
     out += "-- norec: " + sql + "\n";
+  }
+  for (const std::string& sql : trace.norec_content) {
+    out += "-- norecrow: " + sql + "\n";
   }
   if (!trace.pqs_count.empty()) {
     out += "-- pqs: " + trace.pqs_count + "\n";
@@ -4121,6 +4594,8 @@ bool ParseOracleTest(std::string_view text, uint64_t* seed, OracleTrace* trace,
       trace->subq.push_back(value);
     } else if (consume("-- norec: ", &value)) {
       trace->norec.push_back(value);
+    } else if (consume("-- norecrow: ", &value)) {
+      trace->norec_content.push_back(value);
     } else if (consume("-- pqs: ", &value)) {
       trace->pqs_count = value;
     } else if (consume("-- pqsu: ", &value)) {

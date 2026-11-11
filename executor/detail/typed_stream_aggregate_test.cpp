@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -80,6 +81,109 @@ TEST(TypedStreamAggregateTest, MatchTypedStringInListExactAndPrefix) {
   EXPECT_FALSE(MatchTypedStringInList("1", prefix));
 }
 
+TEST(TypedStreamAggregateTest, DependentIntegerKernelsAndFallbackMatchAst) {
+  const Schema schema("input", {Column("k", ValueType::kInt64)});
+  const auto key = ColumnValueExp("k");
+  const auto one = ConstantValueExp(Value(1));
+  const auto two = ConstantValueExp(Value(2));
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("*"));
+  const auto doubled =
+      BinaryExpressionExp(key, BinaryOperation::kMultiply, two);
+  for (const auto& expression :
+       {BinaryExpressionExp(key, BinaryOperation::kAdd, one),
+        BinaryExpressionExp(key, BinaryOperation::kSubtract, one), doubled,
+        BinaryExpressionExp(key, BinaryOperation::kMultiply, key),
+        BinaryExpressionExp(doubled, BinaryOperation::kSubtract, key)}) {
+    SelectStatement statement(
+        {NamedExpression("k", key), NamedExpression("d", expression),
+         NamedExpression("n", count)},
+        {}, nullptr);
+    statement.SetGroupBy({key, expression});
+    const auto plan = relational_detail::PlanTypedAggregation(
+        statement, nullptr, schema, {count.get()}, {});
+    ASSERT_TRUE(plan.eligible);
+    ASSERT_EQ(plan.dependent_key_inputs.size(), 1U);
+    ASSERT_EQ(plan.dependent_key_programs.size(), 1U);
+    for (const int64_t raw :
+         {std::numeric_limits<int64_t>::min(),
+          std::numeric_limits<int64_t>::min() + 1, int64_t{-3037000500},
+          int64_t{-3}, int64_t{-1}, int64_t{0}, int64_t{1}, int64_t{3},
+          int64_t{3037000500}, std::numeric_limits<int64_t>::max() - 1,
+          std::numeric_limits<int64_t>::max()}) {
+      SCOPED_TRACE(raw);
+      const Row row({Value(raw)});
+      const auto expected = expression->TryEvaluate(row, schema);
+      int64_t actual = 0;
+      Status error = Status::kSuccess;
+      const bool success = relational_detail::EvaluateTypedIntExprCells(
+          plan.dependent_key_inputs[0], &raw, [](slot_t) { return false; },
+          &actual, &error);
+      EXPECT_EQ(success, expected.HasValue());
+      if (expected.HasValue()) {
+        EXPECT_EQ(Value(actual), expected.Value());
+      } else {
+        // The primitive reports failure internally; Bytecode below supplies
+        // the public error classification, which must match the AST exactly.
+        EXPECT_NE(error, Status::kSuccess);
+      }
+      const auto fallback =
+          TryEvaluateRowAuto(plan.dependent_key_programs[0], row);
+      EXPECT_EQ(fallback.GetStatus(), expected.GetStatus());
+      if (fallback.HasValue() && expected.HasValue()) {
+        EXPECT_EQ(fallback.Value(), expected.Value());
+      }
+    }
+    const Row null_row({Value()});
+    const auto expected = expression->TryEvaluate(null_row, schema);
+    const auto fallback =
+        TryEvaluateRowAuto(plan.dependent_key_programs[0], null_row);
+    ASSERT_TRUE(expected.HasValue());
+    ASSERT_TRUE(fallback.HasValue());
+    EXPECT_EQ(fallback.Value(), expected.Value());
+    EXPECT_TRUE(fallback.Value().IsNull());
+  }
+}
+
+TEST(TypedStreamAggregateTest, ConstantInListsFoldSignsButDeferUnsafeInputs) {
+  const Schema schema("input", {Column("k", ValueType::kInt64)});
+  const auto key = ColumnValueExp("k");
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("*"));
+  SelectStatement statement(
+      {NamedExpression("k", key), NamedExpression("n", count)}, {}, nullptr);
+  statement.SetGroupBy({key});
+  const auto negative =
+      UnaryExpressionExp(ConstantValueExp(Value(1)), UnaryOperation::kMinus);
+  const auto six =
+      BinaryExpressionExp(ConstantValueExp(Value(4)), BinaryOperation::kAdd,
+                          ConstantValueExp(Value(2)));
+  const auto plan_for = [&](std::vector<Expression> list) {
+    return relational_detail::PlanTypedAggregation(
+        statement, nullptr, schema, {count.get()},
+        {InExpressionExp(key, std::move(list))});
+  };
+  const auto plan = plan_for({negative, six});
+  ASSERT_TRUE(plan.eligible);
+  ASSERT_EQ(plan.inlist_compares.size(), 1U);
+  EXPECT_EQ(plan.inlist_compares.front().int_values,
+            (std::vector<int64_t>{-1, 6}));
+  const auto divide_by_zero =
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kDivide,
+                          ConstantValueExp(Value(0)));
+  for (const auto& unsafe :
+       std::vector<Expression>{divide_by_zero, key, ConstantValueExp(Value()),
+                               ConstantValueExp(Value(-1).WithUnsigned()),
+                               FunctionCallExp("rand", {})}) {
+    EXPECT_TRUE(plan_for({negative, unsafe}).inlist_compares.empty());
+  }
+  // The first matching alternative must still hide a later arithmetic error.
+  ASSIGN_OR_ASSERT_FAIL(Value, result,
+                        InExpressionExp(key, {negative, divide_by_zero})
+                            ->TryEvaluate(Row({Value(-1)}), schema));
+  EXPECT_TRUE(result.Truthy());
+}
+
 TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
   const Schema schema = MakeScanSchema();
 
@@ -96,6 +200,72 @@ TEST(TypedStreamAggregateTest, TryCompileAndDecideTypedFilterCompare) {
   EXPECT_EQ(compiled->int_constant, 24);
   EXPECT_TRUE(DecideTypedFilterCompare(Value(10), Value(24), *compiled));
   EXPECT_FALSE(DecideTypedFilterCompare(Value(30), Value(24), *compiled));
+}
+
+TEST(TypedStreamAggregateTest, LiteralLikeMatchesAstAndRejectsOtherDomains) {
+  const Schema schema("input", {Column("s", ValueType::kVarChar)});
+  const std::vector<std::string> patterns{"",
+                                          "%",
+                                          "%%",
+                                          "alpha",
+                                          "alpha%",
+                                          "%alpha",
+                                          "%alpha%",
+                                          "尾%",
+                                          "%尾",
+                                          "%a\\b%",
+                                          std::string("%a\0b%", 5)};
+  const std::vector<Value> values{Value(),
+                                  Value(""),
+                                  Value("alpha"),
+                                  Value("alphaalpha"),
+                                  Value("xalpha"),
+                                  Value("alphax"),
+                                  Value("xalphax"),
+                                  Value("ALPHA"),
+                                  Value("尾alpha"),
+                                  Value("alpha尾"),
+                                  Value("a\\b"),
+                                  Value(std::string("a\0b", 3)),
+                                  Value(std::string("a\0bx", 4))};
+  for (const auto op : {BinaryOperation::kLike, BinaryOperation::kNotLike}) {
+    for (const auto& pattern : patterns) {
+      const auto predicate =
+          BinaryExpressionExp(ColumnValueExp("s"), op,
+                              ConstantValueExp(Value(std::string(pattern))));
+      const auto compiled =
+          TryCompileTypedFilterCompare(predicate, schema, true);
+      if (!compiled.has_value()) {
+        ADD_FAILURE() << "literal LIKE did not compile: " << pattern;
+        continue;
+      }
+      EXPECT_FALSE(TryCompileTypedFilterCompare(predicate, schema, false));
+      for (const auto& value : values) {
+        const auto expected = predicate->TryEvaluate(Row({value}), schema);
+        ASSERT_TRUE(expected.HasValue()) << expected.GetStatus();
+        const bool actual = relational_detail::DecideTypedFilterCompareCells(
+            *compiled, nullptr, [&](slot_t) { return value.IsNull(); },
+            [&](slot_t) { return value; });
+        EXPECT_EQ(actual, !expected.Value().IsNull() &&
+                              expected.Value().value.int_value != 0)
+            << pattern << " / " << value;
+      }
+    }
+  }
+  for (const auto& pattern :
+       {Value("a_b"), Value("a%b"), Value("%a%b%"), Value("%%%"), Value(),
+        Value(1), Value("alpha%").WithCollation(2)}) {
+    EXPECT_FALSE(TryCompileTypedFilterCompare(
+        BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
+                            ConstantValueExp(pattern)),
+        schema, true));
+  }
+  Column interval("s", ValueType::kVarChar);
+  interval.SetInterval(true);
+  EXPECT_FALSE(TryCompileTypedFilterCompare(
+      BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kLike,
+                          ConstantValueExp(Value("%"))),
+      Schema("input", {interval}), true));
 }
 
 TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedConditionalInput) {

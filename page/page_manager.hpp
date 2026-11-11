@@ -120,7 +120,7 @@ class PageManager {
   ~PageManager();
 
   StatusOr<PageRef> GetPage(page_id_t page_id, bool shared = false);
-  Status InitializeMetaPage() { return Status::kSuccess; }
+  static Status InitializeMetaPage() { return Status::kSuccess; }
 
   StatusOr<PageRef> AllocateNewPage(Transaction& txn, PageType new_page_type);
   Status DestroyPage(Transaction& txn, Page* target);
@@ -161,7 +161,7 @@ class PageManager {
   StatusOr<std::string> LsmRead(page_id_t tree_id, std::string_view key) const;
   std::vector<std::pair<std::string, std::string>> LsmScanRange(
       page_id_t tree_id, std::string_view begin, std::string_view end,
-      bool ascending, txn_id_t reader_txn_id = 0) const;
+      bool ascending, const Transaction* reader = nullptr) const;
   Status LsmDestroy(Transaction& txn, page_id_t tree_id);
 
   // Transaction lifecycle hooks (commit baseline promotion & in-memory undo).
@@ -192,7 +192,7 @@ class PageManager {
   [[nodiscard]] uint64_t CacheMisses() const noexcept {
     return cache_misses_.load(std::memory_order_relaxed);
   }
-  [[nodiscard]] size_t PinnedPageCount() const noexcept { return 0; }
+  [[nodiscard]] static size_t PinnedPageCount() noexcept { return 0; }
   [[nodiscard]] uint64_t TailWaitCount() const noexcept {
     return tail_wait_count_.load(std::memory_order_relaxed);
   }

@@ -131,9 +131,8 @@ std::unordered_set<ColumnName> Schema::ColumnSet() const {
 }
 
 Schema Schema::WithName(std::string_view name) const {
-  Schema renamed;
+  Schema renamed(*this);
   renamed.name_ = std::string(name);
-  renamed.columns_ = columns_;
   for (Column& column : renamed.columns_) {
     column.Name() = ColumnName(std::string_view(name), column.Name().name);
   }

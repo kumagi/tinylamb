@@ -24,6 +24,8 @@
 #include "expression/expression.hpp"
 #include "expression/parameter_slot.hpp"
 #include "plan.hpp"
+#include "plan/index_only_scan_plan.hpp"
+#include "plan/index_scan_plan.hpp"
 #include "table/table_statistics.hpp"
 
 namespace tinylamb {
@@ -50,6 +52,22 @@ std::string SelectionPlan::ToString() const {
          "] (estimated rows: " + std::to_string(EmitRowCount()) + ")";
 }
 
+Expression SelectionPlan::ChildScanPredicate() const {
+  if (const auto* scan = dynamic_cast<const IndexScanPlan*>(src_.get())) {
+    return scan->ScanPredicate();
+  }
+  if (const auto* scan = dynamic_cast<const IndexOnlyScanPlan*>(src_.get())) {
+    return scan->ScanPredicate();
+  }
+  return nullptr;
+}
+
+bool SelectionPlan::ChildAppliesPredicate() const {
+  // Identity is intentional: text rendering does not preserve every piece
+  // of expression metadata, including collation and parameter ownership.
+  return exp_ && ChildScanPredicate() == exp_;
+}
+
 bool SelectionPlan::ContainsParameterSlots() const {
   return ContainsParameterSlot(exp_) || src_->ContainsParameterSlots();
 }
@@ -57,6 +75,9 @@ bool SelectionPlan::ContainsParameterSlots() const {
 bool SelectionPlan::InstallParameterSlots(const std::vector<Value>& parameters,
                                           size_t* cursor,
                                           std::vector<Expression>* slots) {
+  if (ChildAppliesPredicate()) {
+    return src_->InstallParameterSlots(parameters, cursor, slots);
+  }
   return SlotizeInPlace(&exp_, parameters, cursor, slots) &&
          src_->InstallParameterSlots(parameters, cursor, slots);
 }

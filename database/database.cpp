@@ -155,7 +155,7 @@ uint64_t Database::CacheMisses() const noexcept {
 }
 
 size_t Database::PinnedPageCount() const noexcept {
-  return storage_ && storage_->pm_ ? storage_->pm_->PinnedPageCount() : 0;
+  return storage_ && storage_->pm_ ? PageManager::PinnedPageCount() : 0;
 }
 
 std::ostream& operator<<(std::ostream& o, const Database& db) {
@@ -420,27 +420,40 @@ StatusOr<Table> Database::CreateTable(TransactionContext& ctx,
   // rows were inserted, so the row-page chain is the single initial page.
   bool catalog_inserted = false;
   const auto unwind_allocation = [&](Status failure) -> Status {
-    // After the catalog row landed, DropTable-equivalent unwinding must also
-    // remove the catalog entry and any statistics rows that were written,
-    // otherwise the catalog keeps serving a table whose storage is back on
-    // the free list.
-    if (catalog_inserted) {
-      std::ignore = catalog_.Delete(ctx.txn_, schema.Name());
-      for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
-        std::ignore = statistics_.Delete(
-            ctx.txn_, StatisticsColumnKey(schema.Name(), column));
+    const auto record_cleanup = [&](std::string_view operation,
+                                    const Status& status) {
+      if (status != Status::kSuccess) {
+        LOG(WARN) << "CreateTable compensation " << operation
+                  << " failed: " << status;
+        ctx.txn_.MarkFailed();
       }
-      std::ignore = statistics_.Delete(ctx.txn_, schema.Name());
+    };
+    // Keep attempting every independent compensation. If any fails, prevent
+    // commit so transaction abort can undo the original allocations and writes.
+    if (catalog_inserted) {
+      record_cleanup("catalog", catalog_.Delete(ctx.txn_, schema.Name()));
+      for (slot_t column = 0; column < schema.ColumnCount(); ++column) {
+        const Status status = statistics_.Delete(
+            ctx.txn_, StatisticsColumnKey(schema.Name(), column));
+        if (status != Status::kNotExists) {
+          record_cleanup("column statistics", status);
+        }
+      }
+      const Status status = statistics_.Delete(ctx.txn_, schema.Name());
+      if (status != Status::kNotExists) {
+        record_cleanup("table statistics", status);
+      }
     }
     for (size_t i = 0; i < new_table.IndexCount(); ++i) {
-      std::ignore = LsmIndex(new_table.GetIndex(i).Root()).Destroy(ctx.txn_);
+      record_cleanup("index",
+                     LsmIndex(new_table.GetIndex(i).Root()).Destroy(ctx.txn_));
     }
-    {
-      auto page = storage_->pm_->GetPage(new_table.first_pid_);
-      if (page.HasValue()) {
-        storage_->pm_->DestroyPage(ctx.txn_, &*page.Value());
-        page.Value().PageUnlock();
-      }
+    auto page = storage_->pm_->GetPage(new_table.first_pid_);
+    if (page.HasValue()) {
+      record_cleanup("table page",
+                     storage_->pm_->DestroyPage(ctx.txn_, &*page.Value()));
+    } else {
+      record_cleanup("table page lookup", page.GetStatus());
     }
     return failure;
   };
@@ -700,15 +713,6 @@ Status Database::PutViewDefinition(TransactionContext& ctx,
                                    std::string_view name,
                                    std::string_view query_text) {
   std::scoped_lock lock(catalog_mu_);
-  const std::string key = ViewKey(name);
-  Status existing = functions_.Delete(ctx.txn_, key);
-  if (existing != Status::kSuccess && existing != Status::kNotExists) {
-    return existing;
-  }
-  Status inserted = functions_.Insert(ctx.txn_, key, std::string(query_text));
-  if (inserted != Status::kSuccess) {
-    return inserted;
-  }
   std::string lowered(name);
   for (char& c : lowered) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -717,10 +721,20 @@ Status Database::PutViewDefinition(TransactionContext& ctx,
   StatusOr<std::string> index =
       functions_.Read(ctx.txn_, std::string(kViewIndexKey));
   if (index.HasValue()) {
-    StatusOr<std::vector<std::string>> decoded = DecodeViewIndex(index.Value());
-    if (decoded.HasValue()) {
-      names = std::move(decoded.Value());
-    }
+    ASSIGN_OR_RETURN(std::vector<std::string>, decoded,
+                     DecodeViewIndex(index.Value()));
+    names = std::move(decoded);
+  } else if (index.GetStatus() != Status::kNotExists) {
+    return index.GetStatus();
+  }
+  const std::string key = ViewKey(name);
+  Status existing = functions_.Delete(ctx.txn_, key);
+  if (existing != Status::kSuccess && existing != Status::kNotExists) {
+    return existing;
+  }
+  Status inserted = functions_.Insert(ctx.txn_, key, std::string(query_text));
+  if (inserted != Status::kSuccess) {
+    return inserted;
   }
   if (std::ranges::find(names, lowered) == names.end()) {
     names.push_back(std::move(lowered));
@@ -744,25 +758,27 @@ StatusOr<std::string> Database::GetViewDefinition(TransactionContext& ctx,
 Status Database::DeleteViewDefinition(TransactionContext& ctx,
                                       std::string_view name) {
   std::scoped_lock lock(catalog_mu_);
-  Status deleted = functions_.Delete(ctx.txn_, ViewKey(name));
-  if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
-    return deleted;
-  }
   std::string lowered(name);
   for (char& c : lowered) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
   StatusOr<std::string> index =
       functions_.Read(ctx.txn_, std::string(kViewIndexKey));
-  if (!index.HasValue()) {
-    return Status::kSuccess;
+  if (!index.HasValue() && index.GetStatus() != Status::kNotExists) {
+    return index.GetStatus();
   }
-  StatusOr<std::vector<std::string>> decoded = DecodeViewIndex(index.Value());
-  if (!decoded.HasValue()) {
-    return Status::kSuccess;
+  std::vector<std::string> names;
+  if (index.HasValue()) {
+    ASSIGN_OR_RETURN(std::vector<std::string>, decoded,
+                     DecodeViewIndex(index.Value()));
+    names = std::move(decoded);
   }
-  std::erase(decoded.Value(), lowered);
-  return WriteViewIndex(functions_, ctx, decoded.Value());
+  Status deleted = functions_.Delete(ctx.txn_, ViewKey(name));
+  if (deleted != Status::kSuccess && deleted != Status::kNotExists) {
+    return deleted;
+  }
+  std::erase(names, lowered);
+  return WriteViewIndex(functions_, ctx, names);
 }
 
 StatusOr<std::vector<std::string>> Database::ListViewDefinitions(
@@ -1140,6 +1156,7 @@ StatusOr<TableStatistics> Database::GetStatistics(
 Status Database::UpdateStatistics(TransactionContext& ctx,
                                   std::string_view schema_name,
                                   const TableStatistics& ts) {
+  std::scoped_lock lock(catalog_mu_);
   // Statistics keys follow the canonical (declared) table name, exactly like
   // the readers (GetStatistics) and DropTable; writing under the caller's
   // raw spelling left the refresh invisible for differently-cased references.

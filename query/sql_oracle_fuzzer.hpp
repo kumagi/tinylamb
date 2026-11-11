@@ -41,8 +41,16 @@ namespace tinylamb {
 //   equivalent flat query; WITH RECURSIVE counters must match arithmetic.
 // - UNNEST oracle: array-literal/GENERATE_ARRAY unnesting (with and without
 //   WITH OFFSET, and as a cross join) must match the mirror's element list.
-// - NoREC (Non-Optimizing Reference Engine): COUNT(*) WHERE p ==
-//   SUM(CASE WHEN p THEN 1 ELSE 0 END).
+// - NoREC (Non-Optimizing Reference Engine, Rigger & Su, ESEC/FSE 2020):
+//   a WHERE predicate the optimizer will rewrite (index range, join
+//   selection, IN/BETWEEN/LIKE canonicalization, filter pushdown, GROUP BY)
+//   must count the same rows as the same predicate evaluated per row with
+//   no WHERE.  `norec` holds scalar pairs (optimized query, reference
+//   query).  `norec_content` holds projection pairs whose reference's last
+//   column is a 0/1 indicator; indicator-1 rows must match the optimized
+//   multiset (paper §3.3).  Replay runs every pair twice: once before any
+//   index, and again after the trace's indexes and ANALYZE, so a bad
+//   access path disagrees with the unoptimized projection.
 // - Constraint-solving / PQS-flavoured oracle: the harness mirrors every
 //   generated row in C++ and evaluates predicates with 3-valued logic, so it
 //   knows the ground truth; a pivot row is forced into a query via predicate
@@ -69,7 +77,10 @@ struct OracleTrace {
   std::vector<std::string> setup;  // CREATE TABLE + INSERTs, in order
   std::string predicate;
   std::vector<std::string> tlp;    // original, part1, part2, part3
-  std::vector<std::string> norec;  // optimized COUNT, reference SUM
+  std::vector<std::string> norec;  // scalar pairs: optimized, reference
+  // Projection pairs.  The reference query's last column is 1 on rows the
+  // WHERE would keep; those payloads must equal the optimized multiset.
+  std::vector<std::string> norec_content;
   // PQS: ground-truth row count, pivot id, and the queries that verify them.
   std::string pqs_count;  // SELECT COUNT(*) WHERE p'
   std::string pqs_u;      // SELECT u WHERE p'

@@ -122,7 +122,7 @@ Crc32CRawHardwareChained(uint32_t crc, const uint8_t* p, size_t n) {
 // and fall back to the same behavior as the matrix walk.
 struct AdvanceByteTable {
   size_t bytes{0};
-  std::array<uint32_t, 256> byte_col[4];
+  std::array<std::array<uint32_t, 256>, 4> byte_col{};
 };
 
 [[nodiscard]] inline AdvanceMatrix ComposeAdvanceMatrix(size_t bytes) {
@@ -156,7 +156,7 @@ struct AdvanceByteTable {
 [[nodiscard]] inline const AdvanceByteTable& AdvanceByteTableFor(size_t bytes) {
   // 16 slots: an 8-lane page CRC probes 8 distinct distances per call, so a
   // 4-slot cache would thrash on every invocation.
-  static thread_local AdvanceByteTable slots[16];
+  static thread_local std::array<AdvanceByteTable, 16> slots{};
   static thread_local size_t next = 0;
   for (const AdvanceByteTable& slot : slots) {
     if (slot.bytes == bytes) {
@@ -171,9 +171,9 @@ struct AdvanceByteTable {
     // build it incrementally from v & (v-1) (drop lowest set bit).
     slot.byte_col[b][0] = 0;
     for (uint32_t v = 1; v < 256; ++v) {
-      const unsigned low = static_cast<unsigned>(__builtin_ctz(v));
+      const auto low = static_cast<unsigned>(__builtin_ctz(v));
       slot.byte_col[b][v] =
-          slot.byte_col[b][v & (v - 1)] ^ composed.col[b * 8 + low];
+          slot.byte_col[b][v & (v - 1)] ^ composed.col[(b * 8) + low];
     }
   }
   slot.bytes = bytes;
@@ -358,6 +358,9 @@ struct AdvanceByteTable {
       raw, std::span<const uint8_t>(static_cast<const uint8_t*>(data), length));
 }
 
+// PAX chunk checksum accumulator. Finalize/Crc32cOf intentionally
+// return the unfinished register (initial 0xffffffff, no final xor), unlike
+// Crc32C above. This convention is part of the PAX chunk wire format.
 class Crc32c final {
  public:
   Crc32c() = default;
@@ -368,7 +371,7 @@ class Crc32c final {
   [[nodiscard]] uint32_t Finalize() const { return value_; }
 
  private:
-  uint32_t value_{0xFFFFFFFFu};
+  uint32_t value_{0xFFFFFFFFU};
 };
 
 [[nodiscard]] inline uint32_t Crc32cOf(const void* data, size_t len) {

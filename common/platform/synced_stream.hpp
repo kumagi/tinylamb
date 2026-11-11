@@ -19,7 +19,7 @@
 
 #include <version>
 
-#if defined(__cpp_lib_syncbuf)
+#ifdef __cpp_lib_syncbuf
 #include <syncstream>
 #else
 #include <mutex>
@@ -29,7 +29,7 @@
 
 namespace tinylamb::platform {
 
-#if defined(__cpp_lib_syncbuf)
+#ifdef __cpp_lib_syncbuf
 
 // C++20 std::osyncstream where the standard library provides it.
 using SyncedOStream = std::osyncstream;

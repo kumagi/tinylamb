@@ -59,6 +59,11 @@ bool IsNullRejectingPredicate(const Expression& expression);
 
 std::string EqualityPairKey(const ColumnName& lhs, const ColumnName& rhs);
 
+// Strict column equalities implied by every deterministic OR branch.
+// Callers must keep the original expression as a residual predicate.
+std::vector<std::pair<ColumnName, ColumnName>> NecessaryDisjunctEqualities(
+    const Expression& predicate);
+
 std::vector<PredicateInfo> SynthesizeDisjunctEqualityPredicates(
     const std::vector<PredicateInfo>& analyzed,
     const std::vector<Relation>& relations);
@@ -200,7 +205,7 @@ bool IsSubset(const std::unordered_set<size_t>& values,
 struct GroupedJoinFusionSpec {
   // GROUP BY expressions, evaluated against the joined schema.
   std::vector<Expression> group_keys;
-  // Aggregate call sites collected from the select list (order matters: it
+  // Aggregate call sites collected from SELECT and HAVING (order matters: it
   // mirrors the AggregateAccumulator layout the emit finishes).
   std::vector<const AggregateExpression*> aggregates;
   // Per-aggregate flags parallel to `aggregates`.
@@ -209,8 +214,11 @@ struct GroupedJoinFusionSpec {
   // row plus the finished aggregate results.
   std::vector<Expression> select_items;
   std::vector<std::string> select_names;
+  // A grouped predicate evaluated against the same finished aggregates as
+  // SELECT, before any output row or TopN candidate is emitted.
+  Expression having;
   std::vector<SelectStatement::OrderByTerm> output_order;
-  // Statement-level eligibility decided by the caller (no HAVING/DISTINCT/
+  // Statement-level eligibility decided by the caller (no DISTINCT/
   // windows, mergeable aggregate kinds, no alias-resolution dependencies).
   bool eligible{false};
   // Set by BuildInput when the final join step actually fused.
@@ -236,7 +244,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                               const SelectStatement& statement,
                               const Scope* outer, const CteMap& ctes,
                               bool* where_fully_applied,
-                              GroupedJoinFusionSpec* fusion = nullptr);
+                              GroupedJoinFusionSpec* fusion = nullptr,
+                              bool ignore_projection_star = false);
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions);
 

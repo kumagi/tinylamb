@@ -1,66 +1,37 @@
-# `query /` — Layer 11 SQL frontend(`sql` rank)
+# `query/` — Layer 11 SQL frontend (`sql` rank)
 
-GoogleSQL AST → `Statement` IR → `SqlEngine` routing → Cascades +
-executors. Entry points for CLI, server, benchmarks:
-`SqlEngine::Execute(ctx, sql) -> StatusOr<QueryResult>` (one-shot) and
-`Prepare(ctx, sql) -> StatusOr<Executor>` (plan/inspect).
+GoogleSQL AST → `Statement` IR → `SqlEngine` routing → Cascades + executors.
+Entry points for CLI, server and benchmarks are `SqlEngine::Execute(ctx, sql)`
+(`StatusOr<QueryResult>`) and `Prepare(ctx, sql)` (`StatusOr<Executor>`).
 
 ## Key files
 
-- `sql_engine.{
-  hpp, cpp
-}
-` — facade. `QueryResult {
-  Next / ForEach / Drain / Collect / AffectedRows / Dump
-}
-` unifies streaming.Routes set - ops(INTERSECT binds tighter),
-    GROUP BY / HAVING, UNNEST / lateral through Cascades;
-exposes
-  `LastError / LastStatementType / LastDmlTable / ResultColumnNames`,
-  `ThreadExecutionCount / RuntimeStats`, `CompliancePrimaryKeyMode`
-                                                  .- `googlesql_frontend.{
-  hpp, cpp
-}
-` — parse = spawn pinned external
-  `TINYLAMB_GOOGLESQL_EXECUTABLE-- mode = parse -` (`fork`+`poll`, timeout),
-    stdin - fed;
-16 - shard parse cache(cap 1024) + 1 s negative cache.Pre
-    - pass rewrites on literal / comment -
-    masked text(e.g. `GROUP BY DISTINCT` →
-  `GROUP BY`, `DISTINCT ON`, `FETCH … WITH TIES` → LIMIT / OFFSET)
-        .- `googlesql_ast.{
-  hpp, cpp
-}
-` + `googlesql_ast_visitor.{ hpp, cpp }
-` — AST dump →
-  `Statement` IR.Missing set -
-    op text is recovered from source byte
-        ranges.- `statement.hpp` — `StatementType {
-  kCreateTable / kDropTable / kSelect / kInsert / kUpdate / kDelete / kAnalyze
-}` + `SelectStatement/SelectSource/JoinType/
-  SetOperationTree/…`. No `kExplain`: **`EXPLAIN [ANALYZE]` is a `Prepare`-
-  level string prefix for SELECT/WITH only** (`ParseExplain` in
-  `sql_engine.cpp`), rejected otherwise without executing anything.
-- `plan_cache.hpp`, `sql_template.{
-  hpp, cpp
-}
-` — fingerprint + literal - binding compiled -
-    plan cache.SELECT / UPDATE /
-        DELETE keep parameter slots and rebind them on replay;
-a SELECT replay slower than 50 ms and
-    8× its first replay is planned again.INSERT stays a per -
-        execution slot clone in the process - global cache.EXPLAIN and non -
-        templatable SQL never participate.A statement planned while a table
-                carried a *
-            measured *
-            clustered index
-            order(`AnyResolvedTableHasClusteredOrder`) is never stored
-    : the proof dies with the next row mutation,
-    and the plan may have folded a LIMIT
-        or an incremental sort on it.- `query_data.{
-  hpp, cpp
-}` — optimizer input (compiled into `tinylamb_executor`
-  for the `plan/ → query_data` edge). `join_reduction.*` — join simplification.
+- `sql_engine.{hpp,cpp}` — facade. `QueryResult` unifies `Next`, `ForEach`,
+  `Drain`, `Collect`, `AffectedRows` and `Dump`. Routes set operations
+  (INTERSECT binds tighter), GROUP BY/HAVING and UNNEST/lateral queries.
+  Exposes `LastError`, `LastStatementType`, `LastDmlTable`,
+  `ResultColumnNames`, `ThreadExecutionCount`, `RuntimeStats` and
+  `CompliancePrimaryKeyMode`.
+- `googlesql_frontend.{hpp,cpp}` — spawns the pinned external
+  `TINYLAMB_GOOGLESQL_EXECUTABLE --mode=parse -`, feeds stdin and enforces a
+  timeout. Uses a 16-shard parse cache (capacity 1024) and one-second negative
+  cache. Literal/comment-masked prepasses rewrite GROUP BY DISTINCT,
+  DISTINCT ON and FETCH WITH TIES syntax.
+- `googlesql_ast.{hpp,cpp}` + `googlesql_ast_visitor.{hpp,cpp}` — AST dump to
+  Statement IR. Missing set-operation text is recovered from source byte ranges.
+- `statement.hpp` — statement types and `SelectStatement`, `SelectSource`,
+  `JoinType`, `SetOperationTree`. No `kExplain`: **EXPLAIN [ANALYZE] is a
+  Prepare-level string prefix for SELECT/WITH only**, rejected for other
+  statements without executing them.
+- `plan_cache.hpp`, `sql_template.{hpp,cpp}` — fingerprint/literal binding.
+  SELECT/UPDATE/DELETE retain parameter slots and rebind on replay. A SELECT
+  replay slower than 50 ms and eight times its first replay is replanned.
+  INSERT uses a per-execution slot clone in the process-global cache.
+  EXPLAIN and non-templatable SQL do not participate. Plans based on measured
+  clustered order (`AnyResolvedTableHasClusteredOrder`) must not be cached:
+  row mutation can invalidate the order proof and any folded LIMIT/sort.
+- `query_data.{hpp,cpp}` — optimizer input, compiled into `tinylamb_executor`
+  for the plan → query_data edge. `join_reduction.*` simplifies joins.
 - **Template-cache contract.** The parsed-tree cache (`FindTemplate` /
   `RememberTemplate` in `sql_engine.cpp`, keyed by the literal-free
   fingerprint) replays through `SqlTemplate::BindSelect`, which must rebuild
@@ -92,99 +63,47 @@ to copy.
 
 ## DML contracts
 
-- Column `DEFAULT` clauses ride the column's reserved
-  `Constraint::kDefault` slot (constant value payload, frozen at CREATE
-  time; volatile expressions are rejected). The INSERT executor substitutes
-  the default for columns omitted from the target list and for the DEFAULT
-  keyword in VALUES (marker `__column_default`, resolved against the target
-  schema);
-`UPDATE SET col =
-    DEFAULT` resolves the same way
-        .A column without a declared default has the implicit default NULL — no
-        error(BigQuery semantics, pinned by the `dml_*` compliance cases and
-  `QueryTest.ColumnDefault*`)
-        .DEFAULT and FOREIGN KEY cannot combine with each other or with
-    PRIMARY KEY on the same column(
-        single constraint slot; the AST visitor rejects conflicting
-        constraints explicitly)
-            .- `PRIMARY KEY` in `CREATE TABLE` is metadata only
-    : **INSERT does not enforce its uniqueness *
-      *(duplicates are stored).The contract is pinned by
-  `sql_dml_paths_coverage_test`; changing it is a semantic decision, not a
-  bugfix. `SqlEngine::CompliancePrimaryKeyMode` additionally tags the first
-  column with a `kPrimaryKey` constraint for compliance-corpus runs — that
-  tag feeds the optimizer (e.g. pk_unique_distinct_elimination), it is not
-  write-time enforcement either.
-- `MERGE INTO` (`query/merge_test.cpp` pins the shapes) materializes the
-  source as a relation in `SqlEngine::ExecuteMerge`, classifies target rows
-  (and unmatched source rows) against the WHEN clauses, and applies the
-  pending DML in apply order deletes → updates → inserts. An equality key
-  extracted from the ON conjuncts hashes the source side (no extractable key
-  falls back to a linear matcher). Clause semantics follow BigQuery: one
-  action per target row (a target matching several source rows under
-  UPDATE/DELETE is rejected), at most one NOT MATCHED [BY TARGET] and one BY
-  SOURCE clause, bare names present in both relations are ambiguous errors,
-  NULL keys never match, and FK NO ACTION edges are enforced.  MATCHED
-  conditions may reference source columns;
-BY SOURCE actions may only reference target
-    columns(source references surface as evaluation errors)
-        .- `TRUNCATE TABLE` desugars to an
-               unconditional `DELETE` (visitor - level) so MVCC
-               / WAL semantics stay uniform;
-a physical page -
-        chain reset with a dedicated WAL record remains a future transaction -
-        layer optimization.Regression
-    : `MergeTest.TruncateTableDropsRowsAndKeepsSchema`.- `CREATE MATERIALIZED
-            VIEW[IF NOT EXISTS] name AS SELECT...` materializes the query into a
-                catalog table of the same
-                name(CTAS schema derivation) and
-    persists the defining SELECT text under a reserved key prefix in the
-    functions tree(`Database::kMaterializedViewKeyPrefix`)
-        .Queries answer from the stored
-    rows(manual staleness — base writes do not flow through);
-`DROP MATERIALIZED VIEW` removes rows +
-    definition and refuses plain tables.There is no REFRESH statement in the
-        pinned parser;
-the manual refresh path is DROP +
-    CREATE.Regression : `query / matview_test.cpp`.- `CREATE TABLE FUNCTION
-    name(args)
-AS SELECT...` bodies are stored as AST clones in the UDF registry,
-    and `FROM name(arg, ...)` expands the stored query with the call -
-        site arguments(`SubstituteInSelect` substitutes parameter names with
-                constants)
-            .Arguments must be statement
-        - constant(volatile calls are rejected before evaluation);
-trailing DEFAULT padding follows scalar -
-    UDF binding rules.Regression :
-  `QueryTest.TableValuedFunctionInvokesStoredBody`
-  Builtin table functions reach the same `TVF` AST node: `FROM
-  GENERATE_SERIES(start, stop[, step])` lowers to an implicit UNNEST of the
-  scalar generator's ARRAY value, so `LoadSource` (relational) and `kUnnest`
-  (Cascades) row-ify it without a dedicated scan operator. Unaliased value
-  column is `value`, `START`/`STOP`/`STEP` named arguments reorder into the
-  positional signature, `TABLESAMPLE` is rejected, and join operands accept
-  the `TVF` node. Regression:
-  `QueryTest.BuiltinTableFunctionBecomesRowSource`.
-        .- `FuseSiblingDerivedAggregates` (kSelect rewrite chain)
-               fuses sibling derived tables that aggregate the SAME base table
-           under the SAME GROUP BY key list into one aggregation(
-               TPC -
-                   H Q21's `multi`/`only_late`): each member's WHERE becomes a CASE inside its own aggregates, its HAVING lifts to
-                       an outer conjunct over the fused columns,
-               and a member with a WHERE adds a `COUNT(CASE WHEN p THEN 1 END) >
-                       0` witness because group membership is not carried by the
-                               wrapped aggregates.The rewrite is all -
-                   or -nothing;
-               bare member references, outer star items,
-               and subqueries in the outer scope leave the statement unfused
-                       .  `ORDER BY` member references map to the matching
-                           SELECT item's output name (ApplyOrderBy resolves
-                               against the post -
-                   projection schema)
-               .
-  `TINYLAMB_FUSE_SIBLING_AGG = 0` opts out;
-`SqlEngine::LastFusedSiblingAggregates()`
-  counts firings.  Regressions: `sibling_aggregate_fusion_test` +
+- Column DEFAULT uses `Constraint::kDefault` with a constant payload frozen at
+  CREATE time; volatile expressions are rejected. INSERT substitutes defaults
+  for omitted columns and the `__column_default` VALUES marker. UPDATE SET
+  col=DEFAULT resolves the same way. Undeclared defaults are NULL. The single
+  constraint slot prevents combining DEFAULT/FOREIGN KEY/PRIMARY KEY on a
+  column; conflicting constraints must be rejected explicitly.
+- PRIMARY KEY in CREATE TABLE is metadata only: INSERT does not enforce its
+  uniqueness. `sql_dml_paths_coverage_test` pins this contract. Compliance mode
+  can tag the first column as a key for optimizer rules; that is not write-time
+  uniqueness enforcement either. Changing this is a semantic decision.
+- MERGE materializes its source, classifies WHEN actions, then applies deletes,
+  updates and inserts. An extracted ON equality key hashes the source;
+  otherwise it uses linear matching. Multiple source matches for target
+  UPDATE/DELETE are rejected. At most one NOT MATCHED BY TARGET and one BY
+  SOURCE clause is supported. Ambiguous bare names fail, NULL keys do not
+  match, and FK NO ACTION edges are enforced. MATCHED may read source columns;
+  BY SOURCE may read only target columns. Tests: `query/merge_test.cpp`.
+- TRUNCATE TABLE lowers to unconditional DELETE, retaining MVCC/WAL behavior.
+  A dedicated physical chain reset is future work.
+  Test: `MergeTest.TruncateTableDropsRowsAndKeepsSchema`.
+- CREATE MATERIALIZED VIEW materializes into a catalog table and stores its
+  defining SELECT under `Database::kMaterializedViewKeyPrefix` in the functions
+  tree. Base writes do not refresh it. DROP removes rows/definition and rejects
+  plain tables. The pinned parser has no REFRESH; use DROP + CREATE.
+  Test: `query/matview_test.cpp`.
+- CREATE TABLE FUNCTION stores an AST clone. FROM calls substitute
+  statement-constant arguments (`SubstituteInSelect`); volatile arguments are
+  rejected and trailing DEFAULT binding follows scalar UDF rules.
+  Test: `QueryTest.TableValuedFunctionInvokesStoredBody`.
+  Builtin GENERATE_SERIES lowers through the same TVF node to implicit UNNEST
+  of an ARRAY. Its unaliased column is `value`; START/STOP/STEP named arguments
+  reorder to the positional signature. TABLESAMPLE is rejected and JOIN accepts
+  TVF operands. Test: `QueryTest.BuiltinTableFunctionBecomesRowSource`.
+- `FuseSiblingDerivedAggregates` combines sibling aggregates over the same base
+  table and GROUP BY keys. Member WHERE clauses become CASE expressions;
+  HAVING lifts to an outer conjunction. Filtered members require a
+  `COUNT(CASE WHEN p THEN 1 END) > 0` witness to preserve group membership.
+  The rewrite is all-or-nothing: bare member references, outer stars and outer
+  subqueries prevent it. ORDER BY member references map to SELECT output names.
+  `TINYLAMB_FUSE_SIBLING_AGG=0` disables it; `LastFusedSiblingAggregates()` counts
+  firings. Tests: `sibling_aggregate_fusion_test` and
   `QueryTest.SiblingDerivedAggregatesFuseIntoSingleScan`.
 
 `expression/collation.hpp` reaches the frontend: an `ORDER BY x COLLATE 'spec'`

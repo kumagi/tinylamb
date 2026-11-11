@@ -2,9 +2,11 @@
 #include "expression/bytecode.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -18,6 +20,188 @@
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+TEST(BytecodeTest, AuditBatchProjectionPreservesUnsignedValuesAfterNull) {
+  Column column("u", ValueType::kInt64);
+  column.SetUnsigned(true);
+  const Schema schema("input", {column});
+  DataChunk input(schema);
+  input.Append(Row({Value()}));
+  input.Append(Row({Value(-1).WithUnsigned()}));
+  const auto expression = ColumnValueExp("u");
+  const auto program = BytecodeCompiler::Compile(expression, schema);
+  ASSERT_TRUE(program.has_value());
+  if (!program) {
+    return;
+  }
+  const auto output = program->TryEvaluateBatch(input);
+  ASSERT_TRUE(output.HasValue());
+  EXPECT_TRUE(output.Value().ValueAt(0).IsNull());
+  EXPECT_TRUE(output.Value().ValueAt(1).IsUnsigned());
+  EXPECT_EQ(output.Value().ValueAt(1), Value(-1).WithUnsigned());
+}
+
+TEST(BytecodeTest, ByteLengthMatchesAstForStringsAndDynamicDomains) {
+  const Schema schema("input", {Column("v", ValueType::kVarChar)});
+  const std::vector<Value> values{Value(),
+                                  Value(""),
+                                  Value("é東京"),
+                                  Value(std::string("a\0b", 3)),
+                                  Value("collated").WithCollation(2),
+                                  Value(-123),
+                                  Value(-1).WithUnsigned(),
+                                  Value(1.25),
+                                  Value::DateFromDays(-10),
+                                  Value::Array({Value(1), Value()}, "INT64")};
+  for (const std::string name : {"byte_length", "octet_length", "length"}) {
+    const auto expression = FunctionCallExp(name, {ColumnValueExp("v")});
+    const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
+    ASSERT_TRUE(program);
+    if (!program) {
+      return;
+    }
+    ASSERT_EQ(program->Instructions().back().opcode, BytecodeOp::kByteLength);
+    ASSERT_TRUE(ScalarExpressionCacheKey({expression}, schema));
+    DataChunk batch(schema);
+    for (const auto& value : values) {
+      const Row row({value});
+      const auto expected = expression->TryEvaluate(row, schema);
+      ASSERT_TRUE(expected.HasValue());
+      const auto actual = program->TryEvaluateRow(row);
+      const auto automatic = TryEvaluateRowAuto(*program, row);
+      ASSERT_TRUE(actual.HasValue());
+      ASSERT_TRUE(automatic.HasValue());
+      EXPECT_EQ(actual.Value(), expected.Value());
+      EXPECT_EQ(automatic.Value(), expected.Value());
+      if (value.IsNull() || value.type == ValueType::kVarChar) {
+        batch.Append(row);
+      }
+    }
+    const auto result = program->TryEvaluateBatch(batch);
+    ASSERT_TRUE(result.HasValue());
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      const Row row = batch.RowAt(i);
+      EXPECT_EQ(result.Value().ValueAt(i), expression->Evaluate(row, schema));
+    }
+    EXPECT_FALSE(BytecodeCompiler::Compile(FunctionCallExp(name, {}), schema));
+  }
+}
+
+TEST(BytecodeTest, DirectColumnAndNullTestsKeepEveryValueDomain) {
+  const std::vector<Value> values{
+      Value(),
+      Value(0),
+      Value(1),
+      Value(-1).WithUnsigned(),
+      Value(-0.0),
+      Value(std::numeric_limits<double>::quiet_NaN()),
+      Value::DateFromDays(-10),
+      Value("text").WithCollation(2),
+      Value::Array({Value(1), Value()}, "INT64")};
+  for (const auto& value : values) {
+    // Derived rows can carry a different runtime domain from their schema.
+    const Schema schema("input", {Column("v", ValueType::kInt64)});
+    const Row row({value});
+    const auto column = ColumnValueExp("v");
+    const auto is_null = UnaryExpressionExp(column, UnaryOperation::kIsNull);
+    const auto not_null =
+        UnaryExpressionExp(column, UnaryOperation::kIsNotNull);
+    for (const auto& expression :
+         {column, is_null, not_null,
+          UnaryExpressionExp(is_null, UnaryOperation::kNot)}) {
+      auto program = BytecodeCompiler::CompileRowCached(expression, schema);
+      ASSERT_TRUE(program);
+      if (!program) {
+        return;
+      }
+      auto expected = expression->TryEvaluate(row, schema);
+      ASSERT_TRUE(expected.HasValue());
+      Value actual;
+      Status error;
+      EXPECT_EQ(program->TryEvaluateRowFast(row, &actual, &error),
+                BytecodeProgram::FastEval::kDone);
+      EXPECT_EQ(actual.type, expected.Value().type);
+      EXPECT_EQ(actual.IsUnsigned(), expected.Value().IsUnsigned());
+      EXPECT_EQ(actual.Collation(), expected.Value().Collation());
+      if (actual.type == ValueType::kDouble &&
+          std::isnan(expected.Value().value.double_value)) {
+        EXPECT_TRUE(std::isnan(actual.value.double_value));
+      } else {
+        EXPECT_EQ(actual, expected.Value());
+      }
+      EXPECT_EQ(program->TryEvaluateRowFast(Row(), &actual, &error),
+                BytecodeProgram::FastEval::kUnsupported);
+    }
+    // Keep the explicit three-instruction spelling covered even when the
+    // expression rewriter folds NOT(IS NULL) to IS NOT NULL.
+    BytecodeProgram program;
+    program.AddInstruction({.opcode = BytecodeOp::kLoadColumn, .operand = 0});
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kUnaryInt64, .unary = UnaryOperation::kIsNull});
+    program.AddInstruction(
+        {.opcode = BytecodeOp::kUnaryInt64, .unary = UnaryOperation::kNot});
+    program.SetFastInterpretable(true);
+    Value actual;
+    Status error;
+    EXPECT_EQ(program.TryEvaluateRowFast(row, &actual, &error),
+              BytecodeProgram::FastEval::kDone);
+    EXPECT_EQ(actual, Value(static_cast<int64_t>(!value.IsNull())));
+  }
+}
+
+TEST(BytecodeTest, CoalescePreservesShortCircuitAndDynamicValueTypes) {
+  const Schema schema("coalesce", {Column("i", ValueType::kInt64),
+                                   Column("d", ValueType::kDouble)});
+  const auto throwing =
+      BinaryExpressionExp(ConstantValueExp(Value(1)), BinaryOperation::kDivide,
+                          ColumnValueExp("i"));
+  const std::vector<Expression> expressions{
+      FunctionCallExp("coalesce",
+                      {ColumnValueExp("d"), ConstantValueExp(Value(0))}),
+      FunctionCallExp("ifnull",
+                      {ColumnValueExp("d"), ConstantValueExp(Value(0))}),
+      FunctionCallExp("coalesce", {ColumnValueExp("d"), throwing}),
+      FunctionCallExp("coalesce",
+                      {ColumnValueExp("i"), ConstantValueExp(Value(7))})};
+  for (const auto& expression : expressions) {
+    const auto program = BytecodeCompiler::CompileRowCached(expression, schema);
+    ASSERT_TRUE(program);
+    if (!program) {
+      return;
+    }
+    for (const auto& row :
+         {Row({Value(0), Value(3.5)}), Row({Value(0), Value()}),
+          Row({Value(2), Value()}), Row({Value(), Value()})}) {
+      const auto expected = expression->TryEvaluate(row, schema);
+      const auto canonical = program->TryEvaluateRow(row);
+      const auto fast = TryEvaluateRowAuto(*program, row);
+      ASSERT_EQ(canonical.HasValue(), expected.HasValue());
+      ASSERT_EQ(fast.HasValue(), expected.HasValue());
+      if (expected.HasValue()) {
+        EXPECT_EQ(canonical.Value().type, expected.Value().type);
+        EXPECT_EQ(fast.Value().type, expected.Value().type);
+        EXPECT_EQ(canonical.Value(), expected.Value());
+        EXPECT_EQ(fast.Value(), expected.Value());
+      } else {
+        EXPECT_EQ(canonical.GetStatus(), expected.GetStatus());
+        EXPECT_EQ(fast.GetStatus(), expected.GetStatus());
+      }
+    }
+  }
+  EXPECT_FALSE(BytecodeCompiler::Compile(expressions.front(), schema));
+  const auto uniform = BytecodeCompiler::Compile(expressions.back(), schema);
+  ASSERT_TRUE(uniform);
+  if (!uniform) {
+    return;
+  }
+  DataChunk batch(schema);
+  batch.Append(Row({Value(), Value()}));
+  batch.Append(Row({Value(8), Value()}));
+  const auto result = uniform->TryEvaluateBatch(batch);
+  ASSERT_TRUE(result.HasValue());
+  EXPECT_EQ(result.Value().ValueAt(0), Value(7));
+  EXPECT_EQ(result.Value().ValueAt(1), Value(8));
+}
 
 TEST(BytecodeTest, FastNullSafeComparisonKeepsTextAndDateDomains) {
   for (const auto op : {BinaryOperation::kIsDistinctFrom,

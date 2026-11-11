@@ -38,6 +38,9 @@ struct JVal {
   double num{0.0};
   std::string str{};
   std::string_view raw{};
+  // Synthetic documents own their source; parsed external documents borrow it.
+  // Propagated to descendants so extracting a node retains its raw spelling.
+  std::shared_ptr<const std::string> source_owner{};
   std::vector<std::shared_ptr<JVal>> arr{};
   std::vector<std::pair<std::string, std::shared_ptr<JVal>>> obj{};
 
@@ -104,16 +107,16 @@ inline void SkipWs(std::string_view& s) {
   }
 }
 
-inline std::string ParseJsonStringToken(std::string_view& s) {
+inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"') {
   std::string res;
-  if (s.empty() || s.front() != '"') {
+  if (s.empty() || s.front() != quote) {
     return res;
   }
   s.remove_prefix(1);
   while (!s.empty()) {
     char c = s.front();
     s.remove_prefix(1);
-    if (c == '"') {
+    if (c == quote) {
       break;
     }
     if (c == '\\' && !s.empty()) {
@@ -253,66 +256,6 @@ inline JVal ParseJsonSimple(std::string_view& s, size_t depth) {
   return v;
 }
 
-inline const JVal* NavigateJsonPath(const JVal& root, std::string_view path) {
-  const JVal* cur = &root;
-  if (path.empty() || path == "$") {
-    return cur;
-  }
-  if (path.front() == '$') {
-    path.remove_prefix(1);
-  }
-  while (!path.empty()) {
-    if (path.front() == '.') {
-      path.remove_prefix(1);
-      std::string key;
-      if (!path.empty() && path.front() == '"') {
-        key = ParseJsonStringToken(path);
-      } else {
-        while (!path.empty() && path.front() != '.' && path.front() != '[') {
-          key += path.front();
-          path.remove_prefix(1);
-        }
-      }
-      if (cur->type != JVal::kObj) {
-        return nullptr;
-      }
-      const JVal* found = nullptr;
-      for (const auto& [k, child] : cur->obj) {
-        if (k == key) {
-          found = child.get();
-          break;
-        }
-      }
-      if (found == nullptr) {
-        return nullptr;
-      }
-      cur = found;
-    } else if (path.front() == '[') {
-      path.remove_prefix(1);
-      int idx = 0;
-      while (!path.empty() &&
-             (std::isdigit(static_cast<unsigned char>(path.front())) != 0)) {
-        idx = (idx * 10) + (path.front() - '0');
-        path.remove_prefix(1);
-      }
-      if (!path.empty() && path.front() == ']') {
-        path.remove_prefix(1);
-      }
-      if (cur->type != JVal::kArr || idx < 0 ||
-          static_cast<size_t>(idx) >= cur->arr.size()) {
-        return nullptr;
-      }
-      cur = cur->arr[static_cast<size_t>(idx)].get();
-      if (cur == nullptr) {
-        return nullptr;
-      }
-    } else {
-      break;
-    }
-  }
-  return cur;
-}
-
 // BigQuery-style JSONTypeName: the JSON_TYPE spelling for each document kind.
 inline std::string_view TypeName(const JVal& v) {
   switch (v.type) {
@@ -380,8 +323,9 @@ inline std::optional<std::vector<PathSegment>> ParsePathSegments(
     } else if (path.front() == '[') {
       path.remove_prefix(1);
       SkipWs(path);
-      if (!path.empty() && path.front() == '"') {
-        std::string key = ParseJsonStringToken(path);
+      if (!path.empty() && (path.front() == '"' || path.front() == '\'')) {
+        const char quote = path.front();
+        std::string key = ParseJsonStringToken(path, quote);
         SkipWs(path);
         if (path.empty() || path.front() != ']' || key.empty()) {
           return std::nullopt;
@@ -399,7 +343,11 @@ inline std::optional<std::vector<PathSegment>> ParsePathSegments(
         int64_t idx = 0;
         while (!path.empty() &&
                (std::isdigit(static_cast<unsigned char>(path.front())) != 0)) {
-          idx = idx * 10 + (path.front() - '0');
+          const int64_t digit = path.front() - '0';
+          if (idx > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+            return std::nullopt;
+          }
+          idx = (idx * 10) + digit;
           path.remove_prefix(1);
         }
         SkipWs(path);
@@ -426,6 +374,43 @@ inline std::optional<std::vector<PathSegment>> ParsePathSegments(
     }
   }
   return segments;
+}
+
+// Shared by the AST document and the relational reader's document storage.
+// Parse the complete path first: a malformed suffix must not select a prefix.
+template <typename Document>
+inline const Document* NavigateJsonPath(const Document& root,
+                                        std::string_view path) {
+  const auto segments = ParsePathSegments(path);
+  if (!segments) {
+    return nullptr;
+  }
+  const Document* current = &root;
+  for (const PathSegment& segment : *segments) {
+    if (current == nullptr) {
+      return nullptr;
+    }
+    if (segment.is_index) {
+      if (current->type != Document::kArr || segment.index < 0 ||
+          std::cmp_greater_equal(segment.index, current->arr.size())) {
+        return nullptr;
+      }
+      current = current->arr[static_cast<size_t>(segment.index)].get();
+    } else {
+      if (current->type != Document::kObj) {
+        return nullptr;
+      }
+      const Document* found = nullptr;
+      for (const auto& [key, child] : current->obj) {
+        if (key == segment.key) {
+          found = child.get();
+          break;
+        }
+      }
+      current = found;
+    }
+  }
+  return current;
 }
 
 // Positions `parent`/`slot` on the final hop of `segments` for mutation:
@@ -686,7 +671,7 @@ inline Value LaxToInt64(const JVal& v) {
     case JVal::kNum: {
       const double d = v.num;
       if (std::isnan(d)) {
-        return Value();
+        return {};
       }
       if (d >= 9223372036854775807.0) {
         return Value(std::numeric_limits<int64_t>::max());
@@ -699,14 +684,14 @@ inline Value LaxToInt64(const JVal& v) {
     case JVal::kStr: {
       const std::optional<double> parsed = lax::ParseNumberText(v.str);
       if (!parsed) {
-        return Value();
+        return {};
       }
       return LaxToInt64(JVal{.type = JVal::kNum, .num = *parsed});
     }
     case JVal::kBool:
       return Value(v.b ? int64_t{1} : int64_t{0});
     default:
-      return Value();
+      return {};
   }
 }
 
@@ -719,14 +704,14 @@ inline Value LaxToDouble(const JVal& v) {
     case JVal::kStr: {
       const std::optional<double> parsed = lax::ParseNumberText(v.str);
       if (!parsed) {
-        return Value();
+        return {};
       }
       return Value(*parsed);
     }
     case JVal::kBool:
       return Value(v.b ? 1.0 : 0.0);
     default:
-      return Value();
+      return {};
   }
 }
 
@@ -744,12 +729,12 @@ inline Value LaxToBool(const JVal& v) {
       }
       const std::optional<double> parsed = lax::ParseNumberText(v.str);
       if (!parsed) {
-        return Value();
+        return {};
       }
       return Value(*parsed != 0.0 ? int64_t{1} : int64_t{0});
     }
     default:
-      return Value();
+      return {};
   }
 }
 
@@ -764,7 +749,7 @@ inline Value LaxToString(const JVal& v) {
     case JVal::kNull:
       return Value(std::string(v.raw));
     default:
-      return Value();
+      return {};
   }
 }
 
@@ -778,9 +763,26 @@ inline JVal JValFromSqlValue(const Value& value) {
   if (value.IsNull()) {
     return JVal{};
   }
-  std::string text = json_text::ToJsonText(value);
-  std::string_view rest = text;
-  return ParseJsonSimple(rest);
+  auto text = std::make_shared<const std::string>(json_text::ToJsonText(value));
+  std::string_view rest = *text;
+  JVal document = ParseJsonSimple(rest);
+  std::vector<JVal*> pending{&document};
+  while (!pending.empty()) {
+    JVal* node = pending.back();
+    pending.pop_back();
+    node->source_owner = text;
+    for (const auto& child : node->arr) {
+      if (child) {
+        pending.push_back(child.get());
+      }
+    }
+    for (const auto& [key, child] : node->obj) {
+      if (child) {
+        pending.push_back(child.get());
+      }
+    }
+  }
+  return document;
 }
 
 // Same value-to-text rule the function evaluators use for string-ish

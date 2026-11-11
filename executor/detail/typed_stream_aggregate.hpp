@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -33,6 +34,7 @@
 namespace tinylamb::relational_detail {
 
 struct TypedFilterCompare {
+  enum class StringMatchKind : uint8_t { kExact, kPrefix, kSuffix, kContains };
   slot_t left{0};
   slot_t right{0};
   BinaryOperation op{BinaryOperation::kEquals};
@@ -42,7 +44,35 @@ struct TypedFilterCompare {
   double double_constant{0.0};
   bool string_payload{false};
   std::string string_constant{};
+  StringMatchKind string_match{StringMatchKind::kExact};
 };
+
+// The compiler admits only literal LIKE segments with optional edge '%'.
+// These byte comparisons match the AST's no-'_' LIKE path, without creating
+// owned Values. NULL rejection remains the caller's responsibility.
+inline bool MatchTypedStringCompare(
+    std::string_view value, const TypedFilterCompare& compare) noexcept {
+  const std::string_view literal = compare.string_constant;
+  bool matched = false;
+  switch (compare.string_match) {
+    case TypedFilterCompare::StringMatchKind::kExact:
+      matched = value == literal;
+      break;
+    case TypedFilterCompare::StringMatchKind::kPrefix:
+      matched = value.starts_with(literal);
+      break;
+    case TypedFilterCompare::StringMatchKind::kSuffix:
+      matched = value.ends_with(literal);
+      break;
+    case TypedFilterCompare::StringMatchKind::kContains:
+      matched = value.find(literal) != std::string_view::npos;
+      break;
+  }
+  return compare.op == BinaryOperation::kNotEquals ||
+                 compare.op == BinaryOperation::kNotLike
+             ? !matched
+             : matched;
+}
 
 struct TypedConditionalInput {
   TypedFilterCompare condition;
@@ -121,13 +151,21 @@ enum class SlimAggKind : uint8_t {
   kSumDouble,
   kAvgDouble,
   kCountDistinctInt64,
+  kCountDistinctDouble,
 };
+
+[[nodiscard]] constexpr bool IsSlimDistinctKind(SlimAggKind kind) {
+  return kind == SlimAggKind::kCountDistinctInt64 ||
+         kind == SlimAggKind::kCountDistinctDouble;
+}
 
 constexpr size_t kSlimDistinctSlots = 8;
 
 struct TypedEmitItem {
   bool is_key{false};
   size_t index{0};
+  std::optional<Value> constant{std::nullopt};
+  std::optional<size_t> dependent_key{std::nullopt};
 };
 
 struct TypedInListCompare {
@@ -143,6 +181,12 @@ struct TypedInListCompare {
 struct TypedAggregationPlan {
   bool eligible{false};
   std::vector<slot_t> key_offsets;
+  // Integer expressions determined by the plain group keys. Evaluate once
+  // for every completed group, before HAVING/TopN can hide an overflow.
+  std::vector<BytecodeProgram> dependent_key_programs;
+  // Aligned checked integer kernels for non-NULL dictionary inputs. Bytecode
+  // remains the fallback for NULL and failed fast evaluation.
+  std::vector<TypedIntExprInput> dependent_key_inputs;
   std::vector<TypedAggregateInput> aggregates;
   bool slim{false};
   std::vector<SlimAggKind> slim_kinds;
@@ -152,6 +196,9 @@ struct TypedAggregationPlan {
   std::vector<bool> order_nulls_first;
   std::vector<BytecodeProgram> filter_programs;
   std::vector<TypedFilterCompare> filter_compares;
+  // AND of disjunctions; each disjunction is an OR of non-throwing compare
+  // conjunctions. NULL comparisons cannot make an AND branch pass.
+  std::vector<std::vector<std::vector<TypedFilterCompare>>> filter_disjunctions;
   std::vector<TypedInListCompare> inlist_compares;
 };
 
@@ -390,7 +437,7 @@ inline bool TryPackShortVarcharSpan(std::string_view sv, uint32_t* out) {
   if (sv.size() > 3 || !PlainStringComparable(sv)) {
     return false;
   }
-  uint32_t part = static_cast<uint32_t>(sv.size() + 1);
+  auto part = static_cast<uint32_t>(sv.size() + 1);
   for (size_t i = 0; i < sv.size(); ++i) {
     part |= static_cast<uint32_t>(static_cast<uint8_t>(sv[i])) << ((i + 1) * 8);
   }
@@ -434,6 +481,37 @@ TypedAggregationPlan PlanTypedAggregation(
     const Schema& scan_schema,
     const std::vector<const AggregateExpression*>& aggregate_expressions,
     const std::vector<Expression>& scan_predicates);
+
+StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
+    TransactionContext& context,
+    const std::vector<const SelectStatement*>& sets, const Relation& input);
+
+StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
+    TransactionContext& context, const SelectStatement& statement,
+    const Relation& input,
+    const std::vector<const AggregateExpression*>& aggregates);
+
+// Partial COUNT(*) by physical dictionary code, followed by one scalar key
+// evaluation per observed value and canonical regrouping. No shared scan-cache
+// publication; callers must decline reusable sources and HAVING.
+StatusOr<std::optional<Relation>> TryDictionaryExpressionCountTopN(
+    TransactionContext& context, const SelectStatement& statement,
+    const Table& table, const std::vector<slot_t>& projection,
+    const Schema& qualified_schema,
+    const std::vector<const AggregateExpression*>& aggregates,
+    const std::vector<Expression>& predicates, const CteMap& ctes);
+
+// Fold a single encoded VARCHAR input into first-occurrence-ordered values
+// and multiplicities. Eligibility restricts the caller's aggregates to COUNT,
+// MIN/MAX and exact bounded BYTE_LENGTH averages. The callback applies the
+// original row filter before evaluating any key or aggregate expression.
+StatusOr<bool> TryFoldDictionaryAggregateRows(
+    TransactionContext& context, const SelectStatement& statement,
+    const Table& table, const std::vector<slot_t>& projection,
+    const Schema& schema,
+    const std::vector<const AggregateExpression*>& aggregates,
+    const std::vector<Expression>& predicates,
+    const std::function<Status(const Row&, int64_t)>& consume);
 
 StatusOr<Relation> RunTypedParallelStreamAggregate(
     TransactionContext& context, const SelectStatement& stmt,

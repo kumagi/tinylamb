@@ -18,6 +18,11 @@
 
 #include <gtest/gtest.h>
 
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
 TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
   LOG(ERROR) << "ERROR";
   LOG(ALERT) << "ALERT";
@@ -31,4 +36,33 @@ TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
 
 TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
   ASSERT_DEATH({ LOG(FATAL) << "FATAL"; }, "FATAL");
+}
+
+TEST(LogMessageTest, AuditConcurrentMessagesStayOnOneLine) {
+  ::testing::internal::CaptureStderr();
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 8; ++worker) {
+    workers.emplace_back([worker] {
+      const std::string marker(256, static_cast<char>('A' + worker));
+      for (int line = 0; line < 100; ++line) {
+        LOG(INFO) << "audit-begin:" << marker << ":audit-end";
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  std::istringstream output(::testing::internal::GetCapturedStderr());
+  std::string line;
+  size_t count = 0;
+  while (std::getline(output, line)) {
+    const auto begin = line.find("audit-begin:");
+    ASSERT_NE(begin, std::string::npos);
+    const auto end = line.find(":audit-end", begin);
+    ASSERT_NE(end, std::string::npos);
+    const auto marker = line.substr(begin + 12, end - begin - 12);
+    ASSERT_EQ(marker.size(), 256U);
+    EXPECT_EQ(marker, std::string(256, marker.front()));
+    EXPECT_EQ(line.find("audit-begin:", begin + 1), std::string::npos);
+    ++count;
+  }
+  EXPECT_EQ(count, 800U);
 }

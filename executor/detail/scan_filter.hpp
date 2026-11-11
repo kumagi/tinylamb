@@ -41,6 +41,9 @@ struct SimpleComparePredicate {
   // non-JSON, non-collated) string, letting MatchSimpleCompare compare
   // bytes directly instead of routing through TryEvaluateBinary per row.
   bool plain_string_payload{false};
+  // A successfully parsed DATE string, held in int_constant while retaining
+  // the original Value for mixed-domain rows and exact fallback evaluation.
+  bool date_string_payload{false};
   // Column-vs-column compare (`l_receiptdate > l_commitdate`): when set,
   // MatchSimpleCompare reads both sides from the row positionally and
   // `constant` is unused.  Compile time only accepts like-kind numeric or
@@ -64,6 +67,15 @@ struct PrefixInPredicate {
 // build domain, so the int-value set verdict equals the per-row runtime
 // membership build's exact verdict and the matcher is total: every input gets
 // the SQL three-valued answer, no row defers to the contextful path.
+struct MembershipStringHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view value) const noexcept {
+    return std::hash<std::string_view>{}(value);
+  }
+};
+using MembershipStringSet =
+    std::unordered_set<std::string, MembershipStringHash, std::equal_to<>>;
+
 struct PrebuiltMembershipPredicate {
   slot_t column{0};
   bool negated{false};
@@ -81,6 +93,9 @@ struct PrebuiltMembershipPredicate {
   // An equality-correlated EXISTS is two-valued: NULL probes do not match
   // (NOT EXISTS keeps them), and NULL build keys do not poison misses.
   bool existence{false};
+  // Plain string members use byte equality; unusual probe collations fall
+  // back to the canonical comparison against these owned member values.
+  std::shared_ptr<const MembershipStringSet> string_values;
 };
 
 // `col op (correlated scalar aggregate subquery)` with exactly one
@@ -210,6 +225,17 @@ StatusOr<bool> EvaluateConjunctsTolerant(
     const std::vector<Expression>& conjuncts,
     const std::function<StatusOr<Value>(const Expression&)>& eval);
 
+struct NullPeekCompare {
+  slot_t column;
+  bool expect_null;
+};
+
+// Returns the residual NULL tests decidable from the full-table bitmap.
+// Callers may skip residual evaluation only when every residual is covered.
+std::vector<NullPeekCompare> BuildNullPeeks(
+    const CompiledScanFilter& filter, const Schema& projected_schema,
+    const std::vector<slot_t>* projection, const Schema& full_schema);
+
 std::vector<IntegerPeekCompare> BuildIntegerPeeks(
     const CompiledScanFilter& filter, const std::vector<slot_t>* projection,
     const Schema& full_schema);
@@ -253,15 +279,19 @@ int MatchScanFilterWorker(const Row& row, const Schema& schema,
 // Filters `source` into `result` with worker threads applying the full
 // filter (simple compares plus the compiled worker programs; rows whose
 // programs raise are re-checked on the main thread).  Rows are partitioned
-// into contiguous index ranges and emitted in worker order, so output order
-// matches a serial scan of `source`.  Returns false (touching nothing) when
+// into contiguous index ranges and emitted in source order, with deferred
+// rows reinserted at their original position among accepted rows. If
+// movable_source is supplied, it must be &source and grants exclusive ownership
+// of its row buffers: accepted/deferred rows are moved, while cached/shared
+// relations use the default copying path. Returns false (touching nothing) when
 // the source is small, spilled, or the filter has no worker programs.
 bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
                            const CompiledScanFilter& filter,
                            const Schema& match_schema, const Scope* outer,
                            const CteMap& ctes,
                            const ScanRuntimeFilter* runtime_filter,
-                           Relation* result, Status* error);
+                           Relation* result, Status* error,
+                           Relation* movable_source = nullptr);
 
 StatusOr<Relation> ApplyTableSample(TransactionContext& context,
                                     const SelectSource& source, Relation input);

@@ -2,8 +2,8 @@
 
 > 現在の改善バックログは [docs/next-actions.md](docs/next-actions.md) を参照。
 > 設計判断の記録 (ADR) は [docs/review/](docs/review/) と
-> [docs/adr-proposal.md](docs/adr-proposal.md) (`docs/adr/` ディレクトリは
-> 実在しない。ADR を常設する場合はそこに `NNN-<topic>.md` で作る)。
+> [docs/adr-proposal.md](docs/adr-proposal.md)、採用済み ADR は
+> [docs/adr/](docs/adr/)（[固定長 WAL と論理終端](docs/adr/0001-fixed-wal-logical-end.md)）。
 
 この文書は「今どこを触っているのか」「新しい変更はどの層に属するのか」の共通言語を
 提供する。依存方向の強制は `scripts/check_layering.py` (include-lint) が行う
@@ -60,7 +60,7 @@ server                server/          (postgres wire protocol)
 
 | 層 | ディレクトリ | 代表ファイル | 主な責務 |
 |---|---|---|---|
-| common | `common/` | `status_or.hpp`, `log_message.hpp`, `vm_cache.hpp` | エラー型, ログ, 符号化, 仮想メモリキャッシュ |
+| common | `common/` | `status_or.hpp`, `log_message.hpp` | エラー型, ログ, 符号化, 共通ユーティリティ |
 | type | `type/` | `value.hpp`, `row.hpp`, `schema.hpp`, `date.hpp` | 値・行・スキーマの表現 |
 | storage | `page/` `recovery/` `transaction/` | `page_manager.hpp`, `logger.hpp`(WAL), `transaction_manager.hpp` | メモリ内RowPageブロックとLSM管理, 先書きログ, MVCC分離レベル |
 | index | `index/` | `lsm_index.hpp`, `b_plus_tree.hpp`, `index.hpp`, `index_schema.hpp` | LSM-Tree インデックス (`BPlusTree` は `LsmIndex` の互換エイリアス) |
@@ -113,17 +113,17 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   許容している。修正が完了したらその行を削る (潰すごとにリストが減る)。
   新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則
 
-## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 65 辺)
+## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 78 辺)
 
-`python3 scripts/check_layering.py` のサマリ (2026-10 時点):
+`python3 scripts/check_layering.py` のサマリ (2026-11-11 検証):
 
 | 区分 | エッジ | 辺数 |
 |---|---|---|
 | V1 | expression → database | 0 (解消済み) |
-| V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=12, executor→sql=6 |
+| V3' | relational/executor → statement IR (query/statement.hpp) | relational→sql=21, executor→sql=6 |
 | V4 | plan → executor | 2 (plan/product_plan.cpp, plan/implementation_rules.cpp → executor/hash_join_mode.hpp) |
 
 無番号の許容エッジ (詳細はスクリプト内コメント参照): common→type (6),
-type→storage/row_position (1), index→table (3), table→expression (7),
+type→storage/row_position (1), index→table (4), table→expression (7),
 expression→executor (bytecode→data_chunk, 2),
-relational(detail)→executor 本体 (9), plan→sql (query_data/statement, 13)。
+relational(detail)→executor 本体 (15), plan→sql (query_data/statement, 14)。

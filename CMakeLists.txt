@@ -294,6 +294,8 @@ tinylamb_add_layer(tinylamb_common
         common/encoder.cpp
         common/decoder.cpp
         common/runtime_filter.cpp
+        common/parallel_work.cpp
+        common/regex_guard.cpp
         common/platform/cpu_affinity.cpp
         common/platform/event_poller.cpp
         common/platform/file_io.cpp
@@ -302,6 +304,22 @@ tinylamb_add_layer(tinylamb_common
         common/platform/socket.cpp
         common/platform/time_format.cpp
         common/platform/time_zone.cpp)
+# Optional linear-time regex replacement. Builds without RE2 retain the
+# guarded standard-library evaluator and identical replacement syntax.
+option(TINYLAMB_ENABLE_RE2 "Use installed RE2 for regular expression replacement" ON)
+if(TINYLAMB_ENABLE_RE2)
+    find_path(TINYLAMB_RE2_INCLUDE_DIR re2/re2.h)
+    find_library(TINYLAMB_RE2_LIBRARY NAMES re2)
+    if(TINYLAMB_RE2_INCLUDE_DIR AND TINYLAMB_RE2_LIBRARY)
+        target_include_directories(tinylamb_common SYSTEM PRIVATE ${TINYLAMB_RE2_INCLUDE_DIR})
+        target_link_libraries(tinylamb_common PRIVATE ${TINYLAMB_RE2_LIBRARY})
+        target_compile_definitions(tinylamb_common PRIVATE TINYLAMB_HAVE_RE2=1)
+        message(STATUS "Regex replacement: RE2 (${TINYLAMB_RE2_LIBRARY})")
+    else()
+        message(STATUS "Regex replacement: guarded std::regex (RE2 not installed)")
+    endif()
+endif()
+
 if(APPLE)
     # common/platform/time_zone.cpp: Apple's libc++ ships no C++20 tzdb, so
     # zone lookups go through CFTimeZone.
@@ -584,6 +602,7 @@ add_library(tinylamb_sql
         query/sql_session_fuzzer.cpp
         query/expr_oracle_fuzzer.cpp
         query/griffin_fuzzer.cpp
+        query/sql_diff_oracle_fuzzer.cpp
 )
 add_library(tinylamb::sql ALIAS tinylamb_sql)
 target_compile_features(tinylamb_sql PUBLIC cxx_std_20)
@@ -729,6 +748,11 @@ add_executable(tinylamb_tpcds_benchmark EXCLUDE_FROM_ALL
 tinylamb_apply_options(tinylamb_tpcds_benchmark)
 target_link_libraries(tinylamb_tpcds_benchmark PRIVATE tinylamb::sql)
 
+add_executable(tinylamb_tpcds_compare EXCLUDE_FROM_ALL
+        benchmark/tpcds_compare.cpp)
+tinylamb_apply_options(tinylamb_tpcds_compare)
+target_link_libraries(tinylamb_tpcds_compare PRIVATE tinylamb::sql)
+
 add_executable(tinylamb_pg_read_benchmark
         benchmark/pg_read_benchmark.cpp)
 tinylamb_apply_options(tinylamb_pg_read_benchmark)
@@ -818,14 +842,11 @@ if(BUILD_TESTING)
                 tinylamb::test_util
         )
         if(TINYLAMB_ENABLE_TSAN)
-            # The M0/M1 lock-order cycles are documented false positives
-            # (docs/lock_order.md): GetPageImpl releases the pool latch before
-            # constructing the PageRef, so the mutexes never nest; TSan cannot
-            # see the unlock through the inlined constructor and flags every
-            # page-pool touch, failing otherwise-green tests with exit 66.
-            # detect_deadlocks=0 turns off lock-order reporting only; data
-            # race detection stays on. die_after_fork=0 lets gtest death
-            # tests (fork + worker threads) run their scenario in the child.
+            # Preserve the existing race-only TSan configuration. The original
+            # exemption referred to the retired PagePool; it is not evidence
+            # that current lock-order reports are false positives. A separate
+            # detector-enabled audit is required before claiming lock-order
+            # coverage. die_after_fork=0 permits gtest death-test children.
             set(_test_env "TSAN_OPTIONS=detect_deadlocks=0 die_after_fork=0")
         else()
             set(_test_env "")
@@ -870,8 +891,10 @@ add_simple_test(common/log_message_test.cpp)
 add_simple_test(common/crc32c_test.cpp)
 add_simple_test(common/platform/platform_test.cpp)
 add_simple_test(common/serdes_test.cpp)
+add_simple_test(common/status_or_test.cpp)
 add_simple_test(common/string_util_test.cpp)
 add_simple_test(common/runtime_filter_test.cpp)
+add_simple_test(common/parallel_work_test.cpp)
 add_simple_test(type/value_test.cpp)
 add_simple_test(type/collation_test.cpp)
 add_simple_test(type/row_test.cpp)
@@ -917,6 +940,7 @@ add_simple_test(expression/json_text_test.cpp)
 add_simple_test(query/join_reduction_test.cpp)
 add_simple_test(query/select_rewrites_test.cpp)
 add_simple_test(table/pax_chunk/pax_chunk_codecs_test.cpp)
+add_simple_test(table/fragment/fragment_test.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(pax_chunk_codecs_test PRIVATE ${_pax_compile_opts})
 endif()
@@ -969,6 +993,7 @@ add_simple_test(query/sql_aggregate_fuzzer_test.cpp)
 add_simple_test(query/sql_plancache_fuzzer_test.cpp)
 add_simple_test(query/sql_session_fuzzer_test.cpp TIMEOUT 5400)
 add_simple_test(query/expr_oracle_fuzzer_test.cpp TIMEOUT 5400)
+add_simple_test(query/sql_diff_oracle_fuzzer_test.cpp)
 add_simple_test(query/griffin_fuzzer_test.cpp TIMEOUT 5400)
 add_simple_test(expression/expr_simplify_oracle_test.cpp)
 target_sources(googlesql_compliance_test PRIVATE
@@ -989,6 +1014,7 @@ add_simple_test(benchmark/tpcc_workload_extra_test.cpp LIBS tinylamb::tpcc)
 add_simple_test(server/postgres_server_extra_test.cpp LIBS tinylamb::postgres_server)
 add_simple_test(table/table_statistics_extra_test.cpp)
 add_simple_test(query/sql_extra_test.cpp)
+add_simple_test(query/sql_audit_regression_test.cpp)
 add_simple_test(query/sql_bugfix_regression_test.cpp)
 add_simple_test(query/analytical_features_test.cpp)
 add_simple_test(query/foreign_key_test.cpp)
@@ -1137,6 +1163,7 @@ add_fuzzer_test(query/sql_plancache_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/sql_session_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/expr_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 add_fuzzer_test(query/griffin_fuzzer_libfuzzer.cpp tinylamb::sql)
+add_fuzzer_test(query/sql_diff_oracle_fuzzer_libfuzzer.cpp tinylamb::sql)
 endif()
 
 ########################################

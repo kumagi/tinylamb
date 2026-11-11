@@ -17,6 +17,7 @@
 #include "expression/column_value.hpp"
 #include "page/row_position.hpp"
 #include "table/full_scan_iterator.hpp"
+#include "table/lstable_bridge.hpp"
 #include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
@@ -130,6 +131,141 @@ Status TopNExecutor::Materialize() {
   }
   bool folded = false;
   if (direct_columns.size() == keys_.size()) {
+    auto scan = std::dynamic_pointer_cast<ParallelScan>(source_);
+    const auto* store = scan ? scan->GetLSTableStore() : nullptr;
+    if (store != nullptr &&
+        scan->OutputColumnCount() == schema_.ColumnCount()) {
+      struct BlockRow {
+        const LSTablePageBlock* block{nullptr};
+        size_t row{0};
+        size_t sequence{0};
+      };
+      const auto value_at = [](const LSTableColumnBlock& column, size_t row) {
+        if (column.IsNull(row)) {
+          return Value();
+        }
+        if (column.type == ValueType::kVarChar) {
+          return Value(std::string(column.VarcharAt(row)));
+        }
+        if (column.type == ValueType::kDouble) {
+          return Value(std::bit_cast<double>(column.int_cells[row]));
+        }
+        Value value(column.int_cells[row]);
+        value.type = column.type;
+        return column.is_unsigned ? value.WithUnsigned() : value;
+      };
+      const auto block_precedes = [&](const BlockRow& left,
+                                      const BlockRow& right) {
+        for (size_t k = 0; k < keys_.size(); ++k) {
+          const auto slot = scan->TableColumnSlot(direct_columns[k]);
+          const auto& l = left.block->columns[slot];
+          const auto& r = right.block->columns[slot];
+          int comparison = 0;
+          if (l.type == ValueType::kVarChar && !l.IsNull(left.row) &&
+              !r.IsNull(right.row)) {
+            comparison = CompareVarCharForOrderBy(
+                l.VarcharAt(left.row), r.VarcharAt(right.row),
+                orders[k].KeyCollation() == Collation::kCaseInsensitive);
+            if (!orders[k].Ascending()) {
+              comparison = -comparison;
+            }
+          } else {
+            comparison = orders[k].Compare(value_at(l, left.row),
+                                           value_at(r, right.row));
+          }
+          if (comparison != 0) {
+            return comparison < 0;
+          }
+        }
+        return left.sequence < right.sequence;
+      };
+      size_t bytes = 0;
+      const size_t workers = scan->WorkerCount();
+      if (!__builtin_mul_overflow(capacity, sizeof(BlockRow) * 2, &bytes) &&
+          !__builtin_mul_overflow(bytes, workers + 1, &bytes) &&
+          QueryMemoryBudget::Global().CanReserve(bytes)) {
+        QueryMemoryCharge charge(bytes);
+        using BlockHeap = std::priority_queue<BlockRow, std::vector<BlockRow>,
+                                              decltype(block_precedes)>;
+        std::vector<BlockHeap> partials;
+        partials.reserve(workers);
+        for (size_t w = 0; w < workers; ++w) {
+          partials.emplace_back(block_precedes);
+        }
+        std::vector<size_t> prefixes(store->blocks.size() + 1, 0);
+        for (size_t b = 0; b < store->blocks.size(); ++b) {
+          if (__builtin_add_overflow(prefixes[b], store->blocks[b].row_count,
+                                     &prefixes[b + 1])) {
+            return StatusError(StatusCode::kTooBigData,
+                               "TopN row count overflow");
+          }
+        }
+        std::vector<size_t> counts(workers, 0);
+        auto fold = scan->TryFoldLSTableBlocks(
+            workers, [&](size_t w, const LSTablePageBlock& block,
+                         const uint32_t* selected, size_t count) {
+              auto& local = partials[w];
+              counts[w] += count;
+              const size_t prefix =
+                  prefixes[static_cast<size_t>(&block - store->blocks.data())];
+              for (size_t i = 0; i < count; ++i) {
+                const size_t row = selected == nullptr ? i : selected[i];
+                const BlockRow candidate{
+                    .block = &block, .row = row, .sequence = prefix + row};
+                if (local.size() < capacity) {
+                  local.push(candidate);
+                } else if (block_precedes(candidate, local.top())) {
+                  local.pop();
+                  local.push(candidate);
+                }
+              }
+              return Status::kSuccess;
+            });
+        if (!fold.HasValue()) {
+          return fold.GetStatus();
+        }
+        folded = fold.Value();
+        if (folded) {
+          BlockHeap best(block_precedes);
+          for (size_t w = 0; w < workers; ++w) {
+            input_rows_ += counts[w];
+            auto& local = partials[w];
+            while (!local.empty()) {
+              const BlockRow candidate = local.top();
+              local.pop();
+              if (best.size() < capacity) {
+                best.push(candidate);
+              } else if (block_precedes(candidate, best.top())) {
+                best.pop();
+                best.push(candidate);
+              }
+            }
+          }
+          // Only the winning prefix becomes owned rows. The scan keeps the
+          // immutable store alive throughout comparisons and materialization.
+          while (!best.empty()) {
+            const BlockRow selected = best.top();
+            best.pop();
+            Candidate candidate;
+            candidate.sequence = selected.sequence;
+            candidate.position = RowPosition(
+                selected.block->page_id, selected.block->slots[selected.row]);
+            for (size_t c = 0; c < schema_.ColumnCount(); ++c) {
+              candidate.row.values_.push_back(
+                  value_at(selected.block->columns[scan->TableColumnSlot(c)],
+                           selected.row));
+            }
+            for (size_t c : direct_columns) {
+              candidate.keys.push_back(candidate.row[c]);
+            }
+            heap.push(std::move(candidate));
+          }
+          fused_scan_ = true;
+        }
+      }
+    }
+  }
+  if (!folded && direct_columns.size() == keys_.size()) {
     if (auto scan = std::dynamic_pointer_cast<ParallelScan>(source_)) {
       // Each morsel keeps its best prefix. The union of these prefixes
       // contains the global best prefix, including stable equal-key ties.

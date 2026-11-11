@@ -45,6 +45,17 @@ enum class Collation : uint8_t {
              : Collation::kNone;
 }
 
+// Explicit incompatible string collations make IN membership ambiguous.
+// Numeric tags (notably UINT64's tag 3) are not string collations.
+[[nodiscard]] inline bool HaveConflictingCollations(const Value& left,
+                                                    const Value& right) {
+  if (left.type != ValueType::kVarChar || right.type != ValueType::kVarChar) {
+    return false;
+  }
+  const Collation lhs = CollationOf(left), rhs = CollationOf(right);
+  return lhs != Collation::kNone && rhs != Collation::kNone && lhs != rhs;
+}
+
 // The wire name used by PhysicalProperties::collation and its key
 // serialization: "" (empty) means "engine default", which is binary order.
 [[nodiscard]] std::string_view CollationName(Collation collation);

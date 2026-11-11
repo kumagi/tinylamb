@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,7 +25,9 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -45,9 +48,11 @@
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/sql_udf.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
+#include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -58,6 +63,19 @@
 namespace tinylamb::relational_detail {
 
 namespace {
+
+// Alphabetic text with spaces cannot be an interval, timestamp or structured
+// value; its equality is byte equality just like the plain-string fast path.
+bool BinaryStringKey(const Value& value) {
+  if (value.type != ValueType::kVarChar || value.IsCaseInsensitive()) {
+    return false;
+  }
+  const auto text = value.AsStringView();
+  return PlainStringComparable(text) ||
+         std::ranges::all_of(text, [](unsigned char c) {
+           return c == ' ' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+         });
+}
 
 // EXISTS observes only whether rows remain after the query's relational
 // operators. Ordering those rows cannot change that boolean, including when
@@ -270,56 +288,12 @@ Value ProjectSubqueryRow(const Row& row, bool as_struct, const Schema* schema) {
     }
     return "f" + std::to_string(index + 1);
   };
-  auto scalar_to_json = [](const Value& v) -> std::string {
-    switch (v.type) {
-      case ValueType::kNull:
-        return "null";
-      case ValueType::kInt64:
-        return std::to_string(v.value.int_value);
-      case ValueType::kDouble:
-        return FormatDoubleShortest(v.value.double_value);
-      case ValueType::kVarChar:
-        return "\"" + std::string(v.value.varchar_value) + "\"";
-      case ValueType::kArray: {
-        std::string inner;
-        const std::vector<Value>& elements = v.ArrayElements();
-        for (size_t i = 0; i < elements.size(); ++i) {
-          if (i > 0) {
-            inner += ",";
-          }
-          const Value& element = elements[i];
-          switch (element.type) {
-            case ValueType::kNull:
-              inner += "null";
-              break;
-            case ValueType::kInt64:
-              inner += std::to_string(element.value.int_value);
-              break;
-            case ValueType::kDouble:
-              inner += FormatDoubleShortest(element.value.double_value);
-              break;
-            case ValueType::kVarChar:
-              inner += "\"" + std::string(element.value.varchar_value) + "\"";
-              break;
-            default:
-              inner += element.AsString();
-          }
-        }
-        return "[" + inner + "]";
-      }
-      default:
-        return v.AsString();
-    }
-  };
-  std::string json = "{";
-  for (size_t i = 0; i < row.values_.size(); ++i) {
-    if (i > 0) {
-      json += ",";
-    }
-    json += "\"" + field_key(i) + "\":" + scalar_to_json(row.values_[i]);
+  std::vector<std::pair<std::string, Value>> fields;
+  fields.reserve(row.Count());
+  for (size_t i = 0; i < row.Count(); ++i) {
+    fields.emplace_back(field_key(i), row[i]);
   }
-  json += "}";
-  return Value(std::move(json));
+  return Value(EncodeStructJson(fields));
 }
 
 double ElapsedMs(std::chrono::steady_clock::time_point begin) {
@@ -478,6 +452,1043 @@ const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
     return nullptr;
   }
   return &found->second;
+}
+
+// A grouped CTE referenced by multiple inner joins only needs group keys in
+// the union of their dimension domains. Read bounded, filtered dimensions on
+// this snapshot; retain the joins and use an enclosure, not a replacement.
+std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name, const CteMap& ctes) {
+  const auto& body = *consumer.WithQueries().at(name);
+  if (consumer.IsRecursiveWith(name) || body.GroupBy().empty() ||
+      body.IsGroupAll() || body.HasLimit() || body.Offset() != 0 ||
+      body.Having() || body.Qualify() || !body.UnionAll().empty() ||
+      body.GetSetOperationTree() || !body.WithQueries().empty() ||
+      HasWindowFunctions(body) || StatementContainsVolatileFunction(body) ||
+      ContainsQuery(body.WhereClause()) ||
+      StatementContainsVolatileFunction(consumer)) {
+    return nullptr;
+  }
+  for (const auto& [other, unused] : consumer.WithQueries()) {
+    std::unordered_set<std::string> refs;
+    CollectCteBodyOuterRefs(consumer, other, &refs);
+    if (refs.contains(name)) {
+      return nullptr;
+    }
+  }
+  std::vector<Schema> body_schemas;
+  for (const auto& source : body.Sources()) {
+    if (source.unnest || source.sample || source.is_lateral) {
+      return nullptr;
+    }
+    const auto& alias = source.alias.empty() ? source.table : source.alias;
+    if (source.query) {
+      std::vector<Column> columns;
+      for (size_t i = 0; i < source.query->SelectList().size(); ++i) {
+        const auto& item = source.query->SelectList()[i];
+        if (!item.expression ||
+            (item.expression->Type() == TypeTag::kColumnValue &&
+             item.expression->AsColumnValue().GetColumnName().name == "*")) {
+          return nullptr;
+        }
+        columns.emplace_back(ProjectionName(item, i), ValueType::kNull);
+      }
+      body_schemas.push_back(
+          QualifySchema(Schema("", std::move(columns)), alias));
+    } else if (auto cte = ctes.find(source.table); cte != ctes.end()) {
+      body_schemas.push_back(QualifySchema(cte->second->schema, alias));
+    } else {
+      auto table = context.GetTable(source.table);
+      if (!table.HasValue()) {
+        return nullptr;
+      }
+      body_schemas.push_back(QualifySchema(table.Value()->GetSchema(), alias));
+    }
+  }
+  for (const auto& schema : body_schemas) {
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      for (size_t j = 0; j < i; ++j) {
+        if (AliasEquals(schema.GetColumn(i).Name().name,
+                        schema.GetColumn(j).Name().name)) {
+          return nullptr;
+        }
+      }
+    }
+  }
+  const auto binding = [&](const ColumnName& column)
+      -> std::optional<std::pair<size_t, size_t>> {
+    std::optional<std::pair<size_t, size_t>> result;
+    for (size_t i = 0; i < body_schemas.size(); ++i) {
+      if (auto slot = LocalColumnOffset(body_schemas[i], column)) {
+        if (result) {
+          return std::nullopt;
+        }
+        result = std::pair(i, *slot);
+      }
+    }
+    return result;
+  };
+  for (size_t key_index = 0; key_index < body.SelectList().size();
+       ++key_index) {
+    const auto& key = body.SelectList()[key_index].expression;
+    if (!key || key->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const auto owner = binding(key->AsColumnValue().GetColumnName());
+    if (!owner || std::ranges::none_of(body.GroupBy(), [&](const auto& group) {
+          return group && group->Type() == TypeTag::kColumnValue &&
+                 binding(group->AsColumnValue().GetColumnName()) == owner;
+        })) {
+      continue;
+    }
+    const auto& key_meta = body_schemas[owner->first].GetColumn(owner->second);
+    if (key_meta.Type() != ValueType::kInt64 || key_meta.IsUnsigned()) {
+      continue;
+    }
+    const std::string output =
+        ProjectionName(body.SelectList()[key_index], key_index);
+    size_t names = 0;
+    for (size_t i = 0; i < body.SelectList().size(); ++i) {
+      names += static_cast<size_t>(
+          AliasEquals(ProjectionName(body.SelectList()[i], i), output));
+    }
+    if (names != 1) {
+      continue;
+    }
+    size_t uses = 0;
+    std::optional<int64_t> lower, upper;
+    const std::function<bool(const SelectStatement&, bool)> collect =
+        [&](const SelectStatement& part, bool root) {
+          if ((!root && !part.WithQueries().empty()) ||
+              !part.UnionAll().empty() || part.GetSetOperationTree() ||
+              ContainsQuery(part.WhereClause()) ||
+              ContainsQuery(part.Having()) || ContainsQuery(part.Qualify()) ||
+              std::ranges::any_of(part.SelectList(),
+                                  [](const auto& item) {
+                                    return ContainsQuery(item.expression);
+                                  }) ||
+              std::ranges::any_of(part.OrderBy(),
+                                  [](const auto& term) {
+                                    return ContainsQuery(term.expression);
+                                  }) ||
+              std::ranges::any_of(part.GroupBy(), ContainsQuery)) {
+            return false;
+          }
+          for (const auto& source : part.Sources()) {
+            if (source.unnest || source.is_lateral || source.sample ||
+                source.from_nested_join || !source.using_columns.empty() ||
+                ContainsQuery(source.join_condition) ||
+                (source.join_type != JoinType::kInner &&
+                 source.join_type != JoinType::kCross)) {
+              return false;
+            }
+            if (source.query && !collect(*source.query, false)) {
+              return false;
+            }
+          }
+          for (size_t site = 0; site < part.Sources().size(); ++site) {
+            const auto& source = part.Sources()[site];
+            if (source.query || source.table != name) {
+              continue;
+            }
+            ++uses;
+            std::vector<Relation> schemas(part.Sources().size());
+            std::vector<std::shared_ptr<Table>> tables(part.Sources().size());
+            for (size_t i = 0; i < part.Sources().size(); ++i) {
+              const auto& input = part.Sources()[i];
+              if (input.query) {
+                return false;
+              }
+              const auto& alias =
+                  input.alias.empty() ? input.table : input.alias;
+              if (auto cte = ctes.find(input.table); cte != ctes.end()) {
+                schemas[i].schema = QualifySchema(cte->second->schema, alias);
+              } else if (input.table == name) {
+                std::vector<Column> columns;
+                columns.reserve(body.SelectList().size());
+                for (size_t c = 0; c < body.SelectList().size(); ++c) {
+                  columns.emplace_back(ProjectionName(body.SelectList()[c], c),
+                                       ValueType::kNull);
+                }
+                schemas[i].schema =
+                    QualifySchema(Schema("", std::move(columns)), alias);
+              } else {
+                if (consumer.WithQueries().contains(input.table)) {
+                  return false;
+                }
+                auto table = context.GetTable(input.table);
+                if (!table.HasValue()) {
+                  return false;
+                }
+                tables[i] = table.MoveValue();
+                schemas[i].schema =
+                    QualifySchema(tables[i]->GetSchema(), alias);
+              }
+            }
+            auto terms = SplitConjuncts(part.WhereClause());
+            for (const auto& input : part.Sources()) {
+              auto on = SplitConjuncts(input.join_condition);
+              terms.insert(terms.end(), on.begin(), on.end());
+            }
+            const auto predicates =
+                AnalyzePredicates(CombineConjuncts(terms), schemas);
+            bool bounded = false;
+            for (const auto& predicate : predicates) {
+              if (!predicate.resolved || predicate.contains_query ||
+                  predicate.sources.size() != 2 ||
+                  !predicate.sources.contains(site) ||
+                  !IsColumnEqualityPredicate(predicate.expression) ||
+                  predicate.expression->AsBinaryExpression().Op() !=
+                      BinaryOperation::kEquals) {
+                continue;
+              }
+              const auto& equality = predicate.expression->AsBinaryExpression();
+              const ColumnName* lhs =
+                  &equality.Left()->AsColumnValue().GetColumnName();
+              const ColumnName* rhs =
+                  &equality.Right()->AsColumnValue().GetColumnName();
+              if (!LocalColumnOffset(schemas[site].schema, *lhs)) {
+                std::swap(lhs, rhs);
+              }
+              if (!AliasEquals(lhs->name, output)) {
+                continue;
+              }
+              size_t dimension = *predicate.sources.begin();
+              if (dimension == site) {
+                dimension = *std::next(predicate.sources.begin());
+              }
+              if (!tables[dimension]) {
+                continue;
+              }
+              auto stats = context.GetStats(part.Sources()[dimension].table);
+              if (!stats.HasValue() || stats.Value()->Rows() > 100000) {
+                continue;
+              }
+              const auto offset =
+                  LocalColumnOffset(schemas[dimension].schema, *rhs);
+              if (!offset) {
+                continue;
+              }
+              const auto& column = schemas[dimension].schema.GetColumn(*offset);
+              if (column.Type() != ValueType::kInt64 || column.IsUnsigned()) {
+                continue;
+              }
+              std::vector<Expression> local;
+              std::vector<slot_t> projection{static_cast<slot_t>(*offset)};
+              for (const auto& filter : predicates) {
+                if (filter.resolved && !filter.contains_query &&
+                    filter.sources.size() == 1 &&
+                    filter.sources.contains(dimension) &&
+                    SafeToReduceEvaluationCount(filter.expression)) {
+                  local.push_back(filter.expression);
+                  for (const auto& ref : filter.expression->TouchedColumns()) {
+                    if (auto pos =
+                            LocalColumnOffset(schemas[dimension].schema, ref)) {
+                      projection.push_back(static_cast<slot_t>(*pos));
+                    }
+                  }
+                }
+              }
+              if (local.empty()) {
+                continue;
+              }
+              std::ranges::sort(projection);
+              projection.erase(
+                  std::unique(projection.begin(), projection.end()),
+                  projection.end());
+              const auto projected = static_cast<size_t>(std::distance(
+                  projection.begin(),
+                  std::ranges::find(projection, static_cast<slot_t>(*offset))));
+              auto loaded = LoadSource(context, part.Sources()[dimension],
+                                       nullptr, {}, &projection, &local);
+              if (!loaded.HasValue() || loaded.Value().HasSpill() ||
+                  loaded.Value().rows.size() > 100000) {
+                return false;
+              }
+              for (const auto& row : loaded.Value().rows) {
+                const auto& value = row[projected];
+                if (value.IsNull()) {
+                  continue;
+                }
+                if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
+                  return false;
+                }
+                const int64_t raw = value.value.int_value;
+                lower = lower ? std::min(*lower, raw) : raw;
+                upper = upper ? std::max(*upper, raw) : raw;
+              }
+              bounded = true;
+              break;
+            }
+            if (!bounded) {
+              return false;
+            }
+          }
+          return true;
+        };
+    if (!collect(consumer, true) || uses < 2) {
+      continue;
+    }
+    Expression restriction = ConstantValueExp(Value(0));
+    if (lower && upper) {
+      restriction = BinaryExpressionExp(
+          BinaryExpressionExp(key, BinaryOperation::kGreaterThanEquals,
+                              ConstantValueExp(Value(*lower))),
+          BinaryOperation::kAnd,
+          BinaryExpressionExp(key, BinaryOperation::kLessThanEquals,
+                              ConstantValueExp(Value(*upper))));
+    }
+    auto rewritten = std::make_shared<SelectStatement>(body);
+    auto terms = SplitConjuncts(body.WhereClause());
+    terms.push_back(restriction);
+    rewritten->SetWhereClause(CombineConjuncts(terms));
+    return rewritten;
+  }
+  return nullptr;
+}
+
+// A shared grouped CTE can discard groups outside the union of the keys
+// requested by all its consumers. Restrict only direct, signed integer group
+// keys and keep every consumer's original predicate above the CTE.
+std::shared_ptr<SelectStatement> PushSharedGroupedCtePredicates(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name) {
+  if (consumer.Sources().size() < 2 || !consumer.WhereClause() ||
+      ContainsQuery(consumer.WhereClause()) ||
+      ContainsQuery(consumer.Having()) || ContainsQuery(consumer.Qualify()) ||
+      !consumer.UnionAll().empty() || consumer.GetSetOperationTree() ||
+      consumer.IsRecursiveWith(name) ||
+      std::ranges::any_of(
+          consumer.SelectList(),
+          [](const auto& item) { return ContainsQuery(item.expression); }) ||
+      std::ranges::any_of(consumer.GroupBy(), ContainsQuery) ||
+      std::ranges::any_of(consumer.OrderBy(), [](const auto& term) {
+        return ContainsQuery(term.expression);
+      })) {
+    return nullptr;
+  }
+  for (const auto& source : consumer.Sources()) {
+    if (!consumer.WithQueries().contains(source.table) || source.query ||
+        source.unnest || source.sample || source.is_lateral ||
+        source.from_nested_join || !source.using_columns.empty() ||
+        (source.join_type != JoinType::kCross &&
+         source.join_type != JoinType::kInner) ||
+        ContainsQuery(source.join_condition)) {
+      return nullptr;
+    }
+  }
+  if (std::ranges::count_if(consumer.Sources(), [&](const auto& source) {
+        return source.table == name;
+      }) < 2) {
+    return nullptr;
+  }
+  for (const auto& [other, unused] : consumer.WithQueries()) {
+    std::unordered_set<std::string> referenced;
+    CollectCteBodyOuterRefs(consumer, other, &referenced);
+    if (referenced.contains(name)) {
+      return nullptr;
+    }
+  }
+  const auto& body = *consumer.WithQueries().at(name);
+  std::vector<const SelectStatement*> parts{&body};
+  for (size_t i = 0; i < body.UnionAll().size(); ++i) {
+    const auto match = body.MatchFor(i);
+    if (match.by_name || match.corresponding || !match.columns.empty() ||
+        (i < body.SetOperationKinds().size() &&
+         body.SetOperationKinds()[i] != SetOperationKind::kUnionAll)) {
+      return nullptr;
+    }
+    parts.push_back(body.UnionAll()[i].get());
+  }
+  for (const auto* part : parts) {
+    if (part == nullptr || part->HasLimit() || part->Offset() != 0 ||
+        part->Having() || part->Qualify() || part->IsGroupAll() ||
+        (part->GroupBy().empty() &&
+         std::ranges::any_of(part->SelectList(),
+                             [](const auto& item) {
+                               return ContainsAggregate(item.expression);
+                             })) ||
+        (part != &body && !part->UnionAll().empty()) ||
+        (part->GetSetOperationTree() && part->GetSetOperationTree()->grouped) ||
+        !part->WithQueries().empty() || HasWindowFunctions(*part) ||
+        StatementContainsVolatileFunction(*part) ||
+        ContainsQuery(part->WhereClause()) ||
+        part->SelectList().size() != body.SelectList().size() ||
+        std::ranges::any_of(
+            part->SelectList(),
+            [](const auto& item) { return ContainsQuery(item.expression); }) ||
+        std::ranges::any_of(part->Sources(), [&](const auto& source) {
+          return (source.query && part->Sources().size() != 1) ||
+                 source.unnest || source.sample || source.is_lateral ||
+                 consumer.WithQueries().contains(source.table) ||
+                 ContainsQuery(source.join_condition);
+        })) {
+      return nullptr;
+    }
+  }
+  std::vector<std::shared_ptr<SelectStatement>> rewritten;
+  rewritten.reserve(parts.size());
+  for (const auto* part : parts) {
+    rewritten.push_back(std::make_shared<SelectStatement>(*part));
+  }
+  bool changed = false;
+  for (size_t slot = 0; slot < body.SelectList().size(); ++slot) {
+    const auto output = ProjectionName(body.SelectList()[slot], slot);
+    if (std::ranges::count_if(body.SelectList(), [&](const auto& item) {
+          return AliasEquals(ProjectionName(item, slot), output);
+        }) != 1) {
+      continue;
+    }
+    bool valid = true;
+    for (const auto* part : parts) {
+      const auto& key = part->SelectList()[slot].expression;
+      // Frontend binding can qualify the projection before GROUP BY. Compare
+      // resolved owners rather than the spelling of their column references.
+      const auto owner_of =
+          [&](const ColumnName& column) -> std::optional<size_t> {
+        std::optional<size_t> owner;
+        for (size_t i = 0; i < part->Sources().size(); ++i) {
+          const auto& source = part->Sources()[i];
+          const auto& alias =
+              source.alias.empty() ? source.table : source.alias;
+          if (!column.schema.empty() && !AliasEquals(column.schema, alias)) {
+            continue;
+          }
+          size_t matches = 0;
+          if (source.query) {
+            for (size_t j = 0; j < source.query->SelectList().size(); ++j) {
+              matches +=
+                  AliasEquals(ProjectionName(source.query->SelectList()[j], j),
+                              column.name)
+                      ? 1
+                      : 0;
+            }
+          } else {
+            auto table = context.GetTable(source.table);
+            if (!table.HasValue()) {
+              return std::nullopt;
+            }
+            const auto& schema = table.Value()->GetSchema();
+            for (size_t j = 0; j < schema.ColumnCount(); ++j) {
+              matches +=
+                  AliasEquals(schema.GetColumn(j).Name().name, column.name) ? 1
+                                                                            : 0;
+            }
+          }
+          if (matches > 1 || (matches == 1 && owner)) {
+            return std::nullopt;
+          }
+          if (matches == 1) {
+            owner = i;
+          }
+        }
+        return owner;
+      };
+      if (!key || key->Type() != TypeTag::kColumnValue ||
+          (!part->GroupBy().empty() &&
+           std::ranges::none_of(part->GroupBy(), [&](const auto& group) {
+             if (!group || group->Type() != TypeTag::kColumnValue) {
+               return false;
+             }
+             const auto& lhs = key->AsColumnValue().GetColumnName();
+             const auto& rhs = group->AsColumnValue().GetColumnName();
+             if (!AliasEquals(lhs.name, rhs.name)) {
+               return false;
+             }
+             const auto owner = owner_of(lhs);
+             return owner && owner == owner_of(rhs);
+           }))) {
+        valid = false;
+        break;
+      }
+      size_t matches = 0;
+      bool integer = false;
+      for (const auto& source : part->Sources()) {
+        if (source.query) {
+          // Infer a direct derived key from every positional UNION branch.
+          // Restricting the grouping input is safe even when a deeper LIMIT
+          // prevents the existing derived-boundary rewrite from pushing it on.
+          const auto& column = key->AsColumnValue().GetColumnName();
+          if (!column.schema.empty() &&
+              !AliasEquals(column.schema, source.alias)) {
+            continue;
+          }
+          const auto& derived = *source.query;
+          std::optional<size_t> derived_slot;
+          for (size_t j = 0; j < derived.SelectList().size(); ++j) {
+            if (AliasEquals(ProjectionName(derived.SelectList()[j], j),
+                            column.name)) {
+              ++matches;
+              derived_slot = j;
+            }
+          }
+          if (!derived_slot || matches != 1) {
+            valid = false;
+            break;
+          }
+          std::vector<const SelectStatement*> branches{&derived};
+          for (size_t j = 0; j < derived.UnionAll().size(); ++j) {
+            const auto match = derived.MatchFor(j);
+            if (match.by_name || match.corresponding ||
+                !match.columns.empty()) {
+              valid = false;
+            }
+            branches.push_back(derived.UnionAll()[j].get());
+          }
+          integer = true;
+          for (const auto* branch : branches) {
+            if (branch == nullptr || !branch->WithQueries().empty() ||
+                (branch->GetSetOperationTree() &&
+                 branch->GetSetOperationTree()->grouped) ||
+                (branch != &derived && !branch->UnionAll().empty()) ||
+                branch->SelectList().size() != derived.SelectList().size()) {
+              integer = false;
+              break;
+            }
+            const auto& expression =
+                branch->SelectList()[*derived_slot].expression;
+            if (!expression || expression->Type() != TypeTag::kColumnValue) {
+              integer = false;
+              break;
+            }
+            size_t base_matches = 0;
+            bool base_integer = false;
+            for (const auto& base : branch->Sources()) {
+              if (base.query || base.unnest ||
+                  consumer.WithQueries().contains(base.table)) {
+                integer = false;
+                break;
+              }
+              auto base_table = context.GetTable(base.table);
+              if (!base_table.HasValue()) {
+                integer = false;
+                break;
+              }
+              const auto base_schema =
+                  QualifySchema(base_table.Value()->GetSchema(),
+                                base.alias.empty() ? base.table : base.alias);
+              if (const auto offset = LocalColumnOffset(
+                      base_schema,
+                      expression->AsColumnValue().GetColumnName())) {
+                ++base_matches;
+                const auto& meta = base_schema.GetColumn(*offset);
+                base_integer =
+                    meta.Type() == ValueType::kInt64 && !meta.IsUnsigned();
+              }
+            }
+            integer &= base_matches == 1 && base_integer;
+          }
+          continue;
+        }
+        auto table = context.GetTable(source.table);
+        if (!table.HasValue()) {
+          valid = false;
+          break;
+        }
+        auto schema =
+            QualifySchema(table.Value()->GetSchema(),
+                          source.alias.empty() ? source.table : source.alias);
+        if (const auto offset = LocalColumnOffset(
+                schema, key->AsColumnValue().GetColumnName())) {
+          ++matches;
+          const auto& column = schema.GetColumn(*offset);
+          integer = column.Type() == ValueType::kInt64 && !column.IsUnsigned();
+        }
+      }
+      valid &= matches == 1 && integer;
+    }
+    if (!valid) {
+      continue;
+    }
+    std::vector<int64_t> values;
+    for (const auto& source : consumer.Sources()) {
+      if (source.table != name) {
+        continue;
+      }
+      std::optional<int64_t> value;
+      const auto& alias = source.alias.empty() ? source.table : source.alias;
+      for (const auto& term : SplitConjuncts(consumer.WhereClause())) {
+        if (!term || term->Type() != TypeTag::kBinaryExp ||
+            term->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
+          continue;
+        }
+        const auto& binary = term->AsBinaryExpression();
+        Expression column = binary.Left(), literal = binary.Right();
+        if (column->Type() != TypeTag::kColumnValue) {
+          std::swap(column, literal);
+        }
+        if (column->Type() != TypeTag::kColumnValue) {
+          continue;
+        }
+        const auto& target = column->AsColumnValue().GetColumnName();
+        if (!AliasEquals(target.schema, alias) ||
+            !AliasEquals(target.name, output) ||
+            !literal->TouchedColumns().empty() || ContainsQuery(literal) ||
+            ContainsAggregate(literal) || ContainsVolatileCall(literal)) {
+          continue;
+        }
+        auto evaluated = literal->TryEvaluate(Row(), Schema());
+        if (evaluated.HasValue() && !evaluated.Value().IsNull() &&
+            evaluated.Value().type == ValueType::kInt64 &&
+            !evaluated.Value().IsUnsigned()) {
+          value = evaluated.Value().value.int_value;
+          break;
+        }
+      }
+      if (!value) {
+        valid = false;
+        break;
+      }
+      values.push_back(*value);
+    }
+    if (!valid) {
+      continue;
+    }
+    std::ranges::sort(values);
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    for (auto& part : rewritten) {
+      Expression restriction;
+      for (const auto value : values) {
+        auto equality = BinaryExpressionExp(part->SelectList()[slot].expression,
+                                            BinaryOperation::kEquals,
+                                            ConstantValueExp(Value(value)));
+        restriction = restriction
+                          ? BinaryExpressionExp(restriction,
+                                                BinaryOperation::kOr, equality)
+                          : equality;
+      }
+      auto terms = SplitConjuncts(part->WhereClause());
+      terms.push_back(restriction);
+      part->SetWhereClause(CombineConjuncts(terms));
+    }
+    changed = true;
+  }
+  if (!changed) {
+    return nullptr;
+  }
+  auto result = rewritten.front();
+  result->ClearUnionAll();
+  result->SetSetOperationTree(nullptr);
+  for (size_t i = 1; i < rewritten.size(); ++i) {
+    result->AddSetOperation(SetOperationKind::kUnionAll, rewritten[i]);
+  }
+  return result;
+}
+
+std::shared_ptr<SelectStatement> GroupPresenceOnlyCte(
+    const SelectStatement& consumer, const std::string& name) {
+  const auto found = consumer.WithQueries().find(name);
+  if (found == consumer.WithQueries().end() || !found->second ||
+      consumer.IsRecursiveWith(name)) {
+    return nullptr;
+  }
+  const auto& body = *found->second;
+  if (body.Sources().size() < 2 || !body.GroupBy().empty() ||
+      body.IsGroupAll() || body.Having() || body.Qualify() || body.Distinct() ||
+      body.HasLimit() || body.Offset() != 0 || !body.OrderBy().empty() ||
+      !body.WithQueries().empty() || !body.UnionAll().empty() ||
+      body.GetSetOperationTree() || HasWindowFunctions(body) ||
+      ContainsQuery(body.WhereClause()) ||
+      std::ranges::any_of(body.Sources(),
+                          [](const auto& source) {
+                            return source.query || source.unnest ||
+                                   source.sample || source.is_lateral ||
+                                   source.from_nested_join ||
+                                   ContainsQuery(source.join_condition);
+                          }) ||
+      StatementContainsVolatileFunction(body)) {
+    return nullptr;
+  }
+  std::vector<Column> columns;
+  std::unordered_set<std::string> output_names;
+  for (size_t i = 0; i < body.SelectList().size(); ++i) {
+    const auto& item = body.SelectList()[i];
+    if (!item.expression || item.expression->Type() != TypeTag::kColumnValue ||
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      return nullptr;
+    }
+    const auto output = ProjectionName(item, i);
+    if (!output_names.insert(AsciiToLower(output)).second) {
+      return nullptr;
+    }
+    columns.emplace_back(output, ValueType::kNull);
+  }
+  if (columns.empty()) {
+    return nullptr;
+  }
+  bool safe = true;
+  size_t sites = 0;
+  std::vector<bool> needed(columns.size(), false);
+  std::function<void(const SelectStatement&, bool, size_t)> visit;
+  std::function<void(const Expression&, size_t)> visit_expression;
+  visit_expression = [&](const Expression& expression, size_t depth) {
+    if (!expression || !safe) {
+      return;
+    }
+    if (depth > 64) {
+      safe = false;
+      return;
+    }
+    if (expression->Type() == TypeTag::kQueryExp) {
+      const auto& query = expression->AsQueryExpression();
+      if (query.Query()) {
+        visit(*query.Query(),
+              !query.ArrayResult() &&
+                  (query.Exists() ||
+                   (query.Test() && query.Mode() == QuantifierMode::kIn)),
+              depth + 1);
+      }
+      visit_expression(query.Test(), depth + 1);
+      return;
+    }
+    for (const auto& child : ExpressionChildren(expression)) {
+      visit_expression(child, depth + 1);
+    }
+  };
+  visit = [&](const SelectStatement& query, bool presence, size_t depth) {
+    if (!safe) {
+      return;
+    }
+    if (depth > 64 || (&query != &consumer && !query.WithQueries().empty())) {
+      safe = false;
+      return;
+    }
+    // Grouping, windows and row-count boundaries observe multiplicity. An IN
+    // subquery nested inside one is still visited with its own presence proof.
+    presence =
+        presence && query.GroupBy().empty() && !query.IsGroupAll() &&
+        !query.Having() && !query.HasDistinctOn() && !query.ForUpdate() &&
+        std::ranges::none_of(query.SelectList(),
+                             [](const auto& item) {
+                               return ContainsAggregate(item.expression);
+                             }) &&
+        std::ranges::none_of(query.OrderBy(),
+                             [](const auto& term) {
+                               return ContainsAggregate(term.expression);
+                             }) &&
+        std::ranges::none_of(
+            query.Sources(),
+            [](const auto& source) { return !source.using_columns.empty(); }) &&
+        !query.Qualify() && !HasWindowFunctions(query) && !query.HasLimit() &&
+        query.Offset() == 0 && query.UnionAll().empty() &&
+        !query.GetSetOperationTree() &&
+        !StatementContainsVolatileFunction(query);
+    for (const auto& source : query.Sources()) {
+      if (IdentifierEquals(source.table, name)) {
+        if (!presence || source.sample || source.unnest || source.is_lateral ||
+            source.from_nested_join || !source.using_columns.empty()) {
+          safe = false;
+          return;
+        }
+        ++sites;
+        const Schema output(name, columns);
+        const Schema qualified =
+            QualifySchema(output, source.alias.empty() ? name : source.alias);
+        for (const slot_t column : RequiredColumns(query, qualified)) {
+          needed[column] = true;
+        }
+        for (const slot_t column :
+             RequiredColumns(query, QualifySchema(output, name))) {
+          needed[column] = true;
+        }
+      }
+      if (source.query) {
+        visit(*source.query, presence, depth + 1);
+      }
+      visit_expression(source.join_condition, depth + 1);
+      visit_expression(source.unnest, depth + 1);
+    }
+    visit_expression(query.WhereClause(), depth + 1);
+    visit_expression(query.Having(), depth + 1);
+    visit_expression(query.Qualify(), depth + 1);
+    for (const auto& item : query.SelectList()) {
+      visit_expression(item.expression, depth + 1);
+    }
+    for (const auto& key : query.GroupBy()) {
+      visit_expression(key, depth + 1);
+    }
+    for (const auto& term : query.OrderBy()) {
+      visit_expression(term.expression, depth + 1);
+    }
+    for (const auto& branch : query.UnionAll()) {
+      if (branch) {
+        visit(*branch, false, depth + 1);
+      }
+    }
+    if (query.GetSetOperationTree()) {
+      safe = false;
+    }
+    for (const auto& [entry, definition] : query.WithQueries()) {
+      if (entry != name && definition) {
+        visit(*definition, false, depth + 1);
+      }
+    }
+  };
+  visit(consumer, false, 0);
+  if (!safe || sites == 0) {
+    return nullptr;
+  }
+  std::vector<NamedExpression> projection;
+  std::vector<Expression> keys;
+  for (size_t i = 0; i < needed.size(); ++i) {
+    if (needed[i]) {
+      projection.push_back(body.SelectList()[i]);
+      keys.push_back(body.SelectList()[i].expression);
+    }
+  }
+  if (keys.empty()) {
+    return nullptr;
+  }
+  auto grouped = std::make_shared<SelectStatement>(body);
+  grouped->SetSelectList(std::move(projection));
+  grouped->SetGroupBy(std::move(keys));
+  return grouped;
+}
+
+std::shared_ptr<SelectStatement> PushSingleUseCtePredicates(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name) {
+  if (!consumer.WhereClause() || ContainsQuery(consumer.WhereClause()) ||
+      ContainsQuery(consumer.Having()) || ContainsQuery(consumer.Qualify()) ||
+      !consumer.UnionAll().empty() || consumer.GetSetOperationTree() ||
+      consumer.IsRecursiveWith(name) ||
+      std::ranges::any_of(
+          consumer.SelectList(),
+          [](const auto& item) { return ContainsQuery(item.expression); }) ||
+      std::ranges::any_of(consumer.GroupBy(), ContainsQuery) ||
+      std::ranges::any_of(consumer.OrderBy(), [](const auto& term) {
+        return ContainsQuery(term.expression);
+      })) {
+    return nullptr;
+  }
+  size_t uses = 0;
+  for (const auto& source : consumer.Sources()) {
+    if (source.query || source.unnest || source.sample || source.is_lateral ||
+        source.from_nested_join || !source.using_columns.empty() ||
+        source.join_type == JoinType::kFull ||
+        source.join_type == JoinType::kRight ||
+        ContainsQuery(source.join_condition) ||
+        !consumer.WithQueries().contains(source.table)) {
+      return nullptr;
+    }
+    uses += source.table == name ? 1 : 0;
+  }
+  if (uses != 1) {
+    return nullptr;
+  }
+  for (const auto& [other, body] : consumer.WithQueries()) {
+    if (std::ranges::any_of(body->SelectList(), [](const auto& item) {
+          return item.expression &&
+                 item.expression->Type() == TypeTag::kColumnValue &&
+                 item.expression->AsColumnValue().GetColumnName().name == "*";
+        })) {
+      return nullptr;
+    }
+    std::unordered_set<std::string> referenced;
+    CollectCteBodyOuterRefs(consumer, other, &referenced);
+    if (referenced.contains(name)) {
+      return nullptr;
+    }
+  }
+  const auto& body = *consumer.WithQueries().at(name);
+  if (body.HasLimit() || body.Offset() != 0 || body.Having() ||
+      body.Qualify() || body.IsGroupAll() || !body.UnionAll().empty() ||
+      body.GetSetOperationTree() || !body.WithQueries().empty() ||
+      HasWindowFunctions(body) || StatementContainsVolatileFunction(body) ||
+      ContainsQuery(body.WhereClause())) {
+    return nullptr;
+  }
+  struct Output {
+    size_t source;
+    ColumnName name;
+    Expression input;
+    bool integer;
+  };
+  std::vector<Output> outputs;
+  for (size_t s = 0; s < consumer.Sources().size(); ++s) {
+    const auto& source = consumer.Sources()[s];
+    const auto& query = *consumer.WithQueries().at(source.table);
+    const auto& qualifier = source.alias.empty() ? source.table : source.alias;
+    for (size_t i = 0; i < query.SelectList().size(); ++i) {
+      const auto& item = query.SelectList()[i];
+      bool integer = false;
+      if (item.expression && item.expression->Type() == TypeTag::kColumnValue) {
+        size_t matches = 0;
+        const auto& column = item.expression->AsColumnValue().GetColumnName();
+        for (const auto& input : query.Sources()) {
+          if (input.query || input.unnest ||
+              query.WithQueries().contains(input.table) ||
+              consumer.WithQueries().contains(input.table)) {
+            continue;
+          }
+          auto table = context.GetTable(input.table);
+          if (!table.HasValue()) {
+            continue;
+          }
+          const auto schema =
+              QualifySchema(table.Value()->GetSchema(),
+                            input.alias.empty() ? input.table : input.alias);
+          if (const auto slot = LocalColumnOffset(schema, column)) {
+            ++matches;
+            const auto& physical = schema.GetColumn(*slot);
+            integer =
+                physical.Type() == ValueType::kInt64 && !physical.IsUnsigned();
+          }
+        }
+        integer &= matches == 1;
+      }
+      outputs.push_back({s, ColumnName(qualifier, ProjectionName(item, i)),
+                         item.expression, integer});
+    }
+  }
+  const auto resolve =
+      [&](const Expression& expression) -> std::optional<size_t> {
+    if (!expression || expression->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+    const auto& column = expression->AsColumnValue().GetColumnName();
+    std::optional<size_t> found;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      const auto& candidate = outputs[i].name;
+      if (AliasEquals(candidate.name, column.name) &&
+          (column.schema.empty() ||
+           AliasEquals(candidate.schema, column.schema))) {
+        if (found) {
+          return std::nullopt;
+        }
+        found = i;
+      }
+    }
+    return found && outputs[*found].integer ? found : std::nullopt;
+  };
+  std::vector<std::optional<Value>> constants(outputs.size());
+  std::vector<std::pair<size_t, size_t>> edges;
+  const auto gather = [&](const Expression& predicate,
+                          std::optional<size_t> join) {
+    for (const auto& conjunct : SplitConjuncts(predicate)) {
+      if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp) {
+        continue;
+      }
+      const auto& binary = conjunct->AsBinaryExpression();
+      if (binary.Op() != BinaryOperation::kEquals) {
+        continue;
+      }
+      auto left = resolve(binary.Left());
+      auto right = resolve(binary.Right());
+      if (left && right) {
+        if (!join) {
+          edges.emplace_back(*left, *right);
+          edges.emplace_back(*right, *left);
+        } else {
+          if (outputs[*left].source == *join) {
+            std::swap(left, right);
+          }
+          if (outputs[*left].source < *join &&
+              outputs[*right].source == *join) {
+            edges.emplace_back(*left, *right);
+            if (consumer.Sources()[*join].join_type == JoinType::kInner) {
+              edges.emplace_back(*right, *left);
+            }
+          }
+        }
+      } else if (!join) {
+        const auto& literal = left ? binary.Right() : binary.Left();
+        const auto slot = left ? left : right;
+        if (slot && literal->Type() == TypeTag::kConstantValue) {
+          const auto& value = literal->AsConstantValue().GetValue();
+          if (!value.IsNull() && value.type == ValueType::kInt64 &&
+              !value.IsUnsigned()) {
+            constants[*slot] = value;
+          }
+        }
+      }
+    }
+  };
+  gather(consumer.WhereClause(), std::nullopt);
+  for (size_t i = 1; i < consumer.Sources().size(); ++i) {
+    gather(consumer.Sources()[i].join_condition, i);
+  }
+  for (size_t pass = 0; pass < outputs.size(); ++pass) {
+    bool changed = false;
+    for (const auto& [from, to] : edges) {
+      if (constants[from] && !constants[to]) {
+        constants[to] = constants[from];
+        changed = true;
+      }
+    }
+    if (!changed) {
+      break;
+    }
+  }
+  const auto body_column =
+      [&](const ColumnName& name) -> std::optional<std::pair<size_t, size_t>> {
+    std::optional<std::pair<size_t, size_t>> found;
+    for (size_t i = 0; i < body.Sources().size(); ++i) {
+      const auto& source = body.Sources()[i];
+      if (source.query || source.unnest ||
+          consumer.WithQueries().contains(source.table)) {
+        return std::nullopt;
+      }
+      auto table = context.GetTable(source.table);
+      if (!table.HasValue()) {
+        return std::nullopt;
+      }
+      const auto schema =
+          QualifySchema(table.Value()->GetSchema(),
+                        source.alias.empty() ? source.table : source.alias);
+      if (const auto column = LocalColumnOffset(schema, name)) {
+        if (found ||
+            !AliasEquals(schema.GetColumn(*column).Name().name, name.name)) {
+          return std::nullopt;
+        }
+        found = std::pair{i, static_cast<size_t>(*column)};
+      }
+    }
+    return found;
+  };
+  std::vector<Expression> predicates = SplitConjuncts(body.WhereClause());
+  const size_t original = predicates.size();
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    const auto& output = outputs[i];
+    if (!constants[i] || consumer.Sources()[output.source].table != name) {
+      continue;
+    }
+    // Only an ordinary grouping key can commute below grouping. A global
+    // aggregate (including an empty grouping set) must retain its one row.
+    const bool grouped = !body.GroupBy().empty();
+    if ((grouped && std::ranges::none_of(
+                        body.GroupBy(),
+                        [&](const auto& key) {
+                          if (key->Type() != TypeTag::kColumnValue) {
+                            return false;
+                          }
+                          const auto& lhs =
+                              key->AsColumnValue().GetColumnName();
+                          const auto& rhs =
+                              output.input->AsColumnValue().GetColumnName();
+                          if (lhs == rhs) {
+                            return true;
+                          }
+                          const auto owner = body_column(lhs);
+                          return owner && owner == body_column(rhs);
+                        })) ||
+        (!grouped &&
+         std::ranges::any_of(body.SelectList(), [](const auto& item) {
+           return ContainsAggregate(item.expression);
+         }))) {
+      continue;
+    }
+    predicates.push_back(BinaryExpressionExp(output.input,
+                                             BinaryOperation::kEquals,
+                                             ConstantValueExp(*constants[i])));
+  }
+  if (predicates.size() == original) {
+    return nullptr;
+  }
+  auto result = std::make_shared<SelectStatement>(body);
+  result->SetWhereClause(CombineConjuncts(predicates));
+  return result;
 }
 
 ScopedCorrelatedOuter::ScopedCorrelatedOuter(TransactionContext& context,
@@ -733,7 +1744,7 @@ void StashBuildDomainFilter(
   stored.type = filter->type;
   stored.key_count = filter->group->DistinctKeys();
   stored.column = static_cast<slot_t>(*local_offset);
-  stored.owner = &statement;
+  stored.SetOwner(statement);
 }
 
 }  // namespace
@@ -746,6 +1757,13 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     return std::nullopt;
   }
 
+  RelationPtr source_cte;
+  if (statement.Sources().size() == 1 && statement.WithQueries().empty()) {
+    const auto found = ctes.find(statement.Sources()[0].table);
+    if (found != ctes.end()) {
+      source_cte = found->second;
+    }
+  }
   CorrelatedIndex* index = nullptr;
   const auto cached =
       context.execution_runtime()->correlated_indexes.find(&statement);
@@ -756,11 +1774,12 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // the outer context it was built for; reusing it under any other
       // context (including no context) would silently miss rows.  Unfiltered
       // builds (serial 0) stay universally valid.
-      if (candidate->outer_filter_serial == 0 ||
-          (candidate->outer_filter_relation ==
-               context.execution_runtime()->correlated_outer_relation &&
-           candidate->outer_filter_serial ==
-               context.execution_runtime()->correlated_outer_serial)) {
+      if (candidate->source_cte == source_cte &&
+          (candidate->outer_filter_serial == 0 ||
+           (candidate->outer_filter_relation ==
+                context.execution_runtime()->correlated_outer_relation &&
+            candidate->outer_filter_serial ==
+                context.execution_runtime()->correlated_outer_serial))) {
         index = candidate;
       } else {
         DropCacheEntry(*context.execution_runtime(), &statement);
@@ -789,7 +1808,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       return std::nullopt;
     }
     const SelectSource& from = statement.Sources()[0];
-    if (!from.table.empty() && (ctes.contains(from.table) ||
+    if (!from.table.empty() && ((ctes.contains(from.table) && !source_cte) ||
                                 statement.WithQueries().contains(from.table))) {
       return std::nullopt;
     }
@@ -798,7 +1817,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       !context.execution_runtime()->unindexable_queries.contains(&statement)) {
     const SelectSource& from = statement.Sources()[0];
     Schema peek_schema;
-    if (statement.Sources().size() == 1 && !from.query && !from.table.empty()) {
+    if (source_cte) {
+      peek_schema = QualifySchema(source_cte->schema,
+                                  from.alias.empty() ? from.table : from.alias);
+    } else if (statement.Sources().size() == 1 && !from.query &&
+               !from.table.empty()) {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(from.table);
       if (table.HasValue()) {
         peek_schema = table.Value()->GetSchema();
@@ -811,13 +1834,24 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         }
       }
     }
+    // The same correlation equality may occur in every OR branch rather
+    // than at the top level. Use it as an index key, retaining the complete
+    // branch conditions below to recheck candidates (including NULL semantics).
+    auto key_predicates = SplitConjuncts(statement.WhereClause());
+    const auto original_predicates = key_predicates;
+    for (const auto& predicate : original_predicates) {
+      for (const auto& [lhs, rhs] : NecessaryDisjunctEqualities(predicate)) {
+        key_predicates.push_back(BinaryExpressionExp(ColumnValueExp(lhs),
+                                                     BinaryOperation::kEquals,
+                                                     ColumnValueExp(rhs)));
+      }
+    }
     auto has_correlated_equality = [&](const Schema& schema) {
       if (schema.ColumnCount() == 0) {
         return false;
       }
       return std::ranges::any_of(
-          SplitConjuncts(statement.WhereClause()),
-          [&](const Expression& predicate) {
+          key_predicates, [&](const Expression& predicate) {
             if (predicate->Type() != TypeTag::kBinaryExp) {
               return false;
             }
@@ -848,15 +1882,27 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     const void* domain_relation = nullptr;
     uint64_t domain_serial = 0;
     std::vector<Expression> applied_scan_predicates;
-    if (statement.Sources().size() == 1) {
+    if (source_cte) {
+      // Index the materialized rows once, then memoize aggregate answers per
+      // outer key exactly as for a base table. No scan predicates were applied.
+      auto loaded = LoadSource(context, from, &outer, ctes);
+      if (!loaded.HasValue()) {
+        return std::nullopt;
+      }
+      source = loaded.MoveValue();
+    } else if (statement.Sources().size() == 1) {
       std::vector<slot_t> projection;
       if (peek_schema.ColumnCount() > 0) {
+        // The reusable projection was derived in the root scope. A correlated
+        // alias may reference additional columns (including residual keys)
+        // that did not resolve in that scope. Keep every local dependency.
+        projection = RequiredColumns(statement, peek_schema, true);
         if (const std::vector<slot_t>* shared =
                 ReusableProjection(context, from.table)) {
-          projection = *shared;
-        } else {
-          // peek_schema already carries the alias-qualified names.
-          projection = RequiredColumns(statement, peek_schema, true);
+          projection.insert(projection.end(), shared->begin(), shared->end());
+          std::ranges::sort(projection);
+          projection.erase(std::unique(projection.begin(), projection.end()),
+                           projection.end());
         }
         if (projection.empty()) {
           projection.push_back(0);
@@ -872,8 +1918,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // cache entry, so an unrelated or later outer context can never
       // narrow another scan.
       std::vector<std::pair<slot_t, ColumnName>> correlation_equalities;
-      for (const Expression& predicate :
-           SplitConjuncts(statement.WhereClause())) {
+      for (const Expression& predicate : key_predicates) {
         if (predicate->Type() != TypeTag::kBinaryExp) {
           continue;
         }
@@ -924,8 +1969,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // is owned by the statement that derived it; applying it to correlated
       // subqueries silently narrowed unrelated scans.
       std::vector<Expression> scan_predicates;
-      for (const Expression& predicate :
-           SplitConjuncts(statement.WhereClause())) {
+      for (const Expression& predicate : key_predicates) {
         if (IsNonThrowingScanComparison(predicate, peek_schema)) {
           scan_predicates.push_back(predicate);
         }
@@ -958,7 +2002,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         ExecutionRuntime& runtime = *context.execution_runtime();
         for (auto iter = runtime.table_key_filters.begin();
              iter != runtime.table_key_filters.end();) {
-          if (iter->second.owner == &statement) {
+          if (iter->second.OwnedBy(statement)) {
             iter = runtime.table_key_filters.erase(iter);
           } else {
             ++iter;
@@ -973,9 +2017,24 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           StashBuildDomainFilter(context, statement, ctes, *correlation);
         }
       }
+      // A plain EXISTS observes row existence, never its wildcard payload.
+      // Keep every WHERE/ON/correlation dependency but avoid decoding all
+      // fact-table columns just because the SQL spells SELECT *.
+      const bool exists_star =
+          exists_only && statement.GroupBy().empty() && !statement.Having() &&
+          !statement.Distinct() && !statement.HasLimit() &&
+          statement.Offset() == 0 && statement.OrderBy().empty() &&
+          statement.SelectList().size() == 1 &&
+          statement.SelectList()[0].expression &&
+          statement.SelectList()[0].expression->Type() ==
+              TypeTag::kColumnValue &&
+          statement.SelectList()[0]
+                  .expression->AsColumnValue()
+                  .GetColumnName() == ColumnName("*");
       bool predicates_applied = false;
       StatusOr<Relation> built =
-          BuildInput(context, statement, &outer, ctes, &predicates_applied);
+          BuildInput(context, statement, &outer, ctes, &predicates_applied,
+                     nullptr, exists_star);
       if (!built.HasValue()) {
         return std::nullopt;
       }
@@ -983,11 +2042,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     }
     auto created = std::make_unique<CorrelatedIndex>();
     created->schema = source.schema;
+    created->source_cte = source_cte;
     created->outer_filter_relation = domain_relation;
     created->outer_filter_serial = domain_serial;
     std::vector<Expression> indexed_equalities;
-    for (const Expression& predicate :
-         SplitConjuncts(statement.WhereClause())) {
+    for (const Expression& predicate : key_predicates) {
       if (predicate->Type() != TypeTag::kBinaryExp) {
         continue;
       }
@@ -1014,6 +2073,54 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
     if (created->local_columns.empty()) {
       context.execution_runtime()->unindexable_queries.insert(&statement);
       return std::nullopt;
+    }
+    if (created->local_columns.size() == 1 &&
+        source.schema.GetColumn(created->local_columns[0]).Type() ==
+            ValueType::kVarChar) {
+      bool plain = true;
+      const Status checked = source.ForEachRow([&](const Row& row) {
+        const Value& key = row[created->local_columns[0]];
+        if (!key.IsNull() && !BinaryStringKey(key)) {
+          plain = false;
+        }
+      });
+      if (!plain || checked != Status::kSuccess) {
+        return std::nullopt;
+      }
+      const auto& runtime = *context.execution_runtime();
+      const Relation* domain = runtime.correlated_outer_relation;
+      const bool domain_disabled =
+          std::getenv("TINYLAMB_DISABLE_CORRELATED_DOMAIN_FILTER") != nullptr;
+      if (!domain_disabled && (domain != nullptr) && !domain->HasSpill() &&
+          !source.HasSpill() && domain->TotalRows() <= 2000000) {
+        const auto offset =
+            LocalColumnOffset(domain->schema, created->outer_columns[0]);
+        if (offset) {
+          std::unordered_set<std::string> keys;
+          bool compatible = true;
+          for (const auto& row : domain->rows) {
+            const auto& key = row[*offset];
+            if (key.IsNull()) {
+              continue;
+            }
+            if (!BinaryStringKey(key)) {
+              compatible = false;
+              break;
+            }
+            keys.emplace(key.AsStringView());
+          }
+          if (compatible) {
+            std::erase_if(source.rows, [&](const Row& row) {
+              const auto& key = row[created->local_columns[0]];
+              return key.IsNull() ||
+                     !keys.contains(std::string(key.AsStringView()));
+            });
+            created->outer_filter_relation = domain;
+            created->outer_filter_serial = runtime.correlated_outer_serial;
+            ++context.execution_runtime()->correlated_domain_filter_builds;
+          }
+        }
+      }
     }
     std::vector<Expression> correlated_expressions =
         SplitConjuncts(statement.WhereClause());
@@ -1063,7 +2170,47 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
           applied_scan_predicates.end()) {
         continue;
       }
-      local_predicates.push_back(predicate);
+      Expression residual = predicate;
+      if (!NecessaryDisjunctEqualities(predicate).empty()) {
+        // Each indexed strict equality is TRUE inside its matching bucket.
+        // Substitute only those equality conjuncts, leaving every other OR
+        // branch condition intact. This permits build-time aggregation without
+        // incorrectly treating the remaining expression as outer-dependent.
+        std::vector<Expression> branches;
+        for (const auto& branch : SplitDisjuncts(predicate)) {
+          std::vector<Expression> remaining;
+          for (const auto& term : SplitConjuncts(branch)) {
+            bool enforced = false;
+            if (term->Type() == TypeTag::kBinaryExp) {
+              const auto& binary = term->AsBinaryExpression();
+              if (binary.Op() == BinaryOperation::kEquals &&
+                  binary.Left()->Type() == TypeTag::kColumnValue &&
+                  binary.Right()->Type() == TypeTag::kColumnValue) {
+                const auto pair = EqualityPairKey(
+                    binary.Left()->AsColumnValue().GetColumnName(),
+                    binary.Right()->AsColumnValue().GetColumnName());
+                enforced = std::ranges::any_of(
+                    indexed_equalities, [&](const auto& equality) {
+                      const auto& indexed = equality->AsBinaryExpression();
+                      return pair == EqualityPairKey(indexed.Left()
+                                                         ->AsColumnValue()
+                                                         .GetColumnName(),
+                                                     indexed.Right()
+                                                         ->AsColumnValue()
+                                                         .GetColumnName());
+                    });
+              }
+            }
+            if (!enforced) {
+              remaining.push_back(term);
+            }
+          }
+          branches.push_back(remaining.empty() ? ConstantValueExp(Value(1))
+                                               : CombineConjuncts(remaining));
+        }
+        residual = CombineDisjuncts(branches);
+      }
+      local_predicates.push_back(std::move(residual));
     }
 
     const bool integer_key =
@@ -1163,6 +2310,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         check(item.expression);
       }
       check(statement.Having());
+      for (const auto& term : statement.OrderBy()) check(term.expression);
     }
     const bool simple_exists_projection =
         exists_only && statement.GroupBy().empty() &&
@@ -1203,7 +2351,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       created->exists_residual_predicates = probe_predicates;
     }
 
-    source.FinishSpill();
+    if (source.FinishSpill() != Status::kSuccess) {
+      return std::nullopt;
+    }
     Status group_error{Status::kSuccess};
     if (aggregate_only) {
       // One-pass hash aggregate into finished scalar results. Storing only
@@ -1514,9 +2664,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         // bytecode); rows they cannot decide are deferred to the serial
         // pass below.
         const auto build_rows = source.TotalRows();
-        const auto workers =
-            std::min<size_t>({std::thread::hardware_concurrency(), 16UL,
-                              std::max<size_t>(1, build_rows / 4096)});
+        const auto workers = std::min<size_t>(
+            {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+             16UL, std::max<size_t>(1, build_rows / 4096)});
         if (workers > 1) {
           std::vector<BuildWorker> build_workers(workers);
           for (BuildWorker& local : build_workers) {
@@ -1684,7 +2834,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         }
       }
       if (!build_parallel) {
-        source.ForEachRow(accumulate_one);
+        if (source.ForEachRow(accumulate_one) != Status::kSuccess) {
+          return std::nullopt;
+        }
       }
       if (group_error != Status::kSuccess) {
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
@@ -2056,7 +3208,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
       // them into the multimap).
       const CompiledScanFilter local_filter =
           CompileScanFilter(local_predicates, source.schema);
-      source.ForEachRow([&](const Row& row) {
+      const Status iteration = source.ForEachRow([&](const Row& row) {
         if (group_error != Status::kSuccess ||
             HasNullKey(row, created->local_columns)) {
           return;
@@ -2068,19 +3220,20 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         created->exists_keys.insert(
             IntegerJoinKey(row, created->local_columns[0]));
       });
-      if (group_error != Status::kSuccess) {
+      if (iteration != Status::kSuccess || group_error != Status::kSuccess) {
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
       }
       created->exists_key_set = true;
     } else {
-      source.ForEachRow([&](const Row& row) {
+      const Status iteration = source.ForEachRow([&](const Row& row) {
         if (HasNullKey(row, created->local_columns)) {
           return;
         }
         if (!local_predicates.empty()) {
           Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
           for (const Expression& predicate : local_predicates) {
-            if (group_error != Status::kSuccess) {
+            if (iteration != Status::kSuccess ||
+                group_error != Status::kSuccess) {
               return;
             }
             StatusOr<Value> keep =
@@ -2272,7 +3425,10 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
          outer_value.type == ValueType::kDate) ||
         (local_column.Type() == ValueType::kInt64 &&
          outer_value.type == ValueType::kInt64 &&
-         local_column.IsUnsigned() == outer_value.IsUnsigned());
+         local_column.IsUnsigned() == outer_value.IsUnsigned()) ||
+        (index->local_columns.size() == 1 &&
+         local_column.Type() == ValueType::kVarChar &&
+         BinaryStringKey(outer_value));
     if (!same_domain) {
       return std::nullopt;
     }
@@ -2553,12 +3709,34 @@ bool StatementUsesOnlyScopes(  // NOLINT(misc-no-recursion)
     scopes.push_back(std::move(metadata));
   }
   for (const SelectSource& source : statement.Sources()) {
-    if (source.query || source.unnest) {
+    if (source.unnest || source.is_lateral) {
       return false;
     }
     Relation metadata;
 
-    if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
+    if (source.query) {
+      // A derived input has its own scope. Prove it independent before
+      // exposing its named output columns to the enclosing scope check.
+      const auto& derived = *source.query;
+      if (source.alias.empty() || !derived.WithQueries().empty() ||
+          !derived.UnionAll().empty() || derived.GetSetOperationTree() ||
+          derived.Qualify() ||
+          !StatementUsesOnlyScopes(context, derived, {}, ctes)) {
+        return false;
+      }
+      std::vector<Column> columns;
+      columns.reserve(derived.SelectList().size());
+      for (size_t i = 0; i < derived.SelectList().size(); ++i) {
+        const auto& item = derived.SelectList()[i];
+        if (!item.expression ||
+            (item.expression->Type() == TypeTag::kColumnValue &&
+             item.expression->AsColumnValue().GetColumnName().name == "*")) {
+          return false;
+        }
+        columns.emplace_back(ProjectionName(item, i), ValueType::kNull);
+      }
+      metadata.schema = Schema("", std::move(columns));
+    } else if (const auto cte = ctes.find(source.table); cte != ctes.end()) {
       metadata.schema = cte->second->schema;
     } else {
       StatusOr<std::shared_ptr<Table>> table = context.GetTable(source.table);
@@ -2710,6 +3888,11 @@ bool StatementContainsVolatileFunction(const SelectStatement& statement) {
       }
     }
     for (const SelectSource& source : current.Sources()) {
+      // Sampling consumes randomness just like a volatile expression. Shared
+      // inputs and subquery caches must not reuse a sampled evaluation.
+      if (source.sample) {
+        return true;
+      }
       if (expression_contains_volatile(source.join_condition,
                                        expression_contains_volatile) ||
           expression_contains_volatile(source.unnest,
@@ -2899,8 +4082,9 @@ const Relation* ExecuteCachedUncorrelated(TransactionContext& context,
   }
   // Separate AST nodes can describe the same uncorrelated subquery (for
   // example two identical scalar expressions in one SELECT list).  Use a
-  // structural key for those nodes, but include the identity of inherited
-  // CTE relations so a name resolving to different materialized contents can
+  // structural key for supported nodes (opaque aggregate/window/set-operation
+  // nodes retain identity), and include the identity of inherited CTE
+  // relations so a name resolving to different materialized contents can
   // never reuse an unrelated result.
   // EXISTS may safely execute a capped copy, while scalar/IN consumers need
   // the complete relation (and scalar consumers must still observe a second
@@ -3126,8 +4310,8 @@ void MaterializeCacheRowsParallel(const std::string& cache_key,
   }
   BaseRelationArena& a = *arena->second;
   cached->rows.resize(a.rows);
-  const size_t workers =
-      std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+  const size_t workers = std::clamp<size_t>(
+      QueryParallelWorkerLimit(std::thread::hardware_concurrency()), 1, 16);
   std::vector<std::jthread> threads;
   for (size_t w = 1; w < workers; ++w) {
     threads.emplace_back([&, w] {

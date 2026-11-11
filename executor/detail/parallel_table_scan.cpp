@@ -21,6 +21,8 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -38,6 +40,7 @@
 #include "expression/parameter_slot.hpp"
 #include "expression/proto_text.hpp"
 #include "expression/rewrite.hpp"
+#include "expression/unary_expression.hpp"
 #include "index/index_scan_iterator.hpp"
 #include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
@@ -153,10 +156,10 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     } else {
       const size_t lstable_row_workers =
           std::max<size_t>(2, lstable_store->total_rows / 4096);
-      workers = std::min<size_t>(
-          {kMaxParallelScanWorkers,
-           static_cast<size_t>(std::thread::hardware_concurrency()),
-           block_morsels, lstable_row_workers});
+      workers = std::min<size_t>({kMaxParallelScanWorkers,
+                                  static_cast<size_t>(QueryParallelWorkerLimit(
+                                      std::thread::hardware_concurrency())),
+                                  block_morsels, lstable_row_workers});
       workers = std::max<size_t>(1, workers);
     }
   } else {
@@ -164,10 +167,11 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       return false;
     }
     morsels = table.BuildScanMorsels(context.txn_, 8);
-    workers = std::min<size_t>(
-        {kMaxParallelScanWorkers,
-         static_cast<size_t>(std::thread::hardware_concurrency()),
-         std::max<size_t>(1, morsels.size()), row_workers});
+    workers =
+        std::min<size_t>({kMaxParallelScanWorkers,
+                          static_cast<size_t>(QueryParallelWorkerLimit(
+                              std::thread::hardware_concurrency())),
+                          std::max<size_t>(1, morsels.size()), row_workers});
     if (workers <= 1 || morsels.size() < 8) {
       return false;
     }
@@ -209,11 +213,25 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       filter_during_scan && scan_filter != nullptr
           ? BuildIntegerPeeks(*scan_filter, projection, table.GetSchema())
           : std::vector<IntegerPeekCompare>{};
+  if (lstable_store != nullptr &&
+      std::ranges::any_of(integer_peeks, [&](const auto& compare) {
+        return compare.op == BinaryOperation::kEquals &&
+               !lstable_store->MayContainInteger(compare.column,
+                                                 compare.constant);
+      })) {
+    result->schema = result_schema;
+    *error = Status::kSuccess;
+    return true;
+  }
 
   struct LSTableDictColFilter {
     slot_t column{0};
     std::array<uint64_t, 4> pass_mask{};
     std::array<uint8_t, 256> pass{};
+  };
+  struct LSTableWideDictFilter {
+    slot_t column{0};
+    std::vector<uint8_t> pass;
   };
   struct LSTableDoubleZonePredicate {
     slot_t column{0};
@@ -230,6 +248,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     const RuntimeFilterGroup* group{nullptr};
   };
   std::vector<LSTableDictColFilter> lstable_dict_filters;
+  std::vector<LSTableWideDictFilter> lstable_wide_filters;
   std::vector<LSTableDoubleZonePredicate> lstable_double_zones;
   std::vector<LSTableIntColCompare> lstable_col_compares;
   std::vector<LSTableExtraRf> lstable_extra_rfs;
@@ -244,7 +263,19 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
   const bool can_predecide_lstable =
       lstable_store != nullptr && filter_during_scan &&
       scan_filter != nullptr && !scan_filter->compile_decided_reject &&
-      !scan_filter->needs_unsigned_tagging;
+      !scan_filter->needs_unsigned_tagging &&
+      std::ranges::none_of(
+          scan_filter->prebuilt_membership,
+          [](const auto& pred) { return pred.string_values != nullptr; });
+  // NULL tests depend only on the validated snapshot's null bitmap. Decide
+  // them before allocating projected rows, including NOT (col IS NULL).
+  const auto null_tests = can_predecide_lstable
+                              ? BuildNullPeeks(*scan_filter, result_schema,
+                                               projection, table.GetSchema())
+                              : std::vector<NullPeekCompare>{};
+  const bool residual_decided_by_null_tests =
+      can_predecide_lstable &&
+      null_tests.size() == scan_filter->residual.size();
   if (can_predecide_lstable) {
     simple_covered_by_dict.assign(scan_filter->simple.size(), 0);
     prefix_covered_by_dict.assign(scan_filter->prefix_in.size(), 0);
@@ -253,7 +284,8 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     std::vector<int> col_to_df(table.GetSchema().ColumnCount(), -1);
     const auto dict_size_of =
         [](const LSTableColumnDictionary& dict) noexcept -> size_t {
-      if (dict.value_type == ValueType::kInt64) {
+      if (dict.value_type == ValueType::kInt64 ||
+          dict.value_type == ValueType::kDate) {
         return dict.int_entries.size();
       }
       if (dict.value_type == ValueType::kDouble) {
@@ -340,6 +372,24 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       if (full_col >= table.GetSchema().ColumnCount()) {
         continue;
       }
+      if (full_col < lstable_store->dictionaries.size() &&
+          lstable_store->dictionaries[full_col].wide_code_bytes != 0) {
+        const auto& dictionary = lstable_store->dictionaries[full_col];
+        bool supported = false;
+        (void)eval_pred_on_dict_code(pred, dictionary, 0, &supported);
+        if (supported) {
+          LSTableWideDictFilter filter;
+          filter.column = full_col;
+          filter.pass.resize(dict_size_of(dictionary));
+          for (size_t code = 0; code < filter.pass.size(); ++code) {
+            filter.pass[code] = static_cast<uint8_t>(
+                eval_pred_on_dict_code(pred, dictionary, code, &supported));
+          }
+          lstable_wide_filters.push_back(std::move(filter));
+          simple_covered_by_dict[si] = 1;
+          continue;
+        }
+      }
       if (pred.double_payload &&
           table.GetSchema().GetColumn(full_col).Type() == ValueType::kDouble) {
         lstable_double_zones.push_back(
@@ -350,7 +400,10 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       if (!pred.double_payload &&
           !table.GetSchema().GetColumn(full_col).IsUnsigned() &&
           (pred.constant.type == ValueType::kInt64 ||
-           pred.constant.type == ValueType::kDate)) {
+           pred.constant.type == ValueType::kDate ||
+           (pred.date_string_payload &&
+            table.GetSchema().GetColumn(full_col).Type() ==
+                ValueType::kDate))) {
         for (const IntegerPeekCompare& pk : integer_peeks) {
           if (pk.column == full_col && pk.op == pred.op &&
               pk.constant == pred.int_constant) {
@@ -543,6 +596,10 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     if (pred.constant.IsNull()) {
       return false;
     }
+    if (pred.date_string_payload && col.type == ValueType::kDate &&
+        !col.is_unsigned) {
+      return ComparePositional(pred.op, col.int_cells[r], pred.int_constant);
+    }
     if (pred.int_payload &&
         (col.type == ValueType::kInt64 || col.type == ValueType::kDate) &&
         !col.is_unsigned && !pred.constant.IsUnsigned()) {
@@ -581,7 +638,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       *fully_decided = true;
       return false;
     }
-    if (scan_filter->needs_unsigned_tagging) {
+    if (!can_predecide_lstable) {
       return true;
     }
     bool all_simple_checked = true;
@@ -728,7 +785,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
         (!has_post_simple_filter ||
          (worker_programs.complete &&
           scan_filter->prebuilt_scalar_compare.empty() &&
-          all_disjunctive_checked && scan_filter->residual.empty()));
+          all_disjunctive_checked && residual_decided_by_null_tests));
     return true;
   };
   const bool lstable_fast_loop_decides_all = [&]() {
@@ -769,7 +826,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     }
     return worker_programs.complete &&
            scan_filter->prebuilt_scalar_compare.empty() &&
-           scan_filter->residual.empty();
+           residual_decided_by_null_tests;
   }();
   const bool has_ample_memory_budget = Relation::HasAmpleMemoryBudget();
   const bool fast_in_memory_append =
@@ -830,7 +887,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
             case ValueType::kVarChar: {
               const std::string_view sv = col.VarcharAt(r);
               dst.type = ValueType::kVarChar;
-              dst.owned_data.assign(sv.data(), sv.size());
+              dst.owned_data.assign(sv);
               dst.value.varchar_value = dst.owned_data;
               break;
             }
@@ -865,7 +922,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               continue;
             }
             bool zone_rejected = false;
-            bool dict_all_pass = true;
+            bool dict_all_pass = lstable_wide_filters.empty();
             for (const LSTableDictColFilter& df : lstable_dict_filters) {
               const LSTableColumnBlock& dcol = blk->columns[df.column];
               if (((dcol.dict_mask[0] & df.pass_mask[0]) |
@@ -927,6 +984,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
             }
             for (const LSTableDoubleZonePredicate& dz : lstable_double_zones) {
               const LSTableColumnBlock& dcol = blk->columns[dz.column];
+              if (dcol.has_nan || std::isnan(dz.constant)) {
+                continue;
+              }
               if (!dcol.has_double_min_max) {
                 zone_rejected = true;
                 break;
@@ -1081,6 +1141,16 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
                 continue;
               }
             }
+            bool null_rejected = false;
+            for (const NullPeekCompare& test : null_tests) {
+              if (test.expect_null && !blk->columns[test.column].has_null) {
+                null_rejected = true;
+                break;
+              }
+            }
+            if (null_rejected) {
+              continue;
+            }
             const size_t col_count = projection != nullptr
                                          ? projection->size()
                                          : blk->columns.size();
@@ -1163,7 +1233,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
             const bool block_all_pass =
                 rf_col == nullptr && fast_extra_rf_count == 0 &&
                 dict_all_pass && peek_all_pass && col_cmp_all_pass;
-            if (fast_in_memory_append && block_all_pass) {
+            if (fast_in_memory_append && block_all_pass && null_tests.empty()) {
               // Pattern C: Dense All-Pass Streaming (s_block = 100%).
               const uint32_t nrows = blk->row_count;
               for (uint32_t r = 0; r < nrows; ++r) {
@@ -1176,10 +1246,10 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               shard_out[w] += nrows;
               continue;
             }
-            if (fast_in_memory_append && rf_col != nullptr && rf_has_dense &&
-                !rf_col_monotonic && !rf_col_has_null &&
-                fast_extra_rf_count == 0 && dict_all_pass && peek_all_pass &&
-                col_cmp_all_pass) {
+            if (fast_in_memory_append && null_tests.empty() &&
+                rf_col != nullptr && rf_has_dense && !rf_col_monotonic &&
+                !rf_col_has_null && fast_extra_rf_count == 0 && dict_all_pass &&
+                peek_all_pass && col_cmp_all_pass) {
               const uint32_t nrows = blk->row_count;
               const int64_t* const rf_cells = rf_col->int_cells.data();
               const auto span_u =
@@ -1202,6 +1272,16 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               continue;
             }
             for (uint32_t r = 0; r < blk->row_count; ++r) {
+              bool null_matches = true;
+              for (const NullPeekCompare& test : null_tests) {
+                if (blk->columns[test.column].IsNull(r) != test.expect_null) {
+                  null_matches = false;
+                  break;
+                }
+              }
+              if (!null_matches) {
+                continue;
+              }
               if (rf_col != nullptr) {
                 if (rf_col_has_null && rf_col->IsNull(r)) [[unlikely]] {
                   continue;
@@ -1320,6 +1400,18 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
               }
               if (!dict_all_pass) {
                 bool dict_ok = true;
+                for (const auto& filter : lstable_wide_filters) {
+                  const auto& column = blk->columns[filter.column];
+                  const auto code = column.DictionaryCodeAt(r);
+                  if (column.IsNull(r) || code >= filter.pass.size() ||
+                      filter.pass[code] == 0) {
+                    dict_ok = false;
+                    break;
+                  }
+                }
+                if (!dict_ok) {
+                  continue;
+                }
                 for (const LSTableDictColFilter& df : lstable_dict_filters) {
                   const LSTableColumnBlock& dcol = blk->columns[df.column];
                   if (dcol.dict_codes.empty() ||
@@ -1493,24 +1585,12 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       }
     }
   };
-  {
-    std::vector<std::jthread> threads;
-    threads.reserve(workers - 1);
-    for (size_t w = 1; w < workers; ++w) {
-      try {
-        threads.emplace_back(scan_worker, w);
-      } catch (...) {
-        std::scoped_lock lock(error_mu);
-        if (!error_ex) {
-          error_ex = std::current_exception();
-        }
-        break;
-      }
+  const Status scan_status = RunParallelTasks(workers, scan_worker);
+  if (!scan_status.ok()) {
+    if (error != nullptr) {
+      *error = scan_status;
     }
-    // Keep the same static morsel ownership and merge order while making
-    // the calling SQL worker useful. Starting one fewer thread removes a
-    // launch/join pair from each scan without changing aggregate ordering.
-    scan_worker(0);
+    return false;
   }
   if (error_ex) {
     if (error != nullptr) {
@@ -1560,8 +1640,6 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       }
       result->rows.resize(total_in_memory);
       {
-        std::vector<std::jthread> merge_threads;
-        merge_threads.reserve(workers - 1);
         const auto move_shard = [&](size_t w) {
           std::move(shards[w].rows.begin(), shards[w].rows.end(),
                     result->rows.begin() +
@@ -1569,11 +1647,13 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
           shards[w].rows.clear();
           shards[w].rows.shrink_to_fit();
         };
-        for (size_t w = 1; w < workers; ++w) {
-          merge_threads.emplace_back(move_shard, w);
+        const Status merge_status = RunParallelTasks(workers, move_shard);
+        if (!merge_status.ok()) {
+          record_error(merge_status);
+          return false;
         }
-        move_shard(0);
       }
+
       result->peak_intermediate_rows =
           std::max(result->peak_intermediate_rows, result->rows.size());
     } else {

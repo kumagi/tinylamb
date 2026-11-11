@@ -17,6 +17,7 @@
 #include "table/fragment/fragment.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -78,7 +79,8 @@ bool ConjunctSupported(Runtime runtime, const Schema& sc, const Conjunct& c) {
            IsVarcharColumn(sc, c.col);
   }
   if (c.kind == ConjunctKind::kIsNull) {
-    return c.col < sc.ColumnCount();
+    // The common scan kernel currently materializes integer null maps only.
+    return IsInt64Column(sc, c.col);
   }
   return false;
 }
@@ -729,6 +731,10 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
         if (ci < 0) {
           continue;
         }
+        if (column_nulls[static_cast<size_t>(ci)][r] != 0) {
+          passes = false;
+          break;
+        }
         const int64_t value = column_values[static_cast<size_t>(ci)][r];
         bool holds = false;
         if (c.kind == ConjunctKind::kCompare) {
@@ -786,15 +792,19 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
     // closed interval maps to a closed interval of the run's key space.
     const std::string lo_key =
         MemcomparableInt64KeyOf(frag.range_lo.value_or(INT64_MIN));
-    const std::string hi_key =
-        MemcomparableInt64KeyOf(frag.range_hi.value_or(INT64_MAX));
     begin = run.LowerBound(lo_key);
     // LowerBound returns the first entry >= lo_key; the upper bound is
     // exclusive in the run's key space, so search for hi_key + 1 when the
     // maximum is not the bound itself.
-    end = (frag.range_hi.has_value() && *frag.range_hi == INT64_MAX)
+    end = (!frag.range_hi.has_value() || *frag.range_hi == INT64_MAX)
               ? run.Size()
-              : run.LowerBound(hi_key);
+              : run.LowerBound(MemcomparableInt64KeyOf(*frag.range_hi + 1));
+  }
+  if (frag.access == AccessMode::kPoint) {
+    begin = run.LowerBound(MemcomparableInt64KeyOf(*frag.point_key));
+    end = *frag.point_key == INT64_MAX
+              ? run.Size()
+              : run.LowerBound(MemcomparableInt64KeyOf(*frag.point_key + 1));
   }
   state->bytes_touched += run.Blob().size();
   for (size_t i = begin; i < end && i < run.Size(); ++i) {
@@ -867,11 +877,7 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
         }
         continue;
       }
-      if (!v.IsNull() && v.type == ValueType::kInt64) {
-        passes = false;
-        break;
-      }
-      // A non-int64 cell: the conjunct is not evaluable here.
+      // NULL and non-integer cells cannot satisfy an integer comparison.
       passes = false;
       break;
     }
@@ -908,7 +914,8 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
 
 // Scans a memtable snapshot artifact.
 void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
-                     const Schema& sc, const std::vector<Conjunct>& eval,
+                     const Schema& sc, const Fragment& frag,
+                     const std::vector<Conjunct>& eval,
                      const std::vector<Conjunct>& varchar_eval,
                      const std::vector<slot_t>& needed, uint32_t artifact_index,
                      ScanState* state) {
@@ -919,6 +926,16 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
   for (size_t ri = 0; ri < rows.size(); ++ri) {
     const std::string& key = rows[ri].first;
     const RowEntry& entry = rows[ri].second;
+    if (frag.access != AccessMode::kFilterScan) {
+      int64_t key_value = 0;
+      if (!MemcomparableInt64Key(key, &key_value) ||
+          (frag.access == AccessMode::kPoint && key_value != *frag.point_key) ||
+          (frag.access == AccessMode::kKeyRange &&
+           ((frag.range_lo && key_value < *frag.range_lo) ||
+            (frag.range_hi && key_value > *frag.range_hi)))) {
+        continue;
+      }
+    }
     state->rows_in += 1;
     if (entry.is_deleted) {
       SurvivingRow row;
@@ -1068,6 +1085,7 @@ struct Accumulator {
   int64_t max_val = 0;
   uint64_t count = 0;
   bool has_value = false;
+  std::unordered_set<int64_t> distinct;
 };
 
 // The value and NULL lookups of a row: the needed-column INDEX of a column
@@ -1116,24 +1134,28 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         if (null_of(agg.col)) {
           break;
         }
-        acc->sum += agg.coeff * value_of(agg.col);
+        acc->sum = std::bit_cast<int64_t>(
+            static_cast<uint64_t>(acc->sum) +
+            static_cast<uint64_t>(agg.coeff) *
+                static_cast<uint64_t>(value_of(agg.col)));
         acc->count += 1;
         break;
       }
       for (const AggTerm& term : agg.terms) {
-        __int128 product = term.coeff;
+        uint64_t product = static_cast<uint64_t>(term.coeff);
         bool null_term = false;
         for (slot_t col : term.cols) {
           if (null_of(col)) {
             null_term = true;
             break;
           }
-          product *= value_of(col);
+          product *= static_cast<uint64_t>(value_of(col));
         }
         if (null_term) {
           continue;
         }
-        acc->sum += static_cast<int64_t>(product);
+        acc->sum =
+            std::bit_cast<int64_t>(static_cast<uint64_t>(acc->sum) + product);
       }
       acc->count += 1;
       break;
@@ -1159,7 +1181,10 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
       acc->count += 1;
       break;
     case AggregateKind::kApproxCountDistinct:
-      acc->count += 1;
+      if (!null_of(agg.col)) {
+        acc->distinct.insert(value_of(agg.col));
+        acc->count = acc->distinct.size();
+      }
       break;
     case AggregateKind::kNone:
       break;
@@ -1186,6 +1211,15 @@ std::vector<int64_t> GroupKeyOf(const SurvivingRow& row,
 // part of it is outside the IR's contract (the executor then leaves it to
 // the residual path), and kCorruption when the fragment is malformed.
 Status ValidateFragment(const Schema& sc, const Fragment& frag) {
+  // The current fragment IR carries signed literals/keys and its kernels
+  // compare signed cells. UINT64 has a different memcomparable tag and order;
+  // decline the pushdown until that domain can be represented end to end.
+  for (size_t column = 0; column < sc.ColumnCount(); ++column) {
+    if (sc.GetColumn(column).IsUnsigned()) {
+      return Status::kNotImplemented;
+    }
+  }
+
   if (frag.top_k.has_value() && frag.limit_rows.has_value()) {
     return Status::kCorruption;  // the IR forbids both at once
   }
@@ -1216,8 +1250,17 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
       return Status::kCorruption;
     }
   }
-  if (frag.top_k.has_value() && frag.top_k->col >= sc.ColumnCount()) {
-    return Status::kCorruption;
+  if (frag.top_k.has_value()) {
+    if (frag.top_k->col >= sc.ColumnCount()) {
+      return Status::kCorruption;
+    }
+    if (!IsInt64Column(sc, frag.top_k->col)) {
+      return Status::kNotImplemented;
+    }
+  }
+  if (frag.access != AccessMode::kFilterScan &&
+      !IsInt64Column(sc, sc.KeyColumnIndex())) {
+    return Status::kNotImplemented;
   }
   if (frag.aggregate.has_value()) {
     const Aggregate& agg = *frag.aggregate;
@@ -1298,7 +1341,7 @@ void ScanArtifacts(const ArtifactSet& artifacts, const Fragment& frag,
               state);
     } else if (a.kind == ArtifactRef::Kind::kMemSnapshot &&
                a.mem_rows != nullptr) {
-      ScanMemSnapshot(*a.mem_rows, sc, eval, varchar_eval, needed,
+      ScanMemSnapshot(*a.mem_rows, sc, frag, eval, varchar_eval, needed,
                       artifact_index, state);
     }
   }
@@ -1314,7 +1357,7 @@ Capabilities GetCapabilities(Runtime runtime) {
   Capabilities caps;
   caps.runtime = runtime;
   // The native library and the WASM module expose the same IR; the WASM
-  // module's kernel coverage is narrower (see docs/08-wasm-pushdown.md), so
+  // module's kernel coverage is narrower, so
   // the bits that depend on a WASM kernel are off for the WASM runtime.
   // The v1 IR's int64 predicates, aggregates and the single-column GROUP BY
   // all have a native kernel and are shared by both runtimes.
@@ -1520,6 +1563,10 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
     return report;
   }
   const Schema& sc = *schema;
+  if (ValidateFragment(sc, fragment) != Status::kSuccess) {
+    report.coverage = Coverage::kNone;
+    return report;
+  }
   const std::vector<slot_t> needed = NeededColumns(sc, fragment);
   std::vector<size_t> residual;
   for (size_t i = 0; i < fragment.conjuncts.size(); ++i) {
@@ -1675,7 +1722,9 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
     aggregate_pushed = AggregateSupported(caps, *fragment.aggregate);
   }
   const bool group_pushed =
-      fragment.group_cols.empty() || caps.group_by_single_column;
+      fragment.group_cols.empty() ||
+      (fragment.group_cols.size() == 1 ? caps.group_by_single_column
+                                       : caps.group_by_multi_column);
 
   // The Top-K fast path: a single chunk, no filter, no aggregate and no
   // group by. The chunk's Top-K kernel prunes the row groups whose
@@ -1684,9 +1733,11 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
   // generic path does) would throw the pruning away and decode the whole
   // column for nothing.
   if (fragment.top_k.has_value() && fragment.conjuncts.empty() &&
+      fragment.access == AccessMode::kFilterScan &&
       !fragment.aggregate.has_value() && fragment.group_cols.empty() &&
       artifacts.size() == 1 && artifacts[0].kind == ArtifactRef::Kind::kChunk &&
-      artifacts[0].chunk != nullptr) {
+      artifacts[0].chunk != nullptr &&
+      artifacts[0].generation <= fragment.read_version) {
     const TopKSpec& spec = *fragment.top_k;
     const std::vector<TopKEntry> entries = TopKColumn(
         *artifacts[0].chunk, spec.col, spec.k, spec.descending, &schema);
@@ -1738,10 +1789,13 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
         artifacts[0].kind == ArtifactRef::Kind::kChunk &&
         artifacts[0].chunk != nullptr && fragment.conjuncts.empty() &&
         fragment.aggregate.has_value() &&
-        fragment.aggregate->kind == AggregateKind::kSum) {
-      const std::vector<GroupByEntryN> entries =
+        fragment.aggregate->kind == AggregateKind::kSum &&
+        fragment.aggregate->coeff == 1 && fragment.aggregate->terms.empty() &&
+        rows.size() == artifacts[0].chunk->TotalRowCount()) {
+      ASSIGN_OR_RETURN(
+          std::vector<GroupByEntryN>, entries,
           GroupBySumColumns(*artifacts[0].chunk, fragment.group_cols,
-                            fragment.aggregate->col, &schema);
+                            fragment.aggregate->col, &schema));
       for (const GroupByEntryN& e : entries) {
         GroupOutput out;
         out.key = e.key;
@@ -1828,11 +1882,25 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
     const RowReader reader{.flat_values = &state.values,
                            .flat_nulls = &state.nulls,
                            .needed = &needed};
+    std::vector<uint64_t> artifact_base(artifacts.size(), 0);
+    uint64_t base = 0;
+    for (size_t i = 0; i < artifacts.size(); ++i) {
+      artifact_base[i] = base;
+      const ArtifactRef& artifact = artifacts[i];
+      if (artifact.kind == ArtifactRef::Kind::kChunk && artifact.chunk) {
+        base += artifact.chunk->TotalRowCount();
+      } else if (artifact.kind == ArtifactRef::Kind::kRun && artifact.run) {
+        base += artifact.run->Size();
+      } else if (artifact.mem_rows) {
+        base += artifact.mem_rows->size();
+      }
+    }
     std::vector<TopKEntry> entries;
     entries.reserve(rows.size());
     for (const SurvivingRow& row : rows) {
       TopKEntry e;
       e.value = reader.Value(row, spec.col);
+      e.row = artifact_base[row.artifact_index] + row.row_index;
       entries.push_back(e);
     }
     const bool desc = spec.descending;

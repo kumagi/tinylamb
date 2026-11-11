@@ -138,9 +138,9 @@ tinylamb の最適化処理では、独立した 3 種類の Rule セットを�
 
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
-| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 74 回の `Add`（重複登録 1 件を除き実効 73 種） | スカラー式の正規化および定数畳み込み（例: `1 + 2` を `3` に変換、`NOT (a AND b)` の展開） |
-| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 有効 116（無効化コメント 1 件を除く） | Memo に結果が等価となる別の論理表現を追加（結合順序の交換、述語の押し込みなど） |
-| 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 52 | 論理式を具体的な物理演算子（HashJoin や IndexScan など）へ変換し、コスト評価対象とする |
+| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 71（2026-11-11 作業ツリー） | スカラー式の正規化および定数畳み込み（例: `1 + 2` を `3` に変換、`NOT (a AND b)` の展開） |
+| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 86（2026-11-11 作業ツリー） | Memo に結果が等価となる別の論理表現を追加（結合順序の交換、述語の押し込みなど） |
+| 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を具体的な物理演算子（HashJoin や IndexScan など）へ変換し、コスト評価対象とする |
 
 論理 Rule の典型例である結合順序の交換（`join_commutativity`）の登録コードを以下に示します（`plan/cascades.cpp` の `RuleSet::Default()`）。
 

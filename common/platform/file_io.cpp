@@ -24,7 +24,7 @@
 
 #include "common/platform/os.hpp"
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -41,7 +41,7 @@
 
 namespace tinylamb::platform {
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 namespace {
 
 int MapWin32ErrorToErrno(DWORD err) {
@@ -78,7 +78,7 @@ constexpr DWORD kLockByteHigh = 0x7fffffffU;
 #endif
 
 int OpenFile(const std::filesystem::path& path, OpenFlags flags, int mode) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   (void)mode;
   const bool writable = flags.mode == OpenMode::kReadWrite;
   const DWORD desired_access =
@@ -136,7 +136,7 @@ int OpenFile(const std::filesystem::path& path, OpenFlags flags, int mode) {
 }
 
 int CloseFile(int fd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   return ::_close(fd);
 #else
   return ::close(fd);
@@ -144,7 +144,7 @@ int CloseFile(int fd) {
 }
 
 int Dup2(int oldfd, int newfd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   return ::_dup2(oldfd, newfd) == 0 ? newfd : -1;
 #else
   return ::dup2(oldfd, newfd);
@@ -152,7 +152,7 @@ int Dup2(int oldfd, int newfd) {
 }
 
 ssize_t Write(int fd, const void* buf, size_t count) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const auto capped = static_cast<unsigned int>(
       std::min<size_t>(count, static_cast<size_t>(INT_MAX)));
   const int r = ::_write(fd, buf, capped);
@@ -166,7 +166,7 @@ ssize_t Write(int fd, const void* buf, size_t count) {
 }
 
 ssize_t Pread(int fd, void* buf, size_t count, int64_t offset) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   if (offset < 0) {
     errno = EINVAL;
     return -1;
@@ -199,7 +199,7 @@ ssize_t Pread(int fd, void* buf, size_t count, int64_t offset) {
 }
 
 ssize_t Pwrite(int fd, const void* buf, size_t count, int64_t offset) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   if (offset < 0) {
     errno = EINVAL;
     return -1;
@@ -229,7 +229,7 @@ ssize_t Pwrite(int fd, const void* buf, size_t count, int64_t offset) {
 }
 
 int ClearAppend(int fd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   (void)fd;
   return 0;
 #else
@@ -239,7 +239,7 @@ int ClearAppend(int fd) {
 }
 
 int Truncate(int fd, int64_t length) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const errno_t err = ::_chsize_s(fd, length);
   if (err != 0) {
     errno = err;
@@ -252,7 +252,7 @@ int Truncate(int fd, int64_t length) {
 }
 
 int FileSize(int fd, int64_t* size_out) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const intptr_t raw = ::_get_osfhandle(fd);
   if (raw == -1) {
     errno = EBADF;
@@ -276,7 +276,7 @@ int FileSize(int fd, int64_t* size_out) {
 }
 
 int TryLockExclusive(int fd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const intptr_t raw = ::_get_osfhandle(fd);
   if (raw == -1) {
     errno = EBADF;
@@ -298,7 +298,7 @@ int TryLockExclusive(int fd) {
 }
 
 int UnlockFile(int fd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const intptr_t raw = ::_get_osfhandle(fd);
   if (raw == -1) {
     errno = EBADF;
@@ -318,7 +318,7 @@ int UnlockFile(int fd) {
 }
 
 int SyncDirectory(const std::filesystem::path& dir) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   (void)dir;
   return 0;
 #else
@@ -345,7 +345,7 @@ int SyncDirectory(const std::filesystem::path& dir) {
 }
 
 int DataSync(int fd) {
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
   const intptr_t raw = ::_get_osfhandle(fd);
   if (raw == -1) {
     errno = EBADF;

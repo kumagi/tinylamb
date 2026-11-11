@@ -22,7 +22,9 @@
 #include <utility>
 #include <vector>
 
+#include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -67,6 +69,12 @@ StatusOr<Value> CaseExpression::TryEvaluate(const Row& row,
 }
 
 namespace {
+
+bool IsNullLiteral(const Expression& expression) {
+  return expression && expression->Type() == TypeTag::kConstantValue &&
+         dynamic_cast<const ParameterSlot*>(expression.get()) == nullptr &&
+         expression->AsConstantValue().GetValue().IsNull();
+}
 
 Type UnifiedBranchType(std::vector<Type> branch_types) {
   if (branch_types.empty()) {
@@ -123,9 +131,11 @@ Type CaseExpression::ResultType(const Schema& schema) const {
   std::vector<tinylamb::Type> branch_types;
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
-    branch_types.push_back(when.second->ResultType(schema));
+    if (!IsNullLiteral(when.second)) {
+      branch_types.push_back(when.second->ResultType(schema));
+    }
   }
-  if (else_clause_) {
+  if (else_clause_ && !IsNullLiteral(else_clause_)) {
     branch_types.push_back(else_clause_->ResultType(schema));
   }
   return UnifiedBranchType(std::move(branch_types));
@@ -135,9 +145,11 @@ Type CaseExpression::ResultType(const Schema& left, const Schema& right) const {
   std::vector<tinylamb::Type> branch_types;
   branch_types.reserve(when_clauses_.size() + 1);
   for (const auto& when : when_clauses_) {
-    branch_types.push_back(when.second->ResultType(left, right));
+    if (!IsNullLiteral(when.second)) {
+      branch_types.push_back(when.second->ResultType(left, right));
+    }
   }
-  if (else_clause_) {
+  if (else_clause_ && !IsNullLiteral(else_clause_)) {
     branch_types.push_back(else_clause_->ResultType(left, right));
   }
   return UnifiedBranchType(std::move(branch_types));

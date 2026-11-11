@@ -122,6 +122,9 @@ StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
       if (columns[i].IsUnsigned() && values_[i].type == ValueType::kInt64) {
         values_[i].SetUnsigned();
       }
+      if (columns[i].IsInterval() && !values_[i].IsNull()) {
+        values_[i].SetInterval();
+      }
     }
   } else {
     for (slot_t i = 0; i < count; ++i) {
@@ -133,6 +136,9 @@ StatusOr<size_t> Row::TryDeserialize(const char* src, const Schema& sc) {
       src += consumed;
       if (columns[i].IsUnsigned() && values_[i].type == ValueType::kInt64) {
         values_[i].SetUnsigned();
+      }
+      if (columns[i].IsInterval() && !values_[i].IsNull()) {
+        values_[i].SetInterval();
       }
     }
   }
@@ -189,6 +195,9 @@ StatusOr<size_t> DeserializeProjectedUnchecked(
       src += consumed;
       if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
         value.SetUnsigned();
+      }
+      if (schema_columns[i].IsInterval() && !value.IsNull()) {
+        value.SetInterval();
       }
       ++projection;
     } else {
@@ -286,6 +295,9 @@ StatusOr<size_t> Row::TryDeserializeProjected(
       if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
         value.SetUnsigned();
       }
+      if (schema_columns[i].IsInterval() && !value.IsNull()) {
+        value.SetInterval();
+      }
       ++projection;
     } else {
       if (const size_t fixed = FixedSerializedSize(type); fixed != 0)
@@ -322,6 +334,9 @@ StatusOr<size_t> Row::TryDeserializeProjected(
       }
       if (schema_columns[i].IsUnsigned() && value.type == ValueType::kInt64) {
         value.SetUnsigned();
+      }
+      if (schema_columns[i].IsInterval() && !value.IsNull()) {
+        value.SetInterval();
       }
       ++projection;
     } else {
@@ -522,16 +537,19 @@ StatusOr<size_t> Row::TryDeserializePlanned(const char* src,
   return static_cast<size_t>(src - original_offset);
 }
 
-std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
-                                           slot_t column) {
+StatusOr<std::optional<int64_t>> Row::TryPeekInteger(const char* src,
+                                                     const Schema& sc,
+                                                     slot_t column) {
   constexpr slot_t kNullBitmapFlag = slot_t{1} << 15;
   slot_t encoded_count = 0;
   src += DeserializeSlot(src, &encoded_count);
   const bool has_null = (encoded_count & kNullBitmapFlag) != 0;
   const auto count = static_cast<slot_t>(encoded_count & ~kNullBitmapFlag);
-  if (column >= count || count != sc.ColumnCount() ||
-      column >= sc.ColumnCount()) {
-    return std::nullopt;
+  if (count != sc.ColumnCount()) {
+    return Status::kCorrupt;
+  }
+  if (column >= count) {
+    return Status::kInvalidArgument;
   }
   const char* bitmap = nullptr;
   if (has_null) {
@@ -567,9 +585,7 @@ std::optional<int64_t> Row::TryPeekInteger(const char* src, const Schema& sc,
     const size_t skipped =
         Value::SkipSerializedInto(src, sc.GetColumn(i).Type(), &skip_error);
     if (skip_error != Status::kSuccess) [[unlikely]] {
-      // Same failure mode as the retired StatusOr wrapper: corrupt images
-      // surface loudly instead of silently pruning the row.
-      detail::ExcShimThrow("Value::SkipSerialized", skip_error);
+      return skip_error;
     }
     src += skipped;
   }
@@ -681,7 +697,11 @@ size_t PeekValueSerializedSize(  // NOLINT(misc-no-recursion)
         if (max_len - need < 1) {
           throw std::runtime_error("truncated array element type byte");
         }
-        const auto elem_vt = static_cast<ValueType>(src[need++]);
+        const auto encoded_type = static_cast<uint8_t>(src[need++]);
+        if ((encoded_type >> 3) > 4) {
+          throw std::runtime_error("invalid array element tag");
+        }
+        const auto elem_vt = static_cast<ValueType>(encoded_type & 7);
         need = PeekValueSerializedSize(src, max_len, need, elem_vt, depth + 1);
       }
       return need;
@@ -748,17 +768,17 @@ Status Row::TryDecodeMemcomparableFormat(std::string_view src) {
   return Status::kSuccess;
 }
 
-Row Row::Extract(const std::vector<slot_t>& elms) const {
-  Row tmp;
+StatusOr<Row> Row::TryExtract(const std::vector<slot_t>& elms) const {
   std::vector<Value> extracted;
   extracted.reserve(elms.size());
   for (size_t offset : elms) {
     if (values_.size() <= offset) {
-      return {};
+      return StatusError(StatusCode::kInvalidArgument,
+                         "row projection column is out of range");
     }
     extracted.push_back(values_[offset]);
   }
-  return Row(extracted);
+  return Row(std::move(extracted));
 }
 
 Row Row::operator+(const Row& rhs) const {

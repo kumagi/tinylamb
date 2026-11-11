@@ -47,8 +47,8 @@ class Logger final {
     uint64_t nanoseconds;
   };
   [[nodiscard]] SyncStats GetSyncStats() const {
-    return {sync_count_.load(std::memory_order_relaxed),
-            sync_ns_.load(std::memory_order_relaxed)};
+    return {.count = sync_count_.load(std::memory_order_relaxed),
+            .nanoseconds = sync_ns_.load(std::memory_order_relaxed)};
   }
 
   // D1: a WAL record must stay within the bound the recovery reader accepts

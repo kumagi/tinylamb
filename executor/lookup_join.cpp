@@ -282,7 +282,12 @@ bool LookupJoin::Load() {
       return false;
     }
     hold_left_ = left_batch.RowAt(0);
-    const Row left_key = hold_left_.Extract(left_cols_);
+    const auto left_key_result = hold_left_.TryExtract(left_cols_);
+    if (!left_key_result.HasValue()) {
+      FailWith(left_key_result.GetStatus());
+      return false;
+    }
+    const Row& left_key = left_key_result.Value();
     // SQL's `NULL = NULL` is UNKNOWN, so a NULL equality key can never match;
     // a NaN key has no stable position in the memcomparable order. Both are
     // skipped before any seek, exactly as the residual predicate would.
@@ -319,9 +324,19 @@ bool LookupJoin::NextRow(Row* dst) {
     return false;
   }
   for (;;) {
-    const Row left_key = hold_left_.Extract(left_cols_);
+    const auto left_key_result = hold_left_.TryExtract(left_cols_);
+    if (!left_key_result.HasValue()) {
+      FailWith(left_key_result.GetStatus());
+      return false;
+    }
+    const Row& left_key = left_key_result.Value();
     Row right_row = **right_it_;
-    const Row right_key = right_row.Extract(right_cols_);
+    const auto right_key_result = right_row.TryExtract(right_cols_);
+    if (!right_key_result.HasValue()) {
+      FailWith(right_key_result.GetStatus());
+      return false;
+    }
+    const Row& right_key = right_key_result.Value();
     const bool matched = Matches(left_key, right_key);
     if (at_most_one_ && matched) {
       // Point probe on a single-value unique key: this matching position is

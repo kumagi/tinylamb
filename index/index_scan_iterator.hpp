@@ -88,9 +88,9 @@ class IndexScanIterator : public IteratorBase {
   // stale-key gate (see IndexOnlyScanPlan::EmitExecutor) and the index read
   // guard (held for the iterator's lifetime).
   [[nodiscard]] bool TryReadIndexOnly(Row* dst) const;
-  // RangePartitionedScan support: the leaf-aligned partition boundaries of
-  // [begin_key, end_key], decoded to key images (strictly ascending, each
-  // strictly greater than |begin_key|).  See
+  // RangePartitionedScan support: the key-count-based virtual-leaf partition
+  // boundaries of [begin_key, end_key], decoded to key images (strictly
+  // ascending, each strictly greater than |begin_key|).  See
   // BPlusTree::ScanPartitionBoundaries; an empty result means one partition
   // covers the whole range.
   static StatusOr<std::vector<Row>> PartitionBoundaries(

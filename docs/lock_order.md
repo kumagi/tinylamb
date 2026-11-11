@@ -5,7 +5,7 @@ waiting on an outer one.
 
 ```
 1. Database / catalog latch (schema changes)
-2. PageManager `pages_mu_` (short map lookup/insert) → `Page` content latch
+2. PageManager `blocks_mu_` (short map lookup/insert) → `Page` content latch
    (`PageRef`)
 3. Index mutation gate(s) (`TransactionManager::AcquireIndexReadGuard` /
    `AcquireIndexWriteGuard`) → `PageManager` `trees_mu_` → per-tree
@@ -13,7 +13,7 @@ waiting on an outer one.
 4. Table-tail ownership mutex (`PageManager::table_tails_mu_`, leaf lock)
 5. Logger enqueue latch → Logger work mutex (D1, see below)
 6. MVCC version shard mutex (`VersionShard::mutex`) → transaction table lock
-   (Wound-Wait preemption and the deadlock detector's victim wounding only).
+   (Wound-Wait preemption and the deadlock detector's victim wounding and the diagnostics listed below).
    Never the reverse: no path may acquire a version shard mutex while holding
    the transaction table lock.
 6a. MVCC version shard mutex → page-chain shard mutex (leaf, see
@@ -31,6 +31,11 @@ waiting on an outer one.
    ONLY the transaction's own chain mutex — never the table lock while
    holding it (registry cleanup happens after the mutex is released).
 ```
+
+Timeout diagnostics (`RecordIntentWaitTimeout`) and reservation diagnostics
+(`DebugDumpAllIndexReservations`) also take the transaction table lock below
+a version/index reservation shard mutex. They follow the same direction as
+rule 6; the reverse acquisition remains forbidden.
 
 ## Rules
 

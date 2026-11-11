@@ -30,6 +30,7 @@
 #include "expression/interval_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
+#include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/statement.hpp"
@@ -381,6 +382,16 @@ bool SelectHasBindableConstant(
     const SelectStatement&
         select) {  // NOLINT(misc-no-recursion) // Recursive statement-tree scan
                    // by design; trees are parser-bounded in depth.
+  for (const auto& branch : select.UnionAll()) {
+    if (branch && SelectHasBindableConstant(*branch)) {
+      return true;
+    }
+  }
+  // Tree-only set operations may not have the flat operand representation;
+  // refuse ambiguous CTE template order conservatively for that shape.
+  if (select.GetSetOperationTree() != nullptr && select.UnionAll().empty()) {
+    return true;
+  }
   for (const Expression& key : select.DistinctOn()) {
     if (ContainsBindableConstant(key)) {
       return true;
@@ -456,8 +467,8 @@ bool ContainsBindableConstant(
     case TypeTag::kUnaryExp:
       return ContainsBindableConstant(expression->AsUnaryExpression().Child());
     case TypeTag::kAggregateExp:
-      return ContainsBindableConstant(
-          expression->AsAggregateExpression().Child());
+      return std::ranges::any_of(ExpressionChildren(expression),
+                                 ContainsBindableConstant);
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       for (const auto& clause : searched.when_clauses_) {
@@ -964,10 +975,16 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
           is_raw_prefix = false;
         }
       }
-      std::string literal =
-          is_raw_prefix ? raw_literal
-                        : DecodeStringEscapes(raw_literal, is_bytes_prefix,
-                                              is_triple, quote);
+      std::string literal = raw_literal;
+      if (!is_raw_prefix) {
+        auto decoded =
+            DecodeStringEscapes(raw_literal, is_bytes_prefix, is_triple, quote);
+        if (!decoded.HasValue()) {
+          result.templatable = false;
+          return result;
+        }
+        literal = decoded.MoveValue();
+      }
       // PRODUCTION FIX (Q3): a TIMESTAMP '...' literal is UTC-normalized by
       // the visitor on the first parse, but the template/plan caches replayed
       // the RAW string parameter on later runs, so the same SQL returned a

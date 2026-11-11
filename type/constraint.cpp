@@ -159,7 +159,15 @@ Encoder& operator<<(Encoder& a, const Constraint& c) {
 }
 
 Decoder& operator>>(Decoder& e, Constraint& c) {
-  e >> reinterpret_cast<uint8_t&>(c.ctype) >> c.value;
+  uint8_t tag = 0;
+  e >> tag;
+  if (tag > static_cast<uint8_t>(Constraint::kIndex)) {
+    e.Fail();
+    c = Constraint();
+    return e;
+  }
+  c.ctype = static_cast<Constraint::ConstraintType>(tag);
+  e >> c.value;
   return e;
 }
 }  // namespace tinylamb

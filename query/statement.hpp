@@ -234,12 +234,14 @@ class CreateIndexStatement : public Statement {
         storing_(std::move(storing)),
         unique_(unique),
         if_not_exists_(if_not_exists) {}
-  const std::string& Name() const { return name_; }
-  const std::string& TableName() const { return table_; }
-  const std::vector<std::string>& Keys() const { return keys_; }
-  const std::vector<std::string>& Storing() const { return storing_; }
-  bool Unique() const { return unique_; }
-  bool IfNotExists() const { return if_not_exists_; }
+  [[nodiscard]] const std::string& Name() const { return name_; }
+  [[nodiscard]] const std::string& TableName() const { return table_; }
+  [[nodiscard]] const std::vector<std::string>& Keys() const { return keys_; }
+  [[nodiscard]] const std::vector<std::string>& Storing() const {
+    return storing_;
+  }
+  [[nodiscard]] bool Unique() const { return unique_; }
+  [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
   void Dump(std::ostream& o) const override {
     o << "name=" << name_ << " table=" << table_ << " unique=" << unique_;
   }
@@ -676,7 +678,12 @@ class SelectStatement : public Statement {
   [[nodiscard]] uint64_t RuntimeId() const noexcept {
     return runtime_id_.value;
   }
-  const std::string& Fingerprint() const {
+  // Recomputed because shared child statements and expressions can mutate
+  // independently of this node. Return an owned value so concurrent const
+  // readers do not write a shared cache buffer. Pointer components distinguish
+  // opaque aggregate/window/set-operation nodes within this process; this key
+  // is not a stable serialization or a cross-process cache identifier.
+  std::string Fingerprint() const {
     std::ostringstream stream;
     auto append_string = [&](std::string_view text) {
       stream << text.size() << ':' << text << ';';
@@ -836,8 +843,7 @@ class SelectStatement : public Statement {
     stream << "union_flags;" << union_distinct_ << ':' << union_by_name_
            << ";struct;" << as_struct_ << ";complex;" << complex_ << ";tree;"
            << static_cast<const void*>(set_operation_tree_.get()) << ';';
-    cached_fingerprint_ = stream.str();
-    return cached_fingerprint_;
+    return stream.str();
   }
   void Dump(std::ostream& o) const override {
     o << "select=[";
@@ -906,14 +912,20 @@ class SelectStatement : public Statement {
   struct RuntimeInstanceId {
     uint64_t value{Next()};
     RuntimeInstanceId() = default;
-    RuntimeInstanceId(const RuntimeInstanceId&) noexcept : value(Next()) {}
-    RuntimeInstanceId(RuntimeInstanceId&&) noexcept : value(Next()) {}
-    RuntimeInstanceId& operator=(const RuntimeInstanceId&) noexcept {
-      value = Next();
+    RuntimeInstanceId(const RuntimeInstanceId& /*unused*/) noexcept
+        : value(Next()) {}
+    RuntimeInstanceId(RuntimeInstanceId&& /*unused*/) noexcept
+        : value(Next()) {}
+    RuntimeInstanceId& operator=(const RuntimeInstanceId& other) noexcept {
+      if (this != &other) {
+        value = Next();
+      }
       return *this;
     }
-    RuntimeInstanceId& operator=(RuntimeInstanceId&&) noexcept {
-      value = Next();
+    RuntimeInstanceId& operator=(RuntimeInstanceId&& other) noexcept {
+      if (this != &other) {
+        value = Next();
+      }
       return *this;
     }
     ~RuntimeInstanceId() = default;
@@ -924,7 +936,6 @@ class SelectStatement : public Statement {
     }
   };
   RuntimeInstanceId runtime_id_;
-  mutable std::string cached_fingerprint_;
 };
 
 // Parenthesized set-operation groups cannot be represented by the legacy

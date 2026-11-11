@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,6 +63,10 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
   size_t off = 1;
   std::vector<SortedRun> runs;
   const uint64_t base_gen = data[1];
+  // Ground-truth map keyed by `id`: nullopt means the latest generation wrote
+  // a tombstone; a string means the latest generation wrote that live payload.
+  std::map<int64_t, std::optional<std::string>> expected;
+  std::vector<int64_t> prev_ids;
   for (int r = 0; r < n_runs && off + 2 <= size; ++r) {
     const int n_keys = static_cast<int>(data[off++] % 17);
     std::vector<int64_t> ids;
@@ -70,15 +76,27 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
       off += sizeof(int64_t);
       ids.push_back(id % 100000);
     }
+    // Carry over up to 2 keys from the previous run so cross-generation
+    // overwrites and tombstone shadowing are consistently exercised.
+    for (size_t c = 0; c < prev_ids.size() && c < 2; ++c) {
+      ids.push_back(prev_ids[c]);
+    }
     if (ids.empty()) {
       continue;
     }
     std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    prev_ids = ids;
     std::vector<char> blob;
     std::vector<SortedRun::Entry> index;
     for (int64_t id : ids) {
-      Row live{Value(id), Value("x" + std::to_string(id))};
-      const bool tombstone = (id % 7 == 3) && (r % 2 == 1);
+      const std::string payload =
+          "x" + std::to_string(id) + "_g" + std::to_string(r);
+      Row live{Value(id), Value(std::string(payload))};
+      const bool tombstone =
+          ((id % 7 == 3) && (r % 2 == 1)) || ((id + r) % 11 == 0 && r > 0);
+      expected[id] =
+          tombstone ? std::nullopt : std::optional<std::string>(payload);
       const std::string key = live.EncodeKeyMemcomparableFormat(sc);
       const auto key_off = static_cast<uint32_t>(blob.size());
       const uint32_t be_len = htobe32(static_cast<uint32_t>(key.size()));
@@ -106,6 +124,11 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
   for (const auto& r : runs) {
     ptrs.push_back(&r);
   }
+  // Occasionally reverse input run pointer order to verify generation tags
+  // rather than vector position determine the winning version.
+  if ((data[0] & 0x10) != 0) {
+    std::reverse(ptrs.begin(), ptrs.end());
+  }
   auto chunk_or = MergeAllSortedRuns(ptrs, sc);
   if (!chunk_or.HasValue()) {
     return 0;
@@ -120,6 +143,17 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
     std::abort();
   }
 
+  std::vector<std::pair<int64_t, std::string>> expected_live;
+  expected_live.reserve(expected.size());
+  for (const auto& [k, v] : expected) {
+    if (v.has_value()) {
+      expected_live.emplace_back(k, *v);
+    }
+  }
+  if (chunk.TotalRowCount() != expected_live.size()) {
+    std::abort();
+  }
+
   int64_t prev = 0;
   bool first = true;
   for (size_t i = 0; i < chunk.TotalRowCount(); ++i) {
@@ -128,13 +162,37 @@ int FuzzLsmMergeOneInput(const uint8_t* data, size_t size) {
       std::abort();
     }
     const int64_t k = row_or.Value()[0].AsInt64();
+    const std::string_view v = row_or.Value()[1].AsStringView();
     if (!first) {
       if (!(prev < k)) {
         std::abort();
       }
     }
+    if (k != expected_live[i].first || v != expected_live[i].second) {
+      std::abort();
+    }
     prev = k;
     first = false;
+  }
+
+  // Verify PointLookup agrees with both live winners and tombstoned keys.
+  for (const auto& [k, v] : expected) {
+    size_t row_idx = 0;
+    const Status st = chunk.PointLookup(k, sc, &row_idx);
+    if (v.has_value()) {
+      if (st != Status::kSuccess || row_idx >= chunk.TotalRowCount()) {
+        std::abort();
+      }
+      auto row_or = chunk.ReadRow(row_idx, sc);
+      if (!row_or.HasValue() || row_or.Value()[0].AsInt64() != k ||
+          row_or.Value()[1].AsStringView() != *v) {
+        std::abort();
+      }
+    } else {
+      if (st != Status::kNotExists) {
+        std::abort();
+      }
+    }
   }
   return 0;
 }

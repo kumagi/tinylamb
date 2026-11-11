@@ -1423,6 +1423,14 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
       t.steps.push_back({.sql = ins});
       m.rows.push_back(BuildRow(next_u[m.name] - 1, values));
     }
+    if (m.columns.size() > 1) {
+      const std::string idx_sql =
+          "CREATE INDEX idx_dual_" + m.name + " ON " + m.name + " KEY(1)";
+      if (ApplyDdl(*db, setup_ctx, idx_sql, &why, nullptr)) {
+        t.steps.push_back({.is_ddl = true, .sql = idx_sql});
+        m.plain_keys.push_back({1});
+      }
+    }
     committed.push_back(std::move(m));
   }
   if (setup_ctx.txn_.PreCommit() != Status::kSuccess) {
@@ -1579,6 +1587,27 @@ std::string RunDualTxnSession(Gen& g, bool verbose, SessionStats* stats,
         return "state mismatch on " + target->name + " (txn " +
                std::to_string(x) + ") after step " +
                std::to_string(t.steps.size() - 1) + "\n" + mismatch;
+      }
+      if (!target->plain_keys.empty()) {
+        std::string probe_sql;
+        std::vector<std::string> probe_expected;
+        std::string probe_error;
+        const std::string probe_report = CheckIndexProbe(
+            *db, ctxs[static_cast<size_t>(x)], g, *target,
+            target->plain_keys[0], &probe_sql, &probe_expected, &probe_error);
+        SessionCheck probe;
+        probe.table = target->name;
+        probe.after_step = t.steps.size() - 1;
+        probe.sql_override = probe_sql;
+        probe.expected = probe_expected;
+        probe.txn = x;
+        t.checks.push_back(std::move(probe));
+        if (stats != nullptr) {
+          ++stats->index_probes;
+        }
+        if (!probe_report.empty()) {
+          return probe_report;
+        }
       }
       continue;
     }
@@ -2587,19 +2616,24 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
           }
           src_values.emplace_back(repr, ct);
           const std::string alias = "sc" + std::to_string(i);
-          src_select += ", " + lit + " AS " + alias;
-          ins_vals += ", src." + alias;
+          src_select.append(", ").append(lit).append(" AS ").append(alias);
+          ins_vals.append(", src.").append(alias);
         }
         ins_vals += ")";
-        const std::string sql = "MERGE INTO " + target->name + " USING (" +
-                                src_select + ") AS src ON " + target->name +
-                                ".u = src.su "
-                                "WHEN MATCHED AND " +
-                                target->name +
-                                ".c1 IS NOT NULL THEN UPDATE SET c1 = src.sc1 "
-                                "WHEN MATCHED THEN DELETE "
-                                "WHEN NOT MATCHED THEN INSERT VALUES " +
-                                ins_vals + ";";
+        std::string sql = "MERGE INTO ";
+        sql.append(target->name)
+            .append(" USING (")
+            .append(src_select)
+            .append(") AS src ON ")
+            .append(target->name)
+            .append(".u = src.su WHEN MATCHED AND ")
+            .append(target->name)
+            .append(
+                ".c1 IS NOT NULL THEN UPDATE SET c1 = src.sc1 "
+                "WHEN MATCHED THEN DELETE "
+                "WHEN NOT MATCHED THEN INSERT VALUES ")
+            .append(ins_vals)
+            .append(";");
         if (verbose) {
           std::cerr << "[session][stmt] " << sql << "\n";
         }
@@ -2682,6 +2716,32 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
         break;
       }
     }
+  }
+
+  // Failing-subquery DML guard (2026-11-10 audit High #21): when a table is
+  // non-empty, `DELETE ... WHERE NOT EXISTS (SELECT 1 FROM tbl s WHERE 1 /
+  // (s.u - s.u) > 0)` must fail with a division-by-zero error rather than
+  // treating the aborted subquery stream as empty (`NOT EXISTS = TRUE`) and
+  // wiping the table.
+  for (const MirrorTable& tbl : tables) {
+    if (tbl.rows.empty()) {
+      continue;
+    }
+    const std::string fail_dml = "DELETE FROM " + tbl.name +
+                                 " WHERE NOT EXISTS (SELECT 1 FROM " +
+                                 tbl.name + " s WHERE 1 / (s.u - s.u) > 0);";
+    std::string why;
+    const bool ok =
+        RunSqlWhy(*db, ctx, fail_dml, RouteFlipFor(t.steps.size()), &why);
+    if (ok) {
+      return "failing-subquery DELETE unexpectedly succeeded: " + fail_dml +
+             "\n";
+    }
+    SessionStep fail_step;
+    fail_step.sql = fail_dml;
+    fail_step.must_fail = true;
+    t.steps.push_back(std::move(fail_step));
+    break;
   }
 
   // Final full check of every surviving table.

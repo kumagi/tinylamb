@@ -98,6 +98,10 @@ class PushdownDb {
         "VARCHAR(16));",
         "CREATE TABLE t3 (id INT64, t2_id INT64, val INT64, flag INT64, note "
         "VARCHAR(16));",
+        "CREATE TABLE t1_1 (id INT64, t1_id INT64, val INT64);",
+        // Rows for t1_1 (suffixed table name `t1_1` vs `t1` for IsSameTable)
+        "INSERT INTO t1_1 VALUES (301, 1, 10);",
+        "INSERT INTO t1_1 VALUES (302, 4, 40);",
         // Rows for t1
         "INSERT INTO t1 VALUES (1, 10, 1, 'a1');",
         "INSERT INTO t1 VALUES (2, 20, 0, 'a2');",
@@ -148,6 +152,24 @@ class PushdownDb {
     add_idx("t1", "t1_pk", {0}, IndexMode::kUnique);
     add_idx("t2", "t2_pk", {0}, IndexMode::kUnique);
     add_idx("t3", "t3_pk", {0}, IndexMode::kUnique);
+    // Secondary indexes are what make NoREC's WHERE side take a range,
+    // prefix, or join lookup while the CASE reference still reads every row.
+    add_idx("t1", "t1_val", {1}, IndexMode::kNonUnique);
+    add_idx("t1", "t1_flag", {2}, IndexMode::kNonUnique);
+    add_idx("t1", "t1_note", {3}, IndexMode::kNonUnique);
+    add_idx("t1", "t1_val_flag", {1, 2}, IndexMode::kNonUnique);
+    add_idx("t2", "t2_fk", {1}, IndexMode::kNonUnique);
+    add_idx("t2", "t2_val", {2}, IndexMode::kNonUnique);
+    add_idx("t2", "t2_note", {4}, IndexMode::kNonUnique);
+    add_idx("t3", "t3_fk", {1}, IndexMode::kNonUnique);
+    add_idx("t3", "t3_val", {2}, IndexMode::kNonUnique);
+    for (const char* table : {"t1", "t2", "t3"}) {
+      StatusOr<QueryResult> analyzed =
+          engine.Execute(ctx, std::string("ANALYZE ") + table + ";");
+      if (analyzed.HasValue()) {
+        analyzed.Value().Drain();
+      }
+    }
     return true;
   }
 
@@ -192,9 +214,14 @@ std::optional<int64_t> RunScalarCount(Database& db, TransactionContext& ctx,
 
 bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
                            std::string* mismatch_report) {
-  const int flavor = static_cast<int>(rng() % 25);
+  const int flavor = static_cast<int>(rng() % 32);
   std::string from_clause;
   std::string predicate;
+  // Shapes whose two sides are not the same predicate on the same FROM
+  // (commuted comparison, IN expanded to OR, GROUP BY indicator sum, an
+  // inner join lowered to a cross product).
+  std::string direct_opt;
+  std::string direct_ref;
 
   switch (flavor) {
     case 0: {
@@ -556,6 +583,129 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
       predicate = kPreds[rng() % kPreds.size()];
       break;
     }
+    case 24: {
+      // Flavour 24: Suffixed table name (`t1` vs `t1_1`) outer-join
+      // null-rejection and anti-join (2026-11-10 audit High #16, Medium #75).
+      from_clause = "t1 LEFT JOIN t1_1 ON t1.id = t1_1.t1_id";
+      static const std::array<const char*, 5> kPreds = {
+          "t1.val > 0",
+          "t1.val IS NULL",
+          "t1_1.val IS NULL",
+          "t1.flag = 1 AND t1_1.id IS NULL",
+          "t1.val > 10 OR t1_1.val IS NOT NULL",
+      };
+      predicate = kPreds[rng() % kPreds.size()];
+      break;
+    }
+    case 25: {
+      // Flavour 25: GROUP BY indicator sum.  Zero-count groups exist only on
+      // the reference side and do not change the total.
+      direct_opt =
+          "SELECT COALESCE(SUM(c), 0) FROM (SELECT COUNT(*) AS c FROM t1 "
+          "WHERE t1.val > 0 GROUP BY t1.flag) g;";
+      direct_ref =
+          "SELECT COALESCE(SUM(c), 0) FROM (SELECT SUM(CASE WHEN t1.val > 0 "
+          "THEN 1 ELSE 0 END) AS c FROM t1 GROUP BY t1.flag) g;";
+      break;
+    }
+    case 26: {
+      // Flavour 26: commuting the comparison is required before an index
+      // range on val can match.  The reference keeps the column on the left.
+      direct_opt = "SELECT COUNT(*) FROM t1 WHERE 10 < t1.val;";
+      direct_ref =
+          "SELECT COALESCE(SUM(CASE WHEN t1.val > 10 THEN 1 ELSE 0 END), 0) "
+          "FROM t1;";
+      break;
+    }
+    case 27: {
+      // Flavour 27: BETWEEN on the optimized side, expanded comparisons on
+      // the reference.  Integers, both bounds non-null.
+      direct_opt = "SELECT COUNT(*) FROM t1 WHERE t1.val BETWEEN 0 AND 20;";
+      direct_ref =
+          "SELECT COALESCE(SUM(CASE WHEN (t1.val >= 0) AND (t1.val <= 20) "
+          "THEN 1 ELSE 0 END), 0) FROM t1;";
+      break;
+    }
+    case 28: {
+      // Flavour 28: IN-list versus the OR of equalities (no NULL element).
+      direct_opt = "SELECT COUNT(*) FROM t1 WHERE t1.val IN (10, 20, 40);";
+      direct_ref =
+          "SELECT COALESCE(SUM(CASE WHEN (t1.val = 10) OR (t1.val = 20) OR "
+          "(t1.val = 40) THEN 1 ELSE 0 END), 0) FROM t1;";
+      break;
+    }
+    case 29: {
+      // Flavour 29: inner-join ON lowered to a filter of the cross product.
+      direct_opt =
+          "SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.t1_id AND t1.val > "
+          "0;";
+      direct_ref =
+          "SELECT COALESCE(SUM(CASE WHEN t1.id = t2.t1_id AND t1.val > 0 THEN "
+          "1 ELSE 0 END), 0) FROM t1 CROSS JOIN t2;";
+      break;
+    }
+    case 30: {
+      // Flavour 30: ORDER BY must not change the cardinality.
+      direct_opt =
+          "SELECT COUNT(*) FROM (SELECT id FROM t1 WHERE t1.val > 0 ORDER BY "
+          "t1.val, t1.id) q;";
+      direct_ref =
+          "SELECT COALESCE(SUM(CASE WHEN t1.val > 0 THEN 1 ELSE 0 END), 0) "
+          "FROM t1;";
+      break;
+    }
+    case 31: {
+      // Flavour 31: row contents.  The reference has no WHERE; keep the rows
+      // whose indicator is 1 and compare them to the optimized projection.
+      TransactionContext ctx = db.BeginReadOnlyContext();
+      const char* opt_sql = "SELECT id, val FROM t1 WHERE val > 0;";
+      const char* ref_sql =
+          "SELECT id, val, CASE WHEN val > 0 THEN 1 ELSE 0 END FROM t1;";
+      auto load = [&](const char* sql) -> std::optional<std::vector<Row>> {
+        SqlEngine engine(db);
+        StatusOr<QueryResult> result = engine.Execute(ctx, sql);
+        if (!result.HasValue()) {
+          return std::nullopt;
+        }
+        std::vector<Row> rows;
+        Row row;
+        while (result.Value().Next(&row)) {
+          rows.push_back(row);
+        }
+        if (result.Value().GetStatus() != Status::kSuccess) {
+          return std::nullopt;
+        }
+        return rows;
+      };
+      auto optimized = load(opt_sql);
+      auto reference = load(ref_sql);
+      if (!optimized.has_value() || !reference.has_value()) {
+        return true;
+      }
+      std::vector<std::string> got;
+      for (const Row& row : *optimized) {
+        got.push_back(row.ToString());
+      }
+      std::vector<std::string> expect;
+      for (const Row& row : *reference) {
+        if (row.Count() < 3 || row[2].type != ValueType::kInt64 ||
+            row[2].value.int_value != 1) {
+          continue;
+        }
+        expect.push_back(Row({row[0], row[1]}).ToString());
+      }
+      std::sort(got.begin(), got.end());
+      std::sort(expect.begin(), expect.end());
+      if (got == expect) {
+        return true;
+      }
+      *mismatch_report = "[NoREC CONTENT MISMATCH]\n  optimized: ";
+      *mismatch_report += opt_sql;
+      *mismatch_report += "\n  reference: ";
+      *mismatch_report += ref_sql;
+      *mismatch_report += "\n";
+      return false;
+    }
     default: {
       // Flavour 24: Self-join with triangle conditions
       from_clause = "t1 AS a JOIN t1 AS b ON a.flag = b.flag";
@@ -571,10 +721,14 @@ bool RunNoRecPushdownCheck(Database& db, std::mt19937_64& rng,
 
   TransactionContext ctx = db.BeginReadOnlyContext();
   const std::string opt_query =
-      "SELECT COUNT(*) FROM " + from_clause + " WHERE " + predicate + ";";
-  const std::string ref_query = "SELECT COALESCE(SUM(CASE WHEN " + predicate +
-                                " THEN 1 ELSE 0 END), 0) FROM " + from_clause +
-                                ";";
+      !direct_opt.empty()
+          ? direct_opt
+          : "SELECT COUNT(*) FROM " + from_clause + " WHERE " + predicate + ";";
+  const std::string ref_query =
+      !direct_ref.empty()
+          ? direct_ref
+          : "SELECT COALESCE(SUM(CASE WHEN " + predicate +
+                " THEN 1 ELSE 0 END), 0) FROM " + from_clause + ";";
 
   std::string opt_err;
   std::string ref_err;

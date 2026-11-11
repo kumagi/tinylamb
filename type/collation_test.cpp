@@ -202,8 +202,8 @@ TEST(CollationTest, EqualUnderCollationKeepsValueEqualitySemantics) {
   const Value nan = Value(std::numeric_limits<double>::quiet_NaN());
   EXPECT_TRUE(EqualUnderCollation(nan, nan));
   EXPECT_TRUE(EqualUnderCollation(Value(0.0), Value(-0.0)));
-  EXPECT_TRUE(
-      EqualUnderCollation(Value("2014-1 0 0 0"), Value("2013-13 0 0 0")));
+  EXPECT_TRUE(EqualUnderCollation(Value("2014-1 0 0 0").WithInterval(),
+                                  Value("2013-13 0 0 0").WithInterval()));
   // ... and a case-insensitive interval pair folds like any other text.
   EXPECT_TRUE(EqualUnderCollation(Ci("1 Year"), Ci("1 year")));
 }

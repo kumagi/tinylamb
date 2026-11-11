@@ -200,16 +200,18 @@ ARRAY<STRUCT<id INT64>>[{1}, {2}]
 ==
 
 [mode=explain]
-[plan_not_contains=AND]
-[name=absorbs_redundant_boolean_term]
+# Absorption requires proof that evaluating the removed branch cannot fail.
+[plan_contains=AND]
+[name=boolean_absorption_keeps_unproved_branch]
 SELECT id FROM rewrite_input WHERE flag OR (flag AND a = 10) ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}]
 ==
 
 [mode=explain]
-[plan_not_contains=OR]
-[name=absorbs_redundant_conjunctive_term]
+# Keep the branch until schema-aware non-throwing proof is available.
+[plan_contains=OR]
+[name=conjunctive_absorption_keeps_unproved_branch]
 SELECT id FROM rewrite_input WHERE flag AND (flag OR a = 10) ORDER BY id
 --
 ARRAY<STRUCT<id INT64>>[{1}]

@@ -756,9 +756,11 @@ class PaxChunk final {
                  // SUM = sum(hot[c]*freq[c] in window) -- with ZERO nibble
                  // reads, and the unpredicated SUM / MIN / MAX fold the same
                  // way plus one inner-region pass over the nexc tail.
-                 // [d u16 BE][hot: 15 x 8B BE ascending, slots >= d zero]
+                 // [d u16 BE][nexc u16 BE]
+                 // [hot: 15 x 8B BE ascending, slots >= d zero]
                  // [freq: 15 x u16 BE, freq[c] >= 1 for c < d, 0 above]
-                 // [nexc u16 BE][nibbles ceil(n/2) B: byte j = code(2j)<<4 |
+                 // [inner scheme u8][inner param u32 BE]
+                 // [nibbles ceil(n/2) B: byte j = code(2j)<<4 |
                  //   code(2j+1), codes 0..d-1 = hot[d], 15 = exception,
                  //   d..14 never emitted]
                  // [inner region: nexc exception values in row order, leaf
@@ -1384,9 +1386,7 @@ class PaxChunk final {
     uint16_t key_column_index{0};
     // ValueType of the key column (serialized as 1 byte). Lets a reader
     // (native or WASM) interpret zone-map bounds without external schema.
-    uint8_t key_column_type{0};
     // Whether group_min_keys/group_max_keys are present in the footer.
-    bool zone_map_present{false};
     // LSM generation of the newest input that produced this chunk. Higher
     // generation wins when the same key exists in several artifacts during
     // a read-time merge across memtable + runs + chunks.
@@ -1413,25 +1413,19 @@ class PaxChunk final {
     // Footer v5: per-column scalar statistics computed at build time.
     // Enables COUNT/SUM/AVG answers from metadata alone (no region reads).
     // Only int64 columns carry meaningful sums; others store zeros.
-    bool col_stats_present{false};
     std::vector<uint8_t> col_sum_valid;  // 1 = int64 column (sum meaningful)
     std::vector<uint64_t> col_counts;
     std::vector<int64_t> col_sums;
     // All-column zone maps (v6): min/max for EVERY int64 column per RG.
-    bool all_zm_present{false};
     std::vector<int64_t> all_zone_mins;
     std::vector<int64_t> all_zone_maxs;
     // Per-(RG, int64 col) bloom filter: one u64 word each.
-    bool bloom_present{false};
     std::vector<uint64_t> rg_blooms;
     // Per-(RG, int64 col) HyperLogLog sketch: 64B each.
-    bool hll_present{false};
     std::vector<uint8_t> hll_sketches;  // flat: rg*col*64B
     // Per-RG partial sums for int64 columns: [rg * col_count + col]
-    bool rg_sums_present{false};
     std::vector<int64_t> rg_sums;
     // Hash index for O(1) point lookup on int64 key column.
-    bool hash_idx_present{false};
     uint32_t hash_idx_log2{0};  // table size = 2^log2
     std::vector<int64_t> hash_keys;
     std::vector<uint32_t> hash_rows;
@@ -1440,10 +1434,7 @@ class PaxChunk final {
     // order; each cell uses ceil(rc/8) bytes where rc is that group's row
     // count. Lets the byte-slice/null-aware scan mask nulls without ever
     // materializing them. Absent when null_present is false.
-    bool null_present{false};
     std::vector<uint8_t> null_bitmaps;
-    bool null_summary_valid{false};
-    bool null_any{false};
     uint32_t null_uniform_groups{0};
     uint64_t null_uniform_stride{0};
     // Extended column statistics (v12): per-int64-column MIN/MAX / null count
@@ -1453,7 +1444,6 @@ class PaxChunk final {
     // histogram estimate for range/equality predicates. Non-int64 columns
     // store zero placeholders. Serialized as a new flag-gated footer section
     // AFTER the null bitmaps so earlier readers skip it safely.
-    bool ext_stats_present{false};
     std::vector<int64_t> col_mins;
     std::vector<int64_t> col_maxs;
     std::vector<uint64_t> col_nulls;
@@ -1467,24 +1457,38 @@ class PaxChunk final {
     // equality / IN / conjunction queries count (and intersect) without
     // decoding the column. Built from raw values, so NULL cells appear under
     // key 0 exactly as the decode path reports them.
-    bool inv_idx_present{false};
     std::vector<InvertedCell> inv_index;
     // Xor8 point pre-filter (v14): per-(row-group, int64 column) fingerprint
     // tables for cells the inverted index skips (non-low-cardinality).
     // Answers "definitely absent" for point predicates so row groups decode
     // nothing; "maybe" (1/256 false positives) falls through to the scan.
-    bool xor_present{false};
     std::vector<XorCell> xor_cells;
     // PGM learned index (v15) over the ascending int64 key column: optimal
     // piecewise-linear segments (ShrinkingCone, error eps) mapping keys to
     // global rows. A compact stand-in for the hash index on NO_HASH_IDX
     // builds, and a probe-saver for range seeks on expensive (delta-coded)
     // key columns. Absent for non-int64 / nullable / unsorted keys.
-    bool pgm_present{false};
     uint32_t pgm_eps{0};
     std::vector<PgmSegment> pgm_segments;
     // Total byte size of the footer section (for self-describing read).
     uint32_t footer_size{0};
+
+    // Keep byte-sized flags together; the footer codec uses named fields.
+    uint8_t key_column_type{0};
+    bool zone_map_present{false};
+    bool col_stats_present{false};
+    bool all_zm_present{false};
+    bool bloom_present{false};
+    bool hll_present{false};
+    bool rg_sums_present{false};
+    bool hash_idx_present{false};
+    bool null_present{false};
+    bool null_summary_valid{false};
+    bool null_any{false};
+    bool ext_stats_present{false};
+    bool inv_idx_present{false};
+    bool xor_present{false};
+    bool pgm_present{false};
 
     struct ColumnStats {
       uint64_t count;
@@ -1495,7 +1499,7 @@ class PaxChunk final {
       uint64_t null_count;
       // Histogram: equi-width, HIST_BINS bins over [min,max]
       static constexpr int HIST_BINS = 16;
-      uint64_t hist_counts[HIST_BINS]{};
+      std::array<uint64_t, HIST_BINS> hist_counts{};
       // Mode (most frequent value among int64 values)
       int64_t mode_value;
       uint64_t mode_count;
@@ -1507,7 +1511,9 @@ class PaxChunk final {
         null_count = 0;
         mode_value = 0;
         mode_count = 0;
-        for (int i = 0; i < HIST_BINS; ++i) hist_counts[i] = 0;
+        for (unsigned long& hist_count : hist_counts) {
+          hist_count = 0;
+        }
       }
     };
   };
@@ -1649,7 +1655,9 @@ class PaxChunk final {
     // Saturate: a default-constructed / footer-less chunk would wrap
     // `0 - 0 - 4` into a ~2^64 "region size" for any caller that trusts
     // it as an allocation bound.
-    if (data_.size() <= footer_.footer_size + 4) return 0;
+    if (data_.size() <= footer_.footer_size + 4) {
+      return 0;
+    }
     return data_.size() - footer_.footer_size - 4;
   }
   [[nodiscard]] const Footer& GetFooter() const { return footer_; }
@@ -1674,8 +1682,12 @@ class PaxChunk final {
   // Decode-side acceleration (see BuildEfSelectDirs): the per-cell EF select
   // directory, or nullptr when this cell has none.
   [[nodiscard]] const uint32_t* EfSelectDirAt(size_t off_idx) const {
-    if (off_idx + 1 >= ef_sel_off_.size()) return nullptr;
-    if (ef_sel_off_[off_idx] == ef_sel_off_[off_idx + 1]) return nullptr;
+    if (off_idx + 1 >= ef_sel_off_.size()) {
+      return nullptr;
+    }
+    if (ef_sel_off_[off_idx] == ef_sel_off_[off_idx + 1]) {
+      return nullptr;
+    }
     return ef_sel_flat_.data() + ef_sel_off_[off_idx];
   }
   [[nodiscard]] FsstDecodeView FsstViewAt(size_t off_idx) const {
@@ -1685,9 +1697,13 @@ class PaxChunk final {
     }
     const uint32_t begin = fsst_meta_index_[off_idx];
     const uint32_t end = fsst_meta_index_[off_idx + 1];
-    if (begin == end || begin >= fsst_meta_.size()) return view;
+    if (begin == end || begin >= fsst_meta_.size()) {
+      return view;
+    }
     const FsstDecodeMeta& meta = fsst_meta_[begin];
-    if (!meta.valid) return view;
+    if (!meta.valid) {
+      return view;
+    }
     view.meta = &meta;
     if (meta.symbol_count != 0 &&
         static_cast<size_t>(meta.symbol_index) + meta.symbol_count <=
@@ -1701,7 +1717,9 @@ class PaxChunk final {
   }
   [[nodiscard]] uint64_t Generation() const { return footer_.generation; }
   [[nodiscard]] size_t TotalRowCount() const {
-    if (!rg_prefix_.empty()) return static_cast<size_t>(rg_prefix_.back());
+    if (!rg_prefix_.empty()) {
+      return static_cast<size_t>(rg_prefix_.back());
+    }
     // Bound by row_group_count like every other read path: a hand-built
     // footer with extra row_counts entries would otherwise inflate the
     // total and weaken HashLookup's row-index bounds check.
@@ -1709,7 +1727,9 @@ class PaxChunk final {
                                ? footer_.row_counts.size()
                                : footer_.row_group_count;
     size_t total = 0;
-    for (size_t g = 0; g < ngroups; ++g) total += footer_.row_counts[g];
+    for (size_t g = 0; g < ngroups; ++g) {
+      total += footer_.row_counts[g];
+    }
     return total;
   }
   [[nodiscard]] StatusOr<Row> ReadRow(size_t global_row_index,
@@ -1727,6 +1747,7 @@ class PaxChunk final {
     bool valid = false;      // by_col holds the decoded values of `group`
     uint32_t rows_seen = 0;  // rows served for `group` (fill amortization)
     std::array<uint64_t, 16> column_mask{};
+    std::vector<uint64_t> wide_column_mask;
     bool projection_active = false;
     std::vector<std::vector<std::string>> by_col;
 
@@ -1790,18 +1811,33 @@ class PaxChunk final {
 
     void SelectColumns(std::span<const slot_t> columns) {
       column_mask.fill(0);
+      wide_column_mask.clear();
       projection_active = true;
       for (slot_t column : columns) {
         if (column < column_mask.size() * 64U) {
           column_mask[column / 64U] |= uint64_t{1} << (column % 64U);
+        } else {
+          const size_t word = (column / 64U) - column_mask.size();
+          if (word >= wide_column_mask.size()) {
+            wide_column_mask.resize(word + 1);
+          }
+          wide_column_mask[word] |= uint64_t{1} << (column % 64U);
         }
       }
     }
 
     [[nodiscard]] bool IsColumnSelected(slot_t column) const {
-      return !projection_active || (column < column_mask.size() * 64U &&
-                                    (column_mask[column / 64U] &
-                                     (uint64_t{1} << (column % 64U))) != 0);
+      if (!projection_active) {
+        return true;
+      }
+      const size_t word = column / 64U;
+      const uint64_t bit = uint64_t{1} << (column % 64U);
+      if (word < column_mask.size()) {
+        return (column_mask[word] & bit) != 0;
+      }
+      const size_t wide_word = word - column_mask.size();
+      return wide_word < wide_column_mask.size() &&
+             (wide_column_mask[wide_word] & bit) != 0;
     }
   };
   Status ReadRowIntoCached(size_t global_row_index, const Schema& sc,
@@ -1872,9 +1908,10 @@ class PaxChunk final {
 
   // Build a PAX chunk from a sorted run of rows (ascending by key). The rows
   // are read via the iterator and re-encoded into column-contiguous row
-  // groups.
-  static PaxChunk BuildFromSortedRun(const SortedRun& run, const Schema& sc,
-                                     bool compress = false);
+  // groups. Invalid key order or corrupt row payload returns kCorrupt.
+  static StatusOr<PaxChunk> BuildFromSortedRun(const SortedRun& run,
+                                               const Schema& sc,
+                                               bool compress = false);
 
   // Standalone structural validation of serialized chunk bytes. Performs
   // the full footer walk with overflow-safe arithmetic, sanity gates on
@@ -1886,7 +1923,8 @@ class PaxChunk final {
 
   // Reconstruct a queryable chunk from its self-describing wire image.
   // Structural bounds and both CRCs are verified before any footer field is
-  // materialized.  This is the persistence entry point used by pack files;
+  // materialized. This standalone wire decoder is currently exercised by fuzz
+  // harnesses; database persistence does not use a separate pack-file path;
   // callers never need to retain an out-of-band Footer alongside the bytes.
   [[nodiscard]] static StatusOr<PaxChunk> Deserialize(std::vector<char> bytes);
 
@@ -2067,8 +2105,10 @@ struct AggResult {
 
 // Single-column reduction (M3 pushdown): MIN / MAX / COUNT / SUM /
 // APPROX_COUNT_DISTINCT over the rows that survive the (optional) predicates.
-// COUNT and APPROX_COUNT_DISTINCT answer from footer metadata alone (no
-// decode); MIN/MAX use per-row-group zone maps when unpredicated and fall back
+// Unpredicated COUNT and APPROX_COUNT_DISTINCT use footer metadata. With
+// predicates, COUNT evaluates selection masks and APPROX_COUNT_DISTINCT counts
+// exact distinct selected values by decoding; MIN/MAX use zone maps when
+// unpredicated and fall back
 // to a decode over the selected rows otherwise.
 enum class AggOp { kSum, kMin, kMax, kCount, kApproxDistinct };
 
@@ -2090,15 +2130,16 @@ struct ReduceResult {
 };
 
 // Fused filter + single-column reduce with predicate pushdown. Reuses the
-// selection-vector machinery: COUNT needs no decode, APPROX_COUNT_DISTINCT
-// reads the per-(row-group,column) HLL sketch, MIN/MAX use zone maps when
-// possible.
-// Every column referenced by `plan` (reduce col + predicate cols) is
-// decoded as int64; pass `sc` to gate on the declared types and get an
-// invalid ReduceResult on a non-int64 column instead of garbage numbers.
-// NOTE: this kernel is SEQUENTIAL — the parallel/nthreads parameters are
-// accepted for signature compatibility with VectorizedScanColumn /
-// ScanAggregate but currently ignored (single-threaded execution).
+// selection-vector machinery: unpredicated COUNT uses row counts and
+// unpredicated APPROX_COUNT_DISTINCT reads HLL sketches. Predicates may decode
+// for COUNT and require an exact decoded distinct set for
+// APPROX_COUNT_DISTINCT. MIN/MAX use zone maps when possible. Every column
+// referenced by `plan` (reduce col + predicate cols) is decoded as int64; pass
+// `sc` to gate on the declared types and get an invalid ReduceResult on a
+// non-int64 column instead of garbage numbers. NOTE: this kernel is SEQUENTIAL
+// — the parallel/nthreads parameters are accepted for signature compatibility
+// with VectorizedScanColumn / ScanAggregate but currently ignored
+// (single-threaded execution).
 ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                           bool parallel = false, int nthreads = 0,
                           uint32_t scan_sweeps = 1, const Schema* sc = nullptr,
@@ -2285,8 +2326,10 @@ struct GroupByEntryN {
 //
 // The group key values are the raw int64 values (a NULL cell participates
 // as raw 0, matching the decode path and the WASM pushdown). Entries are
-// returned in first-seen group order.
-std::vector<GroupByEntryN> GroupBySumColumns(
+// returned in first-seen group order. SUM wraps in two's-complement int64,
+// like GroupBySumColumn. Invalid arguments or corrupt row groups return Status;
+// no partial aggregate is returned on failure.
+StatusOr<std::vector<GroupByEntryN>> GroupBySumColumns(
     const PaxChunk& chunk, const std::vector<slot_t>& group_cols,
     slot_t sum_col, const Schema* sc = nullptr,
     WorkloadTracker* workload = nullptr);

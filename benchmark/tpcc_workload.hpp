@@ -90,12 +90,17 @@ std::string TpccLastName(int n);
 // identical when comparing servers through the same generator.
 class TpccSqlSession {
  public:
+  TpccSqlSession() = default;
+  TpccSqlSession(const TpccSqlSession&) = default;
+  TpccSqlSession& operator=(const TpccSqlSession&) = default;
+  TpccSqlSession(TpccSqlSession&&) = default;
+  TpccSqlSession& operator=(TpccSqlSession&&) = default;
   virtual ~TpccSqlSession() = default;
   virtual Status Begin(bool read_only) = 0;
   virtual Status Execute(std::string_view sql, std::vector<Row>* rows) = 0;
   virtual Status Commit() = 0;
   virtual void Abort() = 0;
-  virtual std::string_view LastError() const = 0;
+  [[nodiscard]] virtual std::string_view LastError() const = 0;
 };
 
 // TPC-C transaction mix and data access (Clause 2 and 5.2). Not an audited

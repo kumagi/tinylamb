@@ -65,6 +65,7 @@ TableStatistics IndexRangeStats(const TableStatistics& source,
                                 const std::vector<Value>& end_key) {
   TableStatistics result = source;
   size_t equality_rows = result.Rows();
+  size_t equality_keys = 0;
   const size_t key_count = std::max(begin_key.size(), end_key.size());
   for (size_t i = 0; i < key_count; ++i) {
     if (i >= index.sc_.key_.size()) {
@@ -76,9 +77,11 @@ TableStatistics IndexRangeStats(const TableStatistics& source,
         result.TransformBy(static_cast<int>(index.sc_.key_[i]), lower, upper);
     if (!lower.IsNull() && !upper.IsNull() && lower == upper) {
       equality_rows = result.Rows();
+      ++equality_keys;
     }
   }
-  if (result.Rows() < equality_rows) {
+  // Correlation damping applies only after an equality prefix.
+  if (equality_keys != 0 && result.Rows() < equality_rows) {
     const size_t difference = equality_rows - result.Rows();
     const size_t estimate = equality_rows - (difference / 2) - (difference % 2);
     result = result.ScaleCardinality(estimate);

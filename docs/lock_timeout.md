@@ -20,9 +20,9 @@ resolve the version visible at `txn.SnapshotTimestamp()` through the MVCC
 version chain.
 
 Write-intent acquisition (`TransactionManager::AcquireWriteIntent`) supports
-four deadlock policies (`DeadlockPolicy`: `kLegacy` 5ms abort,
+five deadlock policies (`DeadlockPolicy`: `kLegacy` 5ms abort,
 `kWaitDie`/`kWoundWait` timestamp ordering, `kDeadlockDetect` background
-wait-for graph with youngest-victim wounding); see
+wait-for graph with youngest-victim wounding, and `kNoWait` immediate conflict); see
 `transaction/transaction_manager.hpp` and `docs/lock_order.md`.
 **The default is `kDeadlockDetect`**: the wait-for detector is
 event-driven (sleeps until a wait-for edge exists) and resolves a cycle by

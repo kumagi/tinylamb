@@ -17,7 +17,7 @@
 #ifndef TINYLAMB_COMMON_PLATFORM_ENDIAN_HPP
 #define TINYLAMB_COMMON_PLATFORM_ENDIAN_HPP
 
-#if defined(__APPLE__)
+#ifdef __APPLE__
 
 #include <libkern/OSByteOrder.h>
 #define htobe16(x) OSSwapHostToBigInt16(x)

@@ -76,7 +76,7 @@ PaxChunk BuildValidChunk() {
     index.emplace_back(key_off, row_off, false);
   }
   SortedRun run(std::move(blob), std::move(index), 1);
-  return PaxChunk::BuildFromSortedRun(run, sc);
+  return PaxChunk::BuildFromSortedRun(run, sc).MoveValue();
 }
 
 }  // namespace

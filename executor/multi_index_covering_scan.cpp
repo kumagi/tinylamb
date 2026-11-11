@@ -140,12 +140,14 @@ void MultiIndexCoveringScan::Build() {
   std::sort(positions_.begin(), positions_.end(), RowPositionComparator{});
 }
 
-Row MultiIndexCoveringScan::AssembleFromHeap(const Row& heap_row) const {
+StatusOr<Row> MultiIndexCoveringScan::AssembleFromHeap(
+    const Row& heap_row) const {
   Row assembled;
   assembled.values_.reserve(output_slots_.size());
   for (const slot_t slot : output_slots_) {
     if (slot >= heap_row.Count()) {
-      return {};
+      return StatusError(StatusCode::kCorrupt,
+                         "covering scan column is outside the heap row");
     }
     assembled.values_.push_back(heap_row[slot]);
   }
@@ -183,10 +185,12 @@ size_t MultiIndexCoveringScan::NextBatch(DataChunk* destination,
         FailWith(row_or.GetStatus());
         return destination->Size();
       }
-      assembled = AssembleFromHeap(row_or.Value());
-      if (!assembled.IsValid()) {
-        continue;
+      auto assembled_or = AssembleFromHeap(row_or.Value());
+      if (!assembled_or.HasValue()) {
+        FailWith(assembled_or.GetStatus());
+        return destination->Size();
       }
+      assembled = assembled_or.MoveValue();
     } else {
       assembled = std::move(candidate.values);
     }

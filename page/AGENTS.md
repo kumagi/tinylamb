@@ -17,8 +17,8 @@ Unbounded row blocks + LSM-Tree engines (`tinylamb_page`, shared with
 - `page_ref.{hpp,cpp}` — move-only RAII: latches `Page` on construct and
   unlocks on destroy/`PageUnlock`.
 - `row_page.{hpp,cpp}` — unbounded row block (`std::vector<std::string> slots_`
-  + `committed_slots_` + `committed_lsns_`, up to `kMaxSlotsPerBlock = 256`
-  slots per block with no byte-size limit per row).
+  + `committed_slots_` + `committed_lsns_`, up to `kMaxSlotsPerBlock = 4096`
+  slots per block; dynamic strings with a byte admission budget for new writes).
 - `row_position.hpp` — `RowPosition{page_id, slot}` row-lock and MVCC
   granularity unit.
 

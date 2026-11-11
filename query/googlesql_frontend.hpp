@@ -11,6 +11,12 @@
 
 namespace tinylamb {
 
+namespace frontend_detail {
+// Returns false without modifying the AST if the parser dump cannot carry
+// DISTINCT ON keys. Kept separate so malformed parser responses are testable.
+bool InjectDistinctOnKeys(std::string& ast, const std::string& keys_ast);
+}  // namespace frontend_detail
+
 struct GoogleSqlParseResult {
   bool ok{false};
   std::string ast;

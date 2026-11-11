@@ -2,6 +2,7 @@
 #include "set_operation_plan.hpp"
 
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -13,11 +14,14 @@
 #include "common/set_operation.hpp"
 #include "expression/expression.hpp"
 #include "plan/plan.hpp"
+#include "table/table_statistics.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
 #include "type/value_type.hpp"
 
 namespace tinylamb {
+
+const TableStatistics& SetOperationPlan::GetStats() const { return stats_; }
 
 namespace {
 
@@ -74,14 +78,26 @@ size_t SetOperationPlan::EmitRowCount() const {
   if (children_.empty()) {
     return 0;
   }
-  if (operation_ == SetOperationKind::kUnionAll) {
+  if (operation_ == SetOperationKind::kUnionAll ||
+      operation_ == SetOperationKind::kUnion) {
     size_t rows = 0;
     for (const Plan& child : children_) {
-      rows += child->EmitRowCount();
+      const size_t child_rows = child->EmitRowCount();
+      if (child_rows > std::numeric_limits<size_t>::max() - rows) {
+        return std::numeric_limits<size_t>::max();
+      }
+      rows += child_rows;
     }
     return rows;
   }
-  return children_.front()->EmitRowCount();
+  size_t rows = children_.front()->EmitRowCount();
+  if (operation_ == SetOperationKind::kIntersect ||
+      operation_ == SetOperationKind::kIntersectAll) {
+    for (const Plan& child : children_) {
+      rows = std::min(rows, child->EmitRowCount());
+    }
+  }
+  return rows;
 }
 
 bool SetOperationPlan::IsOrderedBy(const std::vector<Expression>& expressions,

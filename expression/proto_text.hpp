@@ -59,7 +59,8 @@ bool ProtoTextHasField(std::string_view text, std::string_view key);
 // Sets (non-null value), clears (null value) or creates a field addressed by
 // a dotted path inside a proto TEXT payload.  Existing entries keep their
 // position; new entries append at the end of their containing message.
-// Throws std::runtime_error for required-field violations.
+// Returns InvalidArgument for malformed message bodies and required-field
+// violations; an empty path returns nullopt without editing the payload.
 [[nodiscard]] StatusOr<std::optional<std::string>> TryProtoTextSetField(
     std::string_view text, const std::vector<std::string>& path,
     const Value& new_value, const std::string& type_name);

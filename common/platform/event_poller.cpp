@@ -24,7 +24,7 @@
 #include "common/platform/os.hpp"
 #include "common/platform/socket.hpp"
 
-#if defined(TINYLAMB_OS_LINUX)
+#ifdef TINYLAMB_OS_LINUX
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -51,15 +51,22 @@ constexpr size_t kMaxBatch = 128;
 EventPoller::~EventPoller() { Close(); }
 
 void EventPoller::Close() {
+#ifdef TINYLAMB_OS_WINDOWS
+  {
+    std::scoped_lock lock(mu_);
+    poll_fd_ = -1;
+    interest_.clear();
+  }
+  interest_changed_.notify_all();
+#else
   if (poll_fd_ >= 0) {
-#if !defined(TINYLAMB_OS_WINDOWS)
     ::close(poll_fd_);
-#endif
     poll_fd_ = -1;
   }
 #ifndef __linux__
   std::scoped_lock lock(mu_);
   interest_.clear();
+#endif
 #endif
 }
 
@@ -193,27 +200,29 @@ void Waker::Drain() const {
 #elif defined(TINYLAMB_OS_WINDOWS)
 
 bool EventPoller::Open() {
+  std::scoped_lock lock(mu_);
   if (poll_fd_ >= 0) return true;
   poll_fd_ = 1;
   return true;
 }
 
 bool EventPoller::Add(int fd, uint32_t interest) {
+  std::scoped_lock lock(mu_);
   if (poll_fd_ < 0 || fd < 0) {
     errno = EBADF;
     return false;
   }
-  std::scoped_lock lock(mu_);
   interest_[fd] = interest;
+  interest_changed_.notify_all();
   return true;
 }
 
 bool EventPoller::Modify(int fd, uint32_t interest) {
+  std::scoped_lock lock(mu_);
   if (poll_fd_ < 0) {
     errno = EBADF;
     return false;
   }
-  std::scoped_lock lock(mu_);
   const auto found = interest_.find(fd);
   if (found == interest_.end()) {
     errno = ENOENT;
@@ -224,11 +233,11 @@ bool EventPoller::Modify(int fd, uint32_t interest) {
 }
 
 bool EventPoller::Remove(int fd) {
+  std::scoped_lock lock(mu_);
   if (poll_fd_ < 0) {
     errno = EBADF;
     return false;
   }
-  std::scoped_lock lock(mu_);
   const auto found = interest_.find(fd);
   if (found == interest_.end()) {
     errno = ENOENT;
@@ -239,14 +248,26 @@ bool EventPoller::Remove(int fd) {
 }
 
 int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
-  if (poll_fd_ < 0) {
-    errno = EBADF;
+  if (out.empty()) {
+    errno = EINVAL;
     return -1;
   }
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(std::max(0, timeout_ms));
   std::vector<WSAPOLLFD> poll_fds;
   std::vector<uint32_t> interests;
   {
-    std::scoped_lock lock(mu_);
+    std::unique_lock lock(mu_);
+    const auto ready = [&] { return poll_fd_ < 0 || !interest_.empty(); };
+    if (timeout_ms < 0) {
+      interest_changed_.wait(lock, ready);
+    } else if (!interest_changed_.wait_until(lock, deadline, ready)) {
+      return 0;
+    }
+    if (poll_fd_ < 0) {
+      errno = EBADF;
+      return -1;
+    }
     poll_fds.reserve(interest_.size());
     interests.reserve(interest_.size());
     for (const auto& [fd, interest] : interest_) {
@@ -262,11 +283,11 @@ int EventPoller::Wait(std::span<PollResult> out, int timeout_ms) {
       interests.push_back(interest);
     }
   }
-  if (poll_fds.empty()) {
-    if (timeout_ms > 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
-    }
-    return 0;
+  if (timeout_ms >= 0) {
+    timeout_ms = static_cast<int>(
+        std::max<int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
+                                 deadline - std::chrono::steady_clock::now())
+                                 .count()));
   }
   const int count = PollSockets(poll_fds.data(), poll_fds.size(), timeout_ms);
   if (count < 0) return -1;

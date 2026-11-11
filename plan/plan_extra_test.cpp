@@ -22,6 +22,7 @@
 #include "plan/distinct_plan.hpp"
 #include "plan/group_by_plan.hpp"
 #include "plan/incremental_sort_plan.hpp"
+#include "plan/minmax_index_plan.hpp"
 #include "plan/plan.hpp"
 #include "plan/relation_rename_plan.hpp"
 #include "plan/relational_plan.hpp"
@@ -59,6 +60,40 @@ std::string DumpToString(const PlanBase& plan, int indent = 0) {
 }
 
 }  // namespace
+
+TEST(PlanAuditTest, SetCardinalityUsesEveryBranch) {
+  const auto empty = MakeValuesChild(0);
+  const auto left = MakeValuesChild(2);
+  const auto right = MakeValuesChild(3);
+  for (const auto kind :
+       {SetOperationKind::kUnion, SetOperationKind::kUnionAll}) {
+    SetOperationPlan plan({empty, right}, kind);
+    EXPECT_EQ(plan.EmitRowCount(), 3U);
+    EXPECT_EQ(plan.GetStats().Rows(), 3U);
+  }
+  for (const auto kind :
+       {SetOperationKind::kIntersect, SetOperationKind::kIntersectAll}) {
+    EXPECT_EQ(SetOperationPlan({right, left}, kind).EmitRowCount(), 2U);
+    EXPECT_EQ(SetOperationPlan({right, empty}, kind).EmitRowCount(), 0U);
+  }
+}
+
+TEST(PlanAuditTest, EmptySetOperationHasEmptyStatistics) {
+  const SetOperationPlan plan({}, SetOperationKind::kUnionAll);
+  EXPECT_EQ(plan.GetStats().Rows(), 0U);
+  EXPECT_EQ(plan.EmitRowCount(), 0U);
+  EXPECT_EQ(plan.GetSchema().ColumnCount(), 0U);
+}
+
+TEST(PlanAuditTest, MalformedMinMaxDescriptionDoesNotDereferenceExpression) {
+  for (const Expression& expression :
+       {Expression{}, ConstantValueExp(Value(1))}) {
+    MinMaxIndexPlan plan(MakeValuesChild(), NamedExpression("x", expression), 0,
+                         false);
+    EXPECT_NE(plan.ToString().find("invalid aggregate"), std::string::npos);
+    EXPECT_NE(DumpToString(plan).find("invalid aggregate"), std::string::npos);
+  }
+}
 
 TEST(DistinctPlanExtraTest, DumpToStringAndDelegation) {
   Plan child = MakeValuesChild();
@@ -140,7 +175,7 @@ TEST(SetOperationPlanExtraTest, RowCountsOrderingAndDump) {
 
   SetOperationPlan union_dedup({left, right}, SetOperationKind::kUnion);
   EXPECT_EQ(union_dedup.AccessRowCount(), 5U);
-  EXPECT_EQ(union_dedup.EmitRowCount(), 2U);  // distinct: front child's cap
+  EXPECT_EQ(union_dedup.EmitRowCount(), 5U);  // unknown branch overlap
 
   // ToString per operation kind.
   EXPECT_EQ(union_dedup.ToString(), "Union");

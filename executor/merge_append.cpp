@@ -88,14 +88,10 @@ bool MergeAppendExecutor::Before(const Head& left, const Head& right) const {
       FailWith(rhs.GetStatus());
       return false;
     }
-    if (lhs.Value().IsNull() || rhs.Value().IsNull()) {
-      if (lhs.Value().IsNull() != rhs.Value().IsNull()) {
-        const bool nulls_first = key.nulls_first.value_or(key.ascending);
-        return lhs.Value().IsNull() == nulls_first;
-      }
-    } else if (lhs.Value() != rhs.Value()) {
-      return key.ascending ? lhs.Value() < rhs.Value()
-                           : rhs.Value() < lhs.Value();
+    const int comparison =
+        MakeSortKeyOrder(key).Compare(lhs.Value(), rhs.Value());
+    if (comparison != 0) {
+      return comparison < 0;
     }
   }
   return left.source < right.source;

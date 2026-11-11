@@ -90,8 +90,9 @@ class ParallelAggregationExecutor final : public ExecutorBase {
 
   [[nodiscard]] PartialState MakeState() const;
   Status Accumulate(PartialState* state, const DataChunk& chunk) const;
-  // Walks `always_generic` and `fallback` (both ascending, disjoint) as one
-  // ascending index sequence.
+  // Visits the disjoint `always_generic` and `fallback` lists. The latter
+  // follows input-kind order, not aggregate-index order; each index updates
+  // an independent aggregate state.
   Status AccumulateGeneric(PartialState* state, const DataChunk& chunk,
                            const std::vector<size_t>& always_generic,
                            const std::vector<size_t>& fallback) const;

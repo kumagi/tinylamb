@@ -75,7 +75,7 @@ class LateMaterializationJoin final : public ExecutorBase {
                                 const Row& index_key) const;
   [[nodiscard]] StatusOr<Row> MaterializePayload(const Candidate& candidate,
                                                  const Row& left_row) const;
-  [[nodiscard]] std::optional<Row> ExtractLeftKey(const Row& left_row) const;
+  [[nodiscard]] StatusOr<Row> ExtractLeftKey(const Row& left_row) const;
   [[nodiscard]] std::optional<RowPosition> ExtractRowId(
       const Row& left_row) const;
   [[nodiscard]] bool IsLeftRowValid(const Row& left_row) const;

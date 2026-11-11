@@ -39,7 +39,6 @@ class Page {
  public:
   Page(page_id_t pid, PageType type) { PageInit(pid, type); }
   Page() = default;
-  ~Page() = default;
 
   void PageInit(page_id_t pid, PageType type) {
     type_ = type;

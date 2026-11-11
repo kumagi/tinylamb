@@ -8,7 +8,7 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
 
 - `plan.hpp` (`PlanBase`: `EmitExecutor/ScanSource/GetStats/GetSchema/
   AccessRowCount/EmitRowCount/IsOrderedBy/OrderIsMeasured/EnforcesLimit/Dump`
-  only) + one
+  and parameter-slot / distinct / collation / EXPLAIN metadata) + one
   `*_plan.{hpp,cpp}` per operator (full/index/index-only/bitmap/minmax scan,
   projection, selection, product, merge-join, sort, topn, limit, aggregation,
   distinct, set-op, values, unnest, apply, recursive-cte, …) +
@@ -116,7 +116,7 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   Its `EmitExecutor` takes `IndexOnlyScanPlan`'s stale-key gate around a read
   guard for EVERY participant, acquired in one index-root order.
 - Rule families: `ExpressionRuleSet::Default` (folds, De Morgan, comparison
-  canonicalization…) → `cascades::RuleSet::Default` (83 logical equivalences:
+  canonicalization…) → `cascades::RuleSet::Default` (86 logical equivalences:
   join commutativity/associativity/enumeration, selection merge/pushdown,
   set-op transparency…) → `implementation_rules.{hpp,cpp}`
   (`DefaultImplementationRules`: range-sliced Index/Bitmap/MinMax, Hash/Merge/
@@ -158,8 +158,8 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
 Remaining allowlisted edges: `plan/* -> query/query_data.hpp` (same CMake
 target), `plan/{product_plan,implementation_rules}.cpp ->
 executor/hash_join_mode.hpp` (cost-estimation helper location debt, V4),
-`plan/implementation_rules.cpp -> executor/detail/scan_filter.hpp`
-(CompiledScanFilter helpers used by implementation rules; same V4 debt).
+`plan/implementation_rules.cpp -> executor/detail/scan_filter.hpp` is a legal
+downward plan-to-relational dependency, not an allowlisted violation.
 `JoinKind` itself lives in `common/join_kind.hpp`; `executor/join_kind.hpp`
 is a compat include.
 

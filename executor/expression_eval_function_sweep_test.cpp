@@ -21,10 +21,12 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/random_string.hpp"
@@ -32,8 +34,11 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/timestamp_trunc_kernel.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
+#include "expression/interval_expression.hpp"
+#include "type/date.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -433,6 +438,26 @@ TEST_F(RelationalFunctionSweepTest, EveryDispatchedFunctionReturnsCleanly) {
   }
 }
 
+TEST_F(RelationalFunctionSweepTest, RegexpReplacementViewsKeepConversions) {
+  for (int pass = 0; pass < 2; ++pass) {
+    EXPECT_EQ(Evaluate("regexp_replace", {Value(std::string("a\0b", 3)),
+                                          Value("(a)"), Value(R"(\1$)")}),
+              std::make_optional(Value(std::string("a$\0b", 4))));
+    EXPECT_EQ(Evaluate("regexp_replace", {Value(123), Value(2), Value(9)}),
+              std::make_optional(Value("193")));
+    EXPECT_EQ(Evaluate("regexp_replace",
+                       {Value("b"), Value("(a)?b"), Value(R"(\1X)")}),
+              std::make_optional(Value("X")));
+    EXPECT_EQ(Evaluate("regexp_replace", {Value(), Value("["), Value(R"(\9)")}),
+              std::make_optional(Value()));
+    EXPECT_EQ(Evaluate("regexp_replace", {Value("a"), Value("["), Value()}),
+              std::make_optional(Value()));
+    EXPECT_FALSE(
+        Evaluate("regexp_replace", {Value("a"), Value("(a)"), Value(R"(\2)")})
+            .has_value());
+  }
+}
+
 TEST_F(RelationalFunctionSweepTest, CanonicalPins) {
   struct Pin {
     const char* name;
@@ -558,6 +583,397 @@ TEST_F(RelationalFunctionSweepTest, DeterminismAndNullPropagation) {
   for (const std::string& name : null_tolerant_probe) {
     SCOPED_TRACE(name);
     EXPECT_NO_THROW({ (void)Evaluate(name, {Value()}); });
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest,
+       ExtractSeparatesTimestampAndIntervalDomains) {
+  const std::vector<std::pair<std::string, int64_t>> parts{
+      {"year", 2024},
+      {"month", 2},
+      {"day", 29},
+      {"hour", 12},
+      {"minute", 34},
+      {"second", 56},
+      {"millisecond", 123},
+      {"microsecond", 123456},
+      {"nanosecond", 123456789}};
+  for (const auto& [part, expected] : parts) {
+    for (const char* text : {"2024-02-29 12:34:56.123456789+00",
+                             "2024-02-29T12:34:56.123456789Z"}) {
+      EXPECT_EQ(Evaluate("extract_" + part, {Value(text)}),
+                std::make_optional(Value(expected)))
+          << part << " / " << text;
+    }
+    EXPECT_EQ(Evaluate("extract_" + part, {Value()}),
+              std::make_optional(Value()));
+  }
+  EXPECT_EQ(Evaluate("extract_hour",
+                     {Value("2024-02-29 12:34:56+00"), Value("+05:30")}),
+            std::make_optional(Value(18)));
+  EXPECT_EQ(Evaluate("extract_minute",
+                     {Value("2024-02-29 12:34:56+00"), Value("+05:30")}),
+            std::make_optional(Value(4)));
+  EXPECT_EQ(
+      Evaluate("extract_minute", {Value("2024-02-29 12:34:56+00"), Value()}),
+      std::make_optional(Value()));
+  for (const char* text :
+       {"2024-02-30 12:34:56+00", "2024-02-29 25:00:00+00", "not-a-date"}) {
+    EXPECT_FALSE(Evaluate("extract_minute", {Value(text)}).has_value());
+  }
+  const std::vector<std::pair<std::string, int64_t>> interval_parts{
+      {"year", 1},
+      {"month", 2},
+      {"day", 3},
+      {"hour", 4},
+      {"minute", 5},
+      {"second", 6},
+      {"millisecond", 123},
+      {"microsecond", 123456},
+      {"nanosecond", 123456789}};
+  for (const auto& [part, expected] : interval_parts) {
+    const Value interval = Value("1-2 3 4:5:6.123456789").WithInterval();
+    EXPECT_EQ(Evaluate("extract_" + part, {interval}),
+              std::make_optional(Value(expected)))
+        << part;
+    const auto ast = ExecuteFunction("extract_" + part, {interval});
+    EXPECT_TRUE(ast.HasValue()) << part;
+    if (ast.HasValue()) {
+      EXPECT_EQ(ast.Value(), Value(expected)) << part;
+    }
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, FixedCivilTimesMatchGeneralParser) {
+  // +0000 retains the same UTC meaning but uses the general input parser.
+  // Include century leap-year rules, both ends of the supported year range,
+  // and day/week/month boundaries in positive and negative epochs.
+  for (const std::string& date :
+       {"0001-01-01", "1582-10-15", "1900-02-28", "1969-12-31", "1970-01-01",
+        "2000-02-29", "2024-02-29", "2024-12-31", "9999-12-31"}) {
+    for (const std::string& time : {"00:00:00", "12:34:56", "23:59:59"}) {
+      const std::string canonical =
+          std::string(date).append(" ").append(time).append("+00");
+      for (const std::string& unit : {"year", "quarter", "month", "week", "day",
+                                      "hour", "minute", "second"}) {
+        for (const std::string& zone : {"UTC", "+05:30", "-03:30"}) {
+          SCOPED_TRACE(testing::Message()
+                       << canonical << " " << unit << " " << zone);
+          const auto fixed =
+              Evaluate("timestamp_trunc",
+                       {Value(std::string(canonical)), Value(std::string(unit)),
+                        Value(std::string(zone))});
+          const auto general =
+              Evaluate("timestamp_trunc",
+                       {Value(canonical + "00"), Value(std::string(unit)),
+                        Value(std::string(zone))});
+          ASSERT_TRUE(fixed.has_value());
+          ASSERT_TRUE(general.has_value());
+          EXPECT_EQ(fixed, general);
+        }
+      }
+      const auto minute = Evaluate(
+          "timestamp_trunc",
+          {Value(std::string(canonical)), Value("minute"), Value("UTC")});
+      ASSERT_TRUE(minute.has_value());
+      const std::string expected =
+          std::string(date).append(" ").append(time, 0, 6).append("00+00");
+      EXPECT_EQ(minute, std::make_optional(Value(std::string(expected))));
+      for (const std::string& unit : {"year", "month", "day"}) {
+        // Bare DATE strings exercise the ten-byte form without a timestamp.
+        const auto result = Evaluate(
+            "datetime_trunc",
+            {Value(std::string(date)), Value(std::string(unit)), Value("UTC")});
+        const auto midnight = Evaluate(
+            "datetime_trunc", {Value(date + " 00:00:00"),
+                               Value(std::string(unit)), Value("UTC")});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(midnight.has_value());
+        EXPECT_EQ(result, midnight);
+      }
+    }
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, PackedUtcTruncationKeysMatchReference) {
+  using relational_detail::CompileUtcTimestampTrunc;
+  using relational_detail::FormatUtcTimestampTruncKey;
+  using relational_detail::TryUtcTimestampTruncKey;
+  const std::string previous = GetDefaultTimeZone();
+  struct Restore {
+    explicit Restore(std::string value) : zone(std::move(value)) {}
+    Restore(const Restore&) = delete;
+    Restore& operator=(const Restore&) = delete;
+    Restore(Restore&&) = delete;
+    Restore& operator=(Restore&&) = delete;
+    ~Restore() { SetDefaultTimeZone(zone); }
+    std::string zone;
+  } restore(previous);
+  SetDefaultTimeZone("UTC");
+  for (const std::string& unit : {"SECOND", "minutes", "HOUR", "day"}) {
+    const auto expression = FunctionCallExp(
+        "timestamp_trunc", {ColumnValueExp("s"), ColumnValueExp(unit),
+                            ConstantValueExp(Value("UTC"))});
+    const auto compiled =
+        CompileUtcTimestampTrunc(expression->AsFunctionCallExpression());
+    ASSERT_TRUE(compiled);
+    const auto literal = FunctionCallExp(
+        "timestamp_trunc",
+        {ColumnValueExp("s"), ConstantValueExp(Value(std::string(unit)))});
+    EXPECT_EQ(CompileUtcTimestampTrunc(literal->AsFunctionCallExpression()),
+              compiled);
+    int64_t last_key = 0;
+    std::string last_text;
+    for (const std::string& date :
+         {"0001-01-01", "1582-10-15", "1900-02-28", "1969-12-31", "1970-01-01",
+          "2000-02-29", "2024-02-29", "9999-12-31"}) {
+      for (const std::string& time : {"00:00:00", "12:34:56", "23:59:59"}) {
+        for (const std::string& separator : {" ", "T"}) {
+          for (const std::string& suffix : {"", "+00"}) {
+            std::string text = date;
+            text += separator;
+            text += time;
+            text += suffix;
+            SCOPED_TRACE(testing::Message() << text << " " << unit);
+            const auto key = TryUtcTimestampTruncKey(text, *compiled);
+            ASSERT_TRUE(key);
+            ASSIGN_OR_ASSERT_FAIL(Value, formatted,
+                                  FormatUtcTimestampTruncKey(*key));
+            const auto reference = Evaluate(
+                "timestamp_trunc", {Value(std::string(text)),
+                                    Value(std::string(unit)), Value("UTC")});
+            ASSERT_TRUE(reference);
+            EXPECT_EQ(formatted, *reference);
+            EXPECT_GE(*key, last_key);
+            EXPECT_GE(formatted.AsStringView(), std::string_view(last_text));
+            last_key = *key;
+            last_text = formatted.AsStringView();
+          }
+        }
+      }
+    }
+    for (const std::string& text :
+         {"", "2024-01-01", "2024-01-01 00:00:00+0000",
+          "2024-01-01 00:00:00-01", "2024-01-01 00:00:00.1+00",
+          "2024-01-01 00:00:60+00", " 2024-01-01 00:00:00+00 ",
+          "0000-01-01 00:00:00+00", "1900-02-29 00:00:00+00",
+          "2024-13-01 00:00:00+00", "2024-01-01 24:00:00+00",
+          "2024-01-01 00:60:00+00", "2024-01-01 00:00:61+00"}) {
+      EXPECT_FALSE(TryUtcTimestampTruncKey(text, *compiled)) << text;
+    }
+  }
+  for (const int64_t key :
+       {int64_t{0}, int64_t{20240230000000LL}, int64_t{20240101006000LL},
+        std::numeric_limits<int64_t>::min(),
+        std::numeric_limits<int64_t>::max()}) {
+    EXPECT_EQ(FormatUtcTimestampTruncKey(key).GetStatus(),
+              Status::kInvalidArgument);
+  }
+  for (const Value& unit : {Value(), Value("month"), Value(1)}) {
+    const auto call = FunctionCallExp(
+        "timestamp_trunc", {ColumnValueExp("s"), ConstantValueExp(unit)});
+    EXPECT_FALSE(CompileUtcTimestampTrunc(call->AsFunctionCallExpression()));
+  }
+  for (const Value& zone : {Value(), Value("+09:00"), Value("invalid_zone")}) {
+    const auto call = FunctionCallExp(
+        "timestamp_trunc", {ColumnValueExp("s"), ColumnValueExp("MINUTE"),
+                            ConstantValueExp(zone)});
+    EXPECT_FALSE(CompileUtcTimestampTrunc(call->AsFunctionCallExpression()));
+  }
+  SetDefaultTimeZone("+09:00");
+  const auto call = FunctionCallExp(
+      "timestamp_trunc", {ColumnValueExp("s"), ColumnValueExp("MINUTE"),
+                          ConstantValueExp(Value("UTC"))});
+  EXPECT_FALSE(CompileUtcTimestampTrunc(call->AsFunctionCallExpression()));
+}
+
+TEST_F(RelationalFunctionSweepTest, CivilTimeFractionsLeapSecondsAndErrors) {
+  struct Pin {
+    const char* input;
+    const char* unit;
+    const char* expected;
+  };
+  for (const Pin& pin : {Pin{.input = "2000-02-29 23:59:60+00",
+                             .unit = "second",
+                             .expected = "2000-03-01 00:00:00+00"},
+                         Pin{.input = "1969-12-31 23:59:60+00",
+                             .unit = "minute",
+                             .expected = "1970-01-01 00:00:00+00"},
+                         Pin{.input = "2024-01-02 03:04:05.000000001+00",
+                             .unit = "nanosecond",
+                             .expected = "2024-01-02 03:04:05.000000001+00"},
+                         Pin{.input = "2024-01-02 03:04:05.123456789+00",
+                             .unit = "millisecond",
+                             .expected = "2024-01-02 03:04:05.123+00"},
+                         Pin{.input = "2024-01-02 03:04:05.123456789+00",
+                             .unit = "microsecond",
+                             .expected = "2024-01-02 03:04:05.123456+00"},
+                         Pin{.input = "2024-01-02 03:04:05.010000000+00",
+                             .unit = "nanosecond",
+                             .expected = "2024-01-02 03:04:05.010+00"},
+                         Pin{.input = "2024-01-02 03:04:05.000010000+00",
+                             .unit = "nanosecond",
+                             .expected = "2024-01-02 03:04:05.000010+00"},
+                         Pin{.input = " 2024-01-02T03:04:05+00 ",
+                             .unit = "hour",
+                             .expected = "2024-01-02 03:00:00+00"}}) {
+    SCOPED_TRACE(pin.input);
+    const auto result = Evaluate(
+        "timestamp_trunc", {Value(pin.input), Value(pin.unit), Value("UTC")});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result, std::make_optional(Value(pin.expected)));
+  }
+  for (const std::string& text :
+       {"0000-01-01 00:00:00+00", "1900-02-29 00:00:00+00",
+        "2024-13-01 00:00:00+00", "2024-01-32 00:00:00+00",
+        "2024-01-01 24:00:00+00", "2024-01-01 00:60:00+00",
+        "2024-01-01 00:00:61+00", "9999-12-31 23:59:60+00",
+        "2024-x1-01 00:00:00+00", ""}) {
+    SCOPED_TRACE(text);
+    EXPECT_FALSE(Evaluate("timestamp_trunc", {Value(std::string(text)),
+                                              Value("minute"), Value("UTC")})
+                     .has_value());
+  }
+  const auto null =
+      Evaluate("timestamp_trunc", {Value(), Value("minute"), Value("UTC")});
+  ASSERT_TRUE(null.has_value());
+  EXPECT_EQ(null, std::make_optional(Value()));
+  EXPECT_FALSE(Evaluate("timestamp_trunc", {Value("2024-01-01 00:00:00+00"),
+                                            Value("fortnight"), Value("UTC")})
+                   .has_value());
+  EXPECT_FALSE(
+      Evaluate("timestamp_trunc", {Value("2024-01-01 00:00:00+00"),
+                                   Value("minute"), Value("invalid_time_zone")})
+          .has_value());
+}
+
+TEST_F(RelationalFunctionSweepTest, TruncationDatePartIsNotARowReference) {
+  const Schema schema("t", {Column("s", ValueType::kVarChar),
+                            Column("MINUTE", ValueType::kVarChar),
+                            Column("payload", ValueType::kVarChar)});
+  const Row row({Value("2024-02-29 12:34:56+00"), Value("invalid-unit"),
+                 Value(std::string(4096, 'x'))});
+  const relational_detail::Scope scope{.row = &row, .schema = &schema};
+  for (const char* function :
+       {"date_trunc", "datetime_trunc", "timestamp_trunc"}) {
+    for (const char* unit : {"MINUTE", "HOUR", "DAY"}) {
+      SCOPED_TRACE(testing::Message() << function << " " << unit);
+      const auto symbolic =
+          FunctionCallExp(function, {ColumnValueExp("s"), ColumnValueExp(unit),
+                                     ConstantValueExp(Value("UTC"))});
+      const auto literal = FunctionCallExp(
+          function, {ColumnValueExp("s"), ConstantValueExp(Value(unit)),
+                     ConstantValueExp(Value("UTC"))});
+      ASSIGN_OR_ASSERT_FAIL(Value, actual,
+                            relational_detail::TryEvaluate(
+                                symbolic, scope, nullptr, *context_, {}));
+      ASSIGN_OR_ASSERT_FAIL(Value, expected,
+                            relational_detail::TryEvaluate(
+                                literal, scope, nullptr, *context_, {}));
+      EXPECT_EQ(actual, expected);
+    }
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, AuditControlFlowMatchesAst) {
+  const Schema schema("t", {Column("v", ValueType::kInt64)});
+  const Row row({Value(1)});
+  const relational_detail::Scope scope{.row = &row, .schema = &schema};
+  const relational_detail::CteMap ctes;
+  const std::vector<Expression> expressions{
+      FunctionCallExp("if", {ConstantValueExp(Value(true)), ColumnValueExp("v"),
+                             ConstantValueExp(Value(2.0))}),
+      FunctionCallExp("if", {ConstantValueExp(Value(true)),
+                             ConstantValueExp(Value(-1).WithUnsigned()),
+                             ConstantValueExp(Value(2.0))}),
+      FunctionCallExp(
+          "ifnull",
+          {ColumnValueExp("v"),
+           FunctionCallExp("error", {ConstantValueExp(Value("untaken"))})})};
+  for (const auto& expression : expressions) {
+    const auto expected = expression->TryEvaluate(row, schema);
+    const auto actual = relational_detail::TryEvaluate(
+        expression, scope, nullptr, *context_, ctes);
+    ASSERT_TRUE(expected.HasValue());
+    ASSERT_TRUE(actual.HasValue()) << actual.GetStatus();
+    EXPECT_EQ(actual.Value().type, expected.Value().type);
+    EXPECT_EQ(actual.Value(), expected.Value());
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, AuditStructEncodingMatchesAst) {
+  for (const Value& text :
+       {Value(std::string("quote\"\n\t")), Value("{\"nested\":1}"),
+        Value("null"), Value("UPPER").WithCollation(2)}) {
+    for (const Value& quoted : {Value(), Value(0), Value(1)}) {
+      const std::vector<Value> args{Value("key"), text, quoted};
+      const auto expected = ExecuteFunction("__struct_json__", args);
+      const auto actual = Evaluate("__struct_json__", args);
+      ASSERT_TRUE(expected.HasValue());
+      if (!actual.has_value()) {
+        ADD_FAILURE() << "STRUCT evaluation failed";
+        continue;
+      }
+      EXPECT_EQ(actual->AsStringView(), expected.Value().AsStringView());
+    }
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, AuditArrayIndexesRejectNonIntegers) {
+  const Value array = Arr({Value(10), Value(20)});
+  for (const Value& index : {Value(1.0), Value("1"), Value::DateFromDays(1)}) {
+    for (const char* name :
+         {"array_element_offset", "array_element_ordinal",
+          "array_element_safe_offset", "array_element_safe_ordinal"}) {
+      EXPECT_FALSE(Evaluate(name, {array, index}).has_value());
+    }
+    EXPECT_FALSE(Evaluate("array_slice", {array, index, Value(1)}).has_value());
+    EXPECT_FALSE(Evaluate("array_slice", {array, Value(1), index}).has_value());
+  }
+}
+
+TEST_F(RelationalFunctionSweepTest, AuditTimestampArithmeticUsesAbsoluteTime) {
+  const std::string previous = GetDefaultTimeZone();
+  struct Restore {
+    explicit Restore(std::string saved) : zone(std::move(saved)) {}
+    Restore(const Restore&) = delete;
+    Restore& operator=(const Restore&) = delete;
+    Restore(Restore&&) = delete;
+    Restore& operator=(Restore&&) = delete;
+    std::string zone;
+    ~Restore() { SetDefaultTimeZone(zone); }
+  } restore{previous};
+  for (const char* zone : {"UTC", "America/Los_Angeles", "+05:30"}) {
+    SetDefaultTimeZone(zone);
+    struct Case {
+      const char* input;
+      const char* added;
+      const char* subtracted;
+    };
+    for (const Case& pin : {Case{.input = "2020-07-01 12:00:00+00",
+                                 .added = "2020-07-01 13:00:00+00",
+                                 .subtracted = "2020-07-01 11:00:00+00"},
+                            Case{.input = "2020-03-08 09:00:00+00",
+                                 .added = "2020-03-08 10:00:00+00",
+                                 .subtracted = "2020-03-08 08:00:00+00"},
+                            Case{.input = "2020-11-01 08:00:00+00",
+                                 .added = "2020-11-01 09:00:00+00",
+                                 .subtracted = "2020-11-01 07:00:00+00"}}) {
+      const char* input = pin.input;
+      for (const bool subtract : {false, true}) {
+        SCOPED_TRACE(testing::Message()
+                     << zone << " " << input << " " << subtract);
+        const auto expression =
+            FunctionCallExp(subtract ? "timestamp_sub" : "timestamp_add",
+                            {ConstantValueExp(Value(input)),
+                             std::make_shared<IntervalExpression>(1, "hour")});
+        const relational_detail::Scope scope{};
+        ASSIGN_OR_ASSERT_FAIL(Value, result,
+                              relational_detail::TryEvaluate(
+                                  expression, scope, nullptr, *context_, {}));
+        EXPECT_EQ(result, Value(subtract ? pin.subtracted : pin.added));
+      }
+    }
   }
 }
 

@@ -48,7 +48,8 @@ bool JoinValueUnmatchable(const Value& value) {
 ParallelMergeJoin::ParallelMergeJoin(
     Executor left, std::vector<slot_t> left_cols, Executor right,
     std::vector<slot_t> right_cols, size_t worker_count, JoinKind kind,
-    Expression residual, Schema residual_schema, size_t right_width)
+    Expression residual, Schema residual_schema, size_t right_width,
+    size_t left_width)
     : left_(std::move(left)),
       left_cols_(std::move(left_cols)),
       right_(std::move(right)),
@@ -58,7 +59,8 @@ ParallelMergeJoin::ParallelMergeJoin(
       residual_(std::move(residual)),
       residual_conjuncts_(SplitConjuncts(residual_)),
       residual_schema_(std::move(residual_schema)),
-      right_width_(right_width) {}
+      right_width_(right_width),
+      left_width_(left_width) {}
 
 bool ParallelMergeJoin::KeyIsNull(const Row& row,
                                   const std::vector<slot_t>& cols) {
@@ -462,6 +464,20 @@ void ParallelMergeJoin::EnsureMaterialized() {
   }
   if (left_width_ == 0 && !left_rows_.empty()) {
     left_width_ = left_rows_.front().first.values_.size();
+  }
+  const bool preserve_left = kind_ == JoinKind::kLeftOuter ||
+                             kind_ == JoinKind::kFullOuter ||
+                             kind_ == JoinKind::kSingle;
+  const bool preserve_right =
+      kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter;
+  if ((preserve_left && !left_rows_.empty() && right_rows_.empty() &&
+       right_width_ == 0) ||
+      (preserve_right && !right_rows_.empty() && left_rows_.empty() &&
+       left_width_ == 0)) {
+    residual_error_ = StatusError(StatusCode::kInvalidArgument,
+                                  "outer join requires the empty input width");
+    materialized_ = true;
+    return;
   }
   // A failed child must stop materialization here: continuing would run the
   // merge over truncated input and serve the partial join as success

@@ -689,6 +689,11 @@ class Transaction final {
                                std::string_view prev_value = {});
   StatusOr<lsn_t> LsmDestroyLog(page_id_t root);
 
+  // Recover this transaction's latest write when a shared LSM key's live
+  // entry has since been overwritten by another uncommitted transaction.
+  bool FindPendingLsmWrite(page_id_t root, std::string_view key,
+                           std::string* value, bool* deleted) const;
+
   void ReserveIndexUndoBytes(page_id_t pid, size_t bytes);
 
   StatusOr<lsn_t> AllocatePageLog(page_id_t page_id, PageType new_page_type);
@@ -701,7 +706,9 @@ class Transaction final {
   // Note this waits only until the transaction's records are WRITTEN to the
   // WAL (CommittedLSN), not fsynced — it is a visibility barrier, not a
   // durability barrier; use Logger::WaitForDurable for the latter.
-  void CommitWait() const;
+  // Wait for the complete latest record and observed commit dependencies.
+  // Returns WAL failure instead of polling forever when the writer stops.
+  [[nodiscard]] Status CommitWait() const;
 
   PageManager* GetPageManager() {
     return transaction_manager_->GetPageManager();

@@ -508,11 +508,7 @@ query+server の各層を並行レビューし、発見した改善点を重要�
 - 場所: `CMakeLists.txt:557-570`(add_simple_test)、`:153-162`(`tinylamb_parser` の正体は
   `legacy/parser/*.cpp`)、`:418-423`(test_util が `type/row.cpp` を独自コンパイル →
   `tinylamb_type` アーカイブ内同一 TU とシンボル競合の ODR ハザード)
-- 追記 (2026-09): `parser/`・`legacy/parser/` はビルド対象から除外され、
-  `legacy/` ディレクトリは削除済み。トップレベルの `parser/` にはビルド外の
-  参照用ソース（`parser.hpp`/`pratt_parser.hpp`/`token.hpp`/`tokenizer.hpp`
-  およびビルド外の `*_test.cpp`）のみが残る（経緯は git 履歴参照）。
-  本項は歴史的経緯の記録。
+- 追記 (2026-11-11): `parser/` と `legacy/` はディレクトリごと削除済み。以下は削除前の歴史的な問題の記録であり、現行 frontend は `query/` と外部 GoogleSQL parser のみ。
 - 問題: page/recovery 等の下位レイヤーテストまで legacy parser/sql/test_util にリンクされ、
   ビルド時間増とレイヤ違反の隠蔽要因になる。AGENTS.md の「legacy は canonical 実行に不使用」
   と、top-level `parser/` ディレクトリ(legacy parser のテスト置き場)の位置づけも不明瞭。

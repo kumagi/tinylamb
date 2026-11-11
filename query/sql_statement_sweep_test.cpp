@@ -3,7 +3,15 @@
 // Statement-level characterization sweep over a table-backed
 // database: joins, set operations, grouping sets, windows, subqueries,
 // cached-relation aggregation paths, EXPLAIN, and DML including the
-// struct-INSERT expansion.  Values are the recorded engine results.
+// struct-INSERT expansion. Values are engine characterization, not a claim
+// of strict GoogleSQL type analysis. Sparse GROUP BY below is a permissive
+// dialect deviation: non-key columns read a representative row, and that row
+// is not an SQL semantic guarantee across plans. BOOL/numeric coercions have
+// the same status (see sql_expression_matrix_test.cpp).
+// Actual successful STRUCT/whole-row NULL inserts and nonempty field UPDATE
+// are covered by SqlAuditRegressionTest.StructInsertExpansionHasRealStoredRows.
+// The empty CTAS fixture st_t infers id as STRING; its INSERT errors below
+// check that specific mismatch, not STRUCT support.
 
 #include <gtest/gtest.h>
 
@@ -3268,10 +3276,6 @@ TEST_F(SqlStatementSweepTest, ErrorTable) {
       "INSERT INTO tiny SELECT a FROM g",
       "INSERT INTO t (a, c) VALUES STRUCT(11 AS a, 'kumquat' AS c)",
       "TRUNCATE TABLE no_such_table",
-      "INSERT INTO st_t VALUES (1, STRUCT(10 AS x, 'hello' AS y))",
-      "INSERT INTO st_t VALUES (2, NULL)",
-      "INSERT INTO st_t (id, s) VALUES (3, STRUCT(20 AS x, "
-      "'line\\nbreak\\ttab' AS y))",
       "SELECT * FROM missing_table",
       "SELECT missing_col FROM t",
       "SELECT a FROM t WHERE nope = 1",
@@ -3287,6 +3291,19 @@ TEST_F(SqlStatementSweepTest, ErrorTable) {
     SCOPED_TRACE(sql);
     EXPECT_THROW(
         { RunSql(engine_.get(), context_.get(), sql); }, std::exception);
+  }
+}
+
+TEST_F(SqlStatementSweepTest, EmptyCtasStructInsertFailsForInferredIdType) {
+  for (const char* sql :
+       {"INSERT INTO st_t VALUES (1, STRUCT(10 AS x, 'hello' AS y))",
+        "INSERT INTO st_t VALUES (2, NULL)",
+        "INSERT INTO st_t (id, s) VALUES (3, STRUCT(20 AS x, 'three' AS y))"}) {
+    const auto prepared = engine_->Prepare(*context_, sql);
+    ASSERT_FALSE(prepared.HasValue()) << sql;
+    EXPECT_NE(engine_->LastError().find("INSERT type mismatch for column id"),
+              std::string::npos)
+        << engine_->LastError();
   }
 }
 

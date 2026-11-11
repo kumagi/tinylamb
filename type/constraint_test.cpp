@@ -20,13 +20,34 @@
 #include <functional>
 #include <sstream>
 
+#include "common/decoder.hpp"
 #include "common/log_message.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
+#include "type/type.hpp"
 #include "type/value_type.hpp"
 #include "value.hpp"
 
 namespace tinylamb {
+
+TEST(ConstraintAuditTest, DecodersRejectUnknownDiscriminants) {
+  for (unsigned tag : {8U, 127U, 255U}) {
+    std::string bytes(1, static_cast<char>(tag));
+    bytes.push_back(static_cast<char>(ValueType::kNull));
+    EXPECT_FALSE(Decode<Constraint>(bytes).HasValue()) << tag;
+  }
+  for (unsigned tag :
+       {static_cast<unsigned>(TypeTag::kLambdaExp) + 1, 127U, 255U}) {
+    EXPECT_FALSE(
+        Decode<Type>(std::string(1, static_cast<char>(tag))).HasValue())
+        << tag;
+  }
+  for (unsigned tag = 0; tag <= static_cast<unsigned>(TypeTag::kLambdaExp);
+       ++tag) {
+    EXPECT_TRUE(Decode<Type>(std::string(1, static_cast<char>(tag))).HasValue())
+        << tag;
+  }
+}
 
 TEST(ConstraintTest, Constructor_WithDifferentTypes_InitializesCorrectly) {
   Constraint c(Constraint::kNothing);

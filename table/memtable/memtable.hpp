@@ -34,20 +34,22 @@
 
 namespace tinylamb {
 
-// Per-shard write lock: uncontended acquire is one RMW and the contention
-// path spins with a pause instead of taking pthread's futex detour -- shard
-// hold windows are single skiplist operations (nanoseconds), so a futex
-// round-trip on contention costs more than the critical section itself.
-// Fairness is weaker than std::mutex; drains are still serialized globally
-// by flush_mutex_ (a plain std::mutex), which bounds any writer's wait.
+// Per-shard spin lock: uncontended acquire is one RMW. Single-key operations
+// hold it briefly, but SnapshotShard also holds it while copying every entry
+// in that shard, including payload allocations. Contending writers spin for
+// that entire copy; neither fairness nor a bounded wait is guaranteed.
+// Flushes additionally serialize through flush_mutex_ (a std::mutex).
 class ShardLock {
  public:
   ShardLock() = default;
   ShardLock(const ShardLock&) = delete;
   ShardLock& operator=(const ShardLock&) = delete;
+  ShardLock(ShardLock&&) = delete;
+  ShardLock& operator=(ShardLock&&) = delete;
+  ~ShardLock() = default;
   void lock() {
     while (flag_.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__)
+#ifdef __x86_64__
       __builtin_ia32_pause();
 #endif
     }
@@ -185,7 +187,7 @@ class MemTable final {
   Shard& ShardFor(std::string_view key) {
     return shards_[static_cast<size_t>(ShardIndex(key))];
   }
-  const Shard& ShardFor(std::string_view key) const {
+  [[nodiscard]] const Shard& ShardFor(std::string_view key) const {
     return shards_[static_cast<size_t>(ShardIndex(key))];
   }
   static int ShardIndex(std::string_view key) {

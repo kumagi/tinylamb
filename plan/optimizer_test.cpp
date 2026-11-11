@@ -1462,10 +1462,89 @@ TEST_F(OptimizerTest, CompositeIndexEqualityPrefixWithOneSidedRange) {
   ASSERT_SUCCESS(context.PreCommit());
 }
 
-TEST_F(OptimizerTest, ResidualPredicateWrapsIndexScanInSelection) {
-  // Arrange: the predicate touches c1 (indexed) and c2 (only reachable through
-  // the composite index prefix), so the pushed predicate is not fully covered
-  // by any single index key and must be wrapped in a SelectionPlan.
+TEST_F(OptimizerTest, AuditRangeIndexAppliesResidualExactlyOnce) {
+  auto context = rs_->BeginContext();
+  cascades::RuleContext rule_context;
+  rule_context.transaction = &context;
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, context.GetTable("Sc1"));
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<TableStatistics>, statistics,
+                        context.GetStats("Sc1"));
+  rule_context.tables.emplace("Sc1", table);
+  rule_context.statistics.emplace("Sc1", statistics);
+  const cascades::ImplementationRule* scan_rule = nullptr;
+  for (const auto& rule : DefaultImplementationRules().Rules()) {
+    if (rule.Name() == "index_scan") {
+      scan_rule = &rule;
+    }
+  }
+  ASSERT_NE(scan_rule, nullptr);
+  auto bound = std::make_shared<ParameterSlot>(0, Value(3));
+  auto excluded = std::make_shared<ParameterSlot>(1, Value("c2-1"));
+  auto predicate = BinaryExpressionExp(
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c1")),
+                          BinaryOperation::kLessThan, bound),
+      BinaryOperation::kAnd,
+      BinaryExpressionExp(ColumnValueExp(ColumnName("Sc1", "c2")),
+                          BinaryOperation::kNotEquals, excluded));
+  cascades::Memo memo;
+  const auto group = memo.Build({"Sc1"}, {{predicate, {"Sc1"}}});
+  const auto alternatives =
+      scan_rule->Apply(memo, group, memo.Get(group).expressions.front(), {},
+                       cascades::PhysicalProperties{}, rule_context);
+  ASSERT_FALSE(alternatives.empty());
+  for (const auto& alternative : alternatives) {
+    bound->Bind(Value(3));
+    excluded->Bind(Value("c2-1"));
+    std::ostringstream dump;
+    auto executor = alternative.plan->EmitExecutor(context);
+    executor->Dump(dump, 0);
+    // The non-covering IndexScan emits one Selection for the residual.
+    // A second Selection would evaluate it again on every surviving row.
+    const size_t first = dump.str().find("Selection:");
+    if (first != std::string::npos) {
+      EXPECT_EQ(dump.str().find("Selection:", first + 1), std::string::npos)
+          << dump.str();
+    }
+    Row row;
+    std::vector<int64_t> keys;
+    while (executor->Next(&row, nullptr)) {
+      keys.push_back(row[0].value.int_value);
+    }
+    ASSERT_SUCCESS(executor->GetStatus());
+    std::ranges::sort(keys);
+    EXPECT_EQ(keys, (std::vector<int64_t>{0, 2}));
+    size_t cursor = 0;
+    std::vector<Expression> slots;
+    ASSERT_TRUE(alternative.plan->InstallParameterSlots(
+        {Value(3), Value("c2-1")}, &cursor, &slots));
+    ASSERT_EQ(slots.size(), 2U);
+    const std::vector<Value> rebound{Value(2), Value("c2-0")};
+    for (const Expression& slot : slots) {
+      auto parameter = std::dynamic_pointer_cast<ParameterSlot>(slot);
+      ASSERT_NE(parameter, nullptr);
+      parameter->Bind(rebound.at(parameter->Index()));
+    }
+    auto replay = alternative.plan->EmitExecutor(context);
+    std::ostringstream replay_dump;
+    replay->Dump(replay_dump, 0);
+    const size_t replay_first = replay_dump.str().find("Selection:");
+    if (replay_first != std::string::npos) {
+      EXPECT_EQ(replay_dump.str().find("Selection:", replay_first + 1),
+                std::string::npos)
+          << replay_dump.str();
+    }
+    keys.clear();
+    while (replay->Next(&row, nullptr)) {
+      keys.push_back(row[0].value.int_value);
+    }
+    ASSERT_SUCCESS(replay->GetStatus());
+    EXPECT_EQ(keys, (std::vector<int64_t>{1}));
+  }
+}
+
+TEST_F(OptimizerTest, ResidualPredicateSurvivesIndexAccessChoice) {
+  // The predicate touches columns across index keys. Whichever access path
+  // wins must still evaluate the complete residual.
   QueryData query{
       {"Sc1"},
       BinaryExpressionExp(
@@ -1485,10 +1564,6 @@ TEST_F(OptimizerTest, ResidualPredicateWrapsIndexScanInSelection) {
   const Plan& plan = plan_or.Value();
   std::ostringstream dump;
   dump << plan;
-  // The optimizer may choose IndexScan+Selection or BitmapAnd; both are valid.
-  EXPECT_TRUE(dump.str().find("Select:") != std::string::npos ||
-              dump.str().find("BitmapAnd") != std::string::npos)
-      << dump.str();
   Executor executor = plan->EmitExecutor(context);
   Row row;
   ASSERT_TRUE(executor->Next(&row, nullptr));

@@ -49,6 +49,7 @@
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/json_doc.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
@@ -790,8 +791,9 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
   return result;
 }
 
-std::string DecodeStringEscapesImpl(std::string_view value_view, bool is_bytes,
-                                    bool is_triple, char quote) {
+StatusOr<std::string> DecodeStringEscapesImpl(std::string_view value_view,
+                                              bool is_bytes, bool is_triple,
+                                              char quote) {
   const std::string value(value_view);
   std::string decoded;
   decoded.reserve(value.size());
@@ -864,60 +866,35 @@ std::string DecodeStringEscapesImpl(std::string_view value_view, bool is_bytes,
         } else {
           decoded.push_back(next);
         }
-      } else if (next == 'u') {
-        if (i + 4 < value.size()) {
-          std::string hex_str = value.substr(i + 1, 4);
-          try {
-            auto cp = static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
-            if (cp <= 0x7F) {
-              decoded.push_back(static_cast<char>(cp));
-            } else if (cp <= 0x7FF) {
-              decoded.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            } else if (cp <= 0xFFFF) {
-              decoded.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            } else {
-              decoded.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-            i += 4;
-          } catch (...) {
-            decoded.push_back(next);
-          }
-        } else {
-          decoded.push_back(next);
+      } else if (next == 'u' || next == 'U') {
+        const size_t digits = next == 'u' ? 4 : 8;
+        if (is_bytes || value.size() - i - 1 < digits) {
+          return AstError<std::string>("invalid Unicode escape");
         }
-      } else if (next == 'U') {
-        if (i + 8 < value.size()) {
-          std::string hex_str = value.substr(i + 1, 8);
-          try {
-            auto cp = static_cast<uint32_t>(std::stoul(hex_str, nullptr, 16));
-            if (cp <= 0x7F) {
-              decoded.push_back(static_cast<char>(cp));
-            } else if (cp <= 0x7FF) {
-              decoded.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            } else if (cp <= 0xFFFF) {
-              decoded.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            } else {
-              decoded.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-              decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-            i += 8;
-          } catch (...) {
-            decoded.push_back(next);
-          }
-        } else {
-          decoded.push_back(next);
+        const char* begin = value.data() + i + 1;
+        uint32_t cp = 0;
+        const auto [end, error] =
+            std::from_chars(begin, begin + digits, cp, 16);
+        if (error != std::errc{} || end != begin + digits || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+          return AstError<std::string>("invalid Unicode scalar in escape");
         }
+        if (cp <= 0x7F) {
+          decoded.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FF) {
+          decoded.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+          decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+          decoded.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+          decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+          decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+          decoded.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+          decoded.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+          decoded.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+          decoded.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        i += digits;
       } else {
         decoded.push_back(next);
       }
@@ -3100,6 +3077,15 @@ void RecoverNullTreatment(const GoogleSqlAstNode& call, bool* respect_nulls,
 StatusOr<NamedWindowParts> ParseWindowSpecification(
     const GoogleSqlAstNode& spec) {
   NamedWindowParts parts;
+  if (const auto* inherited = spec.Child("Identifier")) {
+    ASSIGN_OR_RETURN(std::string, name, Identifier(*inherited));
+    const auto found = t_named_windows.find(name);
+    if (found == t_named_windows.end()) {
+      return AstError<NamedWindowParts>("GoogleSQL AST: unknown window " +
+                                        name);
+    }
+    parts = found->second;
+  }
   if (const GoogleSqlAstNode* partition = spec.Child("PartitionBy")) {
     for (const auto& child : partition->children) {
       if (child->kind == "Location") {
@@ -3435,6 +3421,75 @@ bool SplitJsonObjectFields(
     flush();
   }
   return true;
+}
+
+// Infer a struct expansion from its actual constructor/projection. Unknown
+// shapes must remain an explicit diagnostic instead of inventing field names.
+std::optional<std::vector<std::string>> StructProjectionFields(
+    const Expression& expression, size_t depth = 0) {
+  if (!expression || depth >= 32) {
+    return std::nullopt;
+  }
+  std::vector<std::string> names;
+  if (expression->Type() == TypeTag::kConstantValue) {
+    const Value& value = expression->AsConstantValue().GetValue();
+    if (value.type != ValueType::kVarChar) {
+      return std::nullopt;
+    }
+    const auto object = json_doc::ParseDocument(value.AsStringView());
+    if (!object || object->type != json_doc::JVal::kObj) {
+      return std::nullopt;
+    }
+    for (const auto& field : object->obj) {
+      names.push_back(field.first);
+    }
+    return names;
+  }
+  if (expression->Type() == TypeTag::kFunctionCallExp) {
+    const auto& call = expression->AsFunctionCallExpression();
+    if (call.FuncName() != "__struct_json__") {
+      return std::nullopt;
+    }
+    const auto& arguments = call.Args();
+    for (size_t i = 0; i + 2 < arguments.size(); i += 3) {
+      if (arguments[i]->Type() != TypeTag::kConstantValue) {
+        return std::nullopt;
+      }
+      const Value& name = arguments[i]->AsConstantValue().GetValue();
+      if (name.type != ValueType::kVarChar) {
+        return std::nullopt;
+      }
+      names.emplace_back(name.AsStringView());
+    }
+    return names;
+  }
+  if (expression->Type() == TypeTag::kQueryExp) {
+    const auto& query = expression->AsQueryExpression().Query();
+    if (!query) {
+      return std::nullopt;
+    }
+    if (query->AsStruct()) {
+      for (const NamedExpression& field : query->SelectList()) {
+        if (!field.name.empty()) {
+          names.push_back(field.name);
+        } else if (field.expression &&
+                   field.expression->Type() == TypeTag::kColumnValue &&
+                   field.expression->AsColumnValue().GetColumnName().name !=
+                       "*") {
+          names.push_back(
+              field.expression->AsColumnValue().GetColumnName().name);
+        } else {
+          return std::nullopt;
+        }
+      }
+      return names;
+    }
+    if (query->SelectList().size() == 1) {
+      return StructProjectionFields(query->SelectList()[0].expression,
+                                    depth + 1);
+    }
+  }
+  return std::nullopt;
 }
 
 // An array of struct literals declares field names once (first element or
@@ -4436,7 +4491,14 @@ StatusOr<Expression> VisitExpression(
         }
       }
     }
-    ValidateStructCastCoercibility(node, safe_cast_target);
+    if (const Status status =
+            ValidateStructCastCoercibility(node, safe_cast_target);
+        status != Status::kSuccess) {
+      if (safe_cast_target) {
+        return ConstantValueExp(Value());
+      }
+      return status;
+    }
     ASSIGN_OR_RETURN(Expression, hv135524_0,
                      (VisitExpression(*node.children[0])));
     Expression child = std::move(hv135524_0);
@@ -6093,7 +6155,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         bool union_by_name = false;
         std::vector<SetOperationKind> per_pair;
         std::vector<SetOperationMatch> per_pair_match;
-        SetOperationKind head_kind = SetOperationKind::kUnionAll;
+        SetOperationKind head_kind = SetOperationKind::kUnion;
         const std::string set_detail = UpperCopy(set_op->detail);
         if (set_detail.find("INTERSECT") != std::string::npos) {
           head_kind = set_detail.find("ALL") != std::string::npos
@@ -6103,8 +6165,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
           head_kind = set_detail.find("ALL") != std::string::npos
                           ? SetOperationKind::kExceptAll
                           : SetOperationKind::kExcept;
-        } else if (set_detail.find("DISTINCT") != std::string::npos) {
-          head_kind = SetOperationKind::kUnion;
+        } else if (set_detail.find("ALL") != std::string::npos) {
+          head_kind = SetOperationKind::kUnionAll;
         }
         if (const GoogleSqlAstNode* metadata_list =
                 set_op->Child("SetOperationMetadataList")) {
@@ -6196,13 +6258,24 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
         // because the optimizer and SQL-template binder still consume them,
         // but flattening a grouped operand changes the meaning of e.g.
         // `(A UNION ALL B) INTERSECT C`.
-        bool has_grouped_operand =
-            first_operand->GetSetOperationTree() != nullptr;
+        const auto needs_scope = [](const SelectStatement& operand) {
+          return operand.GetSetOperationTree() != nullptr ||
+                 operand.HasLimit() || operand.Offset() != 0 ||
+                 !operand.OrderBy().empty() || operand.WithTies();
+        };
+        bool has_grouped_operand = needs_scope(*first_operand);
         for (const auto& branch : branches) {
-          if (branch != nullptr && branch->GetSetOperationTree() != nullptr) {
+          if (branch != nullptr && needs_scope(*branch)) {
             has_grouped_operand = true;
           }
         }
+        // The head's modifiers belong to the saved first operand. Only
+        // modifiers attached to this set-operation wrapper constrain the
+        // combined result.
+        first_stmt->SetLimit(std::nullopt);
+        first_stmt->SetOffset(0);
+        first_stmt->SetOrderBy({});
+        first_stmt->SetWithTies(false);
         auto tree = std::make_shared<SetOperationTree>();
         tree->first = first_operand;
         tree->branches = std::move(branches);
@@ -6238,8 +6311,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               auto folded_or = VisitExpression(*child);
               if (folded_or.HasValue()) {
                 Expression folded = folded_or.MoveValue();
-                if (folded && folded->Type() == TypeTag::kConstantValue) {
-                  const Value constant = folded->AsConstantValue().GetValue();
+                if (folded && folded->TouchedColumns().empty() &&
+                    SafeToReduceEvaluationCount(folded)) {
+                  ASSIGN_OR_RETURN(Value, constant,
+                                   folded->TryEvaluate(Row(), Schema()));
                   if (constant.type == ValueType::kInt64 &&
                       !constant.IsNull() && constant.value.int_value >= 0) {
                     first_stmt->SetLimit(
@@ -6262,6 +6337,22 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
                     ASSIGN_OR_RETURN(uint64_t, hv182030_0,
                                      (ParseUnsignedLiteral(*sub)));
                     first_stmt->SetOffset(hv182030_0);
+                  } else if (!IsAstTrivia(sub->kind)) {
+                    ASSIGN_OR_RETURN(Expression, folded, VisitExpression(*sub));
+                    if (!folded || !folded->TouchedColumns().empty() ||
+                        !SafeToReduceEvaluationCount(folded)) {
+                      return AstError<std::shared_ptr<SelectStatement>>(
+                          "OFFSET requires a constant integer");
+                    }
+                    ASSIGN_OR_RETURN(Value, constant,
+                                     folded->TryEvaluate(Row(), Schema()));
+                    if (constant.type != ValueType::kInt64 ||
+                        constant.IsNull() || constant.value.int_value < 0) {
+                      return AstError<std::shared_ptr<SelectStatement>>(
+                          "OFFSET requires a non-negative integer");
+                    }
+                    first_stmt->SetOffset(
+                        static_cast<size_t>(constant.value.int_value));
                   }
                 }
               }
@@ -6275,8 +6366,10 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
               if (auto folded_or = VisitExpression(*child);
                   folded_or.HasValue()) {
                 Expression folded = folded_or.MoveValue();
-                if (folded && folded->Type() == TypeTag::kConstantValue) {
-                  const Value constant = folded->AsConstantValue().GetValue();
+                if (folded && folded->TouchedColumns().empty() &&
+                    SafeToReduceEvaluationCount(folded)) {
+                  ASSIGN_OR_RETURN(Value, constant,
+                                   folded->TryEvaluate(Row(), Schema()));
                   if (constant.type == ValueType::kInt64 &&
                       !constant.IsNull() && constant.value.int_value >= 0) {
                     first_stmt->SetOffset(
@@ -6414,7 +6507,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
   // The WindowClause hangs off the Select node, next to the FromClause.
   struct NamedWindowsScope {
     std::unordered_map<std::string, NamedWindowParts> previous;
-    NamedWindowsScope() = default;
+    NamedWindowsScope() { previous.swap(t_named_windows); }
     ~NamedWindowsScope() { t_named_windows.swap(previous); }
     NamedWindowsScope(const NamedWindowsScope&) = delete;
     NamedWindowsScope& operator=(const NamedWindowsScope&) = delete;
@@ -6432,31 +6525,8 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       if (name_node == nullptr || spec == nullptr) {
         continue;
       }
-      NamedWindowParts parts;
-      // `v AS (w ORDER BY z)`: inherit from the referenced definition first,
-      // then overlay whatever this specification declares itself.
-      if (const GoogleSqlAstNode* base = spec->Child("Identifier")) {
-        ASSIGN_OR_RETURN(std::string, hv187788_0, (Identifier(*base)));
-        const auto found = t_named_windows.find(hv187788_0);
-        if (found != t_named_windows.end()) {
-          parts = found->second;
-        }
-      }
-      ASSIGN_OR_RETURN(NamedWindowParts, hv187953_0,
-                       (ParseWindowSpecification(*spec)));
-      NamedWindowParts own = std::move(hv187953_0);
-      if (!own.partition_by.empty()) {
-        parts.partition_by = std::move(own.partition_by);
-      }
-      if (!own.order_by.empty()) {
-        parts.order_by = std::move(own.order_by);
-      }
-      if (own.has_frame) {
-        parts.frame_unit = own.frame_unit;
-        parts.frame_start = own.frame_start;
-        parts.frame_end = own.frame_end;
-        parts.has_frame = true;
-      }
+      ASSIGN_OR_RETURN(NamedWindowParts, parts,
+                       ParseWindowSpecification(*spec));
       ASSIGN_OR_RETURN(std::string, hv188409_0, (Identifier(*name_node)));
       t_named_windows[std::move(hv188409_0)] = std::move(parts);
     }
@@ -6510,7 +6580,13 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       }
       ASSIGN_OR_RETURN(Expression, hv190303_0, (VisitExpression(*call)));
       Expression base = std::move(hv190303_0);
-      for (const char* field : {"aarr", "acount", "amin", "amax"}) {
+      const auto fields = StructProjectionFields(base);
+      if (!fields) {
+        return AstError<std::shared_ptr<SelectStatement>>(
+            "GoogleSQL AST: cannot infer fields for function result .* "
+            "expansion");
+      }
+      for (const std::string& field : *fields) {
         projections.emplace_back(
             field, FunctionCallExp(
                        "__get_field_safe",
@@ -6653,16 +6729,6 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     projections.front().expression = FunctionCallExp(
         "__value_table_value", {projections.front().expression});
   }
-  if (is_as_struct && projections.size() == 1 && projection_nodes.size() == 1 &&
-      projection_nodes.front()->kind == "DotStar") {
-    const Expression star = projections.front().expression;
-    const ColumnName& star_name = star->AsColumnValue().GetColumnName();
-    projections.clear();
-    for (const char* field : {"foo", "bar"}) {
-      projections.emplace_back(
-          field, ColumnValueExp(ColumnName(star_name.schema, field)));
-    }
-  }
   // `SELECT AS Proto p.*` selects the value-table message itself.  It is not
   // a proto field literally named `*`, so preserve the value expression and
   // avoid wrapping it in a constructor that would serialize `{*: 1}`.
@@ -6672,7 +6738,7 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       projections.front().expression->Type() == TypeTag::kColumnValue &&
       projections.front().expression->AsColumnValue().GetColumnName().name ==
           "*";
-  if (selects_value_table_star) {
+  if (selects_value_table_star && !is_as_struct) {
     projections.front().expression = FunctionCallExp(
         "__value_table_value", {projections.front().expression});
   }
@@ -7394,7 +7460,13 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       return AstError<std::shared_ptr<SelectStatement>>(
           "QUALIFY with GROUPING SETS / ROLLUP / CUBE is not supported");
     }
-    if (relational_detail::HasWindowFunctions(*statement)) {
+    const bool grouping_order = std::ranges::any_of(
+        statement->OrderBy(), [](const SelectStatement::OrderByTerm& term) {
+          return ContainsGroupingCall(term.expression);
+        });
+    if (relational_detail::HasWindowFunctions(*statement) || grouping_order) {
+      // Hidden ORDER BY GROUPING expressions need the same post-union
+      // projection as windows, even when absent from the visible select list.
       // Window calls observe the combined result of every grouping set
       // (rank() over a ROLLUP output spans detail and subtotal rows), so a
       // per-branch window would restart each rank per branch.  The window
@@ -7506,41 +7578,6 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       // and GROUPING() folds to constants inside it.
       RETURN_IF_FAIL(rewrite_branch(*statement, pending_grouping_sets.front()));
       return statement;
-    }
-
-    // Wrapper-level ORDER BY: with N branches the ORDER BY belongs to the
-    // concatenated result. Terms carrying GROUPING() cannot be evaluated
-    // against the union output, so bind them to the select-list ordinal they
-    // structurally match (the set-operation executor resolves ordinals to
-    // output columns).
-    if (std::ranges::any_of(statement->OrderBy(),
-                            [](const SelectStatement::OrderByTerm& term) {
-                              return ContainsGroupingCall(term.expression);
-                            })) {
-      std::vector<SelectStatement::OrderByTerm> wrapper_terms;
-      wrapper_terms.reserve(statement->OrderBy().size());
-      for (SelectStatement::OrderByTerm term : statement->OrderBy()) {
-        if (ContainsGroupingCall(term.expression)) {
-          bool matched = false;
-          const std::string text = term.expression->ToString();
-          for (size_t j = 0; j < statement->SelectList().size(); ++j) {
-            const NamedExpression& item = statement->SelectList()[j];
-            if (item.expression && item.expression->ToString() == text) {
-              term.expression =
-                  ConstantValueExp(Value(static_cast<int64_t>(j + 1)));
-              matched = true;
-              break;
-            }
-          }
-          if (!matched) {
-            return AstError<std::shared_ptr<SelectStatement>>(
-                "ORDER BY with GROUPING must reference a select-list "
-                "expression");
-          }
-        }
-        wrapper_terms.push_back(std::move(term));
-      }
-      statement->SetOrderBy(std::move(wrapper_terms));
     }
 
     // A snapshot, not a reference: the rewrite below mutates *statement while
@@ -7855,11 +7892,7 @@ StatusOr<Expression> BuildNewConstructor(const GoogleSqlAstNode& node) {
     }
   }
   if (fields != nullptr) {
-    Status st234842 =
-        RequireProtoFieldsPresent(message_name, *fields, assigned);
-    if (st234842 != Status::kSuccess) {
-      return st234842;
-    }
+    RETURN_IF_FAIL(RequireProtoFieldsPresent(message_name, *fields, assigned));
   }
   std::string type_name;
   if (const GoogleSqlAstNode* path_node = node.Child("PathExpression")) {
@@ -7943,7 +7976,7 @@ Status ValidateSelectAsProjections(
       return v.GetStatus();
     }
   }
-  RequireProtoFieldsPresent(message_name, *fields, assigned);
+  RETURN_IF_FAIL(RequireProtoFieldsPresent(message_name, *fields, assigned));
   for (size_t i = 0; i < named.size(); ++i) {
     const ProtoFieldSchema* field = FindProtoField(*fields, named[i].first);
     if (field == nullptr) {
@@ -7972,8 +8005,8 @@ Status ValidateSelectAsProjections(
 
 }  // namespace ast_visitor_detail
 
-std::string DecodeStringEscapes(std::string_view value, bool is_bytes,
-                                bool is_triple, char quote) {
+StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
+                                          bool is_triple, char quote) {
   return DecodeStringEscapesImpl(value, is_bytes, is_triple, quote);
 }
 
@@ -7983,6 +8016,20 @@ std::string NormalizeTimestampText(const std::string& text) {
 
 StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
     const GoogleSqlAstNode& root, std::string_view source) {
+  // Callers can supply hand-built ASTs, bypassing the dump parser. Check
+  // iteratively before hint validation, UDF analysis, cloning or binding.
+  std::vector<std::pair<const GoogleSqlAstNode*, size_t>> pending{{&root, 0}};
+  while (!pending.empty()) {
+    const auto [node, depth] = pending.back();
+    pending.pop_back();
+    if (depth >= kMaxGoogleSqlAstDepth) {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST depth limit exceeded");
+    }
+    for (const auto& child : node->children) {
+      pending.emplace_back(child.get(), depth + 1);
+    }
+  }
   std::string source_storage(source);
   // Only the outermost Visit installs the source; recursive Visit calls
   // pass an empty view and keep the outer scope alive.

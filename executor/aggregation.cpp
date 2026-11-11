@@ -21,23 +21,27 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
+#include "expression/binary_expression.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
@@ -124,8 +128,16 @@ AggregationExecutor::AggregationExecutor(
 }
 
 bool AggregationExecutor::Execute(Row* dst) {
-  if (executed_) {
+  if (executed_ || !GetStatus().ok()) {
     return false;
+  }
+  StatusOr<bool> affine = TryFoldAffineSums(dst);
+  if (!affine.HasValue()) {
+    return FailWith(affine.GetStatus());
+  }
+  if (affine.Value()) {
+    executed_ = true;
+    return true;
   }
   StatusOr<bool> folded = TryFoldScan(dst);
   if (!folded.HasValue()) {
@@ -198,6 +210,389 @@ bool AggregationExecutor::Execute(Row* dst) {
   return NextGeneric(dst);
 }
 
+namespace {
+struct AffineSumInput {
+  size_t column{0};
+  int64_t addend{0};
+};
+
+std::optional<std::vector<AffineSumInput>> ResolveAffineSums(
+    const Schema& schema, const std::vector<NamedExpression>& aggregates) {
+  std::vector<AffineSumInput> inputs;
+  bool transformed = false;
+  for (const auto& named : aggregates) {
+    const auto& agg = named.expression->AsAggregateExpression();
+    if (agg.GetType() != AggregationType::kSum || agg.Distinct() ||
+        agg.WhereFilter() || agg.NeedsGroupContext() || !agg.Child()) {
+      return std::nullopt;
+    }
+    Expression column = agg.Child();
+    int64_t addend = 0;
+    if (column->Type() == TypeTag::kBinaryExp) {
+      const auto& binary = column->AsBinaryExpression();
+      Expression constant = binary.Right();
+      column = binary.Left();
+      if (binary.Op() == BinaryOperation::kAdd &&
+          column->Type() == TypeTag::kConstantValue) {
+        std::swap(column, constant);
+      }
+      if ((binary.Op() != BinaryOperation::kAdd &&
+           binary.Op() != BinaryOperation::kSubtract) ||
+          constant->Type() != TypeTag::kConstantValue) {
+        return std::nullopt;
+      }
+      const Value value = constant->AsConstantValue().GetValue();
+      if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
+        return std::nullopt;
+      }
+      addend = value.AsInt64();
+      if (binary.Op() == BinaryOperation::kSubtract &&
+          __builtin_sub_overflow(int64_t{0}, addend, &addend)) {
+        return std::nullopt;
+      }
+      transformed = true;
+    }
+    if (column->Type() != TypeTag::kColumnValue) {
+      return std::nullopt;
+    }
+    const int offset = schema.Offset(column->AsColumnValue().GetColumnName());
+    if (offset < 0 ||
+        schema.GetColumn(static_cast<size_t>(offset)).Type() !=
+            ValueType::kInt64 ||
+        schema.GetColumn(static_cast<size_t>(offset)).IsUnsigned()) {
+      return std::nullopt;
+    }
+    inputs.push_back({.column = static_cast<size_t>(offset), .addend = addend});
+  }
+  return transformed ? std::optional(std::move(inputs)) : std::nullopt;
+}
+}  // namespace
+
+bool AggregationExecutor::CanFoldAffineSums(
+    const Schema& schema, const std::vector<NamedExpression>& aggregates) {
+  return ResolveAffineSums(schema, aggregates).has_value();
+}
+
+StatusOr<bool> AggregationExecutor::TryFoldAffineSums(Row* dst) {
+  const auto inputs = ResolveAffineSums(input_schema_, aggregates_);
+  const auto scan = std::dynamic_pointer_cast<ParallelScan>(child_);
+  if (!inputs || !scan || scan->GetLSTableStore() == nullptr) {
+    return false;
+  }
+  const auto& store = *scan->GetLSTableStore();
+  std::vector<slot_t> columns;
+  std::vector<size_t> input_columns;
+  for (const auto& input : *inputs) {
+    const slot_t column = scan->TableColumnSlot(input.column);
+    const auto found = std::ranges::find(columns, column);
+    const size_t index = static_cast<size_t>(found - columns.begin());
+    input_columns.push_back(index);
+    if (found == columns.end()) {
+      columns.push_back(column);
+    }
+  }
+  std::vector<int64_t> minima(columns.size(),
+                              std::numeric_limits<int64_t>::max());
+  std::vector<int64_t> maxima(columns.size(),
+                              std::numeric_limits<int64_t>::min());
+  for (const auto& block : store.blocks) {
+    for (size_t c = 0; c < columns.size(); ++c) {
+      if (columns[c] >= block.columns.size()) {
+        return false;
+      }
+      const auto& column = block.columns[columns[c]];
+      if (column.type != ValueType::kInt64 || column.is_unsigned ||
+          column.int_cells.size() < block.row_count) {
+        return false;
+      }
+      if (column.has_min_max) {
+        minima[c] = std::min(minima[c], column.min_int);
+        maxima[c] = std::max(maxima[c], column.max_int);
+      }
+    }
+  }
+  for (size_t i = 0; i < inputs->size(); ++i) {
+    const size_t c = input_columns[i];
+    if (minima[c] > maxima[c]) {
+      continue;
+    }
+    int64_t lo = 0, hi = 0;
+    if (__builtin_add_overflow(minima[c], (*inputs)[i].addend, &lo) ||
+        __builtin_add_overflow(maxima[c], (*inputs)[i].addend, &hi) ||
+        (lo < 0 && hi > 0)) {
+      // Keep row-level expression errors and checked SUM's intermediate
+      // overflow semantics. Monotone sums need only a final range check;
+      // cancellation or uncertain bounds retain the ordinary evaluator.
+      return false;
+    }
+  }
+  struct alignas(64) Partial {
+    __int128 sum{0};
+    uint64_t count{0};
+  };
+  const size_t workers = scan->WorkerCount();
+  std::vector<Partial> partials(workers * columns.size());
+  ASSIGN_OR_RETURN(bool, consumed,
+                   scan->TryFoldLSTableBlocks(
+                       workers,
+                       [&](size_t worker, const LSTablePageBlock& block,
+                           const uint32_t* rows, size_t count) -> Status {
+                         for (size_t c = 0; c < columns.size(); ++c) {
+                           auto& state =
+                               partials[(worker * columns.size()) + c];
+                           const auto& column = block.columns[columns[c]];
+                           for (size_t i = 0; i < count; ++i) {
+                             const size_t row = rows == nullptr ? i : rows[i];
+                             if (!column.IsNull(row)) {
+                               state.sum += column.int_cells[row];
+                               ++state.count;
+                             }
+                           }
+                         }
+                         return Status::kSuccess;
+                       }));
+  if (!consumed) {
+    return false;
+  }
+  std::vector<Partial> totals(columns.size());
+  for (size_t worker = 0; worker < workers; ++worker) {
+    for (size_t c = 0; c < columns.size(); ++c) {
+      totals[c].sum += partials[(worker * columns.size()) + c].sum;
+      totals[c].count += partials[(worker * columns.size()) + c].count;
+    }
+  }
+  std::vector<Value> output;
+  output.reserve(inputs->size());
+  for (size_t i = 0; i < inputs->size(); ++i) {
+    const auto& total = totals[input_columns[i]];
+    if (total.count == 0) {
+      output.emplace_back();
+      continue;
+    }
+    const __int128 sum =
+        total.sum + (static_cast<__int128>((*inputs)[i].addend) * total.count);
+    if (sum < std::numeric_limits<int64_t>::min() ||
+        sum > std::numeric_limits<int64_t>::max()) {
+      return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
+    }
+    output.emplace_back(static_cast<int64_t>(sum));
+  }
+  *dst = Row(std::move(output));
+  affine_folded_ = true;
+  return true;
+}
+
+StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
+  const auto scan = std::dynamic_pointer_cast<ParallelScan>(child_);
+  if (!scan || scan->GetLSTableStore() == nullptr || aggregates_.size() != 1) {
+    return false;
+  }
+  const auto& aggregate = aggregates_[0].expression->AsAggregateExpression();
+  if (aggregate.GetType() != AggregationType::kCount || !aggregate.Distinct() ||
+      aggregate.WhereFilter() || aggregate.NeedsGroupContext() ||
+      !aggregate.Child() ||
+      aggregate.Child()->Type() != TypeTag::kColumnValue) {
+    return false;
+  }
+  const int offset =
+      input_schema_.Offset(aggregate.Child()->AsColumnValue().GetColumnName());
+  if (offset < 0) {
+    return false;
+  }
+  const auto type = input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
+  if (type != ValueType::kVarChar && type != ValueType::kInt64 &&
+      type != ValueType::kDate) {
+    return false;
+  }
+  const auto& store = *scan->GetLSTableStore();
+  const slot_t column = scan->TableColumnSlot(static_cast<size_t>(offset));
+  const auto& dictionary = store.dictionaries[column];
+  const size_t domain = type == ValueType::kVarChar
+                            ? dictionary.entries.size()
+                            : dictionary.int_entries.size();
+  const bool coded = dictionary.wide_code_bytes != 0 && domain != 0;
+  const bool code_equality =
+      coded && (type != ValueType::kVarChar || dictionary.bytewise_equality);
+  size_t bytes = 0;
+  if (__builtin_mul_overflow(
+          code_equality ? domain : static_cast<size_t>(store.total_rows),
+          size_t{96}, &bytes) ||
+      !QueryMemoryBudget::Global().CanReserve(bytes)) {
+    return false;
+  }
+  QueryMemoryCharge charge(bytes);
+  // The immutable store owns all byte views until the fold completes. First
+  // deduplicate physical strings cheaply, then canonicalize each unique value
+  // once so INTERVAL-equivalent renderings retain Value's equality contract.
+  std::unordered_set<std::string_view> strings;
+  std::vector<uint8_t> seen_codes;
+  if (coded) {
+    seen_codes.resize(domain);
+  }
+  relational_detail::FlatIntSet integers;
+  if (type != ValueType::kVarChar && seen_codes.empty()) {
+    integers.Reserve(static_cast<size_t>(store.total_rows));
+  }
+  bool consumed = false;
+  if (!seen_codes.empty()) {
+    ASSIGN_OR_RETURN(
+        bool, whole_store_consumed,
+        scan->TryFoldLSTableStore([&](const LSTableStore&) {
+          // Codes are contiguous across physical pages. The
+          // reserved NULL code is outside the dictionary domain;
+          // no row materialization is needed.
+          if (dictionary.packed_code_bits != 0) {
+            const size_t rows = dictionary.DictionaryCodeCount();
+            for (size_t row = 0; row < rows; ++row) {
+              const uint32_t code = dictionary.DictionaryCodeAt(row);
+              if (code < domain) {
+                seen_codes[code] = 1;
+              }
+            }
+          } else {
+            const auto mark = [&]<typename Code>() {
+              const auto* codes = dictionary.wide_codes.data();
+              const size_t rows = dictionary.wide_codes.size() / sizeof(Code);
+              for (size_t row = 0; row < rows; ++row) {
+                Code code = 0;
+                std::memcpy(&code, codes + (row * sizeof(Code)), sizeof(Code));
+                if (code < domain) {
+                  seen_codes[code] = 1;
+                }
+              }
+            };
+            if (dictionary.wide_code_bytes == 2) {
+              mark.template operator()<uint16_t>();
+            } else {
+              mark.template operator()<uint32_t>();
+            }
+          }
+          return Status::kSuccess;
+        }));
+    consumed = whole_store_consumed;
+  }
+  if (!consumed) {
+    ASSIGN_OR_RETURN(
+        bool, blocks_consumed,
+        scan->TryFoldLSTableBlocks(1, [&](size_t, const LSTablePageBlock& block,
+                                          const uint32_t* rows, size_t count) {
+          const auto& data = block.columns[column];
+          for (size_t i = 0; i < count; ++i) {
+            const size_t row = rows == nullptr ? i : rows[i];
+            if (data.IsNull(row)) {
+              continue;
+            }
+            if (!seen_codes.empty()) {
+              seen_codes[data.DictionaryCodeAt(row)] = 1;
+            } else if (type == ValueType::kVarChar) {
+              strings.insert(data.VarcharAt(row));
+            } else {
+              integers.Insert(data.int_cells[row]);
+            }
+          }
+          return Status::kSuccess;
+        }));
+    consumed = blocks_consumed;
+  }
+  if (!consumed) {
+    return false;
+  }
+  size_t count = integers.Size();
+  if (!seen_codes.empty() &&
+      (type != ValueType::kVarChar || dictionary.bytewise_equality)) {
+    count = static_cast<size_t>(std::ranges::count(seen_codes, uint8_t{1}));
+  } else if (type == ValueType::kVarChar) {
+    for (size_t code = 0; code < seen_codes.size(); ++code) {
+      if (seen_codes[code] != 0) {
+        strings.insert(dictionary.entries[code]);
+      }
+    }
+    std::unordered_set<Value> canonical;
+    canonical.reserve(strings.size());
+    for (const auto value : strings) {
+      canonical.emplace(std::string(value));
+    }
+    count = canonical.size();
+  }
+  if (count > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return StatusError(StatusCode::kIsInfinity, "COUNT DISTINCT overflow");
+  }
+  *dst = Row({Value(static_cast<int64_t>(count))});
+  return true;
+}
+
+StatusOr<bool> AggregationExecutor::TryFoldDateExtrema(Row* dst) {
+  const auto scan = std::dynamic_pointer_cast<ParallelScan>(child_);
+  if (!scan || scan->GetLSTableStore() == nullptr || aggregates_.empty()) {
+    return false;
+  }
+  std::vector<slot_t> columns;
+  std::vector<bool> minimum;
+  for (const auto& named : aggregates_) {
+    const auto& aggregate = named.expression->AsAggregateExpression();
+    if ((aggregate.GetType() != AggregationType::kMin &&
+         aggregate.GetType() != AggregationType::kMax) ||
+        aggregate.Distinct() || aggregate.WhereFilter() ||
+        aggregate.NeedsGroupContext() || !aggregate.Child() ||
+        aggregate.Child()->Type() != TypeTag::kColumnValue) {
+      return false;
+    }
+    const int offset = input_schema_.Offset(
+        aggregate.Child()->AsColumnValue().GetColumnName());
+    if (offset < 0 ||
+        input_schema_.GetColumn(static_cast<size_t>(offset)).Type() !=
+            ValueType::kDate) {
+      return false;
+    }
+    columns.push_back(scan->TableColumnSlot(static_cast<size_t>(offset)));
+    minimum.push_back(aggregate.GetType() == AggregationType::kMin);
+  }
+  const size_t workers = scan->WorkerCount();
+  std::vector<std::vector<Value>> values(workers,
+                                         std::vector<Value>(columns.size()));
+  const auto update = [&](Value& value, int64_t day, bool min) {
+    if (value.IsNull() ||
+        (min ? day < value.value.int_value : day > value.value.int_value)) {
+      value = Value(day);
+      value.type = ValueType::kDate;
+    }
+  };
+  ASSIGN_OR_RETURN(
+      bool, consumed,
+      scan->TryFoldLSTableBlocks(
+          workers, [&](size_t worker, const LSTablePageBlock& block,
+                       const uint32_t* rows, size_t count) {
+            for (size_t c = 0; c < columns.size(); ++c) {
+              const auto& data = block.columns[columns[c]];
+              auto& value = values[worker][c];
+              if (rows == nullptr && data.has_min_max) {
+                update(value, minimum[c] ? data.min_int : data.max_int,
+                       minimum[c]);
+              } else {
+                for (size_t i = 0; i < count; ++i) {
+                  const size_t row = rows == nullptr ? i : rows[i];
+                  if (!data.IsNull(row)) {
+                    update(value, data.int_cells[row], minimum[c]);
+                  }
+                }
+              }
+            }
+            return Status::kSuccess;
+          }));
+  if (!consumed) {
+    return false;
+  }
+  for (size_t w = 1; w < workers; ++w) {
+    for (size_t c = 0; c < columns.size(); ++c) {
+      if (!values[w][c].IsNull()) {
+        update(values[0][c], values[w][c].value.int_value, minimum[c]);
+      }
+    }
+  }
+  *dst = Row(std::move(values[0]));
+  return true;
+}
+
 StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
   auto scan = std::dynamic_pointer_cast<ParallelScan>(child_);
   auto serial = std::dynamic_pointer_cast<FullScan>(child_);
@@ -209,6 +604,17 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
       const int offset =
           input_schema_.Offset(agg.Child()->AsColumnValue().GetColumnName());
       if (offset >= 0) {
+        const auto* encoded_store = scan->GetLSTableStore();
+        if (encoded_store != nullptr &&
+            encoded_store
+                    ->dictionaries[scan->TableColumnSlot(
+                        static_cast<size_t>(offset))]
+                    .wide_code_bytes != 0) {
+          ASSIGN_OR_RETURN(bool, coded_distinct, TryFoldDistinctColumn(dst));
+          if (coded_distinct) {
+            return true;
+          }
+        }
         const auto& col_def =
             input_schema_.GetColumn(static_cast<size_t>(offset));
         if ((col_def.Type() == ValueType::kInt64 ||
@@ -318,6 +724,14 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
         }
       }
     }
+  }
+  ASSIGN_OR_RETURN(bool, distinct_folded, TryFoldDistinctColumn(dst));
+  if (distinct_folded) {
+    return true;
+  }
+  ASSIGN_OR_RETURN(bool, date_folded, TryFoldDateExtrema(dst));
+  if (date_folded) {
+    return true;
   }
   if (!all_typed_ || (!scan && !serial)) {
     return false;
@@ -668,10 +1082,17 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               (*results)[i] = Value(acc.MoveValue());
             }
           } else {
-            (*results)[i] = Value(
-                ((*results)[i].IsNull() ? 0.0
-                                        : (*results)[i].value.double_value) +
-                (static_cast<double>(rows) * constant.value.double_value));
+            const double scaled =
+                static_cast<double>(rows) * constant.value.double_value;
+            const double prior =
+                (*results)[i].IsNull() ? 0.0 : (*results)[i].value.double_value;
+            const double next = prior + scaled;
+            if (std::isfinite(constant.value.double_value) &&
+                std::isfinite(prior) && std::isinf(next)) {
+              return FailWith(StatusError(StatusCode::kIsInfinity,
+                                          "SUM overflow: result is infinite"));
+            }
+            (*results)[i] = Value(next);
           }
           break;
         case AggregationType::kAvg:
@@ -716,15 +1137,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
       }
       case AggregationType::kSum: {
         if (is_int) {
-          std::string column_name =
-              agg.Child()->AsColumnValue().GetColumnName().name;
-          std::ranges::transform(column_name, column_name.begin(),
-                                 [](unsigned char c) {
-                                   return static_cast<char>(std::tolower(c));
-                                 });
-          const bool is_uint64 =
-              column.IsUnsigned() ||
-              column_name.find("uint64") != std::string::npos;
+          const bool is_uint64 = column.IsUnsigned();
           if (is_uint64) {
             uint64_t batch_sum = 0;
             bool any = false;
@@ -1046,6 +1459,7 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
     if (AccumulateTypedBatch(&results, &counts, input_batch_)) {
       continue;
     }
+    if (GetStatus() != Status::kSuccess) return false;
     bool all_done = true;
     for (size_t k = 0; k < aggregates_.size(); ++k) {
       if (accumulators[k] == nullptr || !accumulators[k]->IsDone()) {

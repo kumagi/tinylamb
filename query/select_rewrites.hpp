@@ -23,6 +23,11 @@ namespace tinylamb {
 // defining query at the reference site when sound.
 bool InlineSingleUseCtes(SelectStatement* outer);
 
+// Inline single-use grouped bodies after pushing safe consumer restrictions,
+// so their owned results flow directly into the join without a shared copy.
+bool InlineSingleUseGroupedCtes(SelectStatement* outer,
+                                TransactionContext& context);
+
 // Shared-CTE restriction pushdown: pushes the disjunction of all consumer
 // restrictions into a multi-referenced CTE body when selective.
 size_t PushSharedCteRestrictions(SelectStatement* outer,

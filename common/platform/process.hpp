@@ -60,7 +60,7 @@ int RunProcess(
 int OpenWriteFailingDescriptor();
 
 // errno reported by writes to OpenWriteFailingDescriptor().
-#if defined(__linux__)
+#ifdef __linux__
 inline constexpr int kWriteFailingErrno = ENOSPC;
 #else
 inline constexpr int kWriteFailingErrno = EBADF;

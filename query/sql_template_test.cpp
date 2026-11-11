@@ -58,6 +58,21 @@ TEST(SqlTemplateTest, FingerprintsIgnoreLiterals) {
   EXPECT_EQ(right.parameters[1], Value(12));
 }
 
+TEST(SqlTemplateTest, StatementRuntimeIdChangesOnCopyButNotSelfAssignment) {
+  SelectStatement source;
+  SelectStatement copy(source);
+  EXPECT_NE(copy.RuntimeId(), source.RuntimeId());
+  const uint64_t first_copy_id = copy.RuntimeId();
+  copy = source;
+  EXPECT_NE(copy.RuntimeId(), first_copy_id);
+  EXPECT_NE(copy.RuntimeId(), source.RuntimeId());
+
+  const uint64_t assigned_id = copy.RuntimeId();
+  const SelectStatement* alias = &copy;
+  copy = *alias;
+  EXPECT_EQ(copy.RuntimeId(), assigned_id);
+}
+
 TEST(SqlTemplateTest, LeavesLimitAndStringsTyped) {
   const SqlTemplate extracted = ExtractSqlTemplate(
       "SELECT c_id FROM customer WHERE c_last = 'Last#4' ORDER BY c_first "

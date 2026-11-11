@@ -51,6 +51,16 @@ TEST(QueryMemoryTest,
   EXPECT_GE(EstimateValueBytes(Value(1)), 0U);
 }
 
+TEST(QueryMemoryTest, RowEstimateIncludesNestedArraysAndScalarPayloads) {
+  const Value nested = Value::Array(
+      {Value(1), Value(), Value::Array({Value("abc")}, "STRING")}, "JSON");
+  const size_t nested_bytes = 32 + 4 + 40 + 32 + 32 + 6 + 35;
+  EXPECT_EQ(EstimateValueBytes(nested), nested_bytes);
+  const Row row({Value(), Value(1), Value(2.0), Value::DateFromDays(3),
+                 Value("hello"), nested});
+  EXPECT_EQ(EstimateRowBytes(row), 64 + 32 + 40 + 40 + 40 + 37 + nested_bytes);
+}
+
 TEST(QueryMemoryTest, Global_MultipleCalls_ReturnsSameInstance) {
   QueryMemoryBudget& a = QueryMemoryBudget::Global();
   QueryMemoryBudget& b = QueryMemoryBudget::Global();

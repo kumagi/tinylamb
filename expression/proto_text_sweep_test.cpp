@@ -264,6 +264,26 @@ TEST(ProtoTextSetFieldTest, UpdatesCreatesAndClears) {
   EXPECT_FALSE(noop.has_value());
 }
 
+TEST(ProtoTextSetFieldTest, AuditMalformedPayloadNeverBecomesReplacement) {
+  for (const std::string& text :
+       {std::string("garbage$$$"), std::string("a: 1 garbage$$$"),
+        std::string("m { garbage$$$ }")}) {
+    for (const Value& replacement : {Value(9), Value()}) {
+      auto result = TryProtoTextSetField(
+          text,
+          text.starts_with("m") ? std::vector<std::string>{"m", "a"}
+                                : std::vector<std::string>{"a"},
+          replacement, "");
+      EXPECT_FALSE(result.HasValue()) << text;
+      EXPECT_EQ(result.GetStatus(), Status::kInvalidArgument);
+    }
+  }
+  auto empty = TryProtoTextSetField("", {"a"}, Value(9), "");
+  ASSERT_TRUE(empty.HasValue());
+  ASSERT_TRUE(empty.Value().has_value());
+  EXPECT_EQ(empty.Value().value(), "a: 9");
+}
+
 TEST(ProtoTextSetFieldTest, OuterBracesAreOptional) {
   auto updated = TryProtoTextSetField("{ a: 1 }", {"a"}, Value(int64_t{4}), "")
                      .MoveValue();

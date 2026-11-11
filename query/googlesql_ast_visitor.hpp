@@ -28,8 +28,8 @@ std::string NormalizeTimestampText(const std::string& text);
 // to the first parse, so both consumers decode through this one function
 // (a `\'` swallowed only by the parser made cached replays bind the raw
 // text and shift every following token).
-std::string DecodeStringEscapes(std::string_view value, bool is_bytes,
-                                bool is_triple, char quote);
+StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
+                                          bool is_triple, char quote);
 
 // Session-scoped (thread-local) view registry: name -> defining query AST.
 // CREATE VIEW registers here immediately; SqlEngine re-registers persisted

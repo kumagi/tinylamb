@@ -9,6 +9,7 @@
 #include "common/set_operation.hpp"
 #include "plan/plan.hpp"
 #include "plan/sort_plan.hpp"
+#include "table/table_statistics.hpp"
 #include "type/schema.hpp"
 
 namespace tinylamb {
@@ -18,13 +19,15 @@ class SetOperationPlan final : public PlanBase {
   SetOperationPlan(std::vector<Plan> children, SetOperationKind operation)
       : children_(std::move(children)),
         operation_(operation),
-        schema_(GenerateSchema()) {}
+        schema_(GenerateSchema()),
+        stats_(TableStatistics(schema_).ScaleCardinality(EmitRowCount())) {}
   SetOperationPlan(std::vector<Plan> children, SetOperationKind operation,
                    std::vector<SortKey> order_keys)
       : children_(std::move(children)),
         operation_(operation),
         order_keys_(std::move(order_keys)),
-        schema_(GenerateSchema()) {}
+        schema_(GenerateSchema()),
+        stats_(TableStatistics(schema_).ScaleCardinality(EmitRowCount())) {}
 
   Executor EmitExecutor(TransactionContext& ctx) const override;
   [[nodiscard]] bool ContainsParameterSlots() const override {
@@ -40,9 +43,7 @@ class SetOperationPlan final : public PlanBase {
     });
   }
   [[nodiscard]] const Table* ScanSource() const override { return nullptr; }
-  [[nodiscard]] const TableStatistics& GetStats() const override {
-    return children_.front()->GetStats();
-  }
+  [[nodiscard]] const TableStatistics& GetStats() const override;
   [[nodiscard]] const Schema& GetSchema() const override { return schema_; }
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
@@ -73,6 +74,7 @@ class SetOperationPlan final : public PlanBase {
   SetOperationKind operation_{SetOperationKind::kUnionAll};
   std::vector<SortKey> order_keys_;
   Schema schema_;
+  TableStatistics stats_;
 };
 
 using UnionAllPlan = SetOperationPlan;

@@ -22,11 +22,20 @@ temporary file + `fsync` + `rename` with the following layout:
 
 | Section | Fields | Purpose |
 |---------|--------|---------|
-| Header | `magic` (`kFuzzyCheckpointMagic` = `TLSMCKP1`), `version` (= 2), `replay_start_lsn`, `max_committed_txn_id` | Snapshot identity, WAL replay anchor LSN, and highest committed transaction ID |
+| Header | `magic` (`kFuzzyCheckpointMagic` = `TLSMCKP1`), `version` (= 2), `replay_start_lsn`, `max_committed_txn_id` | Snapshot identity, WAL replay anchor LSN, and transaction-ID high-water mark (may include aborted transactions; used to seed the next ID) |
 | Pages | `max_pid`, `free_pages`, `num_pages` followed by `(page_id, prev_pid, next_pid, link_lsn, slots, slot_lsns)` | Committed state of all live `RowPage` blocks |
 | Trees | `num_trees` followed by `(tree_id, compacted_entries...)` | Compacted committed state of all LSM-Tree indexes and catalog trees |
-| Footer | `crc32c` | Whole-payload CRC-32C integrity check |
+| Footer | `crc32c` | Whole-payload standard CRC-32C (`Crc32C`: initial and final XOR `0xffffffff`) |
 
 On startup, `RecoveryManager::RecoverFrom` loads `<dbname>.db` via
 `PageManager::LoadFuzzyCheckpoint` and replays WAL segments starting from
 `min(begin_lsn, min_dpt_rec_lsn, min_att_first_lsn)`.
+
+## PAX chunk checksums
+
+PAX chunks (`table/pax_chunk/pax_chunk_scan.cpp`) use a separate footer with
+`crc_data` and `crc_footer`. These use `Crc32cOf`, whose result is the raw
+Castagnoli register (initial `0xffffffff`, **no final XOR**), the complement
+of standard CRC-32C. Do not use the snapshot's `Crc32C` convention for these
+fields. `Crc32CTest.AuditPaxChecksumUsesRawRegisterConvention` pins the
+known vector and incremental update behavior.

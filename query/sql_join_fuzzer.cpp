@@ -994,9 +994,9 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       int64_t u_hi;
     };
     const std::array<JoinSelProbe, 3> kJoinSelProbes = {{
-        {"f.u >= 4000 AND f.u < 4180", 4000, 4180},
-        {"f.u < 5000", 0, 5000},
-        {"f.u >= 300", 300, large_fn},
+        {.where_sql = "f.u >= 4000 AND f.u < 4180", .u_lo = 4000, .u_hi = 4180},
+        {.where_sql = "f.u < 5000", .u_lo = 0, .u_hi = 5000},
+        {.where_sql = "f.u >= 300", .u_lo = 300, .u_hi = large_fn},
     }};
     for (const JoinSelProbe& sp : kJoinSelProbes) {
       const std::string sql =
@@ -1018,6 +1018,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         }
       }
       std::vector<std::string> expected;
+      expected.reserve(groups.size());
       for (const auto& [tag, agg] : groups) {
         expected.push_back(FmtStr(tag) + "," + Fmt(agg.first) + "," +
                            Fmt(agg.second) + ",");
@@ -1026,8 +1027,11 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       std::string error;
       auto got = RunQuery(db, ctx, sql, &error);
       if (!got.has_value()) {
-        report += "[JOIN MISMATCH] selectivity probe failed: " + sql +
-                  " :: " + error + "\n";
+        report.append("[JOIN MISMATCH] selectivity probe failed: ")
+            .append(sql)
+            .append(" :: ")
+            .append(error)
+            .append("\n");
         return report;
       }
       std::vector<std::string> actual;
@@ -1162,6 +1166,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
     }
     std::vector<std::string> indf_expected;
+    indf_expected.reserve(indf_groups.size());
     for (const auto& [k, ag] : indf_groups) {
       indf_expected.push_back(Fmt(k) + "," + Fmt(ag.cnt) + "," +
                               Fmt(ag.cnt_tag) + "," +
@@ -1191,6 +1196,145 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
           report += "    " + r + "\n";
         }
         return report;
+      }
+    }
+
+    // Equi-LEFT JOIN with mixed COUNT(non-null left unique col) and
+    // COUNT(nullable right col) (targeting 2026-11-10 audit High #3).
+    const std::string left_cnt_sql =
+        "SELECT f.k, COUNT(*), COUNT(f.u), COUNT(d.tag), SUM(f.a) FROM fact f "
+        "LEFT JOIN dim d ON f.k = d.k GROUP BY f.k;";
+    struct LeftCntAgg {
+      int64_t cnt{0};
+      int64_t cnt_u{0};
+      int64_t cnt_tag{0};
+      int64_t sum_a{0};
+      bool any_a{false};
+    };
+    std::map<int64_t, LeftCntAgg> left_cnt_groups;
+    for (const FactRow& f : facts) {
+      auto range = (f.k == kNullRepr)
+                       ? std::make_pair(dims_by_k.end(), dims_by_k.end())
+                       : dims_by_k.equal_range(f.k);
+      if (range.first == range.second) {
+        LeftCntAgg& ag = left_cnt_groups[f.k];
+        ++ag.cnt;
+        ++ag.cnt_u;
+        if (f.a != kNullRepr) {
+          ag.sum_a += f.a;
+          ag.any_a = true;
+        }
+      } else {
+        for (auto it = range.first; it != range.second; ++it) {
+          LeftCntAgg& ag = left_cnt_groups[f.k];
+          ++ag.cnt;
+          ++ag.cnt_u;
+          ++ag.cnt_tag;
+          if (f.a != kNullRepr) {
+            ag.sum_a += f.a;
+            ag.any_a = true;
+          }
+        }
+      }
+    }
+    std::vector<std::string> left_cnt_expected;
+    left_cnt_expected.reserve(left_cnt_groups.size());
+    for (const auto& [k, ag] : left_cnt_groups) {
+      left_cnt_expected.push_back(Fmt(k) + "," + Fmt(ag.cnt) + "," +
+                                  Fmt(ag.cnt_u) + "," + Fmt(ag.cnt_tag) + "," +
+                                  (ag.any_a ? Fmt(ag.sum_a) : "NULL") + ",");
+    }
+    std::sort(left_cnt_expected.begin(), left_cnt_expected.end());
+    if (auto got = RunQuery(db, ctx, left_cnt_sql, &error); got.has_value()) {
+      std::vector<std::string> actual;
+      for (const EngineRow& r : *got) {
+        std::string row;
+        for (const Value& v : r.cells) {
+          row += FormatEngineValue(v) + ",";
+        }
+        actual.push_back(row);
+      }
+      std::sort(actual.begin(), actual.end());
+      t.queries.push_back({left_cnt_sql, left_cnt_expected});
+      if (actual != left_cnt_expected) {
+        report += "[JOIN MISMATCH] " + left_cnt_sql + "\n";
+        report +=
+            "  expected (" + std::to_string(left_cnt_expected.size()) + "):\n";
+        for (const std::string& r : left_cnt_expected) {
+          report += "    " + r + "\n";
+        }
+        report += "  actual (" + std::to_string(actual.size()) + "):\n";
+        for (const std::string& r : actual) {
+          report += "    " + r + "\n";
+        }
+        return report;
+      }
+    }
+
+    // Fused grouped-join 2^53 + 1 HAVING precision boundary, signed INT64
+    // `uint64_val` alias, and case-insensitive HAVING alias probe
+    // (targeting 2026-11-10 audit High #11, Medium #28, Medium #59).
+    if (!large) {
+      const std::string big_having_sql =
+          "SELECT d.tag, SUM(f.a) AS uint64_val, "
+          "SUM(CASE WHEN f.u >= 0 THEN 9007199254740993 ELSE 0 END) AS big_sum "
+          "FROM fact f JOIN dim d ON f.k = d.k GROUP BY d.tag "
+          "HAVING Big_Sum > 9007199254740992;";
+      struct BigAgg {
+        int64_t cnt{0};
+        int64_t sum_a{0};
+        bool any_a{false};
+      };
+      std::map<int, BigAgg> big_groups;
+      for (const FactRow& f : facts) {
+        if (f.k == kNullRepr) {
+          continue;
+        }
+        auto range = dims_by_k.equal_range(f.k);
+        for (auto it = range.first; it != range.second; ++it) {
+          BigAgg& ag = big_groups[it->second->tag];
+          ++ag.cnt;
+          if (f.a != kNullRepr) {
+            ag.sum_a += f.a;
+            ag.any_a = true;
+          }
+        }
+      }
+      std::vector<std::string> big_expected;
+      for (const auto& [tag, ag] : big_groups) {
+        const int64_t big_sum = ag.cnt * 9007199254740993LL;
+        if (big_sum > 9007199254740992LL) {
+          big_expected.push_back(FmtStr(tag) + "," +
+                                 (ag.any_a ? Fmt(ag.sum_a) : "NULL") + "," +
+                                 Fmt(big_sum) + ",");
+        }
+      }
+      std::sort(big_expected.begin(), big_expected.end());
+      if (auto got = RunQuery(db, ctx, big_having_sql, &error);
+          got.has_value()) {
+        std::vector<std::string> actual;
+        for (const EngineRow& r : *got) {
+          std::string row;
+          for (const Value& v : r.cells) {
+            row += FormatEngineValue(v) + ",";
+          }
+          actual.push_back(row);
+        }
+        std::sort(actual.begin(), actual.end());
+        t.queries.push_back({big_having_sql, big_expected});
+        if (actual != big_expected) {
+          report += "[JOIN MISMATCH] " + big_having_sql + "\n";
+          report +=
+              "  expected (" + std::to_string(big_expected.size()) + "):\n";
+          for (const std::string& r : big_expected) {
+            report += "    " + r + "\n";
+          }
+          report += "  actual (" + std::to_string(actual.size()) + "):\n";
+          for (const std::string& r : actual) {
+            report += "    " + r + "\n";
+          }
+          return report;
+        }
       }
     }
   }

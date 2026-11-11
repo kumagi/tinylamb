@@ -47,6 +47,37 @@ TEST(ColumnTest, SerializeDeserialize_ForDiverseVariants_PreservesState) {
                                   Constraint(Constraint::kUnique)));
 }
 
+TEST(ColumnTest, AuditIntervalMetadataSurvivesSerialization) {
+  Column column("duration", ValueType::kVarChar);
+  column.SetInterval(true);
+  SerializeDeserializeTest(column);
+}
+
+TEST(ColumnTest, AuditIntegerWidthsSurviveSerializationAndEnforceBounds) {
+  for (uint8_t bits : {8, 16, 32, 64}) {
+    for (bool is_unsigned : {false, true}) {
+      Column column("plain_name", ValueType::kInt64,
+                    Constraint(Constraint::kNotNull));
+      column.SetIntegerBits(bits);
+      column.SetUnsigned(is_unsigned);
+      SerializeDeserializeTest(column);
+      EXPECT_TRUE(column.IntegerValueFits(Value(0)));
+      EXPECT_EQ(column.IntegerValueFits(Value(-1)), !is_unsigned);
+      if (bits < 64) {
+        const int64_t boundary = int64_t{1} << (bits - (is_unsigned ? 0 : 1));
+        EXPECT_TRUE(column.IntegerValueFits(Value(boundary - 1)));
+        EXPECT_FALSE(column.IntegerValueFits(Value(boundary)));
+        if (!is_unsigned) {
+          EXPECT_TRUE(column.IntegerValueFits(Value(-boundary)));
+          EXPECT_FALSE(column.IntegerValueFits(Value(-boundary - 1)));
+        }
+      }
+    }
+  }
+  Column ordinary("joint8count", ValueType::kInt64);
+  EXPECT_TRUE(ordinary.IntegerValueFits(Value(1000000)));
+}
+
 TEST(ColumnTest, Dump_ToLogStream_SucceedsWithoutCrash) {
   Column c1(ColumnName("test_column"), ValueType::kInt64);
   Column c2(ColumnName("next_column"), ValueType::kDouble,

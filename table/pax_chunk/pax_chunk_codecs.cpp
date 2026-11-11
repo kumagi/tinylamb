@@ -5105,14 +5105,14 @@ void DecodeBp128Block(const Bp128Region& region, uint32_t block,
 #endif
   const auto minimum = static_cast<uint64_t>(decoded.minimum);
   if (decoded.width > 32) {
-    // The WIDE frames (33..63 bits): the field spans two 64-bit words at an
+    // The WIDE frames (33..64 bits): the field spans two 64-bit words at an
     // arbitrary bit offset, so the extraction is one 8-byte load plus a
     // shift -- the byte-at-a-time walk this replaces issued one checked
     // byte load per BIT. The field's tail (when it crosses the word
     // boundary) comes from the 9th byte, combined through a 128-bit shift
     // so no shift-by-64 edge exists.
     const uint32_t w = decoded.width;
-    const uint64_t mask = (UINT64_C(1) << w) - 1U;
+    const uint64_t mask = w == 64 ? UINT64_MAX : (UINT64_C(1) << w) - 1U;
     while (row < decoded.rows) {
       const uint64_t bit_off = static_cast<uint64_t>(row) * w;
       const uint64_t byte_off = bit_off >> 3;

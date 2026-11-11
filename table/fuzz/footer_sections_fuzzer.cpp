@@ -309,7 +309,7 @@ PaxChunk BuildCompactChunk(uint8_t shape) {
       rows[static_cast<size_t>(i)][2] = Value();
     }
   }
-  cache[idx] = PaxChunk::BuildFromSortedRun(MakeRun(rows, sc), sc);
+  cache[idx] = PaxChunk::BuildFromSortedRun(MakeRun(rows, sc), sc).MoveValue();
   built[idx] = true;
   return cache[idx];
 }

@@ -145,9 +145,9 @@ def layer_of(rel_path):
     return best  # None => outside the DAG (e.g. cli_main_test.cpp)
 
 
-def source_files():
-    for path in sorted(ROOT.rglob("*")):
-        rel = path.relative_to(ROOT).as_posix()
+def source_files(root):
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
         if not path.is_file() or path.suffix not in (".hpp", ".cpp"):
             continue
         if rel.startswith(IGNORED_PREFIXES) or "/.git/" in rel:
@@ -180,7 +180,7 @@ def main():
                   if line.strip() and not line.lstrip().startswith("#")]
 
     violations = []
-    for src in source_files():
+    for src in source_files(Path(args.root)):
         src_layer = layer_of(src)
         if src_layer is None or src_layer == "top":
             continue

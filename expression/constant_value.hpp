@@ -55,9 +55,9 @@ class ConstantValue : public ExpressionBase {
   }
 
   [[nodiscard]] std::string ToString() const override {
-    return val_.AsString();
+    return val_.IsInterval() ? "INTERVAL " + val_.AsString() : val_.AsString();
   }
-  void Dump(std::ostream& o) const override { o << val_; }
+  void Dump(std::ostream& o) const override { o << ToString(); }
 
  protected:
   // ParameterSlot rebinds the sniffed literal in place. The stored value is

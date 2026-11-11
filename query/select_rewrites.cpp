@@ -24,6 +24,7 @@
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -408,9 +409,102 @@ bool InlineSingleUseCtes(SelectStatement* outer) {
         continue;
       }
       CteReferenceSite site = FindSingleCteReference(outer, name);
-      if (site.source == nullptr || site.source->query != nullptr ||
-          site.in_map_body) {
+      if (site.source == nullptr || site.source->query != nullptr) {
         continue;
+      }
+      if (site.in_map_body) {
+        if (site.source->sample || site.source->is_lateral ||
+            (!site.source->alias.empty() && site.source->alias != name &&
+             StatementQualifiesName(*outer, name))) {
+          continue;
+        }
+        // A single-use projection/UNION ALL feeding another CTE need not be
+        // materialized separately. Clone the consumer before changing its
+        // source: parsed trees and WITH bodies can be shared by cached plans.
+        const auto plain_projection = [&](const auto& self,
+                                          const SelectStatement& part,
+                                          size_t depth) -> bool {
+          if (depth > 16 || part.Sources().size() != 1 ||
+              !part.WithQueries().empty() || !part.GroupBy().empty() ||
+              part.IsGroupAll() || part.WhereClause() || part.Having() ||
+              part.Qualify() || part.Distinct() || !part.DistinctOn().empty() ||
+              part.HasLimit() || part.Offset() != 0 ||
+              !part.OrderBy().empty() ||
+              (part.GetSetOperationTree() &&
+               part.GetSetOperationTree()->grouped)) {
+            return false;
+          }
+          const auto& input = part.Sources().front();
+          if (input.unnest || input.sample || input.is_lateral ||
+              input.from_nested_join || input.join_condition ||
+              !input.using_columns.empty() ||
+              (!input.table.empty() &&
+               outer->WithQueries().contains(input.table))) {
+            return false;
+          }
+          const std::string owner =
+              input.alias.empty() ? input.table : input.alias;
+          for (const auto& item : part.SelectList()) {
+            if (!item.expression ||
+                item.expression->Type() != TypeTag::kColumnValue) {
+              return false;
+            }
+            const auto& column =
+                item.expression->AsColumnValue().GetColumnName();
+            if (column.name == "*" ||
+                (!column.schema.empty() && column.schema != owner)) {
+              return false;
+            }
+          }
+          if (input.query && !self(self, *input.query, depth + 1)) {
+            return false;
+          }
+          for (size_t b = 0; b < part.UnionAll().size(); ++b) {
+            const auto match = part.MatchFor(b);
+            if ((b < part.SetOperationKinds().size() &&
+                 part.SetOperationKinds()[b] != SetOperationKind::kUnionAll) ||
+                match.by_name || match.corresponding ||
+                !match.columns.empty() ||
+                !self(self, *part.UnionAll()[b], depth + 1)) {
+              return false;
+            }
+          }
+          return true;
+        };
+        if (!plain_projection(plain_projection, *body_it->second, 0)) {
+          continue;
+        }
+        std::string consumer_name;
+        std::shared_ptr<SelectStatement> replacement;
+        for (const auto& [entry, consumer] : outer->WithQueries()) {
+          if (outer->IsRecursiveWith(entry) ||
+              !consumer->WithQueries().empty()) {
+            continue;
+          }
+          for (size_t i = 0; i < consumer->Sources().size(); ++i) {
+            if (&consumer->Sources()[i] != site.source) {
+              continue;
+            }
+            replacement = std::make_shared<SelectStatement>(*consumer);
+            auto sources = consumer->Sources();
+            sources[i].query = body_it->second;
+            sources[i].alias =
+                sources[i].alias.empty() ? name : sources[i].alias;
+            sources[i].table.clear();
+            replacement->SetSources(std::move(sources));
+            consumer_name = entry;
+            break;
+          }
+        }
+        if (!replacement) {
+          continue;
+        }
+        outer->RemoveWithQuery(consumer_name);
+        outer->AddWithQuery(consumer_name, std::move(replacement));
+        outer->RemoveWithQuery(name);
+        changed = true;
+        inlined = true;
+        break;
       }
       // Slice boundary: inline only single-table row-preserving bodies —
       // exactly what the M5 flattener can consume next. Anything richer
@@ -464,6 +558,105 @@ bool InlineSingleUseCtes(SelectStatement* outer) {
     }
   }
   return changed;
+}
+
+bool InlineSingleUseGroupedCtes(SelectStatement* outer,
+                                TransactionContext& context) {
+  if (outer == nullptr || outer->WithQueries().empty()) {
+    return false;
+  }
+  std::unordered_set<std::string> names;
+  for (const auto& [name, body] : outer->WithQueries()) {
+    (void)body;
+    names.insert(name);
+  }
+  std::unordered_map<std::string, size_t> counts;
+  CountCteReferencesInStatement(*outer, names, &counts);
+  std::vector<std::string> inlined;
+  const auto rewrite_sources = [&](const auto& self, SelectStatement& consumer,
+                                   size_t depth) -> bool {
+    if (depth > 16) {
+      return false;
+    }
+    auto sources = consumer.Sources();
+    bool changed = false;
+    for (auto& source : sources) {
+      if (source.query && source.query->WithQueries().empty() &&
+          !source.is_lateral && !source.sample && !source.from_nested_join) {
+        auto nested = std::make_shared<SelectStatement>(*source.query);
+        if (self(self, *nested, depth + 1)) {
+          source.query = std::move(nested);
+          changed = true;
+        }
+        continue;
+      }
+      const auto found = outer->WithQueries().find(source.table);
+      if (found == outer->WithQueries().end() || counts[source.table] != 1 ||
+          outer->IsRecursiveWith(source.table) || source.query ||
+          source.unnest || source.sample || source.is_lateral ||
+          source.from_nested_join) {
+        continue;
+      }
+      const auto& body = *found->second;
+      if (body.GroupBy().empty() || body.IsGroupAll() || body.Having() ||
+          body.HasLimit() || body.Offset() != 0 || body.Distinct() ||
+          body.HasDistinctOn() || body.Qualify() ||
+          !body.WithQueries().empty() || !body.UnionAll().empty() ||
+          body.GetSetOperationTree() ||
+          relational_detail::StatementContainsVolatileFunction(body) ||
+          ContainsQueryExpression(body.WhereClause()) ||
+          std::ranges::any_of(body.GroupBy(), ContainsQueryExpression) ||
+          std::ranges::any_of(body.OrderBy(),
+                              [](const auto& term) {
+                                return ContainsQueryExpression(term.expression);
+                              }) ||
+          std::ranges::any_of(body.SelectList(),
+                              [](const auto& item) {
+                                return ContainsQueryExpression(item.expression);
+                              }) ||
+          std::ranges::any_of(body.Sources(), [&](const auto& inner) {
+            return inner.query || inner.unnest || inner.sample ||
+                   inner.is_lateral || inner.from_nested_join ||
+                   names.contains(inner.table) ||
+                   ContainsQueryExpression(inner.join_condition);
+          })) {
+        continue;
+      }
+      const std::string name = source.table;
+      if (!source.alias.empty() && source.alias != name &&
+          StatementQualifiesName(*outer, name)) {
+        continue;
+      }
+      // Compute all restrictions against the complete WITH scope. In
+      // particular, LEFT JOIN key constants flow toward the nullable input,
+      // never backwards. A window must see the complete partition. Nested
+      // consumers also keep their predicates outside this boundary; only the
+      // existing top-level grouped-key proof is allowed to restrict the input
+      // here.
+      auto restricted =
+          depth == 0 && !relational_detail::HasWindowFunctions(body)
+              ? relational_detail::PushSingleUseCtePredicates(context, *outer,
+                                                              name)
+              : nullptr;
+      source.query = restricted ? std::move(restricted)
+                                : std::make_shared<SelectStatement>(body);
+      source.alias = source.alias.empty() ? name : source.alias;
+      source.table.clear();
+      inlined.push_back(name);
+      changed = true;
+    }
+    if (changed) {
+      consumer.SetSources(std::move(sources));
+    }
+    return changed;
+  };
+  if (!rewrite_sources(rewrite_sources, *outer, 0)) {
+    return false;
+  }
+  for (const auto& name : inlined) {
+    outer->RemoveWithQuery(name);
+  }
+  return true;
 }
 
 namespace {
@@ -2713,6 +2906,14 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
   // it must ride the ON condition (see the header comment). Chains beyond
   // two relations only qualify when every join is inner.
   const bool two_sources = outer->Sources().size() == 2;
+  if (!two_sources &&
+      std::ranges::any_of(outer->Sources(), [](const SelectSource& source) {
+        return source.join_type == JoinType::kLeft ||
+               source.join_type == JoinType::kRight ||
+               source.join_type == JoinType::kFull;
+      })) {
+    return false;
+  }
   bool inner_where_to_on = false;
   if (index > 0) {
     if (derived.join_type == JoinType::kLeft) {
@@ -3805,7 +4006,21 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
     // Single-use bodies additionally get outer filters pushed in (TODO.md
     // item 2a): the copy is narrowed, never the mapped body, and the outer
     // filter stays as the residual.
-    auto body_copy = std::make_unique<SelectStatement>(*body_it->second);
+    auto restricted =
+        relational_detail::PushSingleUseCtePredicates(ctx, *outer, name);
+    if (!restricted) {
+      restricted =
+          relational_detail::PushSharedGroupedCtePredicates(ctx, *outer, name);
+    }
+    if (!restricted) {
+      restricted =
+          relational_detail::PushGroupedCteJoinDomains(ctx, *outer, name, {});
+    }
+    if (!restricted) {
+      restricted = relational_detail::GroupPresenceOnlyCte(*outer, name);
+    }
+    auto body_copy = std::make_unique<SelectStatement>(
+        restricted ? *restricted : *body_it->second);
     {
       // Every top-level reference site shares the cell, so the narrowing
       // must be a weakening over all of them (TODO.md item 2a).

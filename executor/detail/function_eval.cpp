@@ -55,12 +55,12 @@
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
 #include "common/platform/time_format.hpp"
-#include "common/platform/time_zone.hpp"
 #include "common/regex_guard.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/detail/timestamp_trunc_kernel.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -103,6 +103,53 @@ struct CivilTime {
   int64_t subsecond_nanos{0};
 };
 
+bool ParseFixedCivilTime(std::string_view s, CivilTime* ct) noexcept {
+  // Fixed-width civil text is common in stored columns. Recognize only a
+  // canonical subset here; the general parser below retains all other input
+  // forms, fractional seconds and leap-second normalization.
+  const bool date_only = s.size() == 10;
+  const bool fixed_datetime =
+      s.size() == 19 || (s.size() == 22 && s.substr(19) == "+00");
+  if ((date_only || fixed_datetime) && s[4] == '-' && s[7] == '-' &&
+      (date_only ||
+       ((s[10] == ' ' || s[10] == 'T') && s[13] == ':' && s[16] == ':'))) {
+    const auto digits = [&](size_t offset, size_t count) {
+      int value = 0;
+      for (size_t i = offset; i < offset + count; ++i) {
+        if (s[i] < '0' || s[i] > '9') {
+          return -1;
+        }
+        value = (value * 10) + (s[i] - '0');
+      }
+      return value;
+    };
+    const int year = digits(0, 4);
+    const int month = digits(5, 2);
+    const int day = digits(8, 2);
+    const int hour = date_only ? 0 : digits(11, 2);
+    const int minute = date_only ? 0 : digits(14, 2);
+    const int second = date_only ? 0 : digits(17, 2);
+    if (year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= 31 &&
+        hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 && second >= 0 &&
+        second <= 59 &&
+        std::chrono::year_month_day{
+            std::chrono::year{year},
+            std::chrono::month{static_cast<unsigned>(month)},
+            std::chrono::day{static_cast<unsigned>(day)}}
+            .ok()) {
+      *ct = {.year = year,
+             .month = month,
+             .day = day,
+             .hour = hour,
+             .minute = minute,
+             .second = second,
+             .subsecond_nanos = 0};
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   while (!s.empty() &&
          (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
@@ -114,6 +161,9 @@ bool ParseCivilTime(std::string_view s, CivilTime* ct) {
   }
   if (s.empty()) {
     return false;
+  }
+  if (ParseFixedCivilTime(s, ct)) {
+    return true;
   }
   int Y = 0, M = 0, D = 0;
   if (s.size() == 10 &&
@@ -262,93 +312,14 @@ CivilTime ShiftCivilTimeHours(const CivilTime& ct, int offset_hours) {
   return res;
 }
 
-int ParseTimeZoneOffset(std::string_view tz_str, const CivilTime* ct = nullptr,
-                        int default_offset = 0) {
-  if (tz_str.empty()) {
-    return default_offset;
-  }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
-      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
-      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
-    return 0;
-  }
-  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
-      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
-    char sign = tz_str[3];
-    int h = 0, m = 0;
-    std::string rem(tz_str.substr(4));
-    if (rem.find(':') != std::string::npos) {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%d:%d", &h, &m);
-    } else if (rem.size() == 4) {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%2d%2d", &h, &m);
-    } else {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%d", &h);
-    }
-    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
-  }
-  if (tz_str[0] == '+' || tz_str[0] == '-') {
-    char sign = tz_str[0];
-    int h = 0, m = 0;
-    std::string rem(tz_str.substr(1));
-    if (rem.find(':') != std::string::npos) {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%d:%d", &h, &m);
-    } else if (rem.size() == 4) {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%2d%2d", &h, &m);
-    } else {
-      sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback is intended.
-          rem.c_str(), "%d", &h);
-    }
-    return (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
-  }
-  std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") {
-    zone_name = "Pacific/Chatham";
-  }
-  int y = (ct != nullptr) ? ct->year : 2000;
-  int mon = (ct != nullptr) ? ct->month : 1;
-  int d = (ct != nullptr) ? ct->day : 1;
-  int h = (ct != nullptr) ? ct->hour : 0;
-  int min = (ct != nullptr) ? ct->minute : 0;
-  int s = (ct != nullptr) ? ct->second : 0;
-  y = std::max(y, 1970);
-  const std::optional<int> offset = platform::TimeZoneOffsetAtLocalTime(
-      zone_name, y, static_cast<unsigned>(mon), static_cast<unsigned>(d), h,
-      min, s);
-  return offset.value_or(default_offset);
-}
-
-// CURRENT_DATE('foo') and friends must reject unknown zone names the way
-// GoogleSQL does instead of silently falling back to the session default.
-Status TryValidateTimeZoneName(std::string_view tz_str) {
-  if (tz_str.empty()) {
-    return StatusError(StatusCode::kInvalidArgument, "invalid timezone: empty");
-  }
-  if (tz_str == "UTC" || tz_str == "GMT" || tz_str == "utc" ||
-      tz_str == "gmt" || tz_str == "Z" || tz_str == "z" ||
-      tz_str == "Etc/Greenwich" || tz_str == "Etc/UTC" || tz_str == "Etc/GMT") {
-    return Status::kSuccess;
-  }
-  if (tz_str.starts_with("UTC+") || tz_str.starts_with("UTC-") ||
-      tz_str.starts_with("GMT+") || tz_str.starts_with("GMT-")) {
-    return Status::kSuccess;
-  }
-  if (tz_str[0] == '+' || tz_str[0] == '-') {
-    return Status::kSuccess;
-  }
-  std::string zone_name(tz_str);
-  if (zone_name == "NZ-CHAT") {
-    zone_name = "Pacific/Chatham";
-  }
-  if (!platform::IsKnownTimeZone(zone_name)) {
-    return StatusError(StatusCode::kInvalidArgument,
-                       "invalid timezone: " + std::string(tz_str));
-  }
-  return Status::kSuccess;
+StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
+                                  const CivilTime* ct = nullptr) {
+  return TryTimeZoneOffsetAtLocalTime(
+      zone, ct != nullptr ? std::max(ct->year, 1970) : 2000,
+      ct != nullptr ? static_cast<unsigned>(ct->month) : 1,
+      ct != nullptr ? static_cast<unsigned>(ct->day) : 1,
+      ct != nullptr ? ct->hour : 0, ct != nullptr ? ct->minute : 0,
+      ct != nullptr ? ct->second : 0);
 }
 
 std::string FormatTimeZoneOffset(int tz_offset_sec) {
@@ -394,8 +365,9 @@ __int128 CivilTimeToNanos(const CivilTime& ct) {
       std::chrono::month{static_cast<unsigned>(ct.month)},
       std::chrono::day{static_cast<unsigned>(ct.day)}};
   int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
-  __int128 secs = (static_cast<__int128>(days) * 86400) + (ct.hour * 3600LL) +
-                  (ct.minute * 60LL) + ct.second;
+  __int128 secs = (static_cast<__int128>(days) * 86400) +
+                  (static_cast<__int128>(ct.hour) * 3600) +
+                  (static_cast<__int128>(ct.minute) * 60) + ct.second;
   return (secs * 1000000000) + ct.subsecond_nanos;
 }
 
@@ -426,6 +398,47 @@ CivilTime NanosToCivilTime(__int128 nanos) {
 
 std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true,
                             bool is_date_only = false) {
+  // Valid civil fields have fixed decimal widths. Avoid printf's format
+  // interpreter without changing its padding or the 3/6/9-digit fractions.
+  if (ct.year >= 1 && ct.year <= 9999 && ct.month >= 1 && ct.month <= 12 &&
+      ct.day >= 1 && ct.day <= 31 && ct.hour >= 0 && ct.hour <= 23 &&
+      ct.minute >= 0 && ct.minute <= 59 && ct.second >= 0 && ct.second <= 60 &&
+      ct.subsecond_nanos >= 0 && ct.subsecond_nanos <= 999999999) {
+    std::array<char, 29> text{};
+    const auto pair = [&](size_t offset, int value) {
+      text[offset] = static_cast<char>('0' + (value / 10));
+      text[offset + 1] = static_cast<char>('0' + (value % 10));
+    };
+    pair(0, ct.year / 100);
+    pair(2, ct.year % 100);
+    text[4] = '-';
+    pair(5, ct.month);
+    text[7] = '-';
+    pair(8, ct.day);
+    if (is_date_only) {
+      return {text.data(), 10};
+    }
+    text[10] = ' ';
+    pair(11, ct.hour);
+    text[13] = ':';
+    pair(14, ct.minute);
+    text[16] = ':';
+    pair(17, ct.second);
+    size_t size = 19;
+    if (include_subsecond && ct.subsecond_nanos != 0) {
+      text[size++] = '.';
+      const size_t digits = ct.subsecond_nanos % 1000000 == 0 ? 3
+                            : ct.subsecond_nanos % 1000 == 0  ? 6
+                                                              : 9;
+      int64_t divisor = 100000000;
+      for (size_t i = 0; i < digits; ++i) {
+        text[size++] =
+            static_cast<char>('0' + ((ct.subsecond_nanos / divisor) % 10));
+        divisor /= 10;
+      }
+    }
+    return {text.data(), size};
+  }
   std::array<char, 64> buf{};
   if (is_date_only) {
     (void)snprintf(buf.data(), buf.size(), "%04d-%02d-%02d", ct.year, ct.month,
@@ -502,6 +515,116 @@ StatusOr<double> ParseDoubleStrict(const std::string& text) {
 
 }  // namespace
 
+std::optional<UtcTimestampTruncUnit> CompileUtcTimestampTrunc(
+    const FunctionCallExpression& call) {
+  if (!IdentifierEquals(call.FuncName(), "timestamp_trunc") ||
+      (call.Args().size() != 2 && call.Args().size() != 3) ||
+      GetDefaultTimeZone() != "UTC" || !call.Args()[0] ||
+      call.Args()[0]->Type() != TypeTag::kColumnValue || !call.Args()[1]) {
+    return std::nullopt;
+  }
+  if (call.Args().size() == 3) {
+    const auto& zone = call.Args()[2];
+    if (!zone || zone->Type() != TypeTag::kConstantValue) {
+      return std::nullopt;
+    }
+    const Value& value = zone->AsConstantValue().GetValue();
+    if (value.type != ValueType::kVarChar || value.IsInterval() ||
+        value.AsStringView() != "UTC") {
+      return std::nullopt;
+    }
+  }
+  const auto& argument = call.Args()[1];
+  std::string_view unit;
+  if (argument->Type() == TypeTag::kColumnValue) {
+    unit = argument->AsColumnValue().GetColumnName().name;
+  } else if (argument->Type() == TypeTag::kConstantValue) {
+    const Value& value = argument->AsConstantValue().GetValue();
+    if (value.type != ValueType::kVarChar || value.IsInterval()) {
+      return std::nullopt;
+    }
+    unit = value.AsStringView();
+  } else {
+    return std::nullopt;
+  }
+  if (IdentifierEquals(unit, "second") || IdentifierEquals(unit, "seconds")) {
+    return UtcTimestampTruncUnit::kSecond;
+  }
+  if (IdentifierEquals(unit, "minute") || IdentifierEquals(unit, "minutes")) {
+    return UtcTimestampTruncUnit::kMinute;
+  }
+  if (IdentifierEquals(unit, "hour") || IdentifierEquals(unit, "hours")) {
+    return UtcTimestampTruncUnit::kHour;
+  }
+  if (IdentifierEquals(unit, "day") || IdentifierEquals(unit, "days")) {
+    return UtcTimestampTruncUnit::kDay;
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> TryUtcTimestampTruncKey(
+    std::string_view text, UtcTimestampTruncUnit unit) noexcept {
+  if (text.size() != 19 && (text.size() != 22 || text.substr(19) != "+00")) {
+    return std::nullopt;
+  }
+  CivilTime civil;
+  if (!ParseFixedCivilTime(text, &civil)) {
+    return std::nullopt;
+  }
+  switch (unit) {
+    case UtcTimestampTruncUnit::kDay:
+      civil.hour = 0;
+      [[fallthrough]];
+    case UtcTimestampTruncUnit::kHour:
+      civil.minute = 0;
+      [[fallthrough]];
+    case UtcTimestampTruncUnit::kMinute:
+      civil.second = 0;
+      [[fallthrough]];
+    case UtcTimestampTruncUnit::kSecond:
+      break;
+    default:
+      return std::nullopt;
+  }
+  int64_t key = civil.year;
+  for (const int part :
+       {civil.month, civil.day, civil.hour, civil.minute, civil.second}) {
+    key = (key * 100) + part;
+  }
+  return key;
+}
+
+StatusOr<Value> FormatUtcTimestampTruncKey(int64_t key) try {
+  if (key < 10101000000LL || key > 99991231235959LL) {
+    return Status::kInvalidArgument;
+  }
+  CivilTime civil;
+  civil.second = static_cast<int>(key % 100);
+  key /= 100;
+  civil.minute = static_cast<int>(key % 100);
+  key /= 100;
+  civil.hour = static_cast<int>(key % 100);
+  key /= 100;
+  civil.day = static_cast<int>(key % 100);
+  key /= 100;
+  civil.month = static_cast<int>(key % 100);
+  civil.year = static_cast<int>(key / 100);
+  if (civil.hour > 23 || civil.minute > 59 || civil.second > 59 ||
+      !std::chrono::year_month_day{
+          std::chrono::year{civil.year},
+          std::chrono::month{static_cast<unsigned>(civil.month)},
+          std::chrono::day{static_cast<unsigned>(civil.day)}}
+           .ok()) {
+    return Status::kInvalidArgument;
+  }
+  return Value(FormatCivilTime(civil) + "+00");
+} catch (const std::exception& error) {
+  return StatusError(StatusCode::kRuntimeError, error.what());
+} catch (...) {
+  return StatusError(StatusCode::kRuntimeError,
+                     "timestamp key formatting failed");
+}
+
 StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const FunctionCallExpression& call, const Scope& scope,
     const AggregateResultMap* aggregates, TransactionContext& context,
@@ -516,22 +639,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // binds the stored copy directly: the per-row re-copy + re-lowercase ran
   // inside the residual-predicate loop of every AST-evaluated scan filter.
   const std::string& name = call.FuncName();
-  // IF evaluates only the chosen branch: the untaken branch must not raise
-  // (e.g. guarded out-of-range array accesses under IF guards).
-  if (name == "if") {
-    if (call.Args().size() != 3) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "IF requires 3 arguments");
-    }
-    ASSIGN_OR_RETURN(
-        Value, condition,
-        (TryEvaluate(call.Args()[0], scope, aggregates, context, ctes)));
-
-    const size_t taken = condition.Truthy() ? 1 : 2;
-    return TryEvaluate(call.Args()[taken], scope, aggregates, context, ctes);
-  }
+  // Compare with known-length literals without out-of-line string/char*
+  // comparisons, which otherwise dominate scalar calls in dictionary folds.
+  const std::string_view name_view(name);
   // COALESCE stops at the first non-NULL argument.
-  if (name == "coalesce") {
+  if (name_view == "coalesce" || name_view == "ifnull") {
+    if (name_view == "ifnull" && call.Args().size() != 2) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "IFNULL requires 2 arguments");
+    }
     for (const Expression& argument : call.Args()) {
       ASSIGN_OR_RETURN(
           Value, value,
@@ -546,7 +662,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // and SELECT AS <proto> route non-constant repeated-field arrays and enum
   // values through them so invalid data fails execution instead of being
   // silently dropped from the text-format representation.
-  if (name == "$proto_repeated_guard") {
+  if (name_view == "$proto_repeated_guard") {
     const auto& args = call.Args();
     if (args.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -569,9 +685,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return TryEvaluate(args[1], scope, aggregates, context, ctes);
   }
-  if (name == "$proto_field_guard" || name == "$proto_enum_guard") {
+  if (name_view == "$proto_field_guard" || name_view == "$proto_enum_guard") {
     const auto& args = call.Args();
-    const size_t expected = name == "$proto_field_guard" ? 3 : 2;
+    const size_t expected = name_view == "$proto_field_guard" ? 3 : 2;
     if (args.size() != expected) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " argument count mismatch");
@@ -601,9 +717,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return value;
   }
-  if (name == "date_add" || name == "date_sub" || name == "datetime_add" ||
-      name == "datetime_sub" || name == "timestamp_add" ||
-      name == "timestamp_sub") {
+  if (name_view == "date_add" || name_view == "date_sub" ||
+      name_view == "datetime_add" || name_view == "datetime_sub" ||
+      name_view == "timestamp_add" || name_view == "timestamp_sub") {
     if (call.Args().size() != 2 ||
         call.Args()[1]->Type() != TypeTag::kIntervalExp) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -629,26 +745,35 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     bool is_timestamp = (base_s.find('+') != std::string::npos ||
                          base_s.find('Z') != std::string::npos ||
                          base_s.find('z') != std::string::npos);
+    int timestamp_offset_sec = 0;
     if (is_timestamp) {
-      int tz_offset_sec =
-          ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+        timestamp_offset_sec = parsed_offset;
+      }
       __int128 ns = CivilTimeToNanos(ct) +
-                    (static_cast<__int128>(tz_offset_sec) * 1000000000);
+                    (static_cast<__int128>(timestamp_offset_sec) * 1000000000);
       ct = NanosToCivilTime(ns);
     }
-    const bool is_date = (name == "date_add" || name == "date_sub" ||
+    const bool is_date = (name_view == "date_add" || name_view == "date_sub" ||
                           base.type == ValueType::kDate);
 
     if (unit == "year" || unit == "years" || unit == "quarter" ||
         unit == "quarters" || unit == "month" || unit == "months") {
-      int64_t amount = is_sub ? -raw_amount : raw_amount;
-      int64_t add_m = amount;
+      const __int128 amount =
+          is_sub ? -static_cast<__int128>(raw_amount) : raw_amount;
+      __int128 add_m = amount;
       if (unit.starts_with("year")) {
         add_m = amount * 12;
       } else if (unit.starts_with("quarter")) {
         add_m = amount * 3;
       }
-      int64_t total_m = (ct.year * 12 + (ct.month - 1)) + add_m;
+      const __int128 total_m =
+          ((static_cast<__int128>(ct.year) * 12) + (ct.month - 1)) + add_m;
+      if (total_m < 12 || total_m >= 120000) {
+        return StatusError(StatusCode::kIsInfinity, "DATETIME out of range");
+      }
       int target_y = static_cast<int>(total_m / 12);
       int target_m = static_cast<int>((total_m % 12) + 1);
       if (target_m <= 0) {
@@ -679,8 +804,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             std::chrono::sys_days{ymd}.time_since_epoch().count());
       }
       if (is_timestamp) {
-        int tz_offset_sec =
-            ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+        ASSIGN_OR_RETURN(int, tz_offset_sec,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
         __int128 ns = CivilTimeToNanos(ct) -
                       (static_cast<__int128>(tz_offset_sec) * 1000000000);
         CivilTime utc_ct = NanosToCivilTime(ns);
@@ -697,6 +822,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         delta_days = static_cast<int64_t>(uamount / (86400ULL * 1000000000ULL));
         delta_sub_ns =
             static_cast<int64_t>(uamount % (86400ULL * 1000000000ULL));
+      } else {
+        return StatusError(StatusCode::kIsInfinity, "DATETIME out of range");
       }
       if (!is_sub) {
         delta_days = -delta_days;
@@ -707,7 +834,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (unit == "day" || unit == "days") {
         delta_days = amount;
       } else if (unit == "week" || unit == "weeks") {
-        delta_days = amount * 7LL;
+        if (__builtin_mul_overflow(amount, int64_t{7}, &delta_days)) {
+          return StatusError(StatusCode::kIsInfinity, "DATETIME out of range");
+        }
       } else if (unit == "hour" || unit == "hours") {
         delta_days = amount / 24;
         delta_sub_ns = (amount % 24) * 3600LL * 1000000000LL;
@@ -749,8 +878,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         std::chrono::day{static_cast<unsigned>(ct.day)}};
     int64_t cur_days =
         std::chrono::sys_days{cur_ymd}.time_since_epoch().count();
-    int64_t target_days = cur_days + delta_days + extra_days;
-    std::chrono::sys_days target_sys_days{std::chrono::days{target_days}};
+    const __int128 target_days =
+        static_cast<__int128>(cur_days) + delta_days + extra_days;
+    const auto min_days = std::chrono::sys_days{std::chrono::year{1} / 1 / 1}
+                              .time_since_epoch()
+                              .count();
+    const auto max_days =
+        std::chrono::sys_days{std::chrono::year{9999} / 12 / 31}
+            .time_since_epoch()
+            .count();
+    if (target_days < min_days || target_days > max_days) {
+      return StatusError(StatusCode::kIsInfinity, "DATETIME out of range");
+    }
+    std::chrono::sys_days target_sys_days{
+        std::chrono::days{static_cast<int64_t>(target_days)}};
     std::chrono::year_month_day target_ymd{target_sys_days};
 
     CivilTime res_ct;
@@ -781,8 +922,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::string(buf.data()));
     }
     if (is_timestamp) {
-      __int128 ns = CivilTimeToNanos(res_ct) +
-                    (static_cast<__int128>(8 * 3600LL) * 1000000000);
+      __int128 ns = CivilTimeToNanos(res_ct) -
+                    (static_cast<__int128>(timestamp_offset_sec) * 1000000000);
       CivilTime utc_ct = NanosToCivilTime(ns);
       return Value(FormatCivilTime(utc_ct) + "+00");
     }
@@ -810,11 +951,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   };
   auto normalize = [](Value value, bool to_double) {
     if (to_double && !value.IsNull() && value.type == ValueType::kInt64) {
-      return Value(static_cast<double>(value.value.int_value));
+      return Value(value.IsUnsigned()
+                       ? static_cast<double>(
+                             static_cast<uint64_t>(value.value.int_value))
+                       : static_cast<double>(value.value.int_value));
     }
     return value;
   };
-  if (name == "if") {
+  if (name_view == "if") {
     if (call.Args().size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "IF requires 3 arguments");
@@ -830,7 +974,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                                   aggregates, context, ctes)));
     return normalize(std::move(taken), as_double);
   }
-  if (name == "iferror") {
+  if (name_view == "iferror") {
     if (call.Args().size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "IFERROR requires 2 arguments");
@@ -846,7 +990,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                                            context, ctes)));
     return normalize(std::move(fallback), as_double);
   }
-  if (name == "iserror") {
+  if (name_view == "iserror") {
     if (call.Args().size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ISERROR requires 1 argument");
@@ -855,7 +999,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         !TryEvaluateProtected(call.Args()[0], scope, aggregates, context, ctes)
              .HasValue());
   }
-  if (name == "nulliferror") {
+  if (name_view == "nulliferror") {
     if (call.Args().size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "NULLIFERROR requires 1 argument");
@@ -868,13 +1012,29 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return attempt;
   }
   std::vector<Value> arguments;
+  arguments.reserve(call.Args().size());
+  const bool truncates_civil_time = name_view == "date_trunc" ||
+                                    name_view == "datetime_trunc" ||
+                                    name_view == "timestamp_trunc";
   for (const Expression& argument : call.Args()) {
+    // The second operand is a date-part token, not a row reference. Looking
+    // up MINUTE in a wide row can otherwise synthesize a whole-row STRUCT
+    // which the truncation branch immediately discards in favor of its name.
+    if (truncates_civil_time && arguments.size() == 1 &&
+        argument->Type() == TypeTag::kColumnValue) {
+      arguments.emplace_back(
+          std::string(argument->AsColumnValue().GetColumnName().name));
+      continue;
+    }
     ASSIGN_OR_RETURN(Value, argument_value,
                      (TryEvaluate(argument, scope, aggregates, context, ctes)));
     arguments.push_back(std::move(argument_value));
   }
 
-  if (name == "__pipe_concat") {
+  if (name_view == "round") {
+    return ExecuteFunction(name, arguments);
+  }
+  if (name_view == "__pipe_concat") {
     if (arguments.size() != 2 || !arguments[0].IsArray()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__pipe_concat requires an array and separator");
@@ -925,7 +1085,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(result));
   }
 
-  if (name == "__struct_json__") {
+  if (name_view == "__struct_json__") {
     // Runtime struct constructor installed by the visitor when struct
     // fields could not be folded at plan time (aggregates, subqueries).
     // Arguments normally alternate name / value / quoted-flag.  Accept the
@@ -941,77 +1101,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "struct constructor arity");
     }
-    std::string json = "{";
-    for (size_t i = 0; i < arguments.size(); i += stride) {
-      if (i != 0) {
-        json += ",";
-      }
-      std::string escaped;
-      const std::string field_name = raw_str(arguments[i]);
-      for (char c : field_name) {
-        if (c == '"' || c == '\\') {
-          escaped.push_back('\\');
-        }
-        escaped.push_back(c);
-      }
-      json += "\"" + escaped + "\":";
-      const Value& field_value = arguments[i + 1];
-      if (field_value.IsNull()) {
-        json += "null";
-        continue;
-      }
-      const bool quoted = triple_form && Truthy(arguments[i + 2]);
-      if (!quoted && field_value.type == ValueType::kVarChar &&
-          field_value.value.varchar_value == "null") {
-        json += "null";
-        continue;
-      }
-      if (field_value.type == ValueType::kDate) {
-        json += "\"" + FormatDateDays(field_value.DateDays()) + "\"";
-        continue;
-      }
-      const auto is_struct = [](std::string_view sv) {
-        return sv.size() >= 2 && sv.front() == '{' && sv.back() == '}';
-      };
-      if (!quoted && field_value.type == ValueType::kVarChar &&
-          LooksLikeProtoText(field_value.value.varchar_value)) {
-        json +=
-            "{" +
-            NormalizeProtoText(field_value.value.varchar_value).value_or("") +
-            "}";
-        continue;
-      }
-      if (quoted || (field_value.type == ValueType::kVarChar &&
-                     !is_struct(field_value.value.varchar_value))) {
-        std::string text = raw_str(field_value);
-        std::string escaped_text;
-        for (char c : text) {
-          if (c == '"' || c == '\\') {
-            escaped_text.push_back('\\');
-          }
-          escaped_text.push_back(c);
-        }
-        json += "\"" + escaped_text + "\"";
-        continue;
-      }
-      if (field_value.type == ValueType::kInt64) {
-        json += std::to_string(field_value.value.int_value);
-      } else if (field_value.type == ValueType::kDouble) {
-        const double d = field_value.value.double_value;
-        std::array<char, 64> buffer{};
-        auto [ptr, ec] =
-            std::to_chars(buffer.data(), buffer.data() + buffer.size(), d);
-        (void)ec;
-        json.append(buffer.data(), static_cast<size_t>(ptr - buffer.data()));
-      } else if (field_value.type == ValueType::kVarChar) {
-        // Flag said unquoted: emit the text without JSON quoting.
-        json += raw_str(field_value);
-      } else {
-        json += field_value.AsString();
-      }
-    }
-    json += "}";
-    return Value(std::move(json));
+    return ExecuteFunction(name, arguments);
   }
 
   auto to_lower = [](std::string_view s) -> std::string {
@@ -1030,46 +1120,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    std::string arg0_str = raw_str(arguments[0]);
-    if (arguments[0].type == ValueType::kVarChar &&
-        arg0_str.find('-') != std::string::npos &&
-        arg0_str.find(' ') != std::string::npos &&
-        arg0_str.find('-') < arg0_str.find(' ')) {
-      IntervalValue iv = IntervalValue::Parse(arg0_str);
-      int64_t y = iv.months / 12;
-      int64_t m = iv.months % 12;
-      int64_t total_sec = iv.nanos / 1000000000LL;
-      int64_t sub_ns = iv.nanos % 1000000000LL;
-      int64_t h = total_sec / 3600;
-      int64_t min = (total_sec % 3600) / 60;
-      int64_t s = total_sec % 60;
-      if (name == "extract_year") {
-        return Value(y);
-      }
-      if (name == "extract_month") {
-        return Value(m);
-      }
-      if (name == "extract_day") {
-        return Value(iv.days);
-      }
-      if (name == "extract_hour") {
-        return Value(h);
-      }
-      if (name == "extract_minute") {
-        return Value(min);
-      }
-      if (name == "extract_second") {
-        return Value(s);
-      }
-      if (name == "extract_millisecond") {
-        return Value(sub_ns / 1000000LL);
-      }
-      if (name == "extract_microsecond") {
-        return Value(sub_ns / 1000LL);
-      }
-      if (name == "extract_nanosecond") {
-        return Value(sub_ns);
-      }
+    if (arguments[0].IsInterval()) {
+      return ExecuteFunction(name, arguments);
     }
     ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
     if (arguments.size() == 2) {
@@ -1077,11 +1129,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value();
       }
       std::string tz_str = raw_str(arguments[1]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
-      }
-      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -1097,7 +1145,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       }
     }
-    if (name == "extract_date") {
+    if (name_view == "extract_date") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1105,7 +1153,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value::DateFromDays(
           std::chrono::sys_days{ymd}.time_since_epoch().count());
     }
-    if (name == "extract_time") {
+    if (name_view == "extract_time") {
       std::array<char, 64> buf{};
       if (ct.subsecond_nanos != 0) {
         if (ct.subsecond_nanos % 1000000 == 0) {
@@ -1127,40 +1175,40 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       return Value(std::string(buf.data()));
     }
-    if (name == "extract_datetime") {
+    if (name_view == "extract_datetime") {
       return Value(FormatCivilTime(ct));
     }
-    if (name == "extract_year") {
+    if (name_view == "extract_year") {
       return Value(static_cast<int64_t>(ct.year));
     }
-    if (name == "extract_quarter") {
+    if (name_view == "extract_quarter") {
       return Value(static_cast<int64_t>(((ct.month - 1) / 3) + 1));
     }
-    if (name == "extract_month") {
+    if (name_view == "extract_month") {
       return Value(static_cast<int64_t>(ct.month));
     }
-    if (name == "extract_day") {
+    if (name_view == "extract_day") {
       return Value(static_cast<int64_t>(ct.day));
     }
-    if (name == "extract_hour") {
+    if (name_view == "extract_hour") {
       return Value(static_cast<int64_t>(ct.hour));
     }
-    if (name == "extract_minute") {
+    if (name_view == "extract_minute") {
       return Value(static_cast<int64_t>(ct.minute));
     }
-    if (name == "extract_second") {
+    if (name_view == "extract_second") {
       return Value(static_cast<int64_t>(ct.second));
     }
-    if (name == "extract_millisecond") {
+    if (name_view == "extract_millisecond") {
       return Value(static_cast<int64_t>(ct.subsecond_nanos / 1000000LL));
     }
-    if (name == "extract_microsecond") {
+    if (name_view == "extract_microsecond") {
       return Value(static_cast<int64_t>(ct.subsecond_nanos / 1000LL));
     }
-    if (name == "extract_nanosecond") {
+    if (name_view == "extract_nanosecond") {
       return Value(ct.subsecond_nanos);
     }
-    if (name == "extract_week") {
+    if (name_view == "extract_week") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1176,7 +1224,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       int week_num = (yday + start_wd) / 7;
       return Value(static_cast<int64_t>(week_num));
     }
-    if (name == "extract_dayofweek") {
+    if (name_view == "extract_dayofweek") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1185,7 +1233,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::weekday{std::chrono::sys_days{ymd}}.c_encoding());
       return Value(static_cast<int64_t>(wd + 1));
     }
-    if (name == "extract_weekday") {
+    if (name_view == "extract_weekday") {
       // BigQuery WEEKDAY: Monday = 1 ... Sunday = 7 (ISO encoding).
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
@@ -1195,7 +1243,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           std::chrono::weekday{std::chrono::sys_days{ymd}}.iso_encoding());
       return Value(static_cast<int64_t>(wd));
     }
-    if (name == "extract_dayofyear") {
+    if (name_view == "extract_dayofyear") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1209,7 +1257,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                  1;
       return Value(static_cast<int64_t>(yday));
     }
-    if (name == "extract_isoyear" || name == "extract_isoweek") {
+    if (name_view == "extract_isoyear" || name_view == "extract_isoweek") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -1219,7 +1267,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       std::chrono::sys_days thu = sd + std::chrono::days{4 - iso_wd};
       std::chrono::year_month_day thu_ymd{thu};
       int isoyear = int(thu_ymd.year());
-      if (name == "extract_isoyear") {
+      if (name_view == "extract_isoyear") {
         return Value(static_cast<int64_t>(isoyear));
       }
       std::chrono::year_month_day iso_start{std::chrono::year{isoyear},
@@ -1235,14 +1283,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "unsupported extract field: " + name);
   }
-  if (name == "__struct_set") {
+  if (name_view == "__struct_set") {
     if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__struct_set requires 3 arguments");
     }
     return StructSetField(arguments[0], raw_str(arguments[1]), arguments[2]);
   }
-  if (name == "error") {
+  if (name_view == "error") {
     // Unreachable in valid plans unless evaluated: raise the requested
     // runtime error (the message text is informational only).
     return StatusError(StatusCode::kInvalidArgument,
@@ -1250,7 +1298,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            ? std::string("ERROR: user-raised")
                            : "generic::out_of_range: " + raw_str(arguments[0]));
   }
-  if (name == "coalesce") {
+  if (name_view == "coalesce") {
     for (Value& value : arguments) {
       if (!value.IsNull()) {
         return value;
@@ -1258,7 +1306,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value();
   }
-  if (name == "nullif") {
+  if (name_view == "nullif") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "NULLIF requires 2 arguments");
@@ -1274,7 +1322,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return arguments[0];
   }
-  if (name == "ifnull") {
+  if (name_view == "ifnull") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "IFNULL requires 2 arguments");
@@ -1299,7 +1347,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument, "requires DATE");
   };
 
-  if (name == "unix_date") {
+  if (name_view == "unix_date") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "UNIX_DATE requires 1 argument");
@@ -1310,7 +1358,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(int64_t, days, (parse_date_val(arguments[0])));
     return Value(days);
   }
-  if (name == "date_from_unix_date") {
+  if (name_view == "date_from_unix_date") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DATE_FROM_UNIX_DATE requires 1 argument");
@@ -1321,7 +1369,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(int64_t, days, (parse_date_val(arguments[0])));
     return Value::DateFromDays(days);
   }
-  if (name == "current_time") {
+  if (name_view == "current_time") {
     if (arguments.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_TIME takes at most 1 argument");
@@ -1332,29 +1380,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     int tz_offset_sec = 0;
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
       std::string tz_str = raw_str(arguments[0]);
-      if (tz_str == "UTC" || tz_str == "utc" || tz_str == "Z" ||
-          tz_str == "z") {
-        tz_offset_sec = 0;
-      } else if (!tz_str.empty() && (tz_str[0] == '+' || tz_str[0] == '-')) {
-        char sign = tz_str[0];
-        int h = 0, m = 0;
-        if (tz_str.find(':') != std::string::npos) {
-          if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-                  tz_str.c_str() + 1, "%d:%d", &h, &m) < 1) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "invalid timezone: " + tz_str);
-          }
-        } else {
-          if (sscanf(  // NOLINT(cert-err34-c) - conversion count is checked.
-                  tz_str.c_str() + 1, "%d", &h) < 1) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "invalid timezone: " + tz_str);
-          }
-        }
-        tz_offset_sec = (h * 3600 + m * 60) * (sign == '-' ? -1 : 1);
-      } else {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
     }
     time_t now = time(nullptr) + tz_offset_sec;
@@ -1365,7 +1393,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                    t.tm_min, t.tm_sec);
     return Value(std::string(buf.data()));
   }
-  if (name == "user" || name == "session_user") {
+  if (name_view == "user" || name_view == "session_user" ||
+      name_view == "current_user") {
     if (!arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "USER takes no arguments");
@@ -1378,7 +1407,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::string(os_user != nullptr ? os_user : "tinylamb"));
   }
-  if (name == "current_datetime") {
+  if (name_view == "current_datetime") {
     if (arguments.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_DATETIME takes at most 1 argument");
@@ -1386,14 +1415,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 1 && arguments[0].IsNull()) {
       return Value();
     }
-    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
       std::string tz_str = raw_str(arguments[0]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
@@ -1407,7 +1436,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                       .subsecond_nanos = 0};
     return Value(FormatCivilTime(current));
   }
-  if (name == "current_date") {
+  if (name_view == "current_date") {
     if (arguments.size() > 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CURRENT_DATE takes at most 1 argument");
@@ -1415,15 +1444,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 1 && arguments[0].IsNull()) {
       return Value();
     }
-    int tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone());
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone())));
     if (arguments.size() == 1 && !arguments[0].IsNull()) {
       std::string tz_str = raw_str(arguments[0]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      RETURN_IF_FAIL(TryValidateTimeZoneName(tz_str));
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     time_t now = time(nullptr) + tz_offset_sec;
     struct tm t = {};
@@ -1435,7 +1463,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::DateFromDays(
         std::chrono::sys_days{ymd}.time_since_epoch().count());
   }
-  if (name == "string") {
+  if (name_view == "string") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STRING requires 1 or 2 arguments");
@@ -1447,11 +1475,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 2) {
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
       std::string tz_str = raw_str(arguments[1]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
-      }
-      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
+      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
       int rem_mins = (tz_offset_sec % 3600) / 60;
       if (rem_mins != 0) {
@@ -1473,7 +1497,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(raw_str(arguments[0]));
   }
-  if (name == "date") {
+  if (name_view == "date") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DATE takes 1 or 2 arguments");
@@ -1551,8 +1575,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                              .hour = h,
                              .minute = m,
                              .second = static_cast<int>(sec)};
-            int default_tz_sec =
-                ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp, -8 * 3600);
+            ASSIGN_OR_RETURN(
+                int, default_tz_sec,
+                (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp)));
             struct tm t = {};
             t.tm_year = Y - 1900;
             t.tm_mon = M - 1;
@@ -1577,7 +1602,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value::Date(s);
   }
-  if (name == "datetime") {
+  if (name_view == "datetime") {
     if (arguments.empty() || arguments.size() > 7) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DATETIME takes 1 to 7 arguments");
@@ -1611,7 +1636,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value(d + " " + arg1_str);
       }
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
-      int tz_offset_sec = ParseTimeZoneOffset(arg1_str, &ct, 0);
+      ASSIGN_OR_RETURN(int, tz_offset_sec,
+                       (ParseTimeZoneOffset(arg1_str, &ct)));
       if (tz_offset_sec != 0) {
         __int128 ns = CivilTimeToNanos(ct) +
                       (static_cast<__int128>(tz_offset_sec) * 1000000000);
@@ -1660,7 +1686,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(FormatCivilTime(ct));
     }
   }
-  if (name == "timestamp") {
+  if (name_view == "timestamp") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TIMESTAMP takes 1 or 2 arguments");
@@ -1672,7 +1698,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
     std::string tz_str =
         (arguments.size() == 2) ? raw_str(arguments[1]) : GetDefaultTimeZone();
-    int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, -8 * 3600);
+    ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
     // An explicit zone inside the timestamp text (" UTC", "Z", "+HH:MM")
     // fixes the instant; the session default must not shift it again.
     if (arguments[0].type == ValueType::kVarChar) {
@@ -1685,8 +1711,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
               std::isdigit(static_cast<unsigned char>(
                   i + 1 < text.size() ? text[i + 1] : '0')) != 0) {
             has_explicit_zone = true;
-            explicit_sec =
-                ParseTimeZoneOffset(std::string(text.substr(i)), &ct, 0);
+            {
+              ASSIGN_OR_RETURN(
+                  int, parsed_offset,
+                  (ParseTimeZoneOffset(std::string(text.substr(i)), &ct)));
+              explicit_sec = parsed_offset;
+            }
             break;
           }
         }
@@ -1711,7 +1741,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     CivilTime utc_ct = NanosToCivilTime(ns);
     return Value(FormatCivilTime(utc_ct) + "+00");
   }
-  if (name == "time") {
+  if (name_view == "time") {
     if (arguments.empty() || arguments.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TIME takes 1 to 4 arguments");
@@ -1728,7 +1758,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             s.find('z') != std::string::npos) {
           int tz_offset_sec = 0;
           if (tz_pos != std::string::npos) {
-            tz_offset_sec = ParseTimeZoneOffset(s.substr(tz_pos), &ct, 0);
+            {
+              ASSIGN_OR_RETURN(int, parsed_offset,
+                               (ParseTimeZoneOffset(s.substr(tz_pos), &ct)));
+              tz_offset_sec = parsed_offset;
+            }
           }
           __int128 ns = CivilTimeToNanos(ct) -
                         (static_cast<__int128>(tz_offset_sec) * 1000000000) +
@@ -1772,7 +1806,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments.size() == 2) {
       ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
       std::string tz_str = raw_str(arguments[1]);
-      int tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct, 0);
+      ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
       if (tz_offset_sec != 0) {
         __int128 ns = CivilTimeToNanos(ct) +
                       (static_cast<__int128>(tz_offset_sec) * 1000000000);
@@ -1830,7 +1864,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(std::string(buf.data()));
     }
   }
-  if (name == "__quantified__") {
+  if (name_view == "__quantified__") {
     // __quantified__(lhs, array, op, ANY|ALL): three-valued SQL semantics.
     if (arguments.size() != 4) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -1984,9 +2018,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(int64_t{1});
   }
-  if (name == "array_element_offset" || name == "array_element_ordinal" ||
-      name == "array_element_safe_offset" ||
-      name == "array_element_safe_ordinal") {
+  if (name_view == "array_element_offset" ||
+      name_view == "array_element_ordinal" ||
+      name_view == "array_element_safe_offset" ||
+      name_view == "array_element_safe_ordinal") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "array element access requires 2 arguments");
@@ -2004,10 +2039,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[1].IsNull()) {
       return Value();
     }
+    if (arguments[1].type != ValueType::kInt64 || arguments[1].IsUnsigned()) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "array index requires INT64");
+    }
     const auto& elements = arr.ArrayElements();
     int64_t index = arguments[1].value.int_value;
-    if (name.find("ordinal") != std::string::npos) {
+    if (name.find("ordinal") != std::string::npos && index > 0) {
       --index;
+    } else if (name.find("ordinal") != std::string::npos) {
+      index = -1;
     }
     if (index < 0 || std::cmp_greater_equal(index, elements.size())) {
       // Out-of-range plain accesses are errors in GoogleSQL; only the SAFE
@@ -2021,8 +2062,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return elements[static_cast<size_t>(index)];
   }
-  if (name == "__bit_and" || name == "__bit_or" || name == "__bit_xor" ||
-      name == "__shift_left" || name == "__shift_right") {
+  if (name_view == "__bit_and" || name_view == "__bit_or" ||
+      name_view == "__bit_xor" || name_view == "__shift_left" ||
+      name_view == "__shift_right") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -2039,13 +2081,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const int64_t rhs = arguments[1].value.int_value;
     const bool is_u = arguments[0].IsUnsigned() || arguments[1].IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
-    if (name == "__bit_and") {
+    if (name_view == "__bit_and") {
       return with_u(Value(lhs & rhs));
     }
-    if (name == "__bit_or") {
+    if (name_view == "__bit_or") {
       return with_u(Value(lhs | rhs));
     }
-    if (name == "__bit_xor") {
+    if (name_view == "__bit_xor") {
       return with_u(Value(lhs ^ rhs));
     }
     if (rhs < 0) {
@@ -2056,10 +2098,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto ulhs = static_cast<uint64_t>(lhs);
-    const uint64_t shifted = name == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
+    const uint64_t shifted =
+        name_view == "__shift_left" ? ulhs << rhs : ulhs >> rhs;
     return with_u(Value(static_cast<int64_t>(shifted)));
   }
-  if (name == "__proto_new") {
+  if (name_view == "__proto_new") {
     // NEW ProtoType(v1 AS f1, ...) / SELECT AS ProtoType: argument layout is
     // (type_name, value1, field1, value2, field2, ...).  Builds the proto
     // TEXT payload; required-field and enum-member violations throw.
@@ -2075,14 +2118,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(ConstructProtoText(type_name, fields));
   }
-  if (name == "__value_table_value") {
+  if (name_view == "__value_table_value") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_value requires one argument");
     }
     return arguments.front();
   }
-  if (name == "__value_table_proto") {
+  if (name_view == "__value_table_proto") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_proto requires two arguments");
@@ -2103,7 +2146,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(ConstructProtoText(type_name, fields));
   }
-  if (name == "__value_table_proto_existing") {
+  if (name_view == "__value_table_proto_existing") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "__value_table_proto_existing requires two arguments");
@@ -2128,7 +2171,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(ConstructProtoText(type_name, fields));
   }
-  if (name == "__proto_set") {
+  if (name_view == "__proto_set") {
     // Dotted SET targets over proto TEXT columns: (payload, path, new_value).
     // NULL payloads have no field structure to update.
     if (arguments.size() != 3) {
@@ -2165,7 +2208,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     auto rewritten = ProtoTextSetField(payload, path, arguments[2], type_name);
     return Value(rewritten.value_or(payload));
   }
-  if (name == "__get_extension") {
+  if (name_view == "__get_extension") {
     // value.(pkg.Ext.field): reads the bracketed extension entry from a
     // proto TEXT payload; NULL bases yield NULL.
     if (arguments.size() != 2) {
@@ -2184,8 +2227,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return out;
   }
-  if (name == "unix_seconds" || name == "unix_millis" ||
-      name == "unix_micros" || name == "unix_date") {
+  if (name_view == "unix_seconds" || name_view == "unix_millis" ||
+      name_view == "unix_micros" || name_view == "unix_date") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires one TIMESTAMP argument");
@@ -2204,18 +2247,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return static_cast<int64_t>(((a % b) != 0 && ((a < 0) != (b < 0))) ? q - 1
                                                                          : q);
     };
-    if (name == "unix_date") {
+    if (name_view == "unix_date") {
       return Value(floor_div_unix(*nanos, 86400000000000LL));
     }
-    if (name == "unix_seconds") {
+    if (name_view == "unix_seconds") {
       return Value(floor_div_unix(*nanos, 1000000000LL));
     }
-    if (name == "unix_millis") {
+    if (name_view == "unix_millis") {
       return Value(floor_div_unix(*nanos, 1000000LL));
     }
     return Value(floor_div_unix(*nanos, 1000LL));
   }
-  if (name == "__get_field_safe") {
+  if (name_view == "__get_field_safe") {
     // Field access tolerating NULL bases / missing members (returns NULL);
     // used for dotted struct references inside DML predicates.
     if (arguments.size() != 2) {
@@ -2279,7 +2322,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value();
   }
-  if (name == "get_field") {
+  if (name_view == "get_field") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "get_field requires 2 arguments");
@@ -2375,8 +2418,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value();
   }
-  if (name == "date_diff" || name == "datetime_diff" ||
-      name == "timestamp_diff") {
+  if (name_view == "date_diff" || name_view == "datetime_diff" ||
+      name_view == "timestamp_diff") {
     if (call.Args().size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 3 arguments");
@@ -2479,17 +2522,20 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     __int128 ns2 = CivilTimeToNanos(t2);
     __int128 diff_ns = ns1 - ns2;
     if (unit == "week" || unit == "weeks") {
-      return Value(
-          static_cast<int64_t>(diff_ns / (7LL * 86400LL * 1000000000LL)));
+      return Value(static_cast<int64_t>(
+          diff_ns / (static_cast<__int128>(7) * 86400LL * 1000000000LL)));
     }
     if (unit == "day" || unit == "days") {
-      return Value(static_cast<int64_t>(diff_ns / (86400LL * 1000000000LL)));
+      return Value(static_cast<int64_t>(
+          diff_ns / (static_cast<__int128>(86400) * 1000000000LL)));
     }
     if (unit == "hour" || unit == "hours") {
-      return Value(static_cast<int64_t>(diff_ns / (3600LL * 1000000000LL)));
+      return Value(static_cast<int64_t>(
+          diff_ns / (static_cast<__int128>(3600) * 1000000000LL)));
     }
     if (unit == "minute" || unit == "minutes") {
-      return Value(static_cast<int64_t>(diff_ns / (60LL * 1000000000LL)));
+      return Value(static_cast<int64_t>(
+          diff_ns / (static_cast<__int128>(60) * 1000000000LL)));
     }
     if (unit == "second" || unit == "seconds") {
       return Value(static_cast<int64_t>(diff_ns / 1000000000LL));
@@ -2511,15 +2557,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "unsupported unit in " + name + ": " + unit);
   }
-  if (name == "date_trunc" || name == "datetime_trunc" ||
-      name == "timestamp_trunc") {
+  if (name_view == "date_trunc" || name_view == "datetime_trunc" ||
+      name_view == "timestamp_trunc") {
     if (call.Args().size() < 2 || call.Args().size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 or 3 arguments");
     }
-    ASSIGN_OR_RETURN(
-        Value, d,
-        (TryEvaluate(call.Args()[0], scope, aggregates, context, ctes)));
+    // Ordinary arguments were evaluated once above, in source order.
+    const Value& d = arguments[0];
     if (d.IsNull()) {
       return Value();
     }
@@ -2527,9 +2572,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (call.Args()[1]->Type() == TypeTag::kColumnValue) {
       unit = to_lower(call.Args()[1]->AsColumnValue().GetColumnName().name);
     } else {
-      ASSIGN_OR_RETURN(
-          Value, uval,
-          (TryEvaluate(call.Args()[1], scope, aggregates, context, ctes)));
+      const Value& uval = arguments[1];
 
       if (!uval.IsNull()) {
         unit = to_lower(raw_str(uval));
@@ -2547,35 +2590,35 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       }
     }
-    bool is_timestamp = (name == "timestamp_trunc" || has_explicit_tz);
+    bool is_timestamp = (name_view == "timestamp_trunc" || has_explicit_tz);
     std::string trunc_tz = GetDefaultTimeZone();
     if (call.Args().size() == 3) {
-      ASSIGN_OR_RETURN(
-          Value, tz_val,
-          (TryEvaluate(call.Args()[2], scope, aggregates, context, ctes)));
+      const Value& tz_val = arguments[2];
 
       if (tz_val.IsNull()) {
         return Value();
       }
       std::string tz_str = raw_str(tz_val);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
-      }
       trunc_tz = tz_str;
     }
 
     ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(d)));
     if (is_timestamp) {
-      __int128 d_utc_ns = CivilTimeToNanos(ct);
+      int parse_tz_sec = 0;
       if (!has_explicit_tz) {
-        int parse_tz_sec =
-            ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
-        d_utc_ns -= static_cast<__int128>(parse_tz_sec) * 1000000000;
+        {
+          ASSIGN_OR_RETURN(int, parsed_offset,
+                           (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+          parse_tz_sec = parsed_offset;
+        }
       }
-      int trunc_tz_sec = ParseTimeZoneOffset(trunc_tz, &ct, -8 * 3600);
-      CivilTime trunc_local_ct = NanosToCivilTime(
-          d_utc_ns + (static_cast<__int128>(trunc_tz_sec) * 1000000000));
+      ASSIGN_OR_RETURN(int, trunc_tz_sec, (ParseTimeZoneOffset(trunc_tz, &ct)));
+      CivilTime trunc_local_ct = ct;
+      if (parse_tz_sec != trunc_tz_sec) {
+        const __int128 shift =
+            (static_cast<__int128>(trunc_tz_sec) - parse_tz_sec) * 1000000000;
+        trunc_local_ct = NanosToCivilTime(CivilTimeToNanos(ct) + shift);
+      }
       if (unit == "year" || unit == "years") {
         trunc_local_ct.month = 1;
         trunc_local_ct.day = 1;
@@ -2641,12 +2684,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kInvalidArgument,
                            "unsupported unit in " + name + ": " + unit);
       }
-      int new_trunc_tz_sec =
-          ParseTimeZoneOffset(trunc_tz, &trunc_local_ct, -8 * 3600);
-      __int128 res_utc_ns =
-          CivilTimeToNanos(trunc_local_ct) -
-          (static_cast<__int128>(new_trunc_tz_sec) * 1000000000);
-      CivilTime res_utc_ct = NanosToCivilTime(res_utc_ns);
+      ASSIGN_OR_RETURN(int, new_trunc_tz_sec,
+                       (ParseTimeZoneOffset(trunc_tz, &trunc_local_ct)));
+      CivilTime res_utc_ct = trunc_local_ct;
+      if (new_trunc_tz_sec != 0) {
+        const __int128 res_utc_ns =
+            CivilTimeToNanos(trunc_local_ct) -
+            (static_cast<__int128>(new_trunc_tz_sec) * 1000000000);
+        res_utc_ct = NanosToCivilTime(res_utc_ns);
+      }
       return Value(FormatCivilTime(res_utc_ct) + "+00");
     }
     if (unit == "year" || unit == "years") {
@@ -2710,7 +2756,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "unsupported unit in " + name + ": " + unit);
     }
-    if (d.type == ValueType::kDate && name == "date_trunc") {
+    if (d.type == ValueType::kDate && name_view == "date_trunc") {
       std::chrono::year_month_day ymd{
           std::chrono::year{ct.year},
           std::chrono::month{static_cast<unsigned>(ct.month)},
@@ -2720,8 +2766,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(FormatCivilTime(ct));
   }
-  if (name == "format_date" || name == "format_datetime" ||
-      name == "format_timestamp") {
+  if (name_view == "format_date" || name_view == "format_datetime" ||
+      name_view == "format_timestamp") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " takes 2 or 3 arguments");
@@ -2737,13 +2783,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value();
       }
       std::string tz_str = raw_str(arguments[2]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset,
+                         (ParseTimeZoneOffset(tz_str, &ct)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str, &ct);
-    } else if (name == "format_datetime" || name == "format_timestamp") {
-      tz_offset_sec = ParseTimeZoneOffset(GetDefaultTimeZone(), &ct, -8 * 3600);
+    } else if (name_view == "format_datetime" ||
+               name_view == "format_timestamp") {
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
+        tz_offset_sec = parsed_offset;
+      }
     }
     ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;
@@ -2772,7 +2823,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     platform::FormatTime(buf.data(), buf.size(), fmt.c_str(), &tm);
     return Value(std::string(buf.data()));
   }
-  if (name == "parse_timestamp") {
+  if (name_view == "parse_timestamp") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_TIMESTAMP requires 2 or 3 arguments");
@@ -2785,15 +2836,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     std::string fmt = raw_str(arguments[0]);
     std::string input = raw_str(arguments[1]);
-    int tz_offset_sec =
-        ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr, -8 * 3600);
+    ASSIGN_OR_RETURN(int, tz_offset_sec,
+                     (ParseTimeZoneOffset(GetDefaultTimeZone(), nullptr)));
     if (arguments.size() == 3) {
       std::string tz_str = raw_str(arguments[2]);
-      if (tz_str.empty() || tz_str == "invalid_time_zone") {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "invalid timezone: " + tz_str);
+      {
+        ASSIGN_OR_RETURN(int, parsed_offset, (ParseTimeZoneOffset(tz_str)));
+        tz_offset_sec = parsed_offset;
       }
-      tz_offset_sec = ParseTimeZoneOffset(tz_str);
     }
     struct tm tm = {};
     tm.tm_year = 100;  // 2000 default
@@ -2828,8 +2878,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(FormatCivilTime(ct) + "+00");
   }
-  if (name == "date_bucket" || name == "timestamp_bucket" ||
-      name == "datetime_bucket") {
+  if (name_view == "date_bucket" || name_view == "timestamp_bucket" ||
+      name_view == "datetime_bucket") {
     if (call.Args().size() < 2 || call.Args().size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " takes 2 or 3 arguments");
@@ -2853,7 +2903,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
       }
     }
-    bool is_ts = (name == "timestamp_bucket" || d_has_tz);
+    bool is_ts = (name_view == "timestamp_bucket" || d_has_tz);
 
     CivilTime orig_ct{.year = 1970,
                       .month = 1,
@@ -2940,7 +2990,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         CivilTime res_ct = orig_ct;
         res_ct.year = bucket_y;
         res_ct.month = bucket_mon;
-        if (d.type == ValueType::kDate && name == "date_bucket") {
+        if (d.type == ValueType::kDate && name_view == "date_bucket") {
           std::chrono::year_month_day ymd{
               std::chrono::year{res_ct.year},
               std::chrono::month{static_cast<unsigned>(res_ct.month)},
@@ -2991,14 +3041,14 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
       __int128 d_ns = CivilTimeToNanos(d_ct);
       if (is_ts && !d_has_tz) {
-        int tz_sec =
-            ParseTimeZoneOffset(GetDefaultTimeZone(), &d_ct, -8 * 3600);
+        ASSIGN_OR_RETURN(int, tz_sec,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &d_ct)));
         d_ns -= static_cast<__int128>(tz_sec) * 1000000000;
       }
       __int128 orig_ns = CivilTimeToNanos(orig_ct);
       if (is_ts && (!has_origin || !orig_has_tz)) {
-        int tz_sec =
-            ParseTimeZoneOffset(GetDefaultTimeZone(), &orig_ct, -8 * 3600);
+        ASSIGN_OR_RETURN(int, tz_sec,
+                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &orig_ct)));
         orig_ns -= static_cast<__int128>(tz_sec) * 1000000000;
       }
       __int128 diff_ns = d_ns - orig_ns;
@@ -3010,7 +3060,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           orig_ns + (floor_div_128(diff_ns, step_ns) * step_ns);
       CivilTime res_ct = NanosToCivilTime(bucket_ns);
 
-      if (d.type == ValueType::kDate && name == "date_bucket") {
+      if (d.type == ValueType::kDate && name_view == "date_bucket") {
         std::chrono::year_month_day ymd{
             std::chrono::year{res_ct.year},
             std::chrono::month{static_cast<unsigned>(res_ct.month)},
@@ -3025,7 +3075,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value();
   }
-  if (name == "parse_date") {
+  if (name_view == "parse_date") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "PARSE_DATE requires 2 arguments");
@@ -3100,7 +3150,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                    tm.tm_mon + 1, tm.tm_mday);
     return Value::Date(std::string(buf.data()));
   }
-  if (name == "last_day") {
+  if (name_view == "last_day") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LAST_DAY takes 1 or 2 arguments");
@@ -3179,10 +3229,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "unsupported LAST_DAY date_part " + part);
   }
-  if (name == "week" && arguments.size() == 1) {
+  if (name_view == "week" && arguments.size() == 1) {
     return Value("week(" + to_lower(raw_str(arguments[0])) + ")");
   }
-  if (name == "add_months") {
+  if (name_view == "add_months") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ADD_MONTHS requires 2 arguments");
@@ -3248,7 +3298,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value::DateFromDays(res_days);
   }
-  if (name == "next_day") {
+  if (name_view == "next_day") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "NEXT_DAY requires 2 arguments");
@@ -3290,7 +3340,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
     return Value::DateFromDays(res_days);
   }
-  if (name == "months_between") {
+  if (name_view == "months_between") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "MONTHS_BETWEEN requires 2 arguments");
@@ -3390,7 +3440,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   };
 
   // String functions
-  if (name == "concat") {
+  if (name_view == "concat") {
     std::string result;
     for (const Value& value : arguments) {
       if (value.IsNull()) {
@@ -3404,7 +3454,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::move(result));
   }
-  if (name == "byte_length" || name == "octet_length") {
+  if (name_view == "byte_length" || name_view == "octet_length") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -3414,7 +3464,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(static_cast<int64_t>(raw_str(arguments[0]).size()));
   }
-  if (name == "length" || name == "char_length" || name == "character_length") {
+  if (name_view == "length" || name_view == "char_length" ||
+      name_view == "character_length") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -3424,7 +3475,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(static_cast<int64_t>(utf8_len(raw_str(arguments[0]))));
   }
-  if (name == "upper") {
+  if (name_view == "upper") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "UPPER requires 1 argument");
@@ -3434,7 +3485,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(UnicodeUpper(raw_str(arguments[0])));
   }
-  if (name == "lower") {
+  if (name_view == "lower") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LOWER requires 1 argument");
@@ -3444,7 +3495,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(UnicodeLower(raw_str(arguments[0])));
   }
-  if (name == "bit_count") {
+  if (name_view == "bit_count") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "BIT_COUNT requires 1 argument");
@@ -3463,7 +3514,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(
         std::popcount(static_cast<uint64_t>(input.value.int_value))));
   }
-  if (name == "normalize_and_casefold" || name == "normalize") {
+  if (name_view == "normalize_and_casefold" || name_view == "normalize") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -3493,12 +3544,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                            name + " supports NFC/NFKC only, got " + mode);
       }
     }
-    if (name == "normalize") {
+    if (name_view == "normalize") {
       return arguments[0];
     }
     return Value(UnicodeCaseFold(raw_str(arguments[0])));
   }
-  if (name == "trim") {
+  if (name_view == "trim") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TRIM requires 1 or 2 arguments");
@@ -3517,7 +3568,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const size_t end = s.find_last_not_of(cutset);
     return Value(s.substr(start, end - start + 1));
   }
-  if (name == "ltrim") {
+  if (name_view == "ltrim") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LTRIM requires 1 or 2 arguments");
@@ -3535,7 +3586,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(s.substr(start));
   }
-  if (name == "rtrim") {
+  if (name_view == "rtrim") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RTRIM requires 1 or 2 arguments");
@@ -3553,7 +3604,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(s.substr(0, end + 1));
   }
-  if (name == "starts_with") {
+  if (name_view == "starts_with") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STARTS_WITH requires 2 arguments");
@@ -3563,7 +3614,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(raw_str(arguments[0]).starts_with(raw_str(arguments[1])));
   }
-  if (name == "ends_with") {
+  if (name_view == "ends_with") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ENDS_WITH requires 2 arguments");
@@ -3573,7 +3624,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(raw_str(arguments[0]).ends_with(raw_str(arguments[1])));
   }
-  if (name == "strpos") {
+  if (name_view == "strpos") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "STRPOS requires 2 arguments");
@@ -3593,7 +3644,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(
         static_cast<int64_t>(utf8_len(std::string_view(s.data(), pos)) + 1));
   }
-  if (name == "instr") {
+  if (name_view == "instr") {
     if (arguments.size() < 2 || arguments.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "INSTR requires 2 to 4 arguments");
@@ -3672,7 +3723,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(int64_t{0});
   }
-  if (name == "replace") {
+  if (name_view == "replace") {
     if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REPLACE requires 3 arguments");
@@ -3694,7 +3745,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::move(s));
   }
-  if (name == "repeat") {
+  if (name_view == "repeat") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REPEAT requires 2 arguments");
@@ -3740,7 +3791,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "reverse") {
+  if (name_view == "reverse") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REVERSE requires 1 argument");
@@ -3760,7 +3811,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::move(res));
   }
-  if (name == "substr" || name == "substring") {
+  if (name_view == "substr" || name_view == "substring") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SUBSTR requires two or three arguments");
@@ -3818,7 +3869,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(utf8_substr(input, static_cast<size_t>(actual_start), length));
   }
 
-  if (name == "byte_substr") {
+  if (name_view == "byte_substr") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SUBSTR requires two or three arguments");
@@ -3876,7 +3927,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(input.substr(static_cast<size_t>(actual_start), length));
   }
 
-  if (name == "byte_reverse") {
+  if (name_view == "byte_reverse") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REVERSE requires 1 argument");
@@ -3889,7 +3940,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(s));
   }
 
-  if (name == "left" || name == "byte_left") {
+  if (name_view == "left" || name_view == "byte_left") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LEFT requires 2 arguments");
@@ -3922,13 +3973,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (len == 0) {
       return Value(std::string());
     }
-    if (name == "byte_left") {
+    if (name_view == "byte_left") {
       return Value(s.substr(0, static_cast<size_t>(len)));
     }
     return Value(utf8_substr(s, 0, static_cast<size_t>(len)));
   }
 
-  if (name == "right" || name == "byte_right") {
+  if (name_view == "right" || name_view == "byte_right") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RIGHT requires 2 arguments");
@@ -3961,7 +4012,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (len == 0) {
       return Value(std::string());
     }
-    if (name == "byte_right") {
+    if (name_view == "byte_right") {
       const size_t start = s.size() >= static_cast<size_t>(len)
                                ? s.size() - static_cast<size_t>(len)
                                : 0;
@@ -3975,7 +4026,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(utf8_substr(s, start_cp, static_cast<size_t>(len)));
   }
 
-  if (name == "lpad" || name == "rpad") {
+  if (name_view == "lpad" || name_view == "rpad") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 or 3 arguments");
@@ -4032,10 +4083,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (needed % pad_cps != 0) {
       pad_str += utf8_substr(pad, 0, needed % pad_cps);
     }
-    return Value(name == "lpad" ? pad_str + s : s + pad_str);
+    return Value(name_view == "lpad" ? pad_str + s : s + pad_str);
   }
 
-  if (name == "ascii") {
+  if (name_view == "ascii") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ASCII requires 1 argument");
@@ -4050,7 +4101,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(static_cast<unsigned char>(s[0])));
   }
 
-  if (name == "unicode") {
+  if (name_view == "unicode") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "UNICODE requires 1 argument");
@@ -4086,7 +4137,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(code));
   }
 
-  if (name == "chr") {
+  if (name_view == "chr") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CHR requires 1 argument");
@@ -4094,9 +4145,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    const int64_t code = arguments[0].type == ValueType::kInt64
-                             ? arguments[0].value.int_value
-                             : 0;
+    if (arguments[0].type != ValueType::kInt64) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "CHR requires an integer argument");
+    }
+    const int64_t code = arguments[0].value.int_value;
     std::string res;
     if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
       return StatusError(StatusCode::kIsInfinity, "CHR argument out of range");
@@ -4119,7 +4172,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "code_points_to_string") {
+  if (name_view == "code_points_to_string") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CODE_POINTS_TO_STRING requires 1 argument");
@@ -4161,7 +4214,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "code_points_to_bytes") {
+  if (name_view == "code_points_to_bytes") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CODE_POINTS_TO_BYTES requires 1 argument");
@@ -4189,7 +4242,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "initcap") {
+  if (name_view == "initcap") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "INITCAP requires 1 or 2 arguments");
@@ -4204,7 +4257,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(UnicodeInitcap(s, delims, has_delim));
   }
 
-  if (name == "regexp_contains") {
+  if (name_view == "regexp_contains") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_CONTAINS requires 2 arguments");
@@ -4223,7 +4276,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_match") {
+  if (name_view == "regexp_match") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_MATCH requires 2 arguments");
@@ -4242,7 +4295,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_instr" || name == "byte_regexp_instr") {
+  if (name_view == "regexp_instr" || name_view == "byte_regexp_instr") {
     if (arguments.size() < 2 || arguments.size() > 5) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_INSTR requires 2 to 5 arguments");
@@ -4282,7 +4335,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           StatusCode::kInvalidArgument,
           "REGEXP_INSTR position and occurrence must be positive");
     }
-    const bool byte_mode = name == "byte_regexp_instr";
+    const bool byte_mode = name_view == "byte_regexp_instr";
     const auto offsets = utf8_offsets(s);
     const size_t total_cps = offsets.size() - 1;
     if (static_cast<size_t>(pos_arg) > (byte_mode ? s.size() : total_cps) + 1) {
@@ -4340,7 +4393,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_extract_all" || name == "byte_regexp_extract_all") {
+  if (name_view == "regexp_extract_all" ||
+      name_view == "byte_regexp_extract_all") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT_ALL requires 2 arguments");
@@ -4371,16 +4425,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         ++it;
       }
-      return Value::Array(std::move(results), name == "byte_regexp_extract_all"
-                                                  ? "BYTES"
-                                                  : "STRING");
+      return Value::Array(
+          std::move(results),
+          name_view == "byte_regexp_extract_all" ? "BYTES" : "STRING");
     } catch (...) {
       return StatusError(StatusCode::kInvalidArgument,
                          "invalid regular expression: " + pat);
     }
   }
 
-  if (name == "regexp_extract") {
+  if (name_view == "regexp_extract") {
     if (arguments.size() < 2 || arguments.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_EXTRACT requires 2 to 4 arguments");
@@ -4406,7 +4460,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
   }
 
-  if (name == "regexp_replace") {
+  if (name_view == "regexp_replace") {
     if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "REGEXP_REPLACE requires 3 arguments");
@@ -4415,19 +4469,28 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         arguments[2].IsNull()) {
       return Value();
     }
-    const std::string s = raw_str(arguments[0]);
-    const std::string pat = raw_str(arguments[1]);
-    const std::string rep = raw_str(arguments[2]);
+    std::array<std::string, 3> owned;
+    std::array<std::string_view, 3> views;
+    for (size_t i = 0; i < views.size(); ++i) {
+      if (arguments[i].type == ValueType::kVarChar) {
+        views[i] = arguments[i].AsStringView();
+      } else {
+        owned[i] = raw_str(arguments[i]);
+        views[i] = owned[i];
+      }
+    }
     try {
-      ASSIGN_OR_RETURN(std::regex, re, CompileCheckedRegex(pat));
-      return Value(std::regex_replace(s, re, rep));
+      ASSIGN_OR_RETURN(std::string, replaced,
+                       ReplaceCheckedRegex(views[0], views[1], views[2]));
+      return Value(std::move(replaced));
     } catch (...) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "invalid regular expression: " + pat);
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "invalid regular expression: " + std::string(views[1]));
     }
   }
 
-  if (name == "split_substr") {
+  if (name_view == "split_substr") {
     if (arguments.size() < 2 || arguments.size() > 4) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SPLIT_SUBSTR requires 2 to 4 arguments");
@@ -4503,7 +4566,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "split") {
+  if (name_view == "split") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SPLIT requires 1 or 2 arguments");
@@ -4545,7 +4608,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(elems), "STRING");
   }
 
-  if (name == "soundex") {
+  if (name_view == "soundex") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SOUNDEX requires 1 argument");
@@ -4626,7 +4689,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(res));
   }
 
-  if (name == "translate") {
+  if (name_view == "translate") {
     if (arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TRANSLATE requires 3 arguments");
@@ -4693,10 +4756,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   }
 
   // JSON functions
-  if (name == "json_extract" || name == "json_query" || name == "json_value" ||
-      name == "json_extract_scalar" || name == "json_extract_array" ||
-      name == "json_query_array" || name == "json_value_array" ||
-      name == "json_extract_string_array") {
+  if (name_view == "json_extract" || name_view == "json_query" ||
+      name_view == "json_value" || name_view == "json_extract_scalar" ||
+      name_view == "json_extract_array" || name_view == "json_query_array" ||
+      name_view == "json_value_array" ||
+      name_view == "json_extract_string_array") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -4990,72 +5054,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (!parse_j(json_str, p, root, 0)) {
       return Value();
     }
-    const JVal* cur = &root;
-    size_t path_pos = 0;
-    if (path_pos < path.size() && path[path_pos] == '$') {
-      ++path_pos;
-    }
-    while (path_pos < path.size() && cur != nullptr) {
-      if (path[path_pos] == '.') {
-        ++path_pos;
-        std::string key;
-        if (path_pos < path.size() && path[path_pos] == '"') {
-          if (!parse_str(path, path_pos, key)) {
-            cur = nullptr;
-            break;
-          }
-        } else {
-          size_t end = path_pos;
-          while (end < path.size() && path[end] != '.' && path[end] != '[') {
-            ++end;
-          }
-          key = std::string(path.substr(path_pos, end - path_pos));
-          path_pos = end;
-        }
-        if (cur->type != JVal::kObj) {
-          cur = nullptr;
-          break;
-        }
-        const JVal* next = nullptr;
-        for (const auto& [k, v] : cur->obj) {
-          if (k == key) {
-            next = v.get();
-            break;
-          }
-        }
-        cur = next;
-      } else if (path[path_pos] == '[') {
-        ++path_pos;
-        size_t end = path_pos;
-        while (end < path.size() && path[end] != ']') {
-          ++end;
-        }
-        if (end >= path.size()) {
-          cur = nullptr;
-          break;
-        }
-        const std::string idx_str =
-            std::string(path.substr(path_pos, end - path_pos));
-        path_pos = end + 1;
-        int64_t idx = 0;
-        try {
-          idx = std::stoll(idx_str);
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - incomparable values
-                         // are ignored.
-          cur = nullptr;
-          break;
-        }
-        if (cur->type != JVal::kArr || idx < 0 ||
-            std::cmp_greater_equal(idx, cur->arr.size())) {
-          cur = nullptr;
-          break;
-        }
-        cur = cur->arr[static_cast<size_t>(idx)].get();
-      } else {
-        cur = nullptr;
-        break;
-      }
-    }
+    const JVal* cur = json_doc::NavigateJsonPath(root, path);
     if (cur == nullptr) {
       return Value();
     }
@@ -5067,7 +5066,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       std::vector<Value> elems;
       elems.reserve(cur->arr.size());
       for (const auto& item : cur->arr) {
-        if (name == "json_value_array" || name == "json_extract_string_array") {
+        if (name_view == "json_value_array" ||
+            name_view == "json_extract_string_array") {
           if (item->type == JVal::kNull) {
             elems.emplace_back();
           } else if (item->type == JVal::kStr) {
@@ -5084,7 +5084,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (cur->type == JVal::kNull) {
       return Value();
     }
-    if (name == "json_value" || name == "json_extract_scalar") {
+    if (name_view == "json_value" || name_view == "json_extract_scalar") {
       if (cur->type == JVal::kArr || cur->type == JVal::kObj) {
         return Value();
       }
@@ -5093,7 +5093,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(cur->canonical());
   }
 
-  if (name == "to_json_string") {
+  if (name_view == "to_json_string") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TO_JSON_STRING requires 1 or 2 arguments");
@@ -5120,7 +5120,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        fname + " requires a numeric argument");
   };
-  if (name == "abs") {
+  if (name_view == "abs") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ABS requires 1 argument");
@@ -5145,7 +5145,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "ABS requires a numeric argument");
   }
-  if (name == "sign") {
+  if (name_view == "sign") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SIGN requires 1 argument");
@@ -5171,91 +5171,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "SIGN requires a numeric argument");
   }
-  if (name == "round") {
-    if (arguments.empty() || arguments.size() > 2) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         "ROUND requires 1 or 2 arguments");
-    }
-    if (arguments[0].IsNull() ||
-        (arguments.size() == 2 && arguments[1].IsNull())) {
-      return Value();
-    }
-    int64_t digits = 0;
-    if (arguments.size() == 2) {
-      if (arguments[1].type != ValueType::kInt64) {
-        return StatusError(StatusCode::kInvalidArgument,
-                           "ROUND digits must be an integer");
-      }
-      digits = arguments[1].value.int_value;
-    }
-    // INT64 input must not round-trip through double: |v| > 2^53 loses
-    // precision and INT64_MAX (== 2^63 as a double) casts back to INT64_MIN
-    // (UB). Round on integers directly.
-    if (arguments[0].type == ValueType::kInt64) {
-      if (arguments[0].IsUnsigned()) {
-        const auto v = static_cast<uint64_t>(arguments[0].value.int_value);
-        if (digits >= 0) {
-          return arguments[0];
-        }
-        uint64_t scale = 1;
-        for (int64_t i = 0; i < -digits; ++i) {
-          if (scale > std::numeric_limits<uint64_t>::max() / 10) {
-            return Value(int64_t{0}).WithUnsigned();
-          }
-          scale *= 10;
-        }
-        uint64_t q = v / scale;
-        const uint64_t rem = v % scale;
-        const uint64_t half = scale / 2;
-        if (rem >= half) {
-          q += 1;
-        }
-        uint64_t result = 0;
-        if (__builtin_mul_overflow(q, scale, &result)) {
-          return StatusError(StatusCode::kIsInfinity,
-                             "integer overflow in ROUND");
-        }
-        return Value(static_cast<int64_t>(result)).WithUnsigned();
-      }
-      const int64_t v = arguments[0].value.int_value;
-      if (digits >= 0) {
-        return Value(v);  // an integer is already rounded to >=0 places
-      }
-      int64_t scale = 1;
-      for (int64_t i = 0; i < -digits; ++i) {
-        if (scale > std::numeric_limits<int64_t>::max() / 10) {
-          return Value(int64_t{0});  // scale overflow => result rounds to 0
-        }
-        scale *= 10;
-      }
-      int64_t q = v / scale;
-      const int64_t rem = v % scale;
-      const int64_t half = scale / 2;
-      // Round half away from zero (GoogleSQL ROUND semantics).
-      const bool negative = v < 0;
-      if ((negative ? -rem : rem) >= half) {
-        q += negative ? -1 : 1;
-      }
-      int64_t result = 0;
-      if (__builtin_mul_overflow(q, scale, &result)) {
-        return StatusError(StatusCode::kIsInfinity,
-                           "integer overflow in ROUND");
-      }
-      return Value(result);
-    }
-    if (arguments[0].type == ValueType::kDouble) {
-      const double val = arguments[0].value.double_value;
-      if (std::isnan(val)) {
-        return Value(val);
-      }
-      const double factor = std::pow(10.0, digits);
-      const double res = std::round(val * factor) / factor;
-      return Value(res);
-    }
-    return StatusError(StatusCode::kInvalidArgument,
-                       "ROUND requires a numeric argument");
-  }
-  if (name == "trunc" || name == "truncate") {
+  if (name_view == "trunc" || name_view == "truncate") {
     if (arguments.empty() || arguments.size() > 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 or 2 arguments");
@@ -5314,7 +5230,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires a numeric argument");
   }
-  if (name == "ceil" || name == "ceiling") {
+  if (name_view == "ceil" || name_view == "ceiling") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -5331,7 +5247,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires a numeric argument");
   }
-  if (name == "floor") {
+  if (name_view == "floor") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "FLOOR requires 1 argument");
@@ -5348,7 +5264,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return StatusError(StatusCode::kInvalidArgument,
                        "FLOOR requires a numeric argument");
   }
-  if (name == "mod") {
+  if (name_view == "mod") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "MOD requires 2 arguments");
@@ -5364,8 +5280,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           return StatusError(StatusCode::kIsInfinity,
                              "division by zero in MOD");
         }
-        const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
-        return Value(static_cast<int64_t>(l % r)).WithUnsigned();
+        return arguments[0].TryArithmetic(arguments[1],
+                                          BinaryOperation::kModulo);
       }
       if (arguments[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in MOD");
@@ -5418,7 +5334,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::fmod(l, r));
   }
-  if (name == "pow" || name == "power") {
+  if (name_view == "pow" || name_view == "power") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -5464,7 +5380,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(res);
   }
-  if (name == "sqrt") {
+  if (name_view == "sqrt") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SQRT requires 1 argument");
@@ -5479,7 +5395,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::sqrt(v));
   }
-  if (name == "cbrt") {
+  if (name_view == "cbrt") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "CBRT requires 1 argument");
@@ -5490,7 +5406,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "CBRT"));
     return Value(AccurateCbrt(v));
   }
-  if (name == "greatest" || name == "least") {
+  if (name_view == "greatest" || name_view == "least") {
     if (arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires at least 1 argument");
@@ -5524,18 +5440,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (best.type == ValueType::kInt64 &&
           arguments[i].type == ValueType::kInt64) {
         const bool takes =
-            name == "greatest" ? arguments[i] > best : arguments[i] < best;
+            name_view == "greatest" ? arguments[i] > best : arguments[i] < best;
         if (takes) {
           best = arguments[i];
         }
       } else if (numeric(best) && numeric(arguments[i])) {
-        const bool takes = name == "greatest"
+        const bool takes = name_view == "greatest"
                                ? as_double(arguments[i]) > as_double(best)
                                : as_double(arguments[i]) < as_double(best);
         if (takes) {
           best = arguments[i];
         }
-      } else if (name == "greatest") {
+      } else if (name_view == "greatest") {
         if (arguments[i] > best) {
           best = arguments[i];
         }
@@ -5555,7 +5471,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return best;
   }
-  if (name == "ln") {
+  if (name_view == "ln") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "LN requires 1 argument");
@@ -5566,9 +5482,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "LN"));
     return Value(std::log(v));
   }
-  if (name == "log" || name == "log10") {
-    if (name == "log10" ? arguments.size() != 1
-                        : (arguments.empty() || arguments.size() > 2)) {
+  if (name_view == "log" || name_view == "log10") {
+    if (name_view == "log10" ? arguments.size() != 1
+                             : (arguments.empty() || arguments.size() > 2)) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " argument count mismatch");
     }
@@ -5577,7 +5493,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], name));
-    if (name == "log10") {
+    if (name_view == "log10") {
       return Value(std::log10(v));
     }
     if (arguments.size() == 1) {
@@ -5589,7 +5505,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::log(v) / std::log(base));
   }
-  if (name == "exp") {
+  if (name_view == "exp") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "EXP requires 1 argument");
@@ -5605,7 +5521,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(res);
   }
-  if (name == "cos") {
+  if (name_view == "cos") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "COS requires 1 argument");
@@ -5616,7 +5532,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "COS"));
     return Value(std::cos(v));
   }
-  if (name == "sin") {
+  if (name_view == "sin") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SIN requires 1 argument");
@@ -5627,7 +5543,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "SIN"));
     return Value(std::sin(v));
   }
-  if (name == "tan") {
+  if (name_view == "tan") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TAN requires 1 argument");
@@ -5638,7 +5554,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "TAN"));
     return Value(std::tan(v));
   }
-  if (name == "acos") {
+  if (name_view == "acos") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ACOS requires 1 argument");
@@ -5653,7 +5569,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::acos(v));
   }
-  if (name == "asin") {
+  if (name_view == "asin") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ASIN requires 1 argument");
@@ -5668,7 +5584,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(std::asin(v));
   }
-  if (name == "atan") {
+  if (name_view == "atan") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ATAN requires 1 argument");
@@ -5679,7 +5595,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "ATAN"));
     return Value(std::atan(v));
   }
-  if (name == "atan2") {
+  if (name_view == "atan2") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ATAN2 requires 2 arguments");
@@ -5691,13 +5607,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, x, to_numeric_double(arguments[1], "ATAN2"));
     return Value(std::atan2(y, x));
   }
-  if (name == "pi") {
+  if (name_view == "pi") {
     if (!arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument, "PI takes no arguments");
     }
     return Value(M_PI);
   }
-  if (name == "radians") {
+  if (name_view == "radians") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RADIANS requires 1 argument");
@@ -5708,7 +5624,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, r0, to_numeric_double(arguments[0], "RADIANS"));
     return Value(r0 * (M_PI / 180.0));
   }
-  if (name == "degrees") {
+  if (name_view == "degrees") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DEGREES requires 1 argument");
@@ -5720,7 +5636,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(r0 * (180.0 / M_PI));
   }
 
-  if (name == "cosh") {
+  if (name_view == "cosh") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "COSH requires 1 argument");
@@ -5736,7 +5652,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(res);
   }
-  if (name == "sinh") {
+  if (name_view == "sinh") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SINH requires 1 argument");
@@ -5752,7 +5668,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(res);
   }
-  if (name == "tanh") {
+  if (name_view == "tanh") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TANH requires 1 argument");
@@ -5763,7 +5679,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, v, to_numeric_double(arguments[0], "TANH"));
     return Value(std::tanh(v));
   }
-  if (name == "div") {
+  if (name_view == "div") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "DIV requires 2 arguments");
@@ -5779,8 +5695,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           return StatusError(StatusCode::kIsInfinity,
                              "division by zero in DIV");
         }
-        const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
-        return Value(static_cast<int64_t>(l / r)).WithUnsigned();
+        return arguments[0].TryArithmetic(arguments[1],
+                                          BinaryOperation::kDivide);
       }
       if (arguments[1].value.int_value == 0) {
         return StatusError(StatusCode::kIsInfinity, "division by zero in DIV");
@@ -5806,7 +5722,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(static_cast<int64_t>(quotient));
   }
-  if (name == "ieee_divide" || name == "safe_divide") {
+  if (name_view == "ieee_divide" || name_view == "safe_divide") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -5817,17 +5733,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     ASSIGN_OR_RETURN(double, l, to_numeric_double(arguments[0], name));
     ASSIGN_OR_RETURN(double, r, to_numeric_double(arguments[1], name));
     if (r == 0.0) {
-      return name == "safe_divide" ? Value() : Value(l / r);
+      return name_view == "safe_divide" ? Value() : Value(l / r);
     }
     const double res = l / r;
-    if (name == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
+    if (name_view == "safe_divide" && (std::isinf(res) || std::isnan(res))) {
       return Value();
     }
     return Value(res);
   }
 
-  if (name == "safe_add" || name == "safe_subtract" ||
-      name == "safe_multiply") {
+  if (name_view == "safe_add" || name_view == "safe_subtract" ||
+      name_view == "safe_multiply") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -5848,19 +5764,19 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         const auto l = static_cast<uint64_t>(arguments[0].value.int_value);
         const auto r = static_cast<uint64_t>(arguments[1].value.int_value);
         uint64_t res = 0;
-        if (name == "safe_add") {
+        if (name_view == "safe_add") {
           if (__builtin_add_overflow(l, r, &res)) {
             return Value();
           }
           return Value(static_cast<int64_t>(res)).WithUnsigned();
         }
-        if (name == "safe_subtract") {
+        if (name_view == "safe_subtract") {
           if (__builtin_sub_overflow(l, r, &res)) {
             return Value();
           }
           return Value(static_cast<int64_t>(res)).WithUnsigned();
         }
-        if (name == "safe_multiply") {
+        if (name_view == "safe_multiply") {
           if (__builtin_mul_overflow(l, r, &res)) {
             return Value();
           }
@@ -5869,21 +5785,21 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
       const int64_t l = arguments[0].value.int_value;
       const int64_t r = arguments[1].value.int_value;
-      if (name == "safe_add") {
+      if (name_view == "safe_add") {
         int64_t res = 0;
         if (__builtin_add_overflow(l, r, &res)) {
           return Value();
         }
         return Value(res);
       }
-      if (name == "safe_subtract") {
+      if (name_view == "safe_subtract") {
         int64_t res = 0;
         if (__builtin_sub_overflow(l, r, &res)) {
           return Value();
         }
         return Value(res);
       }
-      if (name == "safe_multiply") {
+      if (name_view == "safe_multiply") {
         int64_t res = 0;
         if (__builtin_mul_overflow(l, r, &res)) {
           return Value();
@@ -5906,14 +5822,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                    : static_cast<double>(arguments[1].value.int_value))
             : arguments[1].value.double_value;
     // SAFE_* return NULL on overflow; the double path must not leak +/-inf.
-    const double checked =
-        name == "safe_add" ? l + r : (name == "safe_subtract" ? l - r : l * r);
+    const double checked = name_view == "safe_add"
+                               ? l + r
+                               : (name_view == "safe_subtract" ? l - r : l * r);
     if (std::isinf(checked) || std::isnan(checked)) {
       return Value();
     }
     return Value(checked);
   }
-  if (name == "safe_negate") {
+  if (name_view == "safe_negate") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SAFE_NEGATE requires 1 argument");
@@ -5940,11 +5857,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     return Value(-arguments[0].value.double_value);
   }
-  if (name == "format") {
+  if (name_view == "format") {
     return ExecuteFunction(name, arguments);
   }
 
-  if (name == "current_timestamp") {
+  if (name_view == "current_timestamp") {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
     platform::GmTime(static_cast<int64_t>(now), &tm);
@@ -5957,7 +5874,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::string(buffer.data()));
   }
 
-  if (name == "make_interval") {
+  if (name_view == "make_interval") {
     if (arguments.size() < 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "make_interval requires at least 2 arguments");
@@ -5968,10 +5885,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     std::string val_str = raw_str(arguments[0]);
     std::string unit_str = raw_str(arguments[1]);
     IntervalValue iv = IntervalValue::Parse(val_str, unit_str);
-    return Value(iv.ToString());
+    return Value(iv.ToString()).WithInterval();
   }
 
-  if (name == "justify_hours") {
+  if (name_view == "justify_hours") {
     if (arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "JUSTIFY_HOURS requires 1 argument");
@@ -5980,10 +5897,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
-    return Value(iv.JustifyHours().ToString());
+    return Value(iv.JustifyHours().ToString()).WithInterval();
   }
 
-  if (name == "justify_days") {
+  if (name_view == "justify_days") {
     if (arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "JUSTIFY_DAYS requires 1 argument");
@@ -5992,10 +5909,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
-    return Value(iv.JustifyDays().ToString());
+    return Value(iv.JustifyDays().ToString()).WithInterval();
   }
 
-  if (name == "justify_interval") {
+  if (name_view == "justify_interval") {
     if (arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "JUSTIFY_INTERVAL requires 1 argument");
@@ -6004,10 +5921,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     IntervalValue iv = IntervalValue::Parse(raw_str(arguments[0]));
-    return Value(iv.JustifyInterval().ToString());
+    return Value(iv.JustifyInterval().ToString()).WithInterval();
   }
 
-  if (name == "collate") {
+  if (name_view == "collate") {
     // COLLATE(value, spec): attaches the collator to the value; the value
     // itself is unchanged.  The spec rule lives in type/collation.hpp so the
     // AST evaluator (expression/function_call_expression.cpp) resolves the
@@ -6024,7 +5941,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         static_cast<uint8_t>(CollationOfSpec(raw_str(arguments[1]))));
   }
 
-  if (name == "array_length") {
+  if (name_view == "array_length") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_LENGTH requires 1 argument");
@@ -6040,7 +5957,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(array.ArrayElements().size()));
   }
 
-  if (name == "array_to_string") {
+  if (name_view == "array_to_string") {
     if (arguments.size() != 2 && arguments.size() != 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_TO_STRING requires 2 or 3 arguments");
@@ -6122,7 +6039,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
   // OFFSET(n) / ORDINAL(n): index accessors; both yield their argument with
   // the convention checked by the caller's bounds.
-  if (name == "offset" || name == "ordinal") {
+  if (name_view == "offset" || name_view == "ordinal") {
     if (arguments.size() != 1 || arguments[0].IsNull()) {
       return Value();
     }
@@ -6133,7 +6050,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(index.value.double_value));
   }
 
-  if (name == "is_inf" || name == "is_nan") {
+  if (name_view == "is_inf" || name_view == "is_nan") {
     if (arguments.size() != 1) {
       return Value();
     }
@@ -6145,13 +6062,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value(int64_t{0});
     }
     const double v = arg.value.double_value;
-    if (name == "is_inf") {
+    if (name_view == "is_inf") {
       return Value(std::isinf(v) ? int64_t{1} : int64_t{0});
     }
     return Value(std::isnan(v) ? int64_t{1} : int64_t{0});
   }
 
-  if (name == "hll_count.extract") {
+  if (name_view == "hll_count.extract") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "HLL_COUNT.EXTRACT requires 1 argument");
@@ -6188,7 +6105,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return TryExtractSketchQuantilesStatic(sketch, number.value.int_value);
   }
 
-  if (name == "array_concat") {
+  if (name_view == "array_concat") {
     if (arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_CONCAT requires at least 1 argument");
@@ -6212,7 +6129,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(merged), element_type);
   }
 
-  if (name == "array_first" || name == "array_last") {
+  if (name_view == "array_first" || name_view == "array_last") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -6228,16 +6145,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     const auto& elements = arr.ArrayElements();
     if (elements.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
-                         name == "array_first"
+                         name_view == "array_first"
                              ? "ARRAY_FIRST cannot get the first element "
                                "of an empty array"
                              : "ARRAY_LAST cannot get the last element of "
                                "an empty array");
     }
-    return name == "array_first" ? elements.front() : elements.back();
+    return name_view == "array_first" ? elements.front() : elements.back();
   }
 
-  if (name == "array_slice") {
+  if (name_view == "array_slice") {
     // ARRAY_SLICE(arr, offset[, size]): 1-based ORDINAL-style bounds; a
     // negative offset counts from the end. Out-of-range clamps to [].
     if (arguments.size() < 2 || arguments.size() > 3) {
@@ -6256,6 +6173,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 3 && arguments[2].IsNull())) {
       return Value();
     }
+    for (size_t i = 1; i < arguments.size(); ++i) {
+      if (arguments[i].type != ValueType::kInt64 || arguments[i].IsUnsigned()) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "ARRAY_SLICE bounds require INT64");
+      }
+    }
     const auto& elements = arr.ArrayElements();
     const auto n = static_cast<int64_t>(elements.size());
     int64_t offset = arguments[1].value.int_value;
@@ -6264,7 +6187,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value::Array({}, arr.ArrayElementSqlType());
     }
     int64_t begin = offset >= 0 ? offset - 1 : n + offset;
-    int64_t end = begin + size;  // exclusive
+    const __int128 wide_end = static_cast<__int128>(begin) + size;
+    int64_t end = static_cast<int64_t>(std::min<__int128>(wide_end, n));
     begin = std::max<int64_t>(begin, 0);
     end = std::min<int64_t>(end, n);
     std::vector<Value> picked;
@@ -6274,7 +6198,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(picked), arr.ArrayElementSqlType());
   }
 
-  if (name == "array_is_distinct") {
+  if (name_view == "array_is_distinct") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_IS_DISTINCT requires 1 argument");
@@ -6312,7 +6236,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(int64_t{1});
   }
 
-  if (name == "generate_array") {
+  if (name_view == "generate_array") {
     return ExecuteFunction(name, arguments);
   }
 
@@ -6324,11 +6248,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // plan-layer constant folds share this exact code path, so delegating
   // here keeps the two engines element-wise identical (integer stepping
   // stays exact near INT64 boundaries).
-  if (name == "generate_series") {
+  if (name_view == "generate_series") {
     return ExecuteFunction(name, arguments);
   }
 
-  if (name == "generate_date_array") {
+  if (name_view == "generate_date_array") {
     if (call.Args().size() < 2 || call.Args().size() > 3 ||
         arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -6462,8 +6386,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(elements), "DATE");
   }
 
-  if (name == "array_includes" || name == "array_includes_any" ||
-      name == "array_includes_all") {
+  if (name_view == "array_includes" || name_view == "array_includes_any" ||
+      name_view == "array_includes_all") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 2 arguments");
@@ -6474,7 +6398,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (input.IsNull() || target.IsNull()) {
       return Value();
     }
-    if (!input.IsArray() || (name != "array_includes" && !target.IsArray())) {
+    if (!input.IsArray() ||
+        (name_view != "array_includes" && !target.IsArray())) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires ARRAY arguments");
     }
@@ -6488,7 +6413,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     };
     const auto& haystack = input.ArrayElements();
     bool result = false;
-    if (name == "array_includes") {
+    if (name_view == "array_includes") {
       result = false;
       for (const Value& element : haystack) {
         if (!element.IsNull() && equals(element, target)) {
@@ -6498,12 +6423,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       }
     } else {
       const auto& targets = target.ArrayElements();
-      result = name != "array_includes_any";
+      result = name_view != "array_includes_any";
       for (const Value& wanted : targets) {
         if (wanted.IsNull()) {
           // NULL target elements match nothing: ANY cannot use them and ALL
           // fails outright.
-          if (name == "array_includes_all") {
+          if (name_view == "array_includes_all") {
             result = false;
           }
           continue;
@@ -6515,7 +6440,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             break;
           }
         }
-        if (name == "array_includes_any") {
+        if (name_view == "array_includes_any") {
           if (found) {
             result = true;
             break;
@@ -6529,7 +6454,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(result);
   }
 
-  if (name == "rand") {
+  if (name_view == "rand") {
     if (!arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "RAND requires no arguments");
@@ -6543,15 +6468,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(uniform(rng));
   }
 
-  if (name == "session_user" || name == "current_user") {
-    if (!arguments.empty()) {
-      return StatusError(StatusCode::kInvalidArgument,
-                         name + " requires no arguments");
-    }
-    return Value(std::string("tinylamb"));
-  }
-
-  if (name == "generate_uuid") {
+  if (name_view == "generate_uuid") {
     if (!arguments.empty()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "GENERATE_UUID requires no arguments");
@@ -6584,8 +6501,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(uuid));
   }
 
-  if (name == "md5" || name == "sha1" || name == "sha256" || name == "sha512" ||
-      name == "farm_fingerprint") {
+  if (name_view == "md5" || name_view == "sha1" || name_view == "sha256" ||
+      name_view == "sha512" || name_view == "farm_fingerprint") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -6594,16 +6511,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return Value();
     }
     const std::string input = raw_str(arguments[0]);
-    if (name == "md5") {
+    if (name_view == "md5") {
       return Value(digest::Md5Digest(input));
     }
-    if (name == "sha1") {
+    if (name_view == "sha1") {
       return Value(digest::Sha1Digest(input));
     }
-    if (name == "sha256") {
+    if (name_view == "sha256") {
       return Value(digest::Sha256Digest(input));
     }
-    if (name == "sha512") {
+    if (name_view == "sha512") {
       return Value(digest::Sha512Digest(input));
     }
     return Value(static_cast<int64_t>(digest::FarmFingerprint64(input)));
@@ -6612,7 +6529,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
   // PARSE_JSON validates strict JSON text and hands it back in the engine's
   // string-based JSON representation; TO_JSON renders a scalar/struct value
   // as JSON text (same shape as the AST evaluator's branch).
-  if (name == "parse_json" || name == "to_json") {
+  if (name_view == "parse_json" || name_view == "to_json") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -6620,7 +6537,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (arguments[0].IsNull()) {
       return Value();
     }
-    if (name == "parse_json") {
+    if (name_view == "parse_json") {
       if (arguments[0].type != ValueType::kVarChar) {
         return StatusError(StatusCode::kInvalidArgument,
                            "PARSE_JSON requires a string argument");
@@ -6635,7 +6552,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(json_text::ToJsonText(arguments[0]));
   }
 
-  if (name == "to_hex") {
+  if (name_view == "to_hex") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TO_HEX requires 1 argument");
@@ -6646,7 +6563,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(digest::ToHex(raw_str(arguments[0])));
   }
 
-  if (name == "to_base64") {
+  if (name_view == "to_base64") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "TO_BASE64 requires 1 argument");
@@ -6690,7 +6607,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
-  if (name == "from_base64") {
+  if (name_view == "from_base64") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "FROM_BASE64 requires 1 argument");
@@ -6743,7 +6660,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
-  if (name == "from_hex") {
+  if (name_view == "from_hex") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "FROM_HEX requires 1 argument");
@@ -6788,7 +6705,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
-  if (name == "safe_convert_bytes_to_string") {
+  if (name_view == "safe_convert_bytes_to_string") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "SAFE_CONVERT_BYTES_TO_STRING requires 1 argument");
@@ -6869,7 +6786,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::move(out));
   }
 
-  if (name == "bit_cast_to_int64" || name == "bit_cast_to_uint64") {
+  if (name_view == "bit_cast_to_int64" || name_view == "bit_cast_to_uint64") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -6898,7 +6815,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "unsupported BIT_CAST input type");
     }
-    if (name == "bit_cast_to_int64") {
+    if (name_view == "bit_cast_to_int64") {
       return Value(static_cast<int64_t>(bits));
     }
     // UINT64 results above INT64_MAX have no exact in-engine representation:
@@ -6909,7 +6826,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(static_cast<int64_t>(bits));
   }
 
-  if (name == "error") {
+  if (name_view == "error") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ERROR requires 1 argument");
@@ -6919,7 +6836,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         arguments[0].IsNull() ? "ERROR()" : raw_str(arguments[0]));
   }
 
-  if (name == "array_reverse") {
+  if (name_view == "array_reverse") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_REVERSE requires 1 argument");
@@ -6937,7 +6854,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(reversed), array.ArrayElementSqlType());
   }
 
-  if (name == "array_is_distinct") {
+  if (name_view == "array_is_distinct") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_IS_DISTINCT requires 1 argument");
@@ -6974,7 +6891,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(int64_t{1});
   }
 
-  if (name == "array_first" || name == "array_last") {
+  if (name_view == "array_first" || name_view == "array_last") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          name + " requires 1 argument");
@@ -6990,17 +6907,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (array.ArrayElements().empty()) {
       return StatusError(
           StatusCode::kInvalidArgument,
-          name == "array_first"
+          name_view == "array_first"
               ? "ARRAY_FIRST cannot get the first element of an empty array"
               : "ARRAY_LAST cannot get the last element of an empty array");
     }
-    if (name == "array_first") {
+    if (name_view == "array_first") {
       return array.ArrayElements().front();
     }
     return array.ArrayElements().back();
   }
 
-  if (name == "array_slice") {
+  if (name_view == "array_slice") {
     if (arguments.size() < 2 || arguments.size() > 3) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ARRAY_SLICE requires two or three arguments");
@@ -7050,7 +6967,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value::Array(std::move(sliced), array.ArrayElementSqlType());
   }
 
-  if (name == "euclidean_distance") {
+  if (name_view == "euclidean_distance") {
     if (arguments.size() != 2) {
       return StatusError(StatusCode::kInvalidArgument,
                          "EUCLIDEAN_DISTANCE requires 2 arguments");
@@ -7114,7 +7031,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     return Value(std::sqrt(total));
   }
 
-  if (name == "element") {
+  if (name_view == "element") {
     if (arguments.size() != 1) {
       return StatusError(StatusCode::kInvalidArgument,
                          "ELEMENT requires 1 argument");

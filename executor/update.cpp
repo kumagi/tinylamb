@@ -57,18 +57,27 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
   std::unordered_map<std::string, int64_t> live_keys;
   std::vector<std::string> old_keys(pending.size());
   if (enforce_primary_key_) {
-    for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
+    auto it = target_->BeginFullScan(*txn_);
+    for (; it.IsValid(); ++it) {
       const Row& current = *it;
       if (current.values_.empty()) {
         continue;
       }
       ++live_keys[UpdateKeyString(current[0])];
     }
+    if (it.GetStatus() != Status::kSuccess) {
+      return FailWith(it.GetStatus());
+    }
     for (size_t i = 0; i < pending.size(); ++i) {
       StatusOr<Row> current = target_->Read(*txn_, pending[i].second);
-      old_keys[i] = (current.HasValue() && !current.Value().values_.empty())
-                        ? UpdateKeyString(current.Value()[0])
-                        : std::string();
+      if (!current.HasValue()) {
+        return FailWith(current.GetStatus());
+      }
+      if (current.Value().values_.empty()) {
+        return FailWith(StatusError(StatusCode::kCorrupt,
+                                    "primary-key update read an empty row"));
+      }
+      old_keys[i] = UpdateKeyString(current.Value()[0]);
       auto found = live_keys.find(old_keys[i]);
       if (found != live_keys.end()) {
         if (--found->second == 0) {

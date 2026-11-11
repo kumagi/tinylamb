@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/query_parallelism.hpp"
 #include "common/set_operation.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
@@ -234,6 +235,9 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
 
 Executor SelectionPlan::EmitExecutor(TransactionContext& ctx) const {
   Executor src = src_->EmitExecutor(ctx);
+  if (ChildAppliesPredicate()) {
+    return src;
+  }
   if (const auto* index_scan = dynamic_cast<IndexScan*>(src.get());
       (index_scan != nullptr) && index_scan->EnforcesIntegerPredicate(exp_)) {
     return src;
@@ -371,7 +375,35 @@ size_t GroupedAggregateWorkers(size_t child_rows) {
 // between them.
 Executor EmitScalarAggregation(const AggregationPlan& plan,
                                TransactionContext& ctx) {
-  const std::vector<NamedExpression>& aggregates = plan.Aggregates();
+  std::vector<NamedExpression> aggregates = plan.Aggregates();
+  for (auto& named : aggregates) {
+    const auto& aggregate = named.expression->AsAggregateExpression();
+    if (aggregate.GetType() != AggregationType::kAvg || aggregate.Distinct() ||
+        aggregate.WhereFilter() || aggregate.NeedsGroupContext() ||
+        aggregate.HasInnerGroupBy() || !aggregate.Child() ||
+        aggregate.Child()->Type() != TypeTag::kCastExp) {
+      continue;
+    }
+    const auto& cast = aggregate.Child()->AsCastExpression();
+    if (cast.TargetValueType() != ValueType::kDouble ||
+        cast.Child()->Type() != TypeTag::kColumnValue) {
+      continue;
+    }
+    const int offset = plan.Child()->GetSchema().Offset(
+        cast.Child()->AsColumnValue().GetColumnName());
+    if (offset < 0) {
+      continue;
+    }
+    const auto& column =
+        plan.Child()->GetSchema().GetColumn(static_cast<size_t>(offset));
+    // AVG's numeric column kernel already converts each input to FLOAT64.
+    // DISTINCT must retain the cast because rounding can merge integer keys.
+    if (!column.IsUnsigned() && (column.Type() == ValueType::kInt64 ||
+                                 column.Type() == ValueType::kDouble)) {
+      named.expression =
+          AggregateExpressionExp(AggregationType::kAvg, cast.Child());
+    }
+  }
   // ParallelAggregationExecutor keeps only streaming scalar state
   // (PartialState has no per-aggregate row buffer), so aggregates that need
   // whole-group context — HAVING MIN/MAX, inner ORDER BY/LIMIT, a secondary
@@ -609,7 +641,7 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
             : dynamic_cast<const FullScanPlan*>(projected->GetSource().get());
     if (base != nullptr && base->CanNarrow() &&
         input->EmitRowCount() >= kParallelScanMinRows &&
-        base->GetSchema().ColumnCount() != 0 && !projected->Columns().empty() &&
+        base->GetSchema().ColumnCount() != 0 &&
         std::ranges::all_of(projected->Columns(), [&](const auto& column) {
           return column.expression &&
                  column.expression->Type() == TypeTag::kColumnValue &&
@@ -735,8 +767,33 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
           ? std::max(input->EmitRowCount(),
                      parallel_scan->MorselCount() * kParallelAggregationMinRows)
           : input->EmitRowCount();
-  if (parallel_safe && !counts_only && !integer_columns &&
-      !deduplicated_covering_keys &&
+  const bool block_columns =
+      parallel_scan != nullptr && simple_columns &&
+      std::ranges::all_of(aggregates, [&](const NamedExpression& named) {
+        const auto& aggregate = named.expression->AsAggregateExpression();
+        if (!aggregate.Child() || aggregate.HasWhereFilter() ||
+            aggregate.NeedsGroupContext()) {
+          return false;
+        }
+        const int offset = source_schema.Offset(
+            aggregate.Child()->AsColumnValue().GetColumnName());
+        if (offset < 0) {
+          return false;
+        }
+        const auto type =
+            source_schema.GetColumn(static_cast<size_t>(offset)).Type();
+        return (aggregates.size() == 1 && aggregate.Distinct() &&
+                aggregate.GetType() == AggregationType::kCount &&
+                (type == ValueType::kInt64 || type == ValueType::kDate ||
+                 type == ValueType::kVarChar)) ||
+               (type == ValueType::kDate && !aggregate.Distinct() &&
+                (aggregate.GetType() == AggregationType::kMin ||
+                 aggregate.GetType() == AggregationType::kMax));
+      });
+  const bool affine_sums =
+      AggregationExecutor::CanFoldAffineSums(source_schema, aggregates);
+  if (parallel_safe && !counts_only && !integer_columns && !affine_sums &&
+      !block_columns && !deduplicated_covering_keys &&
       effective_rows >= kParallelAggregationMinRows) {
     // Cap workers like the parallel table scan path; unbounded
     // hardware_concurrency() oversubscribes under nested or concurrent
@@ -744,7 +801,8 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
     constexpr size_t kMaxParallelAggregationWorkers = 16;
     const size_t workers = std::max<size_t>(
         1, std::min({kMaxParallelAggregationWorkers,
-                     static_cast<size_t>(std::thread::hardware_concurrency()),
+                     QueryParallelWorkerLimit(static_cast<size_t>(
+                         std::thread::hardware_concurrency())),
                      effective_rows / kParallelAggregationMinRows}));
     return std::make_shared<ParallelAggregationExecutor>(
         std::move(source), source_schema, aggregates, workers);
@@ -794,38 +852,44 @@ Executor TopNPlan::EmitExecutor(TransactionContext& ctx) const {
                                      .nulls_first = key.nulls_first,
                                      .collation = key.collation});
   }
-  Plan input = Child();
+  // Moving a pure column projection above TopN preserves multiplicity and
+  // key values, and lets the scan keep row identifiers until a row wins.
   if (const auto* projection =
-          dynamic_cast<const ProjectionPlan*>(input.get())) {
-    const auto* scan =
-        dynamic_cast<const FullScanPlan*>(projection->GetSource().get());
-    if ((scan != nullptr) && scan->CanNarrow() &&
-        scan->GetStats().Columns() >= scan->GetSchema().ColumnCount()) {
-      std::vector<slot_t> slots;
-      bool valid = !projection->Columns().empty();
-      for (const auto& column : projection->Columns()) {
-        if (!column.expression ||
-            column.expression->Type() != TypeTag::kColumnValue) {
-          valid = false;
-          break;
-        }
-        const int offset = scan->GetSchema().Offset(
-            column.expression->AsColumnValue().GetColumnName());
-        if (offset < 0) {
-          valid = false;
-          break;
-        }
-        slots.push_back(static_cast<slot_t>(offset));
+          dynamic_cast<const ProjectionPlan*>(Child().get())) {
+    const bool columns_only = std::ranges::all_of(
+        projection->Columns(), [&](const NamedExpression& column) {
+          return column.expression &&
+                 column.expression->Type() == TypeTag::kColumnValue &&
+                 projection->GetSource()->GetSchema().Offset(
+                     column.expression->AsColumnValue().GetColumnName()) >= 0;
+        });
+    bool direct_keys = columns_only;
+    auto source_keys = keys;
+    for (auto& key : source_keys) {
+      if (key.expression->Type() != TypeTag::kColumnValue) {
+        direct_keys = false;
+        break;
       }
-      // Identity by position: aliases do not change the row image. Reordered
-      // or duplicate projections retain the ordinary projection executor.
-      if (valid && std::ranges::is_sorted(slots) &&
-          std::adjacent_find(slots.begin(), slots.end()) == slots.end()) {
-        input = std::make_shared<FullScanPlan>(*scan, std::move(slots));
+      const int slot = Child()->GetSchema().Offset(
+          key.expression->AsColumnValue().GetColumnName());
+      if (slot < 0 ||
+          static_cast<size_t>(slot) >= projection->Columns().size()) {
+        direct_keys = false;
+        break;
       }
+      key.expression =
+          projection->Columns()[static_cast<size_t>(slot)].expression;
+    }
+    if (direct_keys) {
+      const auto& source = projection->GetSource();
+      Executor top = std::make_shared<TopNExecutor>(
+          source->EmitExecutor(ctx), source->GetSchema(),
+          std::move(source_keys), Limit(), Offset(), WithTies());
+      return std::make_shared<Projection>(projection->Columns(),
+                                          source->GetSchema(), std::move(top));
     }
   }
-  return std::make_shared<TopNExecutor>(input->EmitExecutor(ctx),
+  return std::make_shared<TopNExecutor>(Child()->EmitExecutor(ctx),
                                         Child()->GetSchema(), std::move(keys),
                                         Limit(), Offset(), WithTies());
 }
@@ -1367,7 +1431,7 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
     return std::make_shared<ParallelMergeJoin>(
         Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
         std::move(right), workers, Kind(), Expression(), Schema(),
-        Right()->GetSchema().ColumnCount());
+        Right()->GetSchema().ColumnCount(), Left()->GetSchema().ColumnCount());
   }
   return std::make_shared<MergeJoin>(
       Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),

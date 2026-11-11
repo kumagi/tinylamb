@@ -439,6 +439,42 @@ TEST_F(SqlGroupingSetsTest, WindowOverRollupRanksComposite) {
   EXPECT_EQ(rows[3][1], Value(int64_t{1}));
 }
 
+// TPC-DS Q18 orders by GROUPING values absent from the visible output.
+TEST_F(SqlGroupingSetsTest, HiddenGroupingOrderKeepsVisibleWidth) {
+  const auto rows =
+      Run("SELECT a, SUM(x) AS s FROM g GROUP BY ROLLUP(a) "
+          "ORDER BY GROUPING(a), a NULLS FIRST LIMIT 4");
+  ASSERT_EQ(rows.size(), 4);
+  for (const auto& row : rows) {
+    ASSERT_EQ(row.values_.size(), 2);
+  }
+  EXPECT_TRUE(rows[0][0].IsNull());
+  EXPECT_EQ(rows[0][1], Value(int64_t{40}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[2][0], Value(int64_t{2}));
+  EXPECT_TRUE(rows[3][0].IsNull());
+  EXPECT_EQ(rows[3][1], Value(int64_t{100}));
+}
+
+// Q70/Q86 combine windows with an unprojected CASE over GROUPING.
+TEST_F(SqlGroupingSetsTest, WindowAndHiddenGroupingOrder) {
+  const auto rows =
+      Run("SELECT a, SUM(x) AS s, RANK() OVER (ORDER BY SUM(x) DESC) AS r "
+          "FROM g GROUP BY ROLLUP(a) "
+          "ORDER BY GROUPING(a) DESC, CASE WHEN GROUPING(a) = 0 THEN a END "
+          "NULLS LAST, r");
+  ASSERT_EQ(rows.size(), 4);
+  for (const auto& row : rows) {
+    ASSERT_EQ(row.values_.size(), 3);
+  }
+  EXPECT_EQ(rows[0][1], Value(int64_t{100}));
+  EXPECT_EQ(rows[0][2], Value(int64_t{1}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[2][0], Value(int64_t{2}));
+  EXPECT_TRUE(rows[3][0].IsNull());
+  EXPECT_EQ(rows[3][2], Value(int64_t{2}));
+}
+
 // Shapes the expansion refuses, each with a dedicated diagnostic.
 TEST_F(SqlGroupingSetsTest, UnsupportedShapesRejectWithDiagnostics) {
   EXPECT_THROW(Run("SELECT DISTINCT a, COUNT(*) AS c FROM g GROUP BY "
@@ -447,10 +483,6 @@ TEST_F(SqlGroupingSetsTest, UnsupportedShapesRejectWithDiagnostics) {
   // GROUPING without a set constructor never folds; the evaluator rejects
   // the unknown function instead of guessing a semantics.
   EXPECT_THROW(Run("SELECT GROUPING(a) FROM g GROUP BY a"), std::runtime_error);
-  // Wrapper ORDER BY may only use GROUPING through a select-list entry.
-  EXPECT_THROW(Run("SELECT a, COUNT(*) AS c FROM g GROUP BY ROLLUP(a) "
-                   "ORDER BY GROUPING(a)"),
-               std::runtime_error);
   // GROUPING arguments must be grouping keys.
   EXPECT_THROW(Run("SELECT a, GROUPING(b) AS gb FROM g GROUP BY ROLLUP(a)"),
                std::runtime_error);

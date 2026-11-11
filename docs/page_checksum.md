@@ -1,42 +1,20 @@
-# Page checksum (CRC-32C)
+# Storage integrity checks
 
-## Algorithm
+Individual in-memory `Page` / `RowPage` objects do not carry a persistent
+page checksum. `PagePool`, `Page::SetChecksum`, `Page::IsValid`, `DecodeDisk`
+and the `TYB1` page format belong to the retired page storage implementation.
+They are not interfaces or format requirements of the current engine.
 
-On-disk pages carry a `uint64_t checksum` field in the page header
-(`page/page.hpp`). The value is **CRC-32C (Castagnoli)**, computed by
-`common/crc32c.hpp` over the page image excluding the runtime-only
-`recovery_lsn` and `checksum` slots. The 32-bit digest is stored
-zero-extended in the 64-bit checksum field.
+`PageManager::WriteFuzzyCheckpoint` writes a checksum over the complete
+snapshot payload before the final checksum field. `LoadFuzzyCheckpoint`
+verifies it before decoding the payload and reports `Status::kCorrupt` on a
+mismatch. This uses standard CRC-32C (`Crc32C`, initial and final XOR
+`0xffffffff`). PAX chunk data/footer checksums use the separate raw-register
+`Crc32cOf` convention. See [the format descriptions](page_format.md).
 
-`Page::SetChecksum()` writes the digest; `Page::IsValid()` recomputes and
-compares. `PagePool::WriteBack` always refreshes the checksum before I/O.
-`PagePool::ReadFrom` verifies after a successful full-page read and throws
-`std::runtime_error` (logged with `Status::kCorrupt`) on mismatch.
+WAL record checksums and fixed-segment metadata have their own framing and
+validation rules; see [WAL format](wal_format.md). A snapshot checksum does
+not replace WAL-before-data ordering or protect unpersisted in-memory bytes.
 
-Short reads / past-EOF materialize an in-memory free page without a stored
-checksum (checksum stays 0 until the first write-back).
-
-## Format compatibility
-
-This **replaces** the previous `std::hash<Page>` digest, which was weak and
-implementation-defined. There is **no automatic migration**:
-
-- Existing `.db` files written with `std::hash` checksums will fail to open
-  once a page is read (`corrupt page checksum`).
-- Regenerate fixtures (TPC-H `--reuse-database` only after a fresh load, TPC-C
-  reload, tests that create temp DBs).
-- Treat this as an on-disk format bump for engineering builds; pages now
-  also carry a format magic (`TYB1`) and version validated by `DecodeDisk`
-  (see `docs/page_format.md`).
-
-## Why CRC-32C
-
-- Stable across compilers and platforms (unlike `std::hash`).
-- Detects torn writes and random bit flips better than additive header hashes.
-- Hardware CRC32C can replace the software loop later without changing the
-  on-disk value for the same bytes.
-
-## 実装上の注意(2026-08-24 レビュー反映)
-
-- ダイジェスト範囲に recovery_lsn を含まない。リカバリ経路(GetPageForRecovery)は意図的に検証をバイパス。
-- 全ゼロ領域/EINVAL/CRC==0 の境界挙動、uint64 フィールドに実効32bit値を格納している点、WriteBack 呼び出し元とエラー時挙動、bit-by-bit CRC の計算コスト、`SetChecksum`/`IsValid` の排他ラッチ前提契約——詳細は page.cpp/hpp のコメントと page_pool 実装を参照。
+Regression sources: `common/crc32c_test.cpp`, `page/page_manager_test.cpp`,
+`recovery/checkpoint_manager_test.cpp`, and the PAX chunk tests under `table/`.

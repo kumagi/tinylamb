@@ -127,6 +127,8 @@ TEST(JsonTextStringRenderer, EscapesControlAndQuotes) {
   EXPECT_EQ(json_text::EncodeJsonString("a\tb"), "\"a\\tb\"");
   EXPECT_EQ(json_text::EncodeJsonString(std::string("\x01\x1f")),
             "\"\\u0001\\u001f\"");
+  EXPECT_EQ(json_text::EncodeJsonString(std::string("\0\x0e\x10\x1e", 4)),
+            "\"\\u0000\\u000e\\u0010\\u001e\"");
 }
 
 TEST(JsonTextRenderer, RendersValuesAndArrays) {

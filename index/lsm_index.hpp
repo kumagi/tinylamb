@@ -112,7 +112,7 @@ class LsmIndex {
   Status Destroy(Transaction& txn) const;
 
   void Dump(std::ostream& o, int indent = 0) const;
-  [[nodiscard]] bool CheckSanity(Transaction& /*txn*/) const { return true; }
+  [[nodiscard]] static bool CheckSanity(Transaction& /*txn*/) { return true; }
 
  private:
   page_id_t root_{0};

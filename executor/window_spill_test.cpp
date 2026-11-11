@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -30,9 +31,11 @@
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/data_chunk.hpp"
+#include "executor/detail/window_eval.hpp"
 #include "executor/values.hpp"
 #include "executor/window.hpp"
 #include "expression/expression.hpp"
+#include "expression/function_call_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/window_function_expression.hpp"
 #include "page/row_position.hpp"
@@ -130,6 +133,152 @@ class WindowSpillTest : public ::testing::Test {
   std::unique_ptr<Database> database_;
   std::unique_ptr<TransactionContext> context_;
 };
+
+TEST_F(WindowSpillTest, IntegerPartitionsKeepNullsAndCompositeOrderPeers) {
+  const Schema schema(
+      "keys", {Column("g", ValueType::kInt64), Column("a", ValueType::kInt64),
+               Column("b", ValueType::kVarChar)});
+  std::vector<Row> rows{
+      Row({Value(-1), Value(2), Value("b")}),
+      Row({Value(), Value(1), Value("z")}),
+      Row({Value(-1), Value(1), Value("a")}),
+      Row({Value(), Value(1), Value("a")}),
+      Row({Value(-1), Value(1), Value("a")}),
+      Row({Value(std::numeric_limits<int64_t>::max()), Value(), Value("x")})};
+  WindowFunctionCallExpression rank;
+  rank.function = "RANK";
+  rank.partition_by = {ColumnValueExp("g")};
+  rank.order_by = {{.expression = ColumnValueExp("a")},
+                   {.expression = ColumnValueExp("b"), .ascending = false}};
+  std::vector<Value> result;
+  ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, rank, rows, schema,
+                                                nullptr, {}, &result),
+            Status::kSuccess);
+  EXPECT_EQ(result, (std::vector<Value>{Value(3), Value(1), Value(1), Value(2),
+                                        Value(1), Value(1)}));
+  rank.order_by.clear();
+  ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, rank, rows, schema,
+                                                nullptr, {}, &result),
+            Status::kSuccess);
+  EXPECT_EQ(result, std::vector<Value>(rows.size(), Value(1)));
+}
+
+TEST_F(WindowSpillTest, LongPeerRunsKeepRankAndCumulativeRange) {
+  const Schema schema("peers", {Column("k", ValueType::kInt64)});
+  std::vector<Row> rows;
+  rows.reserve(20000);
+  for (int64_t i = 0; i < 20000; ++i) {
+    rows.emplace_back(Row({i < 10000 ? Value() : Value(1)}));
+  }
+  WindowFunctionCallExpression rank;
+  rank.function = "RANK";
+  rank.order_by = {{.expression = ColumnValueExp("k"),
+                    .ascending = true,
+                    .nulls_first = true}};
+  std::vector<Value> values;
+  ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, rank, rows, schema,
+                                                nullptr, {}, &values),
+            Status::kSuccess);
+  ASSERT_EQ(values.size(), rows.size());
+  EXPECT_EQ(values.front(), Value(1));
+  EXPECT_EQ(values[9999], Value(1));
+  EXPECT_EQ(values[10000], Value(10001));
+  EXPECT_EQ(values.back(), Value(10001));
+  rank.order_by.clear();
+  ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, rank, rows, schema,
+                                                nullptr, {}, &values),
+            Status::kSuccess);
+  for (const auto& value : values) {
+    EXPECT_EQ(value, Value(1));
+  }
+}
+
+TEST_F(WindowSpillTest, BorrowedPartitionKeysMatchComputedKeys) {
+  const Schema schema("keys", {Column("s", ValueType::kVarChar),
+                               Column("d", ValueType::kDouble)});
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  std::vector<Row> rows{
+      Row({Value("independently allocated long text"), Value(nan)}),
+      Row({Value("independently allocated long text"), Value(-nan)}),
+      Row({Value("zero"), Value(-0.0)}),
+      Row({Value("zero"), Value(0.0)}),
+      Row({Value("UPPER").WithCollation(2), Value(1.0)}),
+      Row({Value("upper").WithCollation(2), Value(1.0)}),
+      Row({Value("1-0 0 0:0:0"), Value(2.0)}),
+      Row({Value("01-00 0 00:00:00"), Value(2.0)}),
+      Row({Value(), Value()}),
+      Row({Value(), Value()})};
+  const size_t pattern = rows.size();
+  for (size_t i = pattern; i < 512; ++i) {
+    rows.push_back(rows[i % pattern]);
+  }
+  for (const auto& keys : std::vector<std::vector<Expression>>{
+           {ColumnValueExp("s")},
+           {ColumnValueExp("s"), ColumnValueExp("d")},
+           {}}) {
+    WindowFunctionCallExpression window;
+    window.function = "COUNT";
+    window.args = {ConstantValueExp(Value(1))};
+    window.partition_by = keys;
+    std::vector<Value> actual, expected;
+    ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, window, rows,
+                                                  schema, nullptr, {}, &actual),
+              Status::kSuccess);
+    for (auto& key : window.partition_by) {
+      key = std::make_shared<FunctionCallExpression>(
+          "COALESCE", std::vector<Expression>{key, ConstantValueExp(Value())});
+    }
+    ASSERT_EQ(relational_detail::ComputeOneWindow(
+                  *context_, window, rows, schema, nullptr, {}, &expected),
+              Status::kSuccess);
+    EXPECT_EQ(actual, expected);
+  }
+}
+
+TEST_F(WindowSpillTest, PrefixAggregatesMatchGeneralFrames) {
+  const Schema schema("prefix", {Column("k", ValueType::kInt64),
+                                 Column("v", ValueType::kDouble)});
+  for (const auto& values : std::vector<std::vector<Value>>{
+           {Value(), Value(2.0), Value(-3.0), Value(), Value(8.0)},
+           {Value(), Value(2), Value(-3), Value(), Value(8)},
+           {Value(2), Value(0.5), Value(), Value(-3)},
+           {Value(1.0), Value(std::numeric_limits<double>::quiet_NaN()),
+            Value(4.0)},
+           {Value(std::numeric_limits<int64_t>::max()), Value(1)}}) {
+    std::vector<Row> rows;
+    rows.reserve(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+      rows.emplace_back(Row({Value(static_cast<int64_t>(i)), values[i]}));
+    }
+    for (const std::string function : {"SUM", "AVG", "MIN", "MAX", "COUNT"}) {
+      SCOPED_TRACE(function);
+      WindowFunctionCallExpression window;
+      window.function = function;
+      window.args = {ColumnValueExp("v")};
+      window.order_by = {{.expression = ColumnValueExp("k")}};
+      window.has_frame = true;
+      window.frame_unit = WindowFrameUnit::kRows;
+      window.frame_start.type = WindowFrameBoundType::kUnboundedPreceding;
+      window.frame_end.type = WindowFrameBoundType::kCurrentRow;
+      std::vector<Value> prefix, reference;
+      const auto actual = relational_detail::ComputeOneWindow(
+          *context_, window, rows, schema, nullptr, {}, &prefix);
+      window.frame_start.type = WindowFrameBoundType::kOffsetPreceding;
+      window.frame_start.offset = ConstantValueExp(Value(100));
+      const auto expected = relational_detail::ComputeOneWindow(
+          *context_, window, rows, schema, nullptr, {}, &reference);
+      ASSERT_EQ(actual, expected);
+      if (actual != Status::kSuccess) {
+        continue;
+      }
+      ASSERT_EQ(prefix.size(), reference.size());
+      for (size_t i = 0; i < prefix.size(); ++i) {
+        EXPECT_EQ(prefix[i].type, reference[i].type);
+        EXPECT_EQ(CompareForOrderBy(prefix[i], reference[i]), 0);
+      }
+    }
+  }
+}
 
 TEST_F(WindowSpillTest, PartitionedSpillMatchesTheBufferedShape) {
   std::vector<NamedExpression> outputs{

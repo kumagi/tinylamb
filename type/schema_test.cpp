@@ -33,6 +33,19 @@
 
 namespace tinylamb {
 
+TEST(SchemaAuditTest, RenamePreservesKeyVersionAndLayout) {
+  const Schema original(
+      "old", {Column("v", ValueType::kInt64), Column("key", ValueType::kInt64)},
+      1, 19);
+  const Schema renamed = original.WithName("new");
+  EXPECT_EQ(renamed.KeyColumnIndex(), 1);
+  EXPECT_EQ(renamed.SchemaVersion(), 19);
+  EXPECT_EQ(renamed.AllFixedWidthCells(), original.AllFixedWidthCells());
+  EXPECT_NE(renamed.LookupIdentity(), original.LookupIdentity());
+  EXPECT_EQ(renamed.GetColumn(1).Name(), ColumnName("new", "key"));
+  EXPECT_EQ(original.GetColumn(1).Name(), ColumnName("old", "key"));
+}
+
 TEST(SchemaTest, Constructor_WithValidColumns_InitializesCorrectly) {
   Schema s("sample", {Column(ColumnName("c1"), ValueType::kInt64,
                              Constraint(Constraint::kPrimaryKey)),

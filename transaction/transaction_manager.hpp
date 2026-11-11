@@ -17,6 +17,7 @@
 #ifndef TINYLAMB_TRANSACTION_MANAGER_HPP
 #define TINYLAMB_TRANSACTION_MANAGER_HPP
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -331,12 +332,9 @@ class TransactionManager {
   // Allows full-table scans on read-mostly / freshly-loaded tables to skip
   // per-page version-chain probes in O(shards) instead of O(pages).
   [[nodiscard]] bool HasAnyPageVersionChains() const noexcept {
-    for (const auto& count : page_chain_counts_) {
-      if (count.load(std::memory_order_acquire) != 0) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(page_chain_counts_, [](const auto& count) {
+      return count.load(std::memory_order_acquire) != 0;
+    });
   }
   void SweepCommittedVersionChains() {
     for (size_t i = 0; i < kGcPassDivisor; ++i) {
@@ -556,11 +554,6 @@ class TransactionManager {
   // snapshot taken from it can never observe a half-published commit.
   [[nodiscard]] uint64_t AllocatePendingCommit();
   void PublishCommit(uint64_t ts);
-  // Drops the registry entry and snapshot pin for a transaction whose slot
-  // still points at `txn` (pointer-identity checked).  Called from the
-  // Transaction destructor; no-op once ForgetTransaction already ran.
-  void ReleaseActiveTransaction(Transaction* txn);
-
   // ---- background GC ----
   static constexpr uint64_t kGcCommitThreshold = 8;
   // A version space at or below this many chains is swept in one full pass
@@ -585,7 +578,6 @@ class TransactionManager {
   // Transaction it returns, and a move must carry the registration over to
   // the new address instead of leaving a pointer to the moved-from object.
   void MoveActiveTransaction(Transaction* from, Transaction* to);
-  void UnregisterActiveTransaction(Transaction* txn);
 
   static constexpr size_t kVersionShardCount = 256;
   static constexpr size_t kIndexMutationShardCount = 256;
@@ -659,6 +651,16 @@ class TransactionManager {
   void PageChainCreated(page_id_t pid);
   void PageChainForgotten(page_id_t pid);
 
+  // Byte-sized state flags share one aligned block.
+  std::atomic<bool> index_key_tracking_complete_{true};
+  std::atomic<bool> synchronous_commit_{true};
+  std::atomic<bool> fail_stop_{false};
+  std::atomic<bool> metrics_enabled_{false};
+  std::atomic<bool> gc_stop_{false};
+  std::atomic<uint8_t> deadlock_policy_{
+      static_cast<uint8_t>(DeadlockPolicy::kDeadlockDetect)};
+  std::atomic<bool> deadlock_detector_stop_{false};
+
   std::atomic<uint64_t> commit_timestamp_{0};
   std::atomic<uint64_t> stable_timestamp_{0};
   mutable std::mutex pending_commits_mutex_;
@@ -701,7 +703,6 @@ class TransactionManager {
     }
   };
   std::array<IndexKeyHistory, kIndexMutationShardCount> index_key_history_{};
-  std::atomic<bool> index_key_tracking_complete_{true};
   mutable std::array<VersionShard, kVersionShardCount> version_shards_;
   std::array<std::atomic<int64_t>, kPageChainShardCount> page_chain_counts_{};
   // Exact per-page version-chain presence, sharded by page id (the same
@@ -726,9 +727,6 @@ class TransactionManager {
   // WAL chain serialization lives on Transaction::chain_mu_ (one mutex per
   // transaction); the former manager-wide chain_publish_mu_ serialized every
   // append of every transaction on a single contended lock.
-  std::atomic<bool> synchronous_commit_{true};
-  std::atomic<bool> fail_stop_{false};
-  std::atomic<bool> metrics_enabled_{false};
   std::atomic<uint64_t> wal_wait_count_{0};
   std::atomic<uint64_t> wal_wait_ns_{0};
   // mutable: AcquireIndexWriteGuard is const and records sampled waits.
@@ -752,7 +750,6 @@ class TransactionManager {
   // Rotating shard cursor for the incremental GC pass. Owned by the GC
   // worker thread alone; no synchronization needed.
   size_t gc_cursor_{0};
-  std::atomic<bool> gc_stop_{false};
   std::mutex gc_mutex_;
   std::condition_variable gc_cv_;
   std::thread gc_worker_;
@@ -769,8 +766,6 @@ class TransactionManager {
   // aborts and ~30% less throughput than detection. The explicit kLegacy
   // value remains available for benchmarks that want the pre-policy
   // behavior.
-  std::atomic<uint8_t> deadlock_policy_{
-      static_cast<uint8_t>(DeadlockPolicy::kDeadlockDetect)};
   // Write-intent wait escalation limit; see SetWriteIntentWaitLimit.
   std::atomic<int64_t> write_intent_wait_limit_ms_{5'000};
   // Startup read of TINYLAMB_WRITE_INTENT_WAIT_MS (fallback: the 5 s
@@ -788,7 +783,6 @@ class TransactionManager {
   // Holder-abort fast give-ups; see TransactionRuntimeStats for the meaning.
   std::atomic<uint64_t> write_intent_holder_abort_giveups_{0};
   // Active deadlock detector thread (kDeadlockDetect only).
-  std::atomic<bool> deadlock_detector_stop_{false};
   std::thread deadlock_detector_;
   // Serializes detector spawn so concurrent SetDeadlockPolicy callers cannot
   // double-assign the thread (which would call std::terminate).

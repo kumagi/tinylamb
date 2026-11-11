@@ -546,11 +546,13 @@ TEST_F(CascadesRulesCoverageTest, CountNonNullColumnRewritesToCountStar) {
   EXPECT_EQ(nullable_plan.find("COUNT(*)"), std::string::npos) << nullable_plan;
 }
 
-TEST_F(CascadesRulesCoverageTest, AggregateUnionRewriteIsReachableFromSqlOr) {
+TEST_F(CascadesRulesCoverageTest, AggregateOverOrPreservesPredicateEvaluation) {
   const std::string sql =
       "SELECT COUNT(*), SUM(c1) FROM sc1 WHERE c1 < 3 OR c3 > 106";
   const std::string plan = Explain(sql);
-  EXPECT_NE(plan.find("aggregate_union_transpose"), std::string::npos) << plan;
+  // Splitting OR into independently evaluated UNION branches needs a
+  // non-throwing proof; retaining the original predicate is valid.
+  EXPECT_NE(plan.find(" OR "), std::string::npos) << plan;
   const auto rows = Run(sql);
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(6));

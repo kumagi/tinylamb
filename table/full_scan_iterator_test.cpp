@@ -17,13 +17,17 @@
 #include "full_scan_iterator.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -31,6 +35,7 @@
 #include "common/platform/file_io.hpp"
 #include "common/platform/process.hpp"
 #include "common/random_string.hpp"
+#include "common/runtime_filter.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "database/database.hpp"
@@ -40,6 +45,7 @@
 #include "page/page_manager.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction_manager.hpp"
 #include "type/constraint.hpp"
@@ -92,6 +98,420 @@ class FullScanIteratorTest : public ::testing::Test {
 };
 
 TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {}
+
+TEST_F(FullScanIteratorTest,
+       ExactUniquenessSurvivesRejectedDictionaryEncoding) {
+  auto context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(
+          context,
+          Schema("UniqueProof", {Column("k", ValueType::kInt64),
+                                 Column("duplicate", ValueType::kInt64),
+                                 Column("nullable", ValueType::kInt64)})));
+  for (int64_t i = 0; i < 8192; ++i) {
+    // Exceed the separate first-column dense-domain uniqueness bitmap.
+    const int64_t k = ((i * 4093) % 8192) * 100003;
+    ASSERT_SUCCESS(table
+                       .Insert(context.txn_, Row({Value(k), Value(i % 4096),
+                                                  i < 2 ? Value() : Value(k)}))
+                       .GetStatus());
+  }
+  const auto store = BuildLSTableStore(context.txn_, table);
+  ASSERT_NE(store, nullptr);
+  EXPECT_EQ(store->column_is_monotonic[0], 0);
+  EXPECT_EQ(store->dictionaries[0].wide_code_bytes, 0);
+  EXPECT_EQ(store->column_is_unique_nonnull[0], 1);
+  EXPECT_EQ(store->column_is_unique_nonnull[1], 0);
+  EXPECT_EQ(store->column_is_unique_nonnull[2], 0);
+  ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest,
+       AuditRejectedRuntimeFilterPreservesLegacyKeyFilter) {
+  auto context = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(context, "SampleTable"));
+  for (int64_t key : {1, 2, 3}) {
+    ASSERT_SUCCESS(
+        table.Insert(context.txn_, Row({Value(key), Value("s"), Value(1.0)}))
+            .GetStatus());
+  }
+  std::unordered_set<int64_t> keys{1, 3};
+  TableScanOptions options;
+  options.key_filter = &keys;
+  options.key_column = 0;
+  RuntimeFilterBuilder builder;
+  builder.Observe(3);
+  const auto group = builder.Build();
+  for (bool absent : {false, true}) {
+    auto iterator = table.BeginFullScan(context.txn_, options);
+    iterator.SetRuntimeFilter(absent ? nullptr : group.get(), 1,
+                              ValueType::kInt64);
+    std::vector<int64_t> actual;
+    while (iterator.IsValid()) {
+      actual.push_back((*iterator)[0].value.int_value);
+      ++iterator;
+    }
+    EXPECT_EQ(actual, (std::vector<int64_t>{1, 3}));
+    EXPECT_EQ(iterator.GetStatus(), Status::kSuccess);
+  }
+}
+
+TEST_F(FullScanIteratorTest, AuditRuntimeFilterRebuildsPeekForNewColumn) {
+  auto context = db_->BeginContext();
+  const Schema schema("two_ints", {Column("a", ValueType::kInt64),
+                                   Column("b", ValueType::kInt64)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->CreateTable(context, schema));
+  for (int64_t key : {1, 2, 3}) {
+    ASSERT_SUCCESS(table.Insert(context.txn_, Row({Value(key), Value(key + 1)}))
+                       .GetStatus());
+  }
+  const std::unordered_set<int64_t> keys{1, 2, 3};
+  TableScanOptions options;
+  options.key_filter = &keys;
+  options.key_column = 0;
+  auto iterator = table.BeginFullScan(context.txn_, options);
+  RuntimeFilterBuilder builder;
+  builder.Observe(3);
+  const auto group = builder.Build();
+  iterator.SetRuntimeFilter(group.get(), 1, ValueType::kInt64);
+  ASSERT_TRUE(iterator.IsValid());
+  EXPECT_EQ((*iterator)[0], Value(2));
+  ++iterator;
+  EXPECT_FALSE(iterator.IsValid());
+  EXPECT_EQ(iterator.GetStatus(), Status::kSuccess);
+}
+
+TEST_F(FullScanIteratorTest, NumericStreamsOwnPageSlicesAndPreserveBits) {
+  constexpr int64_t kRows = 4097;
+  const auto make_row = [](int64_t row) {
+    constexpr std::array<uint64_t, 6> kDoubleBits{0,
+                                                  0x8000000000000000ULL,
+                                                  0x7ff0000000000000ULL,
+                                                  0xfff0000000000000ULL,
+                                                  0x7ff8000000000042ULL,
+                                                  1};
+    const int64_t integer = row == 1   ? std::numeric_limits<int64_t>::min()
+                            : row == 2 ? std::numeric_limits<int64_t>::max()
+                                       : -row;
+    return Row({row % 11 == 0 ? Value() : Value(integer),
+                row % 13 == 0 ? Value() : Value::DateFromDays(row - 2000),
+                row % 17 == 0
+                    ? Value()
+                    : Value(std::bit_cast<double>(kDoubleBits[row % 6])),
+                Value(), Value(std::string(80, 'p'))});
+  };
+  {
+    auto context = db_->BeginContext();
+    const Schema schema(
+        "NumericStreams",
+        {Column("n", ValueType::kInt64), Column("d", ValueType::kDate),
+         Column("f", ValueType::kDouble), Column("z", ValueType::kInt64),
+         Column("s", ValueType::kVarChar)});
+    ASSERT_SUCCESS(db_->CreateTable(context, schema).GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(Table, table,
+                          db_->GetTable(context, "NumericStreams"));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(table.Insert(context.txn_, make_row(i)).GetStatus());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "NumericStreams"));
+  const auto store = BuildLSTableStore(reader.txn_, table);
+  ASSERT_NE(store, nullptr);
+  ASSERT_GT(store->blocks.size(), 1U);
+  ASSERT_EQ(store->integer_columns.size(), 5U);
+  EXPECT_TRUE(store->integer_columns[4].empty());
+  size_t base = 0;
+  for (const auto& block : store->blocks) {
+    EXPECT_TRUE(block.columns[4].int_cells.empty());
+    for (size_t c = 0; c < 4; ++c) {
+      const auto& cells = store->integer_columns[c];
+      const auto& column = block.columns[c];
+      ASSERT_EQ(cells.size(), kRows);
+      EXPECT_EQ(column.int_cells.data(), cells.data() + base);
+      ASSERT_EQ(column.int_cells.size(), block.row_count);
+      for (size_t r = 0; r < block.row_count; ++r) {
+        const auto expected = make_row(static_cast<int64_t>(base + r));
+        EXPECT_EQ(column.IsNull(r), expected[c].IsNull());
+        const int64_t bits =
+            expected[c].IsNull() ? 0
+            : c == 2 ? std::bit_cast<int64_t>(expected[c].value.double_value)
+                     : expected[c].value.int_value;
+        EXPECT_EQ(column.int_cells[r], bits);
+        EXPECT_EQ(cells[base + r], bits);
+      }
+    }
+    base += block.row_count;
+  }
+  EXPECT_EQ(base, kRows);
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, NarrowDictionaryStreamsOwnAllPageSlices) {
+  constexpr int64_t kRows = 1200;
+  const auto text = [](int64_t row) {
+    if (row % 17 == 0) {
+      return Value();
+    }
+    if (row % 19 == 0) {
+      return Value("");
+    }
+    std::string value = "東京" + std::string(80, 'p');
+    value.push_back('\0');
+    value += std::to_string(row % 37);
+    return Value(std::move(value));
+  };
+  {
+    auto context = db_->BeginContext();
+    const Schema schema(
+        "NarrowStreams",
+        {Column("n", ValueType::kInt64), Column("d", ValueType::kDouble),
+         Column("b", ValueType::kVarChar), Column("s", ValueType::kVarChar)});
+    ASSERT_SUCCESS(db_->CreateTable(context, schema).GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(Table, table,
+                          db_->GetTable(context, "NarrowStreams"));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_SUCCESS(
+          table
+              .Insert(
+                  context.txn_,
+                  Row({Value(i % 7), Value(static_cast<double>(i % 11) * 0.25),
+                       Value(std::string(1, static_cast<char>('a' + (i % 7)))),
+                       text(i)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "NarrowStreams"));
+  const auto store = BuildLSTableStore(reader.txn_, table);
+  ASSERT_NE(store, nullptr);
+  ASSERT_GT(store->blocks.size(), 1U);
+  for (size_t c = 0; c < 4; ++c) {
+    const auto& dictionary = store->dictionaries[c];
+    ASSERT_TRUE(dictionary.active);
+    ASSERT_EQ(dictionary.narrow_codes.size(), kRows);
+    EXPECT_TRUE(dictionary.wide_codes.empty());
+    size_t base = 0;
+    for (const auto& block : store->blocks) {
+      const auto& column = block.columns[c];
+      EXPECT_EQ(column.dict_codes.data(),
+                dictionary.narrow_codes.data() + base);
+      EXPECT_EQ(column.dict_codes.size(), block.row_count);
+      EXPECT_EQ(column.DictionaryCodeAt(block.row_count), UINT32_MAX);
+      for (size_t r = 0; r < block.row_count; ++r) {
+        const size_t row = base + r;
+        const uint32_t code = column.DictionaryCodeAt(r);
+        EXPECT_EQ(code, dictionary.DictionaryCodeAt(row));
+        if (c == 0) {
+          ASSERT_LT(code, dictionary.int_entries.size());
+          EXPECT_EQ(dictionary.int_entries[code], row % 7);
+        } else if (c == 1) {
+          ASSERT_LT(code, dictionary.double_entries.size());
+          EXPECT_EQ(dictionary.double_entries[code],
+                    static_cast<double>(row % 11) * 0.25);
+        } else if (c == 2) {
+          EXPECT_EQ(column.VarcharAt(r),
+                    std::string(1, static_cast<char>('a' + (row % 7))));
+        } else {
+          const auto expected = text(static_cast<int64_t>(row));
+          EXPECT_EQ(column.IsNull(r), expected.IsNull());
+          if (expected.IsNull()) {
+            EXPECT_EQ(code, LSTableColumnDictionary::kNullCode);
+          } else {
+            EXPECT_EQ(column.VarcharAt(r), expected.value.varchar_value);
+          }
+        }
+      }
+      base += block.row_count;
+    }
+    EXPECT_EQ(base, kRows);
+    EXPECT_EQ(dictionary.DictionaryCodeAt(base), UINT32_MAX);
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, PackedIntegerDictionaryKeepsNullsAndBoundaries) {
+  for (const int64_t cardinality : {int64_t{1}, int64_t{300}, int64_t{65536}}) {
+    const std::string name = "PackedIntegers" + std::to_string(cardinality);
+    const int64_t rows = std::max(int64_t{8193}, (cardinality * 3) + 1);
+    const auto value_at = [cardinality](int64_t i) {
+      if (i % 17 == 0) {
+        return Value();
+      }
+      const int64_t code = i % cardinality;
+      return Value(cardinality == 1 ? 42
+                   : code == 0      ? INT64_MIN
+                   : code == 1      ? INT64_MAX
+                                    : code - 150);
+    };
+    {
+      auto setup = db_->BeginContext();
+      const Schema schema(
+          name, {Column("n", ValueType::kInt64), Column("k", ValueType::kInt64),
+                 Column("d", ValueType::kDate)});
+      ASSERT_SUCCESS(db_->CreateTable(setup, schema).GetStatus());
+      ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, name));
+      for (int64_t i = 0; i < rows; ++i) {
+        ASSERT_SUCCESS(
+            table
+                .Insert(
+                    setup.txn_,
+                    Row({Value(i), value_at(i),
+                         i % 23 == 0 ? Value() : Value::DateFromDays(i % 31)}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(setup.PreCommit());
+    }
+    auto reader = db_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, name));
+    const auto store = BuildLSTableStore(reader.txn_, table);
+    ASSERT_NE(store, nullptr);
+    for (const size_t c : {size_t{1}, size_t{2}}) {
+      const auto& dictionary = store->dictionaries[c];
+      ASSERT_FALSE(dictionary.active);
+      ASSERT_EQ(dictionary.packed_code_bits,
+                std::bit_width(dictionary.int_entries.size()));
+      ASSERT_GE(dictionary.packed_code_bits, 1U);
+      EXPECT_EQ(dictionary.DictionaryCodeCount(), static_cast<size_t>(rows));
+      EXPECT_EQ(
+          dictionary.wide_codes.size(),
+          (((static_cast<size_t>(rows) * dictionary.packed_code_bits) + 7) /
+           8) +
+              7);
+      EXPECT_LT(dictionary.wide_codes.size(),
+                static_cast<size_t>(rows) * dictionary.wide_code_bytes);
+      size_t base = 0;
+      for (const auto& block : store->blocks) {
+        const auto& column = block.columns[c];
+        EXPECT_EQ(column.DictionaryCodeAt(block.row_count), UINT32_MAX);
+        for (size_t row = 0; row < block.row_count; ++row) {
+          const int64_t n = block.columns[0].int_cells[row];
+          const auto expected = c == 1        ? value_at(n)
+                                : n % 23 == 0 ? Value()
+                                              : Value::DateFromDays(n % 31);
+          const uint32_t code = dictionary.DictionaryCodeAt(base + row);
+          EXPECT_EQ(code, column.DictionaryCodeAt(row));
+          if (expected.IsNull()) {
+            EXPECT_EQ(code, dictionary.int_entries.size());
+          } else {
+            ASSERT_LT(code, dictionary.int_entries.size());
+            EXPECT_EQ(dictionary.int_entries[code], expected.value.int_value);
+          }
+        }
+        base += block.row_count;
+      }
+      EXPECT_EQ(base, dictionary.DictionaryCodeCount());
+      EXPECT_EQ(dictionary.DictionaryCodeAt(base), UINT32_MAX);
+      EXPECT_EQ(dictionary.DictionaryCodeAt(SIZE_MAX), UINT32_MAX);
+    }
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+}
+
+TEST_F(FullScanIteratorTest, WideStringDictionaryKeepsBytesAndSnapshot) {
+  for (const int64_t cardinality : {int64_t{300}, int64_t{65536}}) {
+    const std::string name = "WideStrings" + std::to_string(cardinality);
+    const int64_t rows = cardinality == 300 ? 3000 : cardinality * 3;
+    const auto text = [cardinality](int64_t i) {
+      // Some complete page blocks contain only one-byte values; their old
+      // raw-byte fast path must be disabled after installing wider codes.
+      if (cardinality == 300 && i < 1024) {
+        return Value(std::string(1, static_cast<char>('a' + (i % 26))));
+      }
+      if (i % 17 == 0) {
+        return Value();
+      }
+      if (i % 19 == 0) {
+        return Value("");
+      }
+      std::string value = "é東京" + std::string(80, 'p');
+      value.push_back('\0');
+      value += std::to_string(i % cardinality);
+      return Value(std::move(value));
+    };
+    {
+      auto setup = db_->BeginContext();
+      const Schema schema(name, {Column("k", ValueType::kInt64),
+                                 Column("s", ValueType::kVarChar),
+                                 Column("v", ValueType::kDouble)});
+      ASSERT_SUCCESS(db_->CreateTable(setup, schema).GetStatus());
+      ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, name));
+      for (int64_t i = 0; i < rows; ++i) {
+        ASSERT_SUCCESS(
+            table.Insert(setup.txn_, Row({Value(i), text(i), Value(1.0)}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(setup.PreCommit());
+    }
+    auto reader = db_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, name));
+    const auto store = BuildLSTableStore(reader.txn_, table);
+    ASSERT_NE(store, nullptr);
+    const size_t width = cardinality < 65535 ? 2 : 4;
+    ASSERT_EQ(store->dictionaries[1].wide_code_bytes, width);
+    ASSERT_FALSE(store->dictionaries[1].active);
+    size_t row_offset = 0;
+    const auto& dictionary = store->dictionaries[1];
+    EXPECT_EQ(dictionary.wide_codes.size(), static_cast<size_t>(rows) * width);
+    for (const auto& block : store->blocks) {
+      const auto& strings = block.columns[1];
+      EXPECT_TRUE(strings.varchar_ends.empty());
+      EXPECT_TRUE(strings.varchar_bytes.empty());
+      EXPECT_EQ(strings.wide_code_begin, row_offset);
+      EXPECT_EQ(strings.wide_code_count, block.row_count);
+      EXPECT_EQ(strings.DictionaryCodeAt(block.row_count), UINT32_MAX);
+      for (uint32_t r = 0; r < block.row_count; ++r) {
+        EXPECT_TRUE(store->MayContainInteger(0, block.columns[0].int_cells[r]));
+        const auto expected = text(block.columns[0].int_cells[r]);
+        EXPECT_EQ(strings.DictionaryCodeAt(r),
+                  dictionary.DictionaryCodeAt(row_offset + r));
+        EXPECT_EQ(strings.IsNull(r), expected.IsNull());
+        if (!expected.IsNull()) {
+          EXPECT_EQ(strings.VarcharAt(r), expected.value.varchar_value);
+        }
+      }
+      row_offset += block.row_count;
+    }
+    EXPECT_EQ(dictionary.DictionaryCodeAt(static_cast<size_t>(rows)),
+              UINT32_MAX);
+    const auto check_scan = [&] {
+      auto scan = table.BeginFullScan(reader.txn_, {0, 1});
+      TypedCellBatch batch;
+      size_t count = 0;
+      while (const size_t n = scan.DecodeNextTypedBatch(&batch, 137)) {
+        for (size_t r = 0; r < n; ++r) {
+          const auto expected = text(batch.cells[r * batch.stride]);
+          EXPECT_EQ(batch.nulls[(r * batch.stride) + 1] != 0,
+                    expected.IsNull());
+          if (!expected.IsNull()) {
+            EXPECT_EQ(batch.Varchar(r, 0), expected.value.varchar_value);
+          }
+        }
+        count += n;
+      }
+      EXPECT_EQ(count, static_cast<size_t>(rows));
+      EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
+    };
+    check_scan();
+    {
+      auto writer = db_->BeginContext();
+      ASSIGN_OR_ASSERT_FAIL(Table, current, db_->GetTable(writer, name));
+      auto scan = current.BeginFullScan(writer.txn_);
+      const auto position = scan.Position();
+      scan.DropPageLatch();
+      ASSERT_SUCCESS(current
+                         .Update(writer.txn_, position,
+                                 Row({Value(0), Value("updated"), Value(1.0)}))
+                         .GetStatus());
+      ASSERT_SUCCESS(writer.PreCommit());
+    }
+    check_scan();
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+}
 
 TEST_F(FullScanIteratorTest, BeginFullScan_AllRows_ScansSuccessfully) {
   TransactionContext ctx = db_->BeginContext();

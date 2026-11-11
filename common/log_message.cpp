@@ -24,6 +24,7 @@
 #include <iostream>
 #include <tuple>
 
+#include "common/platform/synced_stream.hpp"
 #include "common/platform/time_format.hpp"
 
 namespace tinylamb::detail {
@@ -31,7 +32,8 @@ namespace tinylamb::detail {
 }  // namespace tinylamb::detail
 
 LogStream::~LogStream() {
-  std::cerr << message_.str() << "\033[0;39;49m\n";
+  tinylamb::platform::SyncedOStream(std::cerr)
+      << message_.str() << "\033[0;39;49m\n";
   if (fatal_) {
     std::abort();
   }

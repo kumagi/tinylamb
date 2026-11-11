@@ -2,10 +2,13 @@
 #include "plan/cascades.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -575,7 +578,7 @@ void PushOrLocalConditions(
   }
   // For each table, try to extract local conditions from every branch.
   for (const std::string& table : all_tables) {
-    if (!relation_enabled(table)) {
+    if (!memo.ContainsRelation({table}) || !relation_enabled(table)) {
       continue;
     }
     std::vector<Expression> local_branches;
@@ -622,7 +625,8 @@ std::vector<Expression> PushSingleRelationConjuncts(
         touched.insert(column.schema);
       }
     }
-    if (touched.size() == 1 && relation_enabled(*touched.begin())) {
+    if (touched.size() == 1 && memo.ContainsRelation({*touched.begin()}) &&
+        relation_enabled(*touched.begin())) {
       memo.MergeScanFilter(memo.EnsureGroup({*touched.begin()}), conjunct);
       continue;
     }
@@ -1096,14 +1100,62 @@ GreedyConnectedSplit(const Memo& memo,
   return {std::move(left), std::move(right)};
 }
 
-void AppendIdentityString(std::ostringstream& out, std::string_view text) {
+// Fingerprints are an internal, locale-independent encoding. Stream sentry
+// and locale formatting costs otherwise dominate repeated memo identities for
+// large expression trees; append delimiters and decimal integers directly.
+class IdentityBuffer {
+ public:
+  IdentityBuffer& operator<<(std::string_view text) {
+    text_.append(text);
+    return *this;
+  }
+  IdentityBuffer& operator<<(const char* text) {
+    text_.append(text);
+    return *this;
+  }
+  IdentityBuffer& operator<<(char value) {
+    text_.push_back(value);
+    return *this;
+  }
+  IdentityBuffer& operator<<(bool value) {
+    return *this << static_cast<unsigned>(value);
+  }
+  template <std::integral Integer>
+  IdentityBuffer& operator<<(Integer value) {
+    static_assert(sizeof(Integer) <= sizeof(uint64_t));
+    std::array<char, 32> digits{};
+    const auto converted =
+        std::to_chars(digits.data(), digits.data() + digits.size(), value);
+    text_.append(digits.data(),
+                 static_cast<size_t>(converted.ptr - digits.data()));
+    return *this;
+  }
+  IdentityBuffer& operator<<(const void* pointer) {
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    if (address != 0) {
+      text_.append("0x");
+    }
+    std::array<char, 2 * sizeof(uintptr_t)> digits{};
+    const auto converted = std::to_chars(
+        digits.data(), digits.data() + digits.size(), address, 16);
+    text_.append(digits.data(),
+                 static_cast<size_t>(converted.ptr - digits.data()));
+    return *this;
+  }
+  [[nodiscard]] std::string Take() && { return std::move(text_); }
+
+ private:
+  std::string text_;
+};
+
+void AppendIdentityString(IdentityBuffer& out, std::string_view text) {
   out << text.size() << ':' << text;
 }
 
-void AppendIdentityExpression(std::ostringstream& out,
+void AppendIdentityExpression(IdentityBuffer& out,
                               const Expression& expression);
 
-void AppendIdentityValue(std::ostringstream& out, const Value& value) {
+void AppendIdentityValue(IdentityBuffer& out, const Value& value) {
   out << "v" << static_cast<int>(value.type) << ':'
       << static_cast<unsigned>(value.Collation()) << ':';
   switch (value.type) {
@@ -1131,7 +1183,7 @@ void AppendIdentityValue(std::ostringstream& out, const Value& value) {
   }
 }
 
-void AppendIdentityExpression(std::ostringstream& out,
+void AppendIdentityExpression(IdentityBuffer& out,
                               const Expression& expression) {
   if (!expression) {
     out << "<null>";
@@ -1263,9 +1315,9 @@ void AppendIdentityExpression(std::ostringstream& out,
 }
 
 std::string ExpressionIdentity(const Expression& expression) {
-  std::ostringstream out;
+  IdentityBuffer out;
   AppendIdentityExpression(out, expression);
-  return out.str();
+  return std::move(out).Take();
 }
 
 }  // namespace
@@ -1909,10 +1961,23 @@ bool Memo::AddExpression(GroupId group, LogicalExpression expression) {
   // rejected duplicate must not trip the degradation flag either (§6.10):
   // mirrored associativity rotations re-derive existing expressions by
   // design and those retries have to stay free.
-  const std::string fingerprint = expression.Fingerprint();
+  // The fingerprint starts with the operator, table and child groups. Most
+  // join alternatives differ there already; avoid serializing their complete
+  // predicate trees merely to reject an unequal prefix. Compute a candidate
+  // identity lazily, and keep recomputing existing payloads when needed so
+  // externally rebound parameters or qualified columns cannot stale a cache.
+  std::optional<std::string> fingerprint;
   const bool duplicate =
       std::ranges::any_of(target.expressions, [&](const auto& existing) {
-        return existing.Fingerprint() == fingerprint;
+        if (existing.operation != expression.operation ||
+            existing.table != expression.table ||
+            existing.children != expression.children) {
+          return false;
+        }
+        if (!fingerprint) {
+          fingerprint = expression.Fingerprint();
+        }
+        return existing.Fingerprint() == *fingerprint;
       });
   if (!duplicate && target.expressions.size() >= expression_cap_) {
     degraded_ = true;
@@ -1983,7 +2048,7 @@ bool IsStrictOnRelations(const Expression& expr,
       expr,
       [&](const ColumnName& col) {
         return std::ranges::any_of(relations, [&](const std::string& rel) {
-          return IsSameTable(rel, col.schema);
+          return rel == col.schema;
         });
       },
       /*in_exp_is_strict=*/false);
@@ -1995,7 +2060,7 @@ bool ExpressionRejectsNullsOnRelations(
       expr,
       [&](const ColumnName& col) {
         return std::ranges::any_of(relations, [&](const std::string& rel) {
-          return IsSameTable(rel, col.schema);
+          return rel == col.schema;
         });
       },
       /*bare_column_rejects_null=*/false);
@@ -2138,6 +2203,14 @@ bool WindowValueStableUnderTruncation(
   if (call.function == "ROW_NUMBER" || call.function == "RANK" ||
       call.function == "DENSE_RANK") {
     return true;
+  }
+  // These functions ignore ROWS bounds. Even an explicitly backward frame
+  // cannot make their partition-size / positional result prefix-stable.
+  if (call.function == "NTILE" || call.function == "PERCENT_RANK" ||
+      call.function == "CUME_DIST" || call.function == "LEAD" ||
+      call.function == "LAG" || call.function == "PERCENTILE_CONT" ||
+      call.function == "PERCENTILE_DISC") {
+    return false;
   }
   // Every other call needs an explicit ROWS frame that starts and ends at or
   // before the current row: both bounds then read rows the survivor keeps.
@@ -3070,9 +3143,10 @@ const RuleSet& RuleSet::Default() {
     // inference / transitive closure). Outer joins are not in this memo.
     built.Add(Rule(
         "infer_join_predicates", Join(),
-        [](const Bindings&, Memo& memo, GroupId,
+        [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (expression.predicate) {
+          if (SelectionMayStrengthenSharedScans(memo, group) &&
+              expression.predicate) {
             InferJoinConstants(memo, *expression.predicate);
           }
         },
@@ -4676,11 +4750,7 @@ const RuleSet& RuleSet::Default() {
             const std::unordered_set<std::string> right_rels(
                 right_group.relations.begin(), right_group.relations.end());
             auto resolves_to_right = [&](const ColumnName& col) {
-              return right_rels.contains(col.schema) ||
-                     std::any_of(right_rels.begin(), right_rels.end(),
-                                 [&](const std::string& rel) {
-                                   return IsSameTable(rel, col.schema);
-                                 });
+              return right_rels.contains(col.schema);
             };
 
             // The Selection must be EXACTLY `right.col IS NULL` conjuncts:
@@ -5644,8 +5714,9 @@ const RuleSet& RuleSet::Default() {
         LogicalOperator::kLimit));
 
     // merge_adjacent_windows: Fuse Window_1(Window_2(X)) into a single
-    // Window(X) when both windows have identical PARTITION BY and sort
-    // specifications, and Window_1 does not reference Window_2's outputs.
+    // Window(X) when both windows have identical PARTITION BY and Window_1
+    // does not reference Window_2's outputs. ORDER BY/frame specifications
+    // remain on each target's WindowFunctionCallExpression.
     built.Add(Rule(
         "merge_adjacent_windows", Window(Any("input")),
         [](const Bindings& bindings, Memo& memo, GroupId group,
@@ -5679,6 +5750,8 @@ const RuleSet& RuleSet::Default() {
               continue;
             }
 
+            // Normal window lowering leaves these node-level sort flags
+            // empty; keep a conservative guard for explicitly supplied IR.
             if (expression.sort_ascending != inner_win.sort_ascending ||
                 expression.sort_nulls_first != inner_win.sort_nulls_first) {
               continue;
@@ -6199,9 +6272,10 @@ const RuleSet& RuleSet::Default() {
     // equalities (t1.x > 10 and t1.x = t2.y -> t2.y > 10).
     built.Add(Rule(
         "inferred_inequality_pushdown", Join(),
-        [](const Bindings&, Memo& memo, GroupId,
+        [](const Bindings&, Memo& memo, GroupId group,
            const LogicalExpression& expression) {
-          if (expression.predicate) {
+          if (SelectionMayStrengthenSharedScans(memo, group) &&
+              expression.predicate) {
             InferJoinInequalities(memo, *expression.predicate);
           }
         },

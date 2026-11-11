@@ -260,8 +260,10 @@ int FuzzRowCodecOneInput(const uint8_t* data, size_t size) {
             !SameCell(reused_full[c], original[c])) {
           CodecFail("Decoded cell disagreed with original cell");
         }
-        const std::optional<int64_t> peeked =
-            Row::TryPeekInteger(buf.data(), sc, c);
+        const auto peek_result = Row::TryPeekInteger(buf.data(), sc, c);
+        if (!peek_result.HasValue())
+          CodecFail("Integer peek failed on valid row");
+        const auto peeked = peek_result.Value();
         const ValueType vt = sc.GetColumn(c).Type();
         if (!original[c].IsNull() &&
             (vt == ValueType::kInt64 || vt == ValueType::kDate)) {

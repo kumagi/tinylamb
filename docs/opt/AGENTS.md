@@ -70,7 +70,7 @@ C++ コードの実例つきで解説する書籍の原稿を置く場所であ�
   本体ではない。ファイルへのリンクはリポジトリ相対パス
   (`plan/cascades.cpp` など)で書く。
 
-## 4. 解説対象の全体像: 3 層の Rule セット(2026-09-13 時点)
+## 4. 解説対象の全体像: 3 層の Rule セット(2026-11-11 作業ツリー照合)
 
 tinylamb の最適化は 3 層の独立した Rule セットで構成される
 (`docs/cascades_optimizer.md` 参照)。Rule はグローバル登録ではなく値であり、
@@ -78,8 +78,8 @@ tinylamb の最適化は 3 層の独立した Rule セットで構成される
 
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
-| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 70 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
-| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 83 | Memo へ同値な論理式を追加(探索) |
+| 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 71 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
+| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 86 | Memo へ同値な論理式を追加(探索) |
 | 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を物理プランへ実装(コスト評価の対象) |
 
 第1部で説明すべきインフラ要素:
@@ -122,7 +122,7 @@ docs/opt/
     60-rule-governance.md          Rule 追加・無効化・事前条件ゲート(D5)
     70-expression-rewrite.md       式書き換え: フレームワークと自明な Rule の一括解説
   part2-rules/                     第2部 Rule リファレンス(辞書向け)
-    logical/<rule-name>.md         論理 Rule 83 本(1 ルール 1 ファイル)
+    logical/<rule-name>.md         論理 Rule 86 本(1 ルール 1 ファイル)
     implementation/<rule-name>.md  実装 Rule 46 本(1 ルール 1 ファイル)
     expression/<rule-name>.md      式書き換え Rule の非自明なもの(個別章)
 ```
@@ -233,15 +233,15 @@ docs/opt/
 権威ある一覧はコード。執筆順はこの分類にこだわらず、第1部で必要になる概念から
 先に解説してよい。各 Rule の進捗は 00-index.md のトラッカーで管理する。
 
-### 論理 Rule(83 本)
+### 論理 Rule(86 本)
 
-`join_enumeration`, `join_commutativity`, `join_associativity_left`, `join_associativity_right`, `join_to_cross_if_no_predicate`, `eliminate_false_selection`, `merge_selections`, `push_selection_into_scan`, `push_selection_through_join`, `split_selection_over_join`, `push_filter_past_setop`, `push_filter_through_distinct`, `push_projection_through_union`, `push_projection_through_join`, `merge_projections`, `push_selection_through_projection`, `push_limit_through_projection`, `topn_push_through_projection`, `union_all_push_limit`, `push_selection_through_aggregation`, `infer_join_predicates`, `merge_limits`, `sort_merge_of_compatible_orders`, `eliminate_true_selection`, `setop_empty_simplification`, `setop_empty_identity`, `union_to_union_all_plus_distinct`, `union_all_merge`, `push_filter_through_left_join_left_side`, `join_on_false_to_empty`, `eliminate_double_sort`, `distinct_over_group_by`, `push_projection_through_aggregation`, `limit_push_through_sort`, `push_filter_through_sort`, `eliminate_sort_under_unordered_consumer`, `distinct_over_distinct`, `cross_to_inner_with_predicate`, `join_empty_simplification`, `intersect_to_semijoin`, `except_to_antijoin`, `distinct_and_group_by_interchange`, `self_join_elimination`, `unique_semi_to_inner`, `outer_to_anti_join`, `right_to_left_outer_join`, `full_outer_join_decomposition`, `outer_to_inner_join_on_null_rejecting_filter`, `outer_join_associativity`, `semi_join_inner_join_reorder`, `semi_join_commutativity`, `push_selection_through_window`, `infer_filter_from_equivalence_class`, `push_semi_join_through_inner_join`, `push_limit_through_left_join`, `merge_adjacent_windows`, `push_not_through_expression`, `no_op_window_elimination`, `dynamic_filter_pushdown_join`, `semi_reduction_pushdown_semi_join`, `semi_reduction_pushdown_anti_join`, `join_predicate_transitivity`, `inferred_inequality_pushdown`, `redundant_join_predicate_elimination`, `unnest_filter_pushdown`, `recursive_termination_predicate_pushdown`, `in_list_to_semi_join`, `functional_dependency_filter_reduction`, `filter_aggregate_pushdown`, `aggregate_union_transpose`, `pk_unique_distinct_elimination`, `not_null_is_not_null_elimination`, `join_identity_dummy`, `count_star_rewrite_on_not_null`, `topn_push_through_proven_one_to_one_join`, `or_to_union`, `distinct_eager_over_join`, `topn_push_through_union_all`, `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`, `extract_year_sargable`, `comparison_self_predicates`
+`join_enumeration`, `join_commutativity`, `join_associativity_left`, `join_associativity_right`, `join_to_cross_if_no_predicate`, `eliminate_false_selection`, `merge_selections`, `push_selection_into_scan`, `push_selection_through_join`, `split_selection_over_join`, `push_filter_past_setop`, `push_filter_through_distinct`, `push_projection_through_union`, `push_projection_through_join`, `merge_projections`, `push_selection_through_projection`, `push_limit_through_projection`, `topn_push_through_projection`, `union_all_push_limit`, `push_selection_through_aggregation`, `infer_join_predicates`, `merge_limits`, `sort_merge_of_compatible_orders`, `eliminate_true_selection`, `setop_empty_simplification`, `setop_empty_identity`, `union_to_union_all_plus_distinct`, `union_all_merge`, `push_filter_through_left_join_left_side`, `join_on_false_to_empty`, `eliminate_double_sort`, `distinct_over_group_by`, `push_projection_through_aggregation`, `limit_push_through_sort`, `push_filter_through_sort`, `eliminate_sort_under_unordered_consumer`, `distinct_over_distinct`, `cross_to_inner_with_predicate`, `join_empty_simplification`, `intersect_to_semijoin`, `except_to_antijoin`, `distinct_and_group_by_interchange`, `self_join_elimination`, `unique_semi_to_inner`, `outer_to_anti_join`, `right_to_left_outer_join`, `full_outer_join_decomposition`, `outer_to_inner_join_on_null_rejecting_filter`, `outer_join_associativity`, `semi_join_inner_join_reorder`, `semi_join_commutativity`, `push_selection_through_window`, `infer_filter_from_equivalence_class`, `push_semi_join_through_inner_join`, `push_limit_through_left_join`, `merge_adjacent_windows`, `push_not_through_expression`, `no_op_window_elimination`, `dynamic_filter_pushdown_join`, `semi_reduction_pushdown_semi_join`, `semi_reduction_pushdown_anti_join`, `join_predicate_transitivity`, `inferred_inequality_pushdown`, `redundant_join_predicate_elimination`, `unnest_filter_pushdown`, `recursive_termination_predicate_pushdown`, `in_list_to_semi_join`, `functional_dependency_filter_reduction`, `filter_aggregate_pushdown`, `aggregate_union_transpose`, `pk_unique_distinct_elimination`, `not_null_is_not_null_elimination`, `join_identity_dummy`, `count_star_rewrite_on_not_null`, `topn_push_through_proven_one_to_one_join`, `or_to_union`, `distinct_eager_over_join`, `topn_push_through_union_all`, `split_window`, `values_fold_into_union`, `cast_pushdown_on_comparison`, `extract_year_sargable`, `comparison_self_predicates`, `constant_unnest_to_values`, `limit_prefix_ordered_window`, `limit_prefix_unordered_window`
 
 ### 実装 Rule(46 本)
 
 `relational_ir`, `dummy_scan`, `values`, `unnest`, `apply`, `recursive_cte`, `index_scan`, `full_scan`, `selection`, `sample`, `projection`, `aggregation`, `sort_incremental`, `sort`, `sort_external_merge`, `window`, `topn`, `empty`, `distinct`, `sort_distinct`, `skip_scan_distinct`, `union`, `union_all`, `intersect`, `intersect_all`, `except`, `except_all`, `limit`, `hash_join`, `merge_join`, `band_join`, `zigzag_join`, `outer_hash_join`, `cross_join`, `semi_hash_join`, `anti_hash_join`, `semi_merge_join`, `anti_merge_join`, `index_join`, `late_materialization_join`, `nested_loop_join`, `outer_nested_loop`, `batch_nested_loop`, `batch_nested_loop_semi`, `batch_nested_loop_anti`, `batch_nested_loop_outer`
 
-### 式書き換え Rule(70 本)(決定: 2026-09-13 — 1 本も飛ばさない)
+### 式書き換え Rule(71 本)(決定: 2026-09-13 — 1 本も飛ばさない)
 
 `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` は全 Rule を解説
 する。定数畳み込み(`x + 0`、`x * 1` など)のように自明度の高いものは

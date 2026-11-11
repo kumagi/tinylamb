@@ -19,10 +19,12 @@
 #include "expression/cast_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/interval_expression.hpp"
+#include "expression/json_doc.hpp"
 #include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/unary_expression.hpp"
@@ -849,7 +851,7 @@ TEST(ExpressionRewriteTest, ArithmeticIdentitiesAndDoubleNegation) {
   EXPECT_EQ(rewrite(BinaryExpressionExp(x, BinaryOperation::kDivide,
                                         ConstantValueExp(Value(1))))
                 ->Type(),
-            TypeTag::kColumnValue);
+            TypeTag::kBinaryExp);
 
   // A dynamic INT64 child may hold INT64_MIN, where `-(-x)` throws while the
   // folded `x` would not: the collapse must stay.
@@ -2378,8 +2380,12 @@ TEST(ExpressionRewriteTest, BooleanFilterPullup) {
       BinaryOperation::kOr, a_eq_1);
   Expression rewritten_absorb = rewriter.Rewrite(absorb);
   ASSERT_EQ(rewritten_absorb->Type(), TypeTag::kBinaryExp);
-  EXPECT_EQ(rewritten_absorb->AsBinaryExpression().Op(),
-            BinaryOperation::kEquals);
+  // The discarded b comparison can raise for an untyped STRING column.
+  const Schema mixed(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kVarChar)});
+  const Row bad({Value(1), Value("not a number")});
+  EXPECT_FALSE(absorb->TryEvaluate(bad, mixed).HasValue());
+  EXPECT_FALSE(rewritten_absorb->TryEvaluate(bad, mixed).HasValue());
 }
 
 TEST(ExpressionRewriteTest, NotInNullSemantics) {
@@ -3112,6 +3118,100 @@ TEST(ExpressionRewriteTest, IsNullStrictWhereAndExpressionRejectsNullsWhere) {
   EXPECT_FALSE(ExpressionRejectsNullsWhere(or_one, match_x));
   EXPECT_FALSE(ExpressionRejectsNullsWhere(col_x, match_x, false));
   EXPECT_TRUE(ExpressionRejectsNullsWhere(col_x, match_x, true));
+}
+
+TEST(ExpressionAuditTest, RewriteKeepsUnknownColumnTypeErrors) {
+  const Schema schema(
+      "s", {Column("n", ValueType::kInt64), Column("s", ValueType::kVarChar)});
+  const Row row({Value(1), Value("text")});
+  const Expression membership =
+      InExpressionExp(ColumnValueExp("n"), {ConstantValueExp(Value("abc"))});
+  const Expression null_value = ConstantValueExp(Value());
+  const Expression bad_boolean = BinaryExpressionExp(
+      null_value, BinaryOperation::kAnd,
+      BinaryExpressionExp(null_value, BinaryOperation::kOr, membership));
+  const Expression division =
+      BinaryExpressionExp(ColumnValueExp("s"), BinaryOperation::kDivide,
+                          ConstantValueExp(Value(1)));
+  for (const Expression& expression : {bad_boolean, division}) {
+    SCOPED_TRACE(expression->ToString());
+    const auto original = expression->TryEvaluate(row, schema);
+    ASSERT_FALSE(original.HasValue());
+    const auto rewritten =
+        ExpressionRewriter(ExpressionRuleSet::Default()).Rewrite(expression);
+    EXPECT_FALSE(rewritten->TryEvaluate(row, schema).HasValue())
+        << rewritten->ToString();
+  }
+}
+
+TEST(ExpressionAuditTest, SyntheticJsonNodesOwnRawText) {
+  auto scalar =
+      json_doc::family::JValFromSqlValue(Value(int64_t{1234567890123456789}));
+  EXPECT_EQ(scalar.raw, "1234567890123456789");
+  EXPECT_EQ(json_doc::LaxToString(scalar), Value("1234567890123456789"));
+  std::shared_ptr<json_doc::JVal> child;
+  {
+    auto array = json_doc::family::JValFromSqlValue(
+        Value::Array({Value(int64_t{1234567890123456789})}, "INT64"));
+    ASSERT_EQ(array.arr.size(), 1U);
+    child = array.arr[0];
+  }
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(json_doc::LaxToString(*child), Value("1234567890123456789"));
+}
+
+TEST(ExpressionAuditTest, JsonPathQuotedMembersAndInvalidSuffixes) {
+  const auto root = json_doc::ParseDocument(R"({"a b":[10,20]})");
+  ASSERT_TRUE(root.has_value());
+  for (const char* path : {"$[\"a b\"][1]", "$['a b'][1]", "$.\"a b\"[1]"}) {
+    const auto* selected = json_doc::NavigateJsonPath(*root, path);
+    ASSERT_NE(selected, nullptr) << path;
+    EXPECT_EQ(selected->raw, "20");
+  }
+  for (const char* path : {"$['a b'][1junk]", "$['a b'][1", "$['a b'][]"}) {
+    EXPECT_EQ(json_doc::NavigateJsonPath(*root, path), nullptr) << path;
+  }
+}
+
+TEST(ExpressionAuditTest, JsonPathIndexesNeverWrap) {
+  auto document = json_doc::ParseDocument("[1,2,3]");
+  ASSERT_TRUE(document.has_value());
+  for (const std::string path : {"$[4294967297]", "$[18446744073709551617]",
+                                 "$[9999999999999999999999999]"}) {
+    EXPECT_EQ(json_doc::NavigateJsonPath(*document, path), nullptr) << path;
+  }
+  EXPECT_FALSE(
+      json_doc::ParsePathSegments("$[18446744073709551617]").has_value());
+  EXPECT_TRUE(
+      json_doc::ParsePathSegments("$[9223372036854775807]").has_value());
+}
+
+class AuditEvaluationContext final : public EvaluationContext {
+ public:
+  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement&,
+                                           const Row*) override {
+    return Status::kNotExists;
+  }
+  const AggregateResultMap* CurrentAggregates() const override {
+    return nullptr;
+  }
+  Status GetOrAddFunction(std::string_view, int) override {
+    return Status::kSuccess;
+  }
+};
+
+TEST(ExpressionAuditTest, IfErrorContextMatchesPlainPromotion) {
+  AuditEvaluationContext context;
+  const Schema schema("s", {Column("v", ValueType::kInt64)});
+  const Row row({Value(2)});
+  const auto expression = FunctionCallExp(
+      "iferror", {ColumnValueExp("v"), ConstantValueExp(Value(0.5))});
+  const auto plain = expression->TryEvaluate(row, schema);
+  const auto scoped = expression->TryEvaluate(row, schema, context);
+  ASSERT_TRUE(plain.HasValue());
+  ASSERT_TRUE(scoped.HasValue());
+  EXPECT_EQ(scoped.Value().type, plain.Value().type);
+  EXPECT_EQ(scoped.Value(), plain.Value());
 }
 
 }  // namespace tinylamb

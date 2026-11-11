@@ -344,6 +344,28 @@ ARRAY<STRUCT<INT64>>[unknown order:{2}, {1}]
   ASSERT_EQ(cases[3].expected_rows.size(), 2U);
 }
 
+TEST(GoogleSqlComplianceFile, AuditNestedArrayScalarKeepsInnerBrackets) {
+  const auto cases = ParseGoogleSqlComplianceFile("nested.test", R"test(
+[name=nested]
+SELECT 1
+--
+ARRAY<ARRAY<INT64>>[[1, 2], [3, [4, 5]], []]
+==
+)test");
+  ASSERT_EQ(cases.size(), 1U);
+  EXPECT_EQ(cases[0].expected_rows, (std::vector<std::vector<std::string>>{
+                                        {"[1, 2]"}, {"[3, [4, 5]]"}, {"[]"}}));
+  const auto truncated = ParseGoogleSqlComplianceFile("truncated.test", R"test(
+[name=truncated]
+SELECT 1
+--
+ARRAY<INT64>[unknown order:
+==
+)test");
+  ASSERT_EQ(truncated.size(), 1U);
+  EXPECT_TRUE(truncated[0].expected_rows.empty());
+}
+
 TEST(GoogleSqlComplianceFile, MatchesIntBoolAndNull) {
   EXPECT_TRUE(ComplianceValueMatches(Value(int64_t{1}), "1"));
   EXPECT_TRUE(ComplianceValueMatches(Value(int64_t{1}), "true"));

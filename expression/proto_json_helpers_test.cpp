@@ -54,6 +54,32 @@ TEST(JsonStructHelpersTest, JsonTextToValueParsesScalars) {
   EXPECT_FALSE(JsonTextToValue("not json", &parsed));
 }
 
+TEST(JsonStructHelpersTest, AuditArrayStringsRoundTripInsideStructMembers) {
+  const std::vector<Value> elements{Value("a\"b,c"),
+                                    Value("slash\\tail"),
+                                    Value("line\nbreak\ttab"),
+                                    Value(std::string("nul\0byte", 8)),
+                                    Value(""),
+                                    Value("NULL"),
+                                    Value()};
+  const Value source = Value::Array(elements, "STRING");
+  auto encoded = TryEncodeStructMemberJson(source);
+  ASSERT_TRUE(encoded.HasValue());
+  Value decoded;
+  ASSERT_TRUE(JsonTextToValue(encoded.Value(), &decoded));
+  ASSERT_EQ(decoded.type, ValueType::kArray);
+  EXPECT_EQ(decoded.ArrayElements(), elements);
+  auto empty = TryEncodeStructMemberJson(Value::Array({}, "STRING"));
+  ASSERT_TRUE(empty.HasValue());
+  ASSERT_TRUE(JsonTextToValue(empty.Value(), &decoded));
+  EXPECT_TRUE(decoded.ArrayElements().empty());
+  EXPECT_FALSE(JsonTextToValue(R"(ARRAY<STRING>["unterminated])", &decoded));
+  ASSERT_TRUE(JsonTextToValue(R"("\uD83D\uDE00")", &decoded));
+  EXPECT_EQ(decoded, Value("😀"));
+  EXPECT_FALSE(JsonTextToValue(R"("\uD800")", &decoded));
+  EXPECT_FALSE(JsonTextToValue(R"("\q")", &decoded));
+}
+
 TEST(JsonStructHelpersTest, EncodeStructMemberJsonCoversValueTypes) {
   auto as_int = TryEncodeStructMemberJson(Value(int64_t{5}));
   ASSERT_TRUE(as_int.HasValue());

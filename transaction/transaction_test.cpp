@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -297,7 +298,7 @@ TEST_F(TransactionTest, MVCCVisibilityChain) {
   ASSERT_TRUE(writer.AddWriteSet(rp));
   writer.RegisterVersionWrite(rp, std::nullopt, "v1");
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   // Assert 1 -- a snapshot reader started after the commit sees "v1"
   {
@@ -334,7 +335,7 @@ TEST_F(TransactionTest, ReadVersionDeleteVisibleAsNotExists) {
   ASSERT_TRUE(writer.AddWriteSet(rp));
   writer.RegisterVersionWrite(rp, "v", std::nullopt);
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   // Act -- read the deleted row from a snapshot after the commit
   Transaction reader = tm_->Begin(true);
@@ -369,7 +370,7 @@ TEST_F(TransactionTest, GcDropsRedundantLatestVersionBeforeDeleteIntentRead) {
     ASSERT_TRUE(writer.AddWriteSet(rp));
     writer.RegisterVersionWrite(rp, std::nullopt, "physical");
     ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-    writer.CommitWait();
+    ASSERT_SUCCESS(writer.CommitWait());
   }
 
   const auto deadline =
@@ -450,6 +451,62 @@ TEST_F(TransactionTest, AddWriteSetFailsWhenMvccIntentHeldElsewhere) {
   contender.Abort();
 }
 
+TEST_F(TransactionTest, AuditReservationModeKeepsRegistrationWithoutDiscount) {
+  const char* mode = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
+  const bool discount_off = mode != nullptr && std::string_view(mode) == "4";
+  if (mode != nullptr && std::string_view(mode) != "0" && !discount_off)
+    GTEST_SKIP();
+  Transaction owner = tm_->Begin();
+  Transaction other = tm_->Begin();
+  owner.ReserveIndexUndoBytes(132, 64);
+  EXPECT_TRUE(tm_->HasForeignIndexReservations(other.ID()));
+  EXPECT_EQ(other.IndexUndoReservedBytes(132), discount_off ? 0U : 64U);
+  EXPECT_EQ(owner.IndexUndoReservedBytes(132), 0U);
+  ASSERT_SUCCESS(owner.Abort());
+  EXPECT_FALSE(tm_->HasForeignIndexReservations(other.ID()));
+}
+
+TEST_F(TransactionTest, AuditWaitFailuresCarrySpecificDiagnostics) {
+  const RowPosition rp(131, 1);
+  Transaction done = tm_->Begin();
+  ASSERT_SUCCESS(done.PreCommit());
+  EXPECT_EQ(tm_->WaitForRowWriteIntent(done, rp), Status::kConflicts);
+  EXPECT_EQ(done.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kConflict);
+  Transaction wounded = tm_->Begin();
+  wounded.Wound();
+  EXPECT_EQ(tm_->WaitForRowWriteIntent(wounded, rp), Status::kConflicts);
+  EXPECT_EQ(wounded.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kWounded);
+  tm_->SetDeadlockPolicy(TransactionManager::DeadlockPolicy::kNoWait);
+  Transaction no_wait = tm_->Begin();
+  EXPECT_EQ(tm_->WaitForRowWriteIntent(no_wait, rp), Status::kConflicts);
+  EXPECT_EQ(no_wait.LastIntentWaitFailure(),
+            Transaction::IntentWaitFailure::kConflict);
+}
+
+TEST_F(TransactionTest, AuditWoundedReservationCannotBypassAcquisition) {
+  const RowPosition rp(130, 1);
+  Transaction owner = tm_->Begin();
+  ASSERT_TRUE(owner.TryAddWriteSet(rp));
+  owner.Wound();
+  EXPECT_FALSE(owner.AddWriteSet(rp, "before"));
+  EXPECT_FALSE(owner.AddWriteSet(rp));
+  EXPECT_FALSE(owner.TryAddWriteSet(rp));
+  owner.Abort();
+}
+
+TEST_F(TransactionTest, AuditDefaultTransactionIntentApisAreSafe) {
+  Transaction txn;
+  const RowPosition rp(130, 2);
+  EXPECT_FALSE(txn.SnapshotSeesRow(rp));
+  EXPECT_FALSE(txn.AddWriteSet(rp));
+  EXPECT_FALSE(txn.AddWriteSet(rp, "before"));
+  EXPECT_FALSE(txn.TryAddWriteSet(rp));
+  EXPECT_NO_FATAL_FAILURE(txn.ReleaseWriteIntent(rp));
+  EXPECT_EQ(txn.CommitWait(), Status::kSuccess);
+}
+
 TEST_F(TransactionTest, DefaultTransactionReadVersionWithoutManager) {
   // Arrange -- a default-constructed Transaction (no TransactionManager)
   Transaction txn;
@@ -520,7 +577,7 @@ TEST_F(TransactionTest, ReadOnlyCacheHitServesStableSnapshot) {
   ASSERT_TRUE(writer.AddWriteSet(rp));
   writer.RegisterVersionWrite(rp, std::nullopt, "v1");
   ASSERT_EQ(writer.PreCommit(), Status::kSuccess);
-  writer.CommitWait();
+  ASSERT_SUCCESS(writer.CommitWait());
 
   Transaction reader = tm_->Begin(true);
   auto first = reader.ReadVersion(rp, std::nullopt);
@@ -536,7 +593,7 @@ TEST_F(TransactionTest, ReadOnlyCacheHitServesStableSnapshot) {
     ASSERT_TRUE(writer2.AddWriteSet(rp));
     writer2.RegisterVersionWrite(rp, "v1", "v2");
     ASSERT_EQ(writer2.PreCommit(), Status::kSuccess);
-    writer2.CommitWait();
+    ASSERT_SUCCESS(writer2.CommitWait());
   }
   auto third = reader.ReadVersion(rp, std::nullopt);
   ASSERT_SUCCESS_AND_EQ(third, "v1");

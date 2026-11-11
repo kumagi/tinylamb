@@ -1503,7 +1503,7 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         if (upper == "INTERVAL") {
           ASSIGN_OR_RETURN(IntervalValue, iv, IntervalValue::TryParse(s));
           ASSIGN_OR_RETURN(std::string, iv_text, iv.TryToString());
-          return Value(std::move(iv_text));
+          return Value(std::move(iv_text)).WithInterval();
         }
         if (upper == "STRING") {
           return Value(std::move(s));

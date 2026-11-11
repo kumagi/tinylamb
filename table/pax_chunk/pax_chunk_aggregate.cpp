@@ -14,10 +14,42 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <bit>
+#include <utility>
+
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
 namespace tinylamb {
+
+bool TryAccumulateScaledSum(int64_t coefficient, __int128 subtotal,
+                            __int128* total) {
+  constexpr __int128 kMin = std::numeric_limits<__int128>::min();
+  constexpr __int128 kMax = std::numeric_limits<__int128>::max();
+  // Check before multiplying: even the intermediate must fit in 128 bits.
+  // Handling -1 separately also avoids the undefined kMin / -1 division.
+  if (coefficient == -1) {
+    if (subtotal == kMin) {
+      return false;
+    }
+  } else if (coefficient > 1) {
+    if (subtotal > kMax / coefficient || subtotal < kMin / coefficient) {
+      return false;
+    }
+  } else if (coefficient < -1) {
+    if (subtotal > kMin / coefficient || subtotal < kMax / coefficient) {
+      return false;
+    }
+  }
+  const __int128 product = subtotal * coefficient;
+  if ((product > 0 && *total > kMax - product) ||
+      (product < 0 && *total < kMin - product)) {
+    return false;
+  }
+  *total += product;
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Vectorized scan engine (compressed-data processing)
@@ -49,11 +81,11 @@ inline bool ScanMatch(int64_t v, ScanOp op, int64_t lit) {
 // ScanMatch cases return false so the caller keeps scalar semantics
 // (unknown ops match nothing). `bits` holds ceil(n/64) row-major words and
 // is assumed zero-initialized.
-#if defined(__AVX2__)
+#ifdef __AVX2__
 namespace predicate_mask {
 enum class Cmp { kEq, kLt, kLe, kGt, kGe };
 
-#if defined(__x86_64__)
+#ifdef __x86_64__
 // Runtime gate for the 8-lane kernels below. The library is compiled with
 // -mavx2, so the AVX-512 bodies live behind target attributes and are only
 // entered on CPUs that report F/BW/VL (Zen 4/5, Ice Lake+).
@@ -114,13 +146,15 @@ __attribute__((target("avx512f,avx512bw,avx512vl"))) void FillMaskAvx512(
     uint64_t word = 0;
     for (int j = 0; j < 8; ++j) {
       const __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
-          vals + i + static_cast<ptrdiff_t>(8) * j));
+          vals + i + (static_cast<ptrdiff_t>(8) * j)));
       word |= static_cast<uint64_t>(Mask8<C>(v, vlit)) << (8 * j);
     }
     bits[out] = word;
   }
   for (; i < n; ++i) {
-    if (ScanMatch(vals[i], op, lit)) bits[i >> 6] |= 1ULL << (i & 63);
+    if (ScanMatch(vals[i], op, lit)) {
+      bits[i >> 6] |= 1ULL << (i & 63);
+    }
   }
 }
 #if defined(__GNUC__) && !defined(__clang__)
@@ -156,14 +190,16 @@ void FillMask(const int64_t* vals, uint32_t n, ScanOp op, int64_t lit,
     uint64_t word = 0;
     for (int j = 0; j < 16; ++j) {
       const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          vals + i + static_cast<ptrdiff_t>(4) * j));
+          vals + i + (static_cast<ptrdiff_t>(4) * j)));
       word |= static_cast<uint64_t>(static_cast<uint16_t>(Mask4<C>(v, vlit)))
               << (4 * j);
     }
     bits[i >> 6] = word;
   }
   for (; i < n; ++i) {
-    if (ScanMatch(vals[i], op, lit)) bits[i >> 6] |= 1ULL << (i & 63);
+    if (ScanMatch(vals[i], op, lit)) {
+      bits[i >> 6] |= 1ULL << (i & 63);
+    }
   }
 }
 }  // namespace predicate_mask
@@ -173,7 +209,7 @@ bool FillPredicateMaskAvx2(const int64_t* vals, uint32_t n, ScanOp op,
                            int64_t lit, uint64_t* bits) {
   using predicate_mask::Cmp;
   using predicate_mask::FillMask;
-#if defined(__x86_64__)
+#ifdef __x86_64__
   if (predicate_mask::HasAvx512()) {
     switch (op) {
       case ScanOp::kEq:
@@ -218,7 +254,7 @@ bool FillPredicateMaskAvx2(const int64_t* vals, uint32_t n, ScanOp op,
 struct PlainPredicateMask {
   using Cmp = predicate_mask::Cmp;
 
-#if defined(__x86_64__)
+#ifdef __x86_64__
   // 8-row body of the BE-region kernel: one 64B load + one byte-swap
   // shuffle + one vpcmp with a direct mask-register result. Same tail
   // discipline as FillMaskAvx512: only full 64-row words are ISA-specific.
@@ -245,7 +281,8 @@ struct PlainPredicateMask {
       for (uint32_t j = 0; j < 8; ++j) {
         const __m512i v = _mm512_shuffle_epi8(
             _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
-                region + static_cast<size_t>(i + 8U * j) * sizeof(int64_t))),
+                region +
+                (static_cast<size_t>(i + (8U * j)) * sizeof(int64_t)))),
             bswap);
         word |= static_cast<uint64_t>(predicate_mask::Mask8<C>(v, vlit))
                 << (8U * j);
@@ -255,8 +292,9 @@ struct PlainPredicateMask {
     // Remainder: the AVX2 body already stops at 64-row words, so its
     // 16/4/1-row tails are reused verbatim (called directly: the partial
     // word is never worth a second runtime dispatch).
-    FillPlainMaskAvx2Body<C>(region + static_cast<size_t>(i) * sizeof(int64_t),
-                             n - i, op, lit, bits + out);
+    FillPlainMaskAvx2Body<C>(
+        region + (static_cast<size_t>(i) * sizeof(int64_t)), n - i, op, lit,
+        bits + out);
   }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
@@ -298,7 +336,7 @@ struct PlainPredicateMask {
     const auto load = [&](uint32_t row) {
       return _mm256_shuffle_epi8(
           _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-              region + static_cast<size_t>(row) * sizeof(int64_t))),
+              region + (static_cast<size_t>(row) * sizeof(int64_t)))),
           bswap);
     };
     const auto mask16 = [&](uint32_t row) -> uint16_t {
@@ -320,7 +358,9 @@ struct PlainPredicateMask {
     };
     uint32_t i = 0;
     size_t out = 0;
-    for (; i + 64 <= n; i += 64, ++out) bits[out] = make_word(i);
+    for (; i + 64 <= n; i += 64, ++out) {
+      bits[out] = make_word(i);
+    }
     for (; i + 16 <= n; i += 16) {
       bits[out] |= static_cast<uint64_t>(mask16(i)) << (i & 63U);
     }
@@ -331,7 +371,7 @@ struct PlainPredicateMask {
     }
     for (; i < n; ++i) {
       if (ScanMatch(static_cast<int64_t>(ReadBE64(
-                        region + static_cast<size_t>(i) * sizeof(int64_t))),
+                        region + (static_cast<size_t>(i) * sizeof(int64_t)))),
                     op, lit)) {
         bits[out] |= 1ULL << (i & 63U);
       }
@@ -365,7 +405,7 @@ struct PlainPredicateMask {
 
 // AVX2 byte-aligned unpack for FOR-BA (values are `bpv` LE bytes + base).
 // Accelerates the dominant scan path; scalar tail handles the remainder.
-#if defined(__AVX2__)
+#ifdef __AVX2__
 void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
                      int64_t base, int64_t* out) {
   // Byte-aligned FOR-BA caps bpv at 8 (validator contract); the scalar tail
@@ -426,7 +466,7 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
   } else if (bpv == 2) {
     for (; i + 16 <= n; i += 16) {
       const __m256i b = _mm256_loadu_si256(
-          reinterpret_cast<const __m256i*>(vp + static_cast<size_t>(i) * 2));
+          reinterpret_cast<const __m256i*>(vp + (static_cast<size_t>(i) * 2)));
       const __m256i lo = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(b));
       const __m256i hi = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(b, 1));
       _mm256_storeu_si256(
@@ -449,7 +489,7 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
   } else if (bpv == 4) {
     for (; i + 8 <= n; i += 8) {
       const __m256i b = _mm256_loadu_si256(
-          reinterpret_cast<const __m256i*>(vp + static_cast<size_t>(i) * 4));
+          reinterpret_cast<const __m256i*>(vp + (static_cast<size_t>(i) * 4)));
       const __m256i lo = _mm256_add_epi64(
           _mm256_cvtepu32_epi64(_mm256_castsi256_si128(b)), vbase);
       const __m256i hi = _mm256_add_epi64(
@@ -460,7 +500,7 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
   } else if (bpv == 8) {
     for (; i + 4 <= n; i += 4) {
       const __m256i b = _mm256_loadu_si256(
-          reinterpret_cast<const __m256i*>(vp + static_cast<size_t>(i) * 8));
+          reinterpret_cast<const __m256i*>(vp + (static_cast<size_t>(i) * 8)));
       _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
                           _mm256_add_epi64(b, vbase));
     }
@@ -469,24 +509,25 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
     // the bpv-byte LE fields into two i64 lanes (high bytes zeroed via the
     // 0x80 control). Every window stays inside the value array -- the tail
     // below owns the last values whose window would cross the region end.
-    alignas(16) unsigned char ctlb[16];
-    std::memset(ctlb, 0x80, sizeof(ctlb));
+    alignas(16) std::array<unsigned char, 16> ctlb{};
+    std::memset(ctlb.data(), 0x80, sizeof(ctlb));
     for (uint32_t k = 0; k < bpv; ++k) {
       ctlb[k] = static_cast<unsigned char>(k);
       ctlb[8 + k] = static_cast<unsigned char>(bpv + k);
     }
-    const __m128i ctl = _mm_load_si128(reinterpret_cast<const __m128i*>(ctlb));
+    const __m128i ctl =
+        _mm_load_si128(reinterpret_cast<const __m128i*>(ctlb.data()));
     const __m128i vbase2 = _mm_set1_epi64x(base);
     const uint64_t nbytes = static_cast<uint64_t>(n) * bpv;
-    for (; i + 2 <= n && (static_cast<uint64_t>(i) + 2) * bpv + 16 <= nbytes;
+    for (; i + 2 <= n && ((static_cast<uint64_t>(i) + 2) * bpv) + 16 <= nbytes;
          i += 4) {
       const __m128i a =
           _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(
-                               vp + static_cast<size_t>(i) * bpv)),
+                               vp + (static_cast<size_t>(i) * bpv))),
                            ctl);
       const __m128i b =
           _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(
-                               vp + static_cast<size_t>(i + 2) * bpv)),
+                               vp + (static_cast<size_t>(i + 2) * bpv))),
                            ctl);
       _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
                           _mm256_add_epi64(_mm256_set_m128i(b, a), vbase));
@@ -495,7 +536,7 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
          i += 2) {
       const __m128i a =
           _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(
-                               vp + static_cast<size_t>(i) * bpv)),
+                               vp + (static_cast<size_t>(i) * bpv))),
                            ctl);
       _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i),
                        _mm_add_epi64(a, vbase2));
@@ -505,21 +546,22 @@ void UnpackForBaAvx2(const unsigned char* src, uint32_t n, uint32_t bpv,
   // byte assembly for the last <ceil(8/bpv) values.
   const uint64_t m = (bpv >= 8) ? ~0ULL : ((1ULL << (8U * bpv)) - 1);
   for (; i < n && static_cast<uint64_t>(n - i) * bpv >= 8; ++i) {
-    uint64_t raw;
-    std::memcpy(&raw, vp + static_cast<size_t>(i) * bpv, 8);
+    uint64_t raw{};
+    std::memcpy(&raw, vp + (static_cast<size_t>(i) * bpv), 8);
     out[i] = static_cast<int64_t>(static_cast<uint64_t>(base) + (raw & m));
   }
   for (; i < n; ++i) {
     uint64_t off = 0;
-    for (uint32_t b = 0; b < bpv; ++b)
-      off |= static_cast<uint64_t>(vp[i * bpv + b]) << (8 * b);
+    for (uint32_t b = 0; b < bpv; ++b) {
+      off |= static_cast<uint64_t>(vp[(i * bpv) + b]) << (8 * b);
+    }
     out[i] = static_cast<int64_t>(static_cast<uint64_t>(base) + off);
   }
 }
 #endif
 
 // Build the match mask (all-ones where decoded value satisfies op against lit).
-#if defined(__AVX2__)
+#ifdef __AVX2__
 template <ScanOp Op>
 inline __m256i ScanMatchMaskFixed(__m256i v, __m256i vlit) {
   if constexpr (Op == ScanOp::kEq) {
@@ -575,19 +617,19 @@ bool PlainSum128Avx2(const char* region, uint32_t n, __int128* sum_out) {
   size_t i = 0;
   for (; i + 16 <= n; i += 16) {
     const __m256i v0 = _mm256_shuffle_epi8(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + i * 8)),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + (i * 8))),
         bswap);
     const __m256i v1 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 32)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 32)),
         bswap);
     const __m256i v2 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 64)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 64)),
         bswap);
     const __m256i v3 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 96)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 96)),
         bswap);
     const __m256i l0 = _mm256_and_si256(v0, low_mask);
     const __m256i l1 = _mm256_and_si256(v1, low_mask);
@@ -608,23 +650,23 @@ bool PlainSum128Avx2(const char* region, uint32_t n, __int128* sum_out) {
   }
   for (; i + 4 <= n; i += 4) {
     const __m256i v = _mm256_shuffle_epi8(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + i * 8)),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + (i * 8))),
         bswap);
     const __m256i l = _mm256_and_si256(v, low_mask);
     const __m256i h = sign_extend_high(_mm256_srli_epi64(v, 32));
     low0 = _mm256_add_epi64(low0, l);
     high0 = _mm256_add_epi64(high0, h);
   }
-  alignas(32) uint64_t low_lanes[16];
-  alignas(32) uint64_t high_lanes[16];
-  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes), low0);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes + 4), low1);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes + 8), low2);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes + 12), low3);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes), high0);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes + 4), high1);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes + 8), high2);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes + 12), high3);
+  alignas(32) std::array<uint64_t, 16> low_lanes{};
+  alignas(32) std::array<uint64_t, 16> high_lanes{};
+  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes.data()), low0);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes.data() + 4), low1);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes.data() + 8), low2);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(low_lanes.data() + 12), low3);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes.data()), high0);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes.data() + 4), high1);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes.data() + 8), high2);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(high_lanes.data() + 12), high3);
   uint64_t low = 0;
   int64_t high = 0;
   for (size_t lane = 0; lane < 16; ++lane) {
@@ -632,13 +674,13 @@ bool PlainSum128Avx2(const char* region, uint32_t n, __int128* sum_out) {
     high += static_cast<int64_t>(high_lanes[lane]);
   }
   for (; i < n; ++i) {
-    const uint64_t value = ReadBE64(region + static_cast<size_t>(i) * 8);
-    const uint32_t high_bits = static_cast<uint32_t>(value >> 32);
+    const uint64_t value = ReadBE64(region + (i * 8));
+    const auto high_bits = static_cast<uint32_t>(value >> 32);
     low += value & 0xFFFFFFFFULL;
     high += static_cast<int64_t>(high_bits) -
             ((high_bits & UINT32_C(0x80000000)) != 0 ? INT64_C(1) << 32 : 0);
   }
-  *sum_out = static_cast<__int128>(high) * (INT64_C(1) << 32) +
+  *sum_out = (static_cast<__int128>(high) * (INT64_C(1) << 32)) +
              static_cast<__int128>(low);
   return true;
 }
@@ -664,19 +706,19 @@ bool ScanPlainCountSumAvx2Impl(const char* region, uint32_t n, ScanOp op,
   size_t i = 0;
   for (; i + 16 <= n; i += 16) {
     const __m256i v0 = _mm256_shuffle_epi8(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + i * 8)),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + (i * 8))),
         bswap);
     const __m256i v1 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 32)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 32)),
         bswap);
     const __m256i v2 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 64)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 64)),
         bswap);
     const __m256i v3 = _mm256_shuffle_epi8(
         _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(bytes + i * 8 + 96)),
+            reinterpret_cast<const __m256i*>(bytes + (i * 8) + 96)),
         bswap);
     const __m256i m0 = ScanMatchMaskFixed<Op>(v0, vlit);
     const __m256i m1 = ScanMatchMaskFixed<Op>(v1, vlit);
@@ -697,23 +739,25 @@ bool ScanPlainCountSumAvx2Impl(const char* region, uint32_t n, ScanOp op,
   }
   for (; i + 4 <= n; i += 4) {
     const __m256i v = _mm256_shuffle_epi8(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + i * 8)),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + (i * 8))),
         bswap);
     const __m256i m = ScanMatchMaskFixed<Op>(v, vlit);
     count0 += static_cast<uint64_t>(__builtin_popcount(
         static_cast<unsigned>(_mm256_movemask_pd(_mm256_castsi256_pd(m)))));
     sum0 = _mm256_add_epi64(sum0, _mm256_and_si256(v, m));
   }
-  alignas(32) uint64_t sum_lanes[16];
-  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes), sum0);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes + 4), sum1);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes + 8), sum2);
-  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes + 12), sum3);
+  alignas(32) std::array<uint64_t, 16> sum_lanes{};
+  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes.data()), sum0);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes.data() + 4), sum1);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes.data() + 8), sum2);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(sum_lanes.data() + 12), sum3);
   uint64_t sum = 0;
-  for (const uint64_t lane : sum_lanes) sum += lane;
+  for (const uint64_t lane : sum_lanes) {
+    sum += lane;
+  }
   uint64_t count = count0 + count1 + count2 + count3;
   for (; i < n; ++i) {
-    const uint64_t value = ReadBE64(region + static_cast<size_t>(i) * 8);
+    const uint64_t value = ReadBE64(region + (i * 8));
     if (ScanMatch(static_cast<int64_t>(value), op, lit)) {
       ++count;
       sum += value;
@@ -756,17 +800,19 @@ inline bool DecodeXorForByteAligned(const char* packed, uint32_t n,
     return false;
   }
   const size_t bytes = width / 8U;
-  const size_t available = static_cast<size_t>(end - packed);
+  const auto available = static_cast<size_t>(end - packed);
   const size_t needed = static_cast<size_t>(n - 1) * bytes;
-  if (needed > available) return false;
-#if defined(__AVX2__)
+  if (needed > available) {
+    return false;
+  }
+#ifdef __AVX2__
   if (width == 56) {
     const __m128i gather =
         _mm_setr_epi8(6, 5, 4, 3, 2, 1, 0, -1, 13, 12, 11, 10, 9, 8, 7, -1);
     const __m256i upper_mask = _mm256_set_epi64x(-1, -1, 0, 0);
-    uint64_t x = static_cast<uint64_t>(out[0]);
+    auto x = static_cast<uint64_t>(out[0]);
     size_t i = 0;
-    for (; i + 4 <= n - 1 && i * 7 + 30 <= available; i += 4) {
+    for (; i + 4 <= n - 1 && (i * 7) + 30 <= available; i += 4) {
       const size_t offset = i * 7;
       const __m128i first = _mm_shuffle_epi8(
           _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + offset)),
@@ -778,7 +824,7 @@ inline bool DecodeXorForByteAligned(const char* packed, uint32_t n,
       __m256i values = _mm256_set_m128i(second, first);
       values = _mm256_xor_si256(values, _mm256_slli_si256(values, 8));
       const __m128i low = _mm256_castsi256_si128(values);
-      const uint64_t carry = static_cast<uint64_t>(_mm_extract_epi64(low, 1));
+      const auto carry = static_cast<uint64_t>(_mm_extract_epi64(low, 1));
       values = _mm256_xor_si256(
           values,
           _mm256_and_si256(_mm256_set1_epi64x(static_cast<long long>(carry)),
@@ -791,7 +837,7 @@ inline bool DecodeXorForByteAligned(const char* packed, uint32_t n,
     for (; i < n - 1; ++i) {
       uint64_t value = 0;
       for (size_t b = 0; b < 7; ++b) {
-        value = (value << 8) | static_cast<unsigned char>(packed[i * 7 + b]);
+        value = (value << 8) | static_cast<unsigned char>(packed[(i * 7) + b]);
       }
       x ^= value;
       out[i + 1] = static_cast<int64_t>(x);
@@ -800,12 +846,14 @@ inline bool DecodeXorForByteAligned(const char* packed, uint32_t n,
   }
 #endif
   const int shift = 64 - static_cast<int>(width);
-  uint64_t x = static_cast<uint64_t>(out[0]);
+  auto x = static_cast<uint64_t>(out[0]);
   size_t i = 0;
   for (; i < n - 1; ++i) {
     const size_t offset = i * bytes;
-    if (offset + sizeof(uint64_t) > available) break;
-    uint64_t word;
+    if (offset + sizeof(uint64_t) > available) {
+      break;
+    }
+    uint64_t word{};
     std::memcpy(&word, packed + offset, sizeof(word));
     x ^= be64toh(word) >> shift;
     out[i + 1] = static_cast<int64_t>(x);
@@ -825,16 +873,16 @@ inline bool DecodeXorForByteAligned(const char* packed, uint32_t n,
 #if defined(__AVX2__) && (defined(__x86_64__) || defined(__i386__))
 __attribute__((target("avx512f,avx512bw"))) void DecodePlainAvx512(
     const char* region, uint32_t n, int64_t* out) {
-  alignas(64) static constexpr uint8_t kBswap[64] = {
+  alignas(64) static constexpr std::array<uint8_t, 64> kBswap = {
       7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
       7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
       7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
       7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8};
-  const __m512i bswap = _mm512_load_si512(kBswap);
+  const __m512i bswap = _mm512_load_si512(kBswap.data());
   uint32_t i = 0;
   for (; i + 16 <= n; i += 16) {
-    __m512i v0 = _mm512_loadu_si512(region + static_cast<size_t>(i) * 8);
-    __m512i v1 = _mm512_loadu_si512(region + static_cast<size_t>(i + 8) * 8);
+    __m512i v0 = _mm512_loadu_si512(region + (static_cast<size_t>(i) * 8));
+    __m512i v1 = _mm512_loadu_si512(region + (static_cast<size_t>(i + 8) * 8));
     v0 = _mm512_shuffle_epi8(v0, bswap);
     v1 = _mm512_shuffle_epi8(v1, bswap);
     _mm512_storeu_si512(out + i, v0);
@@ -842,12 +890,12 @@ __attribute__((target("avx512f,avx512bw"))) void DecodePlainAvx512(
   }
   for (; i + 8 <= n; i += 8) {
     const __m512i v = _mm512_shuffle_epi8(
-        _mm512_loadu_si512(region + static_cast<size_t>(i) * 8), bswap);
+        _mm512_loadu_si512(region + (static_cast<size_t>(i) * 8)), bswap);
     _mm512_storeu_si512(out + i, v);
   }
   for (; i < n; ++i) {
     out[i] =
-        static_cast<int64_t>(ReadBE64(region + static_cast<size_t>(i) * 8));
+        static_cast<int64_t>(ReadBE64(region + (static_cast<size_t>(i) * 8)));
   }
 }
 
@@ -883,15 +931,16 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       static_cast<size_t>(g) >= footer_.row_counts.size()) {
     throw std::out_of_range("DecodeInt64ColumnRg: group/column out of range");
   }
-  const uint32_t off_idx =
-      static_cast<uint32_t>(g) * footer_.column_count + col;
+  const uint32_t off_idx = (g * footer_.column_count) + col;
   if (static_cast<size_t>(off_idx) >= footer_.column_offsets.size() ||
       static_cast<size_t>(off_idx) >= footer_.encodings.size() ||
       static_cast<size_t>(off_idx) >= footer_.params.size()) {
     throw std::out_of_range("DecodeInt64ColumnRg: footer arrays misaligned");
   }
   const uint16_t rc = footer_.row_counts[g];
-  if (rc == 0) return;  // every scheme below writes out[0] unconditionally
+  if (rc == 0) {
+    return;  // every scheme below writes out[0] unconditionally
+  }
   if (decoded_int_cache_ready_ &&
       static_cast<size_t>(off_idx) + 1 < decoded_int_offsets_.size() &&
       decoded_int_offsets_[off_idx + 1] > decoded_int_offsets_[off_idx]) {
@@ -908,7 +957,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
   if (region == nullptr) {
     throw std::out_of_range("DecodeInt64ColumnRg: hostile column offset");
   }
-  const Scheme s = static_cast<Scheme>(footer_.encodings[off_idx]);
+  const auto s = static_cast<Scheme>(footer_.encodings[off_idx]);
   const uint32_t prm = footer_.params[off_idx];
   if (s == Scheme::kRleDelta) {
     const char* rle_delta_end = RegionEndAt(footer_, g, col, data_);
@@ -924,20 +973,20 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     }
     return;
   }
-#if defined(__AVX2__)
+#ifdef __AVX2__
   // The SIMD fast paths read the header-derived extent in one shot; a
   // hand-built footer must not turn that into an OOB sweep. Take the fast
   // path only when the extent provably fits inside the region; otherwise
   // fall through to the generic loop below.
   const char* simd_end = RegionEndAt(footer_, g, col, data_);
   if (s == Scheme::kForBp && prm >= 1 && prm <= 8 && simd_end != nullptr &&
-      region + 8 + static_cast<size_t>(rc) * prm <= simd_end) {
+      region + 8 + (static_cast<size_t>(rc) * prm) <= simd_end) {
     UnpackForBaAvx2(reinterpret_cast<const unsigned char*>(region), rc, prm,
                     static_cast<int64_t>(ReadBE64(region)), out);
     return;
   }
   if (s == Scheme::kPlain && simd_end != nullptr &&
-      region + static_cast<size_t>(rc) * 8 <= simd_end) {
+      region + (static_cast<size_t>(rc) * 8) <= simd_end) {
 #if defined(__x86_64__) || defined(__i386__)
     if (DecodePlainAvx512Available()) {
       DecodePlainAvx512(region, rc, out);
@@ -949,28 +998,29 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const __m256i bswap =
         _mm256_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
                          7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8);
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(region);
+    const auto* p = reinterpret_cast<const uint8_t*>(region);
     size_t i = 0;
     for (; i + 8 <= rc; i += 8) {
       const __m256i v0 =
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i * 8));
-      const __m256i v1 =
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + i * 8 + 32));
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + (i * 8)));
+      const __m256i v1 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(p + (i * 8) + 32));
       _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
                           _mm256_shuffle_epi8(v0, bswap));
       _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i + 4),
                           _mm256_shuffle_epi8(v1, bswap));
     }
-    for (; i < rc; ++i)
+    for (; i < rc; ++i) {
       out[i] = static_cast<int64_t>(
-          ReadBE64(reinterpret_cast<const char*>(p + i * 8)));
+          ReadBE64(reinterpret_cast<const char*>(p + (i * 8))));
+    }
     return;
   }
 #endif
   if (s == Scheme::kRle && prm <= rc) {
     const char* rle_end = RegionEndAt(footer_, g, col, data_);
     if (rle_end != nullptr && rle_end >= region) {
-      const size_t available = static_cast<size_t>(rle_end - region);
+      const auto available = static_cast<size_t>(rle_end - region);
       if (available >= 4 && prm <= (available - 4) / 12 &&
           DecodeInnerI64All(region, static_cast<uint8_t>(s), prm, rc, rle_end,
                             out)) {
@@ -1001,9 +1051,11 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const size_t bit_len = (rc > 1) ? static_cast<size_t>(rc - 1) * prm : 0;
     // Clamp the header-derived window by the region: a hostile prm must not
     // walk the reader past the buffer (the loop then yields 0-bit reads).
-    const char* end = packed + (bit_len + 7) / 8;
-    if (end > reg_end) end = reg_end;
-    if (DecodeXorForByteAligned(packed, rc, prm, end, out)) return;
+    const char* end = packed + ((bit_len + 7) / 8);
+    end = std::min(end, reg_end);
+    if (DecodeXorForByteAligned(packed, rc, prm, end, out)) {
+      return;
+    }
     WordBitReader br(packed, end);
     for (uint32_t t = 1; t < rc; ++t) {
       x ^= br.get(static_cast<int>(prm));
@@ -1027,9 +1079,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // Upper bound on the stream length; decode always stops before this.
     const size_t bit_len =
         (rc > 1) ? static_cast<size_t>(rc - 1) * (1 + 5 + 6 + 64) : 0;
-    const char* end = packed + (bit_len + 7) / 8;
+    const char* end = packed + ((bit_len + 7) / 8);
     // Region clamp: see kXorFor above.
-    if (end > gor_end) end = gor_end;
+    end = std::min(end, gor_end);
     WordBitReader br(packed, end);
     for (uint32_t i = 1; i < rc; ++i) {
       if (br.get1() != 0) {
@@ -1041,8 +1093,8 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         // mw == 64 also shifts by tz == 0 (lz+tz == 0), so the plain shift
         // is well-defined in every reachable case.
         int mw = 64 - lz - tz;
-        if (mw < 0) mw = 0;
-        if (mw > 64) mw = 64;
+        mw = std::max(mw, 0);
+        mw = std::min(mw, 64);
         const uint64_t m = br.get(mw);
         prev ^= (m << tz);
       }
@@ -1060,18 +1112,18 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       return;
     }
     const int exp = static_cast<uint8_t>(region[0]);
-    const Scheme backend = static_cast<Scheme>(static_cast<uint8_t>(region[1]));
+    const auto backend = static_cast<Scheme>(static_cast<uint8_t>(region[1]));
     const uint32_t nexc = ReadBE16(region + 2);
     if (exp > 18 || nexc > rc) {
       std::fill(out, out + rc, 0);
       return;
     }
     const char* exc = region + 4;
-    if (exc + static_cast<size_t>(nexc) * 10 > alp_end) {
+    if (exc + (static_cast<size_t>(nexc) * 10) > alp_end) {
       std::fill(out, out + rc, 0);
       return;
     }
-    const char* inner = exc + static_cast<size_t>(nexc) * 10;
+    const char* inner = exc + (static_cast<size_t>(nexc) * 10);
     if (backend == Scheme::kBitWeave) {
       if (inner + 9 > alp_end) {
         std::fill(out, out + rc, 0);
@@ -1084,14 +1136,14 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         std::fill(out, out + rc, 0);
         return;
       }
-      const int64_t base_v = static_cast<int64_t>(ReadBE64(inner));
+      const auto base_v = static_cast<int64_t>(ReadBE64(inner));
       for (uint32_t i = 0; i < rc; ++i) {
         const uint64_t moff = UnpackBitAt(
             inner + 9, static_cast<uint64_t>(i) * static_cast<uint64_t>(w), w);
-        const int64_t m =
+        const auto m =
             static_cast<int64_t>(static_cast<uint64_t>(base_v) + moff);
         const double back = static_cast<double>(m) / AlpFactorOf(exp);
-        uint64_t b;
+        uint64_t b{};
         std::memcpy(&b, &back, sizeof(b));
         out[i] = static_cast<int64_t>(b);
       }
@@ -1100,12 +1152,14 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         std::fill(out, out + rc, 0);
         return;
       }
-      const int64_t m = static_cast<int64_t>(ReadBE64(inner));
+      const auto m = static_cast<int64_t>(ReadBE64(inner));
       const double back = static_cast<double>(m) / AlpFactorOf(exp);
-      uint64_t b;
+      uint64_t b{};
       std::memcpy(&b, &back, sizeof(b));
-      const int64_t v = static_cast<int64_t>(b);
-      for (uint32_t i = 0; i < rc; ++i) out[i] = v;
+      const auto v = static_cast<int64_t>(b);
+      for (uint32_t i = 0; i < rc; ++i) {
+        out[i] = v;
+      }
     } else if (backend == Scheme::kRle) {
       if (inner + 4 > alp_end) {
         std::fill(out, out + rc, 0);
@@ -1113,7 +1167,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       }
       const uint32_t runs = ReadBE32(inner);
       if (runs == 0 || runs > rc ||
-          inner + 4 + static_cast<size_t>(runs) * 12 > alp_end) {
+          inner + 4 + (static_cast<size_t>(runs) * 12) > alp_end) {
         std::fill(out, out + rc, 0);
         return;
       }
@@ -1122,20 +1176,23 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       uint64_t acc = 0;
       const char* q = inner + 4;
       for (uint32_t r2 = 0; r2 < runs && acc < rc; ++r2) {
-        const int64_t rv = static_cast<int64_t>(ReadBE64(q));
+        const auto rv = static_cast<int64_t>(ReadBE64(q));
         const uint64_t len = ReadBE32(q + 8);
         const uint64_t next = acc + len;
         const uint64_t run_end = (next > rc) ? rc : next;
         const double back = static_cast<double>(rv) / AlpFactorOf(exp);
-        uint64_t b;
+        uint64_t b{};
         std::memcpy(&b, &back, sizeof(b));
-        const int64_t v = static_cast<int64_t>(b);
-        for (uint64_t i = acc; i < run_end; ++i)
+        const auto v = static_cast<int64_t>(b);
+        for (uint64_t i = acc; i < run_end; ++i) {
           out[static_cast<size_t>(i)] = v;
+        }
         acc = next;
         q += 12;
       }
-      for (uint64_t i = acc; i < rc; ++i) out[static_cast<size_t>(i)] = 0;
+      for (uint64_t i = acc; i < rc; ++i) {
+        out[static_cast<size_t>(i)] = 0;
+      }
     } else if (backend == Scheme::kDict) {
       if (inner + 2 > alp_end) {
         std::fill(out, out + rc, 0);
@@ -1144,9 +1201,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       const uint16_t ncodes = ReadBE16(inner);
       const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+          2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
       if (ncodes == 0 ||
-          inner + dict_base + static_cast<size_t>(ncodes) * 8 > alp_end) {
+          inner + dict_base + (static_cast<size_t>(ncodes) * 8) > alp_end) {
         std::fill(out, out + rc, 0);
         return;
       }
@@ -1158,10 +1215,10 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         // Codes past the dictionary decode as 0 (mirrors kDict).
         const int64_t m = (code < ncodes)
                               ? static_cast<int64_t>(ReadBE64(
-                                    dict + static_cast<size_t>(code) * 8))
+                                    dict + (static_cast<size_t>(code) * 8)))
                               : 0;
         const double back = static_cast<double>(m) / AlpFactorOf(exp);
-        uint64_t b;
+        uint64_t b{};
         std::memcpy(&b, &back, sizeof(b));
         out[i] = static_cast<int64_t>(b);
       }
@@ -1170,10 +1227,11 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       return;
     }
     for (uint32_t k = 0; k < nexc; ++k) {
-      const uint32_t pos = ReadBE16(exc + static_cast<size_t>(k) * 10);
-      if (pos < rc)
+      const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(k) * 10));
+      if (pos < rc) {
         out[pos] = static_cast<int64_t>(
-            ReadBE64(exc + static_cast<size_t>(k) * 10 + 2));
+            ReadBE64(exc + (static_cast<size_t>(k) * 10) + 2));
+      }
     }
     return;
   }
@@ -1187,7 +1245,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const char* dfp_end = RegionEndAt(footer_, g, col, data_);
     // Header + checkpoint table before any read (mirrors Int64RegionAt).
     if (dfp_end == nullptr || region + 8 > dfp_end ||
-        region + 8 + static_cast<size_t>(cks) * 8 > dfp_end) {
+        region + 8 + (static_cast<size_t>(cks) * 8) > dfp_end) {
       std::fill(out, out + rc, 0);
       return;
     }
@@ -1202,11 +1260,11 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     if (rc > 1) {
       // Layout: [first u64][checkpoints cks*u64][packed deltas (rc-1)*w bits].
       // The decoder derives cks from n (=rc) and kDeltaCheckpointEvery.
-      const char* packed = region + 8 + static_cast<size_t>(cks) * 8;
+      const char* packed = region + 8 + (static_cast<size_t>(cks) * 8);
       const size_t bit_len = static_cast<size_t>(rc - 1) * prm;
-      const char* end = packed + (bit_len + 7) / 8;
+      const char* end = packed + ((bit_len + 7) / 8);
       // Region clamp: see kXorFor above.
-      if (end > dfp_end) end = dfp_end;
+      end = std::min(end, dfp_end);
       WordBitReader br(packed, end);
       for (uint32_t i = 1; i < rc; ++i) {
         v += br.get(static_cast<int>(prm));  // wrapping: deltas may overflow
@@ -1234,12 +1292,12 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const int cw = BitsNeeded(ncodes - 1);
     const char* packed = region + 2;
     const size_t dict_base =
-        2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+        2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
     const char* dict = region + dict_base;
     // The validator floors the region at 4B/entry but int64 dicts need
     // 8B/entry: a region built at the floor would read code*8 bytes past
     // the region. Zero-fill instead (matches the clamped-code decode).
-    if (dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > reg_end) {
+    if (dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > reg_end) {
       std::fill(out, out + rc, 0);
       return;
     }
@@ -1250,7 +1308,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       out[i] =
           (code >= ncodes)
               ? 0
-              : static_cast<int64_t>(ReadBE64(dict + code * sizeof(int64_t)));
+              : static_cast<int64_t>(ReadBE64(dict + (code * sizeof(int64_t))));
     }
     return;
   }
@@ -1261,7 +1319,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       std::fill(out, out + rc, 0);
       return;
     }
-    const int64_t base_v = static_cast<int64_t>(ReadBE64(region));
+    const auto base_v = static_cast<int64_t>(ReadBE64(region));
     const int w = static_cast<int>(static_cast<uint8_t>(region[8]));
     // A hostile width byte > 64 made WordBitReader::get read/wrap UB; the
     // footer gate caps prm at 64 for validated chunks — clamp the header.
@@ -1271,9 +1329,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     }
     const char* packed = region + 9;
     const size_t bit_len = static_cast<size_t>(rc) * static_cast<size_t>(w);
-    const char* end = packed + (bit_len + 7) / 8;
+    const char* end = packed + ((bit_len + 7) / 8);
     // Clamp the header-derived extent by the region (hostile header).
-    if (end > reg_end) end = reg_end;
+    end = std::min(end, reg_end);
     WordBitReader br(packed, end);
     for (uint32_t i = 0; i < rc; ++i) {
       out[i] = static_cast<int64_t>(static_cast<uint64_t>(base_v) + br.get(w));
@@ -1287,7 +1345,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       std::fill(out, out + rc, 0);
       return;
     }
-    const int64_t base_v = static_cast<int64_t>(ReadBE64(region));
+    const auto base_v = static_cast<int64_t>(ReadBE64(region));
     const uint64_t maxd = ReadBE64(region + 8);
     const int l = static_cast<int>(static_cast<uint8_t>(region[16]));
     const uint64_t high_max = (l >= 64) ? 0 : (maxd >> l);
@@ -1304,7 +1362,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const char* hbmp = region + 17;
     const char* lowbits = hbmp + ((hlen + 7) / 8);
     const size_t bit_len = static_cast<size_t>(rc) * static_cast<size_t>(l);
-    const char* end = lowbits + (bit_len + 7) / 8;
+    const char* end = lowbits + ((bit_len + 7) / 8);
     // Region clamp: a hostile header must not walk SelectBit / the low-bit
     // reader past the buffer.
     if (end > ef_end) {
@@ -1319,15 +1377,17 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     uint64_t sw = 0, sseen = 0, sword = 0, tp = 0;
     bool sloaded = false, in_tail = false, exhausted = false;
     auto ef_select = [&](uint64_t i) -> uint64_t {
-      if (exhausted) return hlen;
+      if (exhausted) {
+        return hlen;
+      }
       for (; !in_tail && (sw + 1) * 64 <= hlen; ++sw) {
         if (!sloaded) {
-          sword = ReadBE64(hbmp + sw * 8);
+          sword = ReadBE64(hbmp + (sw * 8));
           sloaded = true;
         }
-        const uint64_t cnt = static_cast<uint64_t>(__builtin_popcountll(sword));
+        const auto cnt = static_cast<uint64_t>(__builtin_popcountll(sword));
         if (cnt != 0 && sseen + cnt > i) {
-          return sw * 64 + SelectFromWord(sword, i - sseen);
+          return (sw * 64) + SelectFromWord(sword, i - sseen);
         }
         sseen += cnt;
         sloaded = false;
@@ -1340,7 +1400,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         const uint64_t bit =
             (static_cast<uint8_t>(hbmp[tp >> 3]) >> (7 - (tp & 7))) & 1;
         if (bit != 0) {
-          if (sseen == i) return tp;
+          if (sseen == i) {
+            return tp;
+          }
           ++sseen;
         }
       }
@@ -1373,17 +1435,17 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // stops a hostile ncp from walking the checkpoint reads ~512KB past
     // the region (the gate used to run only AFTER the first ReadBE64).
     if (ncp == 0 || (static_cast<uint32_t>(rc) - 1) / C >= ncp ||
-        region + 2 + static_cast<size_t>(ncp) * sizeof(int64_t) > reg_end) {
+        region + 2 + (static_cast<size_t>(ncp) * sizeof(int64_t)) > reg_end) {
       std::fill(out, out + rc, 0);
       return;
     }
     const char* ck = region + 2;
-    const char* ir = region + 2 + static_cast<size_t>(ncp) * sizeof(int64_t);
+    const char* ir = region + 2 + (static_cast<size_t>(ncp) * sizeof(int64_t));
     // Inner-payload extent for the FULL group must stay inside the region:
     // ForBp 8B base + rc*param bytes; BitWeave 9B header + ceil(rc*bw/8)
     // (bw validated below before the packed extent is used).
     if (s == Scheme::kDeltaFor) {
-      if (prm > 8 || ir + 8 + static_cast<size_t>(rc) * prm > reg_end) {
+      if (prm > 8 || ir + 8 + (static_cast<size_t>(rc) * prm) > reg_end) {
         std::fill(out, out + rc, 0);
         return;
       }
@@ -1391,7 +1453,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       std::fill(out, out + rc, 0);
       return;
     }
-    const int64_t inner_base = static_cast<int64_t>(ReadBE64(ir));
+    const auto inner_base = static_cast<int64_t>(ReadBE64(ir));
     WordBitReader brb;
     if (s == Scheme::kDeltaBitweave) {
       const int bw = static_cast<int>(static_cast<uint8_t>(ir[8]));
@@ -1401,8 +1463,8 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       }
       const char* packed = ir + 9;
       const size_t bit_len = static_cast<size_t>(rc) * static_cast<size_t>(bw);
-      const char* end = packed + (bit_len + 7) / 8;
-      if (end > reg_end) end = reg_end;
+      const char* end = packed + ((bit_len + 7) / 8);
+      end = std::min(end, reg_end);
       brb = WordBitReader(packed, end);
       // deltas[0] is unused (MakeDeltas sets it to 0); consume it to keep the
       // contiguous word-window reader aligned with rows 1..rc-1.
@@ -1411,28 +1473,29 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     uint64_t v = ReadBE64(ck);
     out[0] = static_cast<int64_t>(v);
     for (uint32_t j = 1; j < rc; ++j) {
-      uint64_t d;
+      uint64_t d{};
       if (s == Scheme::kDeltaBitweave) {
         d = static_cast<uint64_t>(inner_base) +
             brb.get(static_cast<int>(static_cast<uint8_t>(ir[8])));
       } else {
-        const unsigned char* vp = reinterpret_cast<const unsigned char*>(
-            ir + 8 + static_cast<size_t>(j) * prm);
+        const auto* vp = reinterpret_cast<const unsigned char*>(
+            ir + 8 + (static_cast<size_t>(j) * prm));
         uint64_t off = 0;
         if (vp + 8 <= reinterpret_cast<const unsigned char*>(reg_end)) {
           // Masked u64 load (window inside the region); the byte loop only
           // runs for the last values whose window crosses the region end.
-          uint64_t raw;
+          uint64_t raw{};
           std::memcpy(&raw, vp, 8);
           off = raw & (prm >= 8 ? ~0ULL : ((1ULL << (8U * prm)) - 1));
         } else {
-          for (uint32_t b = 0; b < prm; ++b)
+          for (uint32_t b = 0; b < prm; ++b) {
             off |= static_cast<uint64_t>(vp[b]) << (b * 8);
+          }
         }
         d = static_cast<uint64_t>(inner_base) + off;
       }
       if (j % C == 0) {
-        v = ReadBE64(ck + (j / C) * sizeof(int64_t));
+        v = ReadBE64(ck + ((j / C) * sizeof(int64_t)));
       } else {
         v += d;  // wrapping accumulation in the unsigned domain
       }
@@ -1452,11 +1515,11 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       std::fill(out, out + rc, 0);
       return;
     }
-    const int64_t mn = static_cast<int64_t>(ReadBE64(region));
+    const auto mn = static_cast<int64_t>(ReadBE64(region));
     const int W = static_cast<int>(static_cast<uint8_t>(region[8]));
     const size_t stride = (static_cast<size_t>(rc) + 7) / 8;
     const char* base = region + 9;
-    if (W <= 0 || W > 64 || base + static_cast<size_t>(W) * stride > wv_end) {
+    if (W <= 0 || W > 64 || base + (static_cast<size_t>(W) * stride) > wv_end) {
       std::fill(out, out + rc, mn);
       return;
     }
@@ -1472,16 +1535,16 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // level's bmp[p >> 3] then read up to ~512 MB past the bitmap. Masking
     // the tail byte keeps bulk totals identical to the scalar path's
     // PopcountBits(bmp, n) for every input.
-    const uint8_t tail_mask = static_cast<uint8_t>(
-        (rc % 8 == 0) ? 0xFFu : (0xFFu << (8u - (rc % 8))));
+    const auto tail_mask = static_cast<uint8_t>(
+        (rc % 8 == 0) ? 0xFFU : (0xFFU << (8U - (rc % 8))));
     for (int k = 0; k < W; ++k) {
-      const unsigned char* bmp = reinterpret_cast<const unsigned char*>(
-          base + static_cast<size_t>(k) * stride);
+      const auto* bmp = reinterpret_cast<const unsigned char*>(
+          base + (static_cast<size_t>(k) * stride));
       uint32_t* c = &cum[static_cast<size_t>(k) * (wwords + 1)];
       c[0] = 0;
       for (size_t j = 0; j < wwords; ++j) {
         const size_t b0 = j * 8;
-        uint64_t w;
+        uint64_t w{};
         if (b0 + 8 <= stride) {
           std::memcpy(&w, bmp + b0, sizeof(w));
         } else {
@@ -1490,7 +1553,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
           w = 0;
           for (size_t b = b0; b < stride; ++b) {
             unsigned byte = bmp[b];
-            if (b + 1 == stride) byte &= tail_mask;
+            if (b + 1 == stride) {
+              byte &= tail_mask;
+            }
             w = (w << 8) | byte;
           }
         }
@@ -1501,13 +1566,13 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       uint32_t p = i;
       uint64_t value = 0;
       for (int k = 0; k < W; ++k) {
-        const unsigned char* bmp = reinterpret_cast<const unsigned char*>(
-            base + static_cast<size_t>(k) * stride);
+        const auto* bmp = reinterpret_cast<const unsigned char*>(
+            base + (static_cast<size_t>(k) * stride));
         const uint32_t* c = &cum[static_cast<size_t>(k) * (wwords + 1)];
         const size_t wi = p >> 6;
         const uint32_t inW = p & 63U;
         const size_t b0 = wi * 8;
-        uint64_t w;
+        uint64_t w{};
         if (b0 + 8 <= stride) {
           std::memcpy(&w, bmp + b0, sizeof(w));
           w = __builtin_bswap64(w);  // MSB-first stream position = bit index
@@ -1521,12 +1586,14 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
           w = 0;
           for (size_t b = b0; b < stride; ++b) {
             unsigned byte = bmp[b];
-            if (b + 1 == stride) byte &= tail_mask;
+            if (b + 1 == stride) {
+              byte &= tail_mask;
+            }
             w = (w << 8) | byte;
           }
           w <<= 64U - static_cast<unsigned>((stride - b0) * 8U);
         }
-        const uint32_t bit = static_cast<uint32_t>((w >> (63U - inW)) & 1U);
+        const auto bit = static_cast<uint32_t>((w >> (63U - inW)) & 1U);
         value = (value << 1) | bit;
         uint32_t r1 = c[wi];
         if (inW != 0) {
@@ -1564,7 +1631,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       std::fill(out, out + rc, 0);
       return;
     }
-    const int64_t base_v = static_cast<int64_t>(ReadBE64(region));
+    const auto base_v = static_cast<int64_t>(ReadBE64(region));
     const int w = static_cast<int>(static_cast<uint8_t>(region[8]));
     if (w <= 0 || w > 64) {
       std::fill(out, out + rc, base_v);
@@ -1573,28 +1640,30 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const uint32_t nexc = ReadBE16(region + 9);
     const char* packed = region + 11;
     const size_t bit_len = static_cast<size_t>(rc) * static_cast<size_t>(w);
-    const char* end = packed + (bit_len + 7) / 8;
+    const char* end = packed + ((bit_len + 7) / 8);
     // Clamp the packed-bit reader by the region: the former end was derived
     // from the header alone, so a hostile short region made the reader walk
     // up to rc*w/8 bytes past it.
-    if (end > exc_end) end = exc_end;
+    end = std::min(end, exc_end);
     WordBitReader br(packed, end);
     for (uint32_t i = 0; i < rc; ++i) {
       out[i] = static_cast<int64_t>(static_cast<uint64_t>(base_v) + br.get(w));
     }
-    const char* exc = packed + (bit_len + 7) / 8;
+    const char* exc = packed + ((bit_len + 7) / 8);
     // The header-derived exception extent must stay inside the region
     // before any read: a hostile nexc would otherwise walk 10*nexc bytes
     // past it (the `pos >= rc` break only fires after the read).
-    if (exc + static_cast<size_t>(nexc) * 10 > exc_end) {
+    if (exc + (static_cast<size_t>(nexc) * 10) > exc_end) {
       std::fill(out, out + rc, base_v);
       return;
     }
     for (uint32_t k = 0; k < nexc; ++k) {
-      const uint32_t pos = ReadBE16(exc + static_cast<size_t>(k) * 10);
-      if (pos >= rc) break;  // hostile region: validator rejects, stay safe
-      out[pos] =
-          static_cast<int64_t>(ReadBE64(exc + static_cast<size_t>(k) * 10 + 2));
+      const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(k) * 10));
+      if (pos >= rc) {
+        break;  // hostile region: validator rejects, stay safe
+      }
+      out[pos] = static_cast<int64_t>(
+          ReadBE64(exc + (static_cast<size_t>(k) * 10) + 2));
     }
     return;
   }
@@ -1611,14 +1680,15 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // Full header extent before the k-byte / checkpoint reads: the former
     // order read region[2 + ncp*20] BEFORE any bound check, ~1.3MB past
     // the region for a hostile ncp.
-    if (ncp == 0 || region + 2 + static_cast<size_t>(ncp) * 20 + 1 > reg_end) {
+    if (ncp == 0 ||
+        region + 2 + (static_cast<size_t>(ncp) * 20) + 1 > reg_end) {
       std::fill(out, out + rc, 0);
       return;
     }
     const char* ck = region + 2;
     const int k = static_cast<int>(
-        static_cast<uint8_t>(region[2 + static_cast<size_t>(ncp) * 20]));
-    const char* stream = region + 2 + static_cast<size_t>(ncp) * 20 + 1;
+        static_cast<uint8_t>(region[2 + (static_cast<size_t>(ncp) * 20)]));
+    const char* stream = region + 2 + (static_cast<size_t>(ncp) * 20) + 1;
     if (k < 0 || k > 64 || reg_end <= stream) {
       std::fill(out, out + rc, 0);
       return;
@@ -1641,7 +1711,9 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         }
       }
       uint64_t rem = 0;
-      if (k > 0 && k <= 64) rem = br.get(k);
+      if (k > 0 && k <= 64) {
+        rem = br.get(k);
+      }
       const uint64_t zz = (k >= 64) ? rem : ((q << k) | rem);
       d1 += (zz >> 1) ^ (0ULL - (zz & 1ULL));
       v += d1;
@@ -1669,19 +1741,21 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     // region (the per-byte loop guard bounds only dereferences). Encoder
     // regions always carry the 1-byte deltas[0] placeholder, so this never
     // rejects a valid region.
-    if (region + 2 + static_cast<size_t>(ncp) * 12 + 1 > reg_end) {
+    if (region + 2 + (static_cast<size_t>(ncp) * 12) + 1 > reg_end) {
       std::fill(out, out + rc, 0);
       return;
     }
     const char* stream =
-        region + 2 + static_cast<size_t>(ncp) * 12 + 1;  // skip deltas[0]
+        region + 2 + (static_cast<size_t>(ncp) * 12) + 1;  // skip deltas[0]
     const char* p = stream;
     for (uint32_t j = 1; j < rc; ++j) {
       uint64_t z = 0;
       bool done = false;
       for (int b = 0; b < 10; ++b) {
-        if (reg_end != nullptr && p + b >= reg_end) break;
-        const uint8_t byte = static_cast<uint8_t>(p[b]);
+        if (reg_end != nullptr && p + b >= reg_end) {
+          break;
+        }
+        const auto byte = static_cast<uint8_t>(p[b]);
         z |= static_cast<uint64_t>(byte & 0x7F) << (7 * b);
         if ((byte & 0x80) == 0) {
           p += b + 1;
@@ -1715,7 +1789,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     const size_t bit_len =
         (rc > 1) ? static_cast<size_t>(rc - 1) * (2 + 5 + 6 + 64) : 0;
     const char* end =
-        (reg_end != nullptr) ? reg_end : packed + (bit_len + 7) / 8;
+        (reg_end != nullptr) ? reg_end : packed + ((bit_len + 7) / 8);
     WordBitReader br(packed, end);
     for (uint32_t i = 1; i < rc; ++i) {
       if (br.get1() == 0) {
@@ -1730,8 +1804,8 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
         const int lz = static_cast<int>(br.get(5));
         const int tz = static_cast<int>(br.get(6));
         int mw = 64 - lz - tz;
-        if (mw < 1) mw = 1;
-        if (mw > 64) mw = 64;
+        mw = std::max(mw, 1);
+        mw = std::min(mw, 64);
         const uint64_t m = br.get(mw);
         prev ^= (mw >= 64 ? m : (m << tz));
         prev_lz = lz;
@@ -1757,14 +1831,14 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     }
     const int cb = (BitsNeeded(d - 1) + 7) / 8;
     const char* dict = region + 2;
-    const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+    const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
     if (runs_hdr + 4 > rd_end) {
       std::fill(out, out + rc, 0);
       return;
     }
     const uint32_t runs = ReadBE32(runs_hdr);
     if (runs_hdr + 4 +
-            static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+            (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
         rd_end) {
       std::fill(out, out + rc, 0);
       return;
@@ -1779,7 +1853,7 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
       const int64_t value =
           (code >= d) ? 0
                       : static_cast<int64_t>(
-                            ReadBE64(dict + static_cast<size_t>(code) * 8));
+                            ReadBE64(dict + (static_cast<size_t>(code) * 8)));
       const uint64_t len = ReadBE32(q + cb);
       const uint64_t next = static_cast<uint64_t>(row) + len;
       const uint32_t end = (next > rc) ? rc : static_cast<uint32_t>(next);
@@ -1791,9 +1865,12 @@ void PaxChunk::DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const {
     return;
   }
   const char* reg_end = RegionEndAt(footer_, g, col, data_);
-  if (DecodeCascadeI64All(region, s, prm, rc, reg_end, out)) return;
-  for (uint32_t i = 0; i < rc; ++i)
+  if (DecodeCascadeI64All(region, s, prm, rc, reg_end, out)) {
+    return;
+  }
+  for (uint32_t i = 0; i < rc; ++i) {
     out[i] = Int64RegionAt(region, s, prm, rc, i, reg_end);
+  }
 }
 
 bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
@@ -1806,13 +1883,14 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
       g >= f.row_counts.size()) {
     return false;
   }
-  const uint32_t off_idx = static_cast<uint32_t>(g) * f.column_count + col;
+  const uint32_t off_idx = (g * f.column_count) + col;
   if (off_idx >= f.column_offsets.size() || off_idx >= f.encodings.size() ||
       off_idx >= f.params.size()) {
     return false;
   }
-  if (static_cast<Scheme>(f.encodings[off_idx]) != Scheme::kByteSlice)
+  if (static_cast<Scheme>(f.encodings[off_idx]) != Scheme::kByteSlice) {
     return false;
+  }
   // Form the region pointer through the verified-offset helper: indexing
   // Data().data() with the raw footer value formed a wild pointer before any
   // deref (the reg_end gate below then ran on garbage).
@@ -1826,14 +1904,16 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
     return false;
   }
   const uint16_t rc = f.row_counts[g];
-  const uint8_t w = static_cast<uint8_t>(region[0]);
+  const auto w = static_cast<uint8_t>(region[0]);
   // Same width clamp as Int64RegionAt / ByteSliceFilteredSum: w past 64 has
   // no decodable int64 meaning, and the __int128 shift below is UB for
   // b >= 128 (a hostile width byte reached 255).
-  if (w == 0 || w > 64) return false;
-  const size_t stride = static_cast<size_t>((rc + 7U) / 8U);
+  if (w == 0 || w > 64) {
+    return false;
+  }
+  const auto stride = static_cast<size_t>((rc + 7U) / 8U);
   if (static_cast<size_t>(reg_end - region) <
-      1 + static_cast<size_t>(w) * stride) {
+      1 + (static_cast<size_t>(w) * stride)) {
     return false;
   }
   __int128 sum = 0;
@@ -1842,12 +1922,12 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
   // regions, and counting them inflated the sum by up to 7*(2^w-1) per
   // slice. full = number of complete bytes; the tail byte is masked.
   const size_t full = static_cast<size_t>(rc) >> 3;
-  const uint8_t tail_bits = static_cast<uint8_t>(rc & 7U);
+  const auto tail_bits = static_cast<uint8_t>(rc & 7U);
   // MSB-first keep-mask for the tail byte's `tail_bits` data bits.
-  static const uint8_t kTailMask[8] = {0x00, 0x80, 0xC0, 0xE0,
-                                       0xF0, 0xF8, 0xFC, 0xFE};
+  static const std::array<uint8_t, 8> kTailMask = {0x00, 0x80, 0xC0, 0xE0,
+                                                   0xF0, 0xF8, 0xFC, 0xFE};
   const uint8_t tail_mask = kTailMask[tail_bits & 7U];
-#if defined(__AVX2__)
+#ifdef __AVX2__
   // Vectorized popcount over 32-byte lanes; weighted-sum the per-bit counts
   // without ever materializing a value (the byte-slice SUM identity).
   const __m256i pop_lut =
@@ -1857,7 +1937,7 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
   const __m256i zero = _mm256_setzero_si256();
   for (uint8_t b = 0; b < w; ++b) {
     const unsigned char* sl = reinterpret_cast<const unsigned char*>(region) +
-                              1 + static_cast<size_t>(b) * stride;
+                              1 + (static_cast<size_t>(b) * stride);
     __m256i acc = _mm256_setzero_si256();
     size_t i = 0;
     for (; i + 32 <= full; i += 32) {
@@ -1869,15 +1949,17 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
       acc = _mm256_add_epi64(acc, _mm256_sad_epu8(pc, zero));
     }
     uint64_t cnt = 0;
-    uint64_t lanes[4];
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes), acc);
+    std::array<uint64_t, 4> lanes{};
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes.data()), acc);
     cnt = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    for (; i < full; ++i)
+    for (; i < full; ++i) {
       cnt += static_cast<uint64_t>(__builtin_popcount(
           static_cast<unsigned>(static_cast<unsigned char>(sl[i]))));
-    if (tail_bits != 0U)
+    }
+    if (tail_bits != 0U) {
       cnt += static_cast<uint64_t>(__builtin_popcount(
           static_cast<unsigned>(static_cast<uint8_t>(sl[full]) & tail_mask)));
+    }
     sum += static_cast<__int128>(cnt) * (static_cast<__int128>(1) << b);
   }
 #else
@@ -1899,13 +1981,15 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
 
 bool PBitSColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
                     int64_t* sum_out) {
-  if (sum_out == nullptr) return false;
+  if (sum_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || g >= f.row_group_count ||
       g >= f.row_counts.size()) {
     return false;
   }
-  const uint32_t off_idx = g * f.column_count + col;
+  const uint32_t off_idx = (g * f.column_count) + col;
   if (off_idx >= f.column_offsets.size() || off_idx >= f.encodings.size() ||
       off_idx >= f.params.size() ||
       static_cast<Scheme>(f.encodings[off_idx]) != Scheme::kPBitS) {
@@ -1913,7 +1997,9 @@ bool PBitSColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
   }
   const char* region = RegionStartAt(f, g, col, chunk.Data(), 11);
   const char* end = RegionEndAt(f, g, col, chunk.Data());
-  if (region == nullptr || end == nullptr || end <= region) return false;
+  if (region == nullptr || end == nullptr || end <= region) {
+    return false;
+  }
   PBitSRegion p;
   if (!ParsePBitSRegion(region, f.row_counts[g], f.params[off_idx], end, &p)) {
     return false;
@@ -1927,7 +2013,9 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
                             PaxChunk::CompareOp op, double literal,
                             uint64_t* count_out, double* sum_out,
                             const Schema* sc) {
-  if (count_out == nullptr || sum_out == nullptr) return false;
+  if (count_out == nullptr || sum_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -1991,16 +2079,23 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_chimp128 = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows == 0) continue;
-    const size_t offset = static_cast<size_t>(group) * f.column_count + col;
+    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows == 0) {
+      continue;
+    }
+    const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kChimp128) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
-        if (CellIsNull(f, group, col, row)) continue;
+        if (CellIsNull(f, group, col, row)) {
+          continue;
+        }
         const double value =
             Chimp128Double(static_cast<uint64_t>(decoded[row]));
-        if (!matches(value, op, literal)) continue;
+        if (!matches(value, op, literal)) {
+          continue;
+        }
         ++count;
         sum += value;
       }
@@ -2026,7 +2121,9 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
       if (metadata.numeric_metadata) {
         const double minimum = Chimp128Double(metadata.minimum);
         const double maximum = Chimp128Double(metadata.maximum);
-        if (none_match(minimum, maximum)) continue;
+        if (none_match(minimum, maximum)) {
+          continue;
+        }
         if (all_match(minimum, maximum) && nulls == 0) {
           count += metadata.rows;
           sum += Chimp128Double(metadata.sum);
@@ -2034,16 +2131,24 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
         }
       }
       std::array<uint64_t, kChimp128BlockRows> decoded{};
-      if (!DecodeChimp128Block(metadata, decoded.data())) return false;
+      if (!DecodeChimp128Block(metadata, decoded.data())) {
+        return false;
+      }
       for (uint32_t row = 0; row < metadata.rows; ++row) {
-        if (CellIsNull(f, group, col, start + row)) continue;
-        if (!matches(Chimp128Double(decoded[row]), op, literal)) continue;
+        if (CellIsNull(f, group, col, start + row)) {
+          continue;
+        }
+        if (!matches(Chimp128Double(decoded[row]), op, literal)) {
+          continue;
+        }
         ++count;
         sum += Chimp128Double(decoded[row]);
       }
     }
   }
-  if (!has_chimp128) return false;
+  if (!has_chimp128) {
+    return false;
+  }
   *count_out = count;
   *sum_out = sum;
   return true;
@@ -2053,7 +2158,9 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
                              PaxChunk::CompareOp op, double literal,
                              uint64_t* count_out, double* sum_out,
                              const Schema* sc) {
-  if (count_out == nullptr || sum_out == nullptr) return false;
+  if (count_out == nullptr || sum_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -2117,16 +2224,23 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_alp_rd_tans = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows == 0) continue;
-    const size_t offset = static_cast<size_t>(group) * f.column_count + col;
+    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows == 0) {
+      continue;
+    }
+    const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kAlpRdTans) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
-        if (CellIsNull(f, group, col, row)) continue;
+        if (CellIsNull(f, group, col, row)) {
+          continue;
+        }
         const double value =
             AlpRdTansDouble(static_cast<uint64_t>(decoded[row]));
-        if (!matches(value, op, literal)) continue;
+        if (!matches(value, op, literal)) {
+          continue;
+        }
         ++count;
         sum += value;
       }
@@ -2153,7 +2267,9 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
       if ((metadata.flags & 1U) != 0) {
         const double minimum = AlpRdTansDouble(metadata.minimum);
         const double maximum = AlpRdTansDouble(metadata.maximum);
-        if (none_match(minimum, maximum)) continue;
+        if (none_match(minimum, maximum)) {
+          continue;
+        }
         if (all_match(minimum, maximum) && nulls == 0) {
           count += metadata.rows;
           sum += AlpRdTansDouble(metadata.sum);
@@ -2161,17 +2277,25 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
         }
       }
       std::vector<uint64_t> decoded;
-      if (!AlpRdTansDecodeBlock(parsed, block, &decoded)) return false;
+      if (!AlpRdTansDecodeBlock(parsed, block, &decoded)) {
+        return false;
+      }
       for (uint32_t row = 0; row < metadata.rows; ++row) {
-        if (CellIsNull(f, group, col, start + row)) continue;
+        if (CellIsNull(f, group, col, start + row)) {
+          continue;
+        }
         const double value = AlpRdTansDouble(decoded[row]);
-        if (!matches(value, op, literal)) continue;
+        if (!matches(value, op, literal)) {
+          continue;
+        }
         ++count;
         sum += value;
       }
     }
   }
-  if (!has_alp_rd_tans) return false;
+  if (!has_alp_rd_tans) {
+    return false;
+  }
   *count_out = count;
   *sum_out = sum;
   return true;
@@ -2181,7 +2305,9 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
                          PaxChunk::CompareOp op, double literal,
                          uint64_t* count_out, double* sum_out,
                          const Schema* sc) {
-  if (count_out == nullptr || sum_out == nullptr) return false;
+  if (count_out == nullptr || sum_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -2245,15 +2371,22 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_patas = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows == 0) continue;
-    const size_t offset = static_cast<size_t>(group) * f.column_count + col;
+    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows == 0) {
+      continue;
+    }
+    const size_t offset = (static_cast<size_t>(group) * f.column_count) + col;
     if (static_cast<Scheme>(f.encodings[offset]) != Scheme::kPatas) {
       std::array<int64_t, PaxChunk::kRowGroupSize> decoded{};
       chunk.DecodeInt64ColumnRg(col, group, decoded.data());
       for (uint32_t row = 0; row < rows; ++row) {
-        if (CellIsNull(f, group, col, row)) continue;
+        if (CellIsNull(f, group, col, row)) {
+          continue;
+        }
         const double value = PatasDouble(static_cast<uint64_t>(decoded[row]));
-        if (!matches(value, op, literal)) continue;
+        if (!matches(value, op, literal)) {
+          continue;
+        }
         ++count;
         sum += value;
       }
@@ -2279,7 +2412,9 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
       if ((metadata.flags & 1U) != 0) {
         const double minimum = PatasDouble(metadata.minimum);
         const double maximum = PatasDouble(metadata.maximum);
-        if (none_match(minimum, maximum)) continue;
+        if (none_match(minimum, maximum)) {
+          continue;
+        }
         if (all_match(minimum, maximum) && nulls == 0) {
           count += metadata.rows;
           sum += PatasDouble(metadata.sum);
@@ -2287,17 +2422,25 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
         }
       }
       std::array<uint64_t, kPatasBlockRows> decoded{};
-      if (!DecodePatasBlock(metadata, decoded.data())) return false;
+      if (!DecodePatasBlock(metadata, decoded.data())) {
+        return false;
+      }
       for (uint32_t row = 0; row < metadata.rows; ++row) {
-        if (CellIsNull(f, group, col, start + row)) continue;
+        if (CellIsNull(f, group, col, start + row)) {
+          continue;
+        }
         const double value = PatasDouble(decoded[row]);
-        if (!matches(value, op, literal)) continue;
+        if (!matches(value, op, literal)) {
+          continue;
+        }
         ++count;
         sum += value;
       }
     }
   }
-  if (!has_patas) return false;
+  if (!has_patas) {
+    return false;
+  }
   *count_out = count;
   *sum_out = sum;
   return true;
@@ -2305,15 +2448,20 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
 
 uint64_t ApproxCountDistinct(const PaxChunk& chunk, slot_t col) {
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (!f.hll_present || col >= f.column_count) return 0;
+  if (!f.hll_present || col >= f.column_count) {
+    return 0;
+  }
   const uint32_t cc = f.column_count;
   const uint32_t m = 64;  // registers per (rg,col) sketch
   std::vector<uint8_t> M(m, 0);
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const size_t base = (static_cast<size_t>(g) * cc + col) * m;
-    if (base + m > f.hll_sketches.size()) break;
-    for (uint32_t r = 0; r < m; ++r)
+    if (base + m > f.hll_sketches.size()) {
+      break;
+    }
+    for (uint32_t r = 0; r < m; ++r) {
       M[r] = std::max(M[r], f.hll_sketches[base + r]);
+    }
   }
   double sum_inv = 0;
   uint32_t zeros = 0;
@@ -2324,20 +2472,24 @@ uint64_t ApproxCountDistinct(const PaxChunk& chunk, slot_t col) {
     // so the estimator stays finite; that contribution is negligible.
     const uint8_t bits = M[r] > 63 ? 63 : M[r];
     sum_inv += 1.0 / static_cast<double>(1ULL << bits);
-    if (M[r] == 0) ++zeros;
+    if (M[r] == 0) {
+      ++zeros;
+    }
   }
   const double alpha = 0.709;  // HLL constant for m = 64
   double E = alpha * static_cast<double>(m) * m / sum_inv;
-  if (E < 2.5 * m && zeros > 0)  // small-range (linear counting) correction
+  if (E < 2.5 * m && zeros > 0) {  // small-range (linear counting) correction
     E = static_cast<double>(m) * std::log(static_cast<double>(m) / zeros);
+  }
   return static_cast<uint64_t>(std::llround(E));
 }
 
 // Forward declaration: defined below next to the compressed-domain predicate
 // kernels, but ReduceColumn (above it) has to ask it whether a mask can be
-// answered without decoding. Repeating `static` on the definition is fine.
-static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
-                                 uint32_t g, uint64_t* out);
+// answered without decoding.
+namespace {
+bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p, uint32_t g,
+                          uint64_t* out);
 
 // Build a selection bitmask for a SINGLE predicate on an ALREADY-DECODED
 // column. This is the decode-free half of BuildSelectionVector: the caller
@@ -2352,20 +2504,26 @@ PaxSelectionVector SelectionFromDecodedValues(const int64_t* vals, uint16_t rc,
   PaxSelectionVector sv;
   const size_t nwords = (static_cast<size_t>(rc) + 63U) / 64U;
   sv.bits.assign(nwords, 0);
-  if (rc == 0) return sv;
+  if (rc == 0) {
+    return sv;
+  }
   uint64_t* const out = sv.bits.data();
   bool filled = false;
-#if defined(__AVX2__)
+#ifdef __AVX2__
   filled = FillPredicateMaskAvx2(vals, rc, p.op, p.lit, out);
 #endif
   if (!filled) {
     for (uint16_t i = 0; i < rc; ++i) {
-      if (ScanMatch(vals[i], p.op, p.lit)) out[i >> 6] |= 1ULL << (i & 63U);
+      if (ScanMatch(vals[i], p.op, p.lit)) {
+        out[i >> 6] |= 1ULL << (i & 63U);
+      }
     }
   }
   // Clear bits at or beyond the last row so the popcount below -- and any
   // consumer that trusts `count` -- never sees phantom rows.
-  if (rc & 63U) out[rc >> 6] &= (1ULL << (rc & 63U)) - 1ULL;
+  if ((rc & 63U) != 0U) {
+    out[rc >> 6] &= (1ULL << (rc & 63U)) - 1ULL;
+  }
   uint64_t total = 0;
   for (size_t w = 0; w < nwords; ++w) {
     total += static_cast<uint64_t>(__builtin_popcountll(out[w]));
@@ -2373,6 +2531,8 @@ PaxSelectionVector SelectionFromDecodedValues(const int64_t* vals, uint16_t rc,
   sv.count = total;
   return sv;
 }
+
+}  // namespace
 
 ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                           bool parallel, int nthreads, uint32_t scan_sweeps,
@@ -2388,9 +2548,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
   // way, so validate them too. With a schema supplied, additionally gate
   // every referenced column on its DECLARED type: decoding a varchar
   // region as int64 yields plausible garbage, not an error.
-  if (plan.col >= f.column_count) return ReduceResult{};
+  if (plan.col >= f.column_count) {
+    return ReduceResult{};
+  }
   for (const auto& p : plan.preds) {
-    if (p.col >= f.column_count) return ReduceResult{};
+    if (p.col >= f.column_count) {
+      return ReduceResult{};
+    }
   }
   // Hand-built-footer guard: every loop below indexes row_counts[g] and the
   // per-cell footer arrays before any validation. Declared-but-absent
@@ -2407,14 +2571,20 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       return c < sc->ColumnCount() &&
              sc->GetColumn(c).Type() == ValueType::kInt64;
     };
-    if (!i64(plan.col)) return ReduceResult{};
+    if (!i64(plan.col)) {
+      return ReduceResult{};
+    }
     for (const auto& p : plan.preds) {
-      if (!i64(p.col)) return ReduceResult{};
+      if (!i64(p.col)) {
+        return ReduceResult{};
+      }
     }
   }
   if (workload != nullptr && sc != nullptr) {
     workload->RecordAggregate(*sc, plan.col);
-    for (const auto& p : plan.preds) workload->RecordFilter(*sc, p.col);
+    for (const auto& p : plan.preds) {
+      workload->RecordFilter(*sc, p.col);
+    }
   }
 
   // APPROX_COUNT_DISTINCT: answered entirely from the footer HLL sketches
@@ -2455,21 +2625,23 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
   for (uint32_t sw = 0; sw < sweeps; ++sw) {
     for (uint32_t g = 0; g < rg; ++g) {
       const uint16_t rc = f.row_counts[g];
-#if defined(__AVX2__)
+#ifdef __AVX2__
       if (predicates_select_all && plan.op == AggOp::kSum &&
           rc <= PaxChunk::kRowGroupSize) {
-        const uint32_t toff = g * f.column_count + plan.col;
+        const uint32_t toff = (g * f.column_count) + plan.col;
         if (static_cast<Scheme>(f.encodings[toff]) == Scheme::kPlain &&
             RgColNullBits(f, g, plan.col) == nullptr) {
           const char* region = RegionStartAt(f, g, plan.col, chunk.Data(), 0);
           const char* region_end = RegionEndAt(f, g, plan.col, chunk.Data());
           const size_t required = static_cast<size_t>(rc) * sizeof(int64_t);
           if (region != nullptr && region_end != nullptr &&
-              static_cast<size_t>(region_end - region) >= required) {
+              std::cmp_greater_equal(region_end - region, required)) {
             __int128 sum = 0;
             if (PlainSum128Avx2(region, rc, &sum)) {
               res.count += rc;
-              res.sum += static_cast<__int128>(plan.coeff) * sum;
+              if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
+                return ReduceResult{};
+              }
               continue;
             }
           }
@@ -2490,7 +2662,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       // Gated to a single predicate on the aggregate column, and only when
       // TryFastPredicateMask DECLINES: if a compressed kernel can answer the
       // mask without decoding, decoding it here would throw that win away.
-      int64_t fused_stack[PaxChunk::kRowGroupSize];
+      std::array<int64_t, PaxChunk::kRowGroupSize> fused_stack{};
       const int64_t* fused_vals = nullptr;
       // A compressed-domain mask already computed for THIS cell by THIS
       // predicate. TryFastPredicateMask used to run here purely as a probe and
@@ -2506,17 +2678,17 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           rc <= PaxChunk::kRowGroupSize) {
         // A full row group's worth of words, because a DECLINING
         // TryFastPredicateMask may have written part of one before it bailed.
-        uint64_t probe[PaxChunk::kRowGroupSize / 64 + 1];
-        std::memset(probe, 0, sizeof(probe));
-        if (TryFastPredicateMask(chunk, plan.preds[0], g, probe)) {
+        std::array<uint64_t, (PaxChunk::kRowGroupSize / 64) + 1> probe{};
+        std::memset(probe.data(), 0, sizeof(probe));
+        if (TryFastPredicateMask(chunk, plan.preds[0], g, probe.data())) {
           const size_t nwords = (static_cast<size_t>(rc) + 63U) / 64U;
-          sel.bits.assign(probe, probe + nwords);
+          sel.bits.assign(probe.data(), probe.data() + nwords);
           // The kernels only ever SET bits, so the memset above leaves the
           // rest clear -- but a kernel may have set bits at or past rc in the
           // final word, and BuildSelectionVector trims those before its
           // popcount. Reusing the probe means trimming them here, or `count`
           // and every selection test would see rows that do not exist.
-          if (rc & 63U) {
+          if ((rc & 63U) != 0U) {
             sel.bits[nwords - 1] &= (1ULL << (rc & 63U)) - 1ULL;
           }
           sel.count = 0;
@@ -2526,8 +2698,8 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           }
           sel_ready = true;
         } else {
-          chunk.DecodeInt64ColumnRg(plan.col, g, fused_stack);
-          fused_vals = fused_stack;
+          chunk.DecodeInt64ColumnRg(plan.col, g, fused_stack.data());
+          fused_vals = fused_stack.data();
         }
       }
       // M2 selection vector: predicates fused, decode only the reduced column.
@@ -2537,15 +2709,19 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   : BuildSelectionVector(chunk, plan.preds, g, false);
       }
       res.count += sel.count;
-      if (plan.op == AggOp::kCount) continue;
-      if (sel.count == 0) continue;
+      if (plan.op == AggOp::kCount) {
+        continue;
+      }
+      if (sel.count == 0) {
+        continue;
+      }
       // Compressed-execution target kernels: SUM/MIN/MAX evaluated over
       // CONST/RLE runs and DICT dictionaries directly. NULL cells store raw
       // 0 in the region (exactly what the generic path decodes), so a
       // nonzero value implies a non-null row; only the zero bucket needs
       // the null bitmap before feeding MIN/MAX.
-      const uint32_t toff = g * f.column_count + plan.col;
-      const Scheme ts = static_cast<Scheme>(f.encodings[toff]);
+      const uint32_t toff = (g * f.column_count) + plan.col;
+      const auto ts = static_cast<Scheme>(f.encodings[toff]);
       // Offset-VALUE validation: the array-length guards at the top of this
       // function prove only that the footer entry exists; a hand-built
       // offset value formed a wild pointer that the kConst/kDict paths
@@ -2569,13 +2745,15 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             const uint32_t start = block_index * kBp128BlockRows;
             const uint64_t selected =
                 SelNonNullCount(sel, tnulls, start, start + block.rows);
-            if (selected == 0) continue;
+            if (selected == 0) {
+              continue;
+            }
             if (selected == block.rows && trusted) {
               sum += Bp128BlockSum(block);
               continue;
             }
-            int64_t decoded[kBp128BlockRows];
-            DecodeBp128Block(parsed, block_index, decoded);
+            std::array<int64_t, kBp128BlockRows> decoded{};
+            DecodeBp128Block(parsed, block_index, decoded.data());
             for (uint32_t row = 0; row < block.rows; ++row) {
               const uint32_t global_row = start + row;
               if (((sel.bits[global_row >> 6] >> (global_row & 63U)) & 1ULL) ==
@@ -2589,10 +2767,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += decoded[row];
             }
           }
-          __int128 contribution = 0;
-          if (__builtin_mul_overflow(static_cast<__int128>(plan.coeff), sum,
-                                     &contribution) ||
-              __builtin_add_overflow(res.sum, contribution, &res.sum)) {
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
             return ReduceResult{};
           }
           continue;
@@ -2611,7 +2786,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             const uint32_t start = block_index * kFastPforBlockRows;
             const uint64_t selected =
                 SelNonNullCount(sel, tnulls, start, start + block.rows);
-            if (selected == 0) continue;
+            if (selected == 0) {
+              continue;
+            }
             // The stored brackets cover ALL rows (spikes included), so a
             // fully-selected block's SUM is its metadata word -- the same
             // zero-read shape as the kBp128 arm above.
@@ -2619,8 +2796,8 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += block.sum;
               continue;
             }
-            int64_t decoded[kFastPforBlockRows];
-            FastPforDecodeBlock(block, decoded);
+            std::array<int64_t, kFastPforBlockRows> decoded{};
+            FastPforDecodeBlock(block, decoded.data());
             for (uint32_t row = 0; row < block.rows; ++row) {
               const uint32_t global_row = start + row;
               if (((sel.bits[global_row >> 6] >> (global_row & 63U)) & 1ULL) ==
@@ -2634,10 +2811,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += decoded[row];
             }
           }
-          __int128 contribution = 0;
-          if (__builtin_mul_overflow(static_cast<__int128>(plan.coeff), sum,
-                                     &contribution) ||
-              __builtin_add_overflow(res.sum, contribution, &res.sum)) {
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
             return ReduceResult{};
           }
           continue;
@@ -2657,7 +2831,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             const uint32_t start = block_index * kDeltaFastPforBlockRows;
             const uint64_t selected =
                 SelNonNullCount(sel, tnulls, start, start + block.rows);
-            if (selected == 0) continue;
+            if (selected == 0) {
+              continue;
+            }
             // The stored brackets cover ALL rows (spikes included), so a
             // fully-selected block's SUM is its metadata word -- the same
             // zero-read shape as the kFastPfor arm above.
@@ -2665,8 +2841,8 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += block.sum;
               continue;
             }
-            int64_t decoded[kDeltaFastPforBlockRows];
-            DeltaFastPforDecodeBlock(block, decoded);
+            std::array<int64_t, kDeltaFastPforBlockRows> decoded{};
+            DeltaFastPforDecodeBlock(block, decoded.data());
             for (uint32_t row = 0; row < block.rows; ++row) {
               const uint32_t global_row = start + row;
               if (((sel.bits[global_row >> 6] >> (global_row & 63U)) & 1ULL) ==
@@ -2680,10 +2856,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += decoded[row];
             }
           }
-          __int128 contribution = 0;
-          if (__builtin_mul_overflow(static_cast<__int128>(plan.coeff), sum,
-                                     &contribution) ||
-              __builtin_add_overflow(res.sum, contribution, &res.sum)) {
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
             return ReduceResult{};
           }
           continue;
@@ -2704,19 +2877,23 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 std::min<uint32_t>(kDeltaPForBlockRows, parsed.n - start);
             const uint64_t selected =
                 SelPopcountRange(sel, start, start + rows);
-            if (selected == 0) continue;
+            if (selected == 0) {
+              continue;
+            }
             if (selected == rows && selected_nonnull == rc) {
               const char* bracket =
                   parsed.brackets +
-                  static_cast<size_t>(block) * kDeltaPForBracketBytes;
+                  (static_cast<size_t>(block) * kDeltaPForBracketBytes);
               sum += DeltaPForBracketSum(bracket);
               continue;
             }
-            int64_t decoded[kDeltaPForBlockRows];
-            DecodeDeltaPForBlock(parsed, block, decoded);
+            std::array<int64_t, kDeltaPForBlockRows> decoded{};
+            DecodeDeltaPForBlock(parsed, block, decoded.data());
             for (uint32_t i = 0; i < rows; ++i) {
               const uint32_t row = start + i;
-              if (((sel.bits[row >> 6] >> (row & 63U)) & 1ULL) == 0) continue;
+              if (((sel.bits[row >> 6] >> (row & 63U)) & 1ULL) == 0) {
+                continue;
+              }
               if (tnulls != nullptr &&
                   ((static_cast<unsigned>(tnulls[row >> 3]) >>
                     (7U - (row & 7U))) &
@@ -2726,7 +2903,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               sum += decoded[i];
             }
           }
-          res.sum += static_cast<__int128>(plan.coeff) * sum;
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -2736,13 +2915,17 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             ParseQppRegion(tr, rc, f.params[toff], treg_end, &parsed)) {
           const uint8_t* nulls = RgColNullBits(f, g, plan.col);
           if (nulls == nullptr && sel.count == rc) {
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * QppRegionSumAll(parsed);
+            if (!TryAccumulateScaledSum(plan.coeff, QppRegionSumAll(parsed),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
           __int128 sum = 0;
           for (uint32_t i = 0; i < rc; ++i) {
-            if (((sel.bits[i >> 6] >> (i & 63U)) & 1ULL) == 0) continue;
+            if (((sel.bits[i >> 6] >> (i & 63U)) & 1ULL) == 0) {
+              continue;
+            }
             if (nulls != nullptr &&
                 ((static_cast<unsigned>(nulls[i >> 3]) >> (7U - (i & 7U))) &
                  1U) != 0) {
@@ -2750,7 +2933,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             }
             sum += QppValueAt(parsed, i);
           }
-          res.sum += static_cast<__int128>(plan.coeff) * sum;
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -2769,9 +2954,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           const uint32_t nexc = ReadBE16(tr + 21);
           const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
           if (nexc <= rc && tr + 23 + bmp_bytes <= treg_end) {
-            uint64_t s = a * static_cast<uint64_t>(rc) +
-                         d * (static_cast<uint64_t>(rc) *
-                              (static_cast<uint64_t>(rc) - 1) / 2);
+            uint64_t s = (a * static_cast<uint64_t>(rc)) +
+                         (d * (static_cast<uint64_t>(rc) *
+                               (static_cast<uint64_t>(rc) - 1) / 2));
             if (nexc > 0) {
               std::vector<int64_t> exc(nexc, 0);
               DecodeInnerI64All(tr + 23 + bmp_bytes,
@@ -2785,13 +2970,15 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   continue;  // on-line row
                 }
                 const uint64_t m =
-                    a + static_cast<uint64_t>(i) * d;  // patched-out value
+                    a + (static_cast<uint64_t>(i) * d);  // patched-out value
                 s += static_cast<uint64_t>(exc[eidx]) - m;
                 ++eidx;
               }
             }
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * static_cast<int64_t>(s);
+            if (!TryAccumulateScaledSum(plan.coeff, static_cast<int64_t>(s),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -2809,7 +2996,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             const uint32_t nexc = ReadBE16(pl.hdr + 5);
             std::vector<int64_t> exc(static_cast<size_t>(nexc), 0);
             if (nexc > 0) {
-              DecodeInnerI64All(pl.bmp + (static_cast<size_t>(rc) + 7) / 8,
+              DecodeInnerI64All(pl.bmp + ((static_cast<size_t>(rc) + 7) / 8),
                                 static_cast<uint8_t>(pl.hdr[0]),
                                 ReadBE32(pl.hdr + 1), nexc, treg_end,
                                 exc.data());
@@ -2818,16 +3005,16 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             for (uint32_t j = 0; j < pl.nseg; ++j) {
               const uint32_t seg_start =
                   j == 0 ? 0
-                         : ReadBE32(pl.segs + static_cast<size_t>(j - 1) * 20 +
-                                    16);
+                         : ReadBE32(pl.segs +
+                                    (static_cast<size_t>(j - 1) * 20) + 16);
               const uint32_t seg_end =
-                  ReadBE32(pl.segs + static_cast<size_t>(j) * 20 + 16);
+                  ReadBE32(pl.segs + (static_cast<size_t>(j) * 20) + 16);
               const uint64_t len = seg_end - seg_start;
               const uint64_t first =
-                  ReadBE64(pl.segs + static_cast<size_t>(j) * 20);
+                  ReadBE64(pl.segs + (static_cast<size_t>(j) * 20));
               const uint64_t d =
-                  ReadBE64(pl.segs + static_cast<size_t>(j) * 20 + 8);
-              s += first * len + d * (len * (len - 1) / 2);
+                  ReadBE64(pl.segs + (static_cast<size_t>(j) * 20) + 8);
+              s += (first * len) + (d * (len * (len - 1) / 2));
             }
             // Patch every exception: replace the model value M_i by v_i.
             if (nexc > 0) {
@@ -2836,21 +3023,26 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               uint32_t eidx = 0;
               for (uint32_t i = 0; i < rc && eidx < nexc; ++i) {
                 while (i >=
-                       ReadBE32(pl.segs + static_cast<size_t>(j) * 20 + 16)) {
-                  start = ReadBE32(pl.segs + static_cast<size_t>(j) * 20 + 16);
+                       ReadBE32(pl.segs + (static_cast<size_t>(j) * 20) + 16)) {
+                  start =
+                      ReadBE32(pl.segs + (static_cast<size_t>(j) * 20) + 16);
                   ++j;
                 }
-                if ((pl.bmp[i >> 3] >> (7 - (i & 7))) & 1) continue;
+                if (((pl.bmp[i >> 3] >> (7 - (i & 7))) & 1) != 0) {
+                  continue;
+                }
                 const uint64_t model =
-                    ReadBE64(pl.segs + static_cast<size_t>(j) * 20) +
-                    static_cast<uint64_t>(i - start) *
-                        ReadBE64(pl.segs + static_cast<size_t>(j) * 20 + 8);
+                    ReadBE64(pl.segs + (static_cast<size_t>(j) * 20)) +
+                    (static_cast<uint64_t>(i - start) *
+                     ReadBE64(pl.segs + (static_cast<size_t>(j) * 20) + 8));
                 s += static_cast<uint64_t>(exc[eidx]) - model;
                 ++eidx;
               }
             }
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * static_cast<int64_t>(s);
+            if (!TryAccumulateScaledSum(plan.coeff, static_cast<int64_t>(s),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -2868,21 +3060,21 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           const uint64_t a = ReadBE64(tr);
           const uint64_t b = ReadBE64(tr + 8);
           const uint64_t m = ReadBE64(tr + 16);
-          const uint8_t ischeme = static_cast<uint8_t>(tr[24]);
+          const auto ischeme = static_cast<uint8_t>(tr[24]);
           const uint32_t iparam = ReadBE32(tr + 25);
           const uint32_t nexc = ReadBE16(tr + 29);
           const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
           if (m >= 2 && m <= (UINT64_C(1) << 63) && a < m && b < m && b != 0 &&
               nexc <= rc && tr + 31 + bmp_bytes <= treg_end &&
               (nexc == 0 || InnerSchemeOk(ischeme))) {
-            uint64_t s = a * static_cast<uint64_t>(rc) +
-                         b * (static_cast<uint64_t>(rc) *
-                              (static_cast<uint64_t>(rc) - 1) / 2) -
-                         m * static_cast<uint64_t>(ModFloorSum(
-                                 static_cast<unsigned __int128>(rc),
-                                 static_cast<unsigned __int128>(a),
-                                 static_cast<unsigned __int128>(b),
-                                 static_cast<unsigned __int128>(m)));
+            uint64_t s = (a * static_cast<uint64_t>(rc)) +
+                         (b * (static_cast<uint64_t>(rc) *
+                               (static_cast<uint64_t>(rc) - 1) / 2)) -
+                         (m * static_cast<uint64_t>(ModFloorSum(
+                                  static_cast<unsigned __int128>(rc),
+                                  static_cast<unsigned __int128>(a),
+                                  static_cast<unsigned __int128>(b),
+                                  static_cast<unsigned __int128>(m))));
             if (nexc > 0) {
               std::vector<int64_t> exc(nexc, 0);
               DecodeInnerI64All(tr + 31 + bmp_bytes, ischeme, iparam, nexc,
@@ -2897,11 +3089,15 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   ++eidx;
                 }
                 cur += b;
-                if (cur >= m) cur -= m;
+                if (cur >= m) {
+                  cur -= m;
+                }
               }
             }
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * static_cast<int64_t>(s);
+            if (!TryAccumulateScaledSum(plan.coeff, static_cast<int64_t>(s),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -2917,8 +3113,8 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
         if (SelNonNullCount(sel, tnulls, 0, rc) == rc) {
           const uint32_t nd = static_cast<uint8_t>(tr[0]);
-          const size_t hdr = 8 + static_cast<size_t>(nd) * 16;
-          const uint8_t ischeme = static_cast<uint8_t>(tr[hdr - 7]);
+          const size_t hdr = 8 + (static_cast<size_t>(nd) * 16);
+          const auto ischeme = static_cast<uint8_t>(tr[hdr - 7]);
           const uint32_t iparam = ReadBE32(tr + hdr - 6);
           const uint32_t nexc = ReadBE16(tr + hdr - 2);
           const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -2928,16 +3124,16 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             uint64_t s = 0;
             for (uint32_t l = 0; l < nd; ++l) {
               const uint64_t base =
-                  ReadBE64(tr + 1 + static_cast<size_t>(l) * 16);
+                  ReadBE64(tr + 1 + (static_cast<size_t>(l) * 16));
               const uint64_t step =
-                  ReadBE64(tr + 1 + static_cast<size_t>(l) * 16 + 8);
+                  ReadBE64(tr + 1 + (static_cast<size_t>(l) * 16) + 8);
               // Rows of lane l: l, l+nd, ... < rc. The u64 accumulation is
               // the wrapped lane sum (tick counts run 0..cnt-1).
               uint64_t cnt = 0;
               if (rc > l) {
-                cnt = (static_cast<uint64_t>(rc) - 1 - l) / nd + 1;
+                cnt = ((static_cast<uint64_t>(rc) - 1 - l) / nd) + 1;
               }
-              s += base * cnt + step * (cnt * (cnt - 1) / 2);
+              s += (base * cnt) + (step * (cnt * (cnt - 1) / 2));
             }
             if (nexc > 0) {
               std::vector<int64_t> exc(nexc, 0);
@@ -2951,8 +3147,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                       (7 - (i & 7))) &
                      1) == 0) {
                   const uint64_t model =
-                      ReadBE64(tr + 1 + static_cast<size_t>(l) * 16) +
-                      ReadBE64(tr + 1 + static_cast<size_t>(l) * 16 + 8) * tick;
+                      ReadBE64(tr + 1 + (static_cast<size_t>(l) * 16)) +
+                      (ReadBE64(tr + 1 + (static_cast<size_t>(l) * 16) + 8) *
+                       tick);
                   s += static_cast<uint64_t>(exc[eidx]) - model;
                   ++eidx;
                 }
@@ -2962,8 +3159,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 }
               }
             }
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * static_cast<int64_t>(s);
+            if (!TryAccumulateScaledSum(plan.coeff, static_cast<int64_t>(s),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -2980,8 +3179,12 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         if (ParseSortDictRegion(tr, rc, f.params[toff], treg_end, &parsed)) {
           const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
           if (SelNonNullCount(sel, tnulls, 0, rc) == rc) {
-            res.sum += static_cast<__int128>(plan.coeff) *
-                       static_cast<int64_t>(SortDictPsum(parsed, parsed.nb));
+            if (!TryAccumulateScaledSum(
+                    plan.coeff,
+                    static_cast<int64_t>(SortDictPsum(parsed, parsed.nb)),
+                    &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -3001,8 +3204,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               s += static_cast<uint64_t>(PostingsDictAt(parsed, c)) *
                    PostingsCountAt(parsed, c);
             }
-            res.sum +=
-                static_cast<__int128>(plan.coeff) * static_cast<int64_t>(s);
+            if (!TryAccumulateScaledSum(plan.coeff, static_cast<int64_t>(s),
+                                        &res.sum)) {
+              return ReduceResult{};
+            }
             continue;
           }
         }
@@ -3015,9 +3220,11 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             ParseWaveletRRegion(tr, rc, f.params[toff], treg_end, &parsed) &&
             SelNonNullCount(sel, tnulls, 0, rc) == rc) {
           const uint64_t normalized = WaveletRSumRange(parsed, 0, 0, rc);
-          const int64_t sum = static_cast<int64_t>(
-              static_cast<uint64_t>(parsed.minimum) * rc + normalized);
-          res.sum += static_cast<__int128>(plan.coeff) * sum;
+          const auto sum = static_cast<int64_t>(
+              (static_cast<uint64_t>(parsed.minimum) * rc) + normalized);
+          if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -3028,7 +3235,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
           const int64_t sm = PaxChunk::PBitSFilteredSum(
               tr, f.params[toff], rc, treg_end, tnulls, sel.bits.data());
-          res.sum += static_cast<__int128>(plan.coeff) * sm;
+          if (!TryAccumulateScaledSum(plan.coeff, sm, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -3037,7 +3246,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         __int128 sm = 0;
         if (Rle8SelectedSum(tr, rc, f.params[toff], treg_end, tnulls,
                             sel.bits.data(), &sm)) {
-          res.sum += static_cast<__int128>(plan.coeff) * sm;
+          if (!TryAccumulateScaledSum(plan.coeff, sm, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -3046,7 +3257,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         __int128 sm = 0;
         if (RleDeltaSelectedSum(tr, rc, f.params[toff], treg_end, tnulls,
                                 sel.bits.data(), &sm)) {
-          res.sum += static_cast<__int128>(plan.coeff) * sm;
+          if (!TryAccumulateScaledSum(plan.coeff, sm, &res.sum)) {
+            return ReduceResult{};
+          }
           continue;
         }
       }
@@ -3059,10 +3272,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
         if (tnulls == nullptr && tr != nullptr && treg_end != nullptr &&
             tr + 16 <= treg_end && f.params[toff] > 0) {
-          const int64_t tv = static_cast<int64_t>(ReadBE64(tr));
-          const int64_t fv = static_cast<int64_t>(ReadBE64(tr + 8));
+          const auto tv = static_cast<int64_t>(ReadBE64(tr));
+          const auto fv = static_cast<int64_t>(ReadBE64(tr + 8));
           const uint32_t words = f.params[toff];
-          if (tr + 16 + static_cast<size_t>(words) * 8 > treg_end) {
+          if (tr + 16 + (static_cast<size_t>(words) * 8) > treg_end) {
             // Hostile extent: fall through to the bounded generic decode.
           } else {
             __int128 sum = 0;
@@ -3079,13 +3292,14 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   sel_bits |= sel.bits[(pos >> 6U) + 1U] << (64 - (pos & 63U));
                 }
                 sel_bits &= (span == 64U) ? ~0ULL : ((1ULL << span) - 1ULL);
-                const uint64_t cnt =
+                const auto cnt =
                     static_cast<uint64_t>(__builtin_popcountll(sel_bits));
-                const uint64_t ones =
+                const auto ones =
                     static_cast<uint64_t>(__builtin_popcountll(sel_bits & le));
-                sum += static_cast<__int128>(tv) * static_cast<__int128>(ones) +
-                       static_cast<__int128>(fv) *
-                           static_cast<__int128>(cnt - ones);
+                sum +=
+                    (static_cast<__int128>(tv) * static_cast<__int128>(ones)) +
+                    (static_cast<__int128>(fv) *
+                     static_cast<__int128>(cnt - ones));
                 pos += span;
               } else {  // fill span
                 const uint64_t len = w & kWahLenMask;
@@ -3105,7 +3319,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               }
             }
             if (ok) {
-              res.sum += static_cast<__int128>(plan.coeff) * sum;
+              if (!TryAccumulateScaledSum(plan.coeff, sum, &res.sum)) {
+                return ReduceResult{};
+              }
               continue;
             }
           }
@@ -3124,14 +3340,18 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
         auto consider = [&](int64_t v) {
           if (plan.op == AggOp::kMin) {
-            if (!minmax_seen || v < res.min_val) res.min_val = v;
+            if (!minmax_seen || v < res.min_val) {
+              res.min_val = v;
+            }
           } else {
-            if (!minmax_seen || v > res.max_val) res.max_val = v;
+            if (!minmax_seen || v > res.max_val) {
+              res.max_val = v;
+            }
           }
           minmax_seen = true;
         };
         if (ts == Scheme::kConst) {
-          const int64_t v = static_cast<int64_t>(ReadBE64(tr));
+          const auto v = static_cast<int64_t>(ReadBE64(tr));
           if (plan.op == AggOp::kSum) {
             // NULL rows contribute 0, mirroring the generic path's null
             // mask (same contract the MIN/MAX arm and the RLE/DICT arms
@@ -3141,9 +3361,11 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             // with null_present + kConst must not disagree with the
             // generic decode of the identical chunk.
             const uint64_t nn = SelNonNullCount(sel, tnulls, 0, rc);
-            res.sum += static_cast<__int128>(plan.coeff) * v *
-                       static_cast<__int128>(nn);
-          } else if (v != 0 || SelNonNullCount(sel, tnulls, 0, rc) > 0) {
+            if (!TryAccumulateScaledSum(
+                    plan.coeff, v * static_cast<__int128>(nn), &res.sum)) {
+              return ReduceResult{};
+            }
+          } else if (SelNonNullCount(sel, tnulls, 0, rc) > 0) {
             consider(v);
           }
           continue;
@@ -3155,11 +3377,11 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           // garbage (the DICT block below must not see an RLE region, so
           // this arm always continues).
           if (treg_end != nullptr &&
-              tr + 4 + static_cast<size_t>(f.params[toff]) * 12 <= treg_end) {
+              tr + 4 + (static_cast<size_t>(f.params[toff]) * 12) <= treg_end) {
             uint32_t pos = 0;
             const char* q = tr + 4;
             for (uint32_t r = 0; r < f.params[toff] && pos < rc; ++r) {
-              const int64_t v = static_cast<int64_t>(ReadBE64(q));
+              const auto v = static_cast<int64_t>(ReadBE64(q));
               // u64 extent math: a hostile len wrapped pos+len in uint32,
               // regressed `pos` and re-folded the same rows into the
               // aggregate.
@@ -3170,8 +3392,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               const uint64_t w = SelPopcountRange(sel, pos, end);
               if (w > 0) {
                 if (plan.op == AggOp::kSum) {
-                  res.sum += static_cast<__int128>(plan.coeff) * v *
-                             static_cast<__int128>(w);
+                  if (!TryAccumulateScaledSum(
+                          plan.coeff, v * static_cast<__int128>(w), &res.sum)) {
+                    return ReduceResult{};
+                  }
                 } else if (v != 0 ||
                            SelNonNullCount(sel, tnulls, pos, end) > 0) {
                   consider(v);
@@ -3206,8 +3430,11 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                       : SelPopcountRange(sel, pos, end);
               if (selected > 0) {
                 if (plan.op == AggOp::kSum) {
-                  res.sum += static_cast<__int128>(plan.coeff) * value *
-                             static_cast<__int128>(selected);
+                  if (!TryAccumulateScaledSum(
+                          plan.coeff, value * static_cast<__int128>(selected),
+                          &res.sum)) {
+                    return ReduceResult{};
+                  }
                 } else if (value != 0 ||
                            SelNonNullCount(sel, tnulls, pos, end) > 0) {
                   consider(value);
@@ -3224,23 +3451,27 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           // run's dict value once. Extent gates mirror the kRle arm above;
           // clamp codes and rows past the run walk are raw 0. kOpRle shares
           // the byte layout (its sorted dict only matters to predicates).
-          if (tr + 2 > treg_end) continue;
+          if (tr + 2 > treg_end) {
+            continue;
+          }
           const uint16_t d = ReadBE16(tr);
-          if (d == 0) continue;
+          if (d == 0) {
+            continue;
+          }
           const int cb = (BitsNeeded(d - 1) + 7) / 8;
           const char* tdict = tr + 2;
-          const char* runs_hdr = tdict + static_cast<size_t>(d) * 8;
+          const char* runs_hdr = tdict + (static_cast<size_t>(d) * 8);
           const uint32_t runs = f.params[toff];
           if (runs_hdr + 4 > treg_end || ReadBE32(runs_hdr) != runs ||
               runs_hdr + 4 +
-                      static_cast<size_t>(runs) *
-                          (static_cast<size_t>(cb) + 4) >
+                      (static_cast<size_t>(runs) *
+                       (static_cast<size_t>(cb) + 4)) >
                   treg_end) {
             continue;
           }
           auto dict_at = [&](uint64_t code) {
             return static_cast<int64_t>(
-                ReadBE64(tdict + static_cast<size_t>(code) * 8));
+                ReadBE64(tdict + (static_cast<size_t>(code) * 8)));
           };
           uint64_t pos = 0;
           const char* q = runs_hdr + 4;
@@ -3259,8 +3490,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   SelPopcountRange(sel, static_cast<uint32_t>(pos), end);
               if (w > 0) {
                 if (plan.op == AggOp::kSum) {
-                  res.sum += static_cast<__int128>(plan.coeff) * v *
-                             static_cast<__int128>(w);
+                  if (!TryAccumulateScaledSum(
+                          plan.coeff, v * static_cast<__int128>(w), &res.sum)) {
+                    return ReduceResult{};
+                  }
                 } else if (v != 0 || SelNonNullCount(sel, tnulls,
                                                      static_cast<uint32_t>(pos),
                                                      end) > 0) {
@@ -3296,7 +3529,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   s += static_cast<__int128>(HuffDictDictAt(hp, sym)) *
                        static_cast<__int128>(HuffDictFreqAt(hp, sym));
                 }
-                res.sum += static_cast<__int128>(plan.coeff) * s;
+                if (!TryAccumulateScaledSum(plan.coeff, s, &res.sum)) {
+                  return ReduceResult{};
+                }
               } else {
                 consider(HuffDictDictAt(hp, 0));
                 consider(HuffDictDictAt(hp, hp.d - 1));
@@ -3312,8 +3547,12 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             bool zero_nonnull = false;
             for (uint32_t row = 0; row < rc; ++row) {
               const uint32_t sym = HuffDictDecodeSym(ht, br);
-              if (sym >= hp.d) continue;  // unreachable on a complete table
-              if ((sel.bits[row >> 6] >> (row & 63) & 1ULL) == 0) continue;
+              if (sym >= hp.d) {
+                continue;  // unreachable on a complete table
+              }
+              if ((sel.bits[row >> 6] >> (row & 63) & 1ULL) == 0) {
+                continue;
+              }
               if (tnulls != nullptr &&
                   ((static_cast<unsigned>(tnulls[row >> 3]) >>
                     (7U - (row & 7U))) &
@@ -3327,18 +3566,30 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             }
             if (plan.op == AggOp::kSum) {
               for (uint32_t sym = 0; sym < hp.d; ++sym) {
-                if (sfreq[sym] == 0) continue;
-                res.sum += static_cast<__int128>(plan.coeff) *
-                           static_cast<__int128>(HuffDictDictAt(hp, sym)) *
-                           static_cast<__int128>(sfreq[sym]);
+                if (sfreq[sym] == 0) {
+                  continue;
+                }
+                if (!TryAccumulateScaledSum(
+                        plan.coeff,
+                        static_cast<__int128>(HuffDictDictAt(hp, sym)) *
+                            static_cast<__int128>(sfreq[sym]),
+                        &res.sum)) {
+                  return ReduceResult{};
+                }
               }
             } else {
               for (uint32_t sym = 0; sym < hp.d; ++sym) {
-                if (sfreq[sym] == 0) continue;
+                if (sfreq[sym] == 0) {
+                  continue;
+                }
                 const int64_t v = HuffDictDictAt(hp, sym);
-                if (v != 0) consider(v);
+                if (v != 0) {
+                  consider(v);
+                }
               }
-              if (zero_nonnull) consider(0);
+              if (zero_nonnull) {
+                consider(0);
+              }
             }
             continue;
           }
@@ -3354,10 +3605,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           // or a null present walks the nibbles once, histogramming codes
           // the selection touched and evaluating exception rows directly.
           constexpr size_t kAggTopkHeader =
-              2 + 2 + 15 * 8 + 15 * 2 + 1 + 4;  // 159
+              2 + 2 + (15 * 8) + (15 * 2) + 1 + 4;  // 159
           const uint32_t d = ReadBE16(tr);
           const uint32_t nexc = ReadBE16(tr + 2);
-          const uint8_t ischeme = static_cast<uint8_t>(tr[154]);
+          const auto ischeme = static_cast<uint8_t>(tr[154]);
           const uint32_t iparam = ReadBE32(tr + 155);
           const size_t nib_bytes = (static_cast<size_t>(rc) + 1) / 2;
           if (d == 0 || d > 15 || nexc != f.params[toff] ||
@@ -3374,27 +3625,33 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               __int128 s = 0;
               for (uint32_t c = 0; c < d; ++c) {
                 s += static_cast<__int128>(static_cast<int64_t>(
-                         ReadBE64(tr + 4 + static_cast<size_t>(c) * 8))) *
+                         ReadBE64(tr + 4 + (static_cast<size_t>(c) * 8)))) *
                      static_cast<__int128>(
-                         ReadBE16(tr + 124 + static_cast<size_t>(c) * 2));
+                         ReadBE16(tr + 124 + (static_cast<size_t>(c) * 2)));
               }
               if (nexc > 0) {
                 std::vector<int64_t> exc(nexc, 0);
                 DecodeInnerI64All(tr + kAggTopkHeader + nib_bytes, ischeme,
                                   iparam, nexc, treg_end, exc.data());
-                for (int64_t v : exc) s += v;
+                for (int64_t v : exc) {
+                  s += v;
+                }
               }
-              res.sum += static_cast<__int128>(plan.coeff) * s;
+              if (!TryAccumulateScaledSum(plan.coeff, s, &res.sum)) {
+                return ReduceResult{};
+              }
             } else {
               for (uint32_t c = 0; c < d; ++c) {
                 consider(static_cast<int64_t>(
-                    ReadBE64(tr + 4 + static_cast<size_t>(c) * 8)));
+                    ReadBE64(tr + 4 + (static_cast<size_t>(c) * 8))));
               }
               if (nexc > 0) {
                 std::vector<int64_t> exc(nexc, 0);
                 DecodeInnerI64All(tr + kAggTopkHeader + nib_bytes, ischeme,
                                   iparam, nexc, treg_end, exc.data());
-                for (int64_t v : exc) consider(v);
+                for (int64_t v : exc) {
+                  consider(v);
+                }
               }
             }
             continue;
@@ -3409,7 +3666,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             bool zero_nonnull = false;
             uint32_t eidx = 0;
             for (uint32_t row = 0; row < rc; ++row) {
-              const uint8_t byte =
+              const auto byte =
                   static_cast<uint8_t>(tr[kAggTopkHeader + (row >> 1)]);
               const uint32_t code =
                   (row & 1) == 0 ? (byte >> 4) : (byte & 0x0F);
@@ -3423,7 +3680,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 if (selected && !is_null) {
                   ++sfreq[code];
                   if (static_cast<int64_t>(ReadBE64(
-                          tr + 4 + static_cast<size_t>(code) * 8)) == 0) {
+                          tr + 4 + (static_cast<size_t>(code) * 8))) == 0) {
                     zero_nonnull = true;
                   }
                 }
@@ -3433,30 +3690,48 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 ++eidx;
                 if (count_this) {
                   if (plan.op == AggOp::kSum) {
-                    res.sum += static_cast<__int128>(plan.coeff) * v;
+                    if (!TryAccumulateScaledSum(plan.coeff, v, &res.sum)) {
+                      return ReduceResult{};
+                    }
                   } else {
-                    if (v != 0) consider(v);
-                    if (v == 0) zero_nonnull = true;
+                    if (v != 0) {
+                      consider(v);
+                    }
+                    if (v == 0) {
+                      zero_nonnull = true;
+                    }
                   }
                 }
               }
             }
             if (plan.op == AggOp::kSum) {
               for (uint32_t c = 0; c < d; ++c) {
-                if (sfreq[c] == 0) continue;
-                res.sum += static_cast<__int128>(plan.coeff) *
-                           static_cast<__int128>(static_cast<int64_t>(
-                               ReadBE64(tr + 4 + static_cast<size_t>(c) * 8))) *
-                           static_cast<__int128>(sfreq[c]);
+                if (sfreq[c] == 0) {
+                  continue;
+                }
+                if (!TryAccumulateScaledSum(
+                        plan.coeff,
+                        static_cast<__int128>(static_cast<int64_t>(
+                            ReadBE64(tr + 4 + (static_cast<size_t>(c) * 8)))) *
+                            static_cast<__int128>(sfreq[c]),
+                        &res.sum)) {
+                  return ReduceResult{};
+                }
               }
             } else {
               for (uint32_t c = 0; c < d; ++c) {
-                if (sfreq[c] == 0) continue;
-                const int64_t v = static_cast<int64_t>(
-                    ReadBE64(tr + 4 + static_cast<size_t>(c) * 8));
-                if (v != 0) consider(v);
+                if (sfreq[c] == 0) {
+                  continue;
+                }
+                const auto v = static_cast<int64_t>(
+                    ReadBE64(tr + 4 + (static_cast<size_t>(c) * 8)));
+                if (v != 0) {
+                  consider(v);
+                }
               }
-              if (zero_nonnull) consider(0);
+              if (zero_nonnull) {
+                consider(0);
+              }
             }
             continue;
           }
@@ -3480,9 +3755,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             uint32_t covered = 0;
             for (;;) {
               covered += probe.rows;
-              if (!TileDictNext(&probe)) break;
+              if (!TileDictNext(&probe)) {
+                break;
+              }
             }
-            if (covered != rc) continue;
+            if (covered != rc) {
+              continue;
+            }
           }
           bool zero_nonnull = false;
           for (;;) {
@@ -3495,7 +3774,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                                    ((static_cast<unsigned>(tnulls[row >> 3]) >>
                                      (7U - (row & 7U))) &
                                     1U) != 0;
-              if (!selected || is_null) continue;
+              if (!selected || is_null) {
+                continue;
+              }
               const uint64_t code =
                   c.w == 0 ? 0
                            : UnpackBitAt(c.codes,
@@ -3515,9 +3796,9 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               uint32_t za = 0;
               uint32_t zb = c.d;
               while (za < zb) {
-                const uint32_t zm = za + (zb - za) / 2;
+                const uint32_t zm = za + ((zb - za) / 2);
                 if (static_cast<int64_t>(
-                        ReadBE64(c.dict + static_cast<size_t>(zm) * 8)) < 0) {
+                        ReadBE64(c.dict + (static_cast<size_t>(zm) * 8))) < 0) {
                   za = zm + 1;
                 } else {
                   zb = zm;
@@ -3525,7 +3806,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               }
               if (za < c.d &&
                   static_cast<int64_t>(
-                      ReadBE64(c.dict + static_cast<size_t>(za) * 8)) == 0 &&
+                      ReadBE64(c.dict + (static_cast<size_t>(za) * 8))) == 0 &&
                   freq[za] > 0) {
                 zero_nonnull = true;
               }
@@ -3533,21 +3814,31 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             if (plan.op == AggOp::kSum) {
               __int128 s = 0;
               for (uint32_t k = 0; k < c.d; ++k) {
-                if (freq[k] == 0) continue;
+                if (freq[k] == 0) {
+                  continue;
+                }
                 s += static_cast<__int128>(static_cast<int64_t>(
-                         ReadBE64(c.dict + static_cast<size_t>(k) * 8))) *
+                         ReadBE64(c.dict + (static_cast<size_t>(k) * 8)))) *
                      static_cast<__int128>(freq[k]);
               }
-              res.sum += static_cast<__int128>(plan.coeff) * s;
+              if (!TryAccumulateScaledSum(plan.coeff, s, &res.sum)) {
+                return ReduceResult{};
+              }
             } else {
               for (uint32_t k = 0; k < c.d; ++k) {
-                if (freq[k] == 0) continue;
+                if (freq[k] == 0) {
+                  continue;
+                }
                 consider(static_cast<int64_t>(
-                    ReadBE64(c.dict + static_cast<size_t>(k) * 8)));
+                    ReadBE64(c.dict + (static_cast<size_t>(k) * 8))));
               }
-              if (zero_nonnull) consider(0);
+              if (zero_nonnull) {
+                consider(0);
+              }
             }
-            if (!TileDictNext(&c)) break;
+            if (!TileDictNext(&c)) {
+              break;
+            }
           }
           continue;
         }
@@ -3555,10 +3846,10 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         // dictionary (LowCardinality-style). Codes past ncodes decode to 0.
         const uint16_t ncodes = ReadBE16(tr);
         const size_t dict_base =
-            2 + (static_cast<size_t>(rc) * static_cast<size_t>(BitsNeeded(
-                                               ncodes > 0 ? ncodes - 1 : 0)) +
-                 7) /
-                    8;
+            2 + ((static_cast<size_t>(rc) * static_cast<size_t>(BitsNeeded(
+                                                ncodes > 0 ? ncodes - 1 : 0)) +
+                  7) /
+                 8);
         const char* dict = tr + dict_base;
         // The validator floors the region at 4B/entry but an int64 dict
         // consumes 8B/entry: a region built at the floor (or a hand-built
@@ -3567,7 +3858,7 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
         // every cell of this region to raw 0.
         const bool dict_ok =
             ncodes > 0 && treg_end != nullptr &&
-            dict + static_cast<size_t>(ncodes) * sizeof(int64_t) <= treg_end;
+            dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) <= treg_end;
         if (dict_ok) {
           const int cw = BitsNeeded(ncodes - 1);
           // The histogram is a handful of counters for the low-cardinality
@@ -3575,22 +3866,22 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           // row group per query; keep it on the stack whenever the dictionary
           // is small enough (the DICT validator's own kHuffDict-family ceiling
           // is far above this, so the heap path still covers wide regions).
-          uint64_t freq_stack[257];
+          std::array<uint64_t, 257> freq_stack{};
           std::vector<uint64_t> freq_heap;
           const size_t nfreq = static_cast<size_t>(ncodes) + 1;
-          uint64_t* freq = freq_stack;
+          uint64_t* freq = freq_stack.data();
           if (nfreq > sizeof(freq_stack) / sizeof(freq_stack[0])) {
             freq_heap.assign(nfreq, 0);
             freq = freq_heap.data();
           } else {
-            std::memset(freq_stack, 0, nfreq * sizeof(freq_stack[0]));
+            std::memset(freq_stack.data(), 0, nfreq * sizeof(freq_stack[0]));
           }
           // SUM takes the specialised histogram (no lambda, so the strength
           // reduction is uncontested); MIN/MAX keep the generic fold.
           if (plan.op == AggOp::kSum &&
               DictPassByteExpandable(static_cast<uint32_t>(cw))) {
             const uint8_t* codes = reinterpret_cast<const uint8_t*>(tr) + 2;
-            switch (8u / static_cast<uint32_t>(cw)) {
+            switch (8U / static_cast<uint32_t>(cw)) {
               case 8:
                 DictSelectedCodeHistogramRun<8>(codes, rc, ncodes,
                                                 sel.bits.data(), freq);
@@ -3605,11 +3896,16 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                 break;
             }
             for (uint16_t d = 0; d < ncodes; ++d) {
-              if (freq[d] == 0) continue;
-              const int64_t v =
-                  static_cast<int64_t>(ReadBE64(dict + (size_t)d * 8));
-              res.sum += static_cast<__int128>(plan.coeff) * v *
-                         static_cast<__int128>(freq[d]);
+              if (freq[d] == 0) {
+                continue;
+              }
+              const auto v =
+                  static_cast<int64_t>(ReadBE64(dict + ((size_t)d * 8)));
+              if (!TryAccumulateScaledSum(plan.coeff,
+                                          v * static_cast<__int128>(freq[d]),
+                                          &res.sum)) {
+                return ReduceResult{};
+              }
             }
             // Codes past the dictionary decode to raw 0 and contribute 0 to a
             // SUM, so the clamp bucket needs no term. COUNT comes from `sel`
@@ -3624,11 +3920,14 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               tr, rc, static_cast<uint32_t>(cw), ncodes, sel.bits.data(),
               [&](uint32_t row, uint32_t code) {
                 ++freq[code];
-                if (plan.op == AggOp::kSum || zero_nonnull) return;
+                if (plan.op == AggOp::kSum || zero_nonnull) {
+                  return;
+                }
                 const int64_t v =
-                    code == ncodes ? 0
-                                   : static_cast<int64_t>(ReadBE64(
-                                         dict + static_cast<size_t>(code) * 8));
+                    code == ncodes
+                        ? 0
+                        : static_cast<int64_t>(
+                              ReadBE64(dict + (static_cast<size_t>(code) * 8)));
                 // A selected row only counts as "a real 0 seen" when it is not
                 // a NULL cell: the generic path skips nulls, so the compressed
                 // fold must too.
@@ -3641,20 +3940,31 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
               });
           if (plan.op == AggOp::kSum) {
             for (uint16_t d = 0; d < ncodes; ++d) {
-              if (freq[d] == 0) continue;
-              const int64_t v =
-                  static_cast<int64_t>(ReadBE64(dict + (size_t)d * 8));
-              res.sum += static_cast<__int128>(plan.coeff) * v *
-                         static_cast<__int128>(freq[d]);
+              if (freq[d] == 0) {
+                continue;
+              }
+              const auto v =
+                  static_cast<int64_t>(ReadBE64(dict + ((size_t)d * 8)));
+              if (!TryAccumulateScaledSum(plan.coeff,
+                                          v * static_cast<__int128>(freq[d]),
+                                          &res.sum)) {
+                return ReduceResult{};
+              }
             }
           } else {
             for (uint16_t d = 0; d < ncodes; ++d) {
-              if (freq[d] == 0) continue;
-              const int64_t v =
-                  static_cast<int64_t>(ReadBE64(dict + (size_t)d * 8));
-              if (v != 0) consider(v);
+              if (freq[d] == 0) {
+                continue;
+              }
+              const auto v =
+                  static_cast<int64_t>(ReadBE64(dict + ((size_t)d * 8)));
+              if (v != 0) {
+                consider(v);
+              }
             }
-            if (zero_nonnull) consider(0);
+            if (zero_nonnull) {
+              consider(0);
+            }
           }
           continue;
         }  // dict_ok: else fall through to the generic decode below
@@ -3678,13 +3988,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       //
       // `vals_stack` must outlive this block: `vals` is read by the fold loop
       // below, so scoping the array to the `else` arm leaves it dangling.
-      int64_t vals_stack[PaxChunk::kRowGroupSize];
+      std::array<int64_t, PaxChunk::kRowGroupSize> vals_stack{};
       std::vector<int64_t> vals_heap;
-      const int64_t* vals;
+      const int64_t* vals = nullptr;
       if (fused_vals != nullptr) {
         vals = fused_vals;  // already decoded for the mask above
       } else {
-        vals = vals_stack;
+        vals = vals_stack.data();
         if (rc > PaxChunk::kRowGroupSize) {
           vals_heap.resize(rc);
           vals = vals_heap.data();
@@ -3694,24 +4004,31 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
       const uint8_t* gnulls = RgColNullBits(f, g, plan.col);
       for (uint64_t w = 0; w < sel.bits.size(); ++w) {
         uint64_t bits = sel.bits[w];
-        if (bits == 0) continue;
-        const uint16_t base = static_cast<uint16_t>(w * 64);
-        while (bits) {
-          const uint16_t b = static_cast<uint16_t>(__builtin_ctzll(bits));
+        if (bits == 0) {
+          continue;
+        }
+        const auto base = static_cast<uint16_t>(w * 64);
+        while (bits != 0U) {
+          const auto b = static_cast<uint16_t>(__builtin_ctzll(bits));
           bits &= bits - 1;
           uint16_t i = base + b;
-          if (i >= rc) break;
+          if (i >= rc) {
+            break;
+          }
           // NULL cells decode as raw 0 and would pollute MIN/MAX (column
           // [5, 10, NULL] reported min=0); the metadata fast path above
           // reads the null-aware zone maps, so mask nulls here too.
           if (gnulls != nullptr &&
               ((static_cast<unsigned>(gnulls[i >> 3]) >> (7U - (i & 7U))) &
-               1U) != 0)
+               1U) != 0) {
             continue;
+          }
           const int64_t v = vals[i];
           switch (plan.op) {
             case AggOp::kSum:
-              res.sum += static_cast<__int128>(plan.coeff) * v;
+              if (!TryAccumulateScaledSum(plan.coeff, v, &res.sum)) {
+                return ReduceResult{};
+              }
               break;
             case AggOp::kApproxDistinct:
               distinct_seen.insert(v);
@@ -3744,30 +4061,34 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
     res.valid = true;
     return res;
   }
-  res.valid =
-      !(plan.op == AggOp::kMin || plan.op == AggOp::kMax) || minmax_seen;
+  res.valid = (plan.op != AggOp::kMin && plan.op != AggOp::kMax) || minmax_seen;
   return res;
 }
 
 bool FastColumnSum(const PaxChunk& chunk, slot_t col, int64_t* sum_out,
                    uint64_t* count_out) {
   const PaxChunk::Footer& f = chunk.GetFooter();
-  if (!f.rg_sums_present || col >= f.column_count) return false;
+  if (!f.rg_sums_present || col >= f.column_count) {
+    return false;
+  }
   // col indexes col_sum_valid unchecked below: a hand-built footer can carry
   // a shorter array (VectorizedScanColumn checks the size; this path did
   // not and read out of bounds).
-  if (col >= f.col_sum_valid.size() || !f.col_sum_valid[col]) return false;
+  if (col >= f.col_sum_valid.size() || (f.col_sum_valid[col] == 0U)) {
+    return false;
+  }
   // Hand-built footer guards: row_counts shorter than row_group_count, and
   // the rg_sums index derived from them, must stay in bounds.
   if (f.row_counts.size() < f.row_group_count ||
       f.rg_sums.size() <
-          static_cast<size_t>(f.row_group_count) * f.column_count)
+          static_cast<size_t>(f.row_group_count) * f.column_count) {
     return false;
+  }
   // Unsigned accumulate: adversarial column sums overflow int64 (UB).
   uint64_t s = 0;
   uint64_t c = 0;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
-    const size_t zi = static_cast<size_t>(g) * f.column_count + col;
+    const size_t zi = (static_cast<size_t>(g) * f.column_count) + col;
     s += static_cast<uint64_t>(f.rg_sums[zi]);
     c += f.row_counts[g];
   }
@@ -3789,7 +4110,9 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
   const uint16_t cc = f.column_count;
   // Public API: col indexes col_sum_valid / column_offsets / all_zone_mins
   // below — an out-of-range col read out of bounds before any row work.
-  if (col >= cc) return ScanResult{};
+  if (col >= cc) {
+    return ScanResult{};
+  }
   // Hand-built-footer guard: the loops index row_counts[g] and the per-cell
   // arrays; declared-but-absent arrays would read out of bounds.
   if (f.row_counts.size() < f.row_group_count ||
@@ -3806,7 +4129,9 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
                         sc->GetColumn(col).Type() != ValueType::kInt64)) {
     return ScanResult{};
   }
-  if (workload != nullptr && sc != nullptr) workload->RecordFilter(*sc, col);
+  if (workload != nullptr && sc != nullptr) {
+    workload->RecordFilter(*sc, col);
+  }
 
   int64_t plo = INT64_MIN, phi = INT64_MAX;
   bool range_empty = false;  // predicate is unsatisfiable regardless of data
@@ -3842,9 +4167,11 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
   }
 
   auto scan_rg = [&](uint32_t g, ScanResult& r) {
-    if (range_empty) return;
+    if (range_empty) {
+      return;
+    }
     const uint16_t rc = f.row_counts[g];
-    const size_t zi = static_cast<size_t>(g) * cc + col;
+    const size_t zi = (static_cast<size_t>(g) * cc) + col;
     if (f.all_zm_present && zi < f.all_zone_mins.size() &&
         zi < f.all_zone_maxs.size()) {
       // Zone pruning: skip row groups that cannot contain a match. The
@@ -3852,8 +4179,9 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       // raw 0 — a group with nulls can match through value 0 even when its
       // non-null zone misses the predicate, so pruning must be disabled.
       if (!RgColHasNull(f, g, col) &&
-          !(f.all_zone_mins[zi] <= phi && f.all_zone_maxs[zi] >= plo))
+          (f.all_zone_mins[zi] > phi || f.all_zone_maxs[zi] < plo)) {
         return;
+      }
       // Fully-inside fast path: fold in precomputed partial sum, no decode.
       // Skipped when this (rg,col) contains nulls (see RgColHasNull).
       // col_sum_valid may be EMPTY on a footer built without the v5 stats
@@ -3903,18 +4231,20 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
           r.hit_count += cnt;
           // Wrapping multiply: UB-free two's-complement truncation.
           r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                           static_cast<uint64_t>(lit) * cnt);
+                                           (static_cast<uint64_t>(lit) * cnt));
         }
         return;
       }
       // Xor8 pre-filter: a definite "absent" skips the whole group with no
       // decode; "maybe" falls through to the paths below.
       if (const XorCell* xc = FindXorCell(f, g, col)) {
-        if (!XorCellMayContain(*xc, lit)) return;
+        if (!XorCellMayContain(*xc, lit)) {
+          return;
+        }
       }
     }
     {
-      const size_t bp_off = static_cast<size_t>(g) * cc + col;
+      const size_t bp_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bp_off]) == Scheme::kBp128 &&
           rc > 0) {
         const char* bp_region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -3938,7 +4268,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t fp_off = static_cast<size_t>(g) * cc + col;
+      const size_t fp_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[fp_off]) == Scheme::kFastPfor &&
           rc > 0) {
         const char* fp_region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -3962,7 +4292,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t dfp_off = static_cast<size_t>(g) * cc + col;
+      const size_t dfp_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[dfp_off]) == Scheme::kDeltaFastPfor &&
           rc > 0) {
         const char* dfp_region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -3986,7 +4316,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t qpp_off = static_cast<size_t>(g) * cc + col;
+      const size_t qpp_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[qpp_off]) == Scheme::kQpp && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* region_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4004,7 +4334,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t dpf_off = static_cast<size_t>(g) * cc + col;
+      const size_t dpf_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[dpf_off]) == Scheme::kDeltaPfor &&
           rc > 0) {
         const char* dpf_region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4023,7 +4353,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t pbits_off = static_cast<size_t>(g) * cc + col;
+      const size_t pbits_off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[pbits_off]) == Scheme::kPBitS &&
           rc <= 1024) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 11);
@@ -4032,17 +4362,17 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
         if (region != nullptr && reg_end != nullptr &&
             ParsePBitSRegion(region, rc, f.params[pbits_off], reg_end,
                              &parsed)) {
-          uint64_t bits[16] = {0};
+          std::array<uint64_t, 16> bits = {0};
           PaxChunk::PBitSCompareMask(region, f.params[pbits_off], rc, reg_end,
                                      static_cast<PaxChunk::CompareOp>(op), lit,
-                                     nullptr, bits);
+                                     nullptr, bits.data());
           uint64_t count = 0;
           const size_t words = (static_cast<size_t>(rc) + 63) / 64;
           for (size_t i = 0; i < words; ++i) {
             count += static_cast<uint64_t>(__builtin_popcountll(bits[i]));
           }
           const int64_t sm = PaxChunk::PBitSFilteredSum(
-              region, f.params[pbits_off], rc, reg_end, nullptr, bits);
+              region, f.params[pbits_off], rc, reg_end, nullptr, bits.data());
           r.hit_count += count;
           r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
                                            static_cast<uint64_t>(sm));
@@ -4051,7 +4381,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t off = static_cast<size_t>(g) * cc + col;
+      const size_t off = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[off]) == Scheme::kWaveletR &&
           rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4074,7 +4404,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // reports null cells as 0), so both mask and sum run with null_bmp ==
     // nullptr.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kByteSlice &&
           rc > 0) {
         // Validate the offset VALUE before dereferencing region[0] (the
@@ -4082,7 +4412,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
         if (region != nullptr && reg_end != nullptr && reg_end > region) {
-          const uint8_t w = static_cast<uint8_t>(region[0]);
+          const auto w = static_cast<uint8_t>(region[0]);
           const size_t stride = (static_cast<size_t>(rc) + 7) / 8;
           // mbits is sized for kRowGroupSize=1024 rows: ByteSliceCompareMask
           // writes ceil(rc/64) words, so a hand-built rc up to 65535 with a
@@ -4090,18 +4420,19 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
           // ByteSliceNullAwareCount's rc <= 1024 gate.
           if (rc <= 1024 && w != 0 && w <= 64 &&
               w == static_cast<uint8_t>(f.params[bso]) &&
-              reg_end - region >=
-                  static_cast<ptrdiff_t>(1 + static_cast<size_t>(w) * stride)) {
-            uint64_t mbits[16] = {0};
+              reg_end - region >= static_cast<ptrdiff_t>(
+                                      1 + (static_cast<size_t>(w) * stride))) {
+            std::array<uint64_t, 16> mbits = {0};
             PaxChunk::ByteSliceCompareMask(region, rc,
                                            static_cast<PaxChunk::CompareOp>(op),
-                                           lit, nullptr, mbits);
+                                           lit, nullptr, mbits.data());
             uint64_t cnt = 0;
             const size_t words = (static_cast<size_t>(rc) + 63) / 64;
-            for (size_t k = 0; k < words; k++)
+            for (size_t k = 0; k < words; k++) {
               cnt += static_cast<uint64_t>(__builtin_popcountll(mbits[k]));
-            const int64_t sm =
-                PaxChunk::ByteSliceFilteredSum(region, rc, nullptr, mbits);
+            }
+            const int64_t sm = PaxChunk::ByteSliceFilteredSum(
+                region, rc, nullptr, mbits.data());
             r.hit_count += cnt;
             r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
                                              static_cast<uint64_t>(sm));
@@ -4115,7 +4446,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // codes (no pass table, no decode). Nulls participate as raw 0 exactly
     // like the decode path below.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kOpDict && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4138,7 +4469,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // zero bitstream reads, no row materialized whatever the row order.
     // Nulls participate as raw 0 exactly like the decode path below.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kPostings &&
           rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4162,7 +4493,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // in O(runs), no row materialized. Nulls/clamps participate as raw 0
     // exactly like the decode path below.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kRleDict && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4181,7 +4512,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kRle8 && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4199,7 +4530,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kRleDelta &&
           rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4218,7 +4549,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kRleBp && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4241,7 +4572,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // across it and SUM folds value*length over just that window -- no run
     // outside the window is decoded and no row is materialized.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kRleIdx && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4263,7 +4594,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // code window (two binary searches); the run stream folds per run --
     // O(runs), no pass table.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kOpRle && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4287,7 +4618,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // no run/progression structure required. Nulls participate as raw 0
     // exactly like the decode path below.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kHuffDict &&
           rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4312,7 +4643,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // decode, no run/progression structure required. Nulls participate as
     // raw 0 exactly like the decode path.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kTopk && rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
         const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
@@ -4335,7 +4666,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // with zero code reads) and straddling tiles walk <= 6-bit codes. Nulls
     // participate as raw 0 exactly like the decode path.
     {
-      const size_t bso = static_cast<size_t>(g) * cc + col;
+      const size_t bso = (static_cast<size_t>(g) * cc) + col;
       if (static_cast<Scheme>(f.encodings[bso]) == Scheme::kTileDict &&
           rc > 0) {
         const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
@@ -4354,14 +4685,14 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
         }
       }
     }
-#if defined(__AVX2__)
+#ifdef __AVX2__
     if (static_cast<Scheme>(f.encodings[zi]) == Scheme::kPlain) {
       const char* plain_region = RegionStartAt(f, g, col, chunk.Data(), 0);
       const char* plain_end = RegionEndAt(f, g, col, chunk.Data());
       const size_t plain_bytes = static_cast<size_t>(rc) * sizeof(int64_t);
       if (plain_region != nullptr && plain_end != nullptr &&
           plain_end >= plain_region &&
-          static_cast<size_t>(plain_end - plain_region) >= plain_bytes) {
+          std::cmp_greater_equal(plain_end - plain_region, plain_bytes)) {
         uint64_t cnt = 0;
         uint64_t sm = 0;
         if (ScanPlainCountSumAvx2(plain_region, rc, op, lit, &cnt, &sm)) {
@@ -4373,9 +4704,9 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       }
     }
 #endif
-    alignas(64) int64_t stack_buf[PaxChunk::kRowGroupSize];
+    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_buf{};
     std::vector<int64_t> heap_buf;
-    int64_t* buf = stack_buf;
+    int64_t* buf = stack_buf.data();
     if (rc > PaxChunk::kRowGroupSize) {
       heap_buf.resize(rc);
       buf = heap_buf.data();
@@ -4386,7 +4717,7 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // domain reproduces the documented two's-complement truncation.
     uint64_t cnt = 0;
     uint64_t sm = 0;
-#if defined(__AVX2__)
+#ifdef __AVX2__
     const __m256i vlit = _mm256_set1_epi64x(lit);
     uint32_t i = 0;
     for (; i + 4 <= rc; i += 4) {
@@ -4396,16 +4727,17 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
       cnt += static_cast<uint64_t>(__builtin_popcount(static_cast<unsigned int>(
           _mm256_movemask_pd(_mm256_castsi256_pd(m)))));
       const __m256i vm = _mm256_and_si256(v, m);
-      alignas(32) int64_t tmp[4];
-      _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), vm);
+      alignas(32) std::array<int64_t, 4> tmp{};
+      _mm256_store_si256(reinterpret_cast<__m256i*>(tmp.data()), vm);
       sm += static_cast<uint64_t>(tmp[0]) + static_cast<uint64_t>(tmp[1]) +
             static_cast<uint64_t>(tmp[2]) + static_cast<uint64_t>(tmp[3]);
     }
-    for (; i < rc; ++i)
+    for (; i < rc; ++i) {
       if (ScanMatch(buf[i], op, lit)) {
         ++cnt;
         sm += static_cast<uint64_t>(buf[i]);
       }
+    }
 #else
     for (uint32_t i = 0; i < rc; ++i)
       if (ScanMatch(buf[i], op, lit)) {
@@ -4419,10 +4751,11 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
 
   ScanResult total;
   if (parallel && rg > 1 && scan_sweeps > 0) {
-    if (nthreads <= 0)
+    if (nthreads <= 0) {
       nthreads = static_cast<int>(std::thread::hardware_concurrency());
-    if (nthreads > static_cast<int>(rg)) nthreads = static_cast<int>(rg);
-    if (nthreads < 1) nthreads = 1;
+    }
+    nthreads = std::min(nthreads, static_cast<int>(rg));
+    nthreads = std::max(nthreads, 1);
     // Persistent pool: threads are spawned ONCE and reused across all sweeps
     // (re-spawning per sweep would dominate the cost for small row groups).
     std::vector<std::thread> ths;
@@ -4438,18 +4771,24 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
-          for (uint32_t sw = 0; sw < scan_sweeps; ++sw)
-            for (uint32_t g = static_cast<uint32_t>(t); g < rg;
-                 g += static_cast<uint32_t>(nthreads))
+          for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+            for (auto g = static_cast<uint32_t>(t); g < rg;
+                 g += static_cast<uint32_t>(nthreads)) {
               scan_rg(g, res[static_cast<size_t>(t)]);
+            }
+          }
         } catch (...) {
           worker_errors[static_cast<size_t>(t)] = std::current_exception();
         }
       });
     }
-    for (auto& th : ths) th.join();
+    for (auto& th : ths) {
+      th.join();
+    }
     for (const auto& ep : worker_errors) {
-      if (ep != nullptr) std::rethrow_exception(ep);
+      if (ep != nullptr) {
+        std::rethrow_exception(ep);
+      }
     }
     for (auto& r : res) {
       total.hit_count += r.hit_count;
@@ -4461,8 +4800,11 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
                                static_cast<uint64_t>(r.hit_sum));
     }
   } else {
-    for (uint32_t sw = 0; sw < scan_sweeps; ++sw)
-      for (uint32_t g = 0; g < rg; ++g) scan_rg(g, total);
+    for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+      for (uint32_t g = 0; g < rg; ++g) {
+        scan_rg(g, total);
+      }
+    }
   }
   return total;
 }
@@ -4477,7 +4819,9 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
   const uint16_t cc = f.column_count;
   // Same public-API gates as VectorizedScanColumn: col indexes the per-cell
   // arrays below; hand-built footers may declare arrays that are absent.
-  if (col >= cc) return ScanResult{};
+  if (col >= cc) {
+    return ScanResult{};
+  }
   if (f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
           static_cast<size_t>(f.row_group_count) * f.column_count ||
@@ -4489,7 +4833,9 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
                         sc->GetColumn(col).Type() != ValueType::kInt64)) {
     return ScanResult{};
   }
-  if (workload != nullptr && sc != nullptr) workload->RecordFilter(*sc, col);
+  if (workload != nullptr && sc != nullptr) {
+    workload->RecordFilter(*sc, col);
+  }
 
   // Sorted unique literal set: dedup gives IN-set semantics (a repeated
   // literal does not double-count a row) and makes membership a binary
@@ -4497,7 +4843,9 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
   std::vector<int64_t> slits(lits.begin(), lits.end());
   std::sort(slits.begin(), slits.end());
   slits.erase(std::unique(slits.begin(), slits.end()), slits.end());
-  if (slits.empty()) return ScanResult{};
+  if (slits.empty()) {
+    return ScanResult{};
+  }
   const auto member = [&slits](int64_t v) {
     return std::binary_search(slits.begin(), slits.end(), v);
   };
@@ -4505,8 +4853,10 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
 
   auto scan_rg = [&](uint32_t g, ScanResult& r) {
     const uint16_t rc = f.row_counts[g];
-    if (rc == 0) return;
-    const size_t zi = static_cast<size_t>(g) * cc + col;
+    if (rc == 0) {
+      return;
+    }
+    const size_t zi = (static_cast<size_t>(g) * cc) + col;
     const bool has_null = RgColHasNull(f, g, col);
     if (f.all_zm_present && zi < f.all_zone_mins.size() &&
         zi < f.all_zone_maxs.size()) {
@@ -4516,7 +4866,9 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
       const auto it =
           std::lower_bound(slits.begin(), slits.end(), f.all_zone_mins[zi]);
       const bool lit_in_zone = it != slits.end() && *it <= f.all_zone_maxs[zi];
-      if (!lit_in_zone && !(has_null && zero_member)) return;
+      if (!lit_in_zone && !(has_null && zero_member)) {
+        return;
+      }
     }
     // Inverted-index path: complete postings make absence a proven zero;
     // one posting lookup per literal, no decode (the EQ path generalized).
@@ -4527,12 +4879,12 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
           const uint64_t cnt = p->rows.size();
           r.hit_count += cnt;
           r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                           static_cast<uint64_t>(lit) * cnt);
+                                           (static_cast<uint64_t>(lit) * cnt));
         }
       }
       return;
     }
-    const Scheme s = static_cast<Scheme>(f.encodings[zi]);
+    const auto s = static_cast<Scheme>(f.encodings[zi]);
     const char* region = RegionStartAt(f, g, col, chunk.Data(), 0);
     const char* reg_end = RegionEndAt(f, g, col, chunk.Data());
     if (s == Scheme::kBp128 && region != nullptr && reg_end != nullptr) {
@@ -4641,14 +4993,14 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
       const uint16_t d = ReadBE16(region);
       const int cw = BitsNeeded(d > 0 ? d - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+          2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
       const char* dict = region + dict_base;
       if (d != 0 && d <= 1024 && d == f.params[zi] &&
-          dict + static_cast<size_t>(d) * 8 <= reg_end) {
+          dict + (static_cast<size_t>(d) * 8) <= reg_end) {
         std::vector<uint8_t> pass(static_cast<size_t>(d) + 1, 0);
         for (uint32_t e = 0; e < d; ++e) {
           pass[e] = member(static_cast<int64_t>(
-                        ReadBE64(dict + static_cast<size_t>(e) * 8)))
+                        ReadBE64(dict + (static_cast<size_t>(e) * 8))))
                         ? 1
                         : 0;
         }
@@ -4659,10 +5011,12 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
         for (uint32_t i = 0; i < rc; ++i) {
           const uint64_t code = br.get(cw);
           const uint64_t cb = code < d ? code : d;
-          if (pass[cb] == 0) continue;
+          if (pass[cb] == 0) {
+            continue;
+          }
           ++cnt;
           if (code < d) {
-            sm += ReadBE64(dict + code * sizeof(int64_t));
+            sm += ReadBE64(dict + (code * sizeof(int64_t)));
           }
         }
         r.hit_count += cnt;
@@ -4680,19 +5034,19 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
       // The footer param is the RUN count (the validator pins it to the
       // region's runs field), not the dictionary size.
       if (d != 0 && d <= 1024 &&
-          region + 2 + static_cast<size_t>(d) * 8 + 4 <= reg_end) {
+          region + 2 + (static_cast<size_t>(d) * 8) + 4 <= reg_end) {
         const char* dict = region + 2;
-        const char* runs_p = dict + static_cast<size_t>(d) * 8;
+        const char* runs_p = dict + (static_cast<size_t>(d) * 8);
         const uint32_t runs = ReadBE32(runs_p);
         const size_t cb =
             (static_cast<size_t>(BitsNeeded(d - 1)) + 7) / 8;  // 1 or 2
         const char* q = runs_p + 4;
         if (runs == f.params[zi] &&
-            q + static_cast<size_t>(runs) * (cb + 4) <= reg_end) {
+            q + (static_cast<size_t>(runs) * (cb + 4)) <= reg_end) {
           std::vector<uint8_t> pass(static_cast<size_t>(d) + 1, 0);
           for (uint32_t e = 0; e < d; ++e) {
             pass[e] = member(static_cast<int64_t>(
-                          ReadBE64(dict + static_cast<size_t>(e) * 8)))
+                          ReadBE64(dict + (static_cast<size_t>(e) * 8))))
                           ? 1
                           : 0;
           }
@@ -4714,14 +5068,16 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
             if (pass[cb2] != 0) {
               cnt += take;
               if (code < d) {
-                sm += ReadBE64(dict + code * sizeof(int64_t)) * take;
+                sm += ReadBE64(dict + (code * sizeof(int64_t))) * take;
               }
             }
             acc += take;
             q += cb + 4;
           }
           // Tail rows past the run walk decode as raw 0 (kRle parity).
-          if (acc < rc && zero_member) cnt += rc - acc;
+          if (acc < rc && zero_member) {
+            cnt += rc - acc;
+          }
           r.hit_count += cnt;
           r.hit_sum =
               static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) + sm);
@@ -4761,7 +5117,7 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
             r.hit_count += length;
             r.hit_sum =
                 static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                     static_cast<uint64_t>(value) * length);
+                                     (static_cast<uint64_t>(value) * length));
           }
         }
         return;
@@ -4773,13 +5129,15 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
         uint64_t cnt = 0;
         uint64_t sm = 0;
         for (uint32_t block = 0; block < parsed.blocks; ++block) {
-          const char* bracket = parsed.brackets + static_cast<size_t>(block) *
-                                                      kDeltaPForBracketBytes;
-          const int64_t first = static_cast<int64_t>(ReadBE64(bracket));
-          const int64_t last = static_cast<int64_t>(ReadBE64(bracket + 8));
+          const char* bracket = parsed.brackets + (static_cast<size_t>(block) *
+                                                   kDeltaPForBracketBytes);
+          const auto first = static_cast<int64_t>(ReadBE64(bracket));
+          const auto last = static_cast<int64_t>(ReadBE64(bracket + 8));
           auto lit_begin = std::lower_bound(slits.begin(), slits.end(), first);
           auto lit_end = std::upper_bound(slits.begin(), slits.end(), last);
-          if (lit_begin == lit_end) continue;
+          if (lit_begin == lit_end) {
+            continue;
+          }
           const uint32_t start = block * kDeltaPForBlockRows;
           const uint32_t rows =
               std::min<uint32_t>(kDeltaPForBlockRows, parsed.n - start);
@@ -4790,12 +5148,14 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
             }
             continue;
           }
-          int64_t decoded[kDeltaPForBlockRows];
-          DecodeDeltaPForBlock(parsed, block, decoded);
+          std::array<int64_t, kDeltaPForBlockRows> decoded{};
+          DecodeDeltaPForBlock(parsed, block, decoded.data());
           size_t li = static_cast<size_t>(lit_begin - slits.begin());
           const size_t lend = static_cast<size_t>(lit_end - slits.begin());
           for (uint32_t i = 0; i < rows; ++i) {
-            while (li < lend && slits[li] < decoded[i]) ++li;
+            while (li < lend && slits[li] < decoded[i]) {
+              ++li;
+            }
             if (li < lend && slits[li] == decoded[i]) {
               ++cnt;
               sm += static_cast<uint64_t>(decoded[i]);
@@ -4814,7 +5174,7 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
       if (member(static_cast<int64_t>(ReadBE64(region)))) {
         r.hit_count += rc;
         r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                         ReadBE64(region) * rc);
+                                         (ReadBE64(region) * rc));
       }
       return;
     }
@@ -4823,11 +5183,11 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
         reg_end - region >= 4) {
       const uint32_t runs = ReadBE32(region);
       if (runs == f.params[zi] &&
-          region + 4 + static_cast<size_t>(runs) * 12 <= reg_end) {
+          region + 4 + (static_cast<size_t>(runs) * 12) <= reg_end) {
         const char* q = region + 4;
         uint64_t acc = 0;
         for (uint32_t i = 0; i < runs && acc < rc; ++i) {
-          const int64_t v = static_cast<int64_t>(ReadBE64(q));
+          const auto v = static_cast<int64_t>(ReadBE64(q));
           const uint32_t len = ReadBE32(q + 8);
           const uint64_t next = acc + len;
           const uint32_t take =
@@ -4835,12 +5195,14 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
           if (member(v)) {
             r.hit_count += take;
             r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                             static_cast<uint64_t>(v) * take);
+                                             (static_cast<uint64_t>(v) * take));
           }
           acc += take;
           q += 12;
         }
-        if (acc < rc && zero_member) r.hit_count += rc - acc;
+        if (acc < rc && zero_member) {
+          r.hit_count += rc - acc;
+        }
         return;
       }
     }
@@ -4862,10 +5224,11 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
 
   ScanResult total;
   if (parallel && rg > 1) {
-    if (nthreads <= 0)
+    if (nthreads <= 0) {
       nthreads = static_cast<int>(std::thread::hardware_concurrency());
-    if (nthreads > static_cast<int>(rg)) nthreads = static_cast<int>(rg);
-    if (nthreads < 1) nthreads = 1;
+    }
+    nthreads = std::min(nthreads, static_cast<int>(rg));
+    nthreads = std::max(nthreads, 1);
     // Same threading contract as VectorizedScanColumn: per-worker result
     // slots and a per-worker exception_ptr (a shared slot written by two
     // simultaneous throwers would itself race).
@@ -4877,17 +5240,22 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
-          for (uint32_t g = static_cast<uint32_t>(t); g < rg;
-               g += static_cast<uint32_t>(nthreads))
+          for (auto g = static_cast<uint32_t>(t); g < rg;
+               g += static_cast<uint32_t>(nthreads)) {
             scan_rg(g, res[static_cast<size_t>(t)]);
+          }
         } catch (...) {
           worker_errors[static_cast<size_t>(t)] = std::current_exception();
         }
       });
     }
-    for (auto& th : ths) th.join();
+    for (auto& th : ths) {
+      th.join();
+    }
     for (const auto& ep : worker_errors) {
-      if (ep != nullptr) std::rethrow_exception(ep);
+      if (ep != nullptr) {
+        std::rethrow_exception(ep);
+      }
     }
     for (auto& r : res) {
       total.hit_count += r.hit_count;
@@ -4896,45 +5264,60 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
                                static_cast<uint64_t>(r.hit_sum));
     }
   } else {
-    for (uint32_t g = 0; g < rg; ++g) scan_rg(g, total);
+    for (uint32_t g = 0; g < rg; ++g) {
+      scan_rg(g, total);
+    }
   }
   return total;
 }
 
 Status PaxChunk::ColumnMinMax(slot_t col_idx, int64_t* min_out,
                               int64_t* max_out) const {
-  if (!footer_.all_zm_present || col_idx >= footer_.column_count)
+  if (!footer_.all_zm_present || col_idx >= footer_.column_count) {
     return Status::kNotExists;
+  }
   // Hand-built footer: row_counts may be shorter than row_group_count.
-  if (footer_.row_counts.size() < footer_.row_group_count)
+  if (footer_.row_counts.size() < footer_.row_group_count) {
     return Status::kNotExists;
+  }
   int64_t mn = INT64_MAX, mx = INT64_MIN;
   for (uint32_t g = 0; g < footer_.row_group_count; ++g) {
-    if (footer_.row_counts[g] == 0) continue;
-    const size_t zi = static_cast<size_t>(g) * footer_.column_count + col_idx;
+    if (footer_.row_counts[g] == 0) {
+      continue;
+    }
+    const size_t zi = (static_cast<size_t>(g) * footer_.column_count) + col_idx;
     if (zi >= footer_.all_zone_mins.size() ||
-        zi >= footer_.all_zone_maxs.size())
-      continue;  // truncated zone array: cannot prove anything for this RG
-    if (footer_.all_zone_mins[zi] < mn) mn = footer_.all_zone_mins[zi];
-    if (footer_.all_zone_maxs[zi] > mx) mx = footer_.all_zone_maxs[zi];
+        zi >= footer_.all_zone_maxs.size()) {
+      return Status::kNotExists;  // incomplete bounds cannot prove the column
+    }
+    mn = std::min(footer_.all_zone_mins[zi], mn);
+    mx = std::max(footer_.all_zone_maxs[zi], mx);
   }
-  if (mn > mx) return Status::kNotExists;
+  if (mn > mx) {
+    return Status::kNotExists;
+  }
   *min_out = mn;
   *max_out = mx;
   return Status::kSuccess;
 }
 
-static inline void SvSetRangeRaw(uint64_t* bits, uint32_t start, uint32_t end) {
+namespace {
+
+inline void SvSetRangeRaw(uint64_t* bits, uint32_t start, uint32_t end) {
   uint32_t i = start;
-  if (i < end && (i & 63)) {
+  if (i < end && ((i & 63) != 0U)) {
     const uint32_t edge = std::min<uint32_t>(end, (i | 63U) + 1U);
-    for (; i < edge; ++i) bits[i >> 6] |= (1ULL << (i & 63));
+    for (; i < edge; ++i) {
+      bits[i >> 6] |= (1ULL << (i & 63));
+    }
   }
   while (i + 64 <= end) {
     bits[i >> 6] = ~0ULL;
     i += 64;
   }
-  for (; i < end; ++i) bits[i >> 6] |= (1ULL << (i & 63));
+  for (; i < end; ++i) {
+    bits[i >> 6] |= (1ULL << (i & 63));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4975,29 +5358,30 @@ inline const uint8_t* DictPassTableCached(uint32_t cw, const uint8_t* pass) {
   struct Cache {
     uint32_t cw{0};
     bool valid{false};
-    uint8_t pass[16]{};
-    uint8_t table[256]{};
+    std::array<uint8_t, 16> pass{};
+    std::array<uint8_t, 256> table{};
   };
   thread_local Cache cache;
-  if (cache.valid && cache.cw == cw && std::memcmp(cache.pass, pass, 16) == 0) {
-    return cache.table;
+  if (cache.valid && cache.cw == cw &&
+      std::memcmp(cache.pass.data(), pass, 16) == 0) {
+    return cache.table.data();
   }
-  const uint32_t per_byte = 8u / cw;
-  const uint32_t code_mask = (1u << cw) - 1u;
+  const uint32_t per_byte = 8U / cw;
+  const uint32_t code_mask = (1U << cw) - 1U;
   for (uint32_t byte = 0; byte < 256; ++byte) {
     uint32_t bits = 0;
     for (uint32_t k = 0; k < per_byte; ++k) {
       // The stream is MSB-first, so code k of the byte is the (per_byte-1-k)-th
       // slice from the low end.
-      const uint32_t code = (byte >> (8u - cw * (k + 1u))) & code_mask;
+      const uint32_t code = (byte >> (8U - cw * (k + 1U))) & code_mask;
       bits |= static_cast<uint32_t>(pass[code]) << k;
     }
     cache.table[byte] = static_cast<uint8_t>(bits);
   }
   cache.cw = cw;
-  std::memcpy(cache.pass, pass, 16);
+  std::memcpy(cache.pass.data(), pass, 16);
   cache.valid = true;
-  return cache.table;
+  return cache.table.data();
 }
 
 // `pass` MUST hold 2^cw entries: codes >= the real code count are expected to
@@ -5012,9 +5396,8 @@ inline const uint8_t* DictPassTableCached(uint32_t cw, const uint8_t* pass) {
 // builder. The dispatch below costs one switch per call (per row group) and
 // then unrolls the inner loop 8/16/32 ways.
 template <uint32_t kPerByte>
-static void DictPassMaskByteExpandedRun(const uint8_t* src,
-                                        const uint8_t* table, uint32_t n,
-                                        uint64_t* out_bits) {
+void DictPassMaskByteExpandedRun(const uint8_t* src, const uint8_t* table,
+                                 uint32_t n, uint64_t* out_bits) {
   // 64 is a multiple of every kPerByte, so each full block starts and ends on
   // a byte boundary of the code stream: no straddling read.
   uint32_t i = 0;
@@ -5033,7 +5416,7 @@ static void DictPassMaskByteExpandedRun(const uint8_t* src,
     uint64_t word = 0;
     for (uint32_t j = 0; j < n - i; ++j) {
       const uint32_t byte = src[(i + j) / kPerByte];
-      word |= static_cast<uint64_t>((table[byte] >> (j % kPerByte)) & 1u) << j;
+      word |= static_cast<uint64_t>((table[byte] >> (j % kPerByte)) & 1U) << j;
     }
     out_bits[i >> 6] |= word;
   }
@@ -5041,10 +5424,12 @@ static void DictPassMaskByteExpandedRun(const uint8_t* src,
 
 bool DictPassMaskByteExpanded(const char* codes, uint32_t n, uint32_t cw,
                               const uint8_t* pass, uint64_t* out_bits) {
-  if (!DictPassByteExpandable(cw)) return false;
+  if (!DictPassByteExpandable(cw)) {
+    return false;
+  }
   const uint8_t* table = DictPassTableCached(cw, pass);
-  const uint8_t* src = reinterpret_cast<const uint8_t*>(codes);
-  switch (8u / cw) {
+  const auto* src = reinterpret_cast<const uint8_t*>(codes);
+  switch (8U / cw) {
     case 8:
       DictPassMaskByteExpandedRun<8>(src, table, n, out_bits);
       return true;
@@ -5056,6 +5441,8 @@ bool DictPassMaskByteExpanded(const char* codes, uint32_t n, uint32_t cw,
       return true;
   }
 }
+
+}  // namespace
 
 uint64_t Rle8MaskRange(const uint64_t* bits, uint32_t start, uint32_t end) {
   uint64_t count = 0;
@@ -5093,7 +5480,7 @@ bool Rle8FillPredicateMask(const Rle8Region& p, PaxChunk::CompareOp op,
   for (uint32_t plane = 0; plane < 8; ++plane) {
     const uint32_t first = p.plane_offsets[plane];
     const uint32_t count = p.plane_runs[plane];
-    const uint8_t plane_literal =
+    const auto plane_literal =
         static_cast<uint8_t>(((static_cast<uint64_t>(literal) ^ (1ULL << 63)) >>
                               (56U - 8U * plane)) &
                              0xFFU);
@@ -5142,7 +5529,7 @@ bool Rle8FillPredicateMask(const Rle8Region& p, PaxChunk::CompareOp op,
   if (null_bmp != nullptr) {
     const size_t bytes = (static_cast<size_t>(p.n) + 7U) / 8U;
     for (size_t byte = 0; byte < bytes; ++byte) {
-      const unsigned shift = static_cast<unsigned>(8U * (byte & 7U));
+      const auto shift = static_cast<unsigned>(8U * (byte & 7U));
       out_bits[byte >> 3U] &=
           ~(static_cast<uint64_t>(Rle8ReverseByte(null_bmp[byte])) << shift);
     }
@@ -5152,7 +5539,9 @@ bool Rle8FillPredicateMask(const Rle8Region& p, PaxChunk::CompareOp op,
 
 bool Rle8SumMaskWide(const Rle8Region& p, const uint64_t* bits,
                      __int128* sum_out) {
-  if (bits == nullptr || sum_out == nullptr) return false;
+  if (bits == nullptr || sum_out == nullptr) {
+    return false;
+  }
   __int128 ordered_sum = 0;
   const uint64_t count = Rle8MaskRange(bits, 0, p.n);
   for (uint32_t plane = 0; plane < 8; ++plane) {
@@ -5162,7 +5551,9 @@ bool Rle8SumMaskWide(const Rle8Region& p, const uint64_t* bits,
       const Rle8Run& item = p.runs[first + run];
       const uint64_t selected =
           Rle8MaskRange(bits, item.start, item.start + item.length);
-      if (selected == 0) continue;
+      if (selected == 0) {
+        continue;
+      }
       ordered_sum += static_cast<__int128>(selected) *
                      (static_cast<uint64_t>(item.value) << (56U - 8U * plane));
     }
@@ -5173,28 +5564,40 @@ bool Rle8SumMaskWide(const Rle8Region& p, const uint64_t* bits,
 }
 
 bool Rle8SumMask(const Rle8Region& p, const uint64_t* bits, int64_t* sum_out) {
-  if (sum_out == nullptr) return false;
+  if (sum_out == nullptr) {
+    return false;
+  }
   __int128 wide = 0;
-  if (!Rle8SumMaskWide(p, bits, &wide)) return false;
+  if (!Rle8SumMaskWide(p, bits, &wide)) {
+    return false;
+  }
   *sum_out = static_cast<int64_t>(wide);
   return true;
 }
+
+namespace {
 
 bool Rle8CompareMask(const char* region, uint32_t n, uint32_t param,
                      const char* region_end, PaxChunk::CompareOp op,
                      int64_t literal, const uint8_t* null_bmp,
                      uint64_t* out_bits) {
   Rle8Region parsed;
-  if (!ParseRle8Region(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRle8Region(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   return Rle8FillPredicateMask(parsed, op, literal, null_bmp, out_bits);
 }
 
 bool RleDeltaCompareMask(const char* region, uint32_t n, uint32_t param,
                          const char* region_end, PaxChunk::CompareOp op,
                          int64_t literal, uint64_t* out_bits) {
-  if (out_bits == nullptr) return false;
+  if (out_bits == nullptr) {
+    return false;
+  }
   RleDeltaRegion parsed;
-  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   for (uint32_t run = 0; run < parsed.run_count; ++run) {
     const RleDeltaRun& item = parsed.runs[run];
     if (RleDictMatch(op, item.value, literal)) {
@@ -5204,24 +5607,30 @@ bool RleDeltaCompareMask(const char* region, uint32_t n, uint32_t param,
   return true;
 }
 
+}  // namespace
+
 bool Rle8SelectedSum(const char* region, uint32_t n, uint32_t param,
                      const char* region_end, const uint8_t* null_bmp,
                      const uint64_t* selected, __int128* sum_out) {
   Rle8Region parsed;
-  if (!ParseRle8Region(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRle8Region(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   const size_t words = (static_cast<size_t>(n) + 63U) / 64U;
   const size_t bytes = (static_cast<size_t>(n) + 7U) / 8U;
   std::array<uint64_t, PaxChunk::kRowGroupSize / 64U> active{};
   for (size_t word = 0; word < words; ++word) {
-    const uint32_t start = static_cast<uint32_t>(word * 64U);
+    const auto start = static_cast<uint32_t>(word * 64U);
     const uint32_t rows = std::min<uint32_t>(64U, n - start);
     uint64_t bits = rows == 64U ? ~0ULL : (1ULL << rows) - 1ULL;
-    if (selected != nullptr) bits &= selected[word];
+    if (selected != nullptr) {
+      bits &= selected[word];
+    }
     if (null_bmp != nullptr) {
       const size_t first_byte = word * 8U;
       for (size_t byte = first_byte; byte < std::min(bytes, first_byte + 8U);
            ++byte) {
-        const unsigned shift = static_cast<unsigned>(8U * (byte & 7U));
+        const auto shift = static_cast<unsigned>(8U * (byte & 7U));
         bits &=
             ~(static_cast<uint64_t>(Rle8ReverseByte(null_bmp[byte])) << shift);
       }
@@ -5238,13 +5647,15 @@ bool RleDeltaSelectedSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   RleDeltaRegion parsed;
-  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) return false;
+  if (!ParseRleDeltaRegion(region, n, param, region_end, &parsed)) {
+    return false;
+  }
   bool all_selected = null_bmp == nullptr;
   const size_t words = (static_cast<size_t>(n) + 63U) / 64U;
   if (selected != nullptr) {
     all_selected = true;
     for (size_t word = 0; word < words; ++word) {
-      const uint32_t start = static_cast<uint32_t>(word * 64U);
+      const auto start = static_cast<uint32_t>(word * 64U);
       const uint32_t rows = std::min<uint32_t>(64U, n - start);
       const uint64_t valid = rows == 64U ? ~0ULL : (1ULL << rows) - 1ULL;
       if (selected[word] != valid) {
@@ -5265,15 +5676,17 @@ bool RleDeltaSelectedSum(const char* region, uint32_t n, uint32_t param,
   const size_t bytes = (static_cast<size_t>(n) + 7U) / 8U;
   std::array<uint64_t, PaxChunk::kRowGroupSize / 64U> active{};
   for (size_t word = 0; word < words; ++word) {
-    const uint32_t start = static_cast<uint32_t>(word * 64U);
+    const auto start = static_cast<uint32_t>(word * 64U);
     const uint32_t rows = std::min<uint32_t>(64U, n - start);
     uint64_t bits = rows == 64U ? ~0ULL : (1ULL << rows) - 1ULL;
-    if (selected != nullptr) bits &= selected[word];
+    if (selected != nullptr) {
+      bits &= selected[word];
+    }
     if (null_bmp != nullptr) {
       const size_t first_byte = word * 8U;
       for (size_t byte = first_byte; byte < std::min(bytes, first_byte + 8U);
            ++byte) {
-        const unsigned shift = static_cast<unsigned>(8U * (byte & 7U));
+        const auto shift = static_cast<unsigned>(8U * (byte & 7U));
         bits &=
             ~(static_cast<uint64_t>(Rle8ReverseByte(null_bmp[byte])) << shift);
       }
@@ -5300,18 +5713,21 @@ bool RleDeltaSelectedSum(const char* region, uint32_t n, uint32_t param,
 // region (see RgColHasNull), so the run/dict value equals what the generic
 // DecodeInt64ColumnRg path would compare, keeping results identical. Returns
 // false for schemes without a compressed kernel (caller decodes normally).
-static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
-                                 uint32_t g, uint64_t* out) {
+namespace {
+bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p, uint32_t g,
+                          uint64_t* out) {
   const PaxChunk::Footer& f = chunk.GetFooter();
   const uint16_t rc = f.row_counts[g];
-  const uint32_t off_idx = g * f.column_count + p.col;
-  const Scheme s = static_cast<Scheme>(f.encodings[off_idx]);
+  const uint32_t off_idx = (g * f.column_count) + p.col;
+  const auto s = static_cast<Scheme>(f.encodings[off_idx]);
   // Validate the offset VALUE before any dereference (including the header
   // reads below): the array-size gate in the caller only proves the entry
   // exists, and a hostile value must not form a wild pointer.
   const char* region = RegionStartAt(f, g, p.col, chunk.Data(), 0);
-  if (region == nullptr) return false;
-#if defined(__AVX2__)
+  if (region == nullptr) {
+    return false;
+  }
+#ifdef __AVX2__
   if (s == Scheme::kPlain) {
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
     if (reg_end != nullptr && reg_end >= region &&
@@ -5328,9 +5744,13 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // Unlike the kRle/kDict/kByteSlice paths there is no later extent check
     // here: bound the 8-byte constant read directly.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 8 > reg_end) return false;
-    const int64_t v = static_cast<int64_t>(ReadBE64(region));
-    if (ScanMatch(v, p.op, p.lit)) SvSetRangeRaw(out, 0, rc);
+    if (reg_end == nullptr || region + 8 > reg_end) {
+      return false;
+    }
+    const auto v = static_cast<int64_t>(ReadBE64(region));
+    if (ScanMatch(v, p.op, p.lit)) {
+      SvSetRangeRaw(out, 0, rc);
+    }
     return true;
   }
   if (s == Scheme::kBitmap) {
@@ -5340,16 +5760,17 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         static_cast<size_t>(reg_end - region) < 16U + bitmap_bytes) {
       return false;
     }
-    const int64_t true_value = static_cast<int64_t>(ReadBE64(region));
-    const int64_t false_value = static_cast<int64_t>(ReadBE64(region + 8));
+    const auto true_value = static_cast<int64_t>(ReadBE64(region));
+    const auto false_value = static_cast<int64_t>(ReadBE64(region + 8));
     const bool true_passes = ScanMatch(true_value, p.op, p.lit);
     const bool false_passes = ScanMatch(false_value, p.op, p.lit);
     if (true_passes == false_passes) {
-      if (true_passes) SvSetRangeRaw(out, 0, rc);
+      if (true_passes) {
+        SvSetRangeRaw(out, 0, rc);
+      }
       return true;
     }
-    const unsigned char* bitmap =
-        reinterpret_cast<const unsigned char*>(region + 16);
+    const auto* bitmap = reinterpret_cast<const unsigned char*>(region + 16);
     uint32_t row = 0;
     for (; row + 64U <= rc; row += 64U) {
       uint64_t word = 0;
@@ -5382,15 +5803,17 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     const uint32_t words = f.params[off_idx];
     if (words == 0 || reg_end == nullptr || reg_end < region ||
         static_cast<size_t>(reg_end - region) <
-            16U + static_cast<size_t>(words) * 8U) {
+            16U + (static_cast<size_t>(words) * 8U)) {
       return false;
     }
-    const int64_t tv = static_cast<int64_t>(ReadBE64(region));
-    const int64_t fv = static_cast<int64_t>(ReadBE64(region + 8));
+    const auto tv = static_cast<int64_t>(ReadBE64(region));
+    const auto fv = static_cast<int64_t>(ReadBE64(region + 8));
     const bool true_passes = ScanMatch(tv, p.op, p.lit);
     const bool false_passes = ScanMatch(fv, p.op, p.lit);
     if (true_passes == false_passes) {
-      if (true_passes) SvSetRangeRaw(out, 0, rc);
+      if (true_passes) {
+        SvSetRangeRaw(out, 0, rc);
+      }
       return true;
     }
     uint32_t row = 0;
@@ -5405,19 +5828,26 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         const uint32_t widx = row >> 6U;
         const uint32_t bit_off = row & 63U;
         out[widx] |= m << bit_off;
-        if (bit_off + span > 64U) out[widx + 1] |= m >> (64 - bit_off);
+        if (bit_off + span > 64U) {
+          out[widx + 1] |= m >> (64 - bit_off);
+        }
         row += span;
       } else {  // fill span
         const uint64_t len = w & kWahLenMask;
-        if (len == 0 || len > UINT64_MAX / kWahSpan) return false;
+        if (len == 0 || len > UINT64_MAX / kWahSpan) {
+          return false;
+        }
         uint64_t rows = len * kWahSpan;
-        if (rows > static_cast<uint64_t>(rc - row)) rows = rc - row;
+        if (rows > static_cast<uint64_t>(rc - row)) {
+          rows = rc - row;
+        }
         // The fill carries the "true" (max) value when its bit is set,
         // the "false" value otherwise; exactly one of them passes here.
         const bool fill_passes =
             ((w >> 62) & 1ULL) != 0 ? true_passes : false_passes;
-        if (fill_passes)
+        if (fill_passes) {
           SvSetRangeRaw(out, row, row + static_cast<uint32_t>(rows));
+        }
         row += static_cast<uint32_t>(rows);
       }
     }
@@ -5435,13 +5865,13 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // fast path so the caller decodes via the bounds-checked generic path.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
     if (reg_end == nullptr ||
-        region + 4 + static_cast<size_t>(runs) * 12 > reg_end) {
+        region + 4 + (static_cast<size_t>(runs) * 12) > reg_end) {
       return false;
     }
     uint32_t idx = 0;
     const char* q = region + 4;  // skip runs header
     for (uint32_t r = 0; r < runs && idx < rc; ++r) {
-      const int64_t v = static_cast<int64_t>(ReadBE64(q));
+      const auto v = static_cast<int64_t>(ReadBE64(q));
       const uint32_t len = ReadBE32(q + 8);
       // u64 extent math: a hostile len wrapped idx+len in uint32 and set
       // mask bits at wrong row ranges.
@@ -5495,10 +5925,14 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
                              p.lit, &first, &last)) {
       return false;
     }
-    if (first >= last) return true;  // empty window: nothing selected
+    if (first >= last) {
+      return true;  // empty window: nothing selected
+    }
     const uint32_t row_first = RleIdxRowBefore(parsed, first);
     const uint32_t row_last = RleIdxRowBefore(parsed, last);
-    if (row_last > row_first) SvSetRangeRaw(out, row_first, row_last);
+    if (row_last > row_first) {
+      SvSetRangeRaw(out, row_first, row_last);
+    }
     return true;
   }
   if (s == Scheme::kRle8) {
@@ -5522,7 +5956,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     const uint32_t words = f.params[off_idx];
     if (words == 0 || reg_end == nullptr || reg_end < region ||
         static_cast<size_t>(reg_end - region) <
-            8U + static_cast<size_t>(words) * 8U) {
+            8U + (static_cast<size_t>(words) * 8U)) {
       return false;
     }
     const uint64_t base_u = ReadBE64(region);
@@ -5530,7 +5964,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     const char* wp = region + 8;
     for (uint32_t k = 0; k < words && row < rc; ++k, wp += 8) {
       const uint64_t word = ReadBE64(wp);
-      const uint32_t sel = static_cast<uint32_t>(word >> 60);
+      const auto sel = static_cast<uint32_t>(word >> 60);
       const uint32_t cnt = kSimple8bSelCount[sel];
       const uint32_t bits = kSimple8bSelBits[sel];
       const uint32_t avail = rc - row;
@@ -5584,7 +6018,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       if (p.op != ScanOp::kEq) {
         const bool minimum_hit = ScanMatch(block.minimum, p.op, p.lit);
         const bool maximum_hit = ScanMatch(block.maximum, p.op, p.lit);
-        if (!minimum_hit && !maximum_hit) continue;
+        if (!minimum_hit && !maximum_hit) {
+          continue;
+        }
         if (minimum_hit && maximum_hit) {
           SvSetRangeRaw(out, start, start + block.rows);
           continue;
@@ -5592,8 +6028,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       } else if (p.lit < block.minimum || p.lit > block.maximum) {
         continue;
       }
-      int64_t decoded[kBp128BlockRows];
-      DecodeBp128Block(parsed, block_index, decoded);
+      std::array<int64_t, kBp128BlockRows> decoded{};
+      DecodeBp128Block(parsed, block_index, decoded.data());
       for (uint32_t row = 0; row < block.rows; ++row) {
         if (ScanMatch(decoded[row], p.op, p.lit)) {
           out[(start + row) >> 6] |= 1ULL << ((start + row) & 63U);
@@ -5631,7 +6067,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       if (p.op != ScanOp::kEq) {
         const bool minimum_hit = ScanMatch(block.minimum, p.op, p.lit);
         const bool maximum_hit = ScanMatch(block.maximum, p.op, p.lit);
-        if (!minimum_hit && !maximum_hit) continue;
+        if (!minimum_hit && !maximum_hit) {
+          continue;
+        }
         if (minimum_hit && maximum_hit) {
           SvSetRangeRaw(out, start, start + block.rows);
           continue;
@@ -5639,8 +6077,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       } else if (p.lit < block.minimum || p.lit > block.maximum) {
         continue;
       }
-      int64_t decoded[kFastPforBlockRows];
-      FastPforDecodeBlock(block, decoded);
+      std::array<int64_t, kFastPforBlockRows> decoded{};
+      FastPforDecodeBlock(block, decoded.data());
       for (uint32_t row = 0; row < block.rows; ++row) {
         if (ScanMatch(decoded[row], p.op, p.lit)) {
           out[(start + row) >> 6] |= 1ULL << ((start + row) & 63U);
@@ -5680,7 +6118,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       if (p.op != ScanOp::kEq) {
         const bool minimum_hit = ScanMatch(block.minimum, p.op, p.lit);
         const bool maximum_hit = ScanMatch(block.maximum, p.op, p.lit);
-        if (!minimum_hit && !maximum_hit) continue;
+        if (!minimum_hit && !maximum_hit) {
+          continue;
+        }
         if (minimum_hit && maximum_hit) {
           SvSetRangeRaw(out, start, start + block.rows);
           continue;
@@ -5688,8 +6128,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       } else if (p.lit < block.minimum || p.lit > block.maximum) {
         continue;
       }
-      int64_t decoded[kDeltaFastPforBlockRows];
-      DeltaFastPforDecodeBlock(block, decoded);
+      std::array<int64_t, kDeltaFastPforBlockRows> decoded{};
+      DeltaFastPforDecodeBlock(block, decoded.data());
       for (uint32_t row = 0; row < block.rows; ++row) {
         if (ScanMatch(decoded[row], p.op, p.lit)) {
           out[(start + row) >> 6] |= 1ULL << ((start + row) & 63U);
@@ -5714,34 +6154,37 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // mirror the kRle arm above; clamp codes and rows past the run walk
     // decode as raw 0 (the kDict clamp-bucket convention).
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 2 > reg_end) return false;
+    if (reg_end == nullptr || region + 2 > reg_end) {
+      return false;
+    }
     const uint16_t d = ReadBE16(region);
-    if (d == 0) return false;
+    if (d == 0) {
+      return false;
+    }
     const int cb = (BitsNeeded(d - 1) + 7) / 8;
     const char* dict = region + 2;
-    const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+    const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
     const uint32_t runs = f.params[off_idx];
     if (runs_hdr + 4 > reg_end || ReadBE32(runs_hdr) != runs ||
         runs_hdr + 4 +
-                static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+                (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
             reg_end) {
       return false;
     }
-    uint8_t pass_stack[1024];
+    std::array<uint8_t, 1024> pass_stack{};
     // Sized at construction even on the stack path: a default-constructed
     // vector's data() merges into the same `pass` phi below, and GCC's
     // -Wstringop-overflow models that merged pointer as a write into a
     // size-0 region in Release.
     const bool heap_pass = static_cast<size_t>(d) + 1 > sizeof(pass_stack);
     std::vector<uint8_t> pass_heap(heap_pass ? static_cast<size_t>(d) + 1 : 1U);
-    uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack;
+    uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack.data();
     for (uint16_t e = 0; e < d; ++e) {
-      pass[e] =
-          ScanMatch(
-              static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(e) * 8)),
-              p.op, p.lit)
-              ? 1
-              : 0;
+      pass[e] = ScanMatch(static_cast<int64_t>(
+                              ReadBE64(dict + (static_cast<size_t>(e) * 8))),
+                          p.op, p.lit)
+                    ? 1
+                    : 0;
     }
     pass[d] = ScanMatch(static_cast<int64_t>(0), p.op, p.lit) ? 1 : 0;
     uint64_t acc = 0;
@@ -5760,8 +6203,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       acc = next;
       q += static_cast<size_t>(cb) + 4;
     }
-    if (acc < rc && pass[d] != 0)
+    if (acc < rc && pass[d] != 0) {
       SvSetRangeRaw(out, static_cast<uint32_t>(acc), rc);
+    }
     return true;
   }
   if (s == Scheme::kDict) {
@@ -5769,17 +6213,19 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // zero-length cell at the data-area end would read the next region's
     // bytes. Gate the header like the kConst arm above.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 2 > reg_end) return false;
+    if (reg_end == nullptr || region + 2 > reg_end) {
+      return false;
+    }
     const uint16_t ncodes = ReadBE16(region);
     const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
     const size_t dict_base =
-        2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+        2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
     const char* dict = region + dict_base;
     // The validator floors the region at 4B/entry but an int64 dict consumes
     // 8B/entry: a region built at the floor (or a hand-built footer) would
     // read ncodes*8 bytes past the region into the footer. Decline the fast
     // path so the caller decodes via DecodeInt64ColumnRg, which clamps.
-    if (dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > reg_end) {
+    if (dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > reg_end) {
       return false;
     }
     // Pass table over the WHOLE 2^cw code space: codes >= ncodes decode to
@@ -5791,7 +6237,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       // straddling cw (see DictPassByteExpandable), and a 2^cw table would
       // not fit anyway. Keep the bit-at-a-time loop with the ncodes+1 clamp
       // bucket the kDict arm has always carried.
-      uint8_t pass_stack[1024];
+      std::array<uint8_t, 1024> pass_stack{};
       // Sized at construction even on the stack path: a default-constructed
       // vector's data() merges into the same `pass` phi below, and GCC's
       // -Wstringop-overflow models that merged pointer as a write into a
@@ -5800,10 +6246,10 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
           static_cast<size_t>(ncodes) + 1 > sizeof(pass_stack);
       std::vector<uint8_t> pass_heap(heap_pass ? static_cast<size_t>(ncodes) + 1
                                                : 1U);
-      uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack;
+      uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack.data();
       for (uint32_t d = 0; d < ncodes; ++d) {
         pass[d] = static_cast<uint8_t>(ScanMatch(
-            static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(d) * 8)),
+            static_cast<int64_t>(ReadBE64(dict + (static_cast<size_t>(d) * 8))),
             p.op, p.lit));
       }
       const uint8_t clamp_ok =
@@ -5818,18 +6264,20 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       }
       return true;
     }
-    const uint32_t cw32 = static_cast<uint32_t>(cw);
-    const uint32_t slots = 1u << cw32;
-    uint8_t pass[16];
+    const auto cw32 = static_cast<uint32_t>(cw);
+    const uint32_t slots = 1U << cw32;
+    std::array<uint8_t, 16> pass{};
     for (uint32_t d = 0; d < ncodes; ++d) {
       pass[d] = static_cast<uint8_t>(ScanMatch(
-          static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(d) * 8)),
+          static_cast<int64_t>(ReadBE64(dict + (static_cast<size_t>(d) * 8))),
           p.op, p.lit));
     }
     const uint8_t clamp_ok =
         ScanMatch(static_cast<int64_t>(0), p.op, p.lit) ? 1 : 0;
-    for (uint32_t c = ncodes; c < slots; ++c) pass[c] = clamp_ok;
-    DictPassMaskByteExpanded(region + 2, rc, cw32, pass, out);
+    for (uint32_t c = ncodes; c < slots; ++c) {
+      pass[c] = clamp_ok;
+    }
+    DictPassMaskByteExpanded(region + 2, rc, cw32, pass.data(), out);
     return true;
   }
   if (s == Scheme::kOpDict) {
@@ -5838,14 +6286,18 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // unpack plus a branch-free window test. No pass table, no dictionary
     // evaluation, no decode. Region gates mirror the kDict arm above.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 2 > reg_end) return false;
+    if (reg_end == nullptr || region + 2 > reg_end) {
+      return false;
+    }
     const uint16_t ncodes = ReadBE16(region);
-    if (ncodes == 0) return false;
+    if (ncodes == 0) {
+      return false;
+    }
     const int cw = BitsNeeded(ncodes - 1);
     const size_t dict_base =
-        2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+        2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
     const char* dict = region + dict_base;
-    if (dict + static_cast<size_t>(ncodes) * sizeof(int64_t) > reg_end) {
+    if (dict + (static_cast<size_t>(ncodes) * sizeof(int64_t)) > reg_end) {
       return false;
     }
     uint64_t lo = 0, span = 0;
@@ -5858,14 +6310,16 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       // the "pass table" is just the rank window written over the whole 2^cw
       // code space, so the row loop needs neither the window test nor the
       // clamp compare.
-      uint8_t pass[16];
-      for (uint32_t c = 0; c < (1u << cw); ++c) {
+      std::array<uint8_t, 16> pass{};
+      for (uint32_t c = 0; c < (1U << cw); ++c) {
         uint8_t verdict = clamp_pass ? 1 : 0;
-        if (c < ncodes) verdict = (c - lo < span) ? 1 : 0;
+        if (c < ncodes) {
+          verdict = (c - lo < span) ? 1 : 0;
+        }
         pass[c] = verdict;
       }
-      DictPassMaskByteExpanded(region + 2, rc, static_cast<uint32_t>(cw), pass,
-                               out);
+      DictPassMaskByteExpanded(region + 2, rc, static_cast<uint32_t>(cw),
+                               pass.data(), out);
       return true;
     }
     WordBitReader br(region + 2, region + dict_base);
@@ -5873,13 +6327,17 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       // Exact power-of-two code space: no clamp bucket can occur.
       for (uint32_t i = 0; i < rc; ++i) {
         const uint64_t code = br.get(cw);
-        if (code - lo < span) out[i >> 6] |= (1ULL << (i & 63));
+        if (code - lo < span) {
+          out[i >> 6] |= (1ULL << (i & 63));
+        }
       }
     } else {
       for (uint32_t i = 0; i < rc; ++i) {
         const uint64_t code = br.get(cw);
         const bool ok = code < ncodes ? (code - lo < span) : clamp_pass;
-        if (ok) out[i >> 6] |= (1ULL << (i & 63));
+        if (ok) {
+          out[i >> 6] |= (1ULL << (i & 63));
+        }
       }
     }
     return true;
@@ -5887,13 +6345,13 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
   if (s == Scheme::kByteSlice) {
     // BSI slice-parallel mask over the raw region (nulls arrive as raw 0,
     // exactly what the generic decode path compares, so no null skipping).
-    const uint8_t w = static_cast<uint8_t>(region[0]);
+    const auto w = static_cast<uint8_t>(region[0]);
     const size_t stride = (static_cast<size_t>(rc) + 7) / 8;
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
     if (reg_end == nullptr || w == 0 || w > 64 ||
         w != static_cast<uint8_t>(f.params[off_idx]) ||
         reg_end - region <
-            static_cast<ptrdiff_t>(1 + static_cast<size_t>(w) * stride)) {
+            static_cast<ptrdiff_t>(1 + (static_cast<size_t>(w) * stride))) {
       return false;
     }
     PaxChunk::ByteSliceCompareMask(region, rc,
@@ -5908,10 +6366,10 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         !ParsePBitSRegion(region, rc, f.params[off_idx], reg_end, &parsed)) {
       return false;
     }
-    uint64_t bits[16] = {0};
+    std::array<uint64_t, 16> bits = {0};
     PaxChunk::PBitSCompareMask(region, f.params[off_idx], rc, reg_end,
                                static_cast<PaxChunk::CompareOp>(p.op), p.lit,
-                               nullptr, bits);
+                               nullptr, bits.data());
     for (uint32_t i = 0; i < rc; ++i) {
       if (((bits[i >> 6] >> (i & 63U)) & 1ULL) != 0) {
         out[i >> 6] |= 1ULL << (i & 63U);
@@ -5920,16 +6378,18 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     return true;
   }
   if (s == Scheme::kWaveletR) {
-#if defined(__AVX2__)
-    alignas(64) int64_t stack_values[PaxChunk::kRowGroupSize];
+#ifdef __AVX2__
+    alignas(64) std::array<int64_t, PaxChunk::kRowGroupSize> stack_values{};
     std::vector<int64_t> heap_values;
-    int64_t* values = stack_values;
+    int64_t* values = stack_values.data();
     if (rc > PaxChunk::kRowGroupSize) {
       heap_values.resize(rc);
       values = heap_values.data();
     }
     chunk.DecodeInt64ColumnRg(p.col, g, values);
-    if (FillPredicateMaskAvx2(values, rc, p.op, p.lit, out)) return true;
+    if (FillPredicateMaskAvx2(values, rc, p.op, p.lit, out)) {
+      return true;
+    }
 #endif
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
     WaveletRRegion parsed;
@@ -5960,42 +6420,54 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // exception slots hold mantissa 0). BitWeave mantissas have no
     // distinct-value structure -> fall back to the generic decode path.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 4 > reg_end) return false;
+    if (reg_end == nullptr || region + 4 > reg_end) {
+      return false;
+    }
     const int exp = static_cast<uint8_t>(region[0]);
-    const Scheme backend = static_cast<Scheme>(static_cast<uint8_t>(region[1]));
+    const auto backend = static_cast<Scheme>(static_cast<uint8_t>(region[1]));
     const uint32_t nexc = ReadBE16(region + 2);
-    if (exp > 18 || nexc > rc) return false;
+    if (exp > 18 || nexc > rc) {
+      return false;
+    }
     const char* exc = region + 4;
-    if (exc + static_cast<size_t>(nexc) * 10 > reg_end) return false;
+    if (exc + (static_cast<size_t>(nexc) * 10) > reg_end) {
+      return false;
+    }
     const double f10 = AlpFactorOf(exp);
     const auto mantissa_match = [&](int64_t m) {
       const double back = static_cast<double>(m) / f10;
-      uint64_t b;
+      uint64_t b{};
       std::memcpy(&b, &back, sizeof(b));
       return ScanMatch(static_cast<int64_t>(b), p.op, p.lit);
     };
     if (backend == Scheme::kConst) {
-      const char* iconst = exc + static_cast<size_t>(nexc) * 10;
-      if (iconst + 8 > reg_end) return false;
-      if (mantissa_match(static_cast<int64_t>(ReadBE64(iconst))))
+      const char* iconst = exc + (static_cast<size_t>(nexc) * 10);
+      if (iconst + 8 > reg_end) {
+        return false;
+      }
+      if (mantissa_match(static_cast<int64_t>(ReadBE64(iconst)))) {
         SvSetRangeRaw(out, 0, rc);
+      }
     } else if (backend == Scheme::kRle) {
-      const char* inner = exc + static_cast<size_t>(nexc) * 10;
-      if (inner + 4 > reg_end) return false;
+      const char* inner = exc + (static_cast<size_t>(nexc) * 10);
+      if (inner + 4 > reg_end) {
+        return false;
+      }
       const uint32_t runs = ReadBE32(inner);
       if (runs == 0 || runs > rc ||
-          inner + 4 + static_cast<size_t>(runs) * 12 > reg_end) {
+          inner + 4 + (static_cast<size_t>(runs) * 12) > reg_end) {
         return false;
       }
       uint32_t idx2 = 0;
       const char* q = inner + 4;
       for (uint32_t r2 = 0; r2 < runs && idx2 < rc; ++r2) {
-        const int64_t m = static_cast<int64_t>(ReadBE64(q));
+        const auto m = static_cast<int64_t>(ReadBE64(q));
         const uint64_t len = ReadBE32(q + 8);
         const uint64_t next = static_cast<uint64_t>(idx2) + len;
-        if (mantissa_match(m))
+        if (mantissa_match(m)) {
           SvSetRangeRaw(out, idx2,
                         (next > rc) ? rc : static_cast<uint32_t>(next));
+        }
         idx2 = (next > rc) ? rc : static_cast<uint32_t>(next);
         q += 12;
       }
@@ -6004,20 +6476,25 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       // mantissa 0 (the per-value decoder falls off the run walk to 0; the
       // bulk decoder zero-fills), so a predicate matching 0 must select
       // them -- mirrors the scheme-2 arm above and the WASM twin.
-      if (idx2 < rc && mantissa_match(0)) SvSetRangeRaw(out, idx2, rc);
+      if (idx2 < rc && mantissa_match(0)) {
+        SvSetRangeRaw(out, idx2, rc);
+      }
     } else if (backend == Scheme::kDict) {
-      const char* inner = exc + static_cast<size_t>(nexc) * 10;
-      if (inner + 2 > reg_end) return false;
+      const char* inner = exc + (static_cast<size_t>(nexc) * 10);
+      if (inner + 2 > reg_end) {
+        return false;
+      }
       const uint16_t ncodes = ReadBE16(inner);
       const int cw = BitsNeeded(ncodes > 0 ? ncodes - 1 : 0);
       const size_t dict_base =
-          2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+          2 + ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
       const char* dict = inner + dict_base;
-      if (ncodes == 0 || dict + static_cast<size_t>(ncodes) * 8 > reg_end)
+      if (ncodes == 0 || dict + (static_cast<size_t>(ncodes) * 8) > reg_end) {
         return false;
+      }
       // Pass table over dictionary mantissas; slot ncodes is the clamp
       // bucket (mantissa 0 -> +0.0 -> bitcast 0, mirroring the decoder).
-      uint8_t pass_stack[1024];
+      std::array<uint8_t, 1024> pass_stack{};
       // Sized at construction even on the stack path: a default-constructed
       // vector's data() merges into the same `pass` phi below, and GCC's
       // -Wstringop-overflow models that merged pointer as a write into a
@@ -6026,12 +6503,13 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
           static_cast<size_t>(ncodes) + 1 > sizeof(pass_stack);
       std::vector<uint8_t> pass_heap(heap_pass ? static_cast<size_t>(ncodes) + 1
                                                : 1U);
-      uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack;
-      for (uint16_t d = 0; d < ncodes; ++d)
+      uint8_t* pass = heap_pass ? pass_heap.data() : pass_stack.data();
+      for (uint16_t d = 0; d < ncodes; ++d) {
         pass[d] = mantissa_match(static_cast<int64_t>(
-                      ReadBE64(dict + static_cast<size_t>(d) * 8)))
+                      ReadBE64(dict + (static_cast<size_t>(d) * 8))))
                       ? 1
                       : 0;
+      }
       pass[ncodes] = ScanMatch(0, p.op, p.lit) ? 1 : 0;
       for (uint32_t i = 0; i < rc; ++i) {
         const uint64_t code =
@@ -6040,18 +6518,21 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
                 : UnpackBitAt(
                       inner + 2,
                       static_cast<uint64_t>(i) * static_cast<uint64_t>(cw), cw);
-        if (pass[code < ncodes ? code : ncodes])
+        if (pass[code < ncodes ? code : ncodes] != 0U) {
           out[i >> 6] |= 1ULL << (i & 63);
+        }
       }
     } else {
       return false;
     }
     // Exception rows: exact compare against the stored raw value.
     for (uint32_t k = 0; k < nexc; ++k) {
-      const uint32_t pos = ReadBE16(exc + static_cast<size_t>(k) * 10);
-      if (pos >= rc) continue;
+      const uint32_t pos = ReadBE16(exc + (static_cast<size_t>(k) * 10));
+      if (pos >= rc) {
+        continue;
+      }
       if (ScanMatch(static_cast<int64_t>(
-                        ReadBE64(exc + static_cast<size_t>(k) * 10 + 2)),
+                        ReadBE64(exc + (static_cast<size_t>(k) * 10) + 2)),
                     p.op, p.lit)) {
         out[pos >> 6] |= 1ULL << (pos & 63);
       } else {
@@ -6064,9 +6545,11 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // Dominant-value answer once + per-exception pass flags, then one
     // bitmap walk: EQ on `top` degenerates to copying the bitmap.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 15 > reg_end) return false;
-    const int64_t top = static_cast<int64_t>(ReadBE64(region));
-    const uint8_t ischeme = static_cast<uint8_t>(region[8]);
+    if (reg_end == nullptr || region + 15 > reg_end) {
+      return false;
+    }
+    const auto top = static_cast<int64_t>(ReadBE64(region));
+    const auto ischeme = static_cast<uint8_t>(region[8]);
     const uint32_t iparam = ReadBE32(region + 9);
     const uint32_t nexc = ReadBE16(region + 13);
     const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -6076,22 +6559,22 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       return false;
     }
     const char* bmp = region + 15;
-    int64_t exc_stack[256];
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
       exc = exc_heap.data();
     }
     DecodeInnerI64All(bmp + bmp_bytes, ischeme, iparam, nexc, reg_end, exc);
-    uint8_t epass_stack[256];
+    std::array<uint8_t, 256> epass_stack{};
     std::vector<uint8_t> epass_heap;
-    uint8_t* epass;
+    uint8_t* epass = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      epass = epass_stack;
+      epass = epass_stack.data();
     } else {
       epass_heap.assign(nexc, 0);
       epass = epass_heap.data();
@@ -6105,7 +6588,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         ScanMatch(static_cast<int64_t>(0), p.op, p.lit) ? 1 : 0;
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < rc; ++i) {
-      const uint8_t bit = static_cast<uint8_t>(
+      const auto bit = static_cast<uint8_t>(
           (static_cast<uint8_t>(bmp[i >> 3]) >> (7 - (i & 7))) & 1);
       uint8_t ok = zpass;
       if (bit != 0) {
@@ -6113,8 +6596,12 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       } else if (eidx < nexc) {
         ok = epass[eidx];
       }
-      if (bit == 0) ++eidx;
-      if (ok != 0) out[i >> 6] |= 1ULL << (i & 63);
+      if (bit == 0) {
+        ++eidx;
+      }
+      if (ok != 0) {
+        out[i >> 6] |= 1ULL << (i & 63);
+      }
     }
     return true;
   }
@@ -6123,12 +6610,14 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // nibble walk: EQ on a hot value folds to nibble == code. The pass
     // table makes the per-row work a table load either way, so the shape
     // matches kFreq's bitmap walk minus the bitmap.
-    constexpr size_t kTopkHeader = 2 + 2 + 15 * 8 + 15 * 2 + 1 + 4;  // 159
+    constexpr size_t kTopkHeader = 2 + 2 + (15 * 8) + (15 * 2) + 1 + 4;  // 159
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + kTopkHeader > reg_end) return false;
+    if (reg_end == nullptr || region + kTopkHeader > reg_end) {
+      return false;
+    }
     const uint32_t d = ReadBE16(region);
     const uint32_t nexc = ReadBE16(region + 2);
-    const uint8_t ischeme = static_cast<uint8_t>(region[154]);
+    const auto ischeme = static_cast<uint8_t>(region[154]);
     const uint32_t iparam = ReadBE32(region + 155);
     const size_t nib_bytes = (static_cast<size_t>(rc) + 1) / 2;
     if (d == 0 || d > 15 || nexc != f.params[off_idx] ||
@@ -6136,11 +6625,11 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         (nexc > 0 && !InnerSchemeOk(ischeme))) {
       return false;
     }
-    int64_t exc_stack[256];
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
@@ -6150,11 +6639,11 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       DecodeInnerI64All(region + kTopkHeader + nib_bytes, ischeme, iparam, nexc,
                         reg_end, exc);
     }
-    uint8_t epass_stack[256];
+    std::array<uint8_t, 256> epass_stack{};
     std::vector<uint8_t> epass_heap;
-    uint8_t* epass;
+    uint8_t* epass = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      epass = epass_stack;
+      epass = epass_stack.data();
       std::fill(epass, epass + nexc, 0);
     } else {
       epass_heap.assign(nexc, 0);
@@ -6163,11 +6652,11 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     for (uint32_t e = 0; e < nexc; ++e) {
       epass[e] = ScanMatch(exc[e], p.op, p.lit) ? 1 : 0;
     }
-    uint8_t cpass[15];
+    std::array<uint8_t, 15> cpass{};
     for (uint32_t c = 0; c < 15; ++c) {
       cpass[c] =
           c < d && ScanMatch(static_cast<int64_t>(ReadBE64(
-                                 region + 4 + static_cast<size_t>(c) * 8)),
+                                 region + 4 + (static_cast<size_t>(c) * 8))),
                              p.op, p.lit)
               ? 1
               : 0;
@@ -6177,16 +6666,20 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         ScanMatch(static_cast<int64_t>(0), p.op, p.lit) ? 1 : 0;
     uint32_t eidx = 0;
     for (uint32_t i = 0; i < rc; ++i) {
-      const uint8_t byte = static_cast<uint8_t>(region[kTopkHeader + (i >> 1)]);
+      const auto byte = static_cast<uint8_t>(region[kTopkHeader + (i >> 1)]);
       const uint32_t code = (i & 1) == 0 ? (byte >> 4) : (byte & 0x0F);
-      uint8_t ok;
+      uint8_t ok = 0;
       if (code == 15) {
         ok = eidx < nexc ? epass[eidx] : zpass;
-        if (eidx < nexc) ++eidx;
+        if (eidx < nexc) {
+          ++eidx;
+        }
       } else {
         ok = code < d ? cpass[code] : 0;
       }
-      if (ok != 0) out[i >> 6] |= 1ULL << (i & 63);
+      if (ok != 0) {
+        out[i >> 6] |= 1ULL << (i & 63);
+      }
     }
     return true;
   }
@@ -6201,7 +6694,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       return false;
     }
     TileDictCursor c;
-    if (!TileDictFirst(region, rc, reg_end, &c)) return false;
+    if (!TileDictFirst(region, rc, reg_end, &c)) {
+      return false;
+    }
     for (;;) {
       uint64_t lo = 0;
       uint64_t span = 0;
@@ -6227,7 +6722,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
           }
         }
       }
-      if (!TileDictNext(&c)) break;
+      if (!TileDictNext(&c)) {
+        break;
+      }
     }
     return true;
   }
@@ -6253,7 +6750,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
                                  p.lit, &wlo, &whi)) {
       return false;
     }
-    if (wlo >= whi) return true;  // empty window: nothing selected
+    if (wlo >= whi) {
+      return true;  // empty window: nothing selected
+    }
     if (wlo == 0 && whi >= rc) {
       SvSetRangeRaw(out, 0, rc);
       return true;
@@ -6297,23 +6796,33 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         break;
     }
     uint64_t matched = 0;
-    for (uint32_t c = lo; c < hi; ++c) matched += PostingsCountAt(parsed, c);
-    if (matched == 0) return true;       // nothing selected, zero decode
-    if (matched > rc / 8) return false;  // dense: the AVX2 decode wins
+    for (uint32_t c = lo; c < hi; ++c) {
+      matched += PostingsCountAt(parsed, c);
+    }
+    if (matched == 0) {
+      return true;  // nothing selected, zero decode
+    }
+    if (std::cmp_greater(matched, rc / 8)) {
+      return false;  // dense: the AVX2 decode wins
+    }
     // Jump straight to the first passing list's sub-stream (the bitoffs
     // table + byte-aligned sub-streams): only the passing lists' Rice codes
     // are decoded, so the walk is O(matched), not O(rows).
     PostingsBitCursor cur;
     for (uint32_t c = lo; c < hi; ++c) {
       const uint32_t cnt = PostingsCountAt(parsed, c);
-      if (cnt == 1) continue;
-      cur.Init(parsed.stream + PostingsBitOffAt(parsed, c) / 8,
+      if (cnt == 1) {
+        continue;
+      }
+      cur.Init(parsed.stream + (PostingsBitOffAt(parsed, c) / 8),
                parsed.region_end);
       uint32_t row = PostingsFirstAt(parsed, c);
       out[row >> 6] |= UINT64_C(1) << (row & 63);
       for (uint32_t i = 1; i < cnt; ++i) {
         uint32_t next = 0;
-        if (!PostingsNextRow(parsed, &cur, c, row, &next)) return false;
+        if (!PostingsNextRow(parsed, &cur, c, row, &next)) {
+          return false;
+        }
         row = next;
         out[row >> 6] |= UINT64_C(1) << (row & 63);
       }
@@ -6326,13 +6835,17 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // progression stepping q -- O(n/q) bit sets after one modular inverse.
     // The other ops have no closed-form POSITION set (a residue interval
     // scatters over the rows), so they decline to the generic path.
-    if (p.op != ScanOp::kEq) return false;
+    if (p.op != ScanOp::kEq) {
+      return false;
+    }
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 31 > reg_end) return false;
+    if (reg_end == nullptr || region + 31 > reg_end) {
+      return false;
+    }
     const uint64_t a = ReadBE64(region);
     const uint64_t b = ReadBE64(region + 8);
     const uint64_t m = ReadBE64(region + 16);
-    const uint8_t ischeme = static_cast<uint8_t>(region[24]);
+    const auto ischeme = static_cast<uint8_t>(region[24]);
     const uint32_t iparam = ReadBE32(region + 25);
     const uint32_t nexc = ReadBE16(region + 29);
     const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -6347,27 +6860,29 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // must carry an exception -- so a hostile over-counting bitmap declines
     // instead of silently dropping rows that decode as raw 0.
     {
-      const uint8_t* bmp = reinterpret_cast<const uint8_t*>(region + 31);
+      const auto* bmp = reinterpret_cast<const uint8_t*>(region + 31);
       uint64_t ones = 0;
       for (size_t i = 0; i < bmp_bytes; ++i) {
         uint64_t byte = bmp[i];
         if (i + 1 == bmp_bytes && (rc & 7) != 0) {
-          byte &= static_cast<uint64_t>(0xFFu << (8 - (rc & 7))) & 0xFF;
+          byte &= static_cast<uint64_t>(0xFFU << (8 - (rc & 7))) & 0xFF;
         }
         ones += static_cast<uint64_t>(__builtin_popcountll(byte));
       }
-      if (ones != static_cast<uint64_t>(rc) - nexc) return false;
+      if (ones != static_cast<uint64_t>(rc) - nexc) {
+        return false;
+      }
     }
     // Residue class: b*i ≡ lit - a (mod m). On-model values live in
     // [0, m), so a negative literal or one >= m can only match exceptions.
     const int64_t lit = p.lit;
-    if (lit >= 0 && static_cast<uint64_t>(lit) < m) {
-      const uint64_t k = static_cast<uint64_t>(lit);
+    if (lit >= 0 && std::cmp_less(lit, m)) {
+      const auto k = static_cast<uint64_t>(lit);
       const uint64_t diff = (k % m + m - a) % m;
       const uint64_t bg = ModGcd(b, m);
       if (diff % bg == 0) {
         const uint64_t q = m / bg;
-        const uint64_t step = static_cast<uint64_t>(
+        const auto step = static_cast<uint64_t>(
             static_cast<unsigned __int128>(diff / bg) *
             static_cast<unsigned __int128>(ModInv(b / bg, q)) %
             static_cast<unsigned __int128>(q));
@@ -6378,12 +6893,12 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     // Exception patches, byte-skipping like the kArith arm: all-on bytes
     // are pure residue-class territory.
-    const uint8_t* bmp = reinterpret_cast<const uint8_t*>(region + 31);
-    int64_t exc_stack[256];
+    const auto* bmp = reinterpret_cast<const uint8_t*>(region + 31);
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
@@ -6396,10 +6911,14 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     uint32_t eidx = 0;
     for (size_t byte_i = 0; byte_i < bmp_bytes; ++byte_i) {
       const uint8_t byte = bmp[byte_i];
-      if (byte == 0xFF) continue;  // every row on-model
-      const uint32_t base = static_cast<uint32_t>(byte_i * 8);
+      if (byte == 0xFF) {
+        continue;  // every row on-model
+      }
+      const auto base = static_cast<uint32_t>(byte_i * 8);
       for (uint32_t bit = 0; bit < 8 && base + bit < rc; ++bit) {
-        if ((byte >> (7 - bit)) & 1) continue;
+        if (((byte >> (7 - bit)) & 1) != 0) {
+          continue;
+        }
         const int64_t v = (eidx < nexc) ? exc[eidx] : 0;
         ++eidx;
         if (ScanMatch(v, p.op, p.lit)) {
@@ -6419,10 +6938,12 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // false -> generic path) whenever the model could wrap inside the row
     // group: the window math needs true monotonicity.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 23 > reg_end) return false;
-    const int64_t a = static_cast<int64_t>(ReadBE64(region));
-    const int64_t d = static_cast<int64_t>(ReadBE64(region + 8));
-    const uint8_t ischeme = static_cast<uint8_t>(region[16]);
+    if (reg_end == nullptr || region + 23 > reg_end) {
+      return false;
+    }
+    const auto a = static_cast<int64_t>(ReadBE64(region));
+    const auto d = static_cast<int64_t>(ReadBE64(region + 8));
+    const auto ischeme = static_cast<uint8_t>(region[16]);
     const uint32_t iparam = ReadBE32(region + 17);
     const uint32_t nexc = ReadBE16(region + 21);
     const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -6433,17 +6954,18 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     // Window eligibility: v(rc-1) = a + (rc-1)*d must stay inside int64
     // (wrapping breaks monotonicity); d == 0 is never emitted.
-    const __int128 last = static_cast<__int128>(a) +
-                          static_cast<__int128>(static_cast<uint64_t>(rc) - 1) *
-                              static_cast<__int128>(d);
+    const __int128 last =
+        static_cast<__int128>(a) +
+        (static_cast<__int128>(static_cast<uint64_t>(rc) - 1) *
+         static_cast<__int128>(d));
     if (d == 0 || last < static_cast<__int128>(INT64_MIN) ||
         last > static_cast<__int128>(INT64_MAX)) {
       return false;
     }
     // Predicate -> value interval; the bounds stay inside int128, so the
     // division helpers below cannot overflow.
-    __int128 plo = static_cast<__int128>(INT64_MIN);
-    __int128 phi = static_cast<__int128>(INT64_MAX);
+    auto plo = static_cast<__int128>(INT64_MIN);
+    auto phi = static_cast<__int128>(INT64_MAX);
     switch (p.op) {
       case ScanOp::kEq:
         plo = phi = static_cast<__int128>(p.lit);
@@ -6475,11 +6997,13 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     const auto floordiv = [](__int128 x, int64_t y) {
       __int128 q = x / y;
-      if (x % y != 0 && (x < 0) != (y < 0)) --q;
+      if (x % y != 0 && (x < 0) != (y < 0)) {
+        --q;
+      }
       return q;
     };
     // ceil(x/d) == -floor(-x/d). d < 0 flips which bound drives which end.
-    __int128 w_lo, w_hi;  // satisfying index range, [w_lo, w_hi)
+    __int128 w_lo = 0, w_hi = 0;  // satisfying index range, [w_lo, w_hi)
     if (d > 0) {
       w_lo = std::max<__int128>(0, -floordiv(-(plo - a), d));
       w_hi = std::min<__int128>(rc, floordiv(phi - a, d) + 1);
@@ -6495,12 +7019,12 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // entry; tail clear bits (eidx >= nexc) decode as raw 0. Byte-skipping:
     // all-on bytes are pure window territory, so the patch cost scales with
     // the EXCEPTION count, not the row count.
-    const uint8_t* bmp = reinterpret_cast<const uint8_t*>(region + 23);
-    int64_t exc_stack[256];
+    const auto* bmp = reinterpret_cast<const uint8_t*>(region + 23);
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
@@ -6513,10 +7037,14 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     uint32_t eidx = 0;
     for (size_t byte_i = 0; byte_i < bmp_bytes; ++byte_i) {
       const uint8_t byte = bmp[byte_i];
-      if (byte == 0xFF) continue;  // every row on-line
-      const uint32_t base = static_cast<uint32_t>(byte_i * 8);
+      if (byte == 0xFF) {
+        continue;  // every row on-line
+      }
+      const auto base = static_cast<uint32_t>(byte_i * 8);
       for (uint32_t b = 0; b < 8 && base + b < rc; ++b) {
-        if ((byte >> (7 - b)) & 1) continue;
+        if (((byte >> (7 - b)) & 1) != 0) {
+          continue;
+        }
         const int64_t v = (eidx < nexc) ? exc[eidx] : 0;
         ++eidx;
         if (ScanMatch(v, p.op, p.lit)) {
@@ -6539,11 +7067,15 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // dense predicates, the same trade-off the kSortDict window decline
     // measures. Full-window (every lane covered) folds to one range set.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 40 > reg_end) return false;
+    if (reg_end == nullptr || region + 40 > reg_end) {
+      return false;
+    }
     const uint32_t nd = static_cast<uint8_t>(region[0]);
-    if (nd < 2 || nd > 16) return false;
-    const size_t hdr = 8 + static_cast<size_t>(nd) * 16;
-    const uint8_t ischeme = static_cast<uint8_t>(region[hdr - 7]);
+    if (nd < 2 || nd > 16) {
+      return false;
+    }
+    const size_t hdr = 8 + (static_cast<size_t>(nd) * 16);
+    const auto ischeme = static_cast<uint8_t>(region[hdr - 7]);
     const uint32_t iparam = ReadBE32(region + hdr - 6);
     const uint32_t nexc = ReadBE16(region + hdr - 2);
     const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
@@ -6552,22 +7084,22 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         (nexc > 0 && !InnerSchemeOk(ischeme))) {
       return false;
     }
-    int64_t base[16];
-    int64_t step[16];
-    uint64_t cnt[16];
+    std::array<int64_t, 16> base{};
+    std::array<int64_t, 16> step{};
+    std::array<uint64_t, 16> cnt{};
     for (uint32_t l = 0; l < nd; ++l) {
       base[l] = static_cast<int64_t>(
-          ReadBE64(region + 1 + static_cast<size_t>(l) * 16));
+          ReadBE64(region + 1 + (static_cast<size_t>(l) * 16)));
       step[l] = static_cast<int64_t>(
-          ReadBE64(region + 1 + static_cast<size_t>(l) * 16 + 8));
-      cnt[l] = rc > l ? (static_cast<uint64_t>(rc) - 1 - l) / nd + 1 : 0;
+          ReadBE64(region + 1 + (static_cast<size_t>(l) * 16) + 8));
+      cnt[l] = rc > l ? ((static_cast<uint64_t>(rc) - 1 - l) / nd) + 1 : 0;
       // Window eligibility: the lane's signed line must stay inside int64
       // across the row group (monotone, so no wrap; the encoder emits
       // wrapped grids, so this is a real decline, kArith's check per lane).
       if (cnt[l] > 0) {
-        const __int128 last =
-            static_cast<__int128>(base[l]) +
-            static_cast<__int128>(step[l]) * static_cast<__int128>(cnt[l] - 1);
+        const __int128 last = static_cast<__int128>(base[l]) +
+                              (static_cast<__int128>(step[l]) *
+                               static_cast<__int128>(cnt[l] - 1));
         if (last < static_cast<__int128>(INT64_MIN) ||
             last > static_cast<__int128>(INT64_MAX)) {
           return false;
@@ -6576,8 +7108,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     // Predicate -> value interval; the bounds stay inside int128, so the
     // division helper below cannot overflow (kArith's switch verbatim).
-    __int128 plo = static_cast<__int128>(INT64_MIN);
-    __int128 phi = static_cast<__int128>(INT64_MAX);
+    auto plo = static_cast<__int128>(INT64_MIN);
+    auto phi = static_cast<__int128>(INT64_MAX);
     switch (p.op) {
       case ScanOp::kEq:
         plo = phi = static_cast<__int128>(p.lit);
@@ -6607,18 +7139,22 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     const auto floordiv = [](__int128 x, int64_t y) {
       __int128 q = x / y;
-      if (x % y != 0 && (x < 0) != (y < 0)) --q;
+      if (x % y != 0 && (x < 0) != (y < 0)) {
+        --q;
+      }
       return q;
     };
-    uint32_t wlo[16];
-    uint32_t whi[16];
+    std::array<uint32_t, 16> wlo{};
+    std::array<uint32_t, 16> whi{};
     uint64_t total = 0;
     bool all_full = true;
     for (uint32_t l = 0; l < nd; ++l) {
       wlo[l] = 0;
       whi[l] = 0;
-      if (cnt[l] == 0) continue;  // hostile tail region: lane past rc
-      const __int128 a = static_cast<__int128>(base[l]);
+      if (cnt[l] == 0) {
+        continue;  // hostile tail region: lane past rc
+      }
+      const auto a = static_cast<__int128>(base[l]);
       const int64_t d = step[l];
       __int128 lo = 0;
       __int128 hi = 0;
@@ -6640,13 +7176,15 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         all_full = all_full && wlo[l] == 0 && whi[l] == cnt[l];
       }
     }
-    if (!all_full && total * 4 > rc) return false;  // dense partial declines
+    if (!all_full && total * 4 > rc) {
+      return false;  // dense partial declines
+    }
     if (all_full) {
       SvSetRangeRaw(out, 0, rc);
     } else {
       for (uint32_t l = 0; l < nd; ++l) {
         for (uint32_t t = wlo[l]; t < whi[l]; ++t) {
-          const uint32_t i = l + nd * t;
+          const uint32_t i = l + (nd * t);
           out[i >> 6] |= UINT64_C(1) << (i & 63);
         }
       }
@@ -6655,12 +7193,12 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // entry; tail clear bits (eidx >= nexc) decode as raw 0. Byte-skipping:
     // all-on bytes are pure window territory, so the patch cost scales with
     // the EXCEPTION count, not the row count (kArith's walk verbatim).
-    const uint8_t* bmp = reinterpret_cast<const uint8_t*>(region + hdr);
-    int64_t exc_stack[256];
+    const auto* bmp = reinterpret_cast<const uint8_t*>(region + hdr);
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
@@ -6673,10 +7211,14 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     uint32_t eidx = 0;
     for (size_t byte_i = 0; byte_i < bmp_bytes; ++byte_i) {
       const uint8_t byte = bmp[byte_i];
-      if (byte == 0xFF) continue;  // every row on-model
-      const uint32_t pos = static_cast<uint32_t>(byte_i * 8);
+      if (byte == 0xFF) {
+        continue;  // every row on-model
+      }
+      const auto pos = static_cast<uint32_t>(byte_i * 8);
       for (uint32_t b = 0; b < 8 && pos + b < rc; ++b) {
-        if ((byte >> (7 - b)) & 1) continue;
+        if (((byte >> (7 - b)) & 1) != 0) {
+          continue;
+        }
         const int64_t v = (eidx < nexc) ? exc[eidx] : 0;
         ++eidx;
         if (ScanMatch(v, p.op, p.lit)) {
@@ -6702,8 +7244,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         !ParsePlaRegion(region, rc, f.params[off_idx], reg_end, &pl)) {
       return false;
     }
-    __int128 plo = static_cast<__int128>(INT64_MIN);
-    __int128 phi = static_cast<__int128>(INT64_MAX);
+    auto plo = static_cast<__int128>(INT64_MIN);
+    auto phi = static_cast<__int128>(INT64_MAX);
     switch (p.op) {
       case ScanOp::kEq:
         plo = phi = static_cast<__int128>(p.lit);
@@ -6735,34 +7277,41 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     }
     const auto floordiv = [](__int128 x, int64_t y) {
       __int128 q = x / y;
-      if (x % y != 0 && (x < 0) != (y < 0)) --q;
+      if (x % y != 0 && (x < 0) != (y < 0)) {
+        --q;
+      }
       return q;
     };
     for (uint32_t j = 0; j < pl.nseg; ++j) {
       const uint32_t seg_start =
-          j == 0 ? 0 : ReadBE32(pl.segs + static_cast<size_t>(j - 1) * 20 + 16);
+          j == 0 ? 0
+                 : ReadBE32(pl.segs + (static_cast<size_t>(j - 1) * 20) + 16);
       const uint32_t seg_end =
-          ReadBE32(pl.segs + static_cast<size_t>(j) * 20 + 16);
-      const __int128 first =
-          static_cast<int64_t>(ReadBE64(pl.segs + static_cast<size_t>(j) * 20));
+          ReadBE32(pl.segs + (static_cast<size_t>(j) * 20) + 16);
+      const __int128 first = static_cast<int64_t>(
+          ReadBE64(pl.segs + (static_cast<size_t>(j) * 20)));
       const __int128 d = static_cast<int64_t>(
-          ReadBE64(pl.segs + static_cast<size_t>(j) * 20 + 8));
+          ReadBE64(pl.segs + (static_cast<size_t>(j) * 20) + 8));
       const __int128 last =
-          first + static_cast<__int128>(seg_end - seg_start - 1) * d;
+          first + (static_cast<__int128>(seg_end - seg_start - 1) * d);
       if (last < static_cast<__int128>(INT64_MIN) ||
           last > static_cast<__int128>(INT64_MAX)) {
         return false;
       }
       const __int128 vlo = std::min(first, last);
       const __int128 vhi = std::max(first, last);
-      if (vhi < plo || vlo > phi) continue;  // whole segment misses
+      if (vhi < plo || vlo > phi) {
+        continue;  // whole segment misses
+      }
       if (plo <= vlo && vhi <= phi) {
         SvSetRangeRaw(out, seg_start, seg_end);  // whole segment passes
         continue;
       }
-      if (d == 0) continue;  // a point value is pass-all or pass-none
+      if (d == 0) {
+        continue;  // a point value is pass-all or pass-none
+      }
       const __int128 len = seg_end - seg_start;
-      __int128 w_lo, w_hi;  // satisfying index range within the segment
+      __int128 w_lo = 0, w_hi = 0;  // satisfying index range within the segment
       if (d > 0) {
         w_lo = seg_start +
                std::max<__int128>(
@@ -6787,11 +7336,11 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // set on-line bits); identical walk to the kArith arm.
     const uint32_t nexc = ReadBE16(pl.hdr + 5);
     const size_t bmp_bytes = (static_cast<size_t>(rc) + 7) / 8;
-    int64_t exc_stack[256];
+    std::array<int64_t, 256> exc_stack{};
     std::vector<int64_t> exc_heap;
-    int64_t* exc;
+    int64_t* exc = nullptr;
     if (static_cast<size_t>(nexc) <= 256) {
-      exc = exc_stack;
+      exc = exc_stack.data();
       std::fill(exc, exc + nexc, 0);
     } else {
       exc_heap.assign(nexc, 0);
@@ -6802,13 +7351,17 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
                         ReadBE32(pl.hdr + 1), nexc, reg_end, exc);
     }
     uint32_t eidx = 0;
-    const uint8_t* pl_bmp = reinterpret_cast<const uint8_t*>(pl.bmp);
+    const auto* pl_bmp = reinterpret_cast<const uint8_t*>(pl.bmp);
     for (size_t byte_i = 0; byte_i < bmp_bytes; ++byte_i) {
       const uint8_t byte = pl_bmp[byte_i];
-      if (byte == 0xFF) continue;  // every row on-line
-      const uint32_t base = static_cast<uint32_t>(byte_i * 8);
+      if (byte == 0xFF) {
+        continue;  // every row on-line
+      }
+      const auto base = static_cast<uint32_t>(byte_i * 8);
       for (uint32_t b = 0; b < 8 && base + b < rc; ++b) {
-        if ((byte >> (7 - b)) & 1) continue;
+        if (((byte >> (7 - b)) & 1) != 0) {
+          continue;
+        }
         const int64_t v = (eidx < nexc) ? exc[eidx] : 0;
         ++eidx;
         if (ScanMatch(v, p.op, p.lit)) {
@@ -6838,13 +7391,15 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       return false;
     }
     for (uint32_t b = 0; b < parsed.ncp; ++b) {
-      const char* ck = parsed.ckpts + static_cast<size_t>(b) * 16;
+      const char* ck = parsed.ckpts + (static_cast<size_t>(b) * 16);
       // SIGNED bracket domain (see ParseInterpRegion).
-      const __int128 first =
+      const auto first =
           static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck)));
-      const __int128 last =
+      const auto last =
           static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck + 8)));
-      if (last < plo || first > phi) continue;  // no row in this block passes
+      if (last < plo || first > phi) {
+        continue;  // no row in this block passes
+      }
       const uint32_t bs = b * kInterpBlockRows;
       const uint32_t bt = std::min<uint32_t>(rc, (b + 1) * kInterpBlockRows);
       if (first >= plo && last <= phi) {
@@ -6871,10 +7426,10 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       return false;
     }
     for (uint32_t block = 0; block < parsed.blocks; ++block) {
-      const char* bracket =
-          parsed.brackets + static_cast<size_t>(block) * kDeltaPForBracketBytes;
-      const int64_t first = static_cast<int64_t>(ReadBE64(bracket));
-      const int64_t last = static_cast<int64_t>(ReadBE64(bracket + 8));
+      const char* bracket = parsed.brackets + (static_cast<size_t>(block) *
+                                               kDeltaPForBracketBytes);
+      const auto first = static_cast<int64_t>(ReadBE64(bracket));
+      const auto last = static_cast<int64_t>(ReadBE64(bracket + 8));
       if (static_cast<__int128>(last) < low_value ||
           static_cast<__int128>(first) > high_value) {
         continue;
@@ -6887,8 +7442,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         SvSetRangeRaw(out, start, start + rows);
         continue;
       }
-      int64_t decoded[kDeltaPForBlockRows];
-      DecodeDeltaPForBlock(parsed, block, decoded);
+      std::array<int64_t, kDeltaPForBlockRows> decoded{};
+      DecodeDeltaPForBlock(parsed, block, decoded.data());
       for (uint32_t i = 0; i < rows; ++i) {
         const __int128 value = decoded[i];
         if (value >= low_value && value <= high_value) {
@@ -6937,7 +7492,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     };
     uint32_t alo = 0, ahi = parsed.ng;
     while (alo < ahi) {
-      const uint32_t mid = alo + (ahi - alo) / 2;
+      const uint32_t mid = alo + ((ahi - alo) / 2);
       __int128 glo = 0, ghi = 0;
       bracket(mid, &glo, &ghi);
       if (glo < plo) {
@@ -6949,7 +7504,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     const uint32_t g_first_inside = alo;  // first group with glo >= plo
     uint32_t blo2 = 0, bhi2 = parsed.ng;
     while (blo2 < bhi2) {
-      const uint32_t mid = blo2 + (bhi2 - blo2) / 2;
+      const uint32_t mid = blo2 + ((bhi2 - blo2) / 2);
       __int128 glo = 0, ghi = 0;
       bracket(mid, &glo, &ghi);
       if (ghi <= phi) {
@@ -7090,16 +7645,18 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // Run fold over inner-encoded streams: decode each inner region once,
     // then one SvSetRange per run (the kRleDict shape generalized).
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 18 > reg_end) return false;
-    const uint8_t vs = static_cast<uint8_t>(region[0]);
-    const uint8_t cs = static_cast<uint8_t>(region[1]);
+    if (reg_end == nullptr || region + 18 > reg_end) {
+      return false;
+    }
+    const auto vs = static_cast<uint8_t>(region[0]);
+    const auto cs = static_cast<uint8_t>(region[1]);
     const uint32_t runs = ReadBE32(region + 2);
     const uint32_t vparam = ReadBE32(region + 6);
     const uint32_t cparam = ReadBE32(region + 10);
     const uint64_t vlen = ReadBE32(region + 14);
     if (runs != f.params[off_idx] || runs == 0 || runs > rc ||
-        vlen > static_cast<uint64_t>(reg_end - (region + 18)) ||
-        !InnerSchemeOk(vs) || !InnerSchemeOk(cs)) {
+        std::cmp_greater(vlen, reg_end - (region + 18)) || !InnerSchemeOk(vs) ||
+        !InnerSchemeOk(cs)) {
       return false;
     }
     const char* vreg = region + 18;
@@ -7126,39 +7683,42 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // Pass table over the flat dictionary + one inner decode of the code
     // stream -- the kDict arm's shape with a cascaded code region.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 11 > reg_end) return false;
+    if (reg_end == nullptr || region + 11 > reg_end) {
+      return false;
+    }
     const uint16_t d = ReadBE16(region);
-    if (d == 0 || d != f.params[off_idx]) return false;
-    const uint8_t cs = static_cast<uint8_t>(region[2]);
+    if (d == 0 || d != f.params[off_idx]) {
+      return false;
+    }
+    const auto cs = static_cast<uint8_t>(region[2]);
     const uint32_t cparam = ReadBE32(region + 3);
     const uint64_t clen = ReadBE32(region + 7);
     const char* creg = region + 11;
-    if (clen > static_cast<uint64_t>(reg_end - creg) || !InnerSchemeOk(cs)) {
+    if (std::cmp_greater(clen, reg_end - creg) || !InnerSchemeOk(cs)) {
       return false;
     }
     const char* pool_hdr = creg + clen;
     if (pool_hdr + 1 > reg_end || static_cast<uint8_t>(pool_hdr[0]) != 0 ||
-        pool_hdr + 1 + static_cast<size_t>(d) * 8 > reg_end) {
+        pool_hdr + 1 + (static_cast<size_t>(d) * 8) > reg_end) {
       return false;
     }
     const char* dict = pool_hdr + 1;
-    uint8_t pass_stack[1024];
+    std::array<uint8_t, 1024> pass_stack{};
     std::vector<uint8_t> pass_heap;
-    uint8_t* pass;
+    uint8_t* pass = nullptr;
     if (static_cast<size_t>(d) + 1 <= sizeof(pass_stack)) {
-      pass = pass_stack;
+      pass = pass_stack.data();
       std::fill(pass, pass + static_cast<size_t>(d) + 1, 0);
     } else {
       pass_heap.assign(static_cast<size_t>(d) + 1, 0);
       pass = pass_heap.data();
     }
     for (uint16_t e = 0; e < d; ++e) {
-      pass[e] =
-          ScanMatch(
-              static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(e) * 8)),
-              p.op, p.lit)
-              ? 1
-              : 0;
+      pass[e] = ScanMatch(static_cast<int64_t>(
+                              ReadBE64(dict + (static_cast<size_t>(e) * 8))),
+                          p.op, p.lit)
+                    ? 1
+                    : 0;
     }
     pass[d] = ScanMatch(static_cast<int64_t>(0), p.op, p.lit)
                   ? 1
@@ -7166,7 +7726,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     std::vector<int64_t> codes(rc, 0);
     DecodeInnerI64All(creg, cs, cparam, rc, pool_hdr, codes.data());
     for (uint32_t i = 0; i < rc; ++i) {
-      const uint64_t code = static_cast<uint64_t>(codes[i]);
+      const auto code = static_cast<uint64_t>(codes[i]);
       if (pass[code < d ? code : d] != 0) {
         out[i >> 6] |= 1ULL << (i & 63);
       }
@@ -7178,8 +7738,10 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // mask starts at the match(0) verdict for the whole group, then each
     // listed (position, value) pair overwrites its row's bit.
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 14 > reg_end) return false;
-    const uint8_t vs = static_cast<uint8_t>(region[0]);
+    if (reg_end == nullptr || region + 14 > reg_end) {
+      return false;
+    }
+    const auto vs = static_cast<uint8_t>(region[0]);
     const uint32_t vprm = ReadBE32(region + 1);
     const uint32_t pbpv = static_cast<uint8_t>(region[9]);
     const uint32_t nnz = ReadBE32(region + 10);
@@ -7187,15 +7749,21 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
         pbpv > 8 || !InnerSchemeOk(vs)) {
       return false;
     }
-    const size_t pos_bytes = 8 + static_cast<size_t>(nnz) * pbpv;
-    if (region + 14 + pos_bytes > reg_end) return false;
+    const size_t pos_bytes = 8 + (static_cast<size_t>(nnz) * pbpv);
+    if (region + 14 + pos_bytes > reg_end) {
+      return false;
+    }
     const char* posr = region + 14;
     const char* vreg = posr + pos_bytes;
-    if (ScanMatch(0, p.op, p.lit)) SvSetRangeRaw(out, 0, rc);
+    if (ScanMatch(0, p.op, p.lit)) {
+      SvSetRangeRaw(out, 0, rc);
+    }
     for (uint32_t r = 0; r < nnz; ++r) {
       const int64_t pv =
           Int64RegionAt(posr, Scheme::kForBp, pbpv, nnz, r, reg_end);
-      if (pv < 0 || pv >= rc) continue;  // hostile position: skip the row
+      if (pv < 0 || std::cmp_greater_equal(pv, rc)) {
+        continue;  // hostile position: skip the row
+      }
       const int64_t v =
           Int64RegionAt(vreg, static_cast<Scheme>(vs), vprm, nnz, r, reg_end);
       if (ScanMatch(v, p.op, p.lit)) {
@@ -7213,27 +7781,32 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     // range [lo, hi) with two binary searches -- no pass table (the whole
     // point of the scheme vs kRleDict's d-entry scan).
     const char* reg_end = RegionEndAt(f, g, p.col, chunk.Data());
-    if (reg_end == nullptr || region + 2 > reg_end) return false;
+    if (reg_end == nullptr || region + 2 > reg_end) {
+      return false;
+    }
     const uint16_t d = ReadBE16(region);
-    if (d == 0) return false;
+    if (d == 0) {
+      return false;
+    }
     const int cb = (BitsNeeded(d - 1) + 7) / 8;
     const char* dict = region + 2;
-    const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+    const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
     const uint32_t runs = f.params[off_idx];
     if (runs_hdr + 4 > reg_end || ReadBE32(runs_hdr) != runs ||
         runs_hdr + 4 +
-                static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) >
+                (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) >
             reg_end) {
       return false;
     }
     const auto dict_at = [&](uint32_t e) {
-      return static_cast<int64_t>(ReadBE64(dict + static_cast<size_t>(e) * 8));
+      return static_cast<int64_t>(
+          ReadBE64(dict + (static_cast<size_t>(e) * 8)));
     };
     // lower_bound / upper_bound over the BE64 dictionary entries.
     const auto lb = [&](int64_t key) {  // first e with dict[e] >= key
       uint32_t l = 0, h = d;
       while (l < h) {
-        const uint32_t mid = l + (h - l) / 2;
+        const uint32_t mid = l + ((h - l) / 2);
         if (dict_at(mid) < key) {
           l = mid + 1;
         } else {
@@ -7245,7 +7818,7 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
     const auto ub = [&](int64_t key) {  // first e with dict[e] > key
       uint32_t l = 0, h = d;
       while (l < h) {
-        const uint32_t mid = l + (h - l) / 2;
+        const uint32_t mid = l + ((h - l) / 2);
         if (key < dict_at(mid)) {
           h = mid;
         } else {
@@ -7297,8 +7870,9 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
       q += static_cast<size_t>(cb) + 4;
     }
     // Rows past the run walk decode as raw 0 (kRle parity).
-    if (acc < rc && zero_pass)
+    if (acc < rc && zero_pass) {
       SvSetRangeRaw(out, static_cast<uint32_t>(acc), rc);
+    }
     return true;
   }
   return false;
@@ -7311,6 +7885,8 @@ static bool TryFastPredicateMask(const PaxChunk& chunk, const Predicate& p,
 // path (TryFastPredicateMask) fills each predicate's mask without decoding
 // rows; predicates without a fast kernel decode the column once and compare
 // per row. Masks AND across predicates and columns.
+}  // namespace
+
 namespace {
 constexpr size_t kSelStackWords = 16;  // covers kRowGroupSize (1024) rows
 
@@ -7319,13 +7895,15 @@ constexpr size_t kSelStackWords = 16;  // covers kRowGroupSize (1024) rows
 // whose setup cost dominates. Explicit 4-word vector stores keep it to a
 // couple of instructions per group; the scalar tail covers short masks.
 inline void FillWords(uint64_t* p, size_t n, uint64_t v) {
-#if defined(__AVX2__)
+#ifdef __AVX2__
   const __m256i vv = _mm256_set1_epi64x(static_cast<long long>(v));
   size_t i = 0;
   for (; i + 4 <= n; i += 4) {
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(p + i), vv);
   }
-  for (; i < n; ++i) p[i] = v;
+  for (; i < n; ++i) {
+    p[i] = v;
+  }
 #else
   for (size_t i = 0; i < n; ++i) p[i] = v;
 #endif
@@ -7342,17 +7920,19 @@ class SelWordBuf {
       FillWords(heapv_.data(), words, fill);
     } else {
       n_ = words;
-      FillWords(stack_, words, fill);
+      FillWords(stack_.data(), words, fill);
     }
   }
-  uint64_t* data() { return heap_ ? heapv_.data() : stack_; }
-  const uint64_t* data() const { return heap_ ? heapv_.data() : stack_; }
-  size_t size() const { return heap_ ? heapv_.size() : n_; }
+  uint64_t* data() { return heap_ ? heapv_.data() : stack_.data(); }
+  [[nodiscard]] const uint64_t* data() const {
+    return heap_ ? heapv_.data() : stack_.data();
+  }
+  [[nodiscard]] size_t size() const { return heap_ ? heapv_.size() : n_; }
 
  private:
   bool heap_;
   size_t n_ = 0;
-  uint64_t stack_[kSelStackWords] = {};
+  std::array<uint64_t, kSelStackWords> stack_ = {};
   std::vector<uint64_t> heapv_;
 };
 }  // namespace
@@ -7366,19 +7946,19 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
   // footer controlled; out-of-range values read out of bounds before any
   // row work. An unusable cell selects nothing.
   if (g >= f.row_group_count || g >= f.row_counts.size() ||
-      static_cast<size_t>(g) * f.column_count + f.column_count >
+      (static_cast<size_t>(g) * f.column_count) + f.column_count >
           f.column_offsets.size() ||
       f.encodings.size() < f.column_offsets.size() ||
       f.params.size() < f.column_offsets.size()) {
     return sv;
   }
   const uint16_t rc = f.row_counts[g];
-  const size_t nwords = static_cast<size_t>((rc + 63U) / 64U);
+  const auto nwords = static_cast<size_t>((rc + 63U) / 64U);
   sv.bits.resize(nwords);  // new storage: zero-init compiles to memset
   if (preds.empty() || all_inside) {
     // All rows inside: fill whole words, then the partial tail word.
     FillWords(sv.bits.data(), static_cast<size_t>(rc) >> 6, ~0ULL);
-    if (rc & 63U) {
+    if ((rc & 63U) != 0U) {
       sv.bits[static_cast<size_t>(rc) >> 6] = (1ULL << (rc & 63U)) - 1ULL;
     }
     sv.count = rc;
@@ -7386,14 +7966,15 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
   }
   std::vector<slot_t> pcols;
   for (const auto& p : preds) {
-    if (std::find(pcols.begin(), pcols.end(), p.col) == pcols.end())
+    if (std::find(pcols.begin(), pcols.end(), p.col) == pcols.end()) {
       pcols.push_back(p.col);
+    }
   }
   std::sort(pcols.begin(), pcols.end());
 
   // AND one per-column mask per predicate column into the final selection.
   SelWordBuf acc(nwords, ~0ULL);
-  if (rc & 63U) {  // clear bits >= rc in the last word
+  if ((rc & 63U) != 0U) {  // clear bits >= rc in the last word
     acc.data()[rc >> 6] = (1ULL << (rc & 63U)) - 1ULL;
   }
   // Hoisted once: the AND/popcount passes below run per row group, and
@@ -7408,8 +7989,11 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
       return sv;
     }
     size_t npred = 0;
-    for (const auto& p : preds)
-      if (p.col == col) ++npred;
+    for (const auto& p : preds) {
+      if (p.col == col) {
+        ++npred;
+      }
+    }
     // A column with a single predicate (the common case) fuses the kernel
     // output straight into `acc`, saving a whole nwords fill plus a second
     // AND pass per column per row group. Two or more predicates on one
@@ -7417,17 +8001,20 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
     SelWordBuf cm_buf(nwords, ~0ULL);
     uint64_t* cm_p = npred > 1 ? cm_buf.data() : nullptr;
     uint64_t* acc_p = acc.data();
-    if (cm_p != nullptr && (rc & 63U))
+    if (cm_p != nullptr && ((rc & 63U) != 0U)) {
       cm_p[(static_cast<size_t>(rc) - 1) >> 6] &= (1ULL << (rc & 63U)) - 1ULL;
+    }
     // Decoded-values scratch for THIS column only: it must be rebuilt per
     // column, or every later predicate would compare against the first
     // column's values (the col-4 range predicates silently evaluated on
     // col-1 data and zeroed the whole selection).
-    int64_t dec_stack[PaxChunk::kRowGroupSize];
+    std::array<int64_t, PaxChunk::kRowGroupSize> dec_stack{};
     std::vector<int64_t> dec_heap;
     int64_t* decoded = nullptr;
     for (const auto& p : preds) {
-      if (p.col != col) continue;
+      if (p.col != col) {
+        continue;
+      }
       SelWordBuf pm(nwords, 0);
       uint64_t* pm_p = pm.data();
       if (!TryFastPredicateMask(chunk, p, g, pm_p)) {
@@ -7436,35 +8023,45 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
         // this scheme/op, or a hostile region made the fast path unsafe).
         if (decoded == nullptr) {
           if (rc <= PaxChunk::kRowGroupSize) {
-            decoded = dec_stack;
+            decoded = dec_stack.data();
           } else {
             dec_heap.resize(rc);
             decoded = dec_heap.data();
           }
-          if (rc > 0) chunk.DecodeInt64ColumnRg(col, g, decoded);
+          if (rc > 0) {
+            chunk.DecodeInt64ColumnRg(col, g, decoded);
+          }
         }
         if (rc > 0) {
-#if defined(__AVX2__)
+#ifdef __AVX2__
           if (!FillPredicateMaskAvx2(decoded, rc, p.op, p.lit, pm_p)) {
 #endif
-            for (uint16_t i = 0; i < rc; ++i)
-              if (ScanMatch(decoded[i], p.op, p.lit))
+            for (uint16_t i = 0; i < rc; ++i) {
+              if (ScanMatch(decoded[i], p.op, p.lit)) {
                 pm_p[i >> 6] |= 1ULL << (i & 63);
-#if defined(__AVX2__)
+              }
+            }
+#ifdef __AVX2__
           }
 #endif
         }
       }
       uint64_t* dst = cm_p != nullptr ? cm_p : acc_p;
-      for (size_t w = 0; w < nwords; ++w) dst[w] &= pm_p[w];
+      for (size_t w = 0; w < nwords; ++w) {
+        dst[w] &= pm_p[w];
+      }
     }
-    if (cm_p != nullptr)
-      for (size_t w = 0; w < nwords; ++w) acc_p[w] &= cm_p[w];
+    if (cm_p != nullptr) {
+      for (size_t w = 0; w < nwords; ++w) {
+        acc_p[w] &= cm_p[w];
+      }
+    }
   }
   const uint64_t* acc_p = acc.data();
   uint64_t total = 0;
-  for (size_t w = 0; w < nwords; ++w)
+  for (size_t w = 0; w < nwords; ++w) {
     total += static_cast<uint64_t>(__builtin_popcountll(acc_p[w]));
+  }
   sv.bits.resize(nwords);  // already sized above: no reallocation, no fill
   // nwords == 0 (a zero-row row group) leaves acc_p and sv.bits.data() null,
   // and memcpy with a null argument is UB even for a zero byte count -- the
@@ -7500,11 +8097,15 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
   // Public API guard: predicate/term columns index all_zone_mins and the
   // region decoder below; an out-of-range column read out of bounds.
   for (const auto& p : plan.preds) {
-    if (p.col >= cc) return AggResult{};
+    if (p.col >= cc) {
+      return AggResult{};
+    }
   }
   for (const auto& t : plan.terms) {
     for (slot_t c : t.cols) {
-      if (c >= cc) return AggResult{};
+      if (c >= cc) {
+        return AggResult{};
+      }
     }
   }
   // With a schema supplied, enforce the int64-only decode contract on
@@ -7516,18 +8117,27 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
              sc->GetColumn(c).Type() == ValueType::kInt64;
     };
     for (const auto& p : plan.preds) {
-      if (!i64(p.col)) return AggResult{};
+      if (!i64(p.col)) {
+        return AggResult{};
+      }
     }
     for (const auto& t : plan.terms) {
       for (slot_t c : t.cols) {
-        if (!i64(c)) return AggResult{};
+        if (!i64(c)) {
+          return AggResult{};
+        }
       }
     }
   }
   if (workload != nullptr && sc != nullptr) {
-    for (const auto& p : plan.preds) workload->RecordFilter(*sc, p.col);
-    for (const auto& t : plan.terms)
-      for (slot_t c : t.cols) workload->RecordAggregate(*sc, c);
+    for (const auto& p : plan.preds) {
+      workload->RecordFilter(*sc, p.col);
+    }
+    for (const auto& t : plan.terms) {
+      for (slot_t c : t.cols) {
+        workload->RecordAggregate(*sc, c);
+      }
+    }
   }
 
   // Metadata fast paths (no predicates): reuse footer statistics.
@@ -7596,8 +8206,10 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
             all_inside = false;
             continue;
         }
-        if (range_empty) return;  // this predicate kills the whole group
-        const size_t zi = static_cast<size_t>(g) * cc + p.col;
+        if (range_empty) {
+          return;  // this predicate kills the whole group
+        }
+        const size_t zi = (static_cast<size_t>(g) * cc) + p.col;
         if (zi >= f.all_zone_mins.size() || zi >= f.all_zone_maxs.size()) {
           all_inside = false;
           continue;
@@ -7608,11 +8220,15 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
         // real rows here).
         const bool col_has_null = RgColHasNull(f, g, p.col);
         if (!col_has_null &&
-            !(f.all_zone_mins[zi] <= phi && f.all_zone_maxs[zi] >= plo))
+            (f.all_zone_mins[zi] > phi || f.all_zone_maxs[zi] < plo)) {
           return;
-        if (!(f.all_zone_mins[zi] >= plo && f.all_zone_maxs[zi] <= phi))
+        }
+        if (f.all_zone_mins[zi] < plo || f.all_zone_maxs[zi] > phi) {
           all_inside = false;
-        if (col_has_null) all_inside = false;
+        }
+        if (col_has_null) {
+          all_inside = false;
+        }
       }
     }
 
@@ -7622,14 +8238,22 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
     PaxSelectionVector sel =
         BuildSelectionVector(chunk, plan.preds, g, all_inside);
     r.count += sel.count;
-    if (plan.count_only || plan.terms.empty()) return;
-    if (sel.count == 0) return;  // late materialization: nothing to aggregate
+    if (plan.count_only || plan.terms.empty()) {
+      return;
+    }
+    if (sel.count == 0) {
+      return;  // late materialization: nothing to aggregate
+    }
 
     std::vector<slot_t> term_cols;
-    for (const auto& t : plan.terms)
-      for (slot_t c : t.cols)
-        if (std::find(term_cols.begin(), term_cols.end(), c) == term_cols.end())
+    for (const auto& t : plan.terms) {
+      for (slot_t c : t.cols) {
+        if (std::find(term_cols.begin(), term_cols.end(), c) ==
+            term_cols.end()) {
           term_cols.push_back(c);
+        }
+      }
+    }
     std::sort(term_cols.begin(), term_cols.end());
     std::vector<std::vector<int64_t>> tbufs(term_cols.size());
     for (size_t i = 0; i < term_cols.size(); ++i) {
@@ -7647,17 +8271,23 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
     const uint64_t nwords = sel.bits.size();
     for (uint64_t w = 0; w < nwords; ++w) {
       uint64_t bits = sel.bits[w];
-      if (bits == 0) continue;
-      const uint16_t base = static_cast<uint16_t>(w * 64);
+      if (bits == 0) {
+        continue;
+      }
+      const auto base = static_cast<uint16_t>(w * 64);
       while (bits) {
         int b = __builtin_ctzll(bits);
         bits &= bits - 1;
         uint16_t i = base + static_cast<uint16_t>(b);
-        if (i >= rc) break;
+        if (i >= rc) {
+          break;
+        }
         __int128 acc = 0;
         for (const auto& t : plan.terms) {
           __int128 term = t.coeff;
-          for (slot_t c : t.cols) term *= tcol(c)[i];
+          for (slot_t c : t.cols) {
+            term *= tcol(c)[i];
+          }
           acc += term;
         }
         r.sum += acc;
@@ -7667,10 +8297,11 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
 
   AggResult total;
   if (parallel && rg > 1 && scan_sweeps > 0) {
-    if (nthreads <= 0)
+    if (nthreads <= 0) {
       nthreads = static_cast<int>(std::thread::hardware_concurrency());
-    if (nthreads > static_cast<int>(rg)) nthreads = static_cast<int>(rg);
-    if (nthreads < 1) nthreads = 1;
+    }
+    nthreads = std::min(nthreads, static_cast<int>(rg));
+    nthreads = std::max(nthreads, 1);
     std::vector<std::thread> ths;
     ths.reserve(static_cast<size_t>(nthreads));
     std::vector<AggResult> res(static_cast<size_t>(nthreads));
@@ -7684,26 +8315,35 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
-          for (uint32_t sw = 0; sw < scan_sweeps; ++sw)
-            for (uint32_t g = static_cast<uint32_t>(t); g < rg;
-                 g += static_cast<uint32_t>(nthreads))
+          for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+            for (auto g = static_cast<uint32_t>(t); g < rg;
+                 g += static_cast<uint32_t>(nthreads)) {
               agg_rg(g, res[static_cast<size_t>(t)]);
+            }
+          }
         } catch (...) {
           worker_errors[static_cast<size_t>(t)] = std::current_exception();
         }
       });
     }
-    for (auto& th : ths) th.join();
+    for (auto& th : ths) {
+      th.join();
+    }
     for (const auto& ep : worker_errors) {
-      if (ep != nullptr) std::rethrow_exception(ep);
+      if (ep != nullptr) {
+        std::rethrow_exception(ep);
+      }
     }
     for (auto& r : res) {
       total.sum += r.sum;
       total.count += r.count;
     }
   } else {
-    for (uint32_t sw = 0; sw < scan_sweeps; ++sw)
-      for (uint32_t g = 0; g < rg; ++g) agg_rg(g, total);
+    for (uint32_t sw = 0; sw < scan_sweeps; ++sw) {
+      for (uint32_t g = 0; g < rg; ++g) {
+        agg_rg(g, total);
+      }
+    }
   }
   return total;
 }
@@ -7715,7 +8355,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
   std::vector<GroupByEntry> out;
   const PaxChunk::Footer& f = chunk.GetFooter();
   const uint16_t cc = f.column_count;
-  if (group_col >= cc || sum_col >= cc) return out;
+  if (group_col >= cc || sum_col >= cc) {
+    return out;
+  }
   if (f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
           static_cast<size_t>(f.row_group_count) * f.column_count ||
@@ -7728,7 +8370,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       return c < sc->ColumnCount() &&
              sc->GetColumn(c).Type() == ValueType::kInt64;
     };
-    if (!i64(group_col) || !i64(sum_col)) return out;
+    if (!i64(group_col) || !i64(sum_col)) {
+      return out;
+    }
   }
   if (workload != nullptr && sc != nullptr) {
     workload->RecordAggregate(*sc, group_col);
@@ -7737,12 +8381,14 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
   std::unordered_map<int64_t, size_t> index;
   std::vector<__int128> sums;
   const auto emit = [&](int64_t key, int64_t sum, uint64_t cnt) {
-    if (cnt == 0) return;
+    if (cnt == 0) {
+      return;
+    }
     auto it = index.find(key);
     if (it == index.end()) {
       const size_t pos = out.size();
       index.emplace(key, pos);
-      out.push_back(GroupByEntry{key, 0, 0});
+      out.push_back(GroupByEntry{.key = key, .sum = 0, .count = 0});
       sums.push_back(0);
       out[pos].sum = 0;
       sums[pos] += sum;
@@ -7757,9 +8403,11 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
   std::vector<uint32_t> gcodes;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const uint16_t rc = f.row_counts[g];
-    if (rc == 0) continue;
-    const uint32_t goff = static_cast<uint32_t>(g) * cc + group_col;
-    const uint32_t soff = static_cast<uint32_t>(g) * cc + sum_col;
+    if (rc == 0) {
+      continue;
+    }
+    const uint32_t goff = (g * cc) + group_col;
+    const uint32_t soff = (g * cc) + sum_col;
     const auto gs = static_cast<Scheme>(f.encodings[goff]);
     const auto ss = static_cast<Scheme>(f.encodings[soff]);
     // Validate the offset VALUEs before forming the pointers at all (the
@@ -7768,7 +8416,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
     // hand-built-footer guards here.
     const char* gr = RegionStartAt(f, g, group_col, chunk.Data(), 0);
     const char* sr = RegionStartAt(f, g, sum_col, chunk.Data(), 0);
-    if (gr == nullptr || sr == nullptr) continue;
+    if (gr == nullptr || sr == nullptr) {
+      continue;
+    }
     const char* gend = RegionEndAt(f, g, group_col, chunk.Data());
     const char* send = RegionEndAt(f, g, sum_col, chunk.Data());
 
@@ -7786,7 +8436,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       const_sum = static_cast<int64_t>(ReadBE64(sr));
       sum_ready = true;
     } else if (ss == Scheme::kRle && send != nullptr &&
-               sr + 4 + static_cast<size_t>(f.params[soff]) * 12 <= send) {
+               sr + 4 + (static_cast<size_t>(f.params[soff]) * 12) <= send) {
       const char* q = sr + 4;
       uint32_t acc = 0;
       bool ok = true;
@@ -7802,7 +8452,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
         q += 12;
       }
       sum_ready = ok && acc >= rc;
-      if (!sum_ready) sum_runs.clear();
+      if (!sum_ready) {
+        sum_runs.clear();
+      }
     } else if ((ss == Scheme::kRleDict || ss == Scheme::kOpRle) &&
                send != nullptr && send - sr >= 2) {
       // Same sum_runs materialization as kRle above, but each run's value
@@ -7811,11 +8463,11 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       const uint16_t d = ReadBE16(sr);
       const int cb = (BitsNeeded(d > 0 ? d - 1 : 0) + 7) / 8;
       const char* dict = sr + 2;
-      const char* runs_hdr = dict + static_cast<size_t>(d) * 8;
+      const char* runs_hdr = dict + (static_cast<size_t>(d) * 8);
       const uint32_t runs = f.params[soff];
       if (d > 0 && runs_hdr + 4 <= send && ReadBE32(runs_hdr) == runs &&
           runs_hdr + 4 +
-                  static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4) <=
+                  (static_cast<size_t>(runs) * (static_cast<size_t>(cb) + 4)) <=
               send) {
         const char* q = runs_hdr + 4;
         uint64_t acc = 0;
@@ -7833,7 +8485,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           }
           const int64_t v =
               (code < d) ? static_cast<int64_t>(
-                               ReadBE64(dict + static_cast<size_t>(code) * 8))
+                               ReadBE64(dict + (static_cast<size_t>(code) * 8)))
                          : 0;
           sum_runs.emplace_back(
               v,
@@ -7842,15 +8494,17 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           q += static_cast<size_t>(cb) + 4;
         }
         sum_ready = ok && acc >= rc;
-        if (!sum_ready) sum_runs.clear();
+        if (!sum_ready) {
+          sum_runs.clear();
+        }
       }
     } else if ((ss == Scheme::kDict || ss == Scheme::kOpDict) &&
                send != nullptr &&
                DictCodeHistogram(sr, rc, f.params[soff], send, &sum_freq)) {
       sum_ncodes = ReadBE16(sr);
       const int cw = BitsNeeded(sum_ncodes - 1);
-      sum_dict =
-          sr + 2 + (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+      sum_dict = sr + 2 +
+                 ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
       sum_ready = true;
     }
     // Decode fallback for other sum schemes (or failed fast paths).
@@ -7863,7 +8517,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
 
     if (gs == Scheme::kConst && gend != nullptr && gr + 8 <= gend) {
       // One group for the whole row group.
-      const int64_t key = static_cast<int64_t>(ReadBE64(gr));
+      const auto key = static_cast<int64_t>(ReadBE64(gr));
       if (ss == Scheme::kConst && sum_ready) {
         // __int128 multiply like the kRle arm below: const_sum * rc wraps
         // int64 for |const_sum| >= 2^53 with a full 1024-row group (scaled
@@ -7875,8 +8529,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       }
       if (ss == Scheme::kRle && sum_ready && !sum_runs.empty()) {
         __int128 s = 0;
-        for (const auto& [v, len] : sum_runs)
+        for (const auto& [v, len] : sum_runs) {
           s += static_cast<__int128>(v) * len;
+        }
         emit(key, static_cast<int64_t>(s), rc);
         continue;
       }
@@ -7892,7 +8547,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
         chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
       }
       __int128 s = 0;
-      for (int64_t v : sbuf) s += v;
+      for (int64_t v : sbuf) {
+        s += v;
+      }
       emit(key, static_cast<int64_t>(s), rc);
       continue;
     }
@@ -7904,13 +8561,13 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
         const int cw = BitsNeeded(ncodes - 1);
         const char* dict =
             gr + 2 +
-            (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8;
+            ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
         // Row-major code extraction for per-row sum folding.
         gcodes.assign(rc, ncodes);
         WordBitReader br(
             gr + 2,
             gr + 2 +
-                (static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8);
+                ((static_cast<size_t>(rc) * static_cast<size_t>(cw) + 7) / 8));
         for (uint32_t i = 0; i < rc; ++i) {
           const uint64_t c = br.get(cw);
           gcodes[i] = static_cast<uint32_t>(c < ncodes ? c : ncodes);
@@ -7939,7 +8596,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
             const int64_t v =
                 (scode < sum_ncodes)
                     ? static_cast<int64_t>(
-                          ReadBE64(sum_dict + static_cast<size_t>(scode) * 8))
+                          ReadBE64(sum_dict + (static_cast<size_t>(scode) * 8)))
                     : 0;
             acc[gcodes[i]] += v;
             ++cnt[gcodes[i]];
@@ -7955,10 +8612,12 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           }
         }
         for (uint32_t d = 0; d <= ncodes; ++d) {
-          if (cnt[d] == 0) continue;
+          if (cnt[d] == 0) {
+            continue;
+          }
           const int64_t key =
               (d < ncodes) ? static_cast<int64_t>(
-                                 ReadBE64(dict + static_cast<size_t>(d) * 8))
+                                 ReadBE64(dict + (static_cast<size_t>(d) * 8)))
                            : 0;  // clamped codes decode to raw 0
           emit(key, static_cast<int64_t>(acc[d]), cnt[d]);
         }
@@ -7968,7 +8627,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
     }
     if (gs == Scheme::kRle && gend != nullptr) {
       const uint32_t runs = f.params[goff];
-      if (gr + 4 + static_cast<size_t>(runs) * 12 <= gend) {
+      if (gr + 4 + (static_cast<size_t>(runs) * 12) <= gend) {
         // Expand the sum column once (runs/code passes are O(n) narrow
         // ops), then fold per group run with zero hashing.
         if (sbuf.empty()) {
@@ -7978,8 +8637,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           } else if (ss == Scheme::kRle && sum_ready && !sum_runs.empty()) {
             uint32_t pos = 0;
             for (const auto& [v, len] : sum_runs) {
-              for (uint32_t k = 0; k < len && pos < rc; ++k, ++pos)
+              for (uint32_t k = 0; k < len && pos < rc; ++k, ++pos) {
                 sbuf[pos] = v;
+              }
             }
           } else if ((ss == Scheme::kDict || ss == Scheme::kOpDict) &&
                      sum_ready) {
@@ -7989,7 +8649,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
               const uint64_t scode = sbr.get(scw);
               sbuf[i] = (scode < sum_ncodes)
                             ? static_cast<int64_t>(ReadBE64(
-                                  sum_dict + static_cast<size_t>(scode) * 8))
+                                  sum_dict + (static_cast<size_t>(scode) * 8)))
                             : 0;
             }
           } else {
@@ -7999,13 +8659,15 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
         const char* q = gr + 4;
         uint32_t pos = 0;
         for (uint32_t r = 0; r < runs && pos < rc; ++r) {
-          const int64_t key = static_cast<int64_t>(ReadBE64(q));
+          const auto key = static_cast<int64_t>(ReadBE64(q));
           // u64 extent math: a hostile len wrapped pos+len in uint32, so
           // `end < pos` regressed the walk and emitted a ~4-billion count.
           const uint64_t next = static_cast<uint64_t>(pos) + ReadBE32(q + 8);
           const uint32_t end = (next > rc) ? rc : static_cast<uint32_t>(next);
           __int128 s = 0;
-          for (uint32_t i = pos; i < end; ++i) s += sbuf[i];
+          for (uint32_t i = pos; i < end; ++i) {
+            s += sbuf[i];
+          }
           emit(key, static_cast<int64_t>(s), end - pos);
           pos = end;
           q += 12;
@@ -8013,7 +8675,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
         // Truncated region tail: Int64RegionAt decodes rows past the run
         // walk as raw 0, so group them under key 0 exactly like the generic
         // path would (they used to vanish from the group-by output).
-        for (; pos < rc; ++pos) emit(0, sbuf[pos], 1);
+        for (; pos < rc; ++pos) {
+          emit(0, sbuf[pos], 1);
+        }
         continue;
       }
       // else fall through to generic
@@ -8027,11 +8691,12 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       const uint16_t gd = ReadBE16(gr);
       const int gcb = (BitsNeeded(gd > 0 ? gd - 1 : 0) + 7) / 8;
       const char* gdict = gr + 2;
-      const char* gruns_hdr = gdict + static_cast<size_t>(gd) * 8;
+      const char* gruns_hdr = gdict + (static_cast<size_t>(gd) * 8);
       const uint32_t gruns = f.params[goff];
       if (gd > 0 && gruns_hdr + 4 <= gend && ReadBE32(gruns_hdr) == gruns &&
           gruns_hdr + 4 +
-                  static_cast<size_t>(gruns) * (static_cast<size_t>(gcb) + 4) <=
+                  (static_cast<size_t>(gruns) *
+                   (static_cast<size_t>(gcb) + 4)) <=
               gend) {
         if (sbuf.empty()) {
           sbuf.assign(rc, 0);
@@ -8040,8 +8705,9 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           } else if (ss == Scheme::kRle && sum_ready && !sum_runs.empty()) {
             uint32_t pos = 0;
             for (const auto& [v, len] : sum_runs) {
-              for (uint32_t k = 0; k < len && pos < rc; ++k, ++pos)
+              for (uint32_t k = 0; k < len && pos < rc; ++k, ++pos) {
                 sbuf[pos] = v;
+              }
             }
           } else if ((ss == Scheme::kDict || ss == Scheme::kOpDict) &&
                      sum_ready) {
@@ -8051,7 +8717,7 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
               const uint64_t scode = sbr.get(scw);
               sbuf[i] = (scode < sum_ncodes)
                             ? static_cast<int64_t>(ReadBE64(
-                                  sum_dict + static_cast<size_t>(scode) * 8))
+                                  sum_dict + (static_cast<size_t>(scode) * 8)))
                             : 0;
             }
           } else {
@@ -8070,17 +8736,22 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
           const uint64_t next = pos + len;
           const uint32_t end = (next > rc) ? rc : static_cast<uint32_t>(next);
           const int64_t key =
-              (code < gd) ? static_cast<int64_t>(
-                                ReadBE64(gdict + static_cast<size_t>(code) * 8))
+              (code < gd) ? static_cast<int64_t>(ReadBE64(
+                                gdict + (static_cast<size_t>(code) * 8)))
                           : 0;
           __int128 s = 0;
-          for (uint32_t i = static_cast<uint32_t>(pos); i < end; ++i)
+          for (auto i = static_cast<uint32_t>(pos); i < end; ++i) {
             s += sbuf[i];
-          if (end > pos) emit(key, static_cast<int64_t>(s), end - pos);
+          }
+          if (end > pos) {
+            emit(key, static_cast<int64_t>(s), end - pos);
+          }
           pos = end;
           q += static_cast<size_t>(gcb) + 4;
         }
-        for (; pos < rc; ++pos) emit(0, sbuf[pos], 1);
+        for (; pos < rc; ++pos) {
+          emit(0, sbuf[pos], 1);
+        }
         continue;
       }
       // else fall through to generic
@@ -8090,11 +8761,14 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
       std::vector<int64_t> gv(rc), sv(rc);
       chunk.DecodeInt64ColumnRg(group_col, g, gv.data());
       chunk.DecodeInt64ColumnRg(sum_col, g, sv.data());
-      for (uint32_t i = 0; i < rc; ++i) emit(gv[i], sv[i], 1);
+      for (uint32_t i = 0; i < rc; ++i) {
+        emit(gv[i], sv[i], 1);
+      }
     }
   }
-  for (size_t k = 0; k < out.size(); ++k)
+  for (size_t k = 0; k < out.size(); ++k) {
     out[k].sum = static_cast<int64_t>(sums[k]);
+  }
   return out;
 }
 
@@ -8102,10 +8776,12 @@ std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
 // column: the columns are independent, so a pair of equal columns in a
 // different order hashes differently (the key comparison is by VALUE, so
 // the hash only has to spread, not to order).
-static uint64_t HashGroupKey(const std::vector<int64_t>& key) {
+namespace {
+
+uint64_t HashGroupKey(const std::vector<int64_t>& key) {
   uint64_t h = 0x9E3779B97F4A7C15ULL;
   for (int64_t v : key) {
-    uint64_t x = static_cast<uint64_t>(v);
+    auto x = static_cast<uint64_t>(v);
     x ^= x >> 33;
     x *= 0xFF51AFD7ED558CCDULL;
     x ^= x >> 33;
@@ -8116,22 +8792,28 @@ static uint64_t HashGroupKey(const std::vector<int64_t>& key) {
   return h;
 }
 
-std::vector<GroupByEntryN> GroupBySumColumns(
+}  // namespace
+
+StatusOr<std::vector<GroupByEntryN>> GroupBySumColumns(
     const PaxChunk& chunk, const std::vector<slot_t>& group_cols,
-    slot_t sum_col, const Schema* sc, WorkloadTracker* workload) {
+    slot_t sum_col, const Schema* sc, WorkloadTracker* workload) try {
   std::vector<GroupByEntryN> out;
   const PaxChunk::Footer& f = chunk.GetFooter();
   const uint16_t cc = f.column_count;
-  if (group_cols.empty() || sum_col >= cc) return out;
+  if (group_cols.empty() || sum_col >= cc) {
+    return Status::kInvalidArgument;
+  }
   for (slot_t c : group_cols) {
-    if (c >= cc) return out;
+    if (c >= cc) {
+      return Status::kInvalidArgument;
+    }
   }
   if (f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
           static_cast<size_t>(f.row_group_count) * f.column_count ||
       f.encodings.size() < f.column_offsets.size() ||
       f.params.size() < f.column_offsets.size()) {
-    return out;
+    return Status::kInvalidArgument;
   }
   if (sc != nullptr) {
     const auto i64 = [sc](slot_t c) {
@@ -8139,12 +8821,18 @@ std::vector<GroupByEntryN> GroupBySumColumns(
              sc->GetColumn(c).Type() == ValueType::kInt64;
     };
     for (slot_t c : group_cols) {
-      if (!i64(c)) return out;
+      if (!i64(c)) {
+        return Status::kInvalidArgument;
+      }
     }
-    if (!i64(sum_col)) return out;
+    if (!i64(sum_col)) {
+      return Status::kInvalidArgument;
+    }
   }
   if (workload != nullptr && sc != nullptr) {
-    for (slot_t c : group_cols) workload->RecordAggregate(*sc, c);
+    for (slot_t c : group_cols) {
+      workload->RecordAggregate(*sc, c);
+    }
     workload->RecordAggregate(*sc, sum_col);
   }
 
@@ -8173,27 +8861,20 @@ std::vector<GroupByEntryN> GroupBySumColumns(
   key.reserve(nkeys);
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const uint16_t rc = f.row_counts[g];
-    if (rc == 0) continue;
-    bool decodable = true;
-    for (size_t ki = 0; ki < nkeys; ++ki) {
-      gbuf[ki].assign(rc, 0);
-      try {
-        chunk.DecodeInt64ColumnRg(group_cols[ki], g, gbuf[ki].data());
-      } catch (const std::exception&) {
-        decodable = false;
-        break;
-      }
-    }
-    if (!decodable) continue;
-    sbuf.assign(rc, 0);
-    try {
-      chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
-    } catch (const std::exception&) {
+    if (rc == 0) {
       continue;
     }
+    for (size_t ki = 0; ki < nkeys; ++ki) {
+      gbuf[ki].assign(rc, 0);
+      chunk.DecodeInt64ColumnRg(group_cols[ki], g, gbuf[ki].data());
+    }
+    sbuf.assign(rc, 0);
+    chunk.DecodeInt64ColumnRg(sum_col, g, sbuf.data());
     for (uint32_t i = 0; i < rc; ++i) {
       key.clear();
-      for (size_t ki = 0; ki < nkeys; ++ki) key.push_back(gbuf[ki][i]);
+      for (size_t ki = 0; ki < nkeys; ++ki) {
+        key.push_back(gbuf[ki][i]);
+      }
       const uint64_t h = HashGroupKey(key);
       size_t pos = SIZE_MAX;
       auto it = by_hash.find(h);
@@ -8207,24 +8888,30 @@ std::vector<GroupByEntryN> GroupBySumColumns(
       }
       if (pos == SIZE_MAX) {
         pos = entries.size();
-        entries.push_back(GroupEntry{key, 0, 0});
+        entries.push_back(GroupEntry{.key = key, .sum = 0, .count = 0});
         by_hash[h].push_back(static_cast<uint32_t>(pos));
-        out.push_back(GroupByEntryN{key, 0, 0});
+        out.push_back(GroupByEntryN{.key = key, .sum = 0, .count = 0});
       }
-      entries[pos].sum += sbuf[i];
+      entries[pos].sum =
+          std::bit_cast<int64_t>(static_cast<uint64_t>(entries[pos].sum) +
+                                 static_cast<uint64_t>(sbuf[i]));
       entries[pos].count += 1;
       out[pos].sum = entries[pos].sum;
       out[pos].count = entries[pos].count;
     }
   }
   return out;
+} catch (const std::exception& error) {
+  return StatusError(StatusCode::kCorruption, error.what());
 }
 
 std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
                                   bool descending, const Schema* sc,
                                   WorkloadTracker* workload) {
   std::vector<TopKEntry> out;
-  if (k == 0) return out;
+  if (k == 0) {
+    return out;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count ||
       f.column_offsets.size() <
@@ -8237,14 +8924,17 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
                         sc->GetColumn(col).Type() != ValueType::kInt64)) {
     return out;
   }
-  if (workload != nullptr && sc != nullptr) workload->RecordSortKey(*sc, col);
+  if (workload != nullptr && sc != nullptr) {
+    workload->RecordSortKey(*sc, col);
+  }
   // Bounded heap of the current winners; threshold = worst winner.
   // Max-heap for ascending (top = largest winner), min-heap for descending.
   struct Cmp {
     bool descending;
     bool operator()(const TopKEntry& a, const TopKEntry& b) const {
-      if (a.value != b.value)
+      if (a.value != b.value) {
         return descending ? (a.value > b.value) : (a.value < b.value);
+      }
       return a.row < b.row;
     }
   };
@@ -8258,7 +8948,7 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
   std::vector<int64_t> buf;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const uint16_t rc = f.row_counts[g];
-    const size_t zi = static_cast<size_t>(g) * f.column_count + col;
+    const size_t zi = (static_cast<size_t>(g) * f.column_count) + col;
     bool pruned = false;
     if (full && f.all_zm_present && zi < f.all_zone_mins.size() &&
         zi < f.all_zone_maxs.size() && !RgColHasNull(f, g, col)) {
@@ -8273,7 +8963,7 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
       buf.assign(rc, 0);
       chunk.DecodeInt64ColumnRg(col, g, buf.data());
       for (uint16_t i = 0; i < rc; ++i) {
-        const TopKEntry e{buf[i], base_row + i};
+        const TopKEntry e{.value = buf[i], .row = base_row + i};
         if (!full) {
           heap.push(e);
           if (heap.size() >= k) {
@@ -8308,19 +8998,22 @@ std::vector<TopKEntry> TopKColumn(const PaxChunk& chunk, slot_t col, size_t k,
   }
   std::sort(out.begin(), out.end(),
             [descending](const TopKEntry& a, const TopKEntry& b) {
-              if (a.value != b.value)
+              if (a.value != b.value) {
                 return descending ? (a.value > b.value) : (a.value < b.value);
+              }
               return a.row < b.row;
             });
   return out;
 }
 
 uint64_t PgmPredict(const PaxChunk::Footer& f, int64_t key, uint64_t total) {
-  if (!f.pgm_present || f.pgm_segments.empty() || total == 0) return total;
+  if (!f.pgm_present || f.pgm_segments.empty() || total == 0) {
+    return total;
+  }
   // Last segment with key0 <= key (segments partition ascending keys).
   size_t lo = 0, hi = f.pgm_segments.size();
   while (lo < hi) {
-    const size_t mid = lo + (hi - lo) / 2;
+    const size_t mid = lo + ((hi - lo) / 2);
     if (f.pgm_segments[mid].key <= key) {
       lo = mid + 1;
     } else {
@@ -8335,23 +9028,33 @@ uint64_t PgmPredict(const PaxChunk::Footer& f, int64_t key, uint64_t total) {
       (key >= s.key) ? static_cast<uint64_t>(key) - static_cast<uint64_t>(s.key)
                      : 0ULL;
   const double pred =
-      static_cast<double>(s.pos) + s.slope * static_cast<double>(dx);
-  if (!(pred >= 0.0)) return 0;  // NaN-safe floor
+      static_cast<double>(s.pos) + (s.slope * static_cast<double>(dx));
+  if (!(pred >= 0.0)) {
+    return 0;  // NaN-safe floor
+  }
   // A hostile slope (ValidateWalk never bounds it) can push pred past
   // uint64 range (or to +inf); casting that to uint64_t is UB, so clamp
   // to the answer's domain first.
-  if (pred >= static_cast<double>(total)) return total - 1;
-  const uint64_t p = static_cast<uint64_t>(pred);
+  if (pred >= static_cast<double>(total)) {
+    return total - 1;
+  }
+  const auto p = static_cast<uint64_t>(pred);
   return p;
 }
 
 const InvertedCell* FindInvertedCell(const PaxChunk::Footer& f, uint32_t g,
                                      slot_t c) {
-  if (!f.inv_idx_present) return nullptr;
+  if (!f.inv_idx_present) {
+    return nullptr;
+  }
   // Cells are appended in (group, column) order by the builder.
   for (const InvertedCell& cell : f.inv_index) {
-    if (cell.group == g && cell.column == c) return &cell;
-    if (cell.group > g) break;
+    if (cell.group == g && cell.column == c) {
+      return &cell;
+    }
+    if (cell.group > g) {
+      break;
+    }
   }
   return nullptr;
 }
@@ -8360,7 +9063,7 @@ const InvertedPosting* FindInvertedPosting(const InvertedCell& cell,
                                            int64_t value) {
   size_t lo = 0, hi = cell.postings.size();
   while (lo < hi) {
-    const size_t mid = lo + (hi - lo) / 2;
+    const size_t mid = lo + ((hi - lo) / 2);
     if (cell.postings[mid].value < value) {
       lo = mid + 1;
     } else {
@@ -8375,7 +9078,9 @@ const InvertedPosting* FindInvertedPosting(const InvertedCell& cell,
 
 bool InvertedEqCount(const PaxChunk& chunk, slot_t col, int64_t value,
                      uint64_t* count_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count) {
     return false;
@@ -8383,9 +9088,13 @@ bool InvertedEqCount(const PaxChunk& chunk, slot_t col, int64_t value,
   uint64_t total = 0;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const InvertedCell* cell = FindInvertedCell(f, g, col);
-    if (cell == nullptr) return false;
+    if (cell == nullptr) {
+      return false;
+    }
     const InvertedPosting* p = FindInvertedPosting(*cell, value);
-    if (p != nullptr) total += p->rows.size();
+    if (p != nullptr) {
+      total += p->rows.size();
+    }
   }
   *count_out = total;
   return true;
@@ -8393,7 +9102,9 @@ bool InvertedEqCount(const PaxChunk& chunk, slot_t col, int64_t value,
 
 bool InvertedInCount(const PaxChunk& chunk, slot_t col, const int64_t* values,
                      size_t nvalues, uint64_t* count_out) {
-  if (count_out == nullptr || (values == nullptr && nvalues > 0)) return false;
+  if (count_out == nullptr || (values == nullptr && nvalues > 0)) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col >= f.column_count || f.row_counts.size() < f.row_group_count) {
     return false;
@@ -8401,10 +9112,14 @@ bool InvertedInCount(const PaxChunk& chunk, slot_t col, const int64_t* values,
   uint64_t total = 0;
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const InvertedCell* cell = FindInvertedCell(f, g, col);
-    if (cell == nullptr) return false;
+    if (cell == nullptr) {
+      return false;
+    }
     for (size_t v = 0; v < nvalues; ++v) {
       const InvertedPosting* p = FindInvertedPosting(*cell, values[v]);
-      if (p != nullptr) total += p->rows.size();
+      if (p != nullptr) {
+        total += p->rows.size();
+      }
     }
   }
   *count_out = total;
@@ -8412,22 +9127,30 @@ bool InvertedInCount(const PaxChunk& chunk, slot_t col, const int64_t* values,
 }
 
 const XorCell* FindXorCell(const PaxChunk::Footer& f, uint32_t g, slot_t c) {
-  if (!f.xor_present) return nullptr;
+  if (!f.xor_present) {
+    return nullptr;
+  }
   for (const XorCell& cell : f.xor_cells) {
-    if (cell.group == g && cell.column == c) return &cell;
-    if (cell.group > g) break;
+    if (cell.group == g && cell.column == c) {
+      return &cell;
+    }
+    if (cell.group > g) {
+      break;
+    }
   }
   return nullptr;
 }
 
 bool XorCellMayContain(const XorCell& cell, int64_t value) {
   const size_t m = cell.table.size();
-  if (m == 0) return true;  // degenerate: pass safe rather than mis-prune
+  if (m == 0) {
+    return true;  // degenerate: pass safe rather than mis-prune
+  }
   const uint64_t h = XorHash64(value, cell.seed);
   const uint64_t h0 = h % m;
   const uint64_t h1 = XorRotL(h, 21) % m;
   const uint64_t h2 = XorRotL(h, 42) % m;
-  const uint8_t fp = static_cast<uint8_t>(h & 0xFF);
+  const auto fp = static_cast<uint8_t>(h & 0xFF);
   return static_cast<uint8_t>(cell.table[h0] ^ cell.table[h1] ^
                               cell.table[h2]) == fp;
 }
@@ -8437,7 +9160,9 @@ std::vector<uint64_t> XorRgMask(const PaxChunk& chunk, slot_t col,
   const PaxChunk::Footer& f = chunk.GetFooter();
   const size_t nwords = (static_cast<size_t>(f.row_group_count) + 63) / 64;
   std::vector<uint64_t> mask(nwords, 0);
-  if (col >= f.column_count) return mask;
+  if (col >= f.column_count) {
+    return mask;
+  }
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const XorCell* cell = FindXorCell(f, g, col);
     if (cell == nullptr || XorCellMayContain(*cell, value)) {
@@ -8449,7 +9174,9 @@ std::vector<uint64_t> XorRgMask(const PaxChunk& chunk, slot_t col,
 
 bool InvertedAndCount(const PaxChunk& chunk, slot_t col_a, int64_t val_a,
                       slot_t col_b, int64_t val_b, uint64_t* count_out) {
-  if (count_out == nullptr) return false;
+  if (count_out == nullptr) {
+    return false;
+  }
   const PaxChunk::Footer& f = chunk.GetFooter();
   if (col_a >= f.column_count || col_b >= f.column_count ||
       f.row_counts.size() < f.row_group_count) {
@@ -8459,10 +9186,14 @@ bool InvertedAndCount(const PaxChunk& chunk, slot_t col_a, int64_t val_a,
   for (uint32_t g = 0; g < f.row_group_count; ++g) {
     const InvertedCell* ca = FindInvertedCell(f, g, col_a);
     const InvertedCell* cb = FindInvertedCell(f, g, col_b);
-    if (ca == nullptr || cb == nullptr) return false;
+    if (ca == nullptr || cb == nullptr) {
+      return false;
+    }
     const InvertedPosting* pa = FindInvertedPosting(*ca, val_a);
     const InvertedPosting* pb = FindInvertedPosting(*cb, val_b);
-    if (pa == nullptr || pb == nullptr) continue;
+    if (pa == nullptr || pb == nullptr) {
+      continue;
+    }
     // Sorted-merge intersection over row ids (both postings ascending).
     size_t ia = 0, ib = 0;
     while (ia < pa->rows.size() && ib < pb->rows.size()) {

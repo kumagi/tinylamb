@@ -16,6 +16,7 @@
 
 #include "transaction/transaction.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -26,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,6 +44,24 @@
 #include "transaction/transaction_manager.hpp"
 
 namespace tinylamb {
+
+bool Transaction::FindPendingLsmWrite(page_id_t root, std::string_view key,
+                                      std::string* value, bool* deleted) const {
+  std::scoped_lock guard(chain_mu_);
+  const auto records = std::views::reverse(staged_records_);
+  const auto found =
+      std::ranges::find_if(records, [&](const LogRecord& record) {
+        return record.pid == root && record.key == key &&
+               (record.type == LogType::kLsmPut ||
+                record.type == LogType::kLsmDelete);
+      });
+  if (found == records.end()) {
+    return false;
+  }
+  *deleted = found->type == LogType::kLsmDelete;
+  *value = *deleted ? std::string() : found->redo_data;
+  return true;
+}
 
 std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
   switch (t) {
@@ -278,7 +298,16 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
   // keeps writing through a committed transaction would install a permanent
   // write intent that no PreCommit/Abort can ever release (both short-circuit
   // on a finished status), blocking that row for the life of the database.
-  if (IsFailed() || IsFinished() || read_only_) {
+  if (IsFailed() || IsFinished() || read_only_ ||
+      transaction_manager_ == nullptr) {
+    return false;
+  }
+  if (IsWounded()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kWounded);
+    return false;
+  }
+  if (transaction_manager_->FailStopped()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
     return false;
   }
   if (write_set_.contains(rp)) {
@@ -300,14 +329,28 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
 
 bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
   assert(!IsFinished());
-  if (IsFailed() || IsFinished() || read_only_) {
+  if (IsFailed() || IsFinished() || read_only_ ||
+      transaction_manager_ == nullptr) {
+    return false;
+  }
+  if (IsWounded()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kWounded);
+    return false;
+  }
+  if (transaction_manager_->FailStopped()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
     return false;
   }
   if (write_set_.contains(rp)) {
     // The write set may have pre-reserved this row without a before-image
     // (TryAddWriteSet); re-acquire so the image is recorded and concurrent
     // snapshots keep seeing the pre-update value.
-    return transaction_manager_->AcquireWriteIntent(*this, rp, true, before);
+    const bool acquired =
+        transaction_manager_->AcquireWriteIntent(*this, rp, true, before);
+    if (!acquired) {
+      MarkFailed();
+    }
+    return acquired;
   }
   write_set_.insert(rp);
   try {
@@ -325,7 +368,16 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
 
 bool Transaction::TryAddWriteSet(const RowPosition& rp) {
   assert(!IsFinished());
-  if (IsFailed() || IsFinished() || read_only_) {
+  if (IsFailed() || IsFinished() || read_only_ ||
+      transaction_manager_ == nullptr) {
+    return false;
+  }
+  if (IsWounded()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kWounded);
+    return false;
+  }
+  if (transaction_manager_->FailStopped()) {
+    RecordIntentWaitFailure(IntentWaitFailure::kFailStopped);
     return false;
   }
   if (write_set_.contains(rp)) {
@@ -346,10 +398,15 @@ bool Transaction::TryAddWriteSet(const RowPosition& rp) {
 }
 
 bool Transaction::SnapshotSeesRow(const RowPosition& rp) const {
-  return transaction_manager_->SnapshotSeesRow(*this, rp);
+  return transaction_manager_ != nullptr &&
+         transaction_manager_->SnapshotSeesRow(*this, rp);
 }
 
 void Transaction::ReleaseWriteIntent(const RowPosition& rp) {
+  if (transaction_manager_ == nullptr) {
+    write_set_.erase(rp);
+    return;
+  }
   if (!transaction_manager_->ReleaseWriteIntent(*this, rp)) {
     return;
   }
@@ -674,11 +731,6 @@ void Transaction::ReserveIndexUndoBytes(page_id_t pid, size_t bytes) {
   if (bytes == 0 || transaction_manager_ == nullptr) {
     return;
   }
-  static const bool disabled =
-      std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION") != nullptr;
-  if (disabled) {
-    return;
-  }
   transaction_manager_->ReserveIndexUndoBytes(*this, pid, bytes);
 }
 
@@ -715,10 +767,12 @@ void Transaction::ClearWaitForHolder() const {
   }
 }
 
-void Transaction::CommitWait() const {
-  while (transaction_manager_->CommittedLSN() < prev_lsn_) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+Status Transaction::CommitWait() const {
+  if (transaction_manager_ == nullptr) {
+    return Status::kSuccess;
   }
+  return transaction_manager_->WaitForWALDurable(
+      std::max(PrevRecordEndLSN(), DurabilityDependence()));
 }
 
 }  // namespace tinylamb

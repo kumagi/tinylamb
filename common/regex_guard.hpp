@@ -17,9 +17,11 @@
 #ifndef TINYLAMB_REGEX_GUARD_HPP
 #define TINYLAMB_REGEX_GUARD_HPP
 
+#include <array>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC 15 reports -Wmaybe-uninitialized inside <regex>'s NFA construction when
 // instantiating std::regex in sanitizer builds; the library code is fine.
@@ -503,17 +505,44 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
 // Compile `pattern` after the nested-repetition check above; callers get a
 // uniform StatusError for both rejected and malformed patterns.
 inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
+  struct Entry {
+    std::string pattern;
+    std::regex compiled;
+  };
+  // Bounded per-thread storage avoids recompiling constant SQL patterns for
+  // every row without sharing mutable evaluator state between workers.
+  static thread_local std::array<std::optional<Entry>, 8> cache;
+  static thread_local size_t next = 0;
+  for (const auto& entry : cache) {
+    if (entry && entry->pattern == pattern) {
+      return entry->compiled;
+    }
+  }
   if (RegexPatternHasNestedRepetition(pattern)) {
     return StatusError(StatusCode::kInvalidArgument,
                        "regular expression has nested repetition: " + pattern);
   }
   try {
-    return std::regex(pattern);
+    std::regex compiled(pattern);
+    if (pattern.size() <= 4096) {
+      cache[next] = Entry{.pattern = pattern, .compiled = compiled};
+      next = (next + 1) % cache.size();
+    }
+    return compiled;
   } catch (...) {
     return StatusError(StatusCode::kInvalidArgument,
                        "invalid regular expression: " + pattern);
   }
 }
+
+// GoogleSQL replacement strings use backslash-digit captures and escaped
+// backslashes; dollar and ampersand are ordinary text. Translate that small
+// replacement language to the ECMAScript formatter used by std::regex.
+// A bounded per-thread cache retains compiled patterns and replacement
+// programs, never input strings or results. Views need live only for this call.
+StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
+                                          std::string_view pattern,
+                                          std::string_view replacement);
 
 }  // namespace tinylamb
 

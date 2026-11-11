@@ -893,6 +893,17 @@ TEST(SelectStatementFingerprintTest, IncludesModifiersAndTracksMutation) {
   EXPECT_EQ(first.Fingerprint(), first.Fingerprint());
 }
 
+TEST(SelectStatementFingerprintTest, AuditSharedChildMutationRecomputesParent) {
+  auto child = std::make_shared<SelectStatement>(
+      std::vector<NamedExpression>{NamedExpression("x")},
+      std::vector<std::string>{"t"}, nullptr);
+  SelectStatement parent({NamedExpression("v", QueryExpressionExp(child))}, {},
+                         nullptr);
+  const std::string before = parent.Fingerprint();
+  child->SetLimit(1);
+  EXPECT_NE(parent.Fingerprint(), before);
+}
+
 TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
   const auto plain =
       AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("x"));

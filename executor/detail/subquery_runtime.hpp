@@ -62,6 +62,9 @@ using CteMap = std::unordered_map<std::string, RelationPtr>;
 
 struct CorrelatedIndex {
   Schema schema;
+  // A materialized CTE may be rebound by an enclosing/recursive scope.
+  // Retain its identity so a repeated AST probe cannot use a sibling's rows.
+  RelationPtr source_cte;
   std::unordered_multimap<std::string, Row> rows;
   std::vector<slot_t> local_columns;
   std::vector<ColumnName> outer_columns;
@@ -141,6 +144,16 @@ struct TableKeyFilter {
   size_t key_count{0};
   slot_t column{0};
   const SelectStatement* owner{nullptr};
+  uint64_t owner_runtime_id{0};
+  void SetOwner(const SelectStatement& statement) {
+    owner = &statement;
+    owner_runtime_id = statement.RuntimeId();
+  }
+  [[nodiscard]] bool OwnedBy(const SelectStatement& statement) const {
+    // HAVING folding creates temporary statements at recycled stack addresses.
+    // A sibling UNION/ROLLUP branch must not inherit an earlier key domain.
+    return owner == &statement && owner_runtime_id == statement.RuntimeId();
+  }
   const ExpressionBase* source_expr{nullptr};
   bool exact_in{false};
 
@@ -473,6 +486,28 @@ void EnsureReusableProjections(TransactionContext& context,
 
 const std::vector<slot_t>* ReusableProjection(TransactionContext& context,
                                               std::string_view table);
+
+// A shared grouped CTE admits the union of all direct consumers' integer
+// group-key domains, retaining every consumer's original restriction.
+std::shared_ptr<SelectStatement> PushSharedGroupedCtePredicates(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name);
+
+// Enclose all filtered dimension domains of shared grouped CTE consumers.
+std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name, const CteMap& ctes);
+
+// If every CTE consumer observes membership only, retain the referenced
+// columns and group duplicate join outputs before materializing the cell.
+std::shared_ptr<SelectStatement> GroupPresenceOnlyCte(
+    const SelectStatement& consumer, const std::string& name);
+
+// Restrict a singly consumed CTE using necessary integer equalities of its
+// consumer. Outer-join equalities propagate only toward the nullable side.
+std::shared_ptr<SelectStatement> PushSingleUseCtePredicates(
+    TransactionContext& context, const SelectStatement& consumer,
+    const std::string& name);
 
 // Registers `relation` as the outer context for correlated-subquery builds
 // while alive.  FilterRelation holds this around its row loop, so a build

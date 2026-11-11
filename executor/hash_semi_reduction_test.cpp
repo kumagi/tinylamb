@@ -48,6 +48,7 @@
 #include "executor/executor_base.hpp"
 #include "executor/full_scan.hpp"
 #include "executor/hash_join.hpp"
+#include "executor/parallel_merge_join.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/expression.hpp"
@@ -681,6 +682,61 @@ TEST_F(HashSemiReductionExecutorTest, EveryJoinKindProducesTheSameRows) {
     const std::vector<Row> plain = run(/*enable=*/false);
     EXPECT_EQ(SortedText(enabled), SortedText(plain))
         << "kind=" << static_cast<int>(kind);
+  }
+}
+
+TEST(HashJoinAuditTest, EmptyNullSupplyingSideRequiresExplicitWidth) {
+  for (JoinKind kind : {JoinKind::kLeftOuter, JoinKind::kRightOuter,
+                        JoinKind::kFullOuter, JoinKind::kSingle}) {
+    for (bool supply_width : {false, true}) {
+      const bool empty_left = kind == JoinKind::kRightOuter;
+      const std::vector<Row> populated{Row({Value(7), Value("payload")})};
+      const std::vector<Row> empty;
+      auto join = std::make_shared<HashJoin>(
+          std::make_shared<ConstantExecutor>(empty_left ? empty : populated),
+          std::vector<slot_t>{0},
+          std::make_shared<ConstantExecutor>(empty_left ? populated : empty),
+          std::vector<slot_t>{0}, HashJoinMode::kInMemory, kind, 1,
+          supply_width ? 2 : 0, supply_width ? 2 : 0);
+      Row row;
+      EXPECT_EQ(join->Next(&row, nullptr), supply_width);
+      if (supply_width) {
+        ASSERT_EQ(row.Count(), 4U);
+        EXPECT_TRUE(row[empty_left ? 0 : 2].IsNull());
+        EXPECT_EQ(row[empty_left ? 2 : 0], Value(7));
+        EXPECT_FALSE(join->Next(&row, nullptr));
+        ASSERT_SUCCESS(join->GetStatus());
+      } else {
+        EXPECT_EQ(join->GetStatus(), Status::kInvalidArgument);
+      }
+    }
+  }
+}
+
+TEST(HashJoinAuditTest, ParallelMergeKeepsEmptyInputWidthContract) {
+  for (JoinKind kind :
+       {JoinKind::kLeftOuter, JoinKind::kRightOuter, JoinKind::kFullOuter}) {
+    for (bool supplied : {false, true}) {
+      const bool empty_left = kind == JoinKind::kRightOuter;
+      const std::vector<Row> populated{Row({Value(7), Value("payload")})};
+      const std::vector<Row> empty;
+      ParallelMergeJoin join(
+          std::make_shared<ConstantExecutor>(empty_left ? empty : populated),
+          {0},
+          std::make_shared<ConstantExecutor>(empty_left ? populated : empty),
+          {0}, 2, kind, Expression(), Schema(), supplied ? 2 : 0,
+          supplied ? 2 : 0);
+      Row row;
+      EXPECT_EQ(join.Next(&row, nullptr), supplied);
+      if (supplied) {
+        ASSERT_EQ(row.Count(), 4U);
+        EXPECT_TRUE(row[empty_left ? 0 : 2].IsNull());
+        EXPECT_FALSE(join.Next(&row, nullptr));
+        ASSERT_SUCCESS(join.GetStatus());
+      } else {
+        EXPECT_EQ(join.GetStatus(), Status::kInvalidArgument);
+      }
+    }
   }
 }
 

@@ -176,17 +176,10 @@ bool LateMaterializationJoin::Validate() {
   return true;
 }
 
-std::optional<Row> LateMaterializationJoin::ExtractLeftKey(
+StatusOr<Row> LateMaterializationJoin::ExtractLeftKey(
     const Row& left_row) const {
-  if (left_columns_.empty()) {
-    return std::nullopt;
-  }
-  for (const slot_t column : left_columns_) {
-    if (column >= left_row.values_.size()) {
-      return std::nullopt;
-    }
-  }
-  return left_row.Extract(left_columns_);
+  if (left_columns_.empty()) return Status::kInvalidArgument;
+  return left_row.TryExtract(left_columns_);
 }
 
 bool LateMaterializationJoin::IsLeftRowValid(const Row& left_row) const {
@@ -256,11 +249,9 @@ bool LateMaterializationJoin::KeyMatches(const Row& left_key,
 }
 
 bool LateMaterializationJoin::LoadEquiCandidates(const Row& left_row) {
-  const std::optional<Row> extracted = ExtractLeftKey(left_row);
-  if (!extracted.has_value()) {
-    return false;
-  }
-  const Row& left_key = *extracted;
+  const auto extracted = ExtractLeftKey(left_row);
+  if (!extracted.HasValue()) return FailWith(extracted.GetStatus());
+  const Row& left_key = extracted.Value();
   for (const Value& value : left_key.values_) {
     if (IsUnmatchable(value)) {
       return true;
@@ -379,7 +370,7 @@ StatusOr<Row> LateMaterializationJoin::MaterializePayload(
   if (right_projection_.empty()) {
     return full.MoveValue();
   }
-  return full.Value().Extract(right_projection_);
+  return full.Value().TryExtract(right_projection_);
 }
 
 bool LateMaterializationJoin::NextRow(Row* destination, RowPosition* position) {

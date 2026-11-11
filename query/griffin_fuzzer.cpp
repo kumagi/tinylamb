@@ -818,14 +818,12 @@ struct ScopedEnvVar {
 };
 
 bool IsPlanOrderIndependentSelect(std::string_view sql) {
-  for (const std::string_view tok :
-       {"LIMIT", "OFFSET", "OVER", "STRING_AGG", "ARRAY_AGG", "ANY_VALUE",
-        "TABLESAMPLE", "RAND"}) {
-    if (sql.find(tok) != std::string_view::npos) {
-      return false;
-    }
-  }
-  return true;
+  constexpr std::array<std::string_view, 8> tokens = {
+      "LIMIT",     "OFFSET",    "OVER",        "STRING_AGG",
+      "ARRAY_AGG", "ANY_VALUE", "TABLESAMPLE", "RAND"};
+  return std::ranges::all_of(tokens, [sql](std::string_view token) {
+    return sql.find(token) == std::string_view::npos;
+  });
 }
 
 // Oracle (2): re-runs `sql` with bytecode disabled and compares the AST-path
@@ -985,7 +983,7 @@ const std::vector<std::vector<std::string>>& ExtendedSeedPool() {
           "(WHERE b > 0) AS sb FROM gf_lst GROUP BY a HAVING COUNT(*) FILTER "
           "(WHERE s = 'x') >= 0;",
       },
-      // DATE + STRUCT + TO_JSON_STRING + STRPOS
+      // DATE + STRUCT + TO_JSON_STRING + STRPOS + SELECT AS STRUCT s.*
       {
           "CREATE TABLE gf_json (id INT64, dt DATE, name STRING, v INT64);",
           "INSERT INTO gf_json VALUES (1, DATE '2024-01-15', 'alpha-1', 10), "
@@ -993,7 +991,10 @@ const std::vector<std::vector<std::string>>& ExtendedSeedPool() {
           "SELECT id, TO_JSON_STRING(STRUCT(id AS k, dt AS d, name AS n, v AS "
           "val)) AS j FROM gf_json;",
           "SELECT id, DATE_DIFF(DATE_ADD(dt, INTERVAL v DAY), dt, DAY) AS dd, "
-          "STRPOS(COALESCE(name, ''), '-') AS sp FROM gf_json;",
+          "STRPOS(COALESCE(name, ''), '-') AS sp, "
+          "EXTRACT(MONTH FROM DATE '10000-03-15') AS m5, "
+          "JSON_EXTRACT('[10,20,30]', '$[4294967297]') AS j_oob FROM gf_json;",
+          "SELECT AS STRUCT s.* FROM gf_json s;",
       },
       // Nested WITH CTEs + LATERAL + IS NOT DISTINCT FROM outer join
       {
@@ -1018,12 +1019,16 @@ const std::vector<std::vector<std::string>>& ExtendedSeedPool() {
           "SELECT d.tag, COUNT(*), MIN(f.a), MAX(f.u), SUM(f.a) FROM gf_fact f "
           "JOIN gf_dim d ON f.k = d.k GROUP BY d.tag HAVING MIN(f.a) >= -10 OR "
           "MAX(f.u) >= 1;",
+          "SELECT f.k, COUNT(*), COUNT(f.u), COUNT(d.tag), SUM(f.a) AS "
+          "uint64_val FROM gf_fact f LEFT JOIN gf_dim d ON f.k = d.k GROUP BY "
+          "f.k;",
           "MERGE INTO gf_dim t USING gf_fact s ON t.k = s.u WHEN MATCHED AND "
           "s.a > 0 THEN UPDATE SET tag = 'upd' WHEN NOT MATCHED THEN INSERT "
           "(k, tag) VALUES (s.u + 10, 'new');",
           "SELECT k, tag FROM gf_dim;",
       },
-      // Multi-window RANGE/GROUPS + EXCLUDE + QUALIFY + 3-way set ops
+      // Multi-window RANGE/GROUPS + EXCLUDE + named WINDOW + QUALIFY + 3-way
+      // set ops
       {
           "CREATE TABLE gf_win (u INT64, grp STRING, a INT64, b INT64);",
           "INSERT INTO gf_win VALUES (1, 'x', 1, 10), (2, 'x', 1, 20), (3, "
@@ -1034,6 +1039,9 @@ const std::vector<std::vector<std::string>>& ExtendedSeedPool() {
           "PRECEDING AND 1 FOLLOWING EXCLUDE GROUP) AS gc, DENSE_RANK() OVER "
           "(PARTITION BY grp ORDER BY a NULLS FIRST) AS dr FROM gf_win QUALIFY "
           "dr <= 2;",
+          "SELECT (SELECT 1) AS c1, u, grp, a, SUM(b) OVER (w ORDER BY u ROWS "
+          "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run_b, COUNT(*) "
+          "OVER w AS p_cnt FROM gf_win WINDOW w AS (PARTITION BY grp);",
           "(SELECT a, b FROM gf_win WHERE b > 0 EXCEPT ALL SELECT a, b FROM "
           "gf_win WHERE grp = 'y') UNION ALL (SELECT a, b FROM gf_win "
           "INTERSECT ALL SELECT a, b FROM gf_win WHERE a IS NOT NULL);",

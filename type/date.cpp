@@ -8,9 +8,77 @@
 #include <string>
 #include <string_view>
 
+#include "common/platform/time_zone.hpp"
 #include "common/status_or.hpp"
 
 namespace tinylamb {
+
+StatusOr<int> TryTimeZoneOffsetAtLocalTime(std::string_view zone, int year,
+                                           unsigned month, unsigned day,
+                                           int hour, int minute, int second) {
+  const auto invalid = [&] {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid timezone: " + std::string(zone));
+  };
+  if (zone.empty()) {
+    return invalid();
+  }
+  if (zone == "UTC" || zone == "GMT" || zone == "utc" || zone == "gmt" ||
+      zone == "Z" || zone == "z" || zone == "Etc/Greenwich" ||
+      zone == "Etc/UTC" || zone == "Etc/GMT") {
+    return 0;
+  }
+  std::string_view offset = zone;
+  if (offset.starts_with("UTC+") || offset.starts_with("UTC-") ||
+      offset.starts_with("GMT+") || offset.starts_with("GMT-")) {
+    offset.remove_prefix(3);
+  }
+  if (offset.front() == '+' || offset.front() == '-') {
+    const int sign = offset.front() == '-' ? -1 : 1;
+    offset.remove_prefix(1);
+    const size_t colon = offset.find(':');
+    std::string_view hours = offset;
+    std::string_view minutes;
+    if (colon != std::string_view::npos) {
+      hours = offset.substr(0, colon);
+      minutes = offset.substr(colon + 1);
+      if (minutes.size() != 2) {
+        return invalid();
+      }
+    } else if (offset.size() == 4) {
+      hours = offset.substr(0, 2);
+      minutes = offset.substr(2);
+    }
+    if (hours.empty() || hours.size() > 2) {
+      return invalid();
+    }
+    const auto digits = [](std::string_view text) {
+      int value = 0;
+      for (char c : text) {
+        if (c < '0' || c > '9') {
+          return -1;
+        }
+        value = (value * 10) + (c - '0');
+      }
+      return value;
+    };
+    const int h = digits(hours), m = digits(minutes);
+    if (h < 0 || h > 23 || m < 0 || m > 59) {
+      return invalid();
+    }
+    return sign * (h * 3600 + m * 60);
+  }
+  if (zone == "NZ-CHAT") {
+    zone = "Pacific/Chatham";
+  }
+  const auto result = platform::TimeZoneOffsetAtLocalTime(
+      zone, year, month, day, hour, minute, second);
+  if (!result.has_value()) {
+    return invalid();
+  }
+  return *result;
+}
+
 namespace {
 
 using std::chrono::day;
@@ -187,20 +255,19 @@ namespace {
 // std::string allocation at thread-local init is the accepted failure mode;
 // a bad_alloc here is fatal for the engine regardless of how it surfaces.
 // NOLINTNEXTLINE(cert-err58-cpp)
-thread_local std::string tls_default_time_zone = "America/Los_Angeles";
+thread_local std::string tls_default_time_zone = "UTC";
 }  // namespace
 
 void SetDefaultTimeZone(std::string_view tz) {
   if (tz.empty()) {
-    tls_default_time_zone = "America/Los_Angeles";
+    tls_default_time_zone = "UTC";
   } else {
     tls_default_time_zone = std::string(tz);
   }
 }
 
 std::string GetDefaultTimeZone() {
-  return tls_default_time_zone.empty() ? "America/Los_Angeles"
-                                       : tls_default_time_zone;
+  return tls_default_time_zone.empty() ? "UTC" : tls_default_time_zone;
 }
 
 }  // namespace tinylamb

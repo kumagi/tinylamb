@@ -32,13 +32,17 @@ enum class BytecodeOp : uint8_t {
   // keep the three-valued logic table identical across AST / VM / JIT.
   kJumpIfFalse,
   kJumpIfTrue,
+  // COALESCE/IFNULL: preserve a non-NULL value and skip later arguments.
+  kJumpIfNotNull,
   kJump,
   // EXTRACT(year|month|day FROM date): pops one DATE/VARCHAR value and pushes
   // the extracted part as INT64.  `operand` selects the part (0 = year,
-  // 1 = month, 2 = day).  The kernel reproduces the AST's
-  // extract_{year,month,day} evaluator (string-slice + stoll) exactly,
-  // including its error conditions, so differential coverage holds.
+  // 1 = month, 2 = day). DATE uses calendar parts (including signed/wide
+  // years); VARCHAR keeps the AST's string-slice + stoll parsing and errors.
   kExtractDatePart,
+  // Byte-oriented LENGTH/OCTET_LENGTH/BYTE_LENGTH, including NULL and the
+  // AST's textual conversion for non-string runtime values.
+  kByteLength,
   // Discards the stack top.  The searched-CASE lowering uses it to drop a
   // WHEN condition that was already peeked by its conditional jump (the
   // jump decides without popping), keeping the stack depth invariant across

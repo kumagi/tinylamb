@@ -22,7 +22,9 @@ serializes through here; depends only on `common/`.
   what every sort-shaped operator resolves its keys through). No locale
   collation: a non-`binary` spec folds, non-ASCII keeps byte order.
 - `row.{hpp,cpp}` — `Row{vector<Value>}`: `Serialize`/`Deserialize` (needs a
-  `Schema`), `TryPeekInteger` (INT64/DATE fast path), `Extract`/`operator+`
+  `Schema`), `TryPeekInteger` (StatusOr<optional<int64_t>>; NULL/non-integer is
+  nullopt, corruption is an error), `TryExtract` (checked projection),
+  legacy throwing `Extract`/`operator+`
   (join concatenation).
 - `schema.{hpp,cpp}`, `column.{hpp,cpp}`, `column_name.{hpp,cpp}` —
   `Schema{name, columns}` owns columns (deep copy; easy dangling diagnosis),

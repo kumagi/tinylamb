@@ -1530,9 +1530,9 @@ TEST(MergeJoinTest, ResidualFiltersPairsAndPadsUnmatchedOuterRows) {
   }
 }
 
-TEST(MergeJoinTest, ResidualDivideByZeroEvaluatesNullNotError) {
-  // Divide-by-zero yields SQL NULL in this engine (not an error), so the
-  // residual simply rejects the pair and the outer row is NULL-padded.
+TEST(MergeJoinTest, UnmatchedKeysDoNotEvaluateResidual) {
+  // Unequal keys never reach the residual, so the unmatched left row is
+  // NULL-padded without evaluating a division by zero.
   const Schema lschema("l", {Column("a", ValueType::kInt64)});
   const Schema rschema("r", {Column("b", ValueType::kInt64)});
   const Expression bad = BinaryExpressionExp(
@@ -1544,6 +1544,20 @@ TEST(MergeJoinTest, ResidualDivideByZeroEvaluatesNullNotError) {
   ASSERT_EQ(out.size(), 1U);
   EXPECT_EQ(out[0], (Row({Value(1), Value()})));
   EXPECT_EQ(join.GetStatus(), Status::kSuccess);
+}
+
+TEST(MergeJoinTest, MatchingKeysPropagateResidualDivisionError) {
+  const Schema lschema("l", {Column("a", ValueType::kInt64)});
+  const Schema rschema("r", {Column("b", ValueType::kInt64)});
+  const Expression bad = BinaryExpressionExp(
+      ColumnValueExp(ColumnName("l", "a")), BinaryOperation::kDivide,
+      ColumnValueExp(ColumnName("r", "b")));
+  MergeJoin join(Src({IRow(0)}), {0}, Src({IRow(0)}), {0}, JoinKind::kLeftOuter,
+                 1, 1, bad, lschema + rschema);
+  EXPECT_TRUE(Drain(&join).empty());
+  EXPECT_NE(join.GetStatus(), Status::kSuccess);
+  EXPECT_NE(join.GetStatus().GetMessage().find("division by zero"),
+            std::string::npos);
 }
 
 TEST(MergeJoinTest, MultiColumnKeysAndEmptyInputs) {

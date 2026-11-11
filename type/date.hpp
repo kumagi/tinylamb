@@ -37,6 +37,13 @@ inline constexpr int64_t kDateMaxDays = 11000000;
                        "AddDateIntervalDays");
 }
 
+// Resolve an IANA zone or a complete signed hour/minute offset. Unknown
+// names and malformed numeric offsets are errors, never a default-zone alias.
+[[nodiscard]] StatusOr<int> TryTimeZoneOffsetAtLocalTime(
+    std::string_view zone, int year, unsigned month, unsigned day, int hour,
+    int minute, int second);
+
+// Per-thread SQL default; an empty setting restores UTC.
 void SetDefaultTimeZone(std::string_view tz);
 [[nodiscard]] std::string GetDefaultTimeZone();
 

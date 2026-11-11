@@ -24,6 +24,7 @@
 #include "common/constants.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/expression.hpp"
+#include "type/collation.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -33,6 +34,10 @@ namespace tinylamb {
 
 namespace {
 StatusOr<Value> TryMatches(const Value& child, const Value& candidate) {
+  if (HaveConflictingCollations(child, candidate)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "Collation conflict between the IN operands");
+  }
   return TryEvaluateBinary(BinaryOperation::kEquals, child, candidate);
 }
 

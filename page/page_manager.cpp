@@ -22,11 +22,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <ranges>
 #include <shared_mutex>
 #include <string>
@@ -95,6 +97,25 @@ bool ConsumeString(const char* data, size_t size, size_t* off,
   *off += len;
   return true;
 }
+// Restoring a previously admitted image is not a new space reservation.
+// Another transaction may have consumed bytes released by a shrink/delete.
+// The dynamically sized row block can exceed its admission budget during
+// rollback, just as replay can; dropping the old image would lose data.
+void RestoreAbortedRow(RowPage& page, slot_t slot, const std::string& image) {
+  if (slot >= page.slots_.size()) {
+    page.slots_.resize(static_cast<size_t>(slot) + 1);
+    page.hole_sizes_.resize(static_cast<size_t>(slot) + 1, 0);
+  }
+  const bool occupied = !page.slots_[slot].empty();
+  page.slots_[slot] = image;
+  if (!occupied && !image.empty()) {
+    ++page.row_count_;
+  } else if (occupied && image.empty()) {
+    --page.row_count_;
+  }
+  page.hole_sizes_[slot] = 0;
+}
+
 }  // namespace
 
 const LsmSortedRun::Entry* LsmSortedRun::Find(std::string_view key) const {
@@ -357,16 +378,24 @@ StatusOr<PageRef> PageManager::AllocateNewPage(Transaction& txn,
     }
     auto& slot = blocks_[pid];
     if (slot == nullptr) {
-      slot = std::make_unique<Page>(pid, new_page_type);
-    } else {
-      slot->PageInit(pid, new_page_type);
+      // Publish only an unavailable placeholder until initialization owns
+      // the content latch and the allocation WAL record has been queued.
+      slot = std::make_unique<Page>(pid, PageType::kUnknown);
     }
     page = slot.get();
   }
+  PageRef initialized(page, page->Latch(), false);
   txn.InvalidatePageVersions(pid);
   ASSIGN_OR_RETURN(lsn_t, lsn, txn.AllocatePageLog(pid, new_page_type));
-  page->SetPageLSN(lsn);
-  return PageRef(page, page->Latch(), false);
+  {
+    // GetPage checks type under blocks_mu_. Keep that publication atomic
+    // with respect to lookups while the content latch protects the reset.
+    // Never wait for the page latch while holding blocks_mu_.
+    std::scoped_lock lk(blocks_mu_);
+    initialized->PageInit(pid, new_page_type);
+    initialized->SetPageLSN(lsn);
+  }
+  return initialized;
 }
 
 Status PageManager::DestroyPage(Transaction& txn, Page* target) {
@@ -501,7 +530,8 @@ StatusOr<std::string> PageManager::LsmRead(page_id_t tree_id,
 
 std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
     page_id_t tree_id, std::string_view begin, std::string_view end,
-    bool ascending, txn_id_t reader_txn_id) const {
+    bool ascending, const Transaction* reader) const {
+  const txn_id_t reader_txn_id = reader != nullptr ? reader->ID() : 0;
   cache_hits_.fetch_add(2, std::memory_order_relaxed);
   if (!begin.empty() && !end.empty() && end < begin) {
     return {};
@@ -572,13 +602,17 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
         reader_txn_id != 0 && mem_it->second.uncommitted_txn != 0 &&
         mem_it->second.uncommitted_txn != reader_txn_id;
     if (foreign_uncommitted) {
-      if (mem_it->second.deleted) {
-        continue;
+      // A non-unique index bucket can be updated by several transactions.
+      // The latest physical owner must not hide an earlier write by this
+      // reader. Reconstruct its own overlay from the staged logical WAL;
+      // otherwise retain the committed baseline (or absence).
+      std::string own_value;
+      bool own_deleted = false;
+      if (reader->FindPendingLsmWrite(tree_id, mem_it->first, &own_value,
+                                      &own_deleted)) {
+        merged[mem_it->first] = {std::move(own_value), own_deleted};
       }
-      auto existing_it = merged.find(mem_it->first);
-      if (existing_it == merged.end() || existing_it->second.second) {
-        continue;
-      }
+      continue;
     }
     merged[mem_it->first] = {mem_it->second.value, mem_it->second.deleted};
   }
@@ -887,7 +921,7 @@ void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
         }
         if (page != nullptr) {
           auto page_lk = lock_page_if_needed(page);
-          (void)page->body.row_page.UpdateRow(r.slot, r.undo_data);
+          RestoreAbortedRow(page->body.row_page, r.slot, r.undo_data);
         }
         break;
       }
@@ -902,7 +936,7 @@ void PageManager::ApplyTransactionAbort(txn_id_t txn_id,
         }
         if (page != nullptr) {
           auto page_lk = lock_page_if_needed(page);
-          (void)page->body.row_page.InsertRowAt(r.slot, r.undo_data);
+          RestoreAbortedRow(page->body.row_page, r.slot, r.undo_data);
         }
         break;
       }
@@ -1230,7 +1264,7 @@ Status PageManager::WriteFuzzyCheckpoint(lsn_t replay_start_lsn) {
 }
 
 Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
-                                        bool* loaded_out) {
+                                        bool* loaded_out) try {
   if (replay_start_lsn_out != nullptr) {
     *replay_start_lsn_out = 0;
   }
@@ -1277,7 +1311,8 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
       (version >= 2 &&
        !ConsumeU64(buf.data(), payload_size, &off, &persisted_max_txn)) ||
       !ConsumeU64(buf.data(), payload_size, &off, &max_pid) ||
-      !ConsumeU32(buf.data(), payload_size, &off, &free_count)) {
+      !ConsumeU32(buf.data(), payload_size, &off, &free_count) ||
+      free_count > (payload_size - off) / sizeof(uint64_t)) {
     return Status::kCorrupt;
   }
 
@@ -1299,7 +1334,9 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   }
 
   uint32_t num_blocks = 0;
-  if (!ConsumeU32(buf.data(), payload_size, &off, &num_blocks)) {
+  if (!ConsumeU32(buf.data(), payload_size, &off, &num_blocks) ||
+      num_blocks >
+          (payload_size - off) / (4 * sizeof(uint64_t) + sizeof(uint32_t))) {
     return Status::kCorrupt;
   }
   for (uint32_t i = 0; i < num_blocks; ++i) {
@@ -1312,7 +1349,9 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
         !ConsumeU64(buf.data(), payload_size, &off, &prev_pid) ||
         !ConsumeU64(buf.data(), payload_size, &off, &next_pid) ||
         !ConsumeU64(buf.data(), payload_size, &off, &link_lsn) ||
-        !ConsumeU32(buf.data(), payload_size, &off, &nslots)) {
+        !ConsumeU32(buf.data(), payload_size, &off, &nslots) ||
+        nslots > RowPage::kMaxSlotsPerBlock ||
+        nslots > (payload_size - off) / (sizeof(uint64_t) + sizeof(uint32_t))) {
       return Status::kCorrupt;
     }
     auto page = std::make_unique<Page>(pid, PageType::kRowPage);
@@ -1350,14 +1389,18 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
   }
 
   uint32_t num_trees = 0;
-  if (!ConsumeU32(buf.data(), payload_size, &off, &num_trees)) {
+  if (!ConsumeU32(buf.data(), payload_size, &off, &num_trees) ||
+      num_trees >
+          (payload_size - off) / (sizeof(uint64_t) + sizeof(uint32_t))) {
     return Status::kCorrupt;
   }
   for (uint32_t i = 0; i < num_trees; ++i) {
     page_id_t tid = 0;
     uint32_t nentries = 0;
     if (!ConsumeU64(buf.data(), payload_size, &off, &tid) ||
-        !ConsumeU32(buf.data(), payload_size, &off, &nentries)) {
+        !ConsumeU32(buf.data(), payload_size, &off, &nentries) ||
+        nentries >
+            (payload_size - off) / (sizeof(uint64_t) + 2 * sizeof(uint32_t))) {
       return Status::kCorrupt;
     }
     auto tree = std::make_unique<LsmTreeState>();
@@ -1396,6 +1439,10 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
     *loaded_out = true;
   }
   return Status::kSuccess;
+} catch (const std::bad_alloc&) {
+  return Status::kNoSpace;
+} catch (const std::exception&) {
+  return Status::kCorrupt;
 }
 
 Status PageManager::ReplayCommittedRecord(lsn_t lsn, const LogRecord& r) {
@@ -1684,6 +1731,12 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
   }
   txn_id_t recorded_holder = 0;
   struct WaitCleanup {
+    WaitCleanup(const Transaction* transaction, txn_id_t* holder)
+        : watcher(transaction), recorded_holder(holder) {}
+    WaitCleanup(const WaitCleanup&) = delete;
+    WaitCleanup& operator=(const WaitCleanup&) = delete;
+    WaitCleanup(WaitCleanup&&) = delete;
+    WaitCleanup& operator=(WaitCleanup&&) = delete;
     const Transaction* watcher;
     txn_id_t* recorded_holder;
     ~WaitCleanup() {
@@ -1692,7 +1745,7 @@ Status PageManager::ReserveTableTailImpl(txn_id_t owner, page_id_t first_page,
         watcher->DebugSetPhase(nullptr);
       }
     }
-  } cleanup{.watcher = watcher, .recorded_holder = &recorded_holder};
+  } cleanup{watcher, &recorded_holder};
   const auto start = std::chrono::steady_clock::now();
   const auto deadline = start + kTableTailWaitTimeout;
   bool waited = false;
@@ -1806,6 +1859,12 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
   std::unique_lock lock(table_tails_mu_);
   txn_id_t recorded_holder = 0;
   struct WaitCleanup {
+    WaitCleanup(const Transaction* transaction, txn_id_t* holder)
+        : watcher(transaction), recorded_holder(holder) {}
+    WaitCleanup(const WaitCleanup&) = delete;
+    WaitCleanup& operator=(const WaitCleanup&) = delete;
+    WaitCleanup(WaitCleanup&&) = delete;
+    WaitCleanup& operator=(WaitCleanup&&) = delete;
     const Transaction* watcher;
     txn_id_t* recorded_holder;
     ~WaitCleanup() {
@@ -1814,7 +1873,7 @@ Status PageManager::WaitForTableTailPageImpl(txn_id_t viewer,
         watcher->DebugSetPhase(nullptr);
       }
     }
-  } cleanup{.watcher = watcher, .recorded_holder = &recorded_holder};
+  } cleanup{watcher, &recorded_holder};
   const auto deadline =
       std::chrono::steady_clock::now() + kTableTailWaitTimeout;
   for (;;) {

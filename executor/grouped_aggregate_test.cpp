@@ -580,7 +580,7 @@ TEST(GroupedAggregateTest, HavingKeepsOnlyGroupsWhoseOutputRowIsTrue) {
        {Collect(HashShape(rows, {Key("k")}, StandardPayload(), having)),
         Collect(SortShape(rows, {Key("k")}, StandardPayload(), having))}) {
     ASSERT_EQ(collected.status, Status::kSuccess);
-    EXPECT_EQ(GroupsOf(HashShape(rows, {Key("k")}, StandardPayload(), having)),
+    EXPECT_EQ(Sorted(Text(collected.rows)),
               Sorted({"NULL|2|8|8|8", "2|2|4|4|4"}));
   }
   // The streaming shape filters the same way.
@@ -1068,11 +1068,12 @@ TEST(GroupedAggregateTest, TheEmptyInputReachesNeitherGroupedSpillPath) {
   // A keyless payload is one group over an empty input on both algorithms, with
   // the same historical scalar values, and each keeps that one group as its
   // whole state.
-  const Collected scalar_hash =
-      Collect(HashShape(empty, {}, StandardPayload(), nullptr, partitioned));
+  const auto scalar_hash_executor =
+      HashShape(empty, {}, StandardPayload(), nullptr, partitioned);
+  const Collected scalar_hash = Collect(scalar_hash_executor);
   ASSERT_EQ(scalar_hash.status, Status::kSuccess);
   ASSERT_EQ(scalar_hash.rows.size(), 1U);
-  EXPECT_EQ(hash->PeakResidentGroups(), 0U);
+  EXPECT_EQ(scalar_hash_executor->PeakResidentGroups(), 1U);
   const std::shared_ptr<SortAggregateExecutor> scalar_sort =
       SortShape(empty, {}, StandardPayload(), nullptr, runs);
   const Collected sorted_scalar = Collect(scalar_sort);

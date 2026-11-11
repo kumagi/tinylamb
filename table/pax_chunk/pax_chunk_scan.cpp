@@ -2292,8 +2292,48 @@ struct XorKeyRef {
 
 }  // namespace
 
-PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
-                                      bool compress) {
+StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
+                                                const Schema& sc,
+                                                bool compress) try {
+  if (sc.ColumnCount() == 0 || sc.KeyColumnIndex() >= sc.ColumnCount()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "PAX requires a key column");
+  }
+  for (size_t i = 0; i < sc.ColumnCount(); ++i) {
+    if (sc.GetColumn(i).IsInterval()) {
+      return StatusError(StatusCode::kNotImplemented,
+                         "PAX interval columns require tagged string kernels");
+    }
+  }
+  // Verify the run contract before publishing binary-search zone maps.
+  // Validate lengths here: Entry::BuildKey's compatibility clamp is not a
+  // corruption check and must not turn a truncated key into a valid one.
+  const auto& blob = run.Blob();
+  std::string_view previous;
+  bool have_previous = false;
+  for (size_t i = 0; i < run.Size(); ++i) {
+    const auto entry = run.GetEntry(i);
+    const size_t offset = entry.key_offset_;
+    if (offset > blob.size() || blob.size() - offset < sizeof(uint32_t)) {
+      return StatusError(StatusCode::kCorrupt, "invalid sorted-run key offset");
+    }
+    uint32_t encoded_length = 0;
+    std::memcpy(&encoded_length, blob.data() + offset, sizeof(encoded_length));
+    const size_t length = be32toh(encoded_length);
+    if (length > blob.size() - offset - sizeof(uint32_t)) {
+      return StatusError(StatusCode::kCorrupt, "truncated sorted-run key");
+    }
+    const std::string_view key(blob.data() + offset + sizeof(uint32_t), length);
+    if (have_previous && key < previous) {
+      return StatusError(StatusCode::kCorrupt,
+                         "sorted-run keys are out of order");
+    }
+    previous = key;
+    have_previous = true;
+    if (!entry.IsDeleted() && entry.row_offset_ >= blob.size()) {
+      return StatusError(StatusCode::kCorrupt, "invalid sorted-run row offset");
+    }
+  }
   // Read all rows from the run in ascending order, collect into row groups of
   // kRowGroupSize. Skip deleted entries. For each row group, encode each
   // column contiguously. Record per-row-group per-column offsets in the
@@ -2447,11 +2487,12 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
         if (group_fill == group_rows.size()) {
           group_rows.emplace_back();
         }
-        if (it.GetEntry().BuildRowInto(run.Blob(), sc,
-                                       &group_rows[group_fill])) {
-          ++group_fill;
-          ++total_rows;
+        if (!it.GetEntry().BuildRowInto(run.Blob(), sc,
+                                        &group_rows[group_fill])) {
+          return StatusError(StatusCode::kCorrupt, "invalid sorted-run row");
         }
+        ++group_fill;
+        ++total_rows;
       } else {
         BuildCellsInto(it.GetEntry(), run.Blob(), sc, soa_col_types, group_fill,
                        &soa);
@@ -2471,13 +2512,12 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
                                       static_cast<size_t>(footer.column_count));
         // Footer offsets are uint32: a chunk whose data region crossed
         // 4 GiB would silently wrap every subsequent column_offset and
-        // produce a self-consistent-looking but unreadable chunk. There is
-        // no Status in this builder's signature, so fail loudly instead.
+        // produce a self-consistent-looking but unreadable chunk. Return
+        // an error before publishing any wrapped offsets.
         if (data.size() >
             static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-          LOG(FATAL) << "PAX chunk data region exceeded the uint32 offset "
-                        "cap (4 GiB); refuse to wrap offsets";
-          abort();
+          return StatusError(StatusCode::kCorrupt,
+                             "PAX chunk exceeds uint32 data offset limit");
         }
         // Fused single-pass profile: every encoder input and footer-section
         // accumulator for this row group comes out of one row-major sweep
@@ -2545,8 +2585,11 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
             footer.col_mins[c] = std::min(P.cmin, footer.col_mins[c]);
             footer.col_maxs[c] = std::max(P.cmax, footer.col_maxs[c]);
           }
-          footer.all_zone_mins.push_back(P.mn);
-          footer.all_zone_maxs.push_back(P.mx);
+          // The profile's integer bounds do not describe VARCHAR/DOUBLE
+          // cells. Keep those domains unbounded so RGOverlapsCol cannot
+          // discard their row groups using the placeholder [0, 0].
+          footer.all_zone_mins.push_back(is_i64 ? P.mn : INT64_MIN);
+          footer.all_zone_maxs.push_back(is_i64 ? P.mx : INT64_MAX);
           const size_t bi = (g_idx * footer.column_count) + c;
           if (bi < footer.rg_blooms.size()) {
             footer.rg_blooms[bi] = P.bloom;
@@ -3355,14 +3398,13 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   }
   // Footer offsets are uint32: the per-row hash-index section alone can add
   // ~48 B/row, so a huge run can push the FOOTER (not the data region, which
-  // the per-row-group guard above aborts) past 4 GiB. A wrapped footer_size
-  // then misparses every reader's data_end. Fail loudly instead, exactly like
+  // the per-row-group guard above rejects) past 4 GiB. A wrapped footer_size
+  // then misparses every reader's data_end. Return an error, exactly like
   // the data-region cap.
   if (data.size() - footer_start >
       static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-    LOG(FATAL) << "PAX chunk footer exceeded the uint32 footer_size cap "
-                  "(4 GiB); refuse to wrap footer_size";
-    abort();
+    return StatusError(StatusCode::kCorrupt,
+                       "PAX chunk exceeds uint32 footer size limit");
   }
   footer.footer_size = static_cast<uint32_t>(data.size() - footer_start);
   AppendBE32(data, footer.footer_size);
@@ -3382,6 +3424,9 @@ PaxChunk PaxChunk::BuildFromSortedRun(const SortedRun& run, const Schema& sc,
   chunk.fastpfor_metadata_trusted_ = true;
   chunk.deltafastpfor_metadata_trusted_ = true;
   return chunk;
+} catch (const std::exception& error) {
+  return StatusError(StatusCode::kCorrupt,
+                     std::string("PAX construction failed: ") + error.what());
 }
 
 void PaxChunk::BuildRowCountPrefix() {
@@ -4152,7 +4197,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       }
       if (cur.scheme == Scheme::kFrontCode) {
         if (DecodeFrontCodeAtInto(cur.region, cur.prm, cache->seq_rc, loc,
-                                  cur.region_end, &slot.owned_data)) {
+                                  cur.region_end, &slot.owned_data.Mutable())) {
           slot.type = ValueType::kVarChar;
           slot.value.varchar_value = slot.owned_data;
         } else {
@@ -4347,7 +4392,7 @@ Status PaxChunk::ReadRowIntoImpl(size_t global_row_index, const Schema& sc,
       }
       if (s == Scheme::kFrontCode) {
         if (DecodeFrontCodeAtInto(region, prm, rc, local, region_end,
-                                  &slot.owned_data)) {
+                                  &slot.owned_data.Mutable())) {
           slot.type = ValueType::kVarChar;
           slot.value.varchar_value = slot.owned_data;
         } else {

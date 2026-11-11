@@ -296,9 +296,9 @@ std::optional<uint64_t> VarcharRegionMatchCount(const char* r, Scheme s,
           }
         }
       }
-      // Clamp codes decode as "": hit iff "" takes a rank inside the window.
-      const uint64_t empty_rank = lb(std::string_view());
-      const bool clamp_pass = empty_rank >= wlo && empty_rank < whi;
+      // A clamp decodes to "", even if "" is absent from the dictionary.
+      // Its insertion rank can coincide with a different matching value.
+      const bool clamp_pass = p.Eval(std::string_view());
       const bool exact_width = (1ULL << cw) == ncodes;
       WordBitReader br(r + 2, r + dict_base);
       uint64_t cnt = 0;

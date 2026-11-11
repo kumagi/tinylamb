@@ -39,7 +39,8 @@ bool TryShape(const Schema& sc, const StrCase& c, uint8_t shape,
               PaxChunk* out) {
   setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
   PaxChunk chunk =
-      PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc);
+      PaxChunk::BuildFromSortedRun(MakeRun(MakeStorageRows(shape), sc), sc)
+          .MoveValue();
   unsetenv("TINYLAMB_FORCE_SCHEME");
   const auto& enc = chunk.GetFooter().encodings;
   if (enc.size() > c.col && enc[c.col] == static_cast<uint8_t>(c.expected)) {
@@ -57,7 +58,7 @@ PaxChunk BuildStrForced(const Schema& sc, const StrCase& c, bool* ok) {
     chosen.fill(-1);
     init = true;
   }
-  const auto idx = static_cast<size_t>(&c - kStrCases);
+  const auto idx = static_cast<size_t>(&c - kStrCases.data());
   int& slot = chosen[idx];
   const int first = slot >= 0 ? slot : 0;
   for (int s = first; std::cmp_less(s, c.nshapes); ++s) {

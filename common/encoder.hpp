@@ -66,7 +66,7 @@ class Encoder {
 
  private:
   void Write(const char* data, size_t size) {
-    if (bytes_) {
+    if (bytes_ != nullptr) {
       bytes_->append(data, size);
     } else {
       os_->write(data, static_cast<std::streamsize>(size));

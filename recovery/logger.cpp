@@ -901,7 +901,7 @@ void Logger::SetFailed(int err) {
   // quota that shows up as ENOSPC on shared volumes) and EIO (device
   // trouble). Every transaction fails after this line, so this one line is
   // the postmortem anchor.
-#if defined(EDQUOT)
+#ifdef EDQUOT
   const bool is_space_err = (err == ENOSPC || err == EDQUOT);
 #else
   const bool is_space_err = (err == ENOSPC);

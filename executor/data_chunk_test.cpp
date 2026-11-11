@@ -25,6 +25,20 @@
 
 namespace tinylamb {
 
+TEST(DataChunkTest, AuditIntervalsRetainDomainAcrossBatchCopies) {
+  ColumnVector column(ValueType::kVarChar);
+  column.Append(Value("plain"));
+  const Value typed = Value("2-0 0 0:0:0").WithInterval();
+  column.Append(typed);
+  column.Append(Value());
+  ColumnVector copied(ValueType::kVarChar);
+  copied.AppendRange(column);
+  EXPECT_EQ(copied.ValueAt(0), Value("plain"));
+  EXPECT_TRUE(copied.ValueAt(1).IsInterval());
+  EXPECT_EQ(copied.ValueAt(1), typed);
+  EXPECT_TRUE(copied.ValueAt(2).IsNull());
+}
+
 TEST(DataChunkTest, CollationSurvivesNullPrefixesAndNullOnlyTransfers) {
   const Value folded = Value("A").WithCollation(2);
   ColumnVector source(ValueType::kVarChar);
@@ -670,6 +684,21 @@ TEST(VectorizedBooleanAndBitwiseAggregationTest, LogicalAndOrAggregates) {
   // Column "c" has all NULL: LOGICAL_AND = NULL, LOGICAL_OR = NULL
   EXPECT_TRUE(chunk.AggregateLogicalAnd(2).IsNull());
   EXPECT_TRUE(chunk.AggregateLogicalOr(2).IsNull());
+}
+
+TEST(DataChunkTest, AuditAllNullColumnsRetainZoneNullCounts) {
+  DataChunk input(std::vector<ValueType>{ValueType::kNull});
+  input.Append(Row({Value()}));
+  input.Append(Row({Value()}));
+  DataChunk copied;
+  copied.Append(input, 1);
+  copied.Append(input, 0);
+  EXPECT_EQ(copied.ZoneMapAt(0).NullCount(), 2U);
+  DataChunk projected;
+  const std::vector<const ColumnVector*> columns{&input.ColumnAt(0)};
+  projected.AppendRowFromColumns(columns, 0);
+  projected.AppendRowFromColumns(columns, 1);
+  EXPECT_EQ(projected.ZoneMapAt(0).NullCount(), 2U);
 }
 
 }  // namespace tinylamb

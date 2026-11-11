@@ -2,7 +2,7 @@
 
 `tinylamb` is a C++20 RDBMS: GoogleSQL frontend, Cascades optimizer,
 three-tier expression engine (AST / Bytecode / LLVM JIT), hybrid
-row+PAX storage, ARIES WAL, MVCC, LSM-Tree indexes,
+row+PAX storage, logical WAL, MVCC, LSM-Tree indexes,
 morsel-driven execution, PostgreSQL Simple-Query server.
 
 Each layer directory has its own `AGENTS.md`. **Before touching code in
@@ -57,7 +57,7 @@ plain `add_library` targets.
    narrow INT64 kernels. `expression/differential_test.cpp` must pass.
 4. **WAL-before-data**: `CheckpointManager::WriteCheckpoint` waits for
    `Logger::WaitForDurable(durable_target)` before writing the `<db>.db`
-   snapshot and recycling WAL segments; never bypass it. ARIES invariants:
+   snapshot and recycling WAL segments; never bypass it. Recovery invariants:
    [`docs/recovery_invariants.md`](docs/recovery_invariants.md),
    [`docs/wal_format.md`](docs/wal_format.md).
 5. **Lock ordering**: `docs/lock_order.md` is normative. Page content latch
@@ -69,9 +69,7 @@ plain `add_library` targets.
    (`query/sql_engine.hpp`) over `TransactionContext`. `EXPLAIN [ANALYZE]`
    is a `Prepare`-level string prefix for SELECT/WITH only — there is no
    `kExplain` statement type.
-8. **Legacy parser is retired**: the hand-written `parser/` frontend is not
-   built (re-added as unbilled reference sources only; `legacy/` was deleted,
-   2026-09). Nothing may include it or add it to CMake. The only SQL frontend
+8. **Legacy parser is retired**: the hand-written `parser/` frontend and its `parser/` directory are retired and removed (`legacy/` was also deleted). Nothing may include it or add it to CMake. The only SQL frontend
    is `query/` + external `execute_query --mode=parse` child process.
 9. **Server speaks Simple Query only**: extended protocol messages
    (Parse/Bind/Describe/Execute) are rejected with an ErrorResponse; Flush is
@@ -136,6 +134,6 @@ python3 scripts/check_layering.py   # must exit 0
    fitting layer and re-run `check_layering.py`.
 2. Preserve semantic equivalence (`expression/differential_test.cpp`).
 3. Check ADRs: [`docs/review/`](docs/review/),
-   [`docs/adr-proposal.md`](docs/adr-proposal.md),
+   [`docs/adr-proposal.md`](docs/adr-proposal.md), [`docs/adr/`](docs/adr/),
    [`ARCHITECTURE.md`](ARCHITECTURE.md). Improvement backlog:
    [`docs/next-actions.md`](docs/next-actions.md).

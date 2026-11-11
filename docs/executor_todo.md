@@ -37,7 +37,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `EmptyPlan`（定数 FALSE / NULL の結果をスキャンなしで返す）
 - [x] `RelationRename` + `RelationRenamePlan`
 - [x] `Relational` 不透明 IR + `RelationalPlan`（外側結合・CTE などの避難所）
-- [x] `DataChunk` ベクトル化、`SpillFile`、`QueryMemory`、`QueryScheduler`
+- [x] `DataChunk` ベクトル化、`SpillFile`、`QueryMemory`、`common/parallel_work.hpp`
 - [x] `ZoneMap`（スキャン補助）
 
 `JoinKind::kSemi` / `kAnti` はハッシュ結合実行器にあり、等価キーの
@@ -91,8 +91,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] Cascades から `JoinKind::kSemi` / `kAnti` を選ぶ物理規則
       （等価キー・残余なしの HashJoin。半結合は probe 側スキーマを保持）
 - [ ] `MarkJoin`（一致フラグ列を追加、`IN` の UNKNOWN）
-- [x] `SingleJoin` / `Max1Row` の意味論（スカラサブクエリは 2 行目で
-      cardinality error。`Max1RowPlan` / `Max1RowExecutor` も接続）
+- [x] スカラサブクエリの基数検証（複数行をエラーにする）。
+      `Max1RowPlan` / `Max1RowExecutor` は撤去済みで、専用計画ノードではない。
 - [x] `NullAwareAntiJoin`（`NOT IN`、ビルド側 NULL の短絡）
 - [ ] uniqueness 付き semi → inner に落とさない実行時 assert
 - [x] EXISTS 用 short-circuit nested loop（単一表の安全な LIMIT 1 pushdown、相関 index 経路は維持）
@@ -179,7 +179,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
       `COUNT(*)` のフィルタ順序を回帰）
 - [ ] SQL 標準 `AGG(...) FILTER (WHERE …)` の AST 接続
 - [x] `OrderedSetAggregate`（`PERCENTILE_CONT` / `WITHIN GROUP`）
-- [x] `GroupingSetsExecutor` / `Rollup` / `Cube`（Expand + Agg または複数 Agg）
+- [x] GROUPING SETS / ROLLUP / CUBE（visitor が複数集約と UNION ALL へ展開。専用 `GroupingSetsExecutor` は存在しない）。
 - [x] `ScalarAggEmptyInput`（0 行で COUNT=0、SUM=NULL。AVG/MIN/MAX の NULL も
       含め、逐次・並列集約で回帰テスト済み）
 - [x] spill 付きハッシュ集約の計画接続（Relational fallback の partitioned aggregation、予算超過回帰テストあり）
@@ -332,10 +332,8 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 
 ## P2 — CTE・再帰・マテリアライズ
 
-- [x] `MaterializePlan` / `EagerSpool`（CTE 複数参照。`ExecuteQuery` が
-      `CteMap` に一度だけ materialize）
-- [x] `LazySpool` / `ConsumerSpool`（再スキャン可能バッファ。`Relation` の
-      `ForEachRow` を複数 consumer から利用）
+- [x] CTE の一度だけの実体化と再走査（`CteMap` / `Relation` / 共有 Values）。
+      専用 `MaterializePlan` / `EagerSpool` / `LazySpool` / `ConsumerSpool` は存在しない。
 - [x] `CteScan`（実体化された CTE の読み。`LoadSource` の `CteMap` 経路）
 - [x] CTE の materialize / inline / filter pushdown のコスト選択
       （`SqlEngine::PrepareStatement` の前処理列: 単一参照・非再帰は派生表へ
@@ -430,12 +428,12 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `BatchInsert`（`Insert` が複数行 source を最後まで消費して一括挿入。
       `Insert_FromSourceTable_InsertsAllRows` と上記 INSERT SELECT 回帰で確認）
 - [x] `Upsert` / `ON CONFLICT`
-- [x] `MergeExecutor`（MATCHED / NOT MATCHED）
+- [x] MERGE の MATCHED / NOT MATCHED（`SqlEngine` の DML 経路。専用 `MergeExecutor` は存在しない）。
 - [ ] `UpdateFrom` / `DeleteUsing`（結合更新）
-- [x] `ReturningExecutor`
+- [ ] 専用 `ReturningExecutor`（現行クラスなし）。
 - [ ] `LockRows` / `SELECT FOR UPDATE`
 - [ ] `SkipLocked` / `NOWAIT`
-- [x] `Truncate` 実行器（カタログ操作との境界）
+- [x] TRUNCATE TABLE（無条件 DELETE に lowering。専用 Truncate 実行器なし）。
 - [ ] トリガ相当の before/after 行フック（将来）
 
 ---
@@ -446,12 +444,12 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [ ] Selection vector / validity bitmap の徹底
 - [ ] late materialization の列バッチ
 - [ ] `PipelineBreaker` 明示（Hash build、Sort、Materialize）
-- [ ] morsel-driven 並列の Cascades DOP 接続（`QueryScheduler` 既存）
+- [ ] morsel-driven 並列の Cascades DOP 接続（共通 `RunParallelTasks` 基盤。旧 `QueryScheduler` は存在しない）
 - [ ] `Exchange` / `Gather` / `Redistribute` 実行器（単一ノードはスレッド間）
 - [x] `ParallelHashJoin`（共有ビルド表）
 - [x] `ParallelMergeJoin`
 - [ ] `ScanPartition` ステアリング
-- [x] NUMA 意識のアリーナ
+- [ ] NUMA 意識のアリーナ
 - [x] SIMD 比較カーネル（INT64 は JIT と役割分担）
 - [ ] バッチ集約の辞書エンコード
 - [ ] 圧縮カラムの直接スキャン（PAX）
@@ -503,7 +501,7 @@ Cascades の実装規則が選ぶ **物理プラン** と、それを駆動す�
 - [x] `ReservoirSample`
 - [ ] `BlockSample`
 - [x] HyperLogLogによる統計収集（`AnalyzeScan` 内部で使用）
-- [x] 実行時フィードバック用 `CardinalityProbe`（デバッグ）
+- [ ] 専用 `CardinalityProbe`（現行クラスなし。EXPLAIN ANALYZE の既存計測とは別）。
 
 ---
 

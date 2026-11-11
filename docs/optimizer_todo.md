@@ -24,85 +24,19 @@ Cascades に載せるべき変換・実装規則・コスト/統計の候補。*
 
 ## P0 — 論理オペレータとメモの土台
 
-`LogicalOperator` は Scan / Join / Selection / Projection /
-Aggregation / Limit / Relational（不透明）に加えて、等価キーの
-SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
-残りは構文・カタログ・分散の表面待ちである。
+現行の論理 enum は `plan/cascades.hpp`、一覧は `todo.md` の
+「LogicalOperator / Memo」を参照する。旧 Mark/Single/Max1Row/Assert、
+ConstantTable、Materialize/Spool、Exchange 系の専用ノードは存在しない。
+それらの旧完了記録を現在の登録・到達性の証明として使わない。
 
-- [x] `kOuterJoin`（LEFT / RIGHT / FULL）と join type ペイロード、outer hash
-      実装規則（安全な pushdown 規則は未導入）
-- [x] `kSemiJoin` / `kAntiJoin`（等価キーの Cascades 実装規則まで接続）
-- [x] `kMarkJoin`（`IN` の UNKNOWN marker。enum・`mark_hash_join` 実装規則に
-      加え `mark_join_to_filter` で marker 真偽フィルタを Semi/Anti へ lowering）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [x] `kSingleJoin`（スカラ相関の基数 assertion は `kMax1Row` / `Max1RowPlan`
-      として実装）
-- [x] `kCrossJoin` を inner と分離（無条件 join を明示化し、cross-product
-      カーディナリティでコスト評価。`join_identity_dummy` で DummyScan 側の
-      単位元除去まで接続）
-- [x] `kApply`（相関 APPLY。enum・`apply` 実装規則・`apply_to_join` /
-      `push_apply_through_join` / `hoist_correlated_selection_to_apply` /
-      `decorrelate_aggregate_apply` で型付き lowering。一般 LATERAL の
-      コスト付き展開は FROM 派生スキャン葉（M5）待ちで relational 維持）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [x] `kUnion` / `kUnionAll` / `kIntersect` / `kIntersectAll` / `kExcept` /
-      `kExceptAll`（論理ノードと物理実装規則）
-- [ ] `kWindow`（PARTITION / ORDER ペイロード＋6 論理規則
-      ＋`rank_row_number_to_topn`。frame 型・exclusion は
-      `WindowFunctionCallExpression` の式レベルで保持。物理実行は
-      relational `window_eval` 経由で、window 集約 migration 後に Cascades
-      実装規則へ。2026-09-28: window × GROUPING SETS / ROLLUP / CUBE も
-      visitor が UNION ALL ラッパへ展開（`ExpandGroupingSetsWithWindows`:
-      各枝は集約＋window 入力の hidden 列、wrapper が合成結果上で window
-      評価。TPC-DS q70 / q86 が到達）あわせて `ParseWindowSpecification`
-      が PARTITION BY の非 PathExpression 子を黙って捨てるバグを修正
-      （`PARTITION BY grouping(a)+grouping(b)` / `UPPER(x)` 等が
-      単一パーティションに縮退する silent wrong result）)
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [x] `kSort` を一般 Cascades 論理ノードとして明示し、`SortPlan` の実装規則と
-      出力スキーマ基準の ORDER BY キー正規化を接続
-- [x] `kDistinct` / `kDuplicateElim`
-- [x] `kTopN`（ORDER BY + LIMIT を 1 ノードに。`with_ties` ペイロードと
-      `TopNPlan` への透過まで接続。WITH TIES 問い合わせ自体は
-      `SelectStatement::complex_` 経由で relational 経路に残る）
-- [x] `kValues` / `kConstantTable`（`ValuesPlan` と Cascades 実装規則。
-      単一行分岐の `values_fold_into_union` まで接続）
-- [ ] `kUnnest` / `kGenerateSeries`（enum・`unnest` / `generate_series` 実装規則
-      ・`unnest_filter_pushdown` まで接続。一般 TVF は UNNEST・GENERATE_SERIES
-      以外の表面がなく将来枠）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-      → 2026-10-20: FROM の組み込み TVF `GENERATE_SERIES(...)` は
-      フロントエンドが暗黙 UNNEST（`SelectSource.unnest`）へ落とすため、
-      `kUnnest` 経路がそのまま実行する（専用 `kFunctionScan` は作らない）。
-      回帰: `QueryTest.BuiltinTableFunctionBecomesRowSource`。残る一般 TVF は
-      `EXTERNAL_QUERY` / `ML.*` など外部ソース基盤が前提のものだけ。
-- [ ] `kExpand`（enum と `grouping_sets_expansion` で GROUPING SETS 系を展開。
-      CUBE / ROLLUP 構文自体が parser 未対応のため到達不能）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [x] `kRecursiveCte` / `kWorkTableScan`（relational 経路で実装:
-      `ExecuteRecursiveCte` が作業表反復を担当。Cascades 論理ノードは未導入で、
-      WITH RECURSIVE は opaque relational IR として実行される）
-- [x] `kMaterialize` / `kEagerSpool` / `kLazySpool`（enum・`MaterializePlan`
-      ・`materialize` / `eager_spool` / `lazy_spool` 実装規則まで接続。
-      `MaterializeExecutor` が順序保持で再生）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [x] `kExchange` / `kGather` / `kBroadcast` / `kRedistribute`（enum と単一
-      ノード no-op 実装規則 `exchange_noop` 等まで接続。分散コストは将来枠）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [ ] `kSample` / `kTableSample`（enum のみ。TABLESAMPLE 構文がなく SQL 表面
-      がないため Plan・実行器とも未接続。構文追加時に `SamplePlan` から）
-- [x] `kAssert`（`kMax1Row` / `Max1RowPlan` がスカラ基数 assertion の実現形。
-      一般形の enum は予約）
-- [x] `kMax1Row`（スカラサブクエリ基数の専用論理・物理ノード）
-- [x] `kFilterFalse` / `kEmpty`（定数 FALSE / NULL Selection から EmptyPlanへ
-      論理・物理接続）
-- [x] `kDummyScan`（`SELECT 1` の 1 行ソースを Relational から外し、Optimizer
-      の no-FROM 経路へ接続）
-- [x] Join ペイロードに outer join type（LEFT / RIGHT / FULL）と
-      null-producing side（`LogicalExpression::join_type` → `JoinKind`）
-- [ ] Aggregation ペイロードに grouping sets（`grouping_sets` フィールド＋
-      `grouping_sets_expansion`。`aggregate_union_transpose` 等が利用）
-      → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
+- [x] Window / Unnest / RecursiveCte / Apply / Sample を含む現行 enum と
+      実装規則（詳細な到達制約は `plan/AGENTS.md` とルール監査を参照）。
+- [x] スカラサブクエリ基数検証（サブクエリ評価経路。Max1Row 専用ノードなし）。
+- [x] TABLESAMPLE（`VisitTableSample` → `kSample` → `sample` 実装規則。
+      `query/table_sample_test.cpp`）。
+- [x] GENERATE_SERIES は UNNEST に lowering（専用 GenerateSeries enum なし）。
+- [x] GROUPING SETS / ROLLUP / CUBE は visitor で複数集約の枝へ展開。
+
 - [x] Aggregation 式の DISTINCT agg / FILTER 相当（GoogleSQL `AGG(x WHERE p)`）/
       ORDER BY WITHIN GROUP メタデータを式・rewrite・plan cache で保持
 - [ ] Projection ペイロードに computed vs passthrough 列の区別（明示マーカー
@@ -670,8 +604,8 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [ ] `generate_series_to_values`（`generate_series` 実装規則が Values 化。
       論理の事前具体化は不要のためこの形で確定）
       → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
-- [ ] `table_sample_bernoulli_vs_system`（TABLESAMPLE 構文がなく SQL 表面がない
-      ため将来枠。enum `kSample` は予約）
+- [ ] `table_sample_bernoulli_vs_system`（TABLESAMPLE の SQL 経路は実装済み。
+      BERNOULLI / SYSTEM の意味を保ったコスト選択は別途検討）。
 - [x] `recursive_termination_predicate_push`
 
 ---
@@ -839,13 +773,11 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
       sort/hash 分岐は単一戦略のため将来枠）
 - [ ] `window_sort` / `window_hash_partition`（明示の物理分岐。単一戦略の
       `window` 実装規則で被覆済みのため優先度低）
-- [x] `set_union_hash` / `set_union_sort`（単一実装で確定：
-      set-op は memo に入らず枝ごとに独立計画→executor レベルで fold
-      するため（`ExecuteSetOperation`＋`NeedsRelational` の set-op 経路）、
-      Cascades 側の hash/sort 分岐は到達不能。hash 側は現行の
-      `SetOperationExecutor`（hash＋spill 済み）が担い、sort 側は
-      set-op の Cascades 移管（memo 葉化）待ちの将来枠。
-      現状 MergeAppend 選択あり）
+- [x] 集合演算の `union` / `union_all` / `intersect` / `intersect_all` /
+      `except` / `except_all` 実装規則（`SetOperationPlan`）。SQL の形状によって
+      枝別計画・relational 経路も残るため、登録済みと全 SQL の移管済みを区別する。
+- [ ] 集合演算の hash / sort 代替をコストで選択する（規則追加が dead code
+      という旧判定は無効。現行の SetOperationExecutor と MergeAppend を基準にする）。
 - [ ] `materialize` 実装規則（`materialize`＋`MaterializePlan` まで接続）
       → 2026-10-02 再判定: 旧登録は撤去・統合。実際の代替経路はルール監査を参照。
 - [ ] `spool` 実装規則（`eager_spool` / `lazy_spool`。同上実装を共有し
@@ -967,7 +899,7 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `PIVOT` / `UNPIVOT` 展開（parse 時に `ExpandPivotSource` で join/agg へ展開。
       オプティマイザ側の追加規則は不要のため確定）
 - [ ] `MATCH_RECOGNIZE`（将来。行パターン実行器がなく将来枠）
-- [ ] `TABLESAMPLE`（構文がなく SQL 表面なし。`kSample` enum 予約のみ）
+- [x] `TABLESAMPLE`（SQL・`kSample`・実行規則あり。上記 sampling 項目を参照）。
 - [x] `QUALIFY`（window 付きは Selection-over-Window として Cascades 移管済み。
       window なし・集約あり等は relational 維持）
 - [x] `GROUP BY ALL` / `GROUP BY DISTINCT`（ALL は parse 時に明示キーへ展開、
@@ -985,15 +917,17 @@ SemiJoin / AntiJoin を持つ。商用相当の種類は一通り揃い、
 - [x] `FETCH FIRST … WITH TIES`（`TopNPlan` が `with_ties` を実行し、論理
       `TopN` ペイロード＋実装透過まで接続。`complex_` 問い合わせは当面
       relational 経路に残り、移管後に Cascades が担う）
-- [ ] `FOR UPDATE` / `SKIP LOCKED` とアクセスパス制約（parser 表面がなく到達不能）
+- [x] `FOR UPDATE` の行位置付きアクセスパス（`query/AGENTS.md` の locking select 契約）。
+- [ ] `SKIP LOCKED` 構文（現行 parser 非対応）。
 - [x] `INSERT SELECT` の投影（SQL 実行経路で SELECT の投影結果を target
       列順へ写像して Insert source に接続。回帰は
       `SqlEngineInsertSelectCopiesAndMapsRows`。DML を Cascades で直接最適化する
       並列化は DML 論理ノード導入時に追加）
-- [ ] `MERGE` 文の join 計画（MERGE 構文がなく到達不能。`MergeExecutor` の器は
-      executor 側にあるが表面なし）
-- [ ] `UPDATE … FROM` / `DELETE … USING`（構文がなく到達不能）
-- [ ] `RETURNING` の投影（同上）
+- [ ] `MERGE` 文の join 計画を Cascades へ移管する（構文と `SqlEngine` の
+      実行経路は存在する。専用 `MergeExecutor` クラスはない）。
+- [x] `UPDATE … FROM`（MERGE への lowering）。
+- [ ] `DELETE … USING`（現行は明示的拒否）。
+- [ ] DML の RETURNING 投影の実行契約。
 - [ ] 準備文の generic/custom（Simple Query 専用プロトコルのため表面なし。
       `plan_cache.hpp` は query 側の器）
 - [x] バッチ INSERT の値リスト結合（複数行 VALUES は単一 `Values` ノード。

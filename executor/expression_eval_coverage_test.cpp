@@ -235,7 +235,7 @@ TEST_F(ExpressionEvalSqlTest, JsonPathNavigation) {
   ExpectScalar(
       "SELECT TO_JSON_STRING([STRUCT(1 AS x, 2 AS y), STRUCT(3 AS x, "
       "4 AS y)])",
-      Value(R"(ARRAY<STRUCT>["{"x":1,"y":2}", "{"x":3,"y":4}"])"));
+      Value(R"(ARRAY<STRUCT>["{\"x\":1,\"y\":2}", "{\"x\":3,\"y\":4}"])"));
   ExpectScalar("SELECT TO_JSON_STRING(CAST(STRUCT(1 AS a) AS STRING))",
                Value("{\"a\":1}"));
 }
@@ -265,7 +265,7 @@ TEST_F(ExpressionEvalSqlTest, StructValueAccess) {
   ExpectScalar(
       "SELECT TO_JSON_STRING("
       "[STRUCT(1 AS x, 2 AS y), STRUCT(3 AS x, 4 AS y)])",
-      Value(R"(ARRAY<STRUCT>["{"x":1,"y":2}", "{"x":3,"y":4}"])"));
+      Value(R"(ARRAY<STRUCT>["{\"x\":1,\"y\":2}", "{\"x\":3,\"y\":4}"])"));
   ExpectScalar("SELECT TO_JSON_STRING(CAST(STRUCT(1 AS a) AS STRING))",
                Value("{\"a\":1}"));
   ExpectScalar(

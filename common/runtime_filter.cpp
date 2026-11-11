@@ -96,14 +96,14 @@ MinMaxRuntimeFilter::MinMaxRuntimeFilter(int64_t lo, int64_t hi,
 
 uint64_t BloomRuntimeFilter::Hash(int64_t key, unsigned probe) {
   // One splitmix64 finalizer per key; probe k > 0 advances the state by an
-  // odd stride (double hashing), so the probes land on unrelated bit
-  // positions while Reject pays for a single mix.  Reject inlines this
+  // key-dependent odd stride, so keys colliding at the first position need
+  // not collide at the second. Reject still pays for a single mix and inlines
   // formula -- keep the two in sync.
   auto z = static_cast<uint64_t>(key);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   z ^= z >> 31;
-  return z + ((0x9E3779B97F4A7C15ULL | 1U) * probe);
+  return z + ((std::rotl(z, 32) | 1U) * probe);
 }
 
 size_t BloomRuntimeFilter::BitsForKeys(size_t distinct_keys) {
@@ -151,8 +151,7 @@ bool BloomRuntimeFilter::Reject(int64_t key) const {
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   z ^= z >> 31;
   const size_t bit0 = static_cast<size_t>(z) & mask_;
-  const size_t bit1 =
-      static_cast<size_t>(z + (0x9E3779B97F4A7C15ULL | 1U)) & mask_;
+  const size_t bit1 = static_cast<size_t>(z + (std::rotl(z, 32) | 1U)) & mask_;
   if ((bits_[bit0 >> 6] & (uint64_t{1} << (bit0 & 63))) == 0) {
     return true;
   }

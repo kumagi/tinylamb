@@ -85,6 +85,20 @@ class TableTest : public ::testing::Test {
 
 TEST_F(TableTest, Construct_Default_Succeeds) {}
 
+TEST_F(TableTest, AuditMorselLeaseFailureMarksTransactionFailed) {
+  auto pending_reader = rs_->BeginReadOnlyContext();
+  auto retired_reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        pending_reader.GetTable(kTableName));
+  auto dropper = rs_->BeginContext();
+  ASSERT_SUCCESS(rs_->DropTable(dropper, kTableName));
+  EXPECT_TRUE(table->BuildScanMorsels(pending_reader.txn_).empty());
+  EXPECT_TRUE(pending_reader.txn_.IsFailed());
+  ASSERT_SUCCESS(dropper.PreCommit());
+  EXPECT_TRUE(table->BuildScanMorsels(retired_reader.txn_).empty());
+  EXPECT_TRUE(retired_reader.txn_.IsFailed());
+}
+
 TEST_F(TableTest, Serialization_RoundTripsIncarnationAndReadsLegacyPayload) {
   Table table(Schema("serialized", {Column("value", ValueType::kInt64)}), 7,
               99);
@@ -1593,11 +1607,11 @@ TEST_F(TableTest,
   const page_id_t tree_id = 99999;
 
   ASSERT_SUCCESS(pm->LsmInsert(s1.txn_, tree_id, "k1", "v1"));
-  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s1.txn_.ID()).size(), 1U);
-  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s2.txn_.ID()).size(), 0U);
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, &s1.txn_).size(), 1U);
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, &s2.txn_).size(), 0U);
   ASSERT_SUCCESS(s1.txn_.PreCommit());
 
-  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, s2.txn_.ID()).size(), 1U);
+  EXPECT_EQ(pm->LsmScanRange(tree_id, "", "", true, &s2.txn_).size(), 1U);
 
   TransactionContext d1 = rs_->BeginContext();
   ASSERT_SUCCESS(pm->LsmDestroy(d1.txn_, tree_id));

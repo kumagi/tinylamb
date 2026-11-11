@@ -5,25 +5,17 @@ Every `TINYLAMB_*` environment variable read by the code, in one place.  The
 fast path so a suspected optimization can be isolated without a rebuild.
 They exist for debugging and benchmarking only — none of them changes
 documented SQL semantics; flipping one must not change results, only speed
-(and error timing).  Bool hatches are on when set to any non-empty value.
+(and error timing).  Most bool hatches test presence (`getenv != nullptr`), so even an empty value or `0` enables them; knobs with value parsing document their own rules.
 
 ## Storage / buffer pool / WAL
 
 | Variable | Meaning |
 | --- | --- |
-| `TINYLAMB_PAGE_POOL_BYTES` | Retired no-op compatibility variable (kept so existing benchmark scripts that export it do not break; `PagePool` has been replaced by in-memory `RowPage` blocks and LSM runs). |
+| `TINYLAMB_PAGE_POOL_BYTES` | PageManager capacity hint in bytes, divided by `kPageSize`; unset/empty or less than one page uses the default. The legacy name remains active. |
 | `TINYLAMB_LOG_SEGMENT_BYTES` | WAL segment file size override. |
-| `TINYLAMB_CHECKPOINT_SECONDS` | Retired no-op compatibility variable (periodic timer checkpoints were replaced by LSM compaction-driven persistence). |
-| `TINYLAMB_CHECKPOINT_FLUSH_MS` | Pacing for the checkpoint flush phase. |
+| `TINYLAMB_CHECKPOINT_SECONDS` | Periodic checkpoint interval in seconds (default 10); `0` disables the timer. Compaction and explicit checkpoints remain separate triggers. |
 | `TINYLAMB_DISABLE_EOR_CHECKPOINT` | Skip the end-of-recovery checkpoint. |
-| `TINYLAMB_WAL_RETENTION_WARN_BYTES` | Warn once WAL volume exceeds this many bytes. |
-| `TINYLAMB_WAL_FREE_WARN_BYTES` | Warn when recyclable-but-unrecycled WAL exceeds this many bytes. |
-| `TINYLAMB_RECOVERY_TRACE` | Verbose per-record recovery tracing. |
-| `TINYLAMB_RECOVERY_WORKERS` | Parallel recovery worker count override. |
-| `TINYLAMB_CORRUPT_TAIL_PROBE` | Fault-injection probe: corrupt the WAL tail (recovery tests). |
-| `TINYLAMB_CRC_BITFLIP_PROBE` | Fault-injection probe: flip CRC bits (checksum tests). |
-| `TINYLAMB_DISABLE_READBUF_NOINIT` | Zero-initialize page read buffers (default skips the memset). |
-| `TINYLAMB_DISABLE_CRC_LANES` | Disable the 4-lane CRC32C kernel. |
+| `TINYLAMB_DISABLE_CRC_LANES` | Disable the 8-lane CRC32C kernel. |
 
 ## Transactions
 
@@ -31,12 +23,8 @@ documented SQL semantics; flipping one must not change results, only speed
 | --- | --- |
 | `TINYLAMB_WRITE_INTENT_WAIT_MS` | Write-intent wait bound override. |
 | `TINYLAMB_DEADLOCK_POLICY` | Deadlock handling selection for benchmarks/tests (`abort`- vs `wait`-first). |
-| `TINYLAMB_DISABLE_INDEX_RESERVATION` | Undo-space reservation for index pages (`0`=on, `1`=off, `2`=off with no shared map; default on). |
+| `TINYLAMB_DISABLE_INDEX_RESERVATION` | Index undo-space diagnostic modes: `0`=on (default), `1`=off, `2`=no shared map, `3`=no per-transaction vector, `4`=registration on with admission discount off, `5`=discount on with tree drain retry off. |
 | `TINYLAMB_INTENT_NO_PROGRESS_RESET` | `=1` restores the entry-time write-intent deadline instead of the default no-progress reset. |
-| `TINYLAMB_TEST_UNDO_STOP_AFTER` | Test hook: stop the recovery loser-undo walk after N applications (deterministic mid-undo crash for `recovery_extra_test`). Unset = full walk. |
-| `TINYLAMB_DISABLE_ANCHOR_VOID` | `=1` disables the body-restore-anchor stale-undo evidence voiding in `UndoLoserChains` (A/B for the stale-separator fix). |
-| `TINYLAMB_DISABLE_SEPARATOR_SWEEP` | `=1` disables the post-undo stale-separator sweep in `RecoverFrom` (A/B). |
-| `TINYLAMB_DISABLE_REDO_REINSERT_FLOOR` | `=1` makes compensation re-insert redo failures fatal again instead of the bounded-loss skip (A/B). |
 
 ## Executor / planner A-B hatches (aggregation)
 
@@ -83,7 +71,7 @@ documented SQL semantics; flipping one must not change results, only speed
 | `TINYLAMB_ENABLE_PREBUILT_SCALAR` | Opt-in prebuilt scalar apply (compile-time GROUP BY join for per-key applies); off by default because the build only pays for itself when reused. |
 | `TINYLAMB_PREBUILT_SCALAR_DEBUG` | Trace why a scalar apply predicate was not peeled to the prebuilt map. |
 | `TINYLAMB_DISABLE_SHARED_EXISTS_BUILD` | Sibling EXISTS/NOT EXISTS build sharing in the subquery runtime (each correlated EXISTS re-scans its base table when set). |
-| `TINYLAMB_SCAN_PROJECTION` | Opt-in Cascades scan-column narrowing at the iterator (`=1` enables projected `FullScanPlan`/scan pushdown); default keeps full-width scans because plan feedback flipped TPC-H Q19 to a slower plan. |
+| `TINYLAMB_SCAN_PROJECTION` | Opt-in Cascades scan-column narrowing at the iterator (any set value, including `0` or an empty string, enables projected `FullScanPlan`/scan pushdown); default keeps full-width scans because plan feedback flipped TPC-H Q19 to a slower plan. |
 | `TINYLAMB_DISABLE_TYPED_FILL` | Typed scan fill (arena publish for cache consumers); falls back to Row-shaped cache fills. |
 
 ## Bytecode / expression
@@ -98,7 +86,7 @@ documented SQL semantics; flipping one must not change results, only speed
 | --- | --- |
 | `TINYLAMB_LEGACY_PLANNER` | Pre-Cascades planning heuristics. |
 | `TINYLAMB_LEGACY_ESTIMATE` | Pre-blend cardinality estimation. |
-| `TINYLAMB_GROUPED_ROUTE` | `=relational` prefers the hand-rolled relational route (scan projections, runtime filters, typed folds, grouped-join fusion) for grouped statements; the default keeps the Cascades-first order because the Cascades core infers OR-branch equijoins the relational heuristic does not (TPC-DS q13 degrades to nested loops under the relational route). |
+| `TINYLAMB_GROUPED_ROUTE` | Unset/default prefers the relational route for grouped statements; `=cascades` selects Cascades first. |
 | `TINYLAMB_RULE_STATS` | Print Cascades rule application counters. |
 | `TINYLAMB_DEBUG_DUMP_MEMO` | Dump every Cascades memo group (tag, scan filter, expression fingerprints) to stderr after exploration. Diagnostic for D1 (one group, one meaning) violations. |
 | `TINYLAMB_PLAN_PROFILE` | `=1` prints plan-time profiling (rule wall time table, parse-subprocess and prepare-statement timings). |
@@ -141,7 +129,6 @@ documented SQL semantics; flipping one must not change results, only speed
 | `TINYLAMB_FUNC_FUZZ_TRACE` | Function fuzzer tracing. |
 | `TINYLAMB_FUZZ_ITERS` | In-process fuzz iteration override. |
 | `TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE` | Fault-injection: make `ScopedDb` create fail (quota-guard tests). |
-| `TINYLAMB_BPT_CONC_FUZZ_SEED` | B+Tree concurrency fuzzer seed. |
 | `TINYLAMB_CALLGRIND_MEASUREMENT` | Benchmark mode tuned for callgrind (skips wall-time assertions). |
 | `TINYLAMB_SKIP_ANALYZE` | `=1` skips the post-load ANALYZE pass in the TPC-H benchmark (profiling-only; statistics stay stale). |
 
@@ -151,3 +138,41 @@ documented SQL semantics; flipping one must not change results, only speed
 | --- | --- |
 | `TINYLAMB_DISABLE_IO_AFFINITY` | When present, leave the PostgreSQL server I/O thread unpinned. Normally Run pins that thread to the first CPU in its inherited allowed set. SQL workers and storage threads retain the full set; synchronous SQL on I/O temporarily restores it, and Run restores the caller mask on exit. Best effort on systems that allow affinity calls. |
 | `TINYLAMB_SERVER_METRICS` | When present, emit cumulative JSON counters to stderr at most once per second: monotonic timestamp, selected I/O CPU (`io_cpu`, -1 if unpinned), worker tasks/queue/execution/completion handoff ns, pending tasks, own-commit WAL waits, WAL sync calls/ns and buffered/durable bytes, active transactions and MVCC chain/snapshot gauges. Enables transaction timing. Blocking execution includes WAL wait; the deferred single-statement path reports separate durability_commands/wait_ns/batches after SQL execution. Compare deltas and subtract nested spans instead of adding them. Sync statistics count runtime segment syncs, including segment rolls, but exclude open-time sync and final shutdown fsync. |
+
+## Additional active controls (source audit, 2026-11-11)
+
+| Variable | Meaning |
+| --- | --- |
+| `TINYLAMB_DBG_CNT` | Retired diagnostic probe: currently read by the optimizer but its body is empty. |
+| `TINYLAMB_DISABLE_ARENA_MEMBERSHIP` | Disable membership construction from a cached base-relation arena. |
+| `TINYLAMB_DISABLE_BUILD_RESIDUAL_HOIST` | Disable build-side residual hoisting in fused grouped joins. |
+| `TINYLAMB_DISABLE_BULK_COUNT` | Disable bulk count updates in fused grouped joins. |
+| `TINYLAMB_DISABLE_COUNT_STAR_FUSION` | Disable COUNT(*) join fusion. |
+| `TINYLAMB_DISABLE_HAVING_FOLD` | Disable HAVING folding in relational aggregation. |
+| `TINYLAMB_DISABLE_PARALLEL_MEMBERSHIP` | Disable parallel membership set construction. |
+| `TINYLAMB_DISABLE_PK_ABSORPTION` | Disable primary-key dimension absorption in input building. |
+| `TINYLAMB_DISABLE_STREAM_GROUPED_JOIN` | Disable streaming grouped joins. |
+| `TINYLAMB_DISABLE_TRANSITIVE_KEY_FILTER` | Disable transitive join-key filters. |
+| `TINYLAMB_EXPR_ROW_ORACLE` | Row-expression oracle selection: `0` disables, another present value enables; unset samples one quarter of seeds. |
+| `TINYLAMB_FORCE_PLAIN` | Force the PAX encoder to choose plain encoding (presence). |
+| `TINYLAMB_FORCE_SCHEME` | Force a named PAX encoding where supported by the chooser. |
+| `TINYLAMB_FUZZ_CONTINUE` | Continue after saving a finding when nonempty and not `0`; default aborts. |
+| `TINYLAMB_FUZZ_DB_DIR` | Directory for temporary scoped fuzzer databases. |
+| `TINYLAMB_FUZZ_FINDINGS_DIR` | Additional directory receiving reproducer and report copies. |
+| `TINYLAMB_FUZZ_TRACE_SQL` | Trace fuzzer SQL and SQL-engine execution diagnostics. |
+| `TINYLAMB_FUZZ_VERBOSE` | Verbose oracle-fuzzer diagnostics. |
+| `TINYLAMB_GOOGLESQL_BIN` | Parser executable fallback override (see frontend executable resolution). |
+| `TINYLAMB_GOOGLESQL_ZYGOTE_SOCK` | Unix socket for the GoogleSQL parser zygote. |
+| `TINYLAMB_JOIN_REGRESSION_DIR` | Override the join-oracle regression corpus directory. |
+| `TINYLAMB_NEGATIVE_CACHE_TTL_SEC` | Positive integer parse-failure cache lifetime in seconds; default 1. |
+| `TINYLAMB_NO_CRC` | Skip the PAX chunk CRC calculation for diagnostics. |
+| `TINYLAMB_NO_HASH_IDX` | Omit the PAX hash index; reads fall back to scans. |
+| `TINYLAMB_NO_INV_IDX` | Omit PAX dictionary inverted indexes. |
+| `TINYLAMB_NO_NEW_SCHEMES` | Disable newer adaptive PAX encoding candidates. |
+| `TINYLAMB_NO_XOR8` | Omit PAX XOR8 row-group filters. |
+| `TINYLAMB_ORACLE_ITERS` | Override SQL oracle test iteration count. |
+| `TINYLAMB_PARSE_CACHE_SIZE` | Total parse-cache capacity, divided across 16 shards; values below 16 are ignored. |
+| `TINYLAMB_SMALL_HASH_IDX` | Use two hash slots per PAX row instead of four, rounded up to a power of two. |
+| `TINYLAMB_VALDBG` | PAX validation diagnostics. |
+
+Retired names removed from the active inventory: `TINYLAMB_BPT_CONC_FUZZ_SEED`, `TINYLAMB_CHECKPOINT_FLUSH_MS`, `TINYLAMB_CORRUPT_TAIL_PROBE`, `TINYLAMB_CRC_BITFLIP_PROBE`, `TINYLAMB_DISABLE_ANCHOR_VOID`, `TINYLAMB_DISABLE_READBUF_NOINIT`, `TINYLAMB_DISABLE_REDO_REINSERT_FLOOR`, `TINYLAMB_DISABLE_SEPARATOR_SWEEP`, `TINYLAMB_RECOVERY_TRACE`, `TINYLAMB_RECOVERY_WORKERS`, `TINYLAMB_TEST_UNDO_STOP_AFTER`, `TINYLAMB_WAL_FREE_WARN_BYTES`, `TINYLAMB_WAL_RETENTION_WARN_BYTES`. They have no current C++ readers.

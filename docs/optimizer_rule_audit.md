@@ -7,6 +7,8 @@
 削除した演算子の enum・DSL・専用テスト・旧ルール解説も除去しています。
 既存の未コミット変更とは別に監査開始時のファイルを保存して比較しました。
 
+2026-11-11 更新: 以下の現在一覧を作業ツリーの登録順に再生成しました。論理 86、物理 46、式 71 登録です。冒頭の削減数は 2026-10-02 当時の記録です。
+
 ## 判定と修正
 
 | 撤去した登録 | 理由と残す経路 |
@@ -68,7 +70,7 @@
 `safe_divide_rewrite`、`function_volatility_classification` を撤去しました。
 volatile 関数の定数畳み込み禁止とゼロ除算の扱いは実際の評価・fold の guard に残します。
 同内容で二度登録されていた `abs_of_abs` も一つにしました。
-式ルールは 70 登録です（Cascades 論理・物理の本数とは別）。
+2026-11-11 の再照合で式ルールは 71 登録です（Cascades 論理・物理の本数とは別）。
 既に登録が存在しない `eliminate_identity_projection` /
 `projection_cse_and_pruning` の旧章も削除。恒等射影の除去はスキーマを比較する
 物理 helper `RemoveIdentityProjection` が担当します。
@@ -215,55 +217,58 @@ stack trace を有効にしておらず、発生箇所・原因を特定でき�
 32. `distinct_over_group_by`
 33. `push_projection_through_aggregation`
 34. `limit_push_through_sort`
-35. `push_filter_through_sort`
-36. `eliminate_sort_under_unordered_consumer`
-37. `distinct_over_distinct`
-38. `cross_to_inner_with_predicate`
-39. `join_empty_simplification`
-40. `intersect_to_semijoin`
-41. `except_to_antijoin`
-42. `distinct_and_group_by_interchange`
-43. `self_join_elimination`
-44. `unique_semi_to_inner`
-45. `outer_to_anti_join`
-46. `right_to_left_outer_join`
-47. `full_outer_join_decomposition`
-48. `outer_to_inner_join_on_null_rejecting_filter`
-49. `outer_join_associativity`
-50. `semi_join_inner_join_reorder`
-51. `semi_join_commutativity`
-52. `push_selection_through_window`
-53. `infer_filter_from_equivalence_class`
-54. `push_semi_join_through_inner_join`
-55. `push_limit_through_left_join`
-56. `merge_adjacent_windows`
-57. `push_not_through_expression`
-58. `no_op_window_elimination`
-59. `dynamic_filter_pushdown_join`
-60. `semi_reduction_pushdown_semi_join`
-61. `semi_reduction_pushdown_anti_join`
-62. `join_predicate_transitivity`
-63. `inferred_inequality_pushdown`
-64. `redundant_join_predicate_elimination`
-65. `unnest_filter_pushdown`
-66. `recursive_termination_predicate_pushdown`
-67. `in_list_to_semi_join`
-68. `functional_dependency_filter_reduction`
-69. `filter_aggregate_pushdown`
-70. `aggregate_union_transpose`
-71. `pk_unique_distinct_elimination`
-72. `not_null_is_not_null_elimination`
-73. `join_identity_dummy`
-74. `count_star_rewrite_on_not_null`
-75. `topn_push_through_proven_one_to_one_join`
-76. `or_to_union`
-77. `distinct_eager_over_join`
-78. `topn_push_through_union_all`
-79. `split_window`
-80. `values_fold_into_union`
-81. `cast_pushdown_on_comparison`
-82. `extract_year_sargable`
-83. `comparison_self_predicates`
+35. `limit_prefix_unordered_window`
+36. `limit_prefix_ordered_window`
+37. `push_filter_through_sort`
+38. `eliminate_sort_under_unordered_consumer`
+39. `distinct_over_distinct`
+40. `cross_to_inner_with_predicate`
+41. `join_empty_simplification`
+42. `intersect_to_semijoin`
+43. `except_to_antijoin`
+44. `distinct_and_group_by_interchange`
+45. `self_join_elimination`
+46. `unique_semi_to_inner`
+47. `outer_to_anti_join`
+48. `right_to_left_outer_join`
+49. `full_outer_join_decomposition`
+50. `outer_to_inner_join_on_null_rejecting_filter`
+51. `outer_join_associativity`
+52. `semi_join_inner_join_reorder`
+53. `semi_join_commutativity`
+54. `push_selection_through_window`
+55. `infer_filter_from_equivalence_class`
+56. `push_semi_join_through_inner_join`
+57. `push_limit_through_left_join`
+58. `merge_adjacent_windows`
+59. `push_not_through_expression`
+60. `no_op_window_elimination`
+61. `dynamic_filter_pushdown_join`
+62. `semi_reduction_pushdown_semi_join`
+63. `semi_reduction_pushdown_anti_join`
+64. `join_predicate_transitivity`
+65. `inferred_inequality_pushdown`
+66. `redundant_join_predicate_elimination`
+67. `unnest_filter_pushdown`
+68. `constant_unnest_to_values`
+69. `recursive_termination_predicate_pushdown`
+70. `in_list_to_semi_join`
+71. `functional_dependency_filter_reduction`
+72. `filter_aggregate_pushdown`
+73. `aggregate_union_transpose`
+74. `pk_unique_distinct_elimination`
+75. `not_null_is_not_null_elimination`
+76. `join_identity_dummy`
+77. `count_star_rewrite_on_not_null`
+78. `topn_push_through_proven_one_to_one_join`
+79. `or_to_union`
+80. `distinct_eager_over_join`
+81. `topn_push_through_union_all`
+82. `split_window`
+83. `values_fold_into_union`
+84. `cast_pushdown_on_comparison`
+85. `extract_year_sargable`
+86. `comparison_self_predicates`
 
 ### 物理
 

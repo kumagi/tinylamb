@@ -98,7 +98,11 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
     Status status = IndexInsert(txn, indexes_.back(), row, it.Position());
     if (status != Status::kSuccess) {
       indexes_.pop_back();
-      std::ignore = LsmIndex(root_pid).Destroy(txn);
+      const Status cleanup = LsmIndex(root_pid).Destroy(txn);
+      if (cleanup != Status::kSuccess) {
+        LOG(WARN) << "CreateIndex compensation failed: " << cleanup;
+        txn.MarkFailed();
+      }
       return status;
     }
     ++it;
@@ -112,7 +116,11 @@ Status Table::CreateIndex(Transaction& txn, const IndexSchema& idx) {
       if (status != Status::kSuccess) {
         index_write_guard.unlock();
         indexes_.pop_back();
-        std::ignore = LsmIndex(root_pid).Destroy(txn);
+        const Status cleanup = LsmIndex(root_pid).Destroy(txn);
+        if (cleanup != Status::kSuccess) {
+          LOG(WARN) << "CreateIndex compensation failed: " << cleanup;
+          txn.MarkFailed();
+        }
         return status;
       }
     }
@@ -124,9 +132,11 @@ namespace {
 // Best-effort compensations run after the primary failure is already decided;
 // their own failures must stay observable instead of vanishing into
 // std::ignore, or heap/index divergence goes undiagnosed.
-void LogCompensationFailure(std::string_view operation, const Status& status) {
+void LogCompensationFailure(Transaction& txn, std::string_view operation,
+                            const Status& status) {
   if (status != Status::kSuccess) {
     LOG(WARN) << "Table compensation " << operation << " failed: " << status;
+    txn.MarkFailed();
   }
 }
 }  // namespace
@@ -137,6 +147,17 @@ Status Table::CheckRowConstraints(const Row& row) const {
                        "row column count does not match table schema");
   }
   for (slot_t i = 0; i < schema_.ColumnCount(); ++i) {
+    if (!row[i].IsNull() &&
+        schema_.GetColumn(i).IsInterval() != row[i].IsInterval()) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "INTERVAL assignment requires an explicit matching type");
+    }
+    if (!schema_.GetColumn(i).IntegerValueFits(row[i])) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "assignment out of range for column " +
+                             schema_.GetColumn(i).Name().name);
+    }
     const Constraint::ConstraintType type =
         schema_.GetColumn(i).GetConstraint().ctype;
     if ((type == Constraint::kNotNull || type == Constraint::kPrimaryKey) &&
@@ -334,6 +355,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
         page_manager->TryReserveTableTail(txn.ID(), first_pid_, ref->PageID());
     if (claim != Status::kSuccess && claim != Status::kConflicts) {
       LOG(ERROR) << "TCHAIN6 status=" << claim;
+      txn.MarkFailed();
       return claim;
     }
     if (claim == Status::kSuccess) {
@@ -341,6 +363,7 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
           page_manager->AllocateNewPage(txn, PageType::kRowPage);
       if (!successor_result.HasValue()) {
         LOG(ERROR) << "TCHAIN7 alloc status=" << successor_result.GetStatus();
+        txn.MarkFailed();
         page_manager->CancelTableTailReservation(txn.ID(), first_pid_);
         return successor_result.GetStatus();
       }
@@ -357,17 +380,22 @@ StatusOr<RowPosition> Table::Insert(Transaction& txn, const Row& row) {
       // the index entries added before the failing one and remove the row
       // that was already written to the row page.
       for (size_t j = 0; j < i; ++j) {
-        LogCompensationFailure("insert-rollback IndexDelete",
+        LogCompensationFailure(txn, "insert-rollback IndexDelete",
                                IndexDelete(txn, indexes_[j], rp));
       }
-      ASSIGN_OR_RETURN(PageRef, written,
-                       txn.GetPageManager()->GetPage(rp.page_id));
+      auto written_result = txn.GetPageManager()->GetPage(rp.page_id);
+      if (!written_result.HasValue()) {
+        LogCompensationFailure(txn, "insert-rollback page lookup",
+                               written_result.GetStatus());
+        return status;
+      }
+      PageRef written = written_result.MoveValue();
       if (written.IsNull()) {
         LogCompensationFailure(
-            "insert-rollback heap Delete",
+            txn, "insert-rollback heap Delete",
             StatusError(StatusCode::kCorrupt, "inserted page is unreadable"));
       } else {
-        LogCompensationFailure("insert-rollback heap Delete",
+        LogCompensationFailure(txn, "insert-rollback heap Delete",
                                written->Delete(txn, rp.slot));
       }
       return status;
@@ -543,7 +571,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     for (size_t j = 0; j < count; ++j) {
       const Status status =
           IndexInsert(txn, indexes_[j], original_row, at, &idx_cursors[j]);
-      LogCompensationFailure("update-rollback IndexInsert", status);
+      LogCompensationFailure(txn, "update-rollback IndexInsert", status);
       if (status != Status::kSuccess) {
         txn.MarkFailed();
       }
@@ -553,7 +581,7 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     for (size_t j = 0; j < count; ++j) {
       const Status status =
           IndexDelete(txn, indexes_[j], new_pos, row, &idx_cursors[j]);
-      LogCompensationFailure("update-rollback IndexDelete", status);
+      LogCompensationFailure(txn, "update-rollback IndexDelete", status);
       if (status != Status::kSuccess) {
         txn.MarkFailed();
       }
@@ -772,6 +800,20 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
   // The copy at new_pos exists; now remove index entries and the original
   // physical row.  Every failure below compensates by dropping the copy and
   // keeping the original intact.
+  const auto drop_reserved_copy = [&] {
+    auto copy_result = txn.GetPageManager()->GetPage(new_pos.page_id);
+    if (!copy_result.HasValue()) {
+      LogCompensationFailure(txn, "update-rollback reserved-copy lookup",
+                             copy_result.GetStatus());
+      return;
+    }
+    PageRef copy_page = copy_result.MoveValue();
+    LogCompensationFailure(txn, "update-rollback reserved-copy Delete",
+                           copy_page.IsNull()
+                               ? StatusError(StatusCode::kCorrupt,
+                                             "reserved copy page is unreadable")
+                               : copy_page->Delete(txn, new_pos.slot));
+  };
   Status failure = Status::kSuccess;
   size_t deleted = 0;
   for (; deleted < indexes_.size(); ++deleted) {
@@ -785,34 +827,21 @@ StatusOr<RowPosition> Table::Update(Transaction& txn, const RowPosition& pos,
     // Drop the reserved copy; the original row survives at pos, but the
     // first `deleted` index entries were already removed and must be
     // reinstated or the row would go missing from those index scans.
-    ASSIGN_OR_RETURN(PageRef, copy_page,
-                     txn.GetPageManager()->GetPage(new_pos.page_id));
-    LogCompensationFailure("update-rollback reserved-copy Delete",
-                           copy_page.IsNull()
-                               ? StatusError(StatusCode::kCorrupt,
-                                             "reserved copy page is unreadable")
-                               : copy_page->Delete(txn, new_pos.slot));
-    copy_page.PageUnlock();
+    drop_reserved_copy();
     reinstate_old_keys(deleted, pos);
     return contextualize(failure, "relocation index update");
   }
-  ASSIGN_OR_RETURN(PageRef, source_page,
-                   txn.GetPageManager()->GetPage(pos.page_id));
-  const Status delete_status = source_page.IsNull()
-                                   ? Status::kNotExists
-                                   : source_page->Delete(txn, pos.slot);
-  source_page.PageUnlock();
+  auto source_result = txn.GetPageManager()->GetPage(pos.page_id);
+  Status delete_status = source_result.GetStatus();
+  if (source_result.HasValue()) {
+    PageRef source_page = source_result.MoveValue();
+    delete_status = source_page.IsNull() ? Status::kNotExists
+                                         : source_page->Delete(txn, pos.slot);
+  }
   if (delete_status != Status::kSuccess) {
     // The original row survives at pos; drop the reserved copy and roll the
     // index deletes back.
-    ASSIGN_OR_RETURN(PageRef, copy_page,
-                     txn.GetPageManager()->GetPage(new_pos.page_id));
-    LogCompensationFailure("update-rollback reserved-copy Delete",
-                           copy_page.IsNull()
-                               ? StatusError(StatusCode::kCorrupt,
-                                             "reserved copy page is unreadable")
-                               : copy_page->Delete(txn, new_pos.slot));
-    copy_page.PageUnlock();
+    drop_reserved_copy();
     reinstate_old_keys(indexes_.size(), pos);
     return contextualize(delete_status, "relocation source delete");
   }
@@ -865,7 +894,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     // The row survives, so every applied index deletion must be undone:
     // "row present x some index entries gone" is not a legal state.
     for (size_t j = 0; j < deleted; ++j) {
-      LogCompensationFailure("delete-rollback IndexInsert",
+      LogCompensationFailure(txn, "delete-rollback IndexInsert",
                              IndexInsert(txn, indexes_[j], original_row, pos));
     }
     return failure;
@@ -903,7 +932,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     // so the surviving row stays reachable from every index.
     for (size_t i = indexes_.size(); 0 < i; --i) {
       LogCompensationFailure(
-          "delete-rollback IndexInsert",
+          txn, "delete-rollback IndexInsert",
           IndexInsert(txn, indexes_[i - 1], original_row, pos));
     }
   }
@@ -1271,6 +1300,7 @@ std::vector<Table::ScanMorsel> Table::BuildScanMorsels(
     Transaction& txn, size_t pages_per_morsel) const {
   StatusOr<TableLease> lease = AcquireLease(txn.ID());
   if (!lease.HasValue()) {
+    txn.MarkFailed();
     return {};
   }
   pages_per_morsel = std::max<size_t>(1, pages_per_morsel);

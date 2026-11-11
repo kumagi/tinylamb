@@ -57,6 +57,7 @@ class IndexScanPlan final : public PlanBase {
 
   [[nodiscard]] const Table* ScanSource() const override { return &table_; }
   [[nodiscard]] const Index& GetIndex() const { return index_; }
+  [[nodiscard]] const Expression& ScanPredicate() const { return where_; }
   // A downstream LIMIT expects a short prefix. This is a scheduling hint,
   // never a cap on visited rows: residual predicates can reject any prefix.
   [[nodiscard]] size_t LimitHint() const { return limit_hint_; }

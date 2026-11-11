@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
 #include "common/platform/hash.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -279,8 +281,7 @@ bool ColumnWithConstantBias(const Expression& expression, ColumnName* column,
     return false;
   }
   const Value& constant = (*constant_side)->AsConstantValue().GetValue();
-  if (constant.IsNull() || (constant.type != ValueType::kInt64 &&
-                            constant.type != ValueType::kDate)) {
+  if (constant.type != ValueType::kInt64 || constant.IsUnsigned()) {
     return false;
   }
   const int64_t magnitude = constant.value.int_value;
@@ -294,11 +295,11 @@ bool ColumnWithConstantBias(const Expression& expression, ColumnName* column,
   return true;
 }
 
-// Offset keys require integer-domain columns: the biased fast paths key on
-// raw int64 storage, and the memcomparable encoder biases INT64/DATE only.
+// Bias arithmetic is exact only for signed INT64 operands on both sides.
+// UINT64 mixed arithmetic can promote to DOUBLE and lose low bits.
 bool BiasedKeyTypesSupported(const Schema& schema, size_t column) {
   const ValueType type = schema.GetColumn(column).Type();
-  return type == ValueType::kInt64 || type == ValueType::kDate;
+  return type == ValueType::kInt64 && !schema.GetColumn(column).IsUnsigned();
 }
 
 }  // namespace
@@ -371,6 +372,14 @@ std::vector<std::pair<ColumnName, ColumnName>> DisjunctCommonEqualities(
 }
 
 }  // namespace
+
+std::vector<std::pair<ColumnName, ColumnName>> NecessaryDisjunctEqualities(
+    const Expression& predicate) {
+  if (!SafeToReduceEvaluationCount(predicate)) {
+    return {};
+  }
+  return DisjunctCommonEqualities(predicate);
+}
 
 // Builds synthetic two-source equality predicates for every disjunctive
 // conjunct in `analyzed`: the pairs `DisjunctCommonEqualities` mines become
@@ -593,11 +602,13 @@ std::vector<EqualityKey> EqualityKeys(
       const auto bare_left = LocalColumnOffset(left, other_column);
       const auto bare_right = LocalColumnOffset(right, other_column);
       if (biased_left && bare_right &&
+          BiasedKeyTypesSupported(left, *biased_left) &&
           BiasedKeyTypesSupported(right, *bare_right)) {
         keys.push_back({*biased_left, *bare_right, false, bias, 0});
         return true;
       }
       if (biased_right && bare_left &&
+          BiasedKeyTypesSupported(right, *biased_right) &&
           BiasedKeyTypesSupported(left, *bare_left)) {
         keys.push_back({*bare_left, *biased_right, false, 0, bias});
         return true;
@@ -642,8 +653,11 @@ bool CompositeIntJoinKey(const Schema& left_schema,
     return false;
   }
   for (size_t i = 0; i < left_columns.size(); ++i) {
-    if (left_schema.GetColumn(left_columns[i]).Type() != ValueType::kInt64 ||
-        right_schema.GetColumn(right_columns[i]).Type() != ValueType::kInt64) {
+    const ValueType left_type = left_schema.GetColumn(left_columns[i]).Type();
+    const ValueType right_type =
+        right_schema.GetColumn(right_columns[i]).Type();
+    if (left_type != right_type ||
+        (left_type != ValueType::kInt64 && left_type != ValueType::kDate)) {
       return false;
     }
   }
@@ -664,6 +678,75 @@ CompositeIntKey EncodeCompositeIntKey(const Row& row,
 }
 namespace {
 
+// Pack the build's actual signed integer/date ranges into at most 63 bits.
+// The sign bit remains an out-of-domain sentinel; no valid key can alias it.
+// This is injective over the ranges, so duplicate chains keep exact equality.
+struct PackedJoinRanges {
+  std::array<int64_t, CompositeIntKey::kMaxParts> minima{};
+  std::array<uint64_t, CompositeIntKey::kMaxParts> spans{};
+  std::array<unsigned, CompositeIntKey::kMaxParts> shifts{};
+
+  [[nodiscard]] int64_t Encode(const Row& row,
+                               const std::vector<slot_t>& columns,
+                               const std::vector<int64_t>& offsets) const {
+    uint64_t packed = 0;
+    bool valid = true;
+    for (size_t k = 0; k < columns.size(); ++k) {
+      const int64_t value =
+          AddJoinKeyBias(row[columns[k]].value.int_value, offsets[k]);
+      const uint64_t relative =
+          static_cast<uint64_t>(value) - static_cast<uint64_t>(minima[k]);
+      valid &= value >= minima[k] && relative <= spans[k];
+      packed |= relative << shifts[k];
+    }
+    return valid ? static_cast<int64_t>(packed)
+                 : std::numeric_limits<int64_t>::min();
+  }
+};
+
+std::optional<PackedJoinRanges> BuildPackedJoinRanges(
+    const Relation& build, const std::vector<slot_t>& columns,
+    const std::vector<int64_t>& offsets) {
+  if (build.rows.size() < 1024) {
+    return std::nullopt;
+  }
+  PackedJoinRanges ranges;
+  ranges.minima.fill(std::numeric_limits<int64_t>::max());
+  std::array<int64_t, CompositeIntKey::kMaxParts> maxima{};
+  maxima.fill(std::numeric_limits<int64_t>::min());
+  bool any = false;
+  for (const Row& row : build.rows) {
+    if (HasNullKey(row, columns)) {
+      continue;
+    }
+    any = true;
+    for (size_t k = 0; k < columns.size(); ++k) {
+      const Value& cell = row[columns[k]];
+      if ((cell.type != ValueType::kInt64 && cell.type != ValueType::kDate) ||
+          cell.IsUnsigned()) {
+        return std::nullopt;
+      }
+      const int64_t value = AddJoinKeyBias(cell.value.int_value, offsets[k]);
+      ranges.minima[k] = std::min(ranges.minima[k], value);
+      maxima[k] = std::max(maxima[k], value);
+    }
+  }
+  if (!any) {
+    return std::nullopt;
+  }
+  unsigned bits = 0;
+  for (size_t k = 0; k < columns.size(); ++k) {
+    ranges.spans[k] = static_cast<uint64_t>(maxima[k]) -
+                      static_cast<uint64_t>(ranges.minima[k]);
+    ranges.shifts[k] = bits;
+    bits += std::bit_width(ranges.spans[k]);
+    if (bits > 63) {
+      return std::nullopt;
+    }
+  }
+  return ranges;
+}
+
 void AppendBigEndian(std::string* output, uint64_t value, size_t width) {
   const size_t offset = output->size();
   output->resize(offset + width);
@@ -682,6 +765,102 @@ void AppendMemcomparableInteger(int64_t input, ValueType prefix, bool flip_sign,
   if (flip_sign) {
     (*output)[offset] ^= static_cast<char>(0x80);
   }
+}
+
+// Resident join inputs outlive their bucket table. Keep references to key
+// cells instead of allocating an encoded string for each build/probe row.
+// The supported domains deliberately retain EncodeJoinKey's byte equality;
+// SQL residuals still decide whether a candidate pair actually matches.
+struct BorrowedJoinKey {
+  const Row* row{nullptr};
+  const std::vector<slot_t>* columns{nullptr};
+  const std::vector<int64_t>* biases{nullptr};
+
+  bool operator==(const BorrowedJoinKey& other) const {
+    if (columns->size() != other.columns->size()) {
+      return false;
+    }
+    for (size_t k = 0; k < columns->size(); ++k) {
+      const Value& a = (*row)[(*columns)[k]];
+      const Value& b = (*other.row)[(*other.columns)[k]];
+      if (a.type != b.type) {
+        return false;
+      }
+      if (a.IsNull()) {
+        continue;
+      }
+      if (a.type == ValueType::kVarChar) {
+        if (a.value.varchar_value != b.value.varchar_value) {
+          return false;
+        }
+      } else if (AddJoinKeyBias(a.value.int_value, (*biases)[k]) !=
+                 AddJoinKeyBias(b.value.int_value, (*other.biases)[k])) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+struct BorrowedJoinKeyHash {
+  size_t operator()(const BorrowedJoinKey& key) const {
+    size_t hash = key.columns->size();
+    for (size_t k = 0; k < key.columns->size(); ++k) {
+      const Value& value = (*key.row)[(*key.columns)[k]];
+      const size_t part = value.IsNull() ? 0
+                          : value.type == ValueType::kVarChar
+                              ? std::hash<Value>{}(value)
+                              : std::hash<int64_t>{}(AddJoinKeyBias(
+                                    value.value.int_value, (*key.biases)[k]));
+      hash ^= part + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+  }
+};
+
+bool CanBorrowJoinKeys(const Relation& a, const Relation& b,
+                       const std::vector<slot_t>& a_columns,
+                       const std::vector<slot_t>& b_columns,
+                       const std::vector<int64_t>& a_biases,
+                       const std::vector<int64_t>& b_biases) {
+  if (a.HasSpill() || b.HasSpill() || a_columns.empty() ||
+      a_columns.size() != b_columns.size()) {
+    return false;
+  }
+  for (size_t k = 0; k < a_columns.size(); ++k) {
+    const auto& ac = a.schema.GetColumn(a_columns[k]);
+    const auto& bc = b.schema.GetColumn(b_columns[k]);
+    const auto type = ac.Type();
+    if (type != bc.Type() || ac.IsUnsigned() || bc.IsUnsigned() ||
+        (type != ValueType::kInt64 && type != ValueType::kDate &&
+         type != ValueType::kVarChar) ||
+        (type != ValueType::kInt64 && (a_biases[k] != 0 || b_biases[k] != 0))) {
+      return false;
+    }
+  }
+  const auto uniform = [](const Relation& input,
+                          const std::vector<slot_t>& columns,
+                          const std::vector<int64_t>& biases) {
+    return std::ranges::all_of(input.rows, [&](const Row& row) {
+      for (size_t k = 0; k < columns.size(); ++k) {
+        const auto& value = row[columns[k]];
+        if (value.IsNull()) {
+          continue;
+        }
+        if (value.type != input.schema.GetColumn(columns[k]).Type() ||
+            value.IsUnsigned() || value.IsCaseInsensitive()) {
+          return false;
+        }
+        int64_t biased = 0;
+        if (biases[k] != 0 &&
+            __builtin_add_overflow(value.value.int_value, biases[k], &biased)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  };
+  return uniform(a, a_columns, a_biases) && uniform(b, b_columns, b_biases);
 }
 
 void AppendMemcomparableValue(const Value& value, std::string* output) {
@@ -1380,30 +1559,23 @@ bool ShouldHybridJoin(const Relation& left, const Relation& right) {
   return PreferHybridHashJoin(estimate);
 }
 
-// Chunked parallel probe for big in-memory hash joins.  The serial probe
-// iterates the left relation on one core while the other workers sit idle;
-// at SF=1 the lineitem-side joins spend seconds there.  Callers gate this
-// on: neither side spills (guaranteed by ShouldHybridJoin), no residual
-// predicate re-entering evaluation, no null-safe keys, no RIGHT/FULL
-// outer emission (it needs shared matched flags), and enough left rows to
-// amortize thread startup.  Workers claim contiguous chunks of left.rows,
-// join into a per-chunk buffer, and flush the buffers through result->AddRow
-// one chunk at a time in strict chunk order, so output row order matches
-// the serial loop exactly.  Left-outer unmatched emission happens inside the
-// worker's chunk buffer, preserving order as well.  At most one buffer per
-// worker is ever in flight, so the query memory budget (and the spill
-// behavior inside AddRow) stays in force.  The build-side buckets are
-// read-only during the probe.
+// Parallel probe for large in-memory hash joins. Workers own statically
+// interleaved chunks and accumulate private Relations; worker-order merging is
+// deterministic for a fixed worker count, but differs from serial probe order.
+// Each Relation observes the query memory budget and can spill. Build buckets
+// are read-only; RIGHT/FULL match tracking uses private worker bitmaps merged
+// after the probe. Callers exclude residual predicates and null-safe keys.
 constexpr size_t kParallelProbeMinLeftRows = 16384;
 constexpr size_t kParallelProbeChunk = 8192;
 constexpr size_t kParallelProbeMaxWorkers = 16;
 
 template <typename Buckets, typename KeyOfRow>
 static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
-    Buckets& buckets, const Relation& left,
-    const std::vector<slot_t>& left_columns, KeyOfRow key_of_row,
-    bool left_outer_emit, size_t right_width, size_t worker_count,
-    Relation* result, size_t* join_comparisons, bool stream_is_left = true) {
+    Buckets& buckets, Relation& left, const std::vector<slot_t>& left_columns,
+    KeyOfRow key_of_row, bool left_outer_emit, size_t right_width,
+    size_t worker_count, Relation* result, size_t* join_comparisons,
+    bool stream_is_left = true, const Row* build_base = nullptr,
+    std::vector<char>* build_matched = nullptr) {
   const size_t total = left.rows.size();
   const size_t num_chunks =
       (total + kParallelProbeChunk - 1) / kParallelProbeChunk;
@@ -1419,6 +1591,14 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
     size_t value{0};
   };
   std::vector<PaddedComparison> comparisons(worker_count);
+  // A private bitmap per worker avoids races when multiple probe rows match
+  // the same build row. The caller reserves this auxiliary query memory.
+  std::vector<std::vector<char>> worker_matches(worker_count);
+  if (build_matched != nullptr) {
+    for (auto& flags : worker_matches) {
+      flags.resize(build_matched->size());
+    }
+  }
   std::mutex error_mutex;
   Status first_error{Status::kSuccess};
 
@@ -1435,7 +1615,7 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
         // probe anyway, so prefetching their (unused) keys is harmless.
         auto next_key = key_of_row(left.rows[begin]);
         for (size_t i = begin; i < end; ++i) {
-          const Row& left_row = left.rows[i];
+          Row& left_row = left.rows[i];
           // Carried across iterations: every move is followed by a fresh
           // assignment for the next i, except on the final one where the
           // loop exits before next_key is read again.
@@ -1447,23 +1627,39 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
           }
           if (HasNullKey(left_row, left_columns)) {
             if (left_outer_emit) {
-              std::vector<Value> nulls(right_width);
-              local.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
+              left_row.values_.resize(left_row.Count() + right_width);
+              local.AddRow(std::move(left_row));
             }
             continue;
           }
-          bool matched = false;
           const auto [eq_begin, eq_end] = buckets.equal_range(key);
-          for (auto iter = eq_begin; iter != eq_end; ++iter) {
-            ++comparisons[worker_id].value;
-            Row combined = stream_is_left ? ConcatRows(left_row, *iter->second)
-                                          : ConcatRows(*iter->second, left_row);
-            local.AddRow(std::move(combined));
-            matched = true;
+          if (eq_begin == eq_end) {
+            if (left_outer_emit) {
+              left_row.values_.resize(left_row.Count() + right_width);
+              local.AddRow(std::move(left_row));
+            }
+            continue;
           }
-          if (!matched && left_outer_emit) {
-            std::vector<Value> nulls(right_width);
-            local.AddRow(ConcatRows(left_row, Row(std::move(nulls))));
+          for (auto iter = eq_begin; iter != eq_end;) {
+            const Row* build_row = iter->second;
+            // Advance while a borrowed probe key still has its original row.
+            // Only the last match may consume the input buffer.
+            ++iter;
+            ++comparisons[worker_id].value;
+            if (build_matched != nullptr) {
+              worker_matches[worker_id]
+                            [static_cast<size_t>(build_row - build_base)] = 1;
+            }
+            if (iter == eq_end) {
+              auto& values = left_row.values_;
+              values.insert(stream_is_left ? values.end() : values.begin(),
+                            build_row->values_.begin(),
+                            build_row->values_.end());
+              local.AddRow(std::move(left_row));
+              break;
+            }
+            local.AddRow(stream_is_left ? ConcatRows(left_row, *build_row)
+                                        : ConcatRows(*build_row, left_row));
           }
         }
       } catch (const std::exception& error) {
@@ -1483,16 +1679,7 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
     }
   };
 
-  if (worker_count <= 1) {
-    run_worker(0);
-  } else {
-    std::vector<std::jthread> workers;
-    workers.reserve(worker_count - 1);
-    for (size_t i = 1; i < worker_count; ++i) {
-      workers.emplace_back([&, i] { run_worker(i); });
-    }
-    run_worker(0);
-  }
+  RETURN_IF_FAIL(RunParallelTasks(worker_count, run_worker));
   size_t total_in_memory = 0;
   for (size_t w = 0; w < worker_count; ++w) {
     if (!shards[w].HasSpill()) {
@@ -1524,6 +1711,13 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
   }
   for (const PaddedComparison& count : comparisons) {
     *join_comparisons += count.value;
+  }
+  if (build_matched != nullptr) {
+    for (const auto& flags : worker_matches) {
+      for (size_t i = 0; i < flags.size(); ++i) {
+        (*build_matched)[i] |= flags[i];
+      }
+    }
   }
   return first_error;
 }  // namespace
@@ -1789,18 +1983,27 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     }
     ++result.in_memory_hash_joins;
     // Parallel chunked probe (see ParallelHashProbe): needs a pure row
-    // decision (no residual re-entering TryEvaluate), no shared right-side
-    // matched flags, and a probe side big enough to amortize the threads.
+    // decision (no residual re-entering TryEvaluate) and a probe side big
+    // enough to amortize the threads. FULL/RIGHT use private matched flags.
     static const bool probe_disabled =
         std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE") != nullptr;
-    const bool can_parallelize = !probe_disabled && residual.empty() &&
-                                 using_residuals.empty() &&
-                                 !has_null_safe_key && !want_right_nulls &&
-                                 left.rows.size() >= kParallelProbeMinLeftRows;
+    bool can_parallelize = !probe_disabled && residual.empty() &&
+                           using_residuals.empty() && !has_null_safe_key &&
+                           left.rows.size() >= kParallelProbeMinLeftRows;
     const size_t probe_workers =
-        can_parallelize ? std::min<size_t>(kParallelProbeMaxWorkers,
-                                           std::thread::hardware_concurrency())
-                        : 1;
+        can_parallelize
+            ? std::min<size_t>(
+                  kParallelProbeMaxWorkers,
+                  QueryParallelWorkerLimit(std::thread::hardware_concurrency()))
+            : 1;
+    std::shared_ptr<QueryMemoryCharge> matched_charge;
+    if (can_parallelize && want_right_nulls) {
+      if (right.rows.size() <= SIZE_MAX / probe_workers) {
+        matched_charge =
+            TryReserveQueryMemory(right.rows.size() * probe_workers);
+      }
+      can_parallelize = matched_charge != nullptr;
+    }
     const bool integer_key = !has_null_safe_key &&
                              SingleIntegerJoinKey(left.schema, left_columns) &&
                              SingleIntegerJoinKey(right.schema, right_columns);
@@ -1822,7 +2025,8 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
                                     left_key_offsets[0]);
             },
             want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
-            &result.join_comparisons));
+            &result.join_comparisons, true, right_base,
+            want_right_nulls ? &right_matched : nullptr));
         RETURN_IF_FAIL(residual_error);
       } else {
         for (const Row& left_row : left.rows) {
@@ -1849,47 +2053,69 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     } else if (!has_null_safe_key &&
                CompositeIntJoinKey(left.schema, left_columns, right.schema,
                                    right_columns)) {
-      FlatJoinBuckets<CompositeIntKey, CompositeIntKeyHash> buckets;
-      buckets.reserve(right.rows.size());
-      for (const Row& row : right.rows) {
-        if (HasNullKey(row, right_columns)) {
-          continue;
+      const auto join_with_keys = [&](auto& buckets, const auto& build_key,
+                                      const auto& probe_key) -> Status {
+        buckets.reserve(right.rows.size());
+        for (const Row& row : right.rows) {
+          if (HasNullKey(row, right_columns)) {
+            continue;
+          }
+          buckets.emplace(build_key(row), &row);
         }
-        buckets.emplace(
-            EncodeCompositeIntKey(row, right_columns, &right_key_offsets),
-            &row);
-      }
-      if (can_parallelize) {
-        RETURN_IF_FAIL(ParallelHashProbe(
-            buckets, left, left_columns,
+        if (can_parallelize) {
+          RETURN_IF_FAIL(ParallelHashProbe(
+              buckets, left, left_columns, probe_key, want_left_nulls,
+              right.schema.ColumnCount(), probe_workers, &result,
+              &result.join_comparisons, true, right_base,
+              want_right_nulls ? &right_matched : nullptr));
+          RETURN_IF_FAIL(residual_error);
+        } else {
+          for (const Row& left_row : left.rows) {
+            bool matched = false;
+            if (!HasNullKey(left_row, left_columns)) {
+              const auto key = probe_key(left_row);
+              const auto [begin, end] = buckets.equal_range(key);
+              for (auto iter = begin; iter != end; ++iter) {
+                ++result.join_comparisons;
+                Row combined = ConcatRows(left_row, *iter->second);
+                if (matches(combined)) {
+                  mark_right_match(*iter->second);
+                  result.AddRow(std::move(combined));
+                  matched = true;
+                }
+              }
+            }
+            if (!matched) {
+              emit_unmatched(left_row);
+            }
+          }
+        }
+        return Status::kSuccess;
+      };
+      const auto packed =
+          BuildPackedJoinRanges(right, right_columns, right_key_offsets);
+      if (packed) {
+        FlatJoinBuckets<int64_t> buckets;
+        RETURN_IF_FAIL(join_with_keys(
+            buckets,
+            [&](const Row& row) {
+              return packed->Encode(row, right_columns, right_key_offsets);
+            },
+            [&](const Row& row) {
+              return packed->Encode(row, left_columns, left_key_offsets);
+            }));
+      } else {
+        FlatJoinBuckets<CompositeIntKey, CompositeIntKeyHash> buckets;
+        RETURN_IF_FAIL(join_with_keys(
+            buckets,
+            [&](const Row& row) {
+              return EncodeCompositeIntKey(row, right_columns,
+                                           &right_key_offsets);
+            },
             [&](const Row& row) {
               return EncodeCompositeIntKey(row, left_columns,
                                            &left_key_offsets);
-            },
-            want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
-            &result.join_comparisons));
-        RETURN_IF_FAIL(residual_error);
-      } else {
-        for (const Row& left_row : left.rows) {
-          bool matched = false;
-          if (!HasNullKey(left_row, left_columns)) {
-            const CompositeIntKey key = EncodeCompositeIntKey(
-                left_row, left_columns, &left_key_offsets);
-            const auto [begin, end] = buckets.equal_range(key);
-            for (auto iter = begin; iter != end; ++iter) {
-              ++result.join_comparisons;
-              Row combined = ConcatRows(left_row, *iter->second);
-              if (matches(combined)) {
-                mark_right_match(*iter->second);
-                result.AddRow(std::move(combined));
-                matched = true;
-              }
-            }
-          }
-          if (!matched) {
-            emit_unmatched(left_row);
-          }
-        }
+            }));
       }
     } else {
       FlatJoinBuckets<std::string> buckets;
@@ -1910,7 +2136,8 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
               return EncodeJoinKey(row, left_columns, &left_key_offsets);
             },
             want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
-            &result.join_comparisons));
+            &result.join_comparisons, true, right_base,
+            want_right_nulls ? &right_matched : nullptr));
         RETURN_IF_FAIL(residual_error);
       } else {
         for (const Row& left_row : left.rows) {
@@ -2016,24 +2243,20 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
           ? predicates
           : ResidualJoinPredicates(left.schema, right.schema, predicates);
 
+  const CompiledScanFilter residual_filter =
+      CompileScanFilter(residual, result.schema);
   Status residual_error{Status::kSuccess};
   auto matches = [&](const Row& combined) {
     if (residual.empty()) {
       return true;
     }
-    Scope scope{.row = &combined, .schema = &result.schema, .outer = outer};
-    return std::ranges::all_of(residual, [&](const Expression& predicate) {
-      if (residual_error != Status::kSuccess) {
-        return false;
-      }
-      StatusOr<Value> value =
-          TryEvaluate(predicate, scope, nullptr, context, ctes);
-      if (!value.HasValue()) {
-        residual_error = value.GetStatus();
-        return false;
-      }
-      return Truthy(value.Value());
-    });
+    if (residual_error != Status::kSuccess) {
+      return false;
+    }
+    // Join residuals share WHERE's scalar/three-valued semantics. Compile
+    // once instead of walking the expression tree for every matching pair.
+    return MatchScanFilter(combined, result.schema, residual_filter, outer,
+                           context, ctes, &residual_error);
   };
 
   if (equality_keys.empty()) {
@@ -2066,7 +2289,7 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
                       right.TotalRows() > left.TotalRows() * kFlipRatio &&
                       !left.HasSpill();
     const Relation& build_side = flip ? left : right;
-    const Relation& probe_side = flip ? right : left;
+    Relation& probe_side = flip ? right : left;
     const size_t index_bytes = build_side.TotalRows() * 64;
     const bool hybrid = build_side.HasSpill() ||
                         !QueryMemoryBudget::Global().CanReserve(index_bytes);
@@ -2140,9 +2363,11 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
         residual.empty() && !has_null_safe_key && !probe_side.HasSpill() &&
         probe_side.rows.size() >= kParallelProbeMinLeftRows;
     const size_t probe_workers =
-        can_parallelize ? std::min<size_t>(kParallelProbeMaxWorkers,
-                                           std::thread::hardware_concurrency())
-                        : 1;
+        can_parallelize
+            ? std::min<size_t>(
+                  kParallelProbeMaxWorkers,
+                  QueryParallelWorkerLimit(std::thread::hardware_concurrency()))
+            : 1;
     const bool integer_key = !has_null_safe_key &&
                              SingleIntegerJoinKey(left.schema, left_columns) &&
                              SingleIntegerJoinKey(right.schema, right_columns);
@@ -2320,6 +2545,62 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
           }));
         }
       }
+    } else if (!has_null_safe_key &&
+               CanBorrowJoinKeys(build_side, probe_side, build_columns,
+                                 probe_columns, build_key_offsets,
+                                 probe_key_offsets)) {
+      // Every predicate contributed exactly one equality key. Validated
+      // domains and overflow-free biases make a bucket hit the final verdict.
+      const bool exact_keys = predicates.size() == equality_keys.size();
+      const bool parallel =
+          can_parallelize ||
+          (exact_keys && probe_side.rows.size() >= kParallelProbeMinLeftRows);
+      const size_t borrowed_workers =
+          can_parallelize
+              ? probe_workers
+              : std::min<size_t>(kParallelProbeMaxWorkers,
+                                 QueryParallelWorkerLimit(
+                                     std::thread::hardware_concurrency()));
+      FlatJoinBuckets<BorrowedJoinKey, BorrowedJoinKeyHash> buckets;
+      buckets.reserve(build_side.rows.size());
+      for (const Row& row : build_side.rows) {
+        if (!HasNullKey(row, build_columns)) {
+          buckets.emplace(BorrowedJoinKey{.row = &row,
+                                          .columns = &build_columns,
+                                          .biases = &build_key_offsets},
+                          &row);
+        }
+      }
+      if (parallel) {
+        RETURN_IF_FAIL(ParallelHashProbe(
+            buckets, probe_side, probe_columns,
+            [&](const Row& row) {
+              return BorrowedJoinKey{.row = &row,
+                                     .columns = &probe_columns,
+                                     .biases = &probe_key_offsets};
+            },
+            false, build_side.schema.ColumnCount(), borrowed_workers, &result,
+            &result.join_comparisons, !flip));
+        RETURN_IF_FAIL(residual_error);
+      } else {
+        for (const Row& row : probe_side.rows) {
+          if (HasNullKey(row, probe_columns)) {
+            continue;
+          }
+          const auto [begin, end] = buckets.equal_range(
+              BorrowedJoinKey{.row = &row,
+                              .columns = &probe_columns,
+                              .biases = &probe_key_offsets});
+          for (auto iter = begin; iter != end; ++iter) {
+            ++result.join_comparisons;
+            Row combined = flip ? ConcatRows(*iter->second, row)
+                                : ConcatRows(row, *iter->second);
+            if (exact_keys || matches(combined)) {
+              result.AddRow(std::move(combined));
+            }
+          }
+        }
+      }
     } else {
       FlatJoinBuckets<std::string> buckets;
       buckets.reserve(build_side.rows.size());
@@ -2435,9 +2716,21 @@ std::vector<SelectSource> ReduceOuterJoinsToInner(
   if (!resolved) {
     return reduced;
   }
-  const auto qualifier = [&](size_t index) {
-    const SelectSource& source = reduced[index];
-    return source.alias.empty() ? source.table : source.alias;
+  // Resolve bare names against the same schemas used by predicate analysis.
+  // A qualifier-only check misses valid null rejection in ordinary SQL such
+  // as `WHERE return_reason = reason_key` after a LEFT JOIN.
+  const auto rejects_side = [&](size_t begin, size_t end) {
+    return ExpressionRejectsNullsWhere(
+        where,
+        [&](const ColumnName& column) {
+          for (size_t source = begin; source < end; ++source) {
+            if (LocalColumnOffset(schemas[source].schema, column)) {
+              return true;
+            }
+          }
+          return false;
+        },
+        /*bare_column_rejects_null=*/true);
   };
   bool any_outer = false;
   bool all_reducible = true;
@@ -2453,30 +2746,13 @@ std::vector<SelectSource> ReduceOuterJoinsToInner(
       all_reducible = false;
       continue;
     }
-    std::unordered_set<std::string> prefix;
-    for (size_t source = 0; source < index; ++source) {
-      const std::string name = qualifier(source);
-      if (name.empty()) {
-        all_reducible = false;
-      } else {
-        prefix.insert(name);
-      }
-    }
-    std::unordered_set<std::string> right;
-    const std::string right_name = qualifier(index);
-    if (right_name.empty()) {
-      all_reducible = false;
-    } else {
-      right.insert(right_name);
-    }
     bool rejects = false;
     if (type == JoinType::kLeft) {
-      rejects = ExpressionRejectsNullsOnRelations(where, right);
+      rejects = rejects_side(index, index + 1);
     } else if (type == JoinType::kRight) {
-      rejects = ExpressionRejectsNullsOnRelations(where, prefix);
+      rejects = rejects_side(0, index);
     } else {
-      rejects = ExpressionRejectsNullsOnRelations(where, prefix) &&
-                ExpressionRejectsNullsOnRelations(where, right);
+      rejects = rejects_side(0, index) && rejects_side(index, index + 1);
     }
     if (rejects) {
       reduced[index].join_type = JoinType::kInner;

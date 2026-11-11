@@ -34,7 +34,7 @@
 namespace tinylamb::fuzz {
 namespace {
 
-constexpr const SchemeCase* const kCases = kSchemeCases;
+constexpr const SchemeCase* const kCases = kSchemeCases.data();
 constexpr size_t kCaseCount = kSchemeCaseCount;
 
 PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
@@ -51,7 +51,8 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
   for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
     setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
     PaxChunk chunk = PaxChunk::BuildFromSortedRun(
-        MakeRun(MakeStorageRows(c.shapes[s]), sc), sc);
+                         MakeRun(MakeStorageRows(c.shapes[s]), sc), sc)
+                         .MoveValue();
     unsetenv("TINYLAMB_FORCE_SCHEME");
     const auto& enc = chunk.GetFooter().encodings;
     if (!enc.empty() && enc[c.col] == static_cast<uint8_t>(c.expected)) {

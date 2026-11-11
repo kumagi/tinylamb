@@ -92,6 +92,8 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // Semi/anti variants (decorrelated IN / EXISTS / NOT EXISTS). The probe
   // side is always the left child: matching emits that row once (semi) or
   // not at all (anti), and its row position survives for UPDATE/DELETE.
+  // Outer/single joins require the null-supplying input's width when that
+  // input is empty; omitted widths are inferred only from actual input rows.
   HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
            std::vector<slot_t> right_cols, HashJoinMode mode, JoinKind kind,
            size_t worker_count = std::thread::hardware_concurrency(),

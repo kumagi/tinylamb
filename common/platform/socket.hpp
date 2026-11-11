@@ -19,7 +19,7 @@
 
 #include "common/platform/os.hpp"
 
-#if defined(TINYLAMB_OS_WINDOWS)
+#ifdef TINYLAMB_OS_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -127,7 +127,7 @@ inline constexpr int kSendNoSignal = MSG_NOSIGNAL;
 ssize_t SendNoSignal(int fd, const void* data, size_t size,
                      int extra_flags = 0);
 
-#if defined(TINYLAMB_OS_POSIX)
+#ifdef TINYLAMB_OS_POSIX
 ssize_t SendMsgNoSignal(int fd, const msghdr* message, int extra_flags = 0);
 
 // posix_spawnattr_init plus the platform's "do not leak descriptors into the

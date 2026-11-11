@@ -186,9 +186,9 @@ class Database final : public CatalogReader {
 
   void EmulateCrash();
 
-  // Forces a fuzzy checkpoint now (the periodic 5 s worker is far too slow
-  // to matter in a test/fuzz iteration).  No page latch may be held on this
-  // thread.  Returns the begin-checkpoint LSN recovery will resume from.
+  // Forces a fuzzy checkpoint now (the automatic compaction/checkpoint worker is far too
+  // slow to matter in a test/fuzz iteration).  No page latch may be held on
+  // this thread.  Returns the begin-checkpoint LSN recovery will resume from.
   StatusOr<lsn_t> WriteCheckpoint();
 
   void DeleteAll();

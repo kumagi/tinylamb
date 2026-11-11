@@ -46,13 +46,13 @@ namespace {
 // but a surviving mixed DATE/text array surfaces as a per-row type flip that
 // vectorized consumers reject (column vector type mismatch).  Normalize
 // textual elements back to the declared runtime type at the unnest boundary.
-void CoerceElementsToDeclaredType(Value* array_val) {
+Status CoerceElementsToDeclaredType(Value* array_val) {
   if (array_val == nullptr || !array_val->IsArray()) {
-    return;
+    return Status::kSuccess;
   }
   const std::string& declared = array_val->ArrayElementSqlType();
   if (declared != "DATE") {
-    return;
+    return Status::kSuccess;
   }
   std::vector<Value> coerced;
   bool changed = false;
@@ -61,20 +61,14 @@ void CoerceElementsToDeclaredType(Value* array_val) {
       coerced.push_back(element);
       continue;
     }
-    const std::string text(element.value.varchar_value);
-    int y = 0, m = 0, d = 0;
-    // Best-effort gate only; Value::Date() revalidates the parsed text below.
-    // NOLINTNEXTLINE(cert-err34-c)
-    if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) == 3) {
-      coerced.push_back(Value::Date(text));
-      changed = true;
-    } else {
-      coerced.push_back(element);
-    }
+    ASSIGN_OR_RETURN(Value, date, Value::TryDate(element.value.varchar_value));
+    coerced.push_back(std::move(date));
+    changed = true;
   }
   if (changed) {
     *array_val = Value::Array(std::move(coerced), declared);
   }
+  return Status::kSuccess;
 }
 
 // Re-projects one unnest relation onto the plan's declared unnest section.
@@ -168,7 +162,10 @@ bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
       return FailWith(evaluated.GetStatus());
     }
     Value array_val = evaluated.MoveValue();
-    CoerceElementsToDeclaredType(&array_val);
+    if (const Status status = CoerceElementsToDeclaredType(&array_val);
+        !status.ok()) {
+      return FailWith(status);
+    }
 
     SelectSource source;
     source.alias = alias_.empty() ? "unnest" : alias_;
@@ -194,7 +191,7 @@ bool UnnestExecutor::NextRow(Row* dst, RowPosition* rp) {
 
 size_t UnnestExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
   destination->Reset();
-  if (max_rows == 0) {
+  if (max_rows == 0 || GetStatus() != Status::kSuccess) {
     return 0;
   }
   Row row;

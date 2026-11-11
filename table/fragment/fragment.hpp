@@ -35,7 +35,7 @@
 namespace tinylamb {
 
 // ---------------------------------------------------------------------------
-// The fragment IR (see Interface.md §3).
+// The fragment IR.
 //
 // A fragment is ONE pipeline that a single storage call can execute:
 //
@@ -48,7 +48,7 @@ namespace tinylamb {
 //     -> limit (optional)
 //
 // The SAME fragment description is handed to Estimate() and Execute(): the
-// contract in Interface.md §1.2 forbids splitting the estimate formula from
+// contract here forbids splitting the estimate formula from
 // the execution kernel, because a scheme added on one side only would make
 // the optimizer compare a cost against a capability the executor does not
 // have.
@@ -62,7 +62,7 @@ namespace tinylamb {
 // module expose the same contract with different kernel coverage.
 enum class Runtime { kNative, kWasm };
 
-// The capability bits (Interface.md §4). Taken once per session; a bit
+// The capability bits. Taken once per session; a bit
 // answers "does THIS build of THIS runtime have the kernel for that
 // operator", never "which scheme is this column encoded with".
 struct Capabilities {
@@ -97,7 +97,7 @@ struct Capabilities {
 // The capability bits of a runtime.
 [[nodiscard]] Capabilities GetCapabilities(Runtime runtime);
 
-// Calibrate(runtime) -> ns_per_cpu_unit (Interface.md §6.1). One cpu_unit is
+// Calibrate(runtime) -> ns_per_cpu_unit. One cpu_unit is
 // "compare one PLAIN int64 against one literal". The factor is measured
 // against a fixed PLAIN microbenchmark so the optimizer can compare a native
 // fragment with a WASM one in the same unit.
@@ -174,7 +174,7 @@ struct Aggregate {
 
 // ORDER BY <single column> LIMIT k.
 //
-// The SCOPE of the Top-K pushdown, stated once (Interface.md §3.2):
+// The SCOPE of the Top-K pushdown, stated once:
 //
 //   IN SCOPE : `ORDER BY <one column> [ASC|DESC] LIMIT k` over ONE
 //              artifact set, with no other ORDER BY column and no OFFSET.
@@ -257,7 +257,7 @@ enum class Cardinality { kExact, kHistogram, kNotAccounted };
 enum class Coverage { kFull, kPartial, kNone };
 enum class DuplicateElimination { kApplied, kNotAccounted };
 
-// The price of a fragment (Interface.md §6.2).
+// The price of a fragment.
 struct CostReport {
   double startup_units = 0;
   double cpu_units = 0;
@@ -280,7 +280,7 @@ struct CostReport {
 };
 
 // The classification of one conjunct, used by the optimizer's search
-// (Interface.md §6.3). The labels are stable: adding a scheme classifies it
+//. The labels are stable: adding a scheme classifies it
 // under an existing label instead of inventing one.
 enum class QuoteClass {
   kMetadata,        // zone maps, constant cells, closed forms, footer sums
@@ -312,7 +312,7 @@ struct ConjunctQuote {
 // One output group.
 struct GroupOutput {
   std::vector<int64_t> key;
-  int64_t sum = 0;
+  int64_t sum = 0;  // SUM uses two's-complement int64 truncation.
   int64_t min_val = 0;
   int64_t max_val = 0;
   uint64_t count = 0;

@@ -125,7 +125,7 @@ class ScopedDb {
 
  private:
   static std::string ResolveDbName(std::string_view prefix) {
-    const std::string base = std::string(prefix) + "-" + RandomString(8);
+    std::string base = std::string(prefix) + "-" + RandomString(8);
     const char* db_dir = std::getenv("TINYLAMB_FUZZ_DB_DIR");
     if (db_dir == nullptr || *db_dir == '\0') {
       return base;

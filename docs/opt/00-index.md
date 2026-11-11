@@ -11,7 +11,7 @@
 - 第2部のファイルパスは `part2-rules/<種別>/<rule-name>.md`(表では種別列で省略)。
 - 分類(A〜K など)は暫定。執筆時に前後してもよい(AGENTS.md §11)。
 
-進捗サマリ: 全 216 ファイル（基礎編 7/7、第 2 部 207/207、管理文書 2/2）の原稿を作成済み。
+進捗サマリ: 全 171 ファイル（基礎編 7、第 2 部 162、管理文書 2。2026-11-11 実ファイル数）の原稿を作成済み。
 2026-09-20 に全原稿の日本語を再点検し、敬体の統一、重複の削除、直訳調・冗長表現の修正を実施した。内容とコード引用のレビュー状況は、以下の表にある各章の状態で管理する。
 
 ## 第1部 基礎編(`part1-foundations/`)
@@ -42,7 +42,14 @@
 
 ## 第2部 Rule リファレンス(`part2-rules/`)
 
-### 論理 Rule(83 本)
+2026-11-11 追加章（作業ツリー照合、review）:
+
+- [constant_unnest_to_values](part2-rules/logical/constant_unnest_to_values.md)
+- [limit_prefix_unordered_window](part2-rules/logical/limit_prefix_unordered_window.md)
+- [limit_prefix_ordered_window](part2-rules/logical/limit_prefix_ordered_window.md)
+- [json_family_constant_fold](part2-rules/expression/json_family_constant_fold.md)
+
+### 論理 Rule(86 本)
 
 | Rule 名 | 分類 | 状態 |
 |---|---|---|

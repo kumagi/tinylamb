@@ -551,9 +551,10 @@ TEST_F(SqlFunctionCoverageTest, IfBranches) {
   ExpectRow("SELECT IF(TRUE, 1, 2), IF(FALSE, 1, 2)",
             Row({Value(1), Value(2)}));
   ExpectScalar("SELECT IF(TRUE, 1.5, 2)", Value(1.5));
-  // Untaken branch is not evaluated: an error there never surfaces.
-  ExpectScalar("SELECT IF(TRUE, 1, 1/0)", Value(1));
-  ExpectScalar("SELECT IF(FALSE, 1/0, 42)", Value(42));
+  // Untaken branch is not evaluated, but its DOUBLE type participates
+  // in the common result type.
+  ExpectScalar("SELECT IF(TRUE, 1, 1/0)", Value(1.0));
+  ExpectScalar("SELECT IF(FALSE, 1/0, 42)", Value(42.0));
   // A NULL condition is not truthy, so the else branch is taken.
   ExpectScalar("SELECT IF(NULL, 1, 2)", Value(2));
   ExpectError("SELECT IF(TRUE, 1)");
@@ -766,7 +767,8 @@ TEST_F(SqlFunctionCoverageTest, SafeCastNullsOnError) {
 }
 
 TEST_F(SqlFunctionCoverageTest, CastIntervalBranches) {
-  ExpectScalar("SELECT CAST('1-2 3 4:5:6' AS INTERVAL)", Value("1-2 3 4:5:6"));
+  ExpectScalar("SELECT CAST('1-2 3 4:5:6' AS INTERVAL)",
+               Value("1-2 3 4:5:6").WithInterval());
   ExpectNullScalar("SELECT CAST(NULL AS INTERVAL)");
 }
 
@@ -848,10 +850,12 @@ TEST_F(SqlFunctionCoverageTest, BinaryUnsignedMixedBranches) {
 }
 
 TEST_F(SqlFunctionCoverageTest, BinaryIntervalArithmetic) {
-  ExpectScalar("SELECT '0-0 2 0:0:0' * 3", Value("0-0 6 0:0:0"));
-  ExpectScalar("SELECT 3 * '0-0 2 0:0:0'", Value("0-0 6 0:0:0"));
-  ExpectScalar("SELECT '0-0 2 0:0:0' + '0-0 1 0:0:0'", Value("0-0 3 0:0:0"));
-  ExpectScalar("SELECT '0-0 2 0:0:0' - '0-0 1 0:0:0'", Value("0-0 1 0:0:0"));
+  ExpectScalar("SELECT '0-0 2 0:0:0' * 3", Value("0-0 6 0:0:0").WithInterval());
+  ExpectScalar("SELECT 3 * '0-0 2 0:0:0'", Value("0-0 6 0:0:0").WithInterval());
+  ExpectScalar("SELECT '0-0 2 0:0:0' + '0-0 1 0:0:0'",
+               Value("0-0 3 0:0:0").WithInterval());
+  ExpectScalar("SELECT '0-0 2 0:0:0' - '0-0 1 0:0:0'",
+               Value("0-0 1 0:0:0").WithInterval());
   ExpectScalar("SELECT '0-0 2 0:0:0' = '0-0 2 0:0:0'", Value(true));
   ExpectScalar("SELECT '0-0 1 0:0:0' < '0-0 2 0:0:0'", Value(true));
 }
@@ -1054,7 +1058,8 @@ TEST_F(SqlFunctionCoverageTest, DateTimeFunctionFamily) {
       "SELECT FORMAT_DATETIME('%Y-%m-%d %H:%M:%S', "
       "DATETIME '2026-01-02 03:04:05', 'UTC')",
       Value("2026-01-02 03:04:05"));
-  ExpectScalar("SELECT MAKE_INTERVAL(1, 2)", Value("0-0 1 0:0:0"));
+  ExpectScalar("SELECT MAKE_INTERVAL(1, 2)",
+               Value("0-0 1 0:0:0").WithInterval());
   // CURRENT_* depend on the clock: only assert they evaluate to non-NULL.
   const auto now_rows = RunSql(engine_.get(), context_.get(),
                                "SELECT CURRENT_DATE(), CURRENT_DATETIME()");

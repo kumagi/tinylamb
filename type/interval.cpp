@@ -539,8 +539,14 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
             ok = false;
             break;
           }
-          iv.nanos += static_cast<int64_t>(std::round(
-              (static_cast<double>((th * 3600) + (tm * 60)) + ts) * 1e9));
+          const auto seconds = static_cast<int64_t>(ts);
+          const auto fraction = static_cast<int64_t>(
+              std::round((ts - static_cast<double>(seconds)) * 1e9));
+          const int64_t whole_seconds = checked_add(
+              checked_mul(th, 3600), checked_add(checked_mul(tm, 60), seconds));
+          iv.nanos = checked_add(
+              iv.nanos,
+              checked_add(checked_mul(whole_seconds, 1000000000LL), fraction));
           continue;
         }
         int64_t val = 0;
@@ -605,7 +611,7 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         }
       }
       if (ok) {
-        return iv;
+        return checked_return(iv);
       }
       iv = IntervalValue{};
     }

@@ -1359,13 +1359,12 @@ TEST_F(QueryTest, QualifiedStarWithUnknownRelationFails) {
   if (!executed.HasValue()) {
     rejected = true;
   } else {
-    try {
+    ASSERT_NO_THROW({
       Row row;
       while (executed.Value().Next(&row)) {
       }
-    } catch (const std::exception&) {
-      rejected = true;
-    }
+    });
+    rejected = executed.Value().GetStatus() != Status::kSuccess;
   }
   EXPECT_TRUE(rejected);
   ASSERT_SUCCESS(ctx.txn_.PreCommit());
@@ -5055,16 +5054,14 @@ TEST_F(QueryTest, SqlEngineSelfJoinAmbiguousColumnRejected) {
         << engine.LastError();
   } else {
     Row row;
-    bool rejected = false;
-    try {
+    ASSERT_NO_THROW({
       while (prepared.Value()->Next(&row, nullptr)) {
       }
-    } catch (const std::exception& error) {
-      rejected = true;
-      EXPECT_NE(std::string(error.what()).find("ambiguous"), std::string::npos)
-          << (error.what() != nullptr);
-    }
-    EXPECT_TRUE(rejected);
+    });
+    const Status status = prepared.Value()->GetStatus();
+    EXPECT_NE(status, Status::kSuccess);
+    EXPECT_NE(status.GetMessage().find("ambiguous"), std::string::npos)
+        << status;
   }
 
   ctx.txn_.Abort();

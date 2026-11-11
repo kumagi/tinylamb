@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "common/exc_shim.hpp"
@@ -33,6 +34,49 @@ namespace tinylamb {
 class Encoder;
 class Decoder;
 struct ArrayPayload;
+struct ValuePayload;
+
+// One owner pointer covers either strings or immutable arrays. Scalar
+// overwrites may retain this payload until reuse/destruction, independently
+// of the Value type tag. String mutation detaches shared storage first.
+class OwnedValuePayload {
+ public:
+  OwnedValuePayload() = default;
+  explicit OwnedValuePayload(std::string text);
+  OwnedValuePayload(const OwnedValuePayload& other);
+  OwnedValuePayload(OwnedValuePayload&& other) noexcept
+      : payload_(std::exchange(other.payload_, nullptr)) {}
+  OwnedValuePayload& operator=(const OwnedValuePayload& other);
+  OwnedValuePayload& operator=(OwnedValuePayload&& other) noexcept {
+    if (this != &other) {
+      clear();
+      payload_ = std::exchange(other.payload_, nullptr);
+    }
+    return *this;
+  }
+  OwnedValuePayload& operator=(std::string text);
+  ~OwnedValuePayload() { clear(); }
+  void clear() noexcept {
+    if (payload_ != nullptr) {
+      Release();
+    }
+  }
+  [[nodiscard]] bool empty() const;
+  [[nodiscard]] uint64_t StringHash(std::string_view text) const;
+  operator std::string_view() const;
+  bool operator==(std::string_view text) const {
+    return std::string_view(*this) == text;
+  }
+  void assign(std::string_view text);
+  std::string& Mutable();
+  [[nodiscard]] std::string Take();
+  void SetArray(std::unique_ptr<ArrayPayload> payload) noexcept;
+  [[nodiscard]] ArrayPayload* Array() const noexcept;
+
+ private:
+  void Release() noexcept;
+  ValuePayload* payload_{nullptr};
+};
 
 inline size_t EncodeMemcomparableFormatIntegerTo(char* dst, int64_t in) {
   dst[0] = static_cast<char>(ValueType::kInt64);
@@ -198,7 +242,7 @@ class Value {
   // noinline cold functions in value.cpp -- hot scan/fold callers exhaust
   // their inliner budget long before reaching these, and an out-of-line
   // scalar assign showed up as a top profile entry on multi-million-row
-  // aggregate folds.  A scalar overwrite leaves any stale owned_data/array_
+  // aggregate folds.  A scalar overwrite leaves any stale owned_data
   // payload in place: it stays unreachable behind the type tag (bounded to
   // one old payload per slot) and the implicit destructor releases it.
 #define TINYLAMB_VALUE_SCALAR(t) \
@@ -237,7 +281,8 @@ class Value {
       collation_ = rhs.collation_;
       return *this;
     }
-    return CopyAssignSlow(rhs);
+    CopyAssignSlow(rhs);
+    return *this;
   }
   [[gnu::always_inline]] Value& operator=(Value&& o) noexcept {
     if (this == &o) [[unlikely]] {
@@ -251,13 +296,15 @@ class Value {
       o.type = ValueType::kNull;
       return *this;
     }
-    return MoveAssignSlow(o);
+    MoveAssignSlow(o);
+    return *this;
   }
 #undef TINYLAMB_VALUE_SCALAR
-  // ~Value stays the implicit member-wise destroy: scalar assigns above may
-  // leave a stale owned_data/array_ payload behind (unreachable behind the
-  // type tag, bounded to one old payload per slot), and the implicit dtor is
-  // what releases it.
+  ~Value() = default;
+  // The default destructor performs member-wise destruction: scalar assigns
+  // above may leave a stale owned_data payload behind (unreachable
+  // behind the type tag, bounded to one old payload per slot), and the default
+  // destructor is what releases it.
 
  private:
   // Cold halves of the quartet (defined out-of-line in value.cpp): keeping
@@ -350,26 +397,10 @@ class Value {
         return std::isnan(l) && std::isnan(r);
       }
       case ValueType::kVarChar: {
-        // Byte-equal text is equal; byte-unequal text can still be
-        // interval-equivalent, but only when both sides carry
-        // interval-shaped text and every interval rendering embeds a
-        // space -- so a space-free side settles the comparison without
-        // the EqualsSlow call.
-        const std::string_view l = value.varchar_value;
-        const std::string_view r = rhs.value.varchar_value;
-        if (l == r) [[likely]] {
-          return true;
+        if (IsInterval() || rhs.IsInterval()) {
+          break;
         }
-        const auto may_be_interval = [](std::string_view s) noexcept {
-          return s.size() >= 3 &&
-                 ((s[0] >= '0' && s[0] <= '9') || s[0] == '-' || s[0] == '+' ||
-                  s[0] == ' ') &&
-                 ViewContainsSpace(s);
-        };
-        if (!may_be_interval(l) || !may_be_interval(r)) [[likely]] {
-          return false;
-        }
-        break;
+        return value.varchar_value == rhs.value.varchar_value;
       }
       default:
         break;
@@ -396,20 +427,10 @@ class Value {
         case ValueType::kDouble:
           return value.double_value < rhs.value.double_value;
         case ValueType::kVarChar: {
-          // Byte order first; interval equivalence can only reorder
-          // interval-shaped texts and every interval rendering embeds a
-          // space, so a space-free side makes the byte order final
-          // without the LessSlow (StatusOr machinery) call.
-          const std::string_view l = value.varchar_value;
-          const std::string_view r = rhs.value.varchar_value;
-          const int cmp = l.compare(r);
-          if (cmp == 0) {
-            return false;
+          if (IsInterval() || rhs.IsInterval()) {
+            break;
           }
-          if (!ViewContainsSpace(l) || !ViewContainsSpace(r)) [[likely]] {
-            return cmp < 0;
-          }
-          break;
+          return value.varchar_value < rhs.value.varchar_value;
         }
         default:
           break;
@@ -475,15 +496,21 @@ class Value {
 
   [[nodiscard]] std::string AsString() const;
   [[nodiscard]] int64_t AsInt64() const {
-    if (type != ValueType::kInt64 && type != ValueType::kDate) ThrowAsInt64();
+    if (type != ValueType::kInt64 && type != ValueType::kDate) {
+      ThrowAsInt64();
+    }
     return value.int_value;
   }
   [[nodiscard]] double AsDouble() const {
-    if (type != ValueType::kDouble) ThrowAsDouble();
+    if (type != ValueType::kDouble) {
+      ThrowAsDouble();
+    }
     return value.double_value;
   }
   [[nodiscard]] std::string_view AsStringView() const {
-    if (type != ValueType::kVarChar) ThrowAsStringView();
+    if (type != ValueType::kVarChar) {
+      ThrowAsStringView();
+    }
     return value.varchar_value;
   }
   [[noreturn]] static void ThrowAsInt64();
@@ -531,7 +558,8 @@ class Value {
     value.varchar_value = owned_data;
     collation_ = 0;
   }
-  [[nodiscard]] std::string MoveString() { return std::move(owned_data); }
+  // Transfer the visible string bytes and leave this value NULL.
+  [[nodiscard]] std::string MoveString();
 
   // Collation attachment (COLLATE(value, spec)).  0 = none, 1 = 'binary',
   // 2 = case-insensitive ('und:ci' style).  Comparisons consult the tag when
@@ -548,6 +576,15 @@ class Value {
   [[nodiscard]] Value WithUnsigned() const {
     Value copy = *this;
     copy.collation_ = 3;
+    return copy;
+  }
+  [[nodiscard]] bool IsInterval() const {
+    return type == ValueType::kVarChar && collation_ == 4;
+  }
+  void SetInterval() { collation_ = 4; }
+  [[nodiscard]] Value WithInterval() const {
+    Value copy = *this;
+    copy.SetInterval();
     return copy;
   }
   [[nodiscard]] Value WithCollation(uint8_t collation) const {
@@ -567,11 +604,13 @@ class Value {
     double double_value;
   } value{.varchar_value = std::string_view{}};
   ValueType type{ValueType::kNull};
-  std::string owned_data;
-  std::shared_ptr<ArrayPayload> array_;
 
  private:
+  // Pack both tags together instead of adding a trailing alignment word.
   uint8_t collation_{0};
+
+ public:
+  OwnedValuePayload owned_data;
 };
 
 }  // namespace tinylamb
