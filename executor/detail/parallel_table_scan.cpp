@@ -104,8 +104,15 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
   std::shared_ptr<const LSTableStore> lstable_store;
   const RuntimeFilterGroup* active_lstable_rf = nullptr;
   {
-    std::shared_ptr<const LSTableStore> store =
-        GetOrBuildLSTableStore(context.txn_, table, true);
+    std::vector<slot_t> needed;
+    if (projection != nullptr) {
+      needed = *projection;
+      if (full_key_column) {
+        needed.push_back(*full_key_column);
+      }
+    }
+    std::shared_ptr<const LSTableStore> store = GetOrBuildLSTableStore(
+        context.txn_, table, true, projection != nullptr ? &needed : nullptr);
     if (store != nullptr &&
         store->layout_generation == table.LayoutGeneration() &&
         store->first_pid == table.FirstPageId()) {

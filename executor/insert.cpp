@@ -71,7 +71,8 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
   // colliding with them modifies the same logical row once.
   std::unordered_set<std::string> batch_keys;
   if (enforce_primary_key_) {
-    for (auto it = target_->BeginFullScan(*txn_); it.IsValid(); ++it) {
+    auto it = target_->BeginFullScan(*txn_);
+    for (; it.IsValid(); ++it) {
       const Row& current = *it;
       if (current.values_.empty()) {
         continue;
@@ -79,6 +80,11 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
       std::string key = KeyString(current[0]);
       existing_keys.insert(key);
       existing_positions.emplace(std::move(key), it.Position());
+    }
+    // IsValid() is false both at the end and after a read failure; judging
+    // uniqueness against a prefix of the table would admit duplicates.
+    if (it.GetStatus() != Status::kSuccess) {
+      return FailWith(it.GetStatus());
     }
   }
   // FOREIGN KEY child-side state: the parent key multiset is seeded once

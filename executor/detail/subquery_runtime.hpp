@@ -376,6 +376,18 @@ struct ExecutionRuntime {
   double join_ms{0};
   double project_ms{0};
   double sort_ms{0};
+  // Wall time of the top-level ExecuteQuery, including result materialization.
+  // Operator timers above overlap each other and omit some phases; subtract
+  // them from execute_ms only as a clue, never as a partition of the wall clock.
+  double execute_ms{0};
+  double boundary_ms{0};
+  // Sum of nested BuildInput calls, so it can exceed execute_ms.
+  double build_input_ms{0};
+  double window_ms{0};
+  double window_layout_ms{0};
+  double deferred_materialize_ms{0};
+  size_t window_input_rows{0};
+  size_t rank_bounds{0};
   size_t topn_finish_uses{0};
   size_t topn_finish_capacity{0};
   size_t topn_finish_input_rows{0};
@@ -386,6 +398,7 @@ struct ExecutionRuntime {
   double aggregate_ms{0};
   double planning_ms{0};
   double join_estimate_ms{0};
+  size_t partitioned_aggregate_merges{0};
   size_t typed_parallel_aggregations{0};
   size_t typed_parallel_agg_fallbacks{0};
   // Statements whose final join step fused with their GROUP BY (the joined
@@ -400,6 +413,11 @@ struct ExecutionRuntime {
   size_t scan_values_decoded{0};
   size_t scan_values_available{0};
   size_t relation_spills{0};
+  // Columnar scan stores backing unowned VARCHAR views in join output.
+  // Retained for the query so BuildInput does not deep-copy every string
+  // before the store would otherwise die. Any Value copied out of the query
+  // (InitCopySlow) materializes its own bytes.
+  std::vector<std::shared_ptr<const void>> retained_scan_stores;
   // Relational inner hash joins that keep a resident build and may stream a
   // spilled probe. Counts aggregate across the statement's join steps.
   size_t inner_hash_build_rows{0};
@@ -430,6 +448,15 @@ struct ExecutionRuntime {
   uint64_t correlated_outer_serial{0};
   uint64_t correlated_outer_serials{0};
   size_t correlated_domain_filter_builds{0};
+  // Set by a parent RANK() <= K before it builds a ROLLUP input. Grouping-set
+  // emit keeps every group that can still fall inside that rank, including
+  // ties on the boundary sum.
+  struct GroupingRankLimit {
+    std::string partition_name;
+    std::string order_name;
+    size_t limit{0};
+  };
+  std::optional<GroupingRankLimit> grouping_rank_limit;
 };
 
 double ElapsedMs(std::chrono::steady_clock::time_point begin);

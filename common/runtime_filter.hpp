@@ -45,6 +45,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,10 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   // well under 2%); the bit count is rounded up to a power of two.
   BloomRuntimeFilter(std::vector<uint64_t> bits, size_t bit_count,
                      size_t distinct_keys, size_t nominal_bit_count = 0);
+  // Zero-copy constructor over an immutable memory-mapped word span whose
+  // lifetime outlives this filter (e.g. a persistent `.tlcs` file).
+  BloomRuntimeFilter(std::span<const uint64_t> borrowed_bits, size_t bit_count,
+                     size_t distinct_keys, size_t nominal_bit_count = 0);
 
   [[nodiscard]] RuntimeFilterKind Kind() const override {
     return RuntimeFilterKind::kBloom;
@@ -157,10 +162,13 @@ class BloomRuntimeFilter final : public RuntimeFilter {
   [[nodiscard]] size_t DistinctKeys() const override { return distinct_keys_; }
   [[nodiscard]] size_t MemoryBytes() const override {
     const size_t words =
-        nominal_bit_count_ != 0 ? (nominal_bit_count_ / 64) : bits_.size();
+        nominal_bit_count_ != 0 ? (nominal_bit_count_ / 64) : bits_view_.size();
     return sizeof(*this) + (words * sizeof(uint64_t));
   }
   [[nodiscard]] size_t BitCount() const { return bit_count_; }
+  [[nodiscard]] std::span<const uint64_t> Words() const noexcept {
+    return bits_view_;
+  }
   // A malformed bitset (non power-of-two size, or fewer words than the bit
   // count claims) makes every probe an out-of-bounds read. The repair is to
   // stop pruning entirely rather than to invent bits: a filter that rejects
@@ -175,6 +183,7 @@ class BloomRuntimeFilter final : public RuntimeFilter {
 
  private:
   std::vector<uint64_t> bits_;
+  std::span<const uint64_t> bits_view_;
   size_t bit_count_;
   size_t distinct_keys_;
   size_t nominal_bit_count_{0};

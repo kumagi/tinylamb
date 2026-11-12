@@ -37,6 +37,7 @@ class Transaction;
 class RowPage {
  public:
   static constexpr slot_t kMaxSlotsPerBlock = 4096;
+  static constexpr uint32_t kMaxColumnarRows = 32768;
   static constexpr size_t kSlotEntryBytes = 4;
   static constexpr size_t kBlockBudgetBytes = kPageBodySize - 24;
 
@@ -44,12 +45,14 @@ class RowPage {
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;
+    columnar_row_count_ = 0;
     slots_.clear();
     hole_sizes_.clear();
     committed_allocated_ = false;
     committed_prev_page_id_ = 0;
     committed_next_page_id_ = 0;
     committed_link_lsn_ = 0;
+    committed_columnar_row_count_ = 0;
     committed_slots_.clear();
     committed_lsns_.clear();
   }
@@ -58,11 +61,23 @@ class RowPage {
     prev_page_id_ = 0;
     next_page_id_ = 0;
     row_count_ = 0;
+    columnar_row_count_ = 0;
     slots_.clear();
     hole_sizes_.clear();
   }
 
+  [[nodiscard]] bool IsColumnarStub() const noexcept {
+    return columnar_row_count_ != 0 && slots_.empty();
+  }
+
+  [[nodiscard]] uint32_t ColumnarRowCount() const noexcept {
+    return columnar_row_count_;
+  }
+
   [[nodiscard]] size_t UsedBytes() const {
+    if (IsColumnarStub()) {
+      return kBlockBudgetBytes;
+    }
     size_t used = slots_.size() * kSlotEntryBytes;
     for (const std::string& s : slots_) {
       used += s.size();
@@ -71,6 +86,9 @@ class RowPage {
   }
 
   [[nodiscard]] bin_size_t FreeSize() const {
+    if (IsColumnarStub()) {
+      return 0;
+    }
     const size_t used = UsedBytes();
     return used < kBlockBudgetBytes
                ? static_cast<bin_size_t>(kBlockBudgetBytes - used)
@@ -98,15 +116,23 @@ class RowPage {
   void SetNextPageImpl(page_id_t next) { next_page_id_ = next; }
   void SetPrevPageImpl(page_id_t prev) { prev_page_id_ = prev; }
 
-  [[nodiscard]] slot_t RowCount() const { return row_count_; }
+  [[nodiscard]] slot_t RowCount() const {
+    return IsColumnarStub() ? static_cast<slot_t>(columnar_row_count_)
+                            : row_count_;
+  }
   [[nodiscard]] slot_t RowMax() const {
-    return static_cast<slot_t>(slots_.size());
+    return IsColumnarStub() ? static_cast<slot_t>(columnar_row_count_)
+                            : static_cast<slot_t>(slots_.size());
   }
   [[nodiscard]] bool IsSlotOccupied(slot_t slot) const {
+    if (IsColumnarStub()) {
+      return slot < columnar_row_count_;
+    }
     return slot < slots_.size() && !slots_[slot].empty();
   }
   [[nodiscard]] bool ShouldPreallocateNextBlock() const {
-    return (FreeSize() < 1024 || slots_.size() + 8 >= kMaxSlotsPerBlock) &&
+    return (IsColumnarStub() || FreeSize() < 1024 ||
+            slots_.size() + 8 >= kMaxSlotsPerBlock) &&
            next_page_id_ == 0;
   }
 
@@ -131,6 +157,7 @@ class RowPage {
   page_id_t prev_page_id_ = 0;
   page_id_t next_page_id_ = 0;
   slot_t row_count_ = 0;
+  uint32_t columnar_row_count_ = 0;
   std::vector<std::string> slots_;
   std::vector<size_t> hole_sizes_;
 
@@ -139,6 +166,7 @@ class RowPage {
   page_id_t committed_prev_page_id_ = 0;
   page_id_t committed_next_page_id_ = 0;
   lsn_t committed_link_lsn_ = 0;
+  uint32_t committed_columnar_row_count_ = 0;
   std::vector<std::string> committed_slots_;
   std::vector<lsn_t> committed_lsns_;
 };

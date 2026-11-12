@@ -2,14 +2,20 @@
 #ifndef TINYLAMB_JSON_DOC_HPP
 #define TINYLAMB_JSON_DOC_HPP
 
-// Shared in-memory JSON document model for the JSON function family.  One
-// parser and one path navigator back the constant-fold rewrite
-// (expression/rewrite.cpp) and both function evaluators (the AST
-// ground-truth evaluator in expression/function_call_expression.cpp and the
-// relational evaluator in executor/detail/expression_eval.cpp), so a text
-// accepted or produced by one route matches the others.
+// Shared in-memory JSON document model for the JSON function family.  This
+// parser and path navigator back the constant-fold rewrite
+// (expression/rewrite.cpp), the AST ground-truth evaluator
+// (expression/function_call_expression.cpp) and the JSON mutation family.
+// NOTE: the relational evaluator's accessor functions (JSON_EXTRACT /
+// JSON_VALUE / ... in executor/detail/function_eval.cpp) still use their own
+// recursive parser (`parse_j`). The two are kept in agreement on what they
+// accept (EvaluateJsonFunction rejects text json_text::IsValid rejects, as
+// parse_j does) and on escape decoding (\uXXXX / surrogate pairs), but they
+// are separate implementations.
 
+#include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,11 +25,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/json_string.hpp"
 #include "common/status_or.hpp"
 #include "expression/json_text.hpp"
 #include "type/value.hpp"
@@ -51,25 +59,28 @@ struct JVal {
       case kBool:
         return b ? "true" : "false";
       case kNum: {
+        if (!std::isfinite(num)) {
+          // JSON has no spelling for +-inf; keep the document's own text
+          // (e.g. 1e999) rather than inventing a value.
+          return raw.empty() ? std::string("null") : std::string(raw);
+        }
         if (std::floor(num) == num && std::abs(num) < 1e15) {
           return std::to_string(static_cast<int64_t>(num));
         }
-        return std::to_string(num);
-      }
-      case kStr: {
-        std::string res = "\"";
-        for (char c : str) {
-          if (c == '"') {
-            res += "\\\"";
-          } else if (c == '\\') {
-            res += "\\\\";
-          } else {
-            res += c;
-          }
+        // Shortest round-trip form: std::to_string's fixed six decimals
+        // silently rounded 3.141592653589793 to 3.141593.
+        std::array<char, 32> buffer{};
+        const auto [end, ec] =
+            std::to_chars(buffer.data(), buffer.data() + buffer.size(), num);
+        if (ec != std::errc()) {
+          return std::to_string(num);
         }
-        res += "\"";
-        return res;
+        return {buffer.data(), static_cast<size_t>(end - buffer.data())};
       }
+      case kStr:
+        // Full JSON escaping (control bytes as \uXXXX): the re-rendered text
+        // must stay parseable by json_text::IsValid.
+        return json_text::EncodeJsonString(str);
       case kArr: {
         std::string res = "[";
         for (size_t i = 0; i < arr.size(); ++i) {
@@ -89,8 +100,9 @@ struct JVal {
           if (i > 0) {
             res += ",";
           }
-          res += "\"" + obj[i].first +
-                 "\":" + (obj[i].second ? obj[i].second->canonical() : "null");
+          json_text::AppendJsonString(res, obj[i].first);
+          res += ":";
+          res += obj[i].second ? obj[i].second->canonical() : "null";
         }
         res += "}";
         return res;
@@ -128,6 +140,66 @@ inline std::string ParseJsonStringToken(std::string_view& s, char quote = '"') {
         res += '\t';
       } else if (esc == 'r') {
         res += '\r';
+      } else if (esc == 'b') {
+        res += '\b';
+      } else if (esc == 'f') {
+        res += '\f';
+      } else if (esc == 'u') {
+        // \uXXXX (with UTF-16 surrogate pairs) -> UTF-8, as the validator
+        // accepts; appending "u0041" literally corrupted the value.
+        const auto hex4 = [&](uint32_t* out) {
+          if (s.size() < 4) {
+            return false;
+          }
+          uint32_t code = 0;
+          for (size_t j = 0; j < 4; ++j) {
+            const char d = s[j];
+            code <<= 4U;
+            if (d >= '0' && d <= '9') {
+              code |= static_cast<uint32_t>(d - '0');
+            } else if (d >= 'a' && d <= 'f') {
+              code |= static_cast<uint32_t>(d - 'a' + 10);
+            } else if (d >= 'A' && d <= 'F') {
+              code |= static_cast<uint32_t>(d - 'A' + 10);
+            } else {
+              return false;
+            }
+          }
+          s.remove_prefix(4);
+          *out = code;
+          return true;
+        };
+        uint32_t code = 0;
+        if (!hex4(&code)) {
+          res += esc;
+          continue;
+        }
+        if (code >= 0xD800 && code <= 0xDBFF && s.size() >= 6 &&
+            s[0] == '\\' && s[1] == 'u') {
+          std::string_view saved = s;
+          s.remove_prefix(2);
+          uint32_t low = 0;
+          if (hex4(&low) && low >= 0xDC00 && low <= 0xDFFF) {
+            code = 0x10000 + (((code - 0xD800) << 10U) | (low - 0xDC00));
+          } else {
+            s = saved;
+          }
+        }
+        if (code < 0x80) {
+          res.push_back(static_cast<char>(code));
+        } else if (code < 0x800) {
+          res.push_back(static_cast<char>(0xC0 | (code >> 6U)));
+          res.push_back(static_cast<char>(0x80 | (code & 0x3FU)));
+        } else if (code < 0x10000) {
+          res.push_back(static_cast<char>(0xE0 | (code >> 12U)));
+          res.push_back(static_cast<char>(0x80 | ((code >> 6U) & 0x3FU)));
+          res.push_back(static_cast<char>(0x80 | (code & 0x3FU)));
+        } else {
+          res.push_back(static_cast<char>(0xF0 | (code >> 18U)));
+          res.push_back(static_cast<char>(0x80 | ((code >> 12U) & 0x3FU)));
+          res.push_back(static_cast<char>(0x80 | ((code >> 6U) & 0x3FU)));
+          res.push_back(static_cast<char>(0x80 | (code & 0x3FU)));
+        }
       } else {
         res += esc;
       }
@@ -245,11 +317,9 @@ inline JVal ParseJsonSimple(std::string_view& s, size_t depth) {
     std::string num_str(s.substr(0, len));
     s.remove_prefix(len);
     v.type = JVal::kNum;
-    try {
-      v.num = std::stod(num_str);
-    } catch (...) {
-      v.num = 0;
-    }
+    // strtod saturates instead of throwing: 1e999 becomes +inf (not a
+    // silent 0) and 1e-999999 underflows to 0 exactly as IEEE requires.
+    v.num = std::strtod(num_str.c_str(), nullptr);
     v.raw = start.substr(0, len);
     return v;
   }

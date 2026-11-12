@@ -63,6 +63,12 @@ class ColumnStats {
  public:
   ColumnStats() = default;
   explicit ColumnStats(ValueType type) : type_(type) {}
+  static ColumnStats FromRawParts(
+      ValueType type, size_t non_null_count, size_t null_count,
+      size_t distinct_count, std::vector<HistogramBucket> histogram,
+      std::vector<ValueFrequency> lowest_values,
+      std::vector<ValueFrequency> highest_values,
+      std::vector<ValueFrequency> most_common_values, double correlation);
 
   [[nodiscard]] ValueType Type() const { return type_; }
   [[nodiscard]] size_t Count() const { return non_null_count_; }

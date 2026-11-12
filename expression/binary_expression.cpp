@@ -626,8 +626,16 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         }
       }
     }
-    auto timestamp_seconds =
-        [](std::string_view text) -> std::optional<time_t> {
+    // Timestamp-shaped text -> (UTC epoch seconds, fractional nanoseconds).
+    // An explicit "+HH[:MM]" / "-HH" / "Z" suffix fixes the instant; a
+    // zone-less civil text is read in the session default zone (UTC unless
+    // SET), exactly like CAST(x AS TIMESTAMP).
+    struct Instant {
+      int64_t seconds{0};
+      int64_t nanos{0};
+    };
+    auto timestamp_instant =
+        [](std::string_view text) -> std::optional<Instant> {
       if (text.size() < 19 || text[4] != '-' || text[7] != '-' ||
           (text[10] != ' ' && text[10] != 'T')) {
         return std::nullopt;
@@ -653,13 +661,32 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       tm.tm_hour = hour;
       tm.tm_min = minute;
       tm.tm_sec = second;
-      int64_t epoch = platform::TimeGm(&tm);
+      Instant instant;
+      instant.seconds = platform::TimeGm(&tm);
+      // Fractional seconds compare by VALUE (".5" == ".500000"), not as
+      // digit strings; digits past nanoseconds are truncated.
+      size_t pos = 19;
+      if (pos < text.size() && text[pos] == '.') {
+        ++pos;
+        int64_t scale = 100000000;
+        while (pos < text.size() &&
+               std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+          if (scale > 0) {
+            instant.nanos += (text[pos] - '0') * scale;
+            scale /= 10;
+          }
+          ++pos;
+        }
+      }
       const size_t zone = text.find_first_of("+-Zz", 19);
       if (zone == std::string_view::npos) {
-        // The repository's default session zone is UTC-8 (the same default
-        // used by CAST(TIMESTAMP)), hence local wall time is eight hours
-        // ahead when represented in UTC.
-        epoch += 8LL * 60LL * 60LL;
+        StatusOr<int> default_offset = TryTimeZoneOffsetAtLocalTime(
+            GetDefaultTimeZone(), year, static_cast<unsigned>(month),
+            static_cast<unsigned>(day), hour, minute, second);
+        if (!default_offset.HasValue()) {
+          return std::nullopt;
+        }
+        instant.seconds -= default_offset.Value();
       } else if (text[zone] != 'Z' && text[zone] != 'z') {
         // An explicit numeric offset names the string's own zone: convert to
         // UTC instead of silently treating every offset as UTC.  "+05:30"
@@ -674,10 +701,10 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
         // NOLINTNEXTLINE(cert-err34-c)
         if (sscanf(digits.c_str(), " %d:%d", &zone_hours, &zone_minutes) >= 1) {
           const int64_t offset = (zone_hours * 3600LL) + (zone_minutes * 60LL);
-          epoch += (sign == '-') ? offset : -offset;
+          instant.seconds += (sign == '-') ? offset : -offset;
         }
       }
-      return epoch;
+      return instant;
     };
     if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
       const std::string_view lhs(left.value.varchar_value);
@@ -690,49 +717,30 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
       const bool lhs_timestamp = looks_like_timestamp(lhs);
       const bool rhs_timestamp = looks_like_timestamp(rhs);
       if (lhs_timestamp && rhs_timestamp) {
-        const auto a = timestamp_seconds(lhs);
-        const auto b = timestamp_seconds(rhs);
+        const auto a = timestamp_instant(lhs);
+        const auto b = timestamp_instant(rhs);
         if (a && b) {
-          // A timestamp-typed value is rendered in UTC, while a bare string
-          // in a comparison is parsed in the default UTC-8 session zone.
-          // Keep the civil-time fallback for values crossing a set-operation
-          // boundary where the type tag is carried by the +00 suffix.
-          const auto has_zone = [](std::string_view text) {
-            return text.find_first_of("+-Zz", 19) != std::string_view::npos;
-          };
-          const auto fractional_digits = [](std::string_view text) {
-            const size_t dot = text.find('.', 19);
-            if (dot == std::string_view::npos) {
-              return std::string_view{};
-            }
-            size_t end = dot + 1;
-            while (end < text.size() &&
-                   std::isdigit(static_cast<unsigned char>(text[end])) != 0) {
-              ++end;
-            }
-            return text.substr(dot + 1, end - dot - 1);
-          };
-          const std::string_view lhs_fraction = fractional_digits(lhs);
-          const std::string_view rhs_fraction = fractional_digits(rhs);
-          const bool fractional_equal = lhs_fraction == rhs_fraction;
-          const bool equivalent_default_zone =
-              (has_zone(lhs) != has_zone(rhs)) &&
-              std::llabs(*a - *b) == 8LL * 60LL * 60LL;
-          const bool equal =
-              (*a == *b && fractional_equal) || equivalent_default_zone;
+          // One total order on instants for every operator: = and < can no
+          // longer both hold for one pair (the former +-8h "equivalent
+          // default zone" special case made equality non-transitive).
+          const int cmp = a->seconds != b->seconds
+                              ? (a->seconds < b->seconds ? -1 : 1)
+                              : (a->nanos != b->nanos
+                                     ? (a->nanos < b->nanos ? -1 : 1)
+                                     : 0);
           switch (op) {
             case BinaryOperation::kEquals:
-              return Value(equal);
+              return Value(cmp == 0);
             case BinaryOperation::kNotEquals:
-              return Value(!equal);
+              return Value(cmp != 0);
             case BinaryOperation::kLessThan:
-              return Value(*a < *b);
+              return Value(cmp < 0);
             case BinaryOperation::kLessThanEquals:
-              return Value(*a <= *b);
+              return Value(cmp <= 0);
             case BinaryOperation::kGreaterThan:
-              return Value(*a > *b);
+              return Value(cmp > 0);
             case BinaryOperation::kGreaterThanEquals:
-              return Value(*a >= *b);
+              return Value(cmp >= 0);
             default:
               break;
           }
@@ -1012,8 +1020,16 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     }
   }
   if (left.type != right.type) {
+    // Interval-shaped text ("Y-M D H:M:S"). A DATETIME/TIMESTAMP text
+    // ("2020-01-01 00:00:00") also has a '-' before the ' ', but STRING *
+    // INT64 is a type error for it (ADD/SUB already refuse it), not a
+    // 2020-year interval.
     auto is_iv = [](std::string_view s) {
-      return s.find('-') != std::string_view::npos &&
+      const bool timestamp_shaped = s.size() >= 10 && s[4] == '-' &&
+                                    s[7] == '-' &&
+                                    (s.size() == 10 || s[10] == ' ' ||
+                                     s[10] == 'T');
+      return !timestamp_shaped && s.find('-') != std::string_view::npos &&
              s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };
     if (left.type == ValueType::kVarChar && right.type == ValueType::kInt64 &&

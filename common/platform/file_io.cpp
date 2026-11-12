@@ -35,6 +35,7 @@
 #include <windows.h>
 #else
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -414,6 +415,192 @@ int Preallocate(int fd, int64_t size) {
   (void)fd;
   (void)size;
   return 0;
+#endif
+}
+
+namespace {
+constexpr uint8_t kEmptyMapByte = 0;
+
+#ifndef TINYLAMB_OS_WINDOWS
+void AdviseMemoryRange(const uint8_t* base, size_t map_size, size_t offset,
+                       size_t length, int advice) noexcept {
+  if (base == nullptr || map_size == 0 || offset >= map_size || length == 0) {
+    return;
+  }
+  const size_t clamped_len = std::min(length, map_size - offset);
+  const long raw_page = ::sysconf(_SC_PAGESIZE);
+  const size_t page_size =
+      raw_page > 0 ? static_cast<size_t>(raw_page) : static_cast<size_t>(4096);
+  const size_t aligned_offset = offset & ~(page_size - 1);
+  const size_t aligned_len = (offset - aligned_offset) + clamped_len;
+  // POSIX madvise takes non-const void* even for read-only mappings.
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+  (void)::madvise(const_cast<uint8_t*>(base + aligned_offset), aligned_len,
+                  advice);
+}
+#endif
+}  // namespace
+
+MemoryMap::MemoryMap(MemoryMap&& other) noexcept
+    : data_(other.data_),
+      size_(other.size_),
+      valid_(other.valid_)
+#ifdef TINYLAMB_OS_WINDOWS
+      ,
+      mapping_handle_(other.mapping_handle_)
+#endif
+{
+  other.data_ = nullptr;
+  other.size_ = 0;
+  other.valid_ = false;
+#ifdef TINYLAMB_OS_WINDOWS
+  other.mapping_handle_ = nullptr;
+#endif
+}
+
+MemoryMap& MemoryMap::operator=(MemoryMap&& other) noexcept {
+  if (this != &other) {
+    Close();
+    data_ = other.data_;
+    size_ = other.size_;
+    valid_ = other.valid_;
+    other.data_ = nullptr;
+    other.size_ = 0;
+    other.valid_ = false;
+#ifdef TINYLAMB_OS_WINDOWS
+    mapping_handle_ = other.mapping_handle_;
+    other.mapping_handle_ = nullptr;
+#endif
+  }
+  return *this;
+}
+
+MemoryMap::~MemoryMap() { Close(); }
+
+int MemoryMap::Open(const std::filesystem::path& path) {
+  Close();
+  const int fd = OpenFile(path, {.mode = OpenMode::kReadOnly});
+  if (fd < 0) {
+    return -1;
+  }
+  int64_t file_size = 0;
+  if (FileSize(fd, &file_size) != 0 || file_size < 0) {
+    const int saved = errno;
+    (void)CloseFile(fd);
+    errno = saved != 0 ? saved : EIO;
+    return -1;
+  }
+  if (static_cast<uint64_t>(file_size) >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    (void)CloseFile(fd);
+    errno = EOVERFLOW;
+    return -1;
+  }
+  if (file_size == 0) {
+    (void)CloseFile(fd);
+    data_ = &kEmptyMapByte;
+    size_ = 0;
+    valid_ = true;
+    return 0;
+  }
+  const auto map_size = static_cast<size_t>(file_size);
+#ifdef TINYLAMB_OS_WINDOWS
+  const intptr_t raw = ::_get_osfhandle(fd);
+  if (raw == -1) {
+    (void)CloseFile(fd);
+    errno = EBADF;
+    return -1;
+  }
+  HANDLE mapping = ::CreateFileMappingW(reinterpret_cast<HANDLE>(raw), nullptr,
+                                        PAGE_READONLY, 0, 0, nullptr);
+  if (mapping == nullptr) {
+    const DWORD err = ::GetLastError();
+    (void)CloseFile(fd);
+    errno = MapWin32ErrorToErrno(err);
+    return -1;
+  }
+  void* view = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, map_size);
+  (void)CloseFile(fd);
+  if (view == nullptr) {
+    const DWORD err = ::GetLastError();
+    ::CloseHandle(mapping);
+    errno = MapWin32ErrorToErrno(err);
+    return -1;
+  }
+  mapping_handle_ = mapping;
+  data_ = static_cast<const uint8_t*>(view);
+  size_ = map_size;
+  valid_ = true;
+  return 0;
+#else
+  void* addr = ::mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  const int saved = errno;
+  (void)CloseFile(fd);
+  if (addr == MAP_FAILED) {
+    errno = saved;
+    return -1;
+  }
+  data_ = static_cast<const uint8_t*>(addr);
+  size_ = map_size;
+  valid_ = true;
+  return 0;
+#endif
+}
+
+void MemoryMap::Close() noexcept {
+  if (!valid_) {
+    return;
+  }
+  if (size_ > 0 && data_ != nullptr) {
+#ifdef TINYLAMB_OS_WINDOWS
+    (void)::UnmapViewOfFile(data_);
+    if (mapping_handle_ != nullptr) {
+      ::CloseHandle(static_cast<HANDLE>(mapping_handle_));
+      mapping_handle_ = nullptr;
+    }
+#else
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+    (void)::munmap(const_cast<uint8_t*>(data_), size_);
+#endif
+  }
+  data_ = nullptr;
+  size_ = 0;
+  valid_ = false;
+}
+
+void MemoryMap::AdviseSequential(size_t offset, size_t length) const noexcept {
+  if (!valid_) {
+    return;
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  (void)offset;
+  (void)length;
+#else
+  AdviseMemoryRange(data_, size_, offset, length, MADV_SEQUENTIAL);
+#endif
+}
+
+void MemoryMap::AdviseWillNeed(size_t offset, size_t length) const noexcept {
+  if (!valid_) {
+    return;
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  (void)offset;
+  (void)length;
+#else
+  AdviseMemoryRange(data_, size_, offset, length, MADV_WILLNEED);
+#endif
+}
+
+void MemoryMap::AdviseRandom(size_t offset, size_t length) const noexcept {
+  if (!valid_) {
+    return;
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  (void)offset;
+  (void)length;
+#else
+  AdviseMemoryRange(data_, size_, offset, length, MADV_RANDOM);
 #endif
 }
 

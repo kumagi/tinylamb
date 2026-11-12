@@ -153,9 +153,13 @@ TEST(GoogleSqlAstAuditTest, SetOperationOffsetFoldsExpression) {
   EXPECT_EQ(select->Offset(), 1U);
   auto* query = ast.Value()->children[0].get();
   for (auto& child : query->children) {
-    if (child->kind != "LimitOffset") continue;
+    if (child->kind != "LimitOffset") {
+      continue;
+    }
     for (auto& operand : child->children) {
-      if (operand->kind != "CastExpression") continue;
+      if (operand->kind != "CastExpression") {
+        continue;
+      }
       auto wrapper = std::make_unique<GoogleSqlAstNode>();
       wrapper->kind = "Offset";
       wrapper->children.push_back(std::move(operand));
@@ -1112,7 +1116,9 @@ TEST(GoogleSqlAstTest, AuditRejectsInvalidUnicodeEscapeScalars) {
         mutated = true;
         break;
       }
-      for (auto& child : node->children) pending.push_back(child.get());
+      for (auto& child : node->children) {
+        pending.push_back(child.get());
+      }
     }
     ASSERT_TRUE(mutated);
     EXPECT_FALSE(GoogleSqlAstVisitor::Visit(*ast.Value()).HasValue()) << bad;
@@ -1134,14 +1140,18 @@ TEST(GoogleSqlAstTest, AuditRejectsEmptyOrMalformedUnpivotItems) {
       pending.pop_back();
       if (node->kind == "UnpivotInItemList") {
         if (missing_expression) {
-          for (auto& child : node->children) child->children.clear();
+          for (auto& child : node->children) {
+            child->children.clear();
+          }
         } else {
           node->children.clear();
         }
         mutated = true;
         break;
       }
-      for (auto& child : node->children) pending.push_back(child.get());
+      for (auto& child : node->children) {
+        pending.push_back(child.get());
+      }
     }
     ASSERT_TRUE(mutated);
     EXPECT_FALSE(GoogleSqlAstVisitor::Visit(*ast.Value(), sql).HasValue());

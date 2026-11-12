@@ -122,6 +122,7 @@ BloomRuntimeFilter::BloomRuntimeFilter(std::vector<uint64_t> bits,
                                        size_t bit_count, size_t distinct_keys,
                                        size_t nominal_bit_count)
     : bits_(std::move(bits)),
+      bits_view_(bits_),
       bit_count_(bit_count),
       distinct_keys_(distinct_keys),
       nominal_bit_count_(nominal_bit_count),
@@ -131,8 +132,27 @@ BloomRuntimeFilter::BloomRuntimeFilter(std::vector<uint64_t> bits,
   // lookup into an out-of-bounds bit, and repairing by zeroing the bits would
   // reject every build key, so the only sound repair is to stop pruning.
   if (bit_count_ == 0 || (bit_count_ & (bit_count_ - 1)) != 0 ||
-      bits_.size() * 64 < bit_count_) {
+      bits_view_.size() * 64 < bit_count_) {
     bits_.clear();
+    bits_view_ = {};
+    bit_count_ = 0;
+    nominal_bit_count_ = 0;
+    mask_ = 0;
+    disabled_ = true;
+  }
+}
+
+BloomRuntimeFilter::BloomRuntimeFilter(std::span<const uint64_t> borrowed_bits,
+                                       size_t bit_count, size_t distinct_keys,
+                                       size_t nominal_bit_count)
+    : bits_view_(borrowed_bits),
+      bit_count_(bit_count),
+      distinct_keys_(distinct_keys),
+      nominal_bit_count_(nominal_bit_count),
+      mask_(bit_count - 1) {
+  if (bit_count_ == 0 || (bit_count_ & (bit_count_ - 1)) != 0 ||
+      bits_view_.size() * 64 < bit_count_) {
+    bits_view_ = {};
     bit_count_ = 0;
     nominal_bit_count_ = 0;
     mask_ = 0;
@@ -152,10 +172,10 @@ bool BloomRuntimeFilter::Reject(int64_t key) const {
   z ^= z >> 31;
   const size_t bit0 = static_cast<size_t>(z) & mask_;
   const size_t bit1 = static_cast<size_t>(z + (std::rotl(z, 32) | 1U)) & mask_;
-  if ((bits_[bit0 >> 6] & (uint64_t{1} << (bit0 & 63))) == 0) {
+  if ((bits_view_[bit0 >> 6] & (uint64_t{1} << (bit0 & 63))) == 0) {
     return true;
   }
-  if ((bits_[bit1 >> 6] & (uint64_t{1} << (bit1 & 63))) == 0) {
+  if ((bits_view_[bit1 >> 6] & (uint64_t{1} << (bit1 & 63))) == 0) {
     return true;
   }
   return false;

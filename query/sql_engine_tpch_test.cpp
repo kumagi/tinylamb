@@ -960,6 +960,73 @@ TEST_F(SqlEngineTpchTest, Q21WaitingSupplierShapeCountsOnlyTrueWaiters) {
 }
 
 TEST_F(SqlEngineTpchTest,
+       Q5LocalSupplierVolumeChainedAbsorptionKeepsQualifyingRows) {
+  {
+    TransactionContext context = database_->BeginContext();
+    CreateSchema(*database_, context);
+    Run(*database_, context,
+        "INSERT INTO region VALUES (1,'AFRICA',''), (2,'AMERICA','');");
+    Run(*database_, context,
+        "INSERT INTO nation VALUES (1,'MOROCCO',1,''), "
+        "(2,'ETHIOPIA',1,''), (3,'PERU',2,'');");
+    Run(*database_, context,
+        "INSERT INTO supplier VALUES "
+        "(1,'Supplier#1','Addr',1,'10-111',100.0,'ok'), "
+        "(2,'Supplier#2','Addr',2,'10-222',100.0,'ok'), "
+        "(3,'Supplier#3','Addr',3,'10-333',100.0,'ok');");
+    Run(*database_, context,
+        "INSERT INTO customer VALUES "
+        "(1,'Customer#1','Addr',1,'10-111',100.0,'FURNITURE',''), "
+        "(2,'Customer#2','Addr',2,'10-222',100.0,'BUILDING',''), "
+        "(3,'Customer#3','Addr',3,'10-333',100.0,'BUILDING','');");
+    Run(*database_, context,
+        "INSERT INTO orders VALUES "
+        "(1,1,'F',1000.0,DATE '1994-06-01','1-URGENT','Clerk',0,''), "
+        "(2,2,'F',1000.0,DATE '1994-06-02','1-URGENT','Clerk',0,''), "
+        "(3,3,'F',1000.0,DATE '1994-06-03','1-URGENT','Clerk',0,''), "
+        "(4,1,'F',1000.0,DATE '1995-06-01','1-URGENT','Clerk',0,'');");
+    auto lineitem = database_->GetTable(context, "lineitem");
+    ASSERT_TRUE(lineitem.HasValue());
+    // Populate 50,000 rows so lineitem crosses the deferred_probe_rel
+    // threshold (50,000 rows) while orders/supplier/customer/nation/region
+    // form chained 2-column PK absorptions.
+    Row match_morocco({Value(1), Value(1), Value(1), Value(1), Value(10.0),
+                       Value(100.0), Value(0.10), Value(0.02), Value("N"),
+                       Value("O"), Value::Date("1994-06-05"),
+                       Value::Date("1994-06-10"), Value::Date("1994-06-15"),
+                       Value("NONE"), Value("AIR"), Value("")});
+    Row match_ethiopia({Value(2), Value(1), Value(2), Value(1), Value(10.0),
+                        Value(50.0), Value(0.0), Value(0.02), Value("N"),
+                        Value("O"), Value::Date("1994-06-05"),
+                        Value::Date("1994-06-10"), Value::Date("1994-06-15"),
+                        Value("NONE"), Value("AIR"), Value("")});
+    Row non_matching_order(
+        {Value(4), Value(1), Value(1), Value(1), Value(10.0), Value(100.0),
+         Value(0.0), Value(0.02), Value("N"), Value("O"),
+         Value::Date("1994-06-05"), Value::Date("1994-06-10"),
+         Value::Date("1994-06-15"), Value("NONE"), Value("AIR"), Value("")});
+    ASSERT_TRUE(
+        lineitem.Value().Insert(context.txn_, match_morocco).HasValue());
+    ASSERT_TRUE(
+        lineitem.Value().Insert(context.txn_, match_ethiopia).HasValue());
+    for (size_t i = 0; i < 50000; ++i) {
+      ASSERT_TRUE(
+          lineitem.Value().Insert(context.txn_, non_matching_order).HasValue());
+    }
+    Run(*database_, context, "ANALYZE;");
+    ASSERT_EQ(context.PreCommit(), Status::kSuccess);
+  }
+  TransactionContext ro_ctx = database_->BeginReadOnlyContext();
+  std::vector<Row> rows = Run(*database_, ro_ctx, kTpchQueries[4]);
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value("MOROCCO"));
+  EXPECT_NEAR(rows[0][1].value.double_value, 90.0, 1e-6);
+  EXPECT_EQ(rows[1][0], Value("ETHIOPIA"));
+  EXPECT_NEAR(rows[1][1].value.double_value, 50.0, 1e-6);
+  EXPECT_EQ(ro_ctx.PreCommit(), Status::kSuccess);
+}
+
+TEST_F(SqlEngineTpchTest,
        CreateTableSupportsLSTableStorageEngineAndColumnarScans) {
   TransactionContext context = database_->BeginContext();
   Run(*database_, context,

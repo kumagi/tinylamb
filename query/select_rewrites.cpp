@@ -904,6 +904,12 @@ size_t PushSharedCteRestrictions(SelectStatement* outer,
         if (!conjunct || !ReferencesOnly(conjunct, {site.alias})) {
           continue;
         }
+        // TouchedColumns / StripCteQualifier cannot see inside a subquery,
+        // so a correlated reference to another FROM source would be
+        // re-scoped into the CTE body. Leave such conjuncts at the consumer.
+        if (ContainsQueryExpression(conjunct)) {
+          continue;
+        }
         Expression stripped = StripCteQualifier(conjunct, site.alias);
         const bool names_outputs = std::ranges::all_of(
             stripped->TouchedColumns(), [&outputs](const ColumnName& column) {
@@ -1680,7 +1686,8 @@ bool DecorrelateOneLateralSource(SelectStatement* outer, size_t index,
   const SelectSource& base = inner->Sources()[0];
   if (base.query != nullptr || base.unnest || base.is_lateral ||
       base.table.empty() || !base.using_columns.empty() ||
-      base.from_nested_join || base.join_condition) {
+      base.from_nested_join || base.join_condition || base.sample ||
+      site.sample) {
     return false;
   }
   if (outer->IsRecursiveWith(base.table)) {
@@ -1730,6 +1737,19 @@ bool DecorrelateOneLateralSource(SelectStatement* outer, size_t index,
           return IdentifierEquals(column.schema, identity);
         });
   };
+  // A qualifier that names both the LATERAL body's own source and a
+  // preceding outer source (FROM t1, LATERAL (... FROM t1 WHERE t1.a =
+  // t1.b)) cannot be classified syntactically here; bail out instead of
+  // guessing and moving a local predicate into the correlated ON clause.
+  for (const Expression& conjunct : SplitConjuncts(inner->WhereClause())) {
+    if (conjunct &&
+        std::ranges::any_of(conjunct->TouchedColumns(),
+                            [&](const ColumnName& column) {
+                              return is_inner(column) && is_outer(column);
+                            })) {
+      return false;
+    }
+  }
   // Partition the inner WHERE into correlation equalities and the local
   // remainder. Every other outer reference anywhere in the inner statement
   // aborts the rewrite.
@@ -2961,7 +2981,10 @@ bool FlattenOneDerivedSource(SelectStatement* outer, size_t index,
     return false;
   }
   const SelectSource& base = inner->Sources()[0];
-  if (derived.sample && base.sample) {
+  // The flattened source keeps neither sampling clause in the right place:
+  // an inner TABLESAMPLE would be dropped outright, and an outer one would
+  // move below the inner WHERE (RESERVOIR n would cap the wrong rows).
+  if (derived.sample || base.sample) {
     return false;
   }
   if (base.query != nullptr || base.unnest || base.is_lateral ||
@@ -3980,6 +4003,44 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
       return;
     }
   }
+  // This is a speculative small-cell optimization. A blocking body may
+  // compute its entire input before the first batch crosses the row cap;
+  // abandoning it then executes that same work again on the fallback path.
+  // Cost large, unbounded bodies before starting any of them. Estimates only
+  // select a strategy: ordinary map-scoped CTE execution remains authoritative.
+  static const bool cost_guard_disabled =
+      std::getenv("TINYLAMB_DISABLE_EAGER_CTE_COST_GUARD") != nullptr;
+  if (!cost_guard_disabled) {
+    for (const auto& name : plain_names) {
+      const auto& body = *outer->WithQueries().at(name);
+      const bool bounded_limit = body.HasLimit() && !body.WithTies() &&
+                                 body.Limit() <= kMaxMaterializedCteRows;
+      const bool scalar =
+          body.GroupBy().empty() &&
+          std::ranges::any_of(
+              body.SelectList(), [](const NamedExpression& item) {
+                return relational_detail::ContainsAggregate(item.expression);
+              });
+      if (bounded_limit || scalar) {
+        continue;
+      }
+      std::unordered_map<std::string, size_t> tables;
+      relational_detail::CountStatementTables(body, &tables);
+      size_t estimated_rows = 0;
+      for (const auto& [table, references] : tables) {
+        const auto stats = ctx.GetStats(table);
+        if (!stats.HasValue()) {
+          continue;
+        }
+        const size_t rows = stats.Value()->Rows();
+        if (references != 0 &&
+            rows > (kMaxMaterializedCteRows - estimated_rows) / references) {
+          return;
+        }
+        estimated_rows += rows * references;
+      }
+    }
+  }
   // All gates passed: plan + execute each body through a fresh engine (same
   // transaction snapshot as the outer query; isolated facade state so the
   // outer preparation is undisturbed). Bodies are loaned out of the map and
@@ -4032,6 +4093,7 @@ void SqlEngine::MaterializeCtes(SelectStatement* outer, TransactionContext& ctx,
       }
       TryNarrowCteBody(body_copy.get(), *outer, site_aliases);
     }
+    ++cte_materialization_attempts_;
     StatusOr<Executor> planned =
         body_engine.PrepareStatement(ctx, std::move(body_copy));
     if (!planned.HasValue()) {

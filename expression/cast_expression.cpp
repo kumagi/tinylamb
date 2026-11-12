@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/json_string.hpp"
 #include "common/platform/time_zone.hpp"
 #include "expression/expression.hpp"
 #include "expression/proto_schema.hpp"
@@ -565,6 +566,11 @@ std::vector<std::pair<std::string, std::string>> SplitStructMembers(
 // else keeps its raw text (nested objects/arrays stay textual).
 std::string DecodeStructMemberText(const std::string& raw) {
   if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"') {
+    // The canonical struct text (EncodeStructJson) escapes control bytes as
+    // \uXXXX; decode the full JSON escape set instead of keeping "u0001".
+    if (std::optional<std::string> decoded = json_text::DecodeJsonString(raw)) {
+      return std::move(*decoded);
+    }
     std::string out;
     for (size_t i = 1; i + 1 < raw.size(); ++i) {
       if (raw[i] == '\\' && i + 2 < raw.size()) {
@@ -597,12 +603,22 @@ std::string EncodeStructMemberText(const Value& value) {
     return "null";
   }
   if (value.type == ValueType::kVarChar) {
+    // Same escaping as EncodeStructJson so a CAST round-trip yields text the
+    // canonical decoder (and StructJsonCompare) reads back identically.
     std::string out = "\"";
     for (const char c : value.value.varchar_value) {
       if (c == '"' || c == '\\') {
         out.push_back('\\');
+        out.push_back(c);
+      } else if (static_cast<unsigned char>(c) < 0x20) {
+        constexpr std::string_view kHex = "0123456789abcdef";
+        const auto byte = static_cast<unsigned char>(c);
+        out += "\\u00";
+        out.push_back(kHex[byte >> 4U]);
+        out.push_back(kHex[byte & 0x0FU]);
+      } else {
+        out.push_back(c);
       }
-      out.push_back(c);
     }
     out.push_back('"');
     return out;

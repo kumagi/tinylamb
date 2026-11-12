@@ -2,17 +2,21 @@
 
 // Byte-driven DataChunk/ColumnVector fuzzing: every bulk path
 // (AppendGather, Append(source,row), AppendFrom, AppendRowFromColumns) must
-// produce exactly the same observable state as the scalar Append(Row)
-// reference, including null bits, positions and the zone-map-backed
-// aggregates.
+// produce exactly the same observable state as the scalar reference: row
+// values (null bits included), row positions, per-column zone maps
+// (initialized / null count / value count / min / max) and the column
+// aggregates (BIT_AND/OR/XOR, LOGICAL_AND/OR) against a scalar fold.
 
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "executor/data_chunk.hpp"
+#include "executor/zone_map.hpp"
 #include "type/column.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -65,6 +69,11 @@ Value MakeString(Cursor& c) {
   return Value(std::move(s));
 }
 
+bool SameOptionalValue(const std::optional<Value>& a,
+                       const std::optional<Value>& b) {
+  return a.has_value() == b.has_value() && (!a.has_value() || *a == *b);
+}
+
 void CheckChunkMatches(const DataChunk& a, const DataChunk& b,
                        const std::string& tag) {
   assert(a.Size() == b.Size());
@@ -73,6 +82,16 @@ void CheckChunkMatches(const DataChunk& a, const DataChunk& b,
     const Row left = a.RowAt(row);
     const Row right = b.RowAt(row);
     assert(left == right);
+    assert(a.PositionAt(row) == b.PositionAt(row));
+  }
+  for (size_t col = 0; col < a.ColumnCount(); ++col) {
+    const ZoneMap& za = a.ZoneMapAt(col);
+    const ZoneMap& zb = b.ZoneMapAt(col);
+    assert(za.Initialized() == zb.Initialized());
+    assert(za.NullCount() == zb.NullCount());
+    assert(za.ValueCount() == zb.ValueCount());
+    assert(SameOptionalValue(za.Minimum(), zb.Minimum()));
+    assert(SameOptionalValue(za.Maximum(), zb.Maximum()));
   }
   (void)tag;
 }
@@ -100,8 +119,8 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
 
   // (1) scalar Append reference build.
   DataChunk scalar(schema);
-  for (const Row& r : model) {
-    scalar.Append(r);
+  for (size_t row = 0; row < model.size(); ++row) {
+    scalar.Append(model[row], source.PositionAt(row));
   }
   for (size_t row = 0; row < model.size(); ++row) {
     assert(scalar.RowAt(row) == model[row]);
@@ -124,9 +143,20 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
   gathered.AppendGather(source, selection.data(), selection.size());
   DataChunk gathered_ref(schema, 0);
   for (const uint32_t idx : selection) {
-    gathered_ref.Append(source.RowAt(idx));
+    gathered_ref.Append(source.RowAt(idx), source.PositionAt(idx));
   }
   CheckChunkMatches(gathered_ref, gathered, "AppendGather");
+
+  // (3b) AppendRowFromColumns over the source's column vectors.
+  std::vector<const ColumnVector*> column_sources;
+  for (size_t col = 0; col < source.ColumnCount(); ++col) {
+    column_sources.push_back(&source.ColumnAt(col));
+  }
+  DataChunk from_columns(schema, 0);
+  for (size_t i = 0; i < source.Size(); ++i) {
+    from_columns.AppendRowFromColumns(column_sources, i, source.PositionAt(i));
+  }
+  CheckChunkMatches(scalar, from_columns, "AppendRowFromColumns");
 
   // (4) ColumnVector::AppendFrom matches scalar appends.
   for (size_t col = 0; col < source.ColumnCount(); ++col) {
@@ -143,40 +173,43 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
     }
   }
 
-  // (5) int column aggregates equal the scalar fold.
+  // (5) int column aggregates equal the scalar fold; an all-NULL (or empty)
+  // input must yield NULL, any non-NULL input a non-NULL result.
   uint64_t bit_and = ~uint64_t{0};
   uint64_t bit_or = 0;
   uint64_t bit_xor = 0;
-  int64_t bool_and = 1;
-  int64_t bool_or = 0;
+  bool bool_and = true;
+  bool bool_or = false;
+  bool any_non_null = false;
   for (size_t i = 0; i < source.Size(); ++i) {
     const Value v = source.ColumnAt(0).ValueAt(i);
     if (v.IsNull()) {
       continue;  // SQL aggregates skip NULL inputs.
     }
+    any_non_null = true;
     const auto bits = static_cast<uint64_t>(v.value.int_value);
     bit_and &= bits;
     bit_or |= bits;
     bit_xor ^= bits;
-    bool_and = ((bool_and != 0) && v.Truthy()) ? 1 : 0;
-    bool_or = ((bool_or != 0) || v.Truthy()) ? 1 : 0;
+    bool_and = bool_and && v.Truthy();
+    bool_or = bool_or || v.Truthy();
   }
-  const bool any_int = bit_and != ~uint64_t{0} || bit_or != 0 || bit_xor != 0;
-  if (source.Size() > 0 && any_int) {
-    const Value agg_and = source.AggregateBitAnd(0);
-    const Value agg_or = source.AggregateBitOr(0);
-    const Value agg_xor = source.AggregateBitXor(0);
-    if (!agg_and.IsNull()) {
-      assert(static_cast<uint64_t>(agg_and.value.int_value) == bit_and);
-    }
-    if (!agg_or.IsNull()) {
-      assert(static_cast<uint64_t>(agg_or.value.int_value) == bit_or);
-    }
-    if (!agg_xor.IsNull()) {
-      assert(static_cast<uint64_t>(agg_xor.value.int_value) == bit_xor);
-    }
-    (void)bool_and;
-    (void)bool_or;
+  const Value agg_and = source.AggregateBitAnd(0);
+  const Value agg_or = source.AggregateBitOr(0);
+  const Value agg_xor = source.AggregateBitXor(0);
+  const Value agg_land = source.AggregateLogicalAnd(0);
+  const Value agg_lor = source.AggregateLogicalOr(0);
+  assert(agg_and.IsNull() == !any_non_null);
+  assert(agg_or.IsNull() == !any_non_null);
+  assert(agg_xor.IsNull() == !any_non_null);
+  assert(agg_land.IsNull() == !any_non_null);
+  assert(agg_lor.IsNull() == !any_non_null);
+  if (any_non_null) {
+    assert(static_cast<uint64_t>(agg_and.value.int_value) == bit_and);
+    assert(static_cast<uint64_t>(agg_or.value.int_value) == bit_or);
+    assert(static_cast<uint64_t>(agg_xor.value.int_value) == bit_xor);
+    assert(agg_land.Truthy() == bool_and);
+    assert(agg_lor.Truthy() == bool_or);
   }
   (void)verbose;
 }

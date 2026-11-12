@@ -57,6 +57,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/named_expression.hpp"
+#include "expression/parameter_slot.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/unary_expression.hpp"
@@ -1564,10 +1565,40 @@ bool ShouldHybridJoin(const Relation& left, const Relation& right) {
 // deterministic for a fixed worker count, but differs from serial probe order.
 // Each Relation observes the query memory budget and can spill. Build buckets
 // are read-only; RIGHT/FULL match tracking uses private worker bitmaps merged
-// after the probe. Callers exclude residual predicates and null-safe keys.
+// after the probe. Residuals must be pure positional programs; callers exclude
+// null-safe keys.
 constexpr size_t kParallelProbeMinLeftRows = 16384;
 constexpr size_t kParallelProbeChunk = 8192;
 constexpr size_t kParallelProbeMaxWorkers = 16;
+
+// A row-only residual can run on probe workers without entering the shared
+// transaction/evaluator context. Preserve conjunct order and short circuiting.
+namespace {
+std::optional<std::vector<BytecodeProgram>> CompileProbeResiduals(
+    const std::vector<Expression>& predicates, const Schema& schema) {
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_JOIN_RESIDUAL") != nullptr;
+  if (predicates.empty() || disabled || !BytecodeEnabled()) {
+    return std::nullopt;
+  }
+  std::vector<BytecodeProgram> programs;
+  for (const auto& predicate : predicates) {
+    if (!predicate || ContainsQuery(predicate) ||
+        ContainsParameterSlot(predicate) ||
+        !SafeToReduceEvaluationCount(predicate)) {
+      return std::nullopt;
+    }
+    auto program = BytecodeCompiler::CompileRowCached(
+        predicate, schema, BytecodeCompiler::Context::kFilter);
+    if (!program || program->ResultType() == ValueType::kNull) {
+      return std::nullopt;
+    }
+    programs.push_back(std::move(*program));
+  }
+  return programs;
+}
+
+}  // namespace
 
 template <typename Buckets, typename KeyOfRow>
 static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
@@ -1575,14 +1606,18 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
     KeyOfRow key_of_row, bool left_outer_emit, size_t right_width,
     size_t worker_count, Relation* result, size_t* join_comparisons,
     bool stream_is_left = true, const Row* build_base = nullptr,
-    std::vector<char>* build_matched = nullptr) {
+    std::vector<char>* build_matched = nullptr,
+    const std::vector<BytecodeProgram>* residuals = nullptr) {
   const size_t total = left.rows.size();
+  static const bool release_disabled =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE_RELEASE") != nullptr;
   const size_t num_chunks =
       (total + kParallelProbeChunk - 1) / kParallelProbeChunk;
   worker_count = std::min({worker_count, num_chunks, total});
   std::vector<Relation> shards(worker_count);
+  std::vector<ExecutionRuntime> shard_runtimes(worker_count);
   for (size_t w = 0; w < worker_count; ++w) {
-    shards[w].set_runtime(result->runtime());
+    shards[w].set_runtime(&shard_runtimes[w]);
     shards[w].schema = result->schema;
   }
   // Cache-line padded: every worker bumps its own counter once per emitted
@@ -1640,6 +1675,44 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
             }
             continue;
           }
+          if (residuals != nullptr) {
+            bool matched = false;
+            for (auto iter = eq_begin; iter != eq_end; ++iter) {
+              ++comparisons[worker_id].value;
+              const Row* build_row = iter->second;
+              Row combined = stream_is_left ? ConcatRows(left_row, *build_row)
+                                            : ConcatRows(*build_row, left_row);
+              bool accepted = true;
+              for (const auto& program : *residuals) {
+                auto value = TryEvaluateRowAuto(program, combined);
+                if (!value.HasValue()) {
+                  std::scoped_lock error_lock(error_mutex);
+                  if (first_error.ok()) {
+                    first_error = value.GetStatus();
+                  }
+                  return;
+                }
+                if (!Truthy(value.Value())) {
+                  accepted = false;
+                  break;
+                }
+              }
+              if (!accepted) {
+                continue;
+              }
+              matched = true;
+              if (build_matched != nullptr) {
+                worker_matches[worker_id]
+                              [static_cast<size_t>(build_row - build_base)] = 1;
+              }
+              local.AddRow(std::move(combined));
+            }
+            if (!matched && left_outer_emit) {
+              left_row.values_.resize(left_row.Count() + right_width);
+              local.AddRow(std::move(left_row));
+            }
+            continue;
+          }
           for (auto iter = eq_begin; iter != eq_end;) {
             const Row* build_row = iter->second;
             // Advance while a borrowed probe key still has its original row.
@@ -1662,6 +1735,17 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
                                         : ConcatRows(*build_row, left_row));
           }
         }
+        if (!release_disabled) {
+          // Every probe key in this chunk has been consumed. Accepted rows
+          // own their cells; rejected/copy-only rows no longer feed a probe.
+          // Release those buffers on their current workers while still hot,
+          // avoiding a serial coordinator pass over the rejected payloads.
+          for (size_t i = begin; i < end; ++i) {
+            if (!left.rows[i].values_.empty()) {
+              std::vector<Value>().swap(left.rows[i].values_);
+            }
+          }
+        }
       } catch (const std::exception& error) {
         std::scoped_lock error_lock(error_mutex);
         if (first_error.ok()) {
@@ -1680,6 +1764,12 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
   };
 
   RETURN_IF_FAIL(RunParallelTasks(worker_count, run_worker));
+  if (result->runtime() != nullptr) {
+    for (const auto& runtime : shard_runtimes) {
+      result->runtime()->relation_spills += runtime.relation_spills;
+    }
+  }
+
   size_t total_in_memory = 0;
   for (size_t w = 0; w < worker_count; ++w) {
     if (!shards[w].HasSpill()) {
@@ -1725,6 +1815,21 @@ static Status ParallelHashProbe(  // NOLINT(misc-use-anonymous-namespace)
 StatusOr<Relation> Join(TransactionContext& context, Relation left,
                         Relation right, const SelectSource& source,
                         const Scope* outer, const CteMap& ctes) {
+  // An outer join elsewhere in the statement fixes the surrounding join
+  // tree, not the build side of an inner edge. Reuse the inner operator's
+  // smaller-build selection while retaining left-then-right column order.
+  // USING metadata belongs to the ordered operator and stays on that path.
+  if (source.join_type == JoinType::kInner && source.using_columns.empty() &&
+      left.using_columns == nullptr && right.using_columns == nullptr &&
+      right.TotalRows() >= kFlipMinBuildRows &&
+      right.TotalRows() > left.TotalRows() * kFlipRatio && !left.HasSpill() &&
+      std::getenv("TINYLAMB_DISABLE_ORDERED_INNER_FLIP") == nullptr) {
+    const auto predicates = SplitConjuncts(source.join_condition);
+    if (std::ranges::all_of(predicates, SafeToReduceEvaluationCount)) {
+      return InnerJoin(context, std::move(left), std::move(right), predicates,
+                       outer, ctes);
+    }
+  }
   const auto join_begin = std::chrono::steady_clock::now();
   Relation result(context.execution_runtime());
   result.schema = left.schema + right.schema;
@@ -1837,6 +1942,13 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
           ? ordinary_predicates
           : ResidualJoinPredicates(left.schema, right.schema,
                                    ordinary_predicates);
+  const auto compiled_residuals =
+      outer == nullptr && using_residuals.empty()
+          ? CompileProbeResiduals(residual, result.schema)
+          : std::nullopt;
+  const auto* probe_residuals =
+      compiled_residuals && !compiled_residuals->empty() ? &*compiled_residuals
+                                                         : nullptr;
   Status residual_error{Status::kSuccess};
   auto matches = [&](const Row& combined) {
     const auto merged_value = [&](const std::vector<size_t>& columns,
@@ -1926,6 +2038,16 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     }));
   } else {
     ++result.hash_joins;
+    // The output vector otherwise doubles and moves every Row. A full outer
+    // join emits about one row per input side; an inner join emits at least
+    // the build matches. This only reserves the shell, not the cell storage.
+    if (!left.HasSpill() && !right.HasSpill()) {
+      const size_t hint =
+          left.rows.size() + (want_right_nulls ? right.rows.size() : 0);
+      if (hint > result.rows.capacity() && hint <= (size_t{1} << 20)) {
+        result.rows.reserve(hint);
+      }
+    }
     // D8 (docs/design.md): the hybrid operator now implements null-safe
     // keys and LEFT/RIGHT/FULL outer with full partition reprocessing.
     const bool has_null_safe_key = std::ranges::any_of(
@@ -1987,9 +2109,11 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
     // enough to amortize the threads. FULL/RIGHT use private matched flags.
     static const bool probe_disabled =
         std::getenv("TINYLAMB_DISABLE_PARALLEL_PROBE") != nullptr;
-    bool can_parallelize = !probe_disabled && residual.empty() &&
-                           using_residuals.empty() && !has_null_safe_key &&
-                           left.rows.size() >= kParallelProbeMinLeftRows;
+    bool can_parallelize =
+        !probe_disabled &&
+        (residual.empty() || compiled_residuals.has_value()) &&
+        using_residuals.empty() && !has_null_safe_key &&
+        left.rows.size() >= kParallelProbeMinLeftRows;
     const size_t probe_workers =
         can_parallelize
             ? std::min<size_t>(
@@ -2026,7 +2150,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
             },
             want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
             &result.join_comparisons, true, right_base,
-            want_right_nulls ? &right_matched : nullptr));
+            want_right_nulls ? &right_matched : nullptr, probe_residuals));
         RETURN_IF_FAIL(residual_error);
       } else {
         for (const Row& left_row : left.rows) {
@@ -2067,7 +2191,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
               buckets, left, left_columns, probe_key, want_left_nulls,
               right.schema.ColumnCount(), probe_workers, &result,
               &result.join_comparisons, true, right_base,
-              want_right_nulls ? &right_matched : nullptr));
+              want_right_nulls ? &right_matched : nullptr, probe_residuals));
           RETURN_IF_FAIL(residual_error);
         } else {
           for (const Row& left_row : left.rows) {
@@ -2137,7 +2261,7 @@ StatusOr<Relation> Join(TransactionContext& context, Relation left,
             },
             want_left_nulls, right.schema.ColumnCount(), probe_workers, &result,
             &result.join_comparisons, true, right_base,
-            want_right_nulls ? &right_matched : nullptr));
+            want_right_nulls ? &right_matched : nullptr, probe_residuals));
         RETURN_IF_FAIL(residual_error);
       } else {
         for (const Row& left_row : left.rows) {
@@ -2243,6 +2367,12 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
           ? predicates
           : ResidualJoinPredicates(left.schema, right.schema, predicates);
 
+  const auto compiled_residuals =
+      outer == nullptr ? CompileProbeResiduals(residual, result.schema)
+                       : std::nullopt;
+  const auto* probe_residuals =
+      compiled_residuals && !compiled_residuals->empty() ? &*compiled_residuals
+                                                         : nullptr;
   const CompiledScanFilter residual_filter =
       CompileScanFilter(residual, result.schema);
   Status residual_error{Status::kSuccess};
@@ -2360,7 +2490,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
     const std::vector<int64_t>& probe_key_offsets =
         flip ? right_key_offsets : left_key_offsets;
     const bool can_parallelize =
-        residual.empty() && !has_null_safe_key && !probe_side.HasSpill() &&
+        (residual.empty() || compiled_residuals.has_value()) &&
+        !has_null_safe_key && !probe_side.HasSpill() &&
         probe_side.rows.size() >= kParallelProbeMinLeftRows;
     const size_t probe_workers =
         can_parallelize
@@ -2398,7 +2529,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
                                     probe_key_offsets[0]);
             },
             false, build_side.schema.ColumnCount(), probe_workers, &result,
-            &result.join_comparisons, !flip));
+            &result.join_comparisons, !flip, nullptr, nullptr,
+            probe_residuals));
         RETURN_IF_FAIL(residual_error);
       } else {
         RETURN_IF_FAIL(probe_side.ForEachRow([&](const Row& probe_row) {
@@ -2483,7 +2615,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
           RETURN_IF_FAIL(ParallelHashProbe(
               buckets, probe_side, probe_columns, encode_probe_2x32, false,
               build_side.schema.ColumnCount(), probe_workers, &result,
-              &result.join_comparisons, !flip));
+              &result.join_comparisons, !flip, nullptr, nullptr,
+              probe_residuals));
           RETURN_IF_FAIL(residual_error);
         } else {
           RETURN_IF_FAIL(probe_side.ForEachRow([&](const Row& probe_row) {
@@ -2524,7 +2657,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
                                              &probe_key_offsets);
               },
               false, build_side.schema.ColumnCount(), probe_workers, &result,
-              &result.join_comparisons, !flip));
+              &result.join_comparisons, !flip, nullptr, nullptr,
+              probe_residuals));
           RETURN_IF_FAIL(residual_error);
         } else {
           RETURN_IF_FAIL(probe_side.ForEachRow([&](const Row& probe_row) {
@@ -2580,7 +2714,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
                                      .biases = &probe_key_offsets};
             },
             false, build_side.schema.ColumnCount(), borrowed_workers, &result,
-            &result.join_comparisons, !flip));
+            &result.join_comparisons, !flip, nullptr, nullptr,
+            probe_residuals));
         RETURN_IF_FAIL(residual_error);
       } else {
         for (const Row& row : probe_side.rows) {
@@ -2621,7 +2756,8 @@ StatusOr<Relation> InnerJoin(TransactionContext& context, Relation left,
               return EncodeJoinKey(row, probe_columns, &probe_key_offsets);
             },
             false, build_side.schema.ColumnCount(), probe_workers, &result,
-            &result.join_comparisons, !flip));
+            &result.join_comparisons, !flip, nullptr, nullptr,
+            probe_residuals));
         RETURN_IF_FAIL(residual_error);
       } else {
         RETURN_IF_FAIL(probe_side.ForEachRow([&](const Row& probe_row) {

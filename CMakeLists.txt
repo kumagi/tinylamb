@@ -295,6 +295,7 @@ tinylamb_add_layer(tinylamb_common
         common/decoder.cpp
         common/runtime_filter.cpp
         common/parallel_work.cpp
+        common/sorted_distinct_runs.cpp
         common/regex_guard.cpp
         common/platform/cpu_affinity.cpp
         common/platform/event_poller.cpp
@@ -753,6 +754,13 @@ add_executable(tinylamb_tpcds_compare EXCLUDE_FROM_ALL
 tinylamb_apply_options(tinylamb_tpcds_compare)
 target_link_libraries(tinylamb_tpcds_compare PRIVATE tinylamb::sql)
 
+# Isolated bounded-SPSC aggregate pipeline experiment; not an executor path.
+add_executable(tinylamb_spsc_aggregation_benchmark EXCLUDE_FROM_ALL
+        benchmark/spsc_aggregation_benchmark.cpp)
+tinylamb_apply_options(tinylamb_spsc_aggregation_benchmark)
+target_link_libraries(tinylamb_spsc_aggregation_benchmark PRIVATE
+        tinylamb::common Threads::Threads)
+
 add_executable(tinylamb_pg_read_benchmark
         benchmark/pg_read_benchmark.cpp)
 tinylamb_apply_options(tinylamb_pg_read_benchmark)
@@ -922,6 +930,7 @@ add_simple_test(expression/parameter_slot_test.cpp)
 add_simple_test(executor/executor_test.cpp)
 add_simple_test(executor/parallel_index_scan_test.cpp)
 add_simple_test(executor/relational_regression_test.cpp)
+add_simple_test(common/sorted_distinct_runs_test.cpp)
 add_simple_test(executor/data_chunk_test.cpp)
 add_simple_test(executor/distinct_test.cpp)
 add_simple_test(executor/sort_collation_test.cpp)

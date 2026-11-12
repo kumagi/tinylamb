@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <iterator>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "database/transaction_context.hpp"
@@ -52,9 +54,12 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int iterations = 64;
   if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
-    const int parsed = std::atoi(env);
-    if (parsed > 0) {
-      iterations = parsed;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0 &&
+        std::in_range<int>(parsed)) {
+      iterations = static_cast<int>(parsed);
     }
   }
   int tlp_ran = 0;
@@ -75,7 +80,7 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int dqe_ran = 0;
   int troc_ran = 0;
   const int kIterations = iterations;
-  for (uint32_t seed = 0; seed < static_cast<uint32_t>(kIterations); ++seed) {
+  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     OracleTrace trace;
@@ -153,6 +158,8 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   }
 }
 
+namespace {
+
 // Drains `sql`.  NoREC skips a rejected spelling, so a shape test that only
 // replays would stay green while checking nothing.
 ::testing::AssertionResult ExpectRuns(Database& db, TransactionContext& ctx,
@@ -172,6 +179,8 @@ TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   }
   return ::testing::AssertionSuccess();
 }
+
+}  // namespace
 
 // The canonical NoREC identities (single-table rewrites, joins, GROUP BY,
 // subquery decorrelation, row contents) must execute and agree, including

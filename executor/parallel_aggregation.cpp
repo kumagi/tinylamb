@@ -237,8 +237,16 @@ Status ParallelAggregationExecutor::AccumulateValue(PartialState* state,
   }
   switch (aggregate.GetType()) {
     case AggregationType::kSum:
-      state->values[index] =
-          state->values[index].IsNull() ? value : state->values[index] + value;
+      if (state->values[index].IsNull()) {
+        state->values[index] = value;
+      } else {
+        // Same Status (kIsInfinity) as the serial executor, and no exception
+        // on the main-thread Merge replay, which runs outside any try/catch.
+        ASSIGN_OR_RETURN(
+            Value, next,
+            state->values[index].TryArithmetic(value, BinaryOperation::kAdd));
+        state->values[index] = std::move(next);
+      }
       break;
     case AggregationType::kAvg:
       state->values[index].value.double_value +=

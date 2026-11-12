@@ -89,8 +89,10 @@ TEST(MergeAppendExecutorTest, AuditNaNOrderMatchesSortInBothDirections) {
     std::vector<Executor> sources;
     for (const auto& values : {first, second}) {
       std::vector<Row> rows;
-      for (const auto& value : values)
+      rows.reserve(values.size());
+      for (const auto& value : values) {
         rows.emplace_back(std::vector<Value>{value});
+      }
       sources.push_back(std::make_shared<ValuesExecutor>(std::move(rows)));
     }
     MergeAppendExecutor merge(
@@ -98,7 +100,9 @@ TEST(MergeAppendExecutorTest, AuditNaNOrderMatchesSortInBothDirections) {
         {{.expression = ColumnValueExp("k"), .ascending = ascending}});
     std::vector<Value> result;
     Row row;
-    while (merge.Next(&row, nullptr)) result.push_back(row[0]);
+    while (merge.Next(&row, nullptr)) {
+      result.push_back(row[0]);
+    }
     EXPECT_EQ(merge.GetStatus(), Status::kSuccess);
     ASSERT_EQ(result.size(), 5U);
     for (size_t i = 1; i < result.size(); ++i) {

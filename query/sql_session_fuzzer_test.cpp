@@ -180,6 +180,63 @@ TEST(SqlSessionFuzzer, SnapshotOutlivesConcurrentDeleteCommit) {
   EXPECT_EQ(ReplaySessionTrace(trace, true), "");
 }
 
+// Regression guard for concurrent transactions mutating the same secondary
+// non-unique index key followed by abort, heap slot reuse, commit, and crash
+// recovery:
+// 1. Aborting txn 0 after txn 1 touched the same non-unique key must restore
+//    txn 0's deleted entry and remove txn 0's aborted insert so a subsequent
+//    INSERT that reuses txn 0's heap slot under a different index key is not
+//    emitted twice by IndexScan.
+// 2. Committing txn 1 while txn 0's insert on the same key is uncommitted (and
+//    later aborted or lost across crash recovery) must not bake txn 0's dead
+//    RowPosition into committed_mem / recovered LSM state where IndexOnlyScan
+//    would over-count it.
+TEST(SqlSessionFuzzer,
+     DualTxnNonUniqueIndexCommitAbortSlotReuseAndCrashRecovery) {
+  SessionTrace trace;
+  trace.steps = {
+      {.sql = "CREATE TABLE t (u INT64, c1 INT64, c2 INT64);"},
+      {.sql = "CREATE INDEX idx_t_c1 ON t (c1);"},
+      {.sql = "INSERT INTO t VALUES (1, 10, 100);"},
+      {.sql = "INSERT INTO t VALUES (2, 10, 200);"},
+      {.is_commit = true},
+      {.is_begin = true, .txn = 0},
+      {.is_begin = true, .txn = 1},
+      // Txn 0 deletes u=1 (key c1=10) and inserts u=3 (also key c1=10).
+      {.txn = 0, .sql = "DELETE FROM t WHERE t.u = 1;"},
+      {.txn = 0, .sql = "INSERT INTO t VALUES (3, 10, 300);"},
+      // Txn 1 concurrently inserts u=4 with the same secondary key c1=10.
+      {.txn = 1, .sql = "INSERT INTO t VALUES (4, 10, 400);"},
+      // Txn 1 commits while txn 0 is still uncommitted; txn 0 then aborts.
+      {.is_commit = true, .txn = 1},
+      {.is_abort = true, .txn = 0},
+      // New txn reuses the heap slot vacated by txn 0's aborted u=3, but with
+      // a DIFFERENT secondary index key c1=20.
+      {.is_begin = true, .txn = 0},
+      {.txn = 0, .sql = "INSERT INTO t VALUES (5, 20, 500);"},
+      {.is_commit = true, .txn = 0},
+      // Crash and recover: neither IndexScan nor IndexOnlyScan may see dead or
+      // duplicate entries from txn 0's aborted mutations on c1=10.
+      {.is_crash = true},
+  };
+  for (size_t step_idx : {size_t{10}, size_t{11}, size_t{14}, size_t{15}}) {
+    SessionCheck chk;
+    chk.table = "t";
+    chk.txn = 0;
+    chk.after_step = step_idx;
+    if (step_idx == 10) {
+      chk.expected = {"[2, 10, 200]", "[3, 10, 300]"};
+    } else if (step_idx == 11) {
+      chk.expected = {"[1, 10, 100]", "[2, 10, 200]", "[4, 10, 400]"};
+    } else {
+      chk.expected = {"[1, 10, 100]", "[2, 10, 200]", "[4, 10, 400]",
+                      "[5, 20, 500]"};
+    }
+    trace.checks.push_back(chk);
+  }
+  EXPECT_EQ(ReplaySessionTrace(trace, true), "");
+}
+
 // Stress one seed repeatedly: nondeterministic engine bugs (e.g. abort undo
 // leaving a half-visible row) may only fire under specific timing, so a
 // single iteration is not enough.  Opt-in via env vars.

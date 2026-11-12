@@ -2834,6 +2834,21 @@ TEST(CascadesTest, LimitPrefixThroughUnorderedWindowFires) {
   const auto& all = search.GetMemo();
   EXPECT_TRUE(GroupHasLimitWithDifferentChild(all, limit_group, win_group));
   EXPECT_TRUE(AnyWindowHasLimitedChild(all));
+  // The inner cut under the window is a prefix: it must keep offset+count
+  // rows from the start (OFFSET applied once, by the outer Limit). Skipping
+  // the OFFSET twice would drop rows and renumber the survivors.
+  bool saw_prefix_cut = false;
+  for (size_t g = 0; g < all.GroupCount(); ++g) {
+    for (const LogicalExpression& expr : all.Get(GroupId(g)).expressions) {
+      if (expr.operation == LogicalOperator::kLimit &&
+          !expr.children.empty() && expr.children[0] == scan) {
+        EXPECT_EQ(expr.limit_count, 5U);
+        EXPECT_EQ(expr.limit_offset, 0U);
+        saw_prefix_cut = true;
+      }
+    }
+  }
+  EXPECT_TRUE(saw_prefix_cut);
 
   // And costing must prefer the transformed shape once the base relation is
   // non-trivial: the window only materializes the kept prefix. The rendered
@@ -4528,8 +4543,9 @@ TEST(CascadesTest, AuditJoinInferenceDoesNotStrengthenBranchLocalScans) {
     RuleSet rules;
     for (const auto& rule : RuleSet::Default().Rules()) {
       if (rule.Name() == (inequality ? "inferred_inequality_pushdown"
-                                     : "infer_join_predicates"))
+                                     : "infer_join_predicates")) {
         rules.Add(rule);
+      }
     }
     ASSERT_EQ(rules.Rules().size(), 1U);
     SearchEngine search(std::move(memo), rules);
@@ -5478,8 +5494,9 @@ TEST(CascadesTest, AuditOuterJoinProofKeepsSuffixedRelationsDistinct) {
               BinaryOperation::kGreaterThan, ConstantValueExp(Value(10)))});
   RuleSet rules;
   for (const auto& rule : RuleSet::Default().Rules()) {
-    if (rule.Name() == "outer_to_inner_join_on_null_rejecting_filter")
+    if (rule.Name() == "outer_to_inner_join_on_null_rejecting_filter") {
       rules.Add(rule);
+    }
   }
   ASSERT_EQ(rules.Rules().size(), 1U);
   const size_t before = memo.GroupCount();

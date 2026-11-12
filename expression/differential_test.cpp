@@ -212,8 +212,9 @@ bool SameValue(const Value& left, const Value& right) {
     return false;
   }
   if (left.type == ValueType::kDouble) {
-    // Both paths run identical FP expressions; require bit-identical results
-    // so inf/NaN cells compare deterministically.
+    // Both paths run identical FP expressions: compare with == (so +0.0 and
+    // -0.0 are equal) and treat every NaN as equal, so inf/NaN cells compare
+    // deterministically. This is value equality, not bit identity.
     const bool left_nan = std::isnan(left.value.double_value);
     if (left_nan != std::isnan(right.value.double_value)) {
       return false;
@@ -253,10 +254,14 @@ class DifferentialTally {
       available.emplace_back(&path.first, &path.second);
     }
     skipped_ += static_cast<int>(paths.size() - available.size());
-    if (!available.empty() &&
-        available.front().second->kind == Attempt::Kind::kValue &&
-        oracle.has_value()) {
-      CheckOracle(cell, input, *available.front().second, *oracle);
+    // The oracle names the expected VALUE: every available path must
+    // produce it. Checking only when the first path already returned a value
+    // let a regression that turns every path into a throw pass silently.
+    if (oracle.has_value()) {
+      for (const auto& path : available) {
+        CheckOracle(cell + " path=" + *path.first, input, *path.second,
+                    *oracle);
+      }
     }
     if (available.size() < 2) {
       return;

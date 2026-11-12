@@ -16,6 +16,7 @@
 
 #include "transaction/transaction.hpp"
 
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -454,8 +455,9 @@ TEST_F(TransactionTest, AddWriteSetFailsWhenMvccIntentHeldElsewhere) {
 TEST_F(TransactionTest, AuditReservationModeKeepsRegistrationWithoutDiscount) {
   const char* mode = std::getenv("TINYLAMB_DISABLE_INDEX_RESERVATION");
   const bool discount_off = mode != nullptr && std::string_view(mode) == "4";
-  if (mode != nullptr && std::string_view(mode) != "0" && !discount_off)
+  if (mode != nullptr && std::string_view(mode) != "0" && !discount_off) {
     GTEST_SKIP();
+  }
   Transaction owner = tm_->Begin();
   Transaction other = tm_->Begin();
   owner.ReserveIndexUndoBytes(132, 64);
@@ -745,6 +747,42 @@ TEST_F(TransactionTest, WoundFlagSurvivesMove) {
 }  // namespace tinylamb
 
 namespace tinylamb {
+TEST_F(TransactionTest, ConcurrentExplicitGcPreservesPinnedVersions) {
+  constexpr uint64_t kRows = 10000;
+  auto old = tm_->Begin(true);
+  {
+    auto writer = tm_->Begin();
+    for (uint64_t i = 0; i < kRows; ++i) {
+      const RowPosition position(i + 100, 0);
+      ASSERT_TRUE(writer.AddWriteSet(position, "before"));
+      writer.RegisterVersionWrite(position, "before", "after");
+    }
+    ASSERT_SUCCESS(writer.PreCommit());
+    ASSERT_SUCCESS(writer.CommitWait());
+  }
+  std::barrier start(3);
+  const auto sweep = [&] {
+    start.arrive_and_wait();
+    for (size_t pass = 0; pass < 32; ++pass) {
+      tm_->SweepCommittedVersionChains();
+    }
+  };
+  {
+    std::jthread first(sweep);
+    std::jthread second(sweep);
+    sweep();
+  }
+  EXPECT_EQ(tm_->RuntimeStats().version_chains, kRows);
+  for (const uint64_t i : {uint64_t{0}, kRows / 2, kRows - 1}) {
+    ASSERT_SUCCESS_AND_EQ(tm_->ReadVersion(old, RowPosition(i + 100, 0),
+                                           std::string_view("after")),
+                          std::optional<std::string>("before"));
+  }
+  ASSERT_SUCCESS(old.PreCommit());
+  tm_->SweepCommittedVersionChains();
+  EXPECT_EQ(tm_->RuntimeStats().version_chains, 0U);
+}
+
 TEST_F(TransactionTest, GcFinishesRotatingSweepWithoutAnotherWrite) {
   constexpr uint64_t kRows = 10000;  // exceeds the adaptive full-scan limit
   {

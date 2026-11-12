@@ -28,6 +28,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -7030,6 +7031,48 @@ TEST_F(ExecutorTest, TypedGroupingHandlesConstantsEmptyInputAndAverageCasts) {
   EXPECT_EQ(
       RelationalRun(*rs_, "SELECT AVG(CAST(n AS FLOAT64)) FROM ConstantGroups"),
       std::vector<Row>{Row({Value(11.0 / 3.0)})});
+}
+
+TEST_F(ExecutorTest, ProjectedParallelFoldConvertsExceptionsToStickyStatus) {
+  RelationalRun(*rs_, "CREATE TABLE FoldFailure(unused STRING, k INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO FoldFailure VALUES ('unused',1),('unused',2)");
+  WaitForChainFreePages();
+  auto reader = rs_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        reader.GetTable("FoldFailure"));
+  table->SetLSTableStore(nullptr);
+  table->SetProjectedLSTableStore(nullptr);
+  table->RejectLSTableCapacity(table->LayoutGeneration());
+  const std::vector<slot_t> needed{1};
+  for (const bool allocation_failure : {true, false}) {
+    auto scan = std::make_shared<ParallelScan>(reader.txn_, *table, 2, 1);
+    EXPECT_EQ(scan->GetLSTableStore(), nullptr);
+    StatusOr<bool> folded(false);
+    EXPECT_NO_THROW(
+        folded = scan->TryFoldLSTableBlocks(
+            2,
+            [&](size_t /*worker*/, const LSTablePageBlock& /*block*/,
+                const uint32_t* /*rows*/, size_t /*count*/) -> Status {
+              if (allocation_failure) {
+                throw std::bad_alloc();
+              }
+              throw std::runtime_error("injected fold failure");
+            },
+            &needed));
+    const Status expected =
+        allocation_failure ? Status::kNoSpace : Status::kRuntimeError;
+    ASSERT_FALSE(folded.HasValue());
+    EXPECT_EQ(folded.GetStatus(), expected);
+    EXPECT_EQ(scan->GetStatus(), expected);
+    ASSERT_NE(scan->GetLSTableStore(), nullptr);
+    EXPECT_TRUE(scan->GetLSTableStore()->HasColumn(1));
+    EXPECT_FALSE(scan->GetLSTableStore()->HasColumn(0));
+    DataChunk output;
+    EXPECT_EQ(scan->NextBatch(&output), 0U);
+    EXPECT_EQ(scan->GetStatus(), expected);
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 }  // namespace tinylamb

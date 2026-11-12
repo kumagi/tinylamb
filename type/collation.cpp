@@ -100,8 +100,26 @@ int CompareVarCharForOrderBy(std::string_view left, std::string_view right,
   if (!case_insensitive) {
     const int left_rank = EnumRank(left);
     const int right_rank = EnumRank(right);
-    if (left_rank >= 0 && right_rank >= 0 && left_rank != right_rank) {
-      return left_rank < right_rank ? -1 : 1;
+    if (left_rank >= 0 || right_rank >= 0) {
+      // Order every string by one key function so the comparator stays a
+      // strict weak ordering: an ENUM member sorts as "TESTENUM" followed by
+      // its rank byte (below any printable byte), everything else by its own
+      // bytes. Mixing "rank when both are members, bytes otherwise" built
+      // cycles (NEGATIVE < 0 < "TESTENUM5" < NEGATIVE), which is UB for
+      // std::sort / pdqsort.
+      const auto key = [](std::string_view text, int rank) -> std::string {
+        if (rank < 0) {
+          return std::string(text);
+        }
+        std::string out = "TESTENUM";
+        out.push_back(static_cast<char>(rank));
+        return out;
+      };
+      const std::string left_key = key(left, left_rank);
+      const std::string right_key = key(right, right_rank);
+      if (left_key != right_key) {
+        return left_key < right_key ? -1 : 1;
+      }
     }
   }
   if (case_insensitive) {

@@ -879,6 +879,38 @@ std::optional<IntervalValue> ParseAsInterval(std::string_view s) {
 }
 }  // namespace
 
+static uint64_t HashStringView(std::string_view text) {
+  // 8-byte loads. Borrowed dictionary views are hashed on every probe, so
+  // this stays branch-light. Equal byte strings still share one hash.
+  constexpr uint64_t kMul = 0x100000001b3ULL;
+  uint64_t h = 0xcbf29ce484222325ULL ^ (text.size() * kMul);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(text.data());
+  size_t n = text.size();
+  while (n >= 8) {
+    uint64_t word = 0;
+    std::memcpy(&word, bytes, sizeof(word));
+    h = (h ^ word) * kMul;
+    bytes += 8;
+    n -= 8;
+  }
+  if (n >= 4) {
+    uint32_t word = 0;
+    std::memcpy(&word, bytes, sizeof(word));
+    h = (h ^ word) * kMul;
+    bytes += 4;
+    n -= 4;
+  }
+  while (n != 0) {
+    h = (h ^ bytes[0]) * kMul;
+    ++bytes;
+    --n;
+  }
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  return h == 0 ? 1 : h;
+}
+
 uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
   StringPayload* owned = payload_ != nullptr && !payload_->is_array
                              ? static_cast<StringPayload*>(payload_)
@@ -897,7 +929,7 @@ uint64_t OwnedValuePayload::StringHash(std::string_view text) const {
       return cached;
     }
   }
-  const uint64_t hash = std::hash<std::string_view>()(text);
+  const uint64_t hash = HashStringView(text);
   if (owned != nullptr && hash != UINT64_MAX) {
     owned->hash.store(hash, std::memory_order_relaxed);
   }
@@ -1688,6 +1720,48 @@ StatusOr<Value> Value::TryArithmetic(const Value& rhs,
       return Value(std::bit_cast<int64_t>(uint64_t{0} - magnitude));
     }
     return Value(std::bit_cast<int64_t>(magnitude)).WithUnsigned();
+  }
+  // Mixed signed/unsigned +, -, *: same mathematical-sign policy as the
+  // division above (and as the mixed comparisons). The exact result is
+  // computed in 128 bits; a negative result is an INT64, a non-negative one
+  // a UINT64, and only a result outside both ranges overflows. The raw
+  // uint64 bit arithmetic used to wrap -5 + 2 to 18446744073709551613 and
+  // reject the representable -2 * 3 as an overflow.
+  if (type == ValueType::kInt64 && rhs.type == ValueType::kInt64 &&
+      IsUnsigned() != rhs.IsUnsigned() &&
+      (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract ||
+       op == BinaryOperation::kMultiply)) {
+    const auto exact = [](const Value& v) -> __int128 {
+      return v.IsUnsigned()
+                 ? static_cast<__int128>(static_cast<uint64_t>(v.value.int_value))
+                 : static_cast<__int128>(v.value.int_value);
+    };
+    const __int128 a = exact(*this);
+    const __int128 b = exact(rhs);
+    __int128 r = 0;
+    const char* symbol = "+";
+    if (op == BinaryOperation::kAdd) {
+      r = a + b;  // |a|,|b| < 2^64: no 128-bit overflow
+    } else if (op == BinaryOperation::kSubtract) {
+      r = a - b;
+      symbol = "-";
+    } else {
+      symbol = "*";
+      if (__builtin_mul_overflow(a, b, &r)) {
+        return invalid(std::string("integer overflow on '") + symbol + "'");
+      }
+    }
+    if (r < 0) {
+      if (r < static_cast<__int128>(std::numeric_limits<int64_t>::min())) {
+        return invalid(std::string("integer overflow on '") + symbol + "'");
+      }
+      return Value(static_cast<int64_t>(r));
+    }
+    if (r > static_cast<__int128>(std::numeric_limits<uint64_t>::max())) {
+      return invalid(std::string("integer overflow on '") + symbol + "'");
+    }
+    return Value(std::bit_cast<int64_t>(static_cast<uint64_t>(r)))
+        .WithUnsigned();
   }
   switch (op) {
     case BinaryOperation::kAdd:

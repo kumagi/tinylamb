@@ -13,6 +13,17 @@
 #include "gtest/gtest.h"
 
 namespace tinylamb {
+TEST(ParallelWorkTest, TeamSizeRespectsWorkAndConcurrentAdmission) {
+  EXPECT_EQ(ParallelWorkerCount(0), 1U);
+  EXPECT_EQ(ParallelWorkerCount(1), 1U);
+  std::atomic<size_t> active{3};
+  ScopedQueryParallelismBudget budget(&active, 7);
+  EXPECT_GE(ParallelWorkerCount(1000), 1U);
+  EXPECT_LE(ParallelWorkerCount(1000), 2U);
+  active.store(8);
+  EXPECT_EQ(ParallelWorkerCount(1000), 1U);
+}
+
 TEST(ParallelWorkTest, ReusesHelpersAndExecutesEveryIndex) {
   std::array<std::thread::id, 2> first{};
   std::array<std::thread::id, 2> second{};
@@ -100,6 +111,7 @@ TEST(ParallelWorkTest, ReusedHelpersFollowChangedCpuAffinity) {
   } restore{*original};
   const auto single = platform::CpuSet::Single(original->First());
   ASSERT_TRUE(single.ApplyToCurrentThread());
+  EXPECT_EQ(ParallelWorkerCount(1000), 1U);
   ASSERT_TRUE(RunParallelTasks(2, [&](size_t) {
                 EXPECT_EQ(platform::CpuSet::CurrentThread(), single);
               }).ok());

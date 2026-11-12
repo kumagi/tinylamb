@@ -2060,8 +2060,12 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
   // `APPROX_QUANTILES(f, 2) OVER (PARTITION BY a)` must not violate strict
   // weak ordering or diverge between heap and LSTable.
   if (report.empty() && !large) {
-    const double c_val = static_cast<double>(g.Pick(-5, 5));
-    const std::string c_lit = std::to_string(c_val) + ".0";
+    const auto c_val = static_cast<double>(g.Pick(-5, 5));
+    // std::to_string(double) prints six fractional digits ("3.000000"), so
+    // appending ".0" produced the invalid literal "3.000000.0" and the whole
+    // NaN oracle silently never ran. c_val is integral: print it as such.
+    const std::string c_lit =
+        std::to_string(static_cast<int64_t>(c_val)) + ".0";
     const std::array<std::string, 5> nan_setup = {
         "CREATE TABLE t_nan_heap (u INT64 PRIMARY KEY, a INT64, f FLOAT64);",
         "CREATE TABLE t_nan_lst (u INT64 PRIMARY KEY, a INT64, f FLOAT64) "
@@ -2120,14 +2124,29 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
           std::string err_h, err_l;
           auto got_h = RunQuery(db, ctx, q_heap, &err_h);
           auto got_l = RunQuery(db, ctx, q_lst, &err_l);
-          if (!got_h.has_value() || !got_l.has_value()) {
-            continue;
+          if (got_h.has_value() != got_l.has_value()) {
+            // One storage answered and the other raised: that divergence is
+            // exactly what this oracle exists to catch.
+            report += "[NAN-ZONEMAP/WINDOW ERROR MISMATCH]\n  heap: ";
+            report.append(q_heap)
+                .append(got_h.has_value() ? " -> ok" : " -> " + err_h)
+                .append("\n  lst:  ")
+                .append(q_lst)
+                .append(got_l.has_value() ? " -> ok" : " -> " + err_l)
+                .append("\n");
+            return report;
+          }
+          if (!got_h.has_value()) {
+            continue;  // Both rejected the probe alike.
           }
           const std::vector<std::string> rows_h = FormatRows(*got_h);
           const std::vector<std::string> rows_l = FormatRows(*got_l);
           if (rows_h != rows_l) {
-            report += "[NAN-ZONEMAP/WINDOW MISMATCH]\n  heap: " + q_heap +
-                      "\n  lst:  " + q_lst + "\n";
+            report += "[NAN-ZONEMAP/WINDOW MISMATCH]\n  heap: ";
+            report.append(q_heap)
+                .append("\n  lst:  ")
+                .append(q_lst)
+                .append("\n");
             return report;
           }
         }

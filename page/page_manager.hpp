@@ -74,6 +74,7 @@ struct LsmTreeState {
     bool deleted{false};
     uint64_t generation{0};
     txn_id_t uncommitted_txn{0};
+    std::vector<txn_id_t> uncommitted_owners{};
   };
   struct CommittedEntry {
     std::string value;
@@ -101,6 +102,9 @@ struct LsmTreeState {
 
   [[nodiscard]] bool LookupLiveLocked(std::string_view key,
                                       std::string* value_out) const;
+  [[nodiscard]] bool LookupCommittedLocked(std::string_view key,
+                                           std::string* value_out,
+                                           lsn_t* lsn_out = nullptr) const;
   bool FlushAndCompactIfIdleLocked();
   [[nodiscard]] LsmSortedRun BuildCompactedCommittedRunLocked() const;
 };
@@ -124,6 +128,11 @@ class PageManager {
 
   StatusOr<PageRef> AllocateNewPage(Transaction& txn, PageType new_page_type);
   Status DestroyPage(Transaction& txn, Page* target);
+  StatusOr<std::vector<page_id_t>> InstallColumnarStubChain(
+      page_id_t first_pid, const std::vector<uint32_t>& block_row_counts,
+      lsn_t commit_lsn);
+  Status HydrateColumnarStubPage(page_id_t page_id,
+                                 std::vector<std::string>&& encoded_rows);
 
   // Table tail coordination for concurrent appends.
   page_id_t GetTableTail(page_id_t first_page, page_id_t catalog_hint);

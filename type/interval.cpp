@@ -524,11 +524,16 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         if (p.find(':') != std::string::npos) {
           int64_t th = 0, tm = 0;
           double ts = 0.0;
+          // The sign belongs to the whole H:M:S component: "-0:30:00" is
+          // minus thirty minutes, but sscanf reads "-0" as plain 0. Strip it
+          // and apply it below, as the generic composite branch does.
+          const bool negative = !p.empty() && p.front() == '-';
+          const std::string magnitude = negative ? p.substr(1) : p;
           // The integer fields cannot report conversion failures, but a
           // partially parsed time component is rejected by the != 3 check.
           // NOLINTNEXTLINE(cert-err34-c)
-          if (sscanf(p.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th, &tm, &ts) !=
-              3) {
+          if (sscanf(magnitude.c_str(), "%" SCNd64 ":%" SCNd64 ":%lf", &th,
+                     &tm, &ts) != 3) {
             ok = false;
             break;
           }
@@ -544,9 +549,11 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
               std::round((ts - static_cast<double>(seconds)) * 1e9));
           const int64_t whole_seconds = checked_add(
               checked_mul(th, 3600), checked_add(checked_mul(tm, 60), seconds));
+          const int64_t component_nanos =
+              checked_add(checked_mul(whole_seconds, 1000000000LL), fraction);
           iv.nanos = checked_add(
-              iv.nanos,
-              checked_add(checked_mul(whole_seconds, 1000000000LL), fraction));
+              iv.nanos, negative ? checked_mul(component_nanos, -1)
+                                 : component_nanos);
           continue;
         }
         int64_t val = 0;
@@ -644,11 +651,14 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
       auto sub_ns = static_cast<int64_t>(std::round(s_frac * 1e9));
       const int64_t day_seconds = checked_add(
           checked_mul(th, 3600), checked_add(checked_mul(tm, 60), s_int));
-      iv.nanos = checked_add(
-          iv.nanos,
-          checked_mul(
-              checked_add(checked_mul(day_seconds, 1000000000LL), sub_ns),
-              sign));
+      // Apply sign before combining whole-second nanos and sub-second nanos so
+      // INT64_MIN (-2562047:47:16.854775808) does not overflow INT64_MAX on the
+      // positive magnitude before negation.
+      const int64_t signed_sec_nanos =
+          checked_mul(checked_mul(day_seconds, sign), 1000000000LL);
+      const int64_t signed_sub_ns = checked_mul(sub_ns, sign);
+      iv.nanos =
+          checked_add(iv.nanos, checked_add(signed_sec_nanos, signed_sub_ns));
     } else if (p.find('-') != std::string::npos &&
                (p.size() > 1 && p.find_last_of('-') != 0)) {
       // Y-M
@@ -669,8 +679,10 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           m = 0;
         }
       }
-      iv.months = checked_add(
-          iv.months, checked_mul(checked_add(checked_mul(y, 12), m), sign));
+      const int64_t signed_y_months = checked_mul(checked_mul(y, sign), 12);
+      const int64_t signed_m = checked_mul(m, sign);
+      iv.months =
+          checked_add(iv.months, checked_add(signed_y_months, signed_m));
     } else {
       // Numerical part
       int64_t val = 0;
@@ -684,6 +696,10 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
           iv.days = checked_add(iv.days, val);
         } else if (idx == 0) {
           iv.months = checked_add(iv.months, checked_mul(val, 12));
+        } else {
+          // The third composite field is H:M:S; a bare number there has no
+          // place to go (it used to be dropped silently).
+          return fail("'" + s + "': unexpected component '" + p + "'");
         }
       } else if (parts.size() == 2) {
         if (u == "month to day") {  // NOLINT(bugprone-branch-clone)
@@ -721,10 +737,43 @@ StatusOr<IntervalValue> IntervalValue::TryParse(std::string_view text,
         } else if (u.starts_with("minute")) {
           iv.nanos =
               checked_add(iv.nanos, checked_mul(val, 60LL * 1000000000LL));
-        } else {
+        } else if (u.empty() || u.starts_with("day")) {
           iv.days = checked_add(iv.days, val);
+        } else {
+          // An unknown unit must not silently become a day count.
+          return fail("'" + s + "': unsupported INTERVAL unit '" + u + "'");
         }
       }
+    }
+  }
+  // A unit range ("hour to second") admits only components inside it; the
+  // generic composite reading above can place a mismatched literal into
+  // months/days ('1 2' HOUR TO SECOND became 1 month 2 days).
+  if (const size_t split = u.find(" to "); split != std::string::npos) {
+    static constexpr std::array<std::string_view, 6> kRangeUnits = {
+        "year", "month", "day", "hour", "minute", "second"};
+    auto range_index = [&](std::string name) -> int {
+      while (!name.empty() && name.back() == 's') {
+        name.pop_back();
+      }
+      for (int i = 5; i >= 0; --i) {
+        if (name.starts_with(kRangeUnits[static_cast<size_t>(i)])) {
+          return i;
+        }
+      }
+      return -1;
+    };
+    const int lo = range_index(u.substr(0, split));
+    const int hi = range_index(u.substr(split + 4));
+    if (lo < 0 || hi < lo) {
+      return fail("'" + s + "': invalid INTERVAL unit range '" + u + "'");
+    }
+    const bool months_ok = lo <= 1;
+    const bool days_ok = lo <= 2 && hi >= 2;
+    const bool time_ok = hi >= 3;
+    if ((iv.months != 0 && !months_ok) || (iv.days != 0 && !days_ok) ||
+        (iv.nanos != 0 && !time_ok)) {
+      return fail("'" + s + "': value does not match INTERVAL " + u);
     }
   }
   return checked_return(iv);

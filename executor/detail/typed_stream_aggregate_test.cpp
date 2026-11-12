@@ -15,6 +15,7 @@
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
+#include "expression/expression.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -364,6 +365,23 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
   EXPECT_NEAR(
       EvaluateTypedDoubleExprOnRow(*compiled_charge, row).value.double_value,
       189.0, 1e-9);
+
+  // COALESCE(price * discount, 0) substitutes 0 for a NULL factor.
+  const Expression coalesced = FunctionCallExp(
+      "coalesce", {mul_two, ConstantValueExp(Value(static_cast<int64_t>(0)))});
+  auto compiled_coalesce = TryCompileTypedDoubleExpr(coalesced, schema);
+  ASSERT_TRUE(compiled_coalesce.has_value());
+  EXPECT_TRUE(compiled_coalesce->null_as_zero);
+  EXPECT_DOUBLE_EQ(
+      EvaluateTypedDoubleExprOnRow(*compiled_coalesce, row).value.double_value,
+      20.0);
+  const Row null_price(
+      {Value(1), Value(10), Value(), Value(0.1), Value(0.05), Value("AIR")});
+  EXPECT_TRUE(
+      EvaluateTypedDoubleExprOnRow(*compiled_mul2, null_price).IsNull());
+  EXPECT_DOUBLE_EQ(EvaluateTypedDoubleExprOnRow(*compiled_coalesce, null_price)
+                       .value.double_value,
+                   0.0);
 }
 
 TEST(TypedStreamAggregateTest, TryCompilePositionalHavingAndConjuncts) {

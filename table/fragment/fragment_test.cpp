@@ -27,7 +27,9 @@ class FragmentAuditTest : public ::testing::Test {
   std::vector<std::pair<std::string, RowEntry>> mem_;
   void SetUp() override {
     MemTable table(schema_);
-    for (const Row& row : rows_) ASSERT_EQ(table.Put(row), Status::kSuccess);
+    for (const Row& row : rows_) {
+      ASSERT_EQ(table.Put(row), Status::kSuccess);
+    }
     mem_ = table.Snapshot();
   }
   std::vector<ArtifactRef> Artifacts() {

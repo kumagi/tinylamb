@@ -669,6 +669,11 @@ bool ParseLaneRegion(const char* r, uint32_t n, uint32_t param,
   out->nd = nd;
   out->base = r + 1;
   const size_t hdr = LaneHeaderBytes(nd);
+  // The header grows with nd (up to 264 bytes); the 40-byte floor above
+  // only covers nd = 2. Bound it before reading the trailing fields.
+  if (static_cast<size_t>(region_end - r) < hdr) {
+    return false;
+  }
   out->ischeme = static_cast<uint8_t>(r[hdr - 7]);
   out->iparam = ReadBE32(r + hdr - 6);
   out->nexc = ReadBE16(r + hdr - 2);
@@ -708,13 +713,16 @@ int64_t Int64AtLane(const char* r, uint32_t param, uint32_t n, uint32_t idx,
   }
   p.base = r + 1;
   const size_t hdr = LaneHeaderBytes(p.nd);
+  const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
+  // Bound the nd-sized header (and bitmap) BEFORE reading its trailing
+  // ischeme/iparam/nexc fields: the 40-byte check above only covers nd = 2.
+  if (region_end != nullptr &&
+      static_cast<size_t>(region_end - r) < hdr + bmp_bytes) {
+    return 0;
+  }
   p.ischeme = static_cast<uint8_t>(r[hdr - 7]);
   p.iparam = ReadBE32(r + hdr - 6);
   p.nexc = ReadBE16(r + hdr - 2);
-  const size_t bmp_bytes = (static_cast<size_t>(n) + 7) / 8;
-  if (region_end != nullptr && r + hdr + bmp_bytes > region_end) {
-    return 0;
-  }
   if (p.nexc != param || (p.nexc > 0 && !InnerSchemeOk(p.ischeme))) {
     return 0;
   }
@@ -5671,11 +5679,40 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
     case Scheme::kTemplate:
     case Scheme::kDStream:
     case Scheme::kChimp128:
-    // SIMPLE-8B regions have no monotonicity contract, so a binary search
-    // over the decoder would be unsound; report "no bound" and let the
-    // caller fall back (same door as the float streams above).
-    case Scheme::kSimple8b:
       break;
+    case Scheme::kSimple8b: {
+      // No random-access structure for a bisect, and the callers
+      // (PointLookup / LowerBoundIndex) have no "no bound" fallback: a
+      // false here read as "absent" and hid existing keys. The key column
+      // is sorted, so one forward word walk answers the lower bound in
+      // O(n), mirroring Int64RegionAt's kSimple8b arm.
+      if (param == 0 ||
+          (region_end != nullptr &&
+           r + 8 + (static_cast<size_t>(param) * 8) > region_end)) {
+        return false;
+      }
+      const uint64_t base_u = ReadBE64(r);
+      uint32_t idx = 0;
+      const char* p = r + 8;
+      for (uint32_t w = 0; w < param && idx < n; ++w, p += 8) {
+        const uint64_t word = ReadBE64(p);
+        const auto sel = static_cast<uint32_t>(word >> 60);
+        const uint32_t cnt = kSimple8bSelCount[sel];
+        const uint32_t bits = kSimple8bSelBits[sel];
+        for (uint32_t j = 0; j < cnt && idx < n; ++j, ++idx) {
+          const uint64_t off =
+              bits == 0 ? 0
+                        : (word >> (bits * (cnt - 1 - j))) &
+                              ((UINT64_C(1) << bits) - 1);
+          if (static_cast<int64_t>(base_u + off) >= key) {
+            *pos = idx;
+            return true;
+          }
+        }
+      }
+      *pos = n;
+      return false;
+    }
   }
   return false;
 }

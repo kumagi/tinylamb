@@ -673,6 +673,13 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
     }
 
     const uint64_t base = rg_base[g];
+    // NULL string cells decode as "" inside the selection kernels; a SQL
+    // comparison against NULL is UNKNOWN (row rejected), so consult the
+    // varchar columns' null bitmaps alongside the masks.
+    std::vector<const uint8_t*> varchar_null_bits(varchar_eval.size());
+    for (size_t vi = 0; vi < varchar_eval.size(); ++vi) {
+      varchar_null_bits[vi] = chunk.CellNullBits(g, varchar_eval[vi].col);
+    }
     for (uint16_t r = 0; r < rc; ++r) {
       const auto global_row = static_cast<uint32_t>(base + r);
       if (point_row.has_value() && global_row != *point_row) {
@@ -696,9 +703,15 @@ void ScanChunk(const PaxChunk& chunk, const Schema& sc, const Fragment& frag,
       bool passes = true;
       // The varchar conjuncts: the mask answers them without decoding a
       // string into the fragment.
-      for (const auto& mask : varchar_masks) {
+      for (size_t vi = 0; vi < varchar_masks.size(); ++vi) {
+        const auto& mask = varchar_masks[vi];
         const uint64_t global = base + r;
         if (global >= mask.bits.size() * 64) {
+          passes = false;
+          break;
+        }
+        if (varchar_null_bits[vi] != nullptr &&
+            ((varchar_null_bits[vi][r >> 3] >> (7 - (r & 7))) & 1) != 0) {
           passes = false;
           break;
         }
@@ -838,8 +851,11 @@ void ScanRun(const SortedRun& run, const Schema& sc, const Fragment& frag,
         break;
       }
       const Value& v = decoded[c.col];
-      const std::string_view text =
-          v.IsNull() ? std::string_view() : v.AsStringView();
+      if (v.IsNull()) {
+        passes = false;  // NULL <op> 'x' is UNKNOWN: the row is rejected.
+        break;
+      }
+      const std::string_view text = v.AsStringView();
       const bool hit =
           c.kind == ConjunctKind::kVarcharRange
               ? VarcharRangeHolds(text, c.bytes_literal, c.bytes_literal_hi)
@@ -918,7 +934,10 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
                      const std::vector<Conjunct>& eval,
                      const std::vector<Conjunct>& varchar_eval,
                      const std::vector<slot_t>& needed, uint32_t artifact_index,
-                     ScanState* state) {
+                     uint64_t generation, ScanState* state) {
+  // `generation` is the snapshot's ArtifactRef.generation: the LSM
+  // generation ResolveDuplicates compares (newest wins). Leaving the rows at
+  // the default 0 made the memtable lose every key collision to older runs.
   const slot_t key_col = sc.KeyColumnIndex();
   const int key_idx = NeededIndex(needed, key_col);
   std::vector<int64_t> row_values;  // one surviving row's values
@@ -942,6 +961,7 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
       row.deleted = true;
       row.artifact_index = artifact_index;
       row.row_index = static_cast<uint64_t>(ri);
+      row.generation = generation;
       if (MemcomparableInt64Key(key, &row.key)) {
         row.has_key = true;
       }
@@ -957,8 +977,11 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
         break;
       }
       const Value& v = decoded[c.col];
-      const std::string_view text =
-          v.IsNull() ? std::string_view() : v.AsStringView();
+      if (v.IsNull()) {
+        passes = false;  // NULL <op> 'x' is UNKNOWN: the row is rejected.
+        break;
+      }
+      const std::string_view text = v.AsStringView();
       const bool hit =
           c.kind == ConjunctKind::kVarcharRange
               ? VarcharRangeHolds(text, c.bytes_literal, c.bytes_literal_hi)
@@ -1017,6 +1040,7 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
     SurvivingRow row;
     row.artifact_index = artifact_index;
     row.row_index = static_cast<uint64_t>(ri);
+    row.generation = generation;
     row.value_offset =
         state->AppendValues(row_values.data(), row_nulls.data(), needed.size());
     row.value_count = static_cast<uint32_t>(needed.size());
@@ -1134,15 +1158,15 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         if (null_of(agg.col)) {
           break;
         }
-        acc->sum = std::bit_cast<int64_t>(
-            static_cast<uint64_t>(acc->sum) +
-            static_cast<uint64_t>(agg.coeff) *
-                static_cast<uint64_t>(value_of(agg.col)));
+        acc->sum =
+            std::bit_cast<int64_t>(static_cast<uint64_t>(acc->sum) +
+                                   (static_cast<uint64_t>(agg.coeff) *
+                                    static_cast<uint64_t>(value_of(agg.col))));
         acc->count += 1;
         break;
       }
       for (const AggTerm& term : agg.terms) {
-        uint64_t product = static_cast<uint64_t>(term.coeff);
+        auto product = static_cast<uint64_t>(term.coeff);
         bool null_term = false;
         for (slot_t col : term.cols) {
           if (null_of(col)) {
@@ -1240,14 +1264,24 @@ Status ValidateFragment(const Schema& sc, const Fragment& frag) {
       return Status::kCorruption;
     }
   }
+  // Projection and GROUP BY read through the int64 row decoder only
+  // (NeededColumns skips other types and RowReader then reports 0/NULL),
+  // so a VARCHAR/DOUBLE column here would fold every key to 0 / project 0
+  // under coverage=kFull. Decline instead of answering wrongly.
   for (slot_t c : frag.projection) {
     if (c >= sc.ColumnCount()) {
       return Status::kCorruption;
+    }
+    if (!IsInt64Column(sc, c)) {
+      return Status::kNotImplemented;
     }
   }
   for (slot_t c : frag.group_cols) {
     if (c >= sc.ColumnCount()) {
       return Status::kCorruption;
+    }
+    if (!IsInt64Column(sc, c)) {
+      return Status::kNotImplemented;
     }
   }
   if (frag.top_k.has_value()) {
@@ -1342,7 +1376,7 @@ void ScanArtifacts(const ArtifactSet& artifacts, const Fragment& frag,
     } else if (a.kind == ArtifactRef::Kind::kMemSnapshot &&
                a.mem_rows != nullptr) {
       ScanMemSnapshot(*a.mem_rows, sc, frag, eval, varchar_eval, needed,
-                      artifact_index, state);
+                      artifact_index, a.generation, state);
     }
   }
 }
@@ -1887,11 +1921,13 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
     for (size_t i = 0; i < artifacts.size(); ++i) {
       artifact_base[i] = base;
       const ArtifactRef& artifact = artifacts[i];
-      if (artifact.kind == ArtifactRef::Kind::kChunk && artifact.chunk) {
+      if (artifact.kind == ArtifactRef::Kind::kChunk &&
+          artifact.chunk != nullptr) {
         base += artifact.chunk->TotalRowCount();
-      } else if (artifact.kind == ArtifactRef::Kind::kRun && artifact.run) {
+      } else if (artifact.kind == ArtifactRef::Kind::kRun &&
+                 artifact.run != nullptr) {
         base += artifact.run->Size();
-      } else if (artifact.mem_rows) {
+      } else if (artifact.mem_rows != nullptr) {
         base += artifact.mem_rows->size();
       }
     }

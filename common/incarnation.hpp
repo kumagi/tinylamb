@@ -138,6 +138,31 @@ class TableIncarnation {
     std::scoped_lock lock(lstable_mutex_);
     lstable_store_ = std::move(store);
   }
+  [[nodiscard]] std::shared_ptr<const void> GetProjectedLSTableStoreRaw()
+      const {
+    std::scoped_lock lock(lstable_mutex_);
+    return projected_lstable_store_;
+  }
+  void SetProjectedLSTableStoreRaw(std::shared_ptr<const void> store) {
+    std::scoped_lock lock(lstable_mutex_);
+    projected_lstable_store_ = std::move(store);
+  }
+  [[nodiscard]] uint64_t LSTableCapacityRejectedGeneration() const {
+    return lstable_capacity_rejected_generation_.load(
+        std::memory_order_acquire);
+  }
+  void RejectLSTableCapacity(uint64_t generation) {
+    lstable_capacity_rejected_generation_.store(generation,
+                                                std::memory_order_release);
+  }
+  [[nodiscard]] std::shared_ptr<const void> GetBackingTLCSStoreRaw() const {
+    std::scoped_lock lock(lstable_mutex_);
+    return backing_tlcs_store_;
+  }
+  void SetBackingTLCSStoreRaw(std::shared_ptr<const void> store) {
+    std::scoped_lock lock(lstable_mutex_);
+    backing_tlcs_store_ = std::move(store);
+  }
 
  private:
   static uint64_t NextLayoutGenerationSeed() noexcept {
@@ -154,6 +179,9 @@ class TableIncarnation {
   std::atomic<uint64_t> layout_generation_{NextLayoutGenerationSeed()};
   std::atomic<bool> rows_rewritten_in_place_{false};
   std::shared_ptr<const void> lstable_store_;
+  std::shared_ptr<const void> projected_lstable_store_;
+  std::atomic<uint64_t> lstable_capacity_rejected_generation_{0};
+  std::shared_ptr<const void> backing_tlcs_store_;
 };
 
 class TableLease {

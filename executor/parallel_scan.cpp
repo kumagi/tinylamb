@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <exception>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
@@ -64,7 +66,15 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
   table_lease_ = lease.MoveValue();
   if ((txn_->IsReadOnly() || txn_->WriteSetEmpty()) &&
       !txn_->HasAnyPageVersionChains()) {
-    lstable_store_ = GetOrBuildLSTableStore(*txn_, *table_, true);
+    std::vector<slot_t> needed;
+    if (projection_) {
+      needed = *projection_;
+      for (const auto& compare : peek_compares_) {
+        needed.push_back(compare.column);
+      }
+    }
+    lstable_store_ = GetOrBuildLSTableStore(*txn_, *table_, true,
+                                            projection_ ? &needed : nullptr);
     if (lstable_store_ != nullptr &&
         (lstable_store_->uncommitted_owner_txn != 0 ||
          lstable_store_->layout_generation != table_->LayoutGeneration() ||
@@ -72,14 +82,27 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
       lstable_store_.reset();
     }
   }
-  if (lstable_store_ != nullptr) {
+  // A narrow cached snapshot still proves the page layout. It can supply
+  // morsels without pretending that unrequested columns were decoded.
+  auto scheduling_store = lstable_store_;
+  if (!scheduling_store && (txn_->IsReadOnly() || txn_->WriteSetEmpty()) &&
+      !txn_->HasAnyPageVersionChains()) {
+    scheduling_store = table_->GetProjectedLSTableStore();
+    if (scheduling_store &&
+        (scheduling_store->uncommitted_owner_txn != 0 ||
+         scheduling_store->layout_generation != table_->LayoutGeneration() ||
+         scheduling_store->first_pid != table_->FirstPageId())) {
+      scheduling_store.reset();
+    }
+  }
+  if (scheduling_store != nullptr) {
     const size_t step = std::max<size_t>(1, pages_per_morsel);
-    morsels_.reserve((lstable_store_->page_ids.size() + step - 1) / step);
-    for (size_t i = 0; i < lstable_store_->page_ids.size(); i += step) {
-      const size_t end = std::min(lstable_store_->page_ids.size(), i + step);
+    morsels_.reserve((scheduling_store->page_ids.size() + step - 1) / step);
+    for (size_t i = 0; i < scheduling_store->page_ids.size(); i += step) {
+      const size_t end = std::min(scheduling_store->page_ids.size(), i + step);
       Table::ScanMorsel morsel(
-          lstable_store_->page_ids.begin() + static_cast<ptrdiff_t>(i),
-          lstable_store_->page_ids.begin() + static_cast<ptrdiff_t>(end));
+          scheduling_store->page_ids.begin() + static_cast<ptrdiff_t>(i),
+          scheduling_store->page_ids.begin() + static_cast<ptrdiff_t>(end));
       morsels_.push_back(std::move(morsel));
     }
   } else {
@@ -258,9 +281,9 @@ StatusOr<bool> ParallelScan::TryFoldLSTableStore(
 StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
     size_t worker_count,
     const std::function<Status(size_t, const LSTablePageBlock&, const uint32_t*,
-                               size_t)>& consume) {
-  if (started_ || lstable_store_ == nullptr ||
-      txn_->HasAnyPageVersionChains()) {
+                               size_t)>& consume,
+    const std::vector<slot_t>* required_columns) try {
+  if (started_ || txn_->HasAnyPageVersionChains()) {
     return false;
   }
   if (worker_status_ != Status::kSuccess) {
@@ -310,6 +333,28 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       }
     }
   }
+  if (!lstable_store_ && required_columns != nullptr &&
+      (txn_->IsReadOnly() || txn_->WriteSetEmpty())) {
+    std::vector<slot_t> needed = *required_columns;
+    for (const auto& pred : peek_compares_) {
+      needed.push_back(pred.column);
+    }
+    if (row_filter_) {
+      for (const auto& pred : row_filter_->simple) {
+        needed.push_back(static_cast<slot_t>(pred.column));
+      }
+    }
+    auto store = GetOrBuildLSTableStore(*txn_, *table_, true, &needed);
+    if (store && store->uncommitted_owner_txn == 0 &&
+        store->layout_generation == table_->LayoutGeneration() &&
+        store->first_pid == table_->FirstPageId() &&
+        !txn_->HasAnyPageVersionChains()) {
+      lstable_store_ = std::move(store);
+    }
+  }
+  if (!lstable_store_) {
+    return false;
+  }
   started_ = true;
   typed_folded_ = true;
   if (RejectedByIntegerMembership() ||
@@ -320,9 +365,9 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
   if (total_blocks == 0) {
     return true;
   }
-  const size_t fold_workers = std::min<size_t>(
-      std::max<size_t>(1, worker_count),
-      total_blocks <= 4 ? 1 : std::min(worker_count_, total_blocks));
+  const size_t fold_workers =
+      std::min({std::max<size_t>(1, worker_count), worker_count_,
+                ParallelWorkerCount(total_blocks)});
   const std::vector<IntegerPeekCompare>* peek_ptr =
       peek_compares_.empty() ? nullptr : &peek_compares_;
   std::atomic<bool> failed{false};
@@ -712,6 +757,8 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           }
         }
       }
+    } catch (const std::bad_alloc&) {
+      fail(Status::kNoSpace);
     } catch (const std::exception& ex) {
       fail(StatusError(StatusCode::kRuntimeError, ex.what()));
     } catch (...) {
@@ -719,22 +766,23 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                        "lstable fold scan worker failed"));
     }
   };
-  std::vector<std::jthread> workers;
-  try {
-    workers.reserve(fold_workers - 1);
-    for (size_t w = 1; w < fold_workers; ++w) {
-      workers.emplace_back([&, w] { run_worker(w); });
-    }
-    run_worker(0);
-  } catch (const std::exception& ex) {
-    fail(StatusError(StatusCode::kRuntimeError, ex.what()));
+  const Status parallel_status = RunParallelTasks(fold_workers, run_worker);
+  if (parallel_status != Status::kSuccess) {
+    fail(parallel_status);
   }
-  workers.clear();
   if (failed.load(std::memory_order_acquire)) {
     FailWith(error);
     return error;
   }
   return true;
+} catch (const std::bad_alloc&) {
+  // Store preparation and the shared-pool callback wrapper allocate before
+  // entering a worker. Keep those failures inside the same Status boundary.
+  FailWith(Status::kNoSpace);
+  return Status::kNoSpace;
+} catch (...) {
+  FailWith(Status::kRuntimeError);
+  return Status::kRuntimeError;
 }
 
 bool ParallelScan::HasSignedIntegerColumn(size_t offset) const {

@@ -105,6 +105,43 @@ void AdviseDontNeed(int fd, int64_t offset, int64_t length);
 // real failure.
 int Preallocate(int fd, int64_t size);
 
+// Read-only memory mapping of an immutable file on disk.
+// Mapping an empty (0-byte) file succeeds with IsValid() == true, Size() == 0,
+// and a non-null Data() pointer so span construction is always well-defined.
+class MemoryMap {
+ public:
+  MemoryMap() = default;
+  MemoryMap(const MemoryMap&) = delete;
+  MemoryMap& operator=(const MemoryMap&) = delete;
+  MemoryMap(MemoryMap&& other) noexcept;
+  MemoryMap& operator=(MemoryMap&& other) noexcept;
+  ~MemoryMap();
+
+  // Opens `path` read-only and maps its entire byte range into address space.
+  // Returns 0 on success, or -1 with errno set on failure.
+  int Open(const std::filesystem::path& path);
+
+  // Releases any active mapping. Safe to call repeatedly.
+  void Close() noexcept;
+
+  [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+  [[nodiscard]] const uint8_t* Data() const noexcept { return data_; }
+  [[nodiscard]] size_t Size() const noexcept { return size_; }
+
+  // Best-effort kernel hints on [offset, offset + length) of the mapping.
+  void AdviseSequential(size_t offset, size_t length) const noexcept;
+  void AdviseWillNeed(size_t offset, size_t length) const noexcept;
+  void AdviseRandom(size_t offset, size_t length) const noexcept;
+
+ private:
+  const uint8_t* data_ = nullptr;
+  size_t size_ = 0;
+  bool valid_ = false;
+#ifdef TINYLAMB_OS_WINDOWS
+  void* mapping_handle_ = nullptr;
+#endif
+};
+
 }  // namespace tinylamb::platform
 
 #endif  // TINYLAMB_COMMON_PLATFORM_FILE_IO_HPP

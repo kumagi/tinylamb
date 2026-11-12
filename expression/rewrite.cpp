@@ -152,6 +152,12 @@ Value EvaluateJsonFunction(std::string_view func_name,
   for (char& c : name) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
+  // Malformed JSON text ('{"a" 1}') yields NULL, exactly like the relational
+  // accessor's parser; the tolerant document parser alone would have
+  // repaired it and answered from the guess.
+  if (!json_text::IsValid(json_str)) {
+    return {};
+  }
   std::string_view s = json_str;
   const json_doc::JVal root = json_doc::ParseJsonSimple(s);
   const json_doc::JVal* cur = json_doc::NavigateJsonPath(root, path_str);
@@ -2734,13 +2740,23 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 }
                 const auto& iv1 = l_iv.GetIntervalValue();
                 const auto& iv2 = r_iv.GetIntervalValue();
-                if (binary.Op() == BinaryOperation::kAdd) {
-                  IntervalValue sum = iv1 + iv2;
-                  return IntervalExpressionExp(0, "", sum.ToString());
-                }
-                if (binary.Op() == BinaryOperation::kSubtract) {
-                  IntervalValue diff = iv1 - iv2;
-                  return IntervalExpressionExp(0, "", diff.ToString());
+                // Status-returning arithmetic: an overflow leaves the node
+                // unfolded so the runtime raises it as a Status (the
+                // throwing operators escaped TryRewrite's StatusOr contract).
+                if (binary.Op() == BinaryOperation::kAdd ||
+                    binary.Op() == BinaryOperation::kSubtract) {
+                  StatusOr<IntervalValue> folded_iv =
+                      binary.Op() == BinaryOperation::kAdd
+                          ? iv1.TryPlus(iv2)
+                          : iv1.TryMinus(iv2);
+                  if (!folded_iv.HasValue()) {
+                    return Expression{};
+                  }
+                  StatusOr<std::string> text = folded_iv.Value().TryToString();
+                  if (!text.HasValue()) {
+                    return Expression{};
+                  }
+                  return IntervalExpressionExp(0, "", text.MoveValue());
                 }
               }
               if (left->Type() == TypeTag::kIntervalExp &&
@@ -2757,9 +2773,17 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                   return IntervalExpressionExp(
                       scaled, left->AsIntervalExpression().Unit());
                 }
-                IntervalValue prod =
-                    left->AsIntervalExpression().GetIntervalValue() * k;
-                return IntervalExpressionExp(0, "", prod.ToString());
+                StatusOr<IntervalValue> prod =
+                    left->AsIntervalExpression().GetIntervalValue().TryMultiply(
+                        k);
+                if (!prod.HasValue()) {
+                  return Expression{};
+                }
+                StatusOr<std::string> text = prod.Value().TryToString();
+                if (!text.HasValue()) {
+                  return Expression{};
+                }
+                return IntervalExpressionExp(0, "", text.MoveValue());
               }
               if (IsInt64Constant(left) &&
                   right->Type() == TypeTag::kIntervalExp &&
@@ -2775,9 +2799,17 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                   return IntervalExpressionExp(
                       scaled, right->AsIntervalExpression().Unit());
                 }
-                IntervalValue prod =
-                    right->AsIntervalExpression().GetIntervalValue() * k;
-                return IntervalExpressionExp(0, "", prod.ToString());
+                StatusOr<IntervalValue> prod =
+                    right->AsIntervalExpression().GetIntervalValue().TryMultiply(
+                        k);
+                if (!prod.HasValue()) {
+                  return Expression{};
+                }
+                StatusOr<std::string> text = prod.Value().TryToString();
+                if (!text.HasValue()) {
+                  return Expression{};
+                }
+                return IntervalExpressionExp(0, "", text.MoveValue());
               }
             }
           }
@@ -2794,8 +2826,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
                 }
                 return IntervalExpressionExp(-child.Amount(), child.Unit());
               }
-              IntervalValue neg = -child.GetIntervalValue();
-              return IntervalExpressionExp(0, "", neg.ToString());
+              StatusOr<IntervalValue> neg = child.GetIntervalValue().TryNegate();
+              if (!neg.HasValue()) {
+                return Expression{};
+              }
+              StatusOr<std::string> text = neg.Value().TryToString();
+              if (!text.HasValue()) {
+                return Expression{};
+              }
+              return IntervalExpressionExp(0, "", text.MoveValue());
             }
           }
           if (expression->Type() == TypeTag::kFunctionCallExp) {

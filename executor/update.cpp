@@ -155,8 +155,12 @@ bool Update::Execute(Row* dst, RowPosition* rp) {
         if (new_key == old_key || old_key.IsNull()) {
           continue;
         }
-        if (IsParentKeyReferenced(*check.child, *txn_, check.child_offset,
-                                  old_key, {})) {
+        StatusOr<bool> referenced = IsParentKeyReferenced(
+            *check.child, *txn_, check.child_offset, old_key, {});
+        if (!referenced.HasValue()) {
+          return FailWith(referenced.GetStatus());
+        }
+        if (referenced.Value()) {
           return FailWith(StatusError(
               StatusCode::kConflicts,
               "update on table " + std::string(target_->GetSchema().Name()) +

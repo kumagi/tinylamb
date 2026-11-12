@@ -396,6 +396,37 @@ CivilTime NanosToCivilTime(__int128 nanos) {
   return ct;
 }
 
+// Timestamp text that carries an explicit zone ("+HH[:MM]", "-HH", "Z", the
+// canonical "+00" suffix) names one instant; re-express that instant as
+// civil time in the session default zone (UTC unless overridden). Zone-less
+// text is already civil time and is returned unchanged. `ct` is the civil
+// time ParseCivilTime read from `text` (it ignores the zone suffix).
+StatusOr<CivilTime> ExplicitZoneTextToDefaultCivil(std::string_view text,
+                                                   CivilTime ct) {
+  if (text.size() <= 10) {
+    return ct;
+  }
+  const size_t tz_pos = text.find_first_of("+-", 11);
+  const bool zulu = text.back() == 'Z' || text.back() == 'z' ||
+                    text.ends_with(" UTC") || text.ends_with(" utc");
+  if (tz_pos == std::string_view::npos && !zulu) {
+    return ct;
+  }
+  int explicit_sec = 0;
+  if (tz_pos != std::string_view::npos) {
+    ASSIGN_OR_RETURN(int, parsed,
+                     (ParseTimeZoneOffset(text.substr(tz_pos), &ct)));
+    explicit_sec = parsed;
+  }
+  const __int128 utc_ns = CivilTimeToNanos(ct) -
+                          (static_cast<__int128>(explicit_sec) * 1000000000);
+  const CivilTime utc_ct = NanosToCivilTime(utc_ns);
+  ASSIGN_OR_RETURN(int, default_sec,
+                   (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct)));
+  return NanosToCivilTime(utc_ns +
+                          (static_cast<__int128>(default_sec) * 1000000000));
+}
+
 std::string FormatCivilTime(const CivilTime& ct, bool include_subsecond = true,
                             bool is_date_only = false) {
   // Valid civil fields have fixed decimal widths. Avoid printf's format
@@ -1031,7 +1062,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     arguments.push_back(std::move(argument_value));
   }
 
-  if (name_view == "round") {
+  if (name_view == "round" || name_view == "__between") {
     return ExecuteFunction(name, arguments);
   }
   if (name_view == "__pipe_concat") {
@@ -1614,15 +1645,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (arguments[0].type == ValueType::kDate) {
         return Value(FormatDateDays(arguments[0].DateDays()) + " 00:00:00");
       }
-      ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(arguments[0])));
-      std::string s = raw_str(arguments[0]);
-      if (s.find('+') != std::string::npos ||
-          s.find('Z') != std::string::npos ||
-          s.find('z') != std::string::npos) {
-        __int128 ns = CivilTimeToNanos(ct) +
-                      (static_cast<__int128>(-8 * 3600LL) * 1000000000);
-        ct = NanosToCivilTime(ns);
-      }
+      ASSIGN_OR_RETURN(CivilTime, parsed,
+                       (TryValueToCivilTime(arguments[0])));
+      // DATETIME(timestamp) == DATETIME(timestamp, <session default zone>).
+      ASSIGN_OR_RETURN(
+          CivilTime, ct,
+          (ExplicitZoneTextToDefaultCivil(raw_str(arguments[0]), parsed)));
       return Value(FormatCivilTime(ct));
     }
     if (arguments.size() == 2) {
@@ -1652,7 +1680,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         d = d.substr(0, 10);
       }
       CivilTime ct;
-      ParseCivilTime(d + " " + t, &ct);
+      if (!ParseCivilTime(d + " " + t, &ct)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid DATETIME components: " + d + " " + t);
+      }
       return Value(FormatCivilTime(ct));
     }
     if (arguments.size() >= 6) {
@@ -1764,10 +1795,16 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
               tz_offset_sec = parsed_offset;
             }
           }
-          __int128 ns = CivilTimeToNanos(ct) -
-                        (static_cast<__int128>(tz_offset_sec) * 1000000000) +
-                        (static_cast<__int128>(-8 * 3600LL) * 1000000000);
-          ct = NanosToCivilTime(ns);
+          // TIME(timestamp) == TIME(timestamp, <session default zone>).
+          const __int128 utc_ns =
+              CivilTimeToNanos(ct) -
+              (static_cast<__int128>(tz_offset_sec) * 1000000000);
+          const CivilTime utc_ct = NanosToCivilTime(utc_ns);
+          ASSIGN_OR_RETURN(
+              int, default_sec,
+              (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct)));
+          ct = NanosToCivilTime(
+              utc_ns + (static_cast<__int128>(default_sec) * 1000000000));
         }
         std::array<char, 64> buf{};
         if (ct.subsecond_nanos != 0) {
@@ -2445,24 +2482,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         unit = to_lower(raw_str(uval));
       }
     }
-    ASSIGN_OR_RETURN(CivilTime, ct1, (TryValueToCivilTime(d1)));
-    ASSIGN_OR_RETURN(CivilTime, ct2, (TryValueToCivilTime(d2)));
-    std::string s1 = raw_str(d1);
-    std::string s2 = raw_str(d2);
-    if (s1.find('+') != std::string::npos ||
-        s1.find('Z') != std::string::npos ||
-        s1.find('z') != std::string::npos) {
-      __int128 ns = CivilTimeToNanos(ct1) +
-                    (static_cast<__int128>(-8 * 3600LL) * 1000000000);
-      ct1 = NanosToCivilTime(ns);
-    }
-    if (s2.find('+') != std::string::npos ||
-        s2.find('Z') != std::string::npos ||
-        s2.find('z') != std::string::npos) {
-      __int128 ns = CivilTimeToNanos(ct2) +
-                    (static_cast<__int128>(-8 * 3600LL) * 1000000000);
-      ct2 = NanosToCivilTime(ns);
-    }
+    ASSIGN_OR_RETURN(CivilTime, parsed1, (TryValueToCivilTime(d1)));
+    ASSIGN_OR_RETURN(CivilTime, parsed2, (TryValueToCivilTime(d2)));
+    // Zoned (TIMESTAMP) operands are compared as civil time in the session
+    // default zone (UTC by default), exactly like DATETIME(ts) would render
+    // them; zone-less DATETIME/DATE operands are already civil time.
+    ASSIGN_OR_RETURN(CivilTime, ct1,
+                     (ExplicitZoneTextToDefaultCivil(raw_str(d1), parsed1)));
+    ASSIGN_OR_RETURN(CivilTime, ct2,
+                     (ExplicitZoneTextToDefaultCivil(raw_str(d2), parsed2)));
     if (unit == "year" || unit == "years") {
       return Value(static_cast<int64_t>(ct1.year - ct2.year));
     }
@@ -3558,15 +3586,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
+    const std::string s = raw_str(arguments[0]);
     const std::string cutset =
         arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
-    const size_t start = s.find_first_not_of(cutset);
-    if (start == std::string::npos) {
-      return Value(std::string());
-    }
-    const size_t end = s.find_last_not_of(cutset);
-    return Value(s.substr(start, end - start + 1));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
+                                            /*trailing=*/true)));
   }
   if (name_view == "ltrim") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -3577,14 +3603,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
+    const std::string s = raw_str(arguments[0]);
     const std::string cutset =
         arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
-    const size_t start = s.find_first_not_of(cutset);
-    if (start == std::string::npos) {
-      return Value(std::string());
-    }
-    return Value(s.substr(start));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
+                                            /*trailing=*/false)));
   }
   if (name_view == "rtrim") {
     if (arguments.empty() || arguments.size() > 2) {
@@ -3595,14 +3620,13 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 2 && arguments[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(arguments[0]);
+    const std::string s = raw_str(arguments[0]);
     const std::string cutset =
         arguments.size() == 2 ? raw_str(arguments[1]) : " \t\n\r\f\v";
-    const size_t end = s.find_last_not_of(cutset);
-    if (end == std::string::npos) {
-      return Value(std::string());
-    }
-    return Value(s.substr(0, end + 1));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/false,
+                                            /*trailing=*/true)));
   }
   if (name_view == "starts_with") {
     if (arguments.size() != 2) {
@@ -3661,7 +3685,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -3759,7 +3783,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -3820,21 +3844,17 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 3 && arguments[2].IsNull())) {
       return Value();
     }
+    // Same strict signature as the AST reference: SUBSTR(STRING, INT64[,
+    // INT64]); a FLOAT64 / STRING offset is a type error, not a coercion.
+    if (arguments[0].type != ValueType::kVarChar ||
+        arguments[1].type != ValueType::kInt64 ||
+        (arguments.size() == 3 && arguments[2].type != ValueType::kInt64)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "SUBSTR argument type mismatch");
+    }
     const std::string input = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return v.type == ValueType::kInt64 ? v.value.int_value : def;
     };
     const int64_t start = to_i64(arguments[1], 1);
     if (arguments.size() == 3) {
@@ -3878,21 +3898,15 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         (arguments.size() == 3 && arguments[2].IsNull())) {
       return Value();
     }
+    if (arguments[0].type != ValueType::kVarChar ||
+        arguments[1].type != ValueType::kInt64 ||
+        (arguments.size() == 3 && arguments[2].type != ValueType::kInt64)) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "BYTE_SUBSTR argument type mismatch");
+    }
     const std::string input = raw_str(arguments[0]);
     auto to_i64 = [](const Value& v, int64_t def) -> int64_t {
-      if (v.type == ValueType::kInt64) {
-        return v.value.int_value;
-      }
-      if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
-      }
-      if (v.type == ValueType::kVarChar) {
-        try {
-          return std::stoll(std::string(v.value.varchar_value));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) - fallback.
-        }
-      }
-      return def;
+      return v.type == ValueType::kInt64 ? v.value.int_value : def;
     };
     const int64_t start = to_i64(arguments[1], 1);
     if (arguments.size() == 3) {
@@ -3954,7 +3968,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -3993,7 +4007,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -4041,7 +4055,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -4316,7 +4330,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -4507,7 +4521,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return v.value.int_value;
       }
       if (v.type == ValueType::kDouble) {
-        return static_cast<int64_t>(v.value.double_value);
+        return SaturatingDoubleToInt64(v.value.double_value);
       }
       if (v.type == ValueType::kVarChar) {
         try {
@@ -5196,7 +5210,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
           return arguments[0];
         }
         uint64_t scale = 1;
-        for (int64_t i = 0; i < -digits; ++i) {
+        // Negate in unsigned space: -digits overflows for INT64_MIN.
+        const uint64_t trunc_digits = uint64_t{0} - static_cast<uint64_t>(digits);
+        for (uint64_t i = 0; i < trunc_digits; ++i) {
           if (scale > std::numeric_limits<uint64_t>::max() / 10) {
             return Value(int64_t{0}).WithUnsigned();
           }
@@ -5209,7 +5225,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return Value(v);
       }
       int64_t scale = 1;
-      for (int64_t i = 0; i < -digits; ++i) {
+      const uint64_t trunc_digits = uint64_t{0} - static_cast<uint64_t>(digits);
+      for (uint64_t i = 0; i < trunc_digits; ++i) {
         if (scale > std::numeric_limits<int64_t>::max() / 10) {
           return Value(int64_t{0});
         }
@@ -5223,9 +5240,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (std::isnan(val)) {
         return Value(val);
       }
-      const double factor = std::pow(10.0, digits);
-      const double res = std::trunc(val * factor) / factor;
-      return Value(res);
+      return Value(ScaleRoundDouble(val, digits, /*truncate=*/true));
     }
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires a numeric argument");
@@ -5871,7 +5886,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       return StatusError(StatusCode::kInvalidArgument,
                          "timestamp formatting failed");
     }
-    return Value(std::string(buffer.data()));
+    // Same canonical TIMESTAMP text as every other generator: UTC civil time
+    // with an explicit "+00" zone, so comparisons never guess a zone.
+    return Value(std::string(buffer.data()) + "+00");
   }
 
   if (name_view == "make_interval") {
@@ -6047,7 +6064,12 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     if (index.type == ValueType::kInt64) {
       return index;
     }
-    return Value(static_cast<int64_t>(index.value.double_value));
+    if (index.type == ValueType::kDouble) {
+      return Value(SaturatingDoubleToInt64(index.value.double_value));
+    }
+    // Reading double_value of a VARCHAR/DATE/ARRAY cell type-puns the union.
+    return StatusError(StatusCode::kInvalidArgument,
+                       std::string(name_view) + " requires an INT64 index");
   }
 
   if (name_view == "is_inf" || name_view == "is_nan") {

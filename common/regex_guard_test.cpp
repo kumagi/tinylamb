@@ -196,4 +196,69 @@ TEST(RegexGuardCompileTest, ReplacementProgramsKeepKeysAndUncachedLimits) {
   }
 }
 
+TEST(RegexGuardCompileTest, ZeroCopyViewMatchesReferenceAcrossEdgeCases) {
+  const std::string url_pattern = R"(^https?://(?:www\.)?([^/]+)/[\s\S]*$)";
+  const std::vector<std::string> urls{
+      "",
+      "https://www.google.com/search?q=tinylamb&hl=ja",
+      "http://yandex.ru:8080/path/to/page\nwith\nnewlines",
+      "http://www./backtrack-into-host",
+      "https://www.www.example.org/a/b/c",
+      "https://no-trailing-slash.example.com",
+      "ftp://www.example.com/file",
+      std::string("http://host\0with\0nul/tail", 26),
+  };
+  std::string scratch = "sentinel";
+  for (const std::string& url : urls) {
+    auto expected = ReplaceCheckedRegex(url, url_pattern, R"(\1)");
+    ASSERT_TRUE(expected.HasValue());
+    const std::string ref =
+        std::regex_replace(url, std::regex(url_pattern), "$01");
+    EXPECT_EQ(expected.Value(), ref);
+
+    scratch = "untouched";
+    const std::string_view input_view(url);
+    auto actual =
+        ReplaceCheckedRegexView(input_view, url_pattern, R"(\1)", &scratch);
+    ASSERT_TRUE(actual.HasValue());
+    EXPECT_EQ(actual.Value(), ref);
+    if (!input_view.empty()) {
+      // Single-capture or non-match must point directly into `input_view`
+      // without touching `scratch`.
+      EXPECT_GE(actual.Value().data(), input_view.data());
+      EXPECT_LE(actual.Value().data() + actual.Value().size(),
+                input_view.data() + input_view.size());
+      EXPECT_EQ(scratch, "untouched");
+    }
+  }
+
+  // Composite replacement on the same anchored pattern uses `scratch` cleanly.
+  const std::string sample = "https://www.example.com/index.html";
+  auto formatted =
+      ReplaceCheckedRegexView(sample, url_pattern, R"(<\1:\0>)", &scratch);
+  ASSERT_TRUE(formatted.HasValue());
+  EXPECT_EQ(formatted.Value(), "<example.com:" + sample + ">");
+
+  // Disjoint vs overlapping character-class repetitions must both match
+  // std::regex (overlapping falls back rather than mis-parsing).
+  const std::vector<std::string> tricky_patterns{
+      R"(^([a-z]+)([0-9]+)$)",
+      R"(^([a-z]+)(?:foo)?$)",
+      R"(^(ab|a)[\s\S]*$)",
+      R"(^(a|ab)[\s\S]*$)",
+      R"(^([^:]+):(?:\/\/)?([^/]+)$)",
+  };
+  const std::vector<std::string> tricky_inputs{
+      "", "abc123", "abcfoo", "abc", "ab", "a", "http://host", "http:host"};
+  for (const std::string& pat : tricky_patterns) {
+    for (const std::string& in : tricky_inputs) {
+      auto view_res = ReplaceCheckedRegexView(in, pat, R"(\1)", &scratch);
+      ASSERT_TRUE(view_res.HasValue());
+      EXPECT_EQ(std::string(view_res.Value()),
+                std::regex_replace(in, std::regex(pat), "$01"))
+          << "pattern=" << pat << " input=" << in;
+    }
+  }
+}
+
 }  // namespace tinylamb

@@ -33,6 +33,8 @@
 
 namespace tinylamb::relational_detail {
 
+struct AggregateAccumulator;
+
 struct TypedFilterCompare {
   enum class StringMatchKind : uint8_t { kExact, kPrefix, kSuffix, kContains };
   slot_t left{0};
@@ -107,6 +109,9 @@ struct TypedDoubleExprInput {
   slot_t col2{0};
   double k0{0.0};
   double k1{0.0};
+  // COALESCE(expr, 0) / IFNULL(expr, 0). A NULL subexpression yields 0, not
+  // NULL, so SUM counts the row the same way the general COALESCE does.
+  bool null_as_zero{false};
   std::vector<TypedDoubleExprOp> ops;
 };
 
@@ -491,6 +496,12 @@ StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     const Relation& input,
     const std::vector<const AggregateExpression*>& aggregates);
 
+StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
+    TransactionContext& context, const SelectStatement& statement,
+    const Relation& input,
+    const std::vector<const AggregateExpression*>& aggregates,
+    const CteMap& ctes);
+
 // Partial COUNT(*) by physical dictionary code, followed by one scalar key
 // evaluation per observed value and canonical regrouping. No shared scan-cache
 // publication; callers must decline reusable sources and HAVING.
@@ -501,17 +512,22 @@ StatusOr<std::optional<Relation>> TryDictionaryExpressionCountTopN(
     const std::vector<const AggregateExpression*>& aggregates,
     const std::vector<Expression>& predicates, const CteMap& ctes);
 
-// Fold a single encoded VARCHAR input into first-occurrence-ordered values
-// and multiplicities. Eligibility restricts the caller's aggregates to COUNT,
-// MIN/MAX and exact bounded BYTE_LENGTH averages. The callback applies the
-// original row filter before evaluating any key or aggregate expression.
+// Fold a single VARCHAR input into first-occurrence-ordered values and
+// multiplicities. Shared dictionaries avoid repeated scalar work; otherwise
+// bounded waves read the column directly. COUNT, MIN/MAX and proven-exact
+// BYTE_LENGTH averages permit parallel partial states. Workers evaluate only
+// whitelisted pure AST expressions, after filtering; callbacks run serially
+// in encounter order. The ordinary callback must apply the original filter.
 StatusOr<bool> TryFoldDictionaryAggregateRows(
     TransactionContext& context, const SelectStatement& statement,
     const Table& table, const std::vector<slot_t>& projection,
     const Schema& schema,
     const std::vector<const AggregateExpression*>& aggregates,
     const std::vector<Expression>& predicates,
-    const std::function<Status(const Row&, int64_t)>& consume);
+    const std::function<Status(const Row&, int64_t)>& consume,
+    const std::function<Status(const Row&, int64_t, const Value&,
+                               const std::vector<AggregateAccumulator>&)>&
+        prepared_consume = {});
 
 StatusOr<Relation> RunTypedParallelStreamAggregate(
     TransactionContext& context, const SelectStatement& stmt,
@@ -526,6 +542,18 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     ValueType stream_runtime_filter_type = ValueType::kNull,
     std::optional<slot_t> stream_key_column = std::nullopt,
     const PrebuiltMembershipPredicate* stream_prebuilt_membership = nullptr);
+
+// A finest grouped join produces proven-exact integer SUM/COUNT partials;
+// the rewritten AVG grouping sets consume those partials once per fine group.
+struct ExactIntegerGroupingSets {
+  SelectStatement partial;
+  std::vector<SelectStatement> sets;
+};
+
+std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
+    const std::vector<const SelectStatement*>& sets);
+bool CanUseExactIntegerGroupingSets(TransactionContext& context,
+                                    const SelectStatement& statement);
 
 GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
     const SelectStatement& statement);

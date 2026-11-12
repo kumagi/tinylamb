@@ -25,6 +25,7 @@
 #include <optional>
 #include <ostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -42,6 +43,7 @@
 #include "expression/in_expression.hpp"
 #include "expression/unary_expression.hpp"
 #include "table/iterator.hpp"
+#include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
@@ -1132,6 +1134,31 @@ void ColumnStats::Duplicate(size_t multiplier) {
   multiply_frequencies(most_common_values_);
 }
 
+ColumnStats ColumnStats::FromRawParts(
+    ValueType type, size_t non_null_count, size_t null_count,
+    size_t distinct_count, std::vector<HistogramBucket> histogram,
+    std::vector<ValueFrequency> lowest_values,
+    std::vector<ValueFrequency> highest_values,
+    std::vector<ValueFrequency> most_common_values, double correlation) {
+  ColumnStats stats(type);
+  stats.non_null_count_ = non_null_count;
+  stats.null_count_ = null_count;
+  stats.distinct_count_ = distinct_count;
+  stats.histogram_ = std::move(histogram);
+  stats.lowest_values_ = std::move(lowest_values);
+  stats.highest_values_ = std::move(highest_values);
+  stats.most_common_values_ = std::move(most_common_values);
+  stats.correlation_ = std::clamp(correlation, 0.0, 1.0);
+  CompactFrequencies(&stats.lowest_values_);
+  CompactFrequencies(&stats.highest_values_);
+  CompactFrequencies(&stats.most_common_values_);
+  for (HistogramBucket& b : stats.histogram_) {
+    b.lower = CompactValue(b.lower);
+    b.upper = CompactValue(b.upper);
+  }
+  return stats;
+}
+
 TableStatistics::TableStatistics(const Schema& schema) : row_count_(0) {
   stats_.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -1146,6 +1173,26 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   // away from `generation`, and a row that committed after the scan's snapshot
   // would be visible to a later reader without having been measured here.
   const uint64_t generation = target.LayoutGeneration();
+  if (std::shared_ptr<const LSTableStore> tlcs = target.GetLSTableStore();
+      tlcs != nullptr && tlcs->is_persistent_tlcs && generation != 0 &&
+      tlcs->layout_generation == generation &&
+      tlcs->first_pid == target.FirstPageId() &&
+      !target.RowsRewrittenInPlace() &&
+      !tlcs->serialized_column_stats.empty()) {
+    std::string stats_buf(tlcs->serialized_column_stats);
+    std::stringstream ss(stats_buf);
+    Decoder dec(ss);
+    std::vector<ColumnStats> decoded;
+    dec >> decoded;
+    if (!dec.Failed() && dec.AtEnd() &&
+        decoded.size() == schema.ColumnCount() &&
+        target.LayoutGeneration() == generation) {
+      row_count_ = static_cast<size_t>(tlcs->total_rows);
+      stats_ = std::move(decoded);
+      layout_generation_ = generation;
+      return Status::kSuccess;
+    }
+  }
   std::vector<ColumnCollector> collectors;
   collectors.reserve(schema.ColumnCount());
   for (size_t i = 0; i < schema.ColumnCount(); ++i) {
@@ -1189,7 +1236,11 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   stats_ = std::move(rebuilt);
   layout_generation_ = stable ? generation : 0;
   if (stable && !target.RowsRewrittenInPlace()) {
-    std::ignore = target.RebuildLSTableStore(txn);
+    const auto existing = target.GetLSTableStore();
+    if (existing == nullptr || !existing->is_persistent_tlcs ||
+        existing->layout_generation != generation) {
+      std::ignore = target.RebuildLSTableStore(txn);
+    }
   }
   return Status::kSuccess;
 }

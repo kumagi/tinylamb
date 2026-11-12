@@ -383,9 +383,10 @@ bool TypesComparable(const Expression& left, const Expression& right,
     // so it stays "comparable".  Any other statically indeterminate operand
     // (a CASE whose branches disagree, a cast the static model cannot type)
     // is exactly where the AST decides comparability from the RUNTIME value
-    // of the selected branch; folds that treat evaluation as totareturn
-    // null_constant(left) || null_constant(right)turn null_constant(left) ||
-    // null_constant(right);
+    // of the selected branch; folds that treat evaluation as total may
+    // legitimately erase such a raise, so the pair is NOT comparable (the
+    // harness tolerates the error-erasure direction).
+    return null_constant(left) || null_constant(right);
   }
   if (l == r) {
     return true;  // Same type; only VALUE-dependent raises (string dates).

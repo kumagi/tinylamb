@@ -256,6 +256,14 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   }
   // Plain string constants pre-qualified at compile time compare byte-exact;
   // routing them through TryEvaluateBinary cost two extra scans per row.
+  // A cell carrying a case-insensitive collation tag (e.g. a CTE column
+  // produced by COLLATE(s, 'und:ci')) must fold both sides like the checked
+  // evaluator does; only untagged cells may take the byte-exact route.
+  if (pred.plain_string_payload && value.type == ValueType::kVarChar &&
+      value.IsCaseInsensitive()) {
+    StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
+    return cmp.HasValue() && cmp.Value().Truthy();
+  }
   if (pred.plain_string_payload && value.type == ValueType::kVarChar) {
     const std::string_view l = value.value.varchar_value;
     const std::string_view r = pred.constant.value.varchar_value;
@@ -635,8 +643,25 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
           ParseDateDays(compiled.constant.value.varchar_value);
       compiled.date_string_payload = true;
     } catch (const std::exception&) {
-      // Preserve the ordinary evaluator's handling of invalid literals.
-      compiled.date_string_payload = false;
+      // An invalid date literal is a query error in the checked evaluator;
+      // a fast-path compare would silently reject every row instead.
+      return std::nullopt;
+    }
+  }
+  // Numeric-vs-string and string-vs-numeric comparisons raise "type
+  // mismatch" in the checked evaluator. The payload matchers below would
+  // fall through to "no match" and turn that error into an empty result.
+  {
+    const ValueType col_type = target_col.Type();
+    const ValueType const_type = compiled.constant.type;
+    const bool numeric_col =
+        col_type == ValueType::kInt64 || col_type == ValueType::kDouble;
+    const bool numeric_const =
+        const_type == ValueType::kInt64 || const_type == ValueType::kDouble;
+    if ((numeric_col && const_type == ValueType::kVarChar) ||
+        (col_type == ValueType::kVarChar &&
+         (numeric_const || const_type == ValueType::kDate))) {
+      return std::nullopt;
     }
   }
   if (is_like) {
@@ -1033,9 +1058,17 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                 local_simple.push_back(std::move(*sc));
               }
             }
+            std::vector<slot_t> needed{col_idx};
+            for (const auto& compare : local_simple) {
+              needed.push_back(compare.column);
+              if (compare.column_payload) {
+                needed.push_back(compare.right_column);
+              }
+            }
             std::shared_ptr<const LSTableStore> store =
                 local_filter_ok
-                    ? GetOrBuildLSTableStore(context.txn_, *table.Value(), true)
+                    ? GetOrBuildLSTableStore(context.txn_, *table.Value(), true,
+                                             &needed)
                     : nullptr;
             if (store != nullptr &&
                 store->layout_generation == table.Value()->LayoutGeneration() &&
@@ -1973,6 +2006,13 @@ std::optional<PrebuiltScalarComparePredicate> TryCompilePrebuiltScalarCompare(
   if (has_scalar_type && scalar_type != ValueType::kInt64 &&
       scalar_type != ValueType::kDate && scalar_type != ValueType::kDouble) {
     return bail("scalar type");
+  }
+  // DATE compares only with DATE (and numbers only with numbers); a cross
+  // pair is a "type mismatch" error for the per-row evaluator, which the
+  // matcher would otherwise turn into a silent row rejection.
+  if (has_scalar_type &&
+      (compare_type == ValueType::kDate) != (scalar_type == ValueType::kDate)) {
+    return bail("compare/scalar type cross");
   }
   PrebuiltScalarComparePredicate compiled;
   compiled.column = static_cast<slot_t>(*compare_offset);
@@ -4383,8 +4423,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                           : table_schema;
       size_t table_input_rows = 0;
       if (!context.txn_.HasAnyPageVersionChains()) {
-        std::shared_ptr<const LSTableStore> lst_store =
-            GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+        std::shared_ptr<const LSTableStore> lst_store = GetOrBuildLSTableStore(
+            context.txn_, *table.Value(), true, projection);
         if (lst_store != nullptr && lst_store->uncommitted_owner_txn == 0 &&
             lst_store->layout_generation == table.Value()->LayoutGeneration() &&
             lst_store->first_pid == table.Value()->FirstPageId()) {

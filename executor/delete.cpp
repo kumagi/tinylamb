@@ -46,8 +46,12 @@ bool DeleteExecutor::Execute(Row* dst, RowPosition* rp) {
         if (parent_key.IsNull()) {
           continue;
         }
-        if (IsParentKeyReferenced(*check.child, *txn_, check.child_offset,
-                                  parent_key, pending)) {
+        StatusOr<bool> referenced = IsParentKeyReferenced(
+            *check.child, *txn_, check.child_offset, parent_key, pending);
+        if (!referenced.HasValue()) {
+          return FailWith(referenced.GetStatus());
+        }
+        if (referenced.Value()) {
           return FailWith(StatusError(
               StatusCode::kConflicts,
               "delete on table " + std::string(target_->GetSchema().Name()) +

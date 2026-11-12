@@ -69,7 +69,8 @@ class ParallelScan final : public ExecutorBase {
   StatusOr<bool> TryFoldLSTableBlocks(
       size_t worker_count,
       const std::function<Status(size_t, const LSTablePageBlock&,
-                                 const uint32_t*, size_t)>& consume);
+                                 const uint32_t*, size_t)>& consume,
+      const std::vector<slot_t>* required_columns = nullptr);
   // Consume the entire immutable snapshot once, without page metadata walks.
   // Only an unstarted, unfiltered, chain-free scan is eligible. Projection
   // offsets still map through TableColumnSlot; the callback sees table columns.

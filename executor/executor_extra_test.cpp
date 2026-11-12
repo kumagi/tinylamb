@@ -1014,27 +1014,39 @@ TEST(DrainErrorPropagationTest, AuditHashJoinReportsSpillReadErrorAtEof) {
     std::optional<std::string> temp;
     std::filesystem::path directory;
     Restore() {
-      if (const char* current = std::getenv("TINYLAMB_TEMP")) temp = current;
+      if (const char* current = std::getenv("TINYLAMB_TEMP")) {
+        temp = current;
+      }
       directory = std::filesystem::temp_directory_path() /
                   ("tinylamb-audit-spill-" + RandomString());
       platform::SetEnv("TINYLAMB_TEMP", directory.c_str());
       QueryMemoryBudget::Global().ResetForTest(65536);
     }
+    Restore(const Restore&) = delete;
+    Restore& operator=(const Restore&) = delete;
+    Restore(Restore&&) = delete;
+    Restore& operator=(Restore&&) = delete;
     ~Restore() {
       QueryMemoryBudget::Global().ResetForTest(budget);
-      if (temp)
+      if (temp) {
         platform::SetEnv("TINYLAMB_TEMP", temp->c_str());
-      else
+      } else {
         platform::UnsetEnv("TINYLAMB_TEMP");
+      }
       std::error_code error;
       std::filesystem::remove_all(directory, error);
     }
   } restore;
   std::vector<Row> probe;
   std::vector<Row> build;
-  for (int64_t i = 0; i < 10000; ++i)
+  probe.reserve(10000);
+  build.reserve(32);
+  for (int64_t i = 0; i < 10000; ++i) {
     probe.emplace_back(Row({Value(i % 32), Value(std::string(128, 'x'))}));
-  for (int64_t i = 0; i < 32; ++i) build.emplace_back(Row({Value(i)}));
+  }
+  for (int64_t i = 0; i < 32; ++i) {
+    build.emplace_back(Row({Value(i)}));
+  }
   HashJoin join(std::make_shared<ValuesExecutor>(std::move(probe)), {0},
                 std::make_shared<ValuesExecutor>(std::move(build)), {0},
                 HashJoinMode::kInMemory, 1);
@@ -1048,7 +1060,9 @@ TEST(DrainErrorPropagationTest, AuditHashJoinReportsSpillReadErrorAtEof) {
   }
   ASSERT_GT(files, 0U);
   size_t emitted = 1;
-  while (join.Next(&row, nullptr)) ++emitted;
+  while (join.Next(&row, nullptr)) {
+    ++emitted;
+  }
   EXPECT_LT(emitted, 10000U);
   EXPECT_NE(join.GetStatus(), Status::kSuccess);
 }
@@ -1184,7 +1198,7 @@ class AuditPositionedRows final : public ExecutorBase {
     }
     return output->Size();
   }
-  void Dump(std::ostream& output, int) const override {
+  void Dump(std::ostream& output, int /*indent*/) const override {
     output << "AuditPositionedRows";
   }
 
@@ -1202,7 +1216,9 @@ TEST(JoinAuditTest, NullAwareAntiIncludesNullProbeForEmptyBuild) {
       JoinKind::kNullAwareAnti);
   std::vector<Row> result;
   Row row;
-  while (join.Next(&row, nullptr)) result.push_back(row);
+  while (join.Next(&row, nullptr)) {
+    result.push_back(row);
+  }
   EXPECT_EQ(join.GetStatus(), Status::kSuccess);
   EXPECT_EQ(result, rows);
 }
@@ -1227,10 +1243,10 @@ TEST(JoinAuditTest, SharedBuildKeepsLeftRowPositionsWhenBuildSideFlips) {
 
 class AuditThrowingRows final : public ExecutorBase {
  public:
-  size_t NextBatch(DataChunk*, size_t) override {
+  size_t NextBatch(DataChunk* /*output*/, size_t /*max_rows*/) override {
     throw std::runtime_error("injected worker allocation failure");
   }
-  void Dump(std::ostream& output, int) const override {
+  void Dump(std::ostream& output, int /*indent*/) const override {
     output << "AuditThrowingRows";
   }
 };

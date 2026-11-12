@@ -51,8 +51,9 @@ TEST(FunctionCallAuditTest, InvalidTimeZonesAreRejected) {
     }
     for (const char* name : {"string", "format_timestamp", "parse_timestamp"}) {
       std::vector<Expression> args;
-      if (std::string_view(name) != "string")
+      if (std::string_view(name) != "string") {
         args.push_back(ConstantValueExp(Value("%Y-%m-%d")));
+      }
       args.push_back(ConstantValueExp(Value("2020-01-01")));
       args.push_back(ConstantValueExp(Value(zone)));
       EXPECT_FALSE(

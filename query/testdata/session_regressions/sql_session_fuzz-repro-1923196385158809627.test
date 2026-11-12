@@ -1,0 +1,234 @@
+-- tinylamb-session-test v1
+-- seed: 1923196385158809627
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 VARCHAR(8), c2 INT64);
+-- stmt: INSERT INTO tbl0 VALUES (0, 'a', NULL);
+-- stmt: INSERT INTO tbl0 VALUES (1, 'bb', -2);
+-- stmt: INSERT INTO tbl0 VALUES (2, 'bb', NULL);
+-- stmt: INSERT INTO tbl0 VALUES (3, 'a', -1);
+-- stmt: INSERT INTO tbl0 VALUES (4, 'a', 3);
+-- ddl: CREATE INDEX idx_dual_tbl0 ON tbl0 KEY(1)
+-- commit
+-- begin2
+-- stmt: INSERT INTO tbl0 VALUES (5, 'a', 1);
+-- stmt: INSERT INTO tbl0 VALUES (6, 'bb', NULL);
+-- commit
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- check2: tbl0
+-- checksql2: SELECT c1 FROM tbl0 WHERE c1 = 'a';
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl0;
+-- expect: ["a", "bb", 7]
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl0;
+-- expect: ["a", "bb", 7]
+-- commit2
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- check2: tbl0
+-- checksql2: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl0;
+-- expect: ["a", "bb", 7]
+-- abort2
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- stmt2: UPDATE tbl0 SET c2 = u WHERE tbl0.u = 6;
+-- stmt2: INSERT INTO tbl0 VALUES (7, 'a', 2);
+-- stmt: INSERT INTO tbl0 VALUES (8, 'a', -1);
+-- stmt: INSERT INTO tbl0 VALUES (9, 'bb', NULL);
+-- fail: UPDATE tbl0 SET c1 = c1 WHERE tbl0.u = 5;
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT c1 FROM tbl0 WHERE c1 = 'a';
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", 6]
+-- expect: [7, "a", 2]
+-- check2: tbl0
+-- checksql2: SELECT c1 FROM tbl0 WHERE c1 < 'a';
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", 6]
+-- expect: [7, "a", 2]
+-- check2: tbl0
+-- checksql2: SELECT c1 FROM tbl0 WHERE c1 < 'a';
+-- commit
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- stmt2: DELETE FROM tbl0 WHERE tbl0.u = 1;
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT c1 FROM tbl0 WHERE c1 = 'bb';
+-- expect: ["bb"]
+-- expect: ["bb"]
+-- expect: ["bb"]
+-- expect: ["bb"]
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT DISTINCT c1 FROM tbl0;
+-- expect: ["a"]
+-- expect: ["bb"]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", 6]
+-- expect: [7, "a", 2]
+-- check2: tbl0
+-- checksql2: SELECT DISTINCT c1 FROM tbl0;
+-- expect: ["a"]
+-- expect: ["bb"]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", 6]
+-- expect: [7, "a", 2]
+-- check2: tbl0
+-- checksql2: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl0;
+-- expect: ["a", "bb", 7]
+-- stmt2: INSERT INTO tbl0 VALUES (10, 'bb', NULL);
+-- stmt2: INSERT INTO tbl0 VALUES (11, 'bb', NULL);
+-- crash
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check2: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check: tbl0
+-- expect: [0, "a", NULL]
+-- expect: [1, "bb", -2]
+-- expect: [2, "bb", NULL]
+-- expect: [3, "a", -1]
+-- expect: [4, "a", 3]
+-- expect: [5, "a", 1]
+-- expect: [6, "bb", NULL]
+-- expect: [8, "a", -1]
+-- expect: [9, "bb", NULL]
+-- check: tbl0
+-- checksql: SELECT c1 FROM tbl0 WHERE c1 = 'a';
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- expect: ["a"]
+-- failure: auto-generated by sql_session_fuzzer | index specialized probe mismatch on tbl0 :: SELECT c1 FROM tbl0 WHERE c1 = 'a'; | mirror says 5 rows, engine says 6 | expected: | ["a"] | ["a"] | ["a"] | ["a"] | ["a"] | actual: | ["a"] | ["a"] | ["a"] | ["a"] | ["a"] | ["a"]

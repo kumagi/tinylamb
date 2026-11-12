@@ -108,15 +108,13 @@ TEST_F(SqlDmlPathsCoverageTest, InsertVariantsAndImmediateReads) {
 }
 
 TEST_F(SqlDmlPathsCoverageTest, PrimaryKeyReinsertSemantics) {
-  // Re-inserting an existing primary key appends a second row: uniqueness is
-  // not enforced on INSERT in this engine.  Pin the contract.
+  // A table-level single-column PRIMARY KEY (k) is enforced exactly like the
+  // column-level `k INT64 PRIMARY KEY` spelling: re-inserting the key fails.
   Query("CREATE TABLE t (k INT64 NOT NULL, v STRING(MAX), PRIMARY KEY (k))");
   Query("INSERT INTO t VALUES (1, 'first')");
-  Query("INSERT INTO t VALUES (1, 'second')");
-  ExpectRows("SELECT COUNT(*) FROM t", {Row({Value(2)})});
+  ExpectError("INSERT INTO t VALUES (1, 'second')");
   ExpectRows("SELECT k, v FROM t ORDER BY v",
-             {Row({Value(1), Value(std::string("first"))}),
-              Row({Value(1), Value(std::string("second"))})});
+             {Row({Value(1), Value(std::string("first"))})});
 }
 
 TEST_F(SqlDmlPathsCoverageTest, UpdateWithPredicatesAndExpressions) {

@@ -3,6 +3,7 @@
 #include "query/sql_diff_oracle_fuzzer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -60,6 +61,8 @@ struct ScopedEnv {
   }
   ScopedEnv(const ScopedEnv&) = delete;
   ScopedEnv& operator=(const ScopedEnv&) = delete;
+  ScopedEnv(ScopedEnv&&) = delete;
+  ScopedEnv& operator=(ScopedEnv&&) = delete;
 
   const char* name_;
   bool had_{false};
@@ -330,8 +333,12 @@ std::string CheckSubset(Database& db, TransactionContext& ctx,
       ++stats->subset_checks;
     }
     if (*l > *r) {
-      return "[CARD MISMATCH]\n  " + left + " => " + std::to_string(*l) +
-             "\n  " + right + " => " + std::to_string(*r) + "\n";
+      std::string message = "[CARD MISMATCH]\n  ";
+      message.append(left).append(" => ").append(std::to_string(*l));
+      message.append("\n  ").append(right).append(" => ").append(
+          std::to_string(*r));
+      message += '\n';
+      return message;
     }
   }
   return {};
@@ -355,7 +362,8 @@ std::string RunMode(Database& db, TransactionContext& ctx,
     return {};
   }
   *dump = SortedDump(*rows);
-  static const char* kNames[] = {"default", "relational", "grouped"};
+  static constexpr std::array<const char*, 3> kNames = {"default", "relational",
+                                                        "grouped"};
   return kNames[mode];
 }
 
@@ -419,7 +427,9 @@ std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats) {
     auto left = RunRows(*plain, plain_ctx, sql, false, &error);
     auto right = RunRows(*indexed, indexed_ctx, sql, false, &error);
     if (!left.has_value() || !right.has_value()) {
-      return "radar query failed: " + error + "\n  " + sql;
+      std::string message = "radar query failed: ";
+      message.append(error).append("\n  ").append(sql);
+      return message;
     }
     if (stats != nullptr) {
       ++stats->radar_queries;
@@ -427,8 +437,13 @@ std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats) {
     const std::string a = SortedDump(*left);
     const std::string b = SortedDump(*right);
     if (a != b) {
-      return "[RADAR MISMATCH]\n  query: " + sql + "\n  plain:\n" + a +
-             "  indexed:\n" + b;
+      std::string message = "[RADAR MISMATCH]\n  query: ";
+      message.append(sql)
+          .append("\n  plain:\n")
+          .append(a)
+          .append("  indexed:\n")
+          .append(b);
+      return message;
     }
   }
   return {};
@@ -488,7 +503,8 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
   const int n = g.Pick(5, 10);
   rows.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
-    rows.push_back(Membership{i, g.Chance(65), g.Chance(55)});
+    rows.push_back(
+        Membership{.id = i, .in1 = g.Chance(65), .in2 = g.Chance(55)});
   }
   rows.front().in1 = true;
   rows.front().in2 = true;
@@ -501,10 +517,14 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
                                std::to_string(g.Pick(-2, 3)) + ", " +
                                std::to_string(g.Pick(-2, 2)) + ");";
     if (row.in1) {
-      t.setup.push_back("INSERT INTO " + t1 + " VALUES " + values);
+      std::string insert = "INSERT INTO ";
+      insert.append(t1).append(" VALUES ").append(values);
+      t.setup.push_back(std::move(insert));
     }
     if (row.in2) {
-      t.setup.push_back("INSERT INTO " + t2 + " VALUES " + values);
+      std::string insert = "INSERT INTO ";
+      insert.append(t2).append(" VALUES ").append(values);
+      t.setup.push_back(std::move(insert));
     }
     if (row.in1 && row.in2) {
       inner.push_back(Pair(row.id, false, row.id));
@@ -545,7 +565,8 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
   const std::string tab = TableName(rng);
   t.setup.push_back("CREATE TABLE " + tab +
                     " (u INT64, a INT64, b INT64, flag BOOL, s VARCHAR(8));");
-  static const char* kStr[] = {"''", "'a'", "'bb'", "NULL"};
+  static constexpr std::array<const char*, 4> kStr = {"''", "'a'", "'bb'",
+                                                      "NULL"};
   const int n = g.Pick(6, 12);
   for (int i = 0; i < n; ++i) {
     const std::string a = g.Chance(20) ? "NULL" : std::to_string(g.Pick(-2, 3));
@@ -553,8 +574,11 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
     const char* flag =
         g.Chance(40) ? "TRUE" : (g.Chance(50) ? "FALSE" : "NULL");
     const char* s = kStr[g.Pick(0, 3)];
-    t.setup.push_back("INSERT INTO " + tab + " VALUES (" + std::to_string(i) +
-                      ", " + a + ", " + b + ", " + flag + ", " + s + ");");
+    std::string insert = "INSERT INTO ";
+    insert.append(tab).append(" VALUES (").append(std::to_string(i));
+    insert.append(", ").append(a).append(", ").append(b);
+    insert.append(", ").append(flag).append(", ").append(s).append(");");
+    t.setup.push_back(std::move(insert));
   }
   const int k = g.Pick(-1, 2);
   const int m = g.Pick(-1, 2);
@@ -604,8 +628,11 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
     const std::string a = g.Chance(20) ? "NULL" : std::to_string(g.Pick(-2, 3));
     const std::string b = g.Chance(15) ? "NULL" : std::to_string(g.Pick(-1, 2));
     const char* flag = g.Chance(50) ? "TRUE" : "FALSE";
-    t.setup.push_back("INSERT INTO " + tab + " VALUES (" + std::to_string(i) +
-                      ", " + a + ", " + b + ", " + flag + ", 'a');");
+    std::string insert = "INSERT INTO ";
+    insert.append(tab).append(" VALUES (").append(std::to_string(i));
+    insert.append(", ").append(a).append(", ").append(b);
+    insert.append(", ").append(flag).append(", 'a');");
+    t.setup.push_back(std::move(insert));
   }
   const int k = g.Pick(-1, 2);
   t.queries = {
@@ -650,8 +677,11 @@ std::string RunRadarIteration(std::mt19937& rng, bool /*verbose*/,
   for (int i = 0; i < n; ++i) {
     const std::string a = g.Chance(25) ? "NULL" : std::to_string(g.Pick(-2, 3));
     const std::string b = g.Chance(15) ? "NULL" : std::to_string(g.Pick(-2, 2));
-    t.setup.push_back("INSERT INTO " + tab + " VALUES (" + std::to_string(i) +
-                      ", " + a + ", " + b + ", TRUE, 'a');");
+    std::string insert = "INSERT INTO ";
+    insert.append(tab).append(" VALUES (").append(std::to_string(i));
+    insert.append(", ").append(a).append(", ").append(b).append(
+        ", TRUE, 'a');");
+    t.setup.push_back(std::move(insert));
   }
   t.indexes = {
       "CREATE INDEX idx_gap_a ON " + tab + "(a);",

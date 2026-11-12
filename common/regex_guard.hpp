@@ -246,6 +246,22 @@ inline bool RegexPatternHasNestedRepetition(std::string_view pattern) {
   while (i < n) {
     const char c = pattern[i];
     if (c == '\\') {
+      // \1..\9 are BACKREFERENCES in the ECMAScript evaluator, not literal
+      // digits: their length is whatever the group captured (variable, may
+      // be empty) and matching them is NP-hard under repetition. Model them
+      // as a variable, ambiguous, nullable atom so an unbounded quantifier
+      // on (or around) one is rejected like any other ambiguous operand.
+      if (i + 1 < n && pattern[i + 1] >= '1' && pattern[i + 1] <= '9') {
+        flush();
+        pending_len = kVar;
+        pending_first = CharSet().set();
+        pending_nullable = true;
+        pending_var = true;
+        pending_ambiguous = true;
+        elem_quantified = false;
+        i += 2;
+        continue;
+      }
       CharSet first;
       bool nullable = false;
       if (i + 1 < n && (pattern[i + 1] == 'b' || pattern[i + 1] == 'B')) {
@@ -543,6 +559,17 @@ inline StatusOr<std::regex> CompileCheckedRegex(const std::string& pattern) {
 StatusOr<std::string> ReplaceCheckedRegex(std::string_view input,
                                           std::string_view pattern,
                                           std::string_view replacement);
+
+// Zero-copy variant of ReplaceCheckedRegex: when the result is a slice of
+// `input` (for example on non-match or when an anchored full-input match
+// rewrites to a single capture `\0`..`\9`), returns a view directly into
+// `input` without touching `*scratch`. Otherwise writes the replacement into
+// `*scratch` and returns a view into `*scratch`. Both `input` and `*scratch`
+// must outlive the returned view; `scratch` must be non-null.
+StatusOr<std::string_view> ReplaceCheckedRegexView(std::string_view input,
+                                                   std::string_view pattern,
+                                                   std::string_view replacement,
+                                                   std::string* scratch);
 
 }  // namespace tinylamb
 

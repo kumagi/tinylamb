@@ -163,6 +163,20 @@ class Table {
   [[nodiscard]] const Schema& GetSchema() const { return schema_; }
   [[nodiscard]] std::shared_ptr<const LSTableStore> GetLSTableStore() const;
   void SetLSTableStore(std::shared_ptr<const LSTableStore> store) const;
+  [[nodiscard]] std::shared_ptr<const LSTableStore> GetProjectedLSTableStore()
+      const;
+  void SetProjectedLSTableStore(
+      std::shared_ptr<const LSTableStore> store) const;
+  [[nodiscard]] bool LSTableCapacityRejected(uint64_t generation) const {
+    return incarnation_state_ != nullptr &&
+           incarnation_state_->LSTableCapacityRejectedGeneration() ==
+               generation;
+  }
+  void RejectLSTableCapacity(uint64_t generation) const {
+    if (incarnation_state_ != nullptr) {
+      incarnation_state_->RejectLSTableCapacity(generation);
+    }
+  }
   std::shared_ptr<const LSTableStore> RebuildLSTableStore(
       Transaction& txn) const;
   [[nodiscard]] size_t IndexCount() const { return indexes_.size(); }

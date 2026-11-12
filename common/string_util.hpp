@@ -87,6 +87,76 @@ namespace tinylamb {
   return text;
 }
 
+// Byte length of the UTF-8 sequence led by `lead` (1 for ASCII and for any
+// byte that cannot start a sequence, so malformed input degrades to bytes).
+[[nodiscard]] constexpr size_t Utf8SequenceLength(unsigned char lead) noexcept {
+  if (lead < 0x80U) {
+    return 1;
+  }
+  if ((lead & 0xE0U) == 0xC0U) {
+    return 2;
+  }
+  if ((lead & 0xF0U) == 0xE0U) {
+    return 3;
+  }
+  if ((lead & 0xF8U) == 0xF0U) {
+    return 4;
+  }
+  return 1;
+}
+
+// GoogleSQL TRIM / LTRIM / RTRIM: strip leading and/or trailing CODE POINTS
+// that occur in `cutset`. Matching individual bytes of a multi-byte cutset
+// cut the lead byte of an unrelated character ('Êx' trimmed by 'É' left an
+// invalid 0xAA). Malformed sequences are compared byte by byte.
+[[nodiscard]] inline std::string_view TrimCodePoints(std::string_view text,
+                                                     std::string_view cutset,
+                                                     bool leading,
+                                                     bool trailing) {
+  std::vector<std::string_view> points;
+  for (size_t i = 0; i < cutset.size();) {
+    const size_t len =
+        std::min(Utf8SequenceLength(static_cast<unsigned char>(cutset[i])),
+                 cutset.size() - i);
+    points.push_back(cutset.substr(i, len));
+    i += len;
+  }
+  const auto in_cutset = [&](std::string_view point) {
+    return std::ranges::find(points, point) != points.end();
+  };
+  if (leading) {
+    while (!text.empty()) {
+      const size_t len =
+          std::min(Utf8SequenceLength(static_cast<unsigned char>(text[0])),
+                   text.size());
+      if (!in_cutset(text.substr(0, len))) {
+        break;
+      }
+      text.remove_prefix(len);
+    }
+  }
+  if (trailing) {
+    while (!text.empty()) {
+      // Back up over continuation bytes to the start of the last sequence.
+      size_t start = text.size() - 1;
+      while (start > 0 && text.size() - start < 4 &&
+             (static_cast<unsigned char>(text[start]) & 0xC0U) == 0x80U) {
+        --start;
+      }
+      size_t len = text.size() - start;
+      if (Utf8SequenceLength(static_cast<unsigned char>(text[start])) != len) {
+        start = text.size() - 1;  // malformed tail: compare the last byte
+        len = 1;
+      }
+      if (!in_cutset(text.substr(start, len))) {
+        break;
+      }
+      text.remove_suffix(len);
+    }
+  }
+  return text;
+}
+
 }  // namespace tinylamb
 
 #endif  // TINYLAMB_COMMON_STRING_UTIL_HPP

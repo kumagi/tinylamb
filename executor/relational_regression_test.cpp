@@ -44,6 +44,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -495,6 +496,94 @@ TEST_F(RelationalRegressionTest, UnionJoinBoundsPreserveDuplicatesAndNulls) {
                               union_body +
                               ") u,UnionDim d WHERE u.key=d.dk AND d.flag=1"),
       std::vector<Row>({Row({Value(22)})}));
+}
+
+TEST_F(RelationalRegressionTest, OrderedJoinDropsOnlyConsumedColumns) {
+  using relational_detail::Relation;
+  auto context = rs_->BeginContext();
+  auto fact = std::make_shared<Relation>();
+  fact->schema = Schema(
+      "", {Column("id", ValueType::kInt64), Column("a", ValueType::kInt64),
+           Column("b", ValueType::kInt64), Column("late", ValueType::kInt64)});
+  for (int64_t i = 0; i < 32768; ++i) {
+    fact->rows.emplace_back(
+        std::vector<Value>{Value(i), Value(i % 128), Value(i % 31), Value(1)});
+  }
+  auto dim = std::make_shared<Relation>();
+  dim->schema = Schema("", {Column("k", ValueType::kInt64)});
+  for (int64_t i = 1; i < 128; i += 2) {
+    dim->rows.emplace_back(std::vector<Value>{Value(i)});
+    dim->rows.emplace_back(std::vector<Value>{Value(i)});
+  }
+  auto nullable = std::make_shared<Relation>();
+  nullable->schema = Schema("", {Column("k", ValueType::kInt64),
+                                 Column("payload", ValueType::kVarChar)});
+  for (int64_t i = 0; i < 16; ++i) {
+    nullable->rows.emplace_back(
+        std::vector<Value>{Value(i), Value("value-" + std::to_string(i))});
+  }
+  const relational_detail::CteMap ctes{
+      {"f", fact}, {"d", dim}, {"r", nullable}};
+  const auto col = [](const char* owner, const char* name) {
+    return ColumnValueExp(ColumnName(owner, name));
+  };
+  SelectSource f;
+  f.table = "f";
+  SelectSource d;
+  d.table = "d";
+  d.join_type = JoinType::kInner;
+  d.join_condition = BinaryExpressionExp(
+      col("f", "a"), BinaryOperation::kEquals, col("d", "k"));
+  SelectSource r;
+  r.table = "r";
+  r.join_type = JoinType::kLeft;
+  r.join_condition = BinaryExpressionExp(
+      col("f", "b"), BinaryOperation::kEquals, col("r", "k"));
+  for (const bool late_filter : {false, true}) {
+    SelectStatement statement({NamedExpression("id", col("f", "id")),
+                               NamedExpression("payload", col("r", "payload"))},
+                              {}, nullptr);
+    statement.SetSources({f, d, r});
+    if (late_filter) {
+      statement.SetWhereClause(
+          BinaryExpressionExp(col("f", "late"), BinaryOperation::kGreaterThan,
+                              FunctionCallExp("rand", {})));
+    }
+    for (const size_t workers : {size_t{1}, size_t{4}}) {
+      std::atomic<size_t> active{0};
+      ScopedQueryParallelismBudget budget(&active, workers);
+      bool applied = false;
+      ASSIGN_OR_ASSERT_FAIL(Relation, result,
+                            relational_detail::BuildInput(
+                                context, statement, nullptr, ctes, &applied));
+      EXPECT_EQ(applied, !late_filter);
+      EXPECT_EQ(result.TotalRows(), 32768U);
+      EXPECT_EQ(result.schema.ColumnCount(), late_filter ? 5U : 4U);
+      const auto id = relational_detail::LocalColumnOffset(
+          result.schema, ColumnName("f", "id"));
+      const auto value = relational_detail::LocalColumnOffset(
+          result.schema, ColumnName("r", "payload"));
+      if (!id || !value) {
+        FAIL() << "missing live output column";
+      }
+      std::vector<size_t> seen(32768);
+      ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
+        const int64_t key = row[*id].value.int_value;
+        ASSERT_GE(key, 0);
+        ASSERT_LT(key, 32768);
+        EXPECT_EQ(key % 2, 1);
+        ++seen[static_cast<size_t>(key)];
+        EXPECT_EQ(row[*value], key % 31 < 16
+                                   ? Value("value-" + std::to_string(key % 31))
+                                   : Value());
+      }));
+      for (size_t i = 0; i < seen.size(); ++i) {
+        EXPECT_EQ(seen[i], i % 2 == 1 ? 2U : 0U);
+      }
+    }
+  }
+  EXPECT_EQ(fact->schema.ColumnCount(), 4U);
+  EXPECT_EQ(fact->rows.front().Count(), 4U);
 }
 
 TEST_F(RelationalRegressionTest, SharedCteFiltersBeforeCopyingConsumerColumns) {
@@ -1140,6 +1229,76 @@ TEST_F(RelationalRegressionTest,
               context, window, rows, schema, nullptr, {}, &reference));
           EXPECT_EQ(encoded, reference)
               << function << ' ' << ascending << ' ' << nulls_first;
+        }
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, RankBoundKeepsWholeBoundaryPeers) {
+  auto context = rs_->BeginContext();
+  const Schema schema(
+      "", {Column("id", ValueType::kInt64), Column("p", ValueType::kInt64),
+           Column("k", ValueType::kDouble)});
+  std::vector<Row> source;
+  source.reserve(32768);
+  for (size_t i = 0; i < 32768; ++i) {
+    Value value(static_cast<double>(i % 1024));
+    if (i % 257 == 0) {
+      value = Value();
+    } else if (i % 509 == 0) {
+      value = Value(std::numeric_limits<double>::quiet_NaN());
+    } else if (i % 251 == 0) {
+      value = Value(std::numeric_limits<double>::infinity());
+    } else if (i % 127 == 0) {
+      value = Value(-0.0);
+    }
+    source.emplace_back(std::vector<Value>{Value(i), Value(i % 3), value});
+  }
+  for (const bool ascending : {false, true}) {
+    for (const bool nulls_first : {false, true}) {
+      auto window = std::make_shared<WindowFunctionCallExpression>();
+      window->function = "RANK";
+      window->partition_by = {ColumnValueExp("p")};
+      window->order_by = {{ColumnValueExp("k"), ascending, nulls_first}};
+      WindowFunctionCallExpression generic;
+      generic.function = "RANK";
+      generic.partition_by = window->partition_by;
+      generic.order_by = window->order_by;
+      generic.order_by[0].expression = FunctionCallExp(
+          "coalesce", {ColumnValueExp("k"), ColumnValueExp("k")});
+      std::vector<Value> reference;
+      ASSERT_SUCCESS(relational_detail::ComputeOneWindow(
+          context, generic, source, schema, nullptr, {}, &reference));
+      for (const int64_t limit : {int64_t{1}, int64_t{100}, int64_t{32768}}) {
+        for (const bool alias : {false, true}) {
+          SelectStatement statement(
+              {NamedExpression("id", ColumnValueExp("id")),
+               NamedExpression("r", window)},
+              {}, nullptr);
+          statement.SetQualify(BinaryExpressionExp(
+              alias ? ColumnValueExp("r") : window,
+              alias ? BinaryOperation::kLessThan
+                    : BinaryOperation::kLessThanEquals,
+              ConstantValueExp(Value(limit + (alias ? 1 : 0)))));
+          relational_detail::Relation input;
+          input.schema = schema;
+          input.rows = source;
+          ASSIGN_OR_ASSERT_FAIL(
+              relational_detail::WindowedInput, actual,
+              relational_detail::ApplyWindows(context, statement,
+                                              std::move(input), nullptr, {}));
+          size_t kept = 0;
+          for (size_t r = 0; r < source.size(); ++r) {
+            if (reference[r].value.int_value > limit) {
+              continue;
+            }
+            ASSERT_LT(kept, actual.input.rows.size());
+            EXPECT_EQ(actual.input.rows[kept][0], Value(r));
+            EXPECT_EQ(actual.input.rows[kept][3], reference[r]);
+            ++kept;
+          }
+          EXPECT_EQ(actual.input.rows.size(), kept);
         }
       }
     }
@@ -1972,6 +2131,34 @@ TEST_F(RelationalRegressionTest,
         });
     EXPECT_EQ(stopped.GetStatus(), Status::kConflicts);
     EXPECT_EQ(visits, 1U);
+    for (const size_t workers : {size_t{3}, size_t{7}}) {
+      std::atomic<size_t> active{1};
+      ScopedQueryParallelismBudget parallelism(&active, workers);
+      std::vector<Row> prepared_rows;
+      size_t prepared_visits = 0;
+      ASSIGN_OR_ASSERT_FAIL(
+          bool, prepared_used,
+          relational_detail::TryFoldDictionaryAggregateRows(
+              context, statement, *table, {}, schema,
+              {&count->AsAggregateExpression()}, {},
+              [&](const Row& row, int64_t multiplicity) {
+                prepared_rows.emplace_back(Row({row[0], Value(multiplicity)}));
+                return Status::kSuccess;
+              },
+              [&](const Row& row, int64_t multiplicity, const Value& key,
+                  const std::vector<relational_detail::AggregateAccumulator>&
+                      arguments) {
+                EXPECT_EQ(key, row[0]);
+                EXPECT_EQ(arguments.size(), 1U);
+                EXPECT_EQ(arguments[0].count, multiplicity);
+                prepared_rows.emplace_back(Row({row[0], Value(multiplicity)}));
+                ++prepared_visits;
+                return Status::kSuccess;
+              }));
+      EXPECT_TRUE(prepared_used);
+      EXPECT_GT(prepared_visits, 0U);
+      EXPECT_EQ(prepared_rows, folded);
+    }
     ASSERT_SUCCESS(context.PreCommit());
     // A scalar key can merge several source codes into one group. Preserve
     // its first-occurrence tie order after filtering and applying OFFSET.
@@ -1984,6 +2171,110 @@ TEST_F(RelationalRegressionTest,
                       "SELECT REGEXP_REPLACE(s||'','[0-9]+$','') k,"
                       "COUNT(*) c,MIN(s) FROM " +
                           name + " WHERE s<>'' GROUP BY k LIMIT 2 OFFSET 1"));
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       ParallelDictionaryFoldKeepsTemporalUnitSemantics) {
+  RelationalRun(*rs_, "CREATE TABLE TemporalFold(s STRING)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          setup.GetTable("TemporalFold"));
+    for (int64_t i = 0; i < 6000; ++i) {
+      std::string text = "2024-03-31 12:0";
+      text += std::to_string((i % 300) / 60);
+      text += i % 60 < 10 ? ":0" : ":";
+      text += std::to_string(i % 60);
+      ASSERT_SUCCESS(
+          table->Insert(setup.txn_, Row({Value(std::move(text))})).GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (rs_->TransactionStats().version_chains != 0) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::atomic<size_t> active{1};
+  ScopedQueryParallelismBudget parallelism(&active, 3);
+  for (const std::string_view function :
+       {"TIMESTAMP_TRUNC", "DATETIME_TRUNC"}) {
+    const auto query = [&](bool ordinary) {
+      std::string sql = "SELECT ";
+      sql += function;
+      sql += ordinary ? "(s||'',MINUTE) k" : "(s,MINUTE) k";
+      sql +=
+          ",COUNT(*) c,MIN(s),AVG(BYTE_LENGTH(s)) FROM TemporalFold "
+          "GROUP BY k HAVING c>0 ORDER BY k";
+      return sql;
+    };
+    const auto expected = RelationalRun(*rs_, query(true));
+    ASSERT_EQ(expected.size(), 5U);
+    EXPECT_EQ(RelationalRun(*rs_, query(false)), expected);
+  }
+}
+
+TEST_F(RelationalRegressionTest, ParallelScalarFoldWithoutGlobalDictionary) {
+  RelationalRun(*rs_, "CREATE TABLE RawScalar(s STRING)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          setup.GetTable("RawScalar"));
+    for (int64_t i = 0; i < 12000; ++i) {
+      std::string text(static_cast<size_t>(i % 19 == 0 ? 2000 : 1), 'x');
+      text += std::to_string(i);
+      ASSERT_SUCCESS(
+          table
+              ->Insert(setup.txn_,
+                       Row({i % 97 == 0    ? Value()
+                            : i % 101 == 0 ? Value("")
+                                           : Value(std::move(text))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (rs_->TransactionStats().version_chains != 0) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  {
+    auto context = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("RawScalar"));
+    const auto store = GetOrBuildLSTableStore(context.txn_, *table, true);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->dictionaries[0].wide_code_bytes, 0);
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  const auto query = [](bool ordinary) {
+    std::string sql = "SELECT REGEXP_REPLACE(";
+    sql += ordinary ? "s||''" : "s";
+    sql +=
+        ",'[0-9]+$','') k,COUNT(*) c,COUNT(s),MIN(s),MAX(s),"
+        "AVG(CAST(BYTE_LENGTH(s) AS FLOAT64)) FROM RawScalar "
+        "WHERE s<>'' GROUP BY k HAVING c>3 ORDER BY k LIMIT 2";
+    return sql;
+  };
+  const auto expected = RelationalRun(*rs_, query(true));
+  for (const size_t workers : {size_t{1}, size_t{3}, size_t{7}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget parallelism(&active, workers);
+    EXPECT_EQ(RelationalRun(*rs_, query(false)), expected);
+    struct RestoreBudget {
+      RestoreBudget() = default;
+      RestoreBudget(const RestoreBudget&) = delete;
+      RestoreBudget& operator=(const RestoreBudget&) = delete;
+      RestoreBudget(RestoreBudget&&) = delete;
+      RestoreBudget& operator=(RestoreBudget&&) = delete;
+      size_t limit = QueryMemoryBudget::Global().Limit();
+      ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+    } restore;
+    QueryMemoryBudget::Global().ResetForTest(size_t{4} << 20);
+    EXPECT_EQ(RelationalRun(*rs_, query(false)), expected);
   }
 }
 
@@ -2020,54 +2311,61 @@ TEST_F(RelationalRegressionTest,
   const auto store = GetOrBuildLSTableStore(context.txn_, *table, true);
   ASSERT_NE(store, nullptr);
   ASSERT_EQ(store->dictionaries[0].wide_code_bytes, 2);
-  for (const bool filtered : {false, true}) {
-    const Expression column = ColumnValueExp("s");
-    const Expression key = FunctionCallExp(
-        "regexp_replace", {column, ConstantValueExp(Value("[0-9]+$")),
-                           ConstantValueExp(Value(""))});
-    const auto count =
-        AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"));
-    const auto nonnull =
-        AggregateExpressionExp(AggregationType::kCount, column);
-    const auto minimum = AggregateExpressionExp(AggregationType::kMin, column);
-    const auto maximum = AggregateExpressionExp(AggregationType::kMax, column);
-    const auto average = AggregateExpressionExp(
-        AggregationType::kAvg, FunctionCallExp("byte_length", {column}));
-    SelectStatement statement(
-        {NamedExpression("k", key), NamedExpression("c", count),
-         NamedExpression("n", nonnull), NamedExpression("lo", minimum),
-         NamedExpression("hi", maximum), NamedExpression("av", average)},
-        {},
-        filtered ? BinaryExpressionExp(column, BinaryOperation::kNotEquals,
-                                       ConstantValueExp(Value("")))
-                 : Expression{});
-    SelectSource source;
-    source.table = "RepeatedText";
-    statement.SetSources({source});
-    statement.SetGroupBy({key});
-    statement.SetHaving(BinaryExpressionExp(
-        count, BinaryOperation::kGreaterThan, ConstantValueExp(Value(100))));
-    statement.SetOrderBy({{key, true, true}});
-    statement.SetLimit(13);
-    statement.SetOffset(1);
-    relational_detail::ExecutionRuntime runtime;
-    context.set_execution_runtime(&runtime);
-    ASSIGN_OR_ASSERT_FAIL(
-        relational_detail::Relation, result,
-        relational_detail::ExecuteQuery(context, statement, nullptr, {}));
-    EXPECT_EQ(runtime.scan_rows, 12000U);
-    EXPECT_LT(runtime.scan_values_decoded, 5000U);
-    EXPECT_GT(runtime.scan_output_rows, runtime.scan_values_decoded);
-    std::string reference =
-        "SELECT REGEXP_REPLACE(s||'','[0-9]+$','') k,COUNT(*) c,COUNT(s),"
-        "MIN(s),MAX(s),AVG(CAST(BYTE_LENGTH(s) AS FLOAT64)) FROM RepeatedText";
-    if (filtered) {
-      reference += " WHERE s<>''";
+  for (const size_t workers : {size_t{1}, size_t{3}, size_t{7}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget parallelism(&active, workers);
+    for (const bool filtered : {false, true}) {
+      const Expression column = ColumnValueExp("s");
+      const Expression key = FunctionCallExp(
+          "regexp_replace", {column, ConstantValueExp(Value("[0-9]+$")),
+                             ConstantValueExp(Value(""))});
+      const auto count =
+          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"));
+      const auto nonnull =
+          AggregateExpressionExp(AggregationType::kCount, column);
+      const auto minimum =
+          AggregateExpressionExp(AggregationType::kMin, column);
+      const auto maximum =
+          AggregateExpressionExp(AggregationType::kMax, column);
+      const auto average = AggregateExpressionExp(
+          AggregationType::kAvg, FunctionCallExp("byte_length", {column}));
+      SelectStatement statement(
+          {NamedExpression("k", key), NamedExpression("c", count),
+           NamedExpression("n", nonnull), NamedExpression("lo", minimum),
+           NamedExpression("hi", maximum), NamedExpression("av", average)},
+          {},
+          filtered ? BinaryExpressionExp(column, BinaryOperation::kNotEquals,
+                                         ConstantValueExp(Value("")))
+                   : Expression{});
+      SelectSource source;
+      source.table = "RepeatedText";
+      statement.SetSources({source});
+      statement.SetGroupBy({key});
+      statement.SetHaving(BinaryExpressionExp(
+          count, BinaryOperation::kGreaterThan, ConstantValueExp(Value(100))));
+      statement.SetOrderBy({{key, true, true}});
+      statement.SetLimit(13);
+      statement.SetOffset(1);
+      relational_detail::ExecutionRuntime runtime;
+      context.set_execution_runtime(&runtime);
+      ASSIGN_OR_ASSERT_FAIL(
+          relational_detail::Relation, result,
+          relational_detail::ExecuteQuery(context, statement, nullptr, {}));
+      EXPECT_EQ(runtime.scan_rows, 12000U);
+      EXPECT_LT(runtime.scan_values_decoded, 5000U);
+      EXPECT_GT(runtime.scan_output_rows, runtime.scan_values_decoded);
+      std::string reference =
+          "SELECT REGEXP_REPLACE(s||'','[0-9]+$','') k,COUNT(*) c,COUNT(s),"
+          "MIN(s),MAX(s),AVG(CAST(BYTE_LENGTH(s) AS FLOAT64)) FROM "
+          "RepeatedText";
+      if (filtered) {
+        reference += " WHERE s<>''";
+      }
+      reference +=
+          " GROUP BY k HAVING c>100 ORDER BY k NULLS FIRST LIMIT 13 OFFSET 1";
+      EXPECT_EQ(result.rows, RelationalRun(*rs_, reference));
+      context.set_execution_runtime(nullptr);
     }
-    reference +=
-        " GROUP BY k HAVING c>100 ORDER BY k NULLS FIRST LIMIT 13 OFFSET 1";
-    EXPECT_EQ(result.rows, RelationalRun(*rs_, reference));
-    context.set_execution_runtime(nullptr);
   }
   // Decline order-sensitive/overflow-sensitive payloads rather than changing
   // their accumulation order. The callback must never run on rejection.
@@ -2994,7 +3292,7 @@ TEST_F(RelationalRegressionTest,
   const auto expected =
       RelationalRun(*rs_, prefix + ",CAST(k AS STRING)" + tail);
   // A four-byte argument code works with one worker. With two workers the
-  // exact bitmap product exceeds the cap and the ordinary aggregator runs.
+  // exact bitmap product exceeds the cap and sparse code pairs are used.
   for (const size_t workers : {size_t{1}, size_t{2}}) {
     std::atomic<size_t> active{0};
     ScopedQueryParallelismBudget parallelism(&active, workers);
@@ -3007,6 +3305,154 @@ TEST_F(RelationalRegressionTest,
   const auto constrained = RelationalRun(*rs_, prefix + tail);
   QueryMemoryBudget::Global().ResetForTest(old_limit);
   EXPECT_EQ(constrained, expected);
+}
+
+TEST_F(RelationalRegressionTest,
+       SparseDictionaryDistinctPairsDeduplicateAcrossWorkers) {
+  RelationalRun(*rs_, "CREATE TABLE SparseDistinct(k STRING,v INT64,f INT64)");
+  {
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          setup.GetTable("SparseDistinct"));
+    for (int64_t i = 0; i < 180000; ++i) {
+      // The second half repeats every pair across worker boundaries. The
+      // Cartesian dictionary domain exceeds 64 MiB even with one worker.
+      const int64_t t = i % 90000;
+      const int64_t key = t % 10007;
+      ASSERT_SUCCESS(
+          table
+              ->Insert(
+                  setup.txn_,
+                  Row({key == 1 ? Value() : Value("key_" + std::to_string(key)),
+                       key == 0 || t % 17 == 0
+                           ? Value()
+                           : Value((t % 70001) * 1000000001),
+                       Value(t % 7)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (rs_->TransactionStats().version_chains != 0) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const std::string prefix =
+      "SELECT k,COUNT(DISTINCT v) d,COUNT(DISTINCT v) again,COUNT(*) c "
+      "FROM SparseDistinct";
+  const std::string tail =
+      " ORDER BY d DESC,c DESC,k NULLS FIRST LIMIT 17 OFFSET 3";
+  for (const size_t workers : {size_t{1}, size_t{2}, size_t{4}}) {
+    std::atomic<size_t> active{0};
+    ScopedQueryParallelismBudget parallelism(&active, workers);
+    for (const std::string_view filter : {"", " WHERE k<>'key_7' AND f<3"}) {
+      std::string reference_query = prefix;
+      reference_query.append(filter);
+      reference_query += " GROUP BY k,CAST(k AS STRING)";
+      reference_query += tail;
+      const auto expected = RelationalRun(*rs_, reference_query);
+      auto context = rs_->BeginReadOnlyContext();
+      ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                            context.GetTable("SparseDistinct"));
+      const auto store = GetOrBuildLSTableStore(context.txn_, *table, true);
+      ASSERT_NE(store, nullptr);
+      const size_t domain = store->dictionaries[0].entries.size() + 1;
+      const size_t words =
+          (store->dictionaries[1].int_entries.size() + 63) / 64;
+      ASSERT_GT(domain * words * sizeof(uint64_t), size_t{64} * 1024 * 1024);
+      const auto key = ColumnValueExp("k");
+      const auto distinct = AggregateExpressionExp(AggregationType::kCount,
+                                                   ColumnValueExp("v"), true);
+      const auto count =
+          AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("*"));
+      Expression predicate;
+      if (!filter.empty()) {
+        predicate = BinaryExpressionExp(
+            BinaryExpressionExp(key, BinaryOperation::kNotEquals,
+                                ConstantValueExp(Value("key_7"))),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(ColumnValueExp("f"), BinaryOperation::kLessThan,
+                                ConstantValueExp(Value(3))));
+      }
+      SelectStatement statement(
+          {NamedExpression("k", key), NamedExpression("d", distinct),
+           NamedExpression("again", distinct), NamedExpression("c", count)},
+          {}, predicate);
+      SelectSource source;
+      source.table = "SparseDistinct";
+      statement.SetSources({source});
+      statement.SetGroupBy({key});
+      statement.SetOrderBy({{distinct, false, std::nullopt},
+                            {count, false, std::nullopt},
+                            {key, true, true}});
+      statement.SetLimit(17);
+      statement.SetOffset(3);
+      relational_detail::ExecutionRuntime runtime;
+      context.set_execution_runtime(&runtime);
+      ASSIGN_OR_ASSERT_FAIL(
+          relational_detail::Relation, result,
+          relational_detail::ExecuteQuery(context, statement, nullptr, {}));
+      EXPECT_EQ(result.rows, expected);
+      EXPECT_EQ(runtime.typed_parallel_aggregations, 1U);
+      EXPECT_EQ(runtime.scan_values_decoded, 0U);
+      if (workers == 4 && filter.empty()) {
+        // The same query must keep the encoded path when its observed pairs
+        // exceed the available staging buffer; duplicates cross disk runs
+        // and worker boundaries. Restore the global budget on assertion exit.
+        struct RestoreBudget {
+          RestoreBudget() = default;
+          RestoreBudget(const RestoreBudget&) = delete;
+          RestoreBudget& operator=(const RestoreBudget&) = delete;
+          RestoreBudget(RestoreBudget&&) = delete;
+          RestoreBudget& operator=(RestoreBudget&&) = delete;
+          size_t limit = QueryMemoryBudget::Global().Limit();
+          ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+        } restore;
+        QueryMemoryBudget::Global().ResetForTest(size_t{4} << 20);
+        runtime = {};
+        ASSIGN_OR_ASSERT_FAIL(
+            relational_detail::Relation, spilled,
+            relational_detail::ExecuteQuery(context, statement, nullptr, {}));
+        EXPECT_EQ(spilled.rows, expected);
+        EXPECT_EQ(runtime.typed_parallel_aggregations, 1U);
+        EXPECT_EQ(runtime.scan_values_decoded, 0U);
+      }
+      ASSERT_SUCCESS(context.PreCommit());
+    }
+  }
+  EXPECT_EQ(RelationalRun(*rs_,
+                          "SELECT k,COUNT(DISTINCT v) FROM SparseDistinct "
+                          "WHERE k='key_0' GROUP BY k LIMIT 1"),
+            (std::vector<Row>{Row({Value("key_0"), Value(0)})}));
+  EXPECT_TRUE(
+      RelationalRun(*rs_, prefix + " WHERE f<0 GROUP BY k LIMIT 3").empty());
+  const auto expected =
+      RelationalRun(*rs_, prefix + " GROUP BY k,CAST(k AS STRING)" + tail);
+  const size_t old_limit = QueryMemoryBudget::Global().Limit();
+  QueryMemoryBudget::Global().ResetForTest(size_t{1024} * 1024);
+  const auto constrained = RelationalRun(*rs_, prefix + " GROUP BY k" + tail);
+  QueryMemoryBudget::Global().ResetForTest(old_limit);
+  EXPECT_EQ(constrained, expected);
+  for (const std::string_view suffix :
+       {" ORDER BY k NULLS FIRST LIMIT 1", " LIMIT 0"}) {
+    EXPECT_EQ(RelationalRun(*rs_, prefix + " GROUP BY k" + std::string(suffix)),
+              RelationalRun(*rs_, prefix + " GROUP BY k,CAST(k AS STRING)" +
+                                      std::string(suffix)));
+  }
+  const std::string snapshot_query =
+      prefix + " GROUP BY k ORDER BY k NULLS FIRST LIMIT 1";
+  const auto before_insert = RelationalRun(*rs_, snapshot_query);
+  auto old = rs_->BeginReadOnlyContext();
+  RelationalRun(*rs_,
+                "INSERT INTO SparseDistinct VALUES (NULL,999999999999999,0)");
+  SqlEngine engine(*rs_);
+  ASSIGN_OR_ASSERT_FAIL(QueryResult, old_result,
+                        engine.Execute(old, snapshot_query));
+  EXPECT_EQ(old_result.Collect(), before_insert);
+  ASSERT_SUCCESS(old_result.GetStatus());
+  EXPECT_NE(RelationalRun(*rs_, snapshot_query), before_insert);
+  ASSERT_SUCCESS(old.PreCommit());
 }
 
 TEST_F(RelationalRegressionTest,
@@ -4788,6 +5234,163 @@ TEST_F(RelationalRegressionTest,
   context.Abort();
 }
 
+TEST_F(RelationalRegressionTest,
+       ParallelGroupedFinishRejectsUnmergeableStatisticalStates) {
+  constexpr size_t kRowCount = 32768;
+  constexpr int64_t kNonNullPerGroup = 12288;
+  for (const size_t workers : {size_t{1}, size_t{2}, size_t{8}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget parallelism(&active, workers);
+    for (const bool composite : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << workers << " workers, composite=" << composite);
+      auto context = rs_->BeginContext();
+      relational_detail::Relation input;
+      input.schema = Schema("stat_groups", {Column("g", ValueType::kInt64),
+                                            Column("h", ValueType::kVarChar),
+                                            Column("v", ValueType::kInt64)});
+      for (size_t i = 0; i < kRowCount; ++i) {
+        const int64_t value = static_cast<int64_t>((i / 2) % 4) * 10;
+        input.AddRow(Row({Value(static_cast<int64_t>(i % 2)), Value("all"),
+                          value == 0 ? Value() : Value(value)}));
+      }
+      const auto aggregate = [](AggregationType type) {
+        return AggregateExpressionExp(type, ColumnValueExp("v"));
+      };
+      SelectStatement statement(
+          {NamedExpression("g", ColumnValueExp("g")),
+           NamedExpression("n", aggregate(AggregationType::kCount)),
+           NamedExpression("mean", aggregate(AggregationType::kAvg)),
+           NamedExpression("vp", aggregate(AggregationType::kVarPop)),
+           NamedExpression("vs", aggregate(AggregationType::kVarSamp)),
+           NamedExpression("sp", aggregate(AggregationType::kStddevPop)),
+           NamedExpression("ss", aggregate(AggregationType::kStddevSamp))},
+          {}, nullptr);
+      statement.SetGroupBy(composite
+                               ? std::vector<Expression>{ColumnValueExp("g"),
+                                                         ColumnValueExp("h")}
+                               : std::vector<Expression>{ColumnValueExp("g")});
+      ASSIGN_OR_ASSERT_FAIL(
+          relational_detail::Relation, output,
+          relational_detail::FinishQuery(context, statement, std::move(input),
+                                         nullptr, {}, false));
+      ASSERT_EQ(output.rows.size(), 2U);
+      const double variance = 200.0 / 3.0;
+      const double sample =
+          variance * kNonNullPerGroup / (kNonNullPerGroup - 1);
+      for (const Row& row : output.rows) {
+        EXPECT_EQ(row[1], Value(kNonNullPerGroup));
+        EXPECT_DOUBLE_EQ(row[2].value.double_value, 20.0);
+        EXPECT_NEAR(row[3].value.double_value, variance, 1e-10);
+        EXPECT_NEAR(row[4].value.double_value, sample, 1e-10);
+        EXPECT_NEAR(row[5].value.double_value, std::sqrt(variance), 1e-10);
+        EXPECT_NEAR(row[6].value.double_value, std::sqrt(sample), 1e-10);
+      }
+      context.Abort();
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, CompactStatisticsKeepSequentialMoments) {
+  const std::vector<AggregationType> kinds{
+      AggregationType::kCount,     AggregationType::kAvg,
+      AggregationType::kVarPop,    AggregationType::kVarSamp,
+      AggregationType::kStddevPop, AggregationType::kStddevSamp};
+  std::vector<std::shared_ptr<AggregateExpression>> owned;
+  std::vector<const AggregateExpression*> aggregates;
+  std::vector<NamedExpression> items{NamedExpression("g", ColumnValueExp("g"))};
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    owned.push_back(std::make_shared<AggregateExpression>(
+        kinds[i], ColumnValueExp(i == 0 ? "*" : "v")));
+    aggregates.push_back(owned.back().get());
+    items.emplace_back("a" + std::to_string(i), owned.back());
+  }
+  items.emplace_back(
+      "twice", BinaryExpressionExp(owned.back(), BinaryOperation::kMultiply,
+                                   ConstantValueExp(Value(2.0))));
+  SelectStatement statement(std::move(items), {}, nullptr);
+  statement.SetGroupBy({ColumnValueExp("g")});
+  statement.SetHaving(BinaryExpressionExp(owned.front(),
+                                          BinaryOperation::kGreaterThan,
+                                          ConstantValueExp(Value(0))));
+  relational_detail::Relation input;
+  input.schema = Schema("input", {Column("g", ValueType::kVarChar),
+                                  Column("v", ValueType::kDouble)});
+  std::array<std::vector<relational_detail::AggregateAccumulator>, 4> ground;
+  for (auto& group : ground) {
+    group.reserve(aggregates.size());
+    for (const auto* aggregate : aggregates) {
+      group.emplace_back(aggregate);
+    }
+  }
+  constexpr size_t kRows = 32768;
+  const std::array<Value, 5> cancellation{Value(1e16), Value(1.0), Value(-1e16),
+                                          Value(0.25), Value()};
+  input.rows.reserve(kRows);
+  for (size_t i = 0; i < kRows; ++i) {
+    const size_t group = i % ground.size();
+    Value value;
+    if (group == 0) {
+      value = cancellation[(i / ground.size()) % cancellation.size()];
+    } else if (group == 1) {
+      value =
+          i == 1 ? Value(std::numeric_limits<double>::infinity()) : Value(1.0);
+    } else if (group == 2 && i == 2) {
+      value = Value(2.0);
+    }
+    for (size_t a = 0; a < aggregates.size(); ++a) {
+      ASSERT_SUCCESS(ground[group][a].Add(a == 0 ? Value(1) : value));
+    }
+    input.AddRow(
+        Row({group == 3 ? Value() : Value(std::to_string(group)), value}));
+  }
+  std::array<std::vector<Value>, 4> expected;
+  for (size_t g = 0; g < ground.size(); ++g) {
+    for (auto& accumulator : ground[g]) {
+      ASSIGN_OR_ASSERT_FAIL(Value, value, accumulator.TryFinish());
+      expected[g].push_back(std::move(value));
+    }
+    ASSIGN_OR_ASSERT_FAIL(
+        Value, twice,
+        relational_detail::TryBinary(BinaryOperation::kMultiply,
+                                     expected[g].back(), Value(2.0)));
+    expected[g].push_back(std::move(twice));
+  }
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    auto context = rs_->BeginContext();
+    relational_detail::ExecutionRuntime runtime;
+    context.set_execution_runtime(&runtime);
+    ASSIGN_OR_ASSERT_FAIL(std::optional<relational_detail::Relation>, output,
+                          relational_detail::TryCompactStatisticalAggregate(
+                              context, statement, input, aggregates, {}));
+    if (!output) {
+      FAIL() << "expected compact moments";
+    }
+    ASSERT_EQ(output->rows.size(), ground.size());
+    EXPECT_EQ(runtime.typed_parallel_aggregations, workers == 1 ? 0U : 1U);
+    for (size_t g = 0; g < ground.size(); ++g) {
+      const auto& row = output->rows[g];
+      EXPECT_EQ(row[0], g == 3 ? Value() : Value(std::to_string(g)));
+      ASSERT_EQ(row.Count(), expected[g].size() + 1);
+      for (size_t a = 0; a < expected[g].size(); ++a) {
+        EXPECT_TRUE(relational_detail::DistinctValueEqual{}(row[a + 1],
+                                                            expected[g][a]));
+      }
+    }
+    // A modifier must retain the ordinary aggregate's filtering semantics.
+    owned.back()->SetWhereFilter(ConstantValueExp(Value(false)));
+    ASSIGN_OR_ASSERT_FAIL(std::optional<relational_detail::Relation>, declined,
+                          relational_detail::TryCompactStatisticalAggregate(
+                              context, statement, input, aggregates, {}));
+    EXPECT_FALSE(declined.has_value());
+    owned.back()->SetWhereFilter(nullptr);
+    context.set_execution_runtime(nullptr);
+    context.Abort();
+  }
+}
+
 TEST_F(RelationalRegressionTest, ParallelProbePadsNullAndNaNLeftKeys) {
   constexpr size_t kRowCount = 65536;
   TransactionContext context = rs_->BeginContext();
@@ -5052,9 +5655,9 @@ TEST_F(RelationalRegressionTest, GroupingSetParentMapsKeepOrderAndSubsets) {
       "", {Column("a", ValueType::kVarChar), Column("b", ValueType::kInt64),
            Column("c", ValueType::kInt64), Column("v", ValueType::kDouble)});
   const std::vector<double> values{1.0e16, 1.0, -1.0e16, -0.0};
-  for (int64_t i = 0; i < 32768; ++i) {
+  for (int64_t i = 0; i < 65536; ++i) {
     input.AddRow(Row({i % 11 == 0 ? Value() : Value(std::to_string(i % 3)),
-                      Value(i % 17), Value(i % 127),
+                      Value(i % 17), Value(i % 509),
                       Value(values[static_cast<size_t>(i % 4)])}));
   }
   const auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
@@ -5079,8 +5682,10 @@ TEST_F(RelationalRegressionTest, GroupingSetParentMapsKeepOrderAndSubsets) {
   for (const auto& statement : statements) {
     sets.push_back(&statement);
   }
+  // The finest set spans multiple output morsels; compare exact row order
+  // and cancellation-sensitive sums against the serial route.
   std::vector<std::vector<Row>> reference;
-  for (const size_t workers : {size_t{1}, size_t{2}}) {
+  for (const size_t workers : {size_t{1}, size_t{2}, size_t{4}}) {
     std::atomic<size_t> active{0};
     ScopedQueryParallelismBudget budget(&active, workers);
     auto grouped =
@@ -6273,12 +6878,21 @@ TEST_F(RelationalRegressionTest,
       left.rows.front().values_[1] = Value();
       left.rows.back().values_[1] = Value(std::numeric_limits<int64_t>::max());
     }
-    for (const size_t workers : {size_t{1}, size_t{2}}) {
+    for (const size_t workers : {size_t{1}, size_t{2}, size_t{4}}) {
       std::atomic<size_t> active{0};
       ScopedQueryParallelismBudget budget(&active, workers);
       std::vector<Row> reference;
-      for (const bool early : {false, true}) {
-        fusion.post_having_active = early;
+      for (const int mode : {0, 1, 2, 3}) {
+        const bool early = mode != 0;
+        fusion.post_having_active = mode == 1;
+        fusion.having =
+            mode >= 2
+                ? BinaryExpressionExp(
+                      count, BinaryOperation::kGreaterThan,
+                      ConstantValueExp(Value(
+                          mode == 2 ? int64_t{4}
+                                    : std::numeric_limits<int64_t>::max())))
+                : Expression{};
         fusion.post_having_applied = false;
         auto result = relational_detail::TryFusedGroupedJoin(
             context, left, right, predicates, JoinType::kInner, nullptr, {},
@@ -6296,7 +6910,181 @@ TEST_F(RelationalRegressionTest,
           }
         } else {
           EXPECT_TRUE(fusion.post_having_applied);
-          EXPECT_EQ(output->rows, reference);
+          if (mode == 3) {
+            EXPECT_TRUE(output->rows.empty());
+          } else {
+            EXPECT_EQ(output->rows, reference);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, HighCardinalityCountLogKeepsLateDuplicates) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation left, right;
+  left.schema = Schema("f", {Column(ColumnName("f", "k"), ValueType::kInt64),
+                             Column(ColumnName("f", "p"), ValueType::kInt64)});
+  right.schema =
+      Schema("d", {Column(ColumnName("d", "k"), ValueType::kInt64),
+                   Column(ColumnName("d", "label"), ValueType::kVarChar)});
+  right.rows = {Row({Value(0), Value("a")}), Row({Value(1), Value("b")})};
+  constexpr int64_t kGroups = 32771;
+  left.rows.reserve(kGroups * 3);
+  // Each worker first sees almost entirely distinct groups. Later chunks
+  // revisit them, including NULL and an INT64 key outside the packed range.
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    for (int64_t key = 0; key < kGroups; ++key) {
+      left.rows.emplace_back(std::vector<Value>{
+          Value(key % 2), key == 0 ? Value()
+                          : key == 1
+                              ? Value(std::numeric_limits<int64_t>::max())
+                              : Value(key)});
+    }
+  }
+  const auto col = [](const char* owner, const char* name) {
+    return ColumnValueExp(ColumnName(owner, name));
+  };
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("*"));
+  relational_detail::GroupedJoinFusionSpec fusion;
+  fusion.group_keys = {col("f", "p"), col("d", "label")};
+  fusion.select_items = {col("f", "p"), col("d", "label"), count};
+  fusion.select_names = {"p", "label", "n"};
+  fusion.aggregates = {count.get()};
+  fusion.count_star = {true};
+  fusion.eligible = true;
+  fusion.having = BinaryExpressionExp(count, BinaryOperation::kGreaterThan,
+                                      ConstantValueExp(Value(2)));
+  const std::vector<Expression> predicates{BinaryExpressionExp(
+      col("f", "k"), BinaryOperation::kEquals, col("d", "k"))};
+  for (const bool duplicate_build : {false, true}) {
+    if (duplicate_build) {
+      right.rows.emplace_back(std::vector<Value>{Value(0), Value("a")});
+    }
+    for (const size_t workers : {size_t{1}, size_t{4}}) {
+      std::atomic<size_t> active{0};
+      ScopedQueryParallelismBudget budget(&active, workers);
+      auto result = relational_detail::TryFusedGroupedJoin(
+          context, left, right, predicates, JoinType::kInner, nullptr, {},
+          &fusion);
+      ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+      auto output = result.MoveValue();
+      ASSERT_TRUE(output.has_value());
+      ASSERT_EQ(output->rows.size(), kGroups);
+      std::set<int64_t> seen;
+      for (const auto& row : output->rows) {
+        const int64_t key =
+            row[0].IsNull() ? 0
+            : row[0].value.int_value == std::numeric_limits<int64_t>::max()
+                ? 1
+                : row[0].value.int_value;
+        EXPECT_TRUE(seen.insert(key).second);
+        EXPECT_GE(key, 0);
+        EXPECT_LT(key, kGroups);
+        EXPECT_EQ(row[1], Value(key % 2 == 0 ? "a" : "b"));
+        EXPECT_EQ(row[2], Value(duplicate_build && key % 2 == 0 ? 6 : 3));
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, CountPrefilterKeepsExactBoundaryGroups) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation left, right;
+  left.schema = Schema("f", {Column(ColumnName("f", "k"), ValueType::kInt64),
+                             Column(ColumnName("f", "p"), ValueType::kInt64)});
+  right.schema =
+      Schema("d", {Column(ColumnName("d", "k"), ValueType::kInt64),
+                   Column(ColumnName("d", "label"), ValueType::kVarChar)});
+  right.rows = {Row({Value(0), Value("a")}), Row({Value(1), Value("b")})};
+  constexpr int64_t kGroups = 65536;
+  std::vector<int64_t> counts(kGroups);
+  left.rows.reserve(kGroups * 4);
+  const auto append = [&](int64_t key) {
+    left.rows.emplace_back(
+        std::vector<Value>{Value(key % 2), key == 0   ? Value()
+                                           : key == 1 ? Value(INT64_MAX)
+                                                      : Value(key)});
+    ++counts[static_cast<size_t>(key)];
+  };
+  // A weighted local partial precedes the append-log phase. Most other
+  // groups remain below the threshold, with late duplicates at its boundary.
+  for (int i = 0; i < 6; ++i) {
+    append(0);
+  }
+  for (int repeat = 0; repeat < 6; ++repeat) {
+    for (int64_t key = 0; key < kGroups; ++key) {
+      const int64_t frequency = key % 128 == 0   ? 6
+                                : key % 128 == 1 ? 5
+                                                 : (key % 4) + 1;
+      if (repeat < frequency) {
+        append(key);
+      }
+    }
+  }
+  const auto col = [](const char* owner, const char* name) {
+    return ColumnValueExp(ColumnName(owner, name));
+  };
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, ColumnValueExp("*"));
+  relational_detail::GroupedJoinFusionSpec fusion;
+  fusion.group_keys = {col("f", "p"), col("d", "label")};
+  fusion.select_items = {col("f", "p"), col("d", "label"), count};
+  fusion.select_names = {"p", "label", "n"};
+  fusion.aggregates = {count.get()};
+  fusion.count_star = {true};
+  fusion.eligible = true;
+  fusion.post_having_agg_slot = 0;
+  fusion.post_having_op = BinaryOperation::kGreaterThan;
+  const std::vector<Expression> predicates{BinaryExpressionExp(
+      col("f", "k"), BinaryOperation::kEquals, col("d", "k"))};
+  for (const bool duplicates : {false, true}) {
+    if (duplicates) {
+      right.rows.emplace_back(std::vector<Value>{Value(0), Value("a")});
+    }
+    for (const auto& threshold : {Value(4), Value(4.5), Value(254)}) {
+      const bool integer = threshold.type == ValueType::kInt64;
+      const double limit = integer
+                               ? static_cast<double>(threshold.value.int_value)
+                               : threshold.value.double_value;
+      fusion.having =
+          integer ? BinaryExpressionExp(count, BinaryOperation::kGreaterThan,
+                                        ConstantValueExp(threshold))
+                  : Expression{};
+      fusion.post_having_active = !integer;
+      fusion.post_having_constant_or_factor = limit;
+      for (const size_t workers : {size_t{1}, size_t{4}}) {
+        std::atomic<size_t> active{0};
+        ScopedQueryParallelismBudget budget(&active, workers);
+        auto result = relational_detail::TryFusedGroupedJoin(
+            context, left, right, predicates, JoinType::kInner, nullptr, {},
+            &fusion);
+        ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+        auto output = result.MoveValue();
+        ASSERT_TRUE(output.has_value());
+        size_t expected_groups = 0;
+        for (int64_t key = 0; key < kGroups; ++key) {
+          const int64_t expected = counts[static_cast<size_t>(key)] *
+                                   (duplicates && key % 2 == 0 ? 2 : 1);
+          expected_groups += static_cast<double>(expected) > limit ? 1U : 0U;
+        }
+        ASSERT_EQ(output->rows.size(), expected_groups);
+        std::set<int64_t> seen;
+        for (const auto& row : output->rows) {
+          const int64_t key = row[0].IsNull() ? 0
+                              : row[0].value.int_value == INT64_MAX
+                                  ? 1
+                                  : row[0].value.int_value;
+          ASSERT_GE(key, 0);
+          ASSERT_LT(key, kGroups);
+          EXPECT_TRUE(seen.insert(key).second);
+          const int64_t expected = counts[static_cast<size_t>(key)] *
+                                   (duplicates && key % 2 == 0 ? 2 : 1);
+          EXPECT_GT(static_cast<double>(expected), limit);
+          EXPECT_EQ(row[1], Value(key % 2 == 0 ? "a" : "b"));
+          EXPECT_EQ(row[2], Value(expected));
         }
       }
     }
@@ -6437,7 +7225,7 @@ TEST_F(RelationalRegressionTest, FusedBuildCaseCacheKeepsNullAndCollation) {
 TEST_F(RelationalRegressionTest, BorrowedJoinKeysKeepBytesBiasAndDuplicates) {
   auto context = rs_->BeginContext();
   std::atomic<size_t> active{0};
-  ScopedQueryParallelismBudget budget(&active, 2);
+  ScopedQueryParallelismBudget budget(&active, 4);
   const std::string binary("a\0b", 3);
   const std::string long_text(96, 'x');
   const auto col = [](const char* alias, const char* name) {
@@ -6594,7 +7382,7 @@ TEST_F(RelationalRegressionTest, PackedOuterKeysKeepRangesNullsAndDuplicates) {
 TEST_F(RelationalRegressionTest, ParallelJoinConsumesOnlyLastMatchBuffer) {
   auto context = rs_->BeginContext();
   std::atomic<size_t> active{0};
-  ScopedQueryParallelismBudget budget(&active, 2);
+  ScopedQueryParallelismBudget budget(&active, 4);
   const std::string text(96, 'p');
   const Value array = Value::Array({Value(3), Value(), Value("nested")}, "ANY");
   for (const auto kind : {JoinType::kInner, JoinType::kLeft, JoinType::kFull}) {
@@ -6756,6 +7544,132 @@ TEST_F(RelationalRegressionTest, UnobservedLeftBuildNeedsActualUniqueness) {
   }
 }
 
+TEST_F(RelationalRegressionTest, ExactIntegerRollupReusesWeightedFineGroups) {
+  RelationalRun(*rs_, "CREATE TABLE RollupDim (k INT64, label STRING)");
+  for (const bool wide : {false, true}) {
+    const std::string name = wide ? "RollupWide" : "RollupBounded";
+    RelationalRun(*rs_,
+                  "CREATE TABLE " + name + " (k INT64, g INT64, v INT64)");
+    auto setup = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact, setup.GetTable(name));
+    for (int64_t i = 0; i < 32768; ++i) {
+      const Value value = i % 5 == 0 || i % 128 == 0
+                              ? Value()
+                              : Value(wide ? int64_t{1} << 54 : (i % 31) - 15);
+      ASSERT_SUCCESS(
+          fact->Insert(setup.txn_,
+                       Row({Value(i % 128), Value((i / 128) % 7), value}))
+              .GetStatus());
+    }
+    if (!wide) {
+      ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
+                            setup.GetTable("RollupDim"));
+      for (int64_t key = 0; key < 127; ++key) {
+        ASSERT_SUCCESS(
+            dim->Insert(
+                   setup.txn_,
+                   Row({Value(key),
+                        key == 0 ? Value() : Value(std::to_string(key % 8))}))
+                .GetStatus());
+      }
+      ASSERT_SUCCESS(
+          dim->Insert(setup.txn_, Row({Value(7), Value("7")})).GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+    for (const size_t workers : {size_t{1}, size_t{4}}) {
+      std::atomic<size_t> active{0};
+      ScopedQueryParallelismBudget budget(&active, workers);
+      // Different predicate literals also exercise template rebinding; empty
+      // input must still emit the NULL grand total, and duplicate sets survive.
+      for (const int minimum : {0, 2, 99}) {
+        const std::string source =
+            " FROM " + name + " f JOIN RollupDim d ON f.k=d.k WHERE f.g >= " +
+            std::to_string(minimum);
+        const std::string query =
+            "SELECT d.label, f.g, AVG(f.v) AS a" + source +
+            " GROUP BY GROUPING SETS ((d.label,f.g),(d.label),(d.label),())";
+        const auto got = RelationalRun(*rs_, query);
+        std::vector<Row> expected =
+            RelationalRun(*rs_, "SELECT d.label, f.g, AVG(f.v) AS a" + source +
+                                    " GROUP BY d.label,f.g");
+        const auto subtotal =
+            RelationalRun(*rs_, "SELECT d.label, NULL, AVG(f.v) AS a" + source +
+                                    " GROUP BY d.label");
+        expected.insert(expected.end(), subtotal.begin(), subtotal.end());
+        expected.insert(expected.end(), subtotal.begin(), subtotal.end());
+        const auto total =
+            RelationalRun(*rs_, "SELECT NULL, NULL, AVG(f.v) AS a" + source);
+        expected.insert(expected.end(), total.begin(), total.end());
+        ASSERT_EQ(got.size(), expected.size());
+        std::vector<bool> matched(expected.size(), false);
+        for (const Row& row : got) {
+          size_t index = 0;
+          while (index < expected.size() &&
+                 (matched[index] || row != expected[index])) {
+            ++index;
+          }
+          ASSERT_LT(index, expected.size()) << row;
+          matched[index] = true;
+        }
+        if (!wide && minimum == 0) {
+          EXPECT_NE(ExplainAnalyze(*rs_, query).find("grouped_join_fusions=1"),
+                    std::string::npos);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest, ExactPartialTotalsCheckActualValues) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation left, right;
+  left.schema = Schema("f", {Column(ColumnName("f", "k"), ValueType::kInt64),
+                             Column(ColumnName("f", "v"), ValueType::kInt64)});
+  right.schema = Schema("d", {Column(ColumnName("d", "k"), ValueType::kInt64)});
+  right.rows.emplace_back(std::vector<Value>{Value(1)});
+  right.rows.emplace_back(std::vector<Value>{Value(1)});
+  const auto key = ColumnValueExp(ColumnName("f", "k"));
+  const auto value = ColumnValueExp(ColumnName("f", "v"));
+  const auto sum =
+      std::make_shared<AggregateExpression>(AggregationType::kSum, value);
+  const auto count =
+      std::make_shared<AggregateExpression>(AggregationType::kCount, value);
+  relational_detail::GroupedJoinFusionSpec fusion;
+  fusion.group_keys = {key};
+  fusion.aggregates = {sum.get(), count.get()};
+  fusion.count_star = {false, false};
+  fusion.select_items = {key, sum, count};
+  fusion.select_names = {"k", "s", "n"};
+  fusion.eligible = true;
+  fusion.require_exact_integer_totals = true;
+  const std::vector<Expression> predicates{BinaryExpressionExp(
+      key, BinaryOperation::kEquals, ColumnValueExp(ColumnName("d", "k")))};
+  for (const Value& input :
+       {Value(int64_t{1} << 52), Value((int64_t{1} << 52) + 1),
+        Value(-(int64_t{1} << 52)), Value(std::numeric_limits<int64_t>::min()),
+        Value(1.0), Value(int64_t{1}).WithUnsigned(), Value()}) {
+    left.rows = {Row({Value(1), input})};
+    ASSIGN_OR_ASSERT_FAIL(std::optional<relational_detail::Relation>, output,
+                          relational_detail::TryFusedGroupedJoin(
+                              context, left, right, predicates,
+                              JoinType::kInner, nullptr, {}, &fusion));
+    const bool exact =
+        input.IsNull() ||
+        (input.type == ValueType::kInt64 && !input.IsUnsigned() &&
+         (input.value.int_value == (int64_t{1} << 52) ||
+          input.value.int_value == -(int64_t{1} << 52)));
+    ASSERT_EQ(output.has_value(), exact) << input;
+    if (output) {
+      ASSERT_EQ(output->rows.size(), 1U);
+      EXPECT_EQ(output->rows[0][1],
+                input.IsNull() ? Value() : Value(input.value.int_value * 2));
+      EXPECT_EQ(output->rows[0][2], Value(input.IsNull() ? 0 : 2));
+    }
+    EXPECT_EQ(left.rows[0][1], input);
+  }
+  context.Abort();
+}
+
 TEST_F(RelationalRegressionTest, LargeBuildGroupsMergeParallelAggregateStates) {
   auto context = rs_->BeginContext();
   relational_detail::Relation left, right;
@@ -6861,6 +7775,235 @@ TEST_F(RelationalRegressionTest, LargeBuildGroupsMergeParallelAggregateStates) {
       if (row[0] == Value(1)) {
         EXPECT_EQ(row[1], Value(1.0));
       }
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       LargeOrderedFilterPreservesDuplicatesAndNulls) {
+  RelationalRun(*rs_, "CREATE TABLE OrderedFilterDim(k INT64,keep INT64)");
+  RelationalRun(*rs_, "CREATE TABLE OrderedFilterFact(k INT64,p INT64)");
+  RelationalRun(*rs_, "CREATE TABLE OrderedFilterPad(k INT64)");
+  constexpr int64_t kDimension = 120000;
+  constexpr int64_t kFact = 600000;
+  int64_t expected_count = 0, expected_matched = 0;
+  {
+    auto context = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
+                          context.GetTable("OrderedFilterDim"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
+                          context.GetTable("OrderedFilterFact"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, pad,
+                          context.GetTable("OrderedFilterPad"));
+    for (int64_t k = 0; k < kDimension; ++k) {
+      ASSERT_SUCCESS(
+          dim->Insert(context.txn_, Row({Value(k), Value(k % 16 == 7 ? 1 : 0)}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(
+        dim->Insert(context.txn_, Row({Value(7), Value(1)})).GetStatus());
+    ASSERT_SUCCESS(
+        dim->Insert(context.txn_, Row({Value(), Value(1)})).GetStatus());
+    for (int64_t k = 0; k < 8; ++k) {
+      ASSERT_SUCCESS(pad->Insert(context.txn_, Row({Value(k)})).GetStatus());
+    }
+    for (int64_t i = 0; i < kFact; ++i) {
+      const bool null_key = i % 101 == 0;
+      const bool missing = i % 127 == 0;
+      const bool null_pad = i % 107 == 0;
+      const int64_t key = missing ? kDimension + 1000 : i % kDimension;
+      ASSERT_SUCCESS(
+          fact->Insert(context.txn_, Row({null_key ? Value() : Value(key),
+                                          null_pad ? Value() : Value(i % 17)}))
+              .GetStatus());
+      if (!null_key && !missing && key % 16 == 7) {
+        const int64_t copies = key == 7 ? 2 : 1;
+        expected_count += copies;
+        if (!null_pad && i % 17 < 8) {
+          expected_matched += copies;
+        }
+      }
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  RelationalRun(*rs_, "ANALYZE");
+  const std::string sql =
+      "SELECT COUNT(*),COUNT(p.k) FROM OrderedFilterFact f "
+      "JOIN OrderedFilterDim d ON f.k=d.k LEFT JOIN OrderedFilterPad p ON "
+      "f.p=p.k "
+      "WHERE d.keep=1";
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{0};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    EXPECT_EQ(RelationalRun(*rs_, sql),
+              std::vector<Row>(
+                  {Row({Value(expected_count), Value(expected_matched)})}));
+    const auto profile = ExplainAnalyze(*rs_, sql);
+    const std::string field = "scan_output_rows=";
+    const auto position = profile.find(field);
+    ASSERT_NE(position, std::string::npos) << profile;
+    EXPECT_LT(std::stoull(profile.substr(position + field.size())), 100000U)
+        << profile;
+  }
+}
+
+TEST_F(RelationalRegressionTest, RelativeDimensionPreloadKeepsDeferredFact) {
+  RelationalRun(*rs_,
+                "CREATE TABLE PreloadDim (k INT64,g INT64,label STRING(MAX))");
+  RelationalRun(*rs_, "CREATE TABLE PreloadDate (k INT64,y INT64,z INT64)");
+  RelationalRun(*rs_, "CREATE TABLE PreloadFact (dk INT64,dt INT64,v INT64)");
+  constexpr int64_t kDim = 40000;
+  constexpr int64_t kFact = kDim * 4;
+  std::map<std::pair<int64_t, std::string>, int64_t> counts;
+  std::map<std::tuple<int64_t, std::string, int64_t>, int64_t> wide_counts;
+  {
+    auto context = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, dim,
+                          context.GetTable("PreloadDim"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, date,
+                          context.GetTable("PreloadDate"));
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, fact,
+                          context.GetTable("PreloadFact"));
+    for (int64_t i = 0; i < kDim; ++i) {
+      ASSERT_TRUE(dim->Insert(context.txn_, Row({Value(i), Value(i % 7),
+                                                 Value(std::to_string(i % 3))}))
+                      .HasValue());
+    }
+    for (int64_t i = 0; i < 100; ++i) {
+      ASSERT_TRUE(
+          date->Insert(context.txn_, Row({Value(i), Value(i / 10),
+                                          i % 3 == 0 ? Value() : Value(i % 3)}))
+              .HasValue());
+    }
+    for (int64_t i = 0; i < kFact; ++i) {
+      const bool null_key = i % 101 == 0;
+      const int64_t key = i % kDim;
+      ASSERT_TRUE(
+          fact->Insert(context.txn_, Row({null_key ? Value() : Value(key),
+                                          Value(i % 100), Value(1)}))
+              .HasValue());
+      if (!null_key && (i % 100) / 10 == 1) {
+        ++counts[{key % 7, std::to_string(key % 3)}];
+        ++wide_counts[{key % 7, std::to_string(key % 3),
+                       ((i % 100) % 3 == 0 ? -1 : (i % 100) % 3)}];
+      }
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  RelationalRun(*rs_, "ANALYZE");
+  const std::string sql =
+      "SELECT d.g,d.label,t.y,SUM(f.v) FROM PreloadDim d,PreloadFact "
+      "f,PreloadDate t "
+      "WHERE d.k=f.dk AND t.k=f.dt AND t.y=1 GROUP BY d.g,d.label,t.y "
+      "ORDER BY d.g,d.label,t.y";
+  std::vector<Row> expected;
+  expected.reserve(counts.size());
+  for (const auto& [key, count] : counts) {
+    expected.emplace_back(Row({Value(key.first), Value(std::string(key.second)),
+                               Value(1), Value(count)}));
+  }
+  const std::string wide_sql =
+      "SELECT d.g,d.label,t.y,t.z,SUM(f.v) FROM PreloadDim d,PreloadFact "
+      "f,PreloadDate t "
+      "WHERE d.k=f.dk AND t.k=f.dt AND t.y=1 GROUP BY d.g,d.label,t.y,t.z "
+      "ORDER BY d.g,d.label,t.y,t.z";
+  const auto wide_expected = [&] {
+    std::vector<Row> rows;
+    rows.reserve(wide_counts.size());
+    for (const auto& [key, count] : wide_counts) {
+      rows.emplace_back(Row(
+          {Value(std::get<0>(key)), Value(std::string(std::get<1>(key))),
+           Value(1), std::get<2>(key) == -1 ? Value() : Value(std::get<2>(key)),
+           Value(count)}));
+    }
+    return rows;
+  };
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    EXPECT_EQ(RelationalRun(*rs_, sql), expected);
+    EXPECT_EQ(RelationalRun(*rs_, wide_sql), wide_expected());
+    const auto profile = ExplainAnalyze(*rs_, wide_sql);
+    const std::string field = "scan_rows=";
+    const auto position = profile.find(field);
+    ASSERT_NE(position, std::string::npos) << profile;
+    EXPECT_LT(std::stoull(profile.substr(position + field.size())),
+              static_cast<uint64_t>(kDim + 1000))
+        << profile;
+  }
+  // A duplicate dimension key must retain join multiplicity via fallback.
+  RelationalRun(*rs_, "INSERT INTO PreloadDate VALUES (10,1,1)");
+  for (int64_t i = 10; i < kFact; i += 100) {
+    if (i % 101 != 0) {
+      const int64_t key = i % kDim;
+      ++wide_counts[{key % 7, std::to_string(key % 3), 1}];
+    }
+  }
+  EXPECT_EQ(RelationalRun(*rs_, wide_sql), wide_expected());
+}
+
+TEST_F(RelationalRegressionTest, RawPartitionMergeKeepsCompositeSums) {
+  auto context = rs_->BeginContext();
+  relational_detail::Relation left, right;
+  left.schema = Schema("f", {Column(ColumnName("f", "id"), ValueType::kInt64),
+                             Column(ColumnName("f", "g"), ValueType::kInt64),
+                             Column(ColumnName("f", "v"), ValueType::kDouble)});
+  right.schema =
+      Schema("d", {Column(ColumnName("d", "id"), ValueType::kInt64),
+                   Column(ColumnName("d", "s"), ValueType::kVarChar)});
+  right.rows = {Row({Value(1), Value("x")}), Row({Value(1), Value("x")}),
+                Row({Value(2), Value()})};
+  constexpr int64_t kGroups = 32768;
+  for (int64_t repeat = 0; repeat < 4; ++repeat) {
+    for (int64_t i = 0; i < kGroups; ++i) {
+      left.rows.emplace_back(Row(
+          {Value((i % 2) + 1), Value(i), i % 5 == 0 ? Value() : Value(0.25)}));
+    }
+  }
+  const auto col = [](const char* alias, const char* name) {
+    return ColumnValueExp(ColumnName(alias, name));
+  };
+  const auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
+                                                         col("f", "v"));
+  const auto count = std::make_shared<AggregateExpression>(
+      AggregationType::kCount, col("f", "v"));
+  relational_detail::GroupedJoinFusionSpec fusion;
+  fusion.group_keys = {col("f", "g"), col("d", "s")};
+  fusion.aggregates = {sum.get(), count.get()};
+  fusion.count_star = {false, false};
+  fusion.select_items = {col("f", "g"), col("d", "s"), sum, count};
+  fusion.select_names = {"g", "s", "sum", "count"};
+  fusion.eligible = true;
+  const std::vector<Expression> predicates{BinaryExpressionExp(
+      col("f", "id"), BinaryOperation::kEquals, col("d", "id"))};
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{0};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    relational_detail::ExecutionRuntime runtime;
+    context.set_execution_runtime(&runtime);
+    auto result = relational_detail::TryFusedGroupedJoin(
+        context, left, right, predicates, JoinType::kInner, nullptr, {},
+        &fusion);
+    ASSERT_TRUE(result.HasValue()) << result.GetStatus();
+    auto output = result.MoveValue();
+    if (!output) {
+      FAIL() << "expected specialized aggregation";
+    }
+    ASSERT_EQ(output->rows.size(), static_cast<size_t>(kGroups));
+    EXPECT_EQ(runtime.partitioned_aggregate_merges, workers == 1 ? 0U : 1U);
+    std::vector<bool> seen(kGroups, false);
+    for (const auto& row : output->rows) {
+      const int64_t group = row[0].value.int_value;
+      ASSERT_GE(group, 0);
+      ASSERT_LT(group, kGroups);
+      EXPECT_FALSE(seen[group]);
+      seen[group] = true;
+      const bool null_value = group % 5 == 0;
+      const int64_t multiplicity = group % 2 == 0 ? 2 : 1;
+      EXPECT_EQ(row[1], group % 2 == 0 ? Value("x") : Value());
+      EXPECT_EQ(row[2], null_value ? Value()
+                                   : Value(static_cast<double>(multiplicity)));
+      EXPECT_EQ(row[3], Value(null_value ? 0 : multiplicity * 4));
     }
   }
 }
@@ -7329,8 +8472,9 @@ TEST_F(RelationalRegressionTest, SmallInnerBuildStreamsEverySpilledProbeRow) {
     ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
   } restore;
   QueryMemoryBudget::Global().ResetForTest(65536);
-  for (int shape = 0; shape < 3; ++shape) {
-    SCOPED_TRACE(shape);  // integer / composite integer / byte key
+  for (int variant = 0; variant < 6; ++variant) {
+    SCOPED_TRACE(variant);
+    const int shape = variant % 3;  // integer / composite integer / byte key
     auto context = rs_->BeginContext();
     relational_detail::ExecutionRuntime runtime;
     context.set_execution_runtime(&runtime);
@@ -7364,8 +8508,16 @@ TEST_F(RelationalRegressionTest, SmallInnerBuildStreamsEverySpilledProbeRow) {
                                                BinaryOperation::kEquals,
                                                ColumnValueExp("rk2")));
     }
-    auto joined = relational_detail::InnerJoin(
-        context, std::move(left), std::move(right), predicates, nullptr, {});
+    SelectSource source;
+    source.join_type = JoinType::kInner;
+    source.join_condition = CombineConjuncts(predicates);
+    auto joined =
+        variant < 3
+            ? relational_detail::InnerJoin(context, std::move(left),
+                                           std::move(right), predicates,
+                                           nullptr, {})
+            : relational_detail::Join(context, std::move(left),
+                                      std::move(right), source, nullptr, {});
     ASSERT_TRUE(joined.HasValue()) << joined.GetStatus();
     EXPECT_EQ(joined.Value().hybrid_hash_joins, 0U);
     EXPECT_EQ(joined.Value().in_memory_hash_joins, 1U);
@@ -7979,6 +9131,42 @@ TEST_F(RelationalRegressionTest, LeftNullKeyFilterKeepsOnlyUnmatchedRows) {
   )sql");
   expected[1] = Row({Value(4), Value(9)});
   EXPECT_EQ(null_safe, expected);
+}
+
+TEST_F(RelationalRegressionTest, ParallelUnmatchedLeftJoinPreservesRows) {
+  RelationalRun(*rs_, "CREATE TABLE AntiParallel (a INT64,b INT64,v INT64)");
+  RelationalRun(*rs_, "CREATE TABLE AntiBuild (a INT64,b INT64,p INT64)");
+  RelationalRun(*rs_,
+                "INSERT INTO AntiBuild VALUES "
+                "(1,10,2),(1,10,NULL),(2,20,3),(NULL,10,4),(3,NULL,5)");
+  std::vector<Row> expected;
+  {
+    auto context = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("AntiParallel"));
+    for (int64_t i = 0; i < 65536; ++i) {
+      const Value a =
+          i % 4 == 0
+              ? Value()
+              : Value(i % 11 == 0 ? (int64_t{1} << 32) + (i % 4) : i % 4);
+      const Value b = i % 7 == 0 ? Value() : Value(10);
+      ASSERT_SUCCESS(
+          table->Insert(context.txn_, Row({a, b, Value(i)})).GetStatus());
+      if (a.IsNull() || b.IsNull() || a.value.int_value != 1) {
+        expected.emplace_back(Row({Value(i), Value()}));
+      }
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{0};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    const auto rows = RelationalRun(
+        *rs_,
+        "SELECT f.v,d.p FROM AntiParallel f LEFT JOIN AntiBuild d "
+        "ON f.a=d.a AND f.b=d.b WHERE d.a IS NULL ORDER BY f.v");
+    EXPECT_EQ(rows, expected);
+  }
 }
 
 TEST_F(RelationalRegressionTest, LeftOnLocalFilterKeepsNullExtensionAndWhere) {
@@ -9742,6 +10930,447 @@ TEST_F(RelationalRegressionTest, AuditRowFillWithVarcharRemainsReusable) {
   const auto rows = RelationalRun(*rs_, branch + " UNION ALL " + branch);
   EXPECT_EQ(rows, std::vector<Row>({Row({Value(1), Value(16500.0)}),
                                     Row({Value(1), Value(16500.0)})}));
+}
+
+TEST_F(RelationalRegressionTest, ProjectedColumnStoresKeepQueriesEquivalent) {
+  RelationalRun(*rs_,
+                "CREATE TABLE ProjectionCache(unused INT64, k INT64, s STRING, "
+                "n INT64, plain STRING)");
+  {
+    auto context = rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("ProjectionCache"));
+    for (int64_t i = 0; i < 12000; ++i) {
+      ASSERT_SUCCESS(
+          table
+              ->Insert(
+                  context.txn_,
+                  Row({Value(-1), Value(i % 300),
+                       i % 17 == 0 ? Value()
+                                   : Value("key" + std::to_string(i % 300)),
+                       i % 13 == 0 ? Value() : Value(i % 101),
+                       Value("key" + std::to_string(i % 300))}))
+              .GetStatus());
+    }
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+  const std::vector<std::string> queries{
+      "SELECT COUNT(*) FROM ProjectionCache WHERE n>90",
+      "SELECT COUNT(*),SUM(n),MIN(n),MAX(n) FROM ProjectionCache WHERE k>5 AND "
+      "n<90",
+      "SELECT COUNT(*) FROM ProjectionCache WHERE s LIKE '%2%'",
+      "SELECT COUNT(*) FROM ProjectionCache WHERE plain NOT LIKE '%2%' AND "
+      "k>10",
+      "SELECT COUNT(*) FROM ProjectionCache WHERE n IS NULL OR k=1",
+
+      "SELECT COUNT(*) FROM ProjectionCache",
+      "SELECT SUM(n),AVG(n),MIN(n),MAX(n) FROM ProjectionCache",
+      "SELECT k,COUNT(DISTINCT n) d FROM ProjectionCache WHERE k>5 GROUP BY k "
+      "ORDER BY d DESC,k LIMIT 20",
+      "SELECT REGEXP_REPLACE(s,'[0-9]+','') k,COUNT(*) "
+      "c,MIN(s),AVG(BYTE_LENGTH(s)) FROM ProjectionCache WHERE s<>'' GROUP BY "
+      "k HAVING c>10 ORDER BY k",
+      "SELECT k,n FROM ProjectionCache WHERE n>90 ORDER BY n DESC,k LIMIT 20",
+      "SELECT COUNT(DISTINCT n) FROM ProjectionCache WHERE k>200",
+      "SELECT k,AVG(CAST(BYTE_LENGTH(plain) AS FLOAT64)) l,COUNT(*) c FROM "
+      "ProjectionCache WHERE plain<>'' GROUP BY k HAVING COUNT(*)>10 ORDER BY "
+      "l "
+      "DESC,k LIMIT 25"};
+  std::vector<std::vector<Row>> expected;
+  expected.reserve(queries.size());
+  for (const auto& query : queries) {
+    expected.push_back(RelationalRun(*rs_, query));
+  }
+  for (const size_t workers : {size_t{1}, size_t{3}, size_t{7}}) {
+    auto context = rs_->BeginReadOnlyContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                          context.GetTable("ProjectionCache"));
+    table->SetLSTableStore(nullptr);
+    table->SetProjectedLSTableStore(nullptr);
+    table->RejectLSTableCapacity(table->LayoutGeneration());
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    for (size_t i = 0; i < queries.size(); ++i) {
+      SCOPED_TRACE(queries[i]);
+      EXPECT_EQ(RelationalRun(*rs_, queries[i]), expected[i]);
+      EXPECT_EQ(table->GetLSTableStore(), nullptr);
+    }
+    ASSERT_NE(table->GetProjectedLSTableStore(), nullptr);
+    ASSERT_SUCCESS(context.PreCommit());
+  }
+}
+
+TEST_F(RelationalRegressionTest, PartitionedGroupMergeKeepsKeysAndStates) {
+  constexpr int64_t kGroups = 4096;
+  constexpr int64_t kRepeats = 16;
+  for (const bool composite : {false, true}) {
+    std::vector<Row> previous;
+    for (const size_t workers : {size_t{1}, size_t{4}, size_t{4}}) {
+      std::atomic<size_t> active{1};
+      ScopedQueryParallelismBudget budget(&active, workers);
+      auto context = rs_->BeginContext();
+      relational_detail::ExecutionRuntime runtime;
+      context.set_execution_runtime(&runtime);
+      relational_detail::Relation input;
+      input.schema = Schema("merge_groups", {Column("g", ValueType::kInt64),
+                                             Column("h", ValueType::kVarChar),
+                                             Column("v", ValueType::kDouble)});
+      for (int64_t repeat = 0; repeat < kRepeats; ++repeat) {
+        for (int64_t key = 0; key < kGroups; ++key) {
+          input.AddRow(
+              Row({key == 0 ? Value() : Value(key),
+                   Value(key % 2 == 0 ? "even" : "odd"),
+                   key == 1 || repeat % 4 == 0 ? Value() : Value(0.25)}));
+        }
+      }
+      const auto aggregate = [](AggregationType type) {
+        return AggregateExpressionExp(type, ColumnValueExp("v"));
+      };
+      SelectStatement statement(
+          {NamedExpression("g", ColumnValueExp("g")),
+           NamedExpression("n", aggregate(AggregationType::kCount)),
+           NamedExpression("s", aggregate(AggregationType::kSum)),
+           NamedExpression("a", aggregate(AggregationType::kAvg)),
+           NamedExpression("lo", aggregate(AggregationType::kMin)),
+           NamedExpression("hi", aggregate(AggregationType::kMax)),
+           NamedExpression(
+               "d", std::make_shared<AggregateExpression>(
+                        AggregationType::kCount, ColumnValueExp("v"), true))},
+          {}, nullptr);
+      statement.SetGroupBy(composite
+                               ? std::vector<Expression>{ColumnValueExp("g"),
+                                                         ColumnValueExp("h")}
+                               : std::vector<Expression>{ColumnValueExp("g")});
+      // An outer scope keeps this test on the generic grouped Project path.
+      const Row outer_row;
+      const Schema outer_schema;
+      const relational_detail::Scope outer{.row = &outer_row,
+                                           .schema = &outer_schema};
+      ASSIGN_OR_ASSERT_FAIL(
+          relational_detail::Relation, output,
+          relational_detail::FinishQuery(context, statement, std::move(input),
+                                         &outer, {}, false));
+      ASSERT_EQ(output.rows.size(), static_cast<size_t>(kGroups));
+      EXPECT_EQ(runtime.partitioned_aggregate_merges, workers == 1 ? 0U : 1U);
+      for (const auto& row : output.rows) {
+        const bool all_null = row[0] == Value(1);
+        EXPECT_EQ(row[1], Value(all_null ? 0 : 12));
+        EXPECT_EQ(row[2], all_null ? Value() : Value(3.0));
+        for (size_t column = 3; column < 6; ++column) {
+          EXPECT_EQ(row[column], all_null ? Value() : Value(0.25));
+        }
+        EXPECT_EQ(row[6], Value(all_null ? 0 : 1));
+      }
+      if (workers == 4) {
+        if (!previous.empty()) {
+          EXPECT_EQ(previous, output.rows);
+        }
+        previous = output.rows;
+      }
+      context.set_execution_runtime(nullptr);
+      context.Abort();
+    }
+  }
+}
+
+TEST_F(RelationalRegressionTest,
+       GroupingSetsReleaseBuildReservationBeforeEmit) {
+  auto context = rs_->BeginContext();
+  relational_detail::ExecutionRuntime runtime;
+  context.set_execution_runtime(&runtime);
+  relational_detail::Relation input;
+  input.schema = Schema("group_budget", {Column("g", ValueType::kInt64),
+                                         Column("h", ValueType::kInt64)});
+  constexpr size_t kRows = 32768;
+  for (size_t i = 0; i < kRows; ++i) {
+    input.rows.emplace_back(
+        Row({Value(static_cast<int64_t>(i % 8192)), Value(1)}));
+  }
+  const auto count =
+      AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("h"));
+  SelectStatement fine(
+      {NamedExpression("g", ColumnValueExp("g")), NamedExpression("n", count)},
+      {}, nullptr);
+  fine.SetGroupBy({ColumnValueExp("g"), ColumnValueExp("h")});
+  SelectStatement coarse = fine;
+  coarse.SetGroupBy({ColumnValueExp("g")});
+  SelectStatement total({NamedExpression("g", ConstantValueExp(Value())),
+                         NamedExpression("n", count)},
+                        {}, nullptr);
+  total.SetGroupAll(true);
+  const std::vector<const SelectStatement*> sets{&fine, &coarse, &total};
+  const size_t per_row =
+      (3 * sizeof(size_t)) + (size_t{3} * (128 + 64)) + (6 * sizeof(Value));
+  const size_t build_bound = (kRows + 4096) * per_row;
+  struct RestoreBudget {
+    RestoreBudget() = default;
+    RestoreBudget(const RestoreBudget&) = delete;
+    RestoreBudget& operator=(const RestoreBudget&) = delete;
+    RestoreBudget(RestoreBudget&&) = delete;
+    RestoreBudget& operator=(RestoreBudget&&) = delete;
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  // The initial worst-case reservation fits, but leaves no room for output.
+  QueryMemoryBudget::Global().ResetForTest(((build_bound + 4096) * 5 / 4) + 8);
+  std::atomic<size_t> active{1};
+  ScopedQueryParallelismBudget budget(&active, 1);
+  ASSIGN_OR_ASSERT_FAIL(
+      std::optional<std::vector<relational_detail::Relation>>, result,
+      relational_detail::TryCompactGroupingSets(context, sets, input));
+  if (!result) {
+    FAIL() << "expected specialized aggregation";
+  }
+  ASSERT_EQ(result->size(), 3U);
+  EXPECT_EQ((*result)[0].TotalRows(), 8192U);
+  EXPECT_EQ((*result)[1].TotalRows(), 8192U);
+  EXPECT_EQ((*result)[2].TotalRows(), 1U);
+  for (const auto& relation : *result) {
+    EXPECT_FALSE(relation.HasSpill());
+  }
+  EXPECT_EQ(runtime.relation_spills, 0U);
+  EXPECT_EQ((*result)[2].rows[0][1], Value(static_cast<int64_t>(kRows)));
+  result.reset();
+  context.set_execution_runtime(nullptr);
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, GroupingSetsBudgetUsesPromotedSlimState) {
+  auto context = rs_->BeginContext();
+  relational_detail::ExecutionRuntime runtime;
+  context.set_execution_runtime(&runtime);
+  relational_detail::Relation input;
+  input.schema = Schema("group_budget", {Column("g", ValueType::kInt64),
+                                         Column("h", ValueType::kInt64),
+                                         Column("v", ValueType::kDouble)});
+  constexpr size_t kRows = 32768;
+  for (size_t i = 0; i < kRows; ++i) {
+    input.rows.emplace_back(
+        Row({Value(static_cast<int64_t>(i % 8192)), Value(1), Value(1.0)}));
+  }
+  const auto count = AggregateExpressionExp(
+      AggregationType::kSum,
+      FunctionCallExp("coalesce",
+                      {ColumnValueExp("v"), ConstantValueExp(Value(0))}));
+  SelectStatement fine(
+      {NamedExpression("g", ColumnValueExp("g")), NamedExpression("n", count)},
+      {}, nullptr);
+  fine.SetGroupBy({ColumnValueExp("g"), ColumnValueExp("h")});
+  SelectStatement coarse = fine;
+  coarse.SetGroupBy({ColumnValueExp("g")});
+  SelectStatement total({NamedExpression("g", ConstantValueExp(Value())),
+                         NamedExpression("n", count)},
+                        {}, nullptr);
+  total.SetGroupAll(true);
+  const std::vector<const SelectStatement*> sets{&fine, &coarse, &total};
+  const size_t per_row =
+      (3 * sizeof(size_t)) + (size_t{3} * (128 + 64)) + (6 * sizeof(Value));
+  const size_t build_bound = (kRows + 4096) * per_row;
+  struct RestoreBudget {
+    RestoreBudget() = default;
+    RestoreBudget(const RestoreBudget&) = delete;
+    RestoreBudget& operator=(const RestoreBudget&) = delete;
+    RestoreBudget(RestoreBudget&&) = delete;
+    RestoreBudget& operator=(RestoreBudget&&) = delete;
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  // The initial worst-case reservation fits, but leaves no room for output.
+  QueryMemoryBudget::Global().ResetForTest(((build_bound + 4096) * 5 / 4) + 8);
+  std::atomic<size_t> active{1};
+  ScopedQueryParallelismBudget budget(&active, 1);
+  ASSIGN_OR_ASSERT_FAIL(
+      std::optional<std::vector<relational_detail::Relation>>, result,
+      relational_detail::TryCompactGroupingSets(context, sets, input));
+  if (!result) {
+    FAIL() << "expected specialized aggregation";
+  }
+  ASSERT_EQ(result->size(), 3U);
+  EXPECT_EQ((*result)[0].TotalRows(), 8192U);
+  EXPECT_EQ((*result)[1].TotalRows(), 8192U);
+  EXPECT_EQ((*result)[2].TotalRows(), 1U);
+  for (const auto& relation : *result) {
+    EXPECT_FALSE(relation.HasSpill());
+  }
+  EXPECT_EQ(runtime.relation_spills, 0U);
+  EXPECT_EQ((*result)[2].rows[0][1], Value(static_cast<double>(kRows)));
+  result.reset();
+  context.set_execution_runtime(nullptr);
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, ParallelResidualProbePadsOnlyRejectedMatches) {
+  auto context = rs_->BeginContext();
+  constexpr size_t kRepeats = 8192;
+  for (const bool text : {false, true}) {
+    const auto key = [text](int value) {
+      return text ? Value(std::to_string(value)) : Value(value);
+    };
+    for (const auto kind : {JoinType::kInner, JoinType::kLeft, JoinType::kRight,
+                            JoinType::kFull}) {
+      for (const size_t workers : {size_t{1}, size_t{4}}) {
+        relational_detail::Relation left, right;
+        const auto key_type = text ? ValueType::kVarChar : ValueType::kInt64;
+        left.schema = Schema(
+            "l", {Column("lk", key_type), Column("lv", ValueType::kInt64)});
+        right.schema = Schema(
+            "r", {Column("rk", key_type), Column("rv", ValueType::kInt64)});
+        for (size_t i = 0; i < kRepeats; ++i) {
+          left.rows.emplace_back(Row({key(1), Value(3)}));
+          left.rows.emplace_back(Row({key(1), Value(7)}));
+          left.rows.emplace_back(Row({Value(), Value(0)}));
+          left.rows.emplace_back(Row({key(3), Value(0)}));
+        }
+        right.rows = {Row({key(1), Value(5)}), Row({key(1), Value(9)}),
+                      Row({key(1), Value()}), Row({Value(), Value(0)}),
+                      Row({key(4), Value(0)})};
+        SelectSource source;
+        source.join_type = kind;
+        source.join_condition = BinaryExpressionExp(
+            BinaryExpressionExp(ColumnValueExp("lk"), BinaryOperation::kEquals,
+                                ColumnValueExp("rk")),
+            BinaryOperation::kAnd,
+            BinaryExpressionExp(ColumnValueExp("lv"),
+                                BinaryOperation::kGreaterThan,
+                                ColumnValueExp("rv")));
+        std::atomic<size_t> active{1};
+        ScopedQueryParallelismBudget budget(&active, workers);
+        ASSIGN_OR_ASSERT_FAIL(
+            relational_detail::Relation, result,
+            relational_detail::Join(context, std::move(left), std::move(right),
+                                    source, nullptr, {}));
+        const size_t left_unmatched =
+            kind == JoinType::kLeft || kind == JoinType::kFull ? kRepeats * 3
+                                                               : 0;
+        const size_t right_unmatched =
+            kind == JoinType::kRight || kind == JoinType::kFull ? 4 : 0;
+        EXPECT_EQ(result.TotalRows(),
+                  kRepeats + left_unmatched + right_unmatched);
+        size_t accepted = 0, padded_left = 0, padded_right = 0;
+        ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
+          if (row[1].IsNull()) {
+            ++padded_left;
+          } else if (row[2].IsNull() && row[3].IsNull()) {
+            ++padded_right;
+          } else {
+            EXPECT_EQ(row[1], Value(7));
+            EXPECT_EQ(row[3], Value(5));
+            ++accepted;
+          }
+        }));
+        EXPECT_EQ(accepted, kRepeats);
+        EXPECT_EQ(padded_left, right_unmatched);
+        EXPECT_EQ(padded_right, left_unmatched);
+      }
+    }
+  }
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest,
+       ParallelResidualPreservesShortCircuitAndErrors) {
+  auto context = rs_->BeginContext();
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    for (const bool reject_first : {false, true}) {
+      relational_detail::Relation left, right;
+      left.schema = Schema("l", {Column("lk", ValueType::kInt64),
+                                 Column("lv", ValueType::kDouble)});
+      right.schema = Schema("r", {Column("rk", ValueType::kInt64),
+                                  Column("rv", ValueType::kDouble)});
+      left.rows.assign(32768, Row({Value(1), Value(1.0)}));
+      right.rows.emplace_back(Row({Value(1), Value(0.0)}));
+      auto residual = BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("lv"), BinaryOperation::kDivide,
+                              ColumnValueExp("rv")),
+          BinaryOperation::kGreaterThan, ConstantValueExp(Value(0.0)));
+      if (reject_first) {
+        residual =
+            BinaryExpressionExp(BinaryExpressionExp(ColumnValueExp("lv"),
+                                                    BinaryOperation::kLessThan,
+                                                    ColumnValueExp("rv")),
+                                BinaryOperation::kAnd, residual);
+      }
+      SelectSource source;
+      source.join_type = JoinType::kLeft;
+      source.join_condition = BinaryExpressionExp(
+          BinaryExpressionExp(ColumnValueExp("lk"), BinaryOperation::kEquals,
+                              ColumnValueExp("rk")),
+          BinaryOperation::kAnd, residual);
+      auto output = relational_detail::Join(
+          context, std::move(left), std::move(right), source, nullptr, {});
+      if (reject_first) {
+        ASSERT_TRUE(output.HasValue()) << output.GetStatus();
+        ASSERT_EQ(output.Value().TotalRows(), 32768U);
+        for (const auto& row : output.Value().rows) {
+          EXPECT_TRUE(row[2].IsNull());
+          EXPECT_TRUE(row[3].IsNull());
+        }
+      } else {
+        EXPECT_FALSE(output.HasValue());
+      }
+    }
+  }
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, CompactPartitionPreservesFloatOrderAndHaving) {
+  auto context = rs_->BeginContext();
+  std::vector<Row> reference;
+  for (const size_t workers : {size_t{1}, size_t{4}}) {
+    std::atomic<size_t> active{1};
+    ScopedQueryParallelismBudget budget(&active, workers);
+    relational_detail::ExecutionRuntime runtime;
+    context.set_execution_runtime(&runtime);
+    relational_detail::Relation input;
+    input.schema = Schema("compact", {Column("k", ValueType::kVarChar),
+                                      Column("v", ValueType::kDouble)});
+    for (size_t i = 0; i < 65536; ++i) {
+      const size_t key = i % 4096;
+      const size_t cycle = (i / 4096) % 4;
+      const double value = cycle == 0   ? 1e16
+                           : cycle == 1 ? 1.0
+                           : cycle == 2 ? -1e16
+                                        : 0.25;
+      input.rows.emplace_back(
+          Row({key == 1 ? Value() : Value("key" + std::to_string(key)),
+               key == 0 ? Value() : Value(value)}));
+    }
+    const auto sum =
+        AggregateExpressionExp(AggregationType::kSum, ColumnValueExp("v"));
+    const auto count =
+        AggregateExpressionExp(AggregationType::kCount, ColumnValueExp("v"));
+    SelectStatement statement(
+        {NamedExpression("k", ColumnValueExp("k")), NamedExpression("s", sum),
+         NamedExpression("n", count)},
+        {}, nullptr);
+    statement.SetGroupBy({ColumnValueExp("k")});
+    statement.SetHaving(BinaryExpressionExp(
+        count, BinaryOperation::kGreaterThan, ConstantValueExp(Value(0))));
+    const std::vector<const AggregateExpression*> aggregates{
+        &sum->AsAggregateExpression(), &count->AsAggregateExpression()};
+    ASSIGN_OR_ASSERT_FAIL(std::optional<relational_detail::Relation>, result,
+                          relational_detail::TryCompactRelationAggregate(
+                              context, statement, input, aggregates));
+    if (!result) {
+      FAIL() << "expected specialized aggregation";
+    }
+    ASSERT_EQ(result->TotalRows(), 4095U);
+    EXPECT_EQ(result->schema.GetColumn(1).Type(), ValueType::kDouble);
+    EXPECT_EQ(runtime.typed_parallel_aggregations, workers == 1 ? 0U : 1U);
+    for (const auto& row : result->rows) {
+      EXPECT_EQ(row[1], Value(0.25));
+      EXPECT_EQ(row[2], Value(16));
+    }
+    if (workers == 1) {
+      reference = result->rows;
+    } else {
+      EXPECT_EQ(result->rows, reference);
+    }
+    context.set_execution_runtime(nullptr);
+  }
+  context.Abort();
 }
 
 }  // namespace tinylamb

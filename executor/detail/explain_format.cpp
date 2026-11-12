@@ -1125,51 +1125,14 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
     // is projected (COUNT(*) is the simplest counterexample), so eliminating
     // such a join without a proven key/foreign-key relationship changes the
     // result.
-    const bool can_eliminate = !projected_aliases.empty();
+    [[maybe_unused]] const bool can_eliminate = !projected_aliases.empty();
 
-    // Star-join JoinElimination: when all projected columns belong to a
-    // single source and the remaining inner joins are to unreferenced
-    // tables, eliminate those joins.  The relational engine emits a
-    // JoinElimination annotation so compliance tests can verify the
-    // optimizer recognizes the pattern.
-    size_t eliminated_dimensions = 0;
-    if (can_eliminate && !has_ordered_join && nodes.size() > 1) {
-      // Determine which source index owns each projected alias.
-      std::unordered_map<std::string, size_t> alias_to_source;
-      for (size_t i = 0; i < statement.Sources().size(); ++i) {
-        const SelectSource& src = statement.Sources()[i];
-        const std::string& alias = src.alias.empty() ? src.table : src.alias;
-        alias_to_source[alias] = i;
-      }
-      // Find the set of source indices that are projected.
-      std::unordered_set<size_t> projected_sources;
-      for (const auto& alias : projected_aliases) {
-        auto it = alias_to_source.find(alias);
-        if (it != alias_to_source.end()) {
-          projected_sources.insert(it->second);
-        }
-      }
-      // If all projected columns come from a single source, the other
-      // inner joins (whose tables are not referenced in WHERE either)
-      // can be eliminated.
-      if (projected_sources.size() == 1) {
-        const size_t kept =
-            projected_sources.empty() ? 0 : *projected_sources.begin();
-        for (size_t i = 0; i < statement.Sources().size(); ++i) {
-          if (i == kept) {
-            continue;
-          }
-          const SelectSource& src = statement.Sources()[i];
-          if (src.join_type == JoinType::kInner) {
-            const std::string& alias =
-                src.alias.empty() ? src.table : src.alias;
-            if (!projected_aliases.contains(alias)) {
-              ++eliminated_dimensions;
-            }
-          }
-        }
-      }
-    }
+    // The relational executor never removes an INNER join (that would need
+    // a proven foreign-key / unique-key relationship: an unmatched or
+    // duplicated dimension row changes the result), so its estimate must not
+    // claim such an elimination either. Plans produced by the Cascades core
+    // carry their own JoinElimination annotation (SqlEngine EXPLAIN).
+    const size_t eliminated_dimensions = 0;
     if (eliminated_dimensions > 0) {
       output << pad << "JoinElimination dimensions=" << eliminated_dimensions
              << '\n';
@@ -1181,19 +1144,9 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       plan = std::move(nodes.front());
       for (size_t i = 1; i < nodes.size(); ++i) {
         const SelectSource& source = statement.Sources()[i];
-        // Join elimination: for LEFT JOINs where the right side's table
-        // is not referenced in SELECT or WHERE, the join can be removed
-        // (all NULL-padded rows would be filtered anyway).
-        // NOTE: INNER JOINs must NOT be eliminated even if the right side
-        // is not projected — the join still filters rows.
-        if (can_eliminate) {
-          const std::string& right_alias =
-              source.alias.empty() ? source.table : source.alias;
-          if (source.join_type == JoinType::kLeft &&
-              !projected_aliases.contains(right_alias)) {
-            continue;
-          }
-        }
+        // The relational executor runs every LEFT JOIN as written; the
+        // estimate must not drop one (removal is only sound with a proven
+        // unique right-side key, and is a Cascades rewrite, not this path).
         std::vector<Expression> predicates =
             SplitConjuncts(source.join_condition);
         const char* kind = "cross";
@@ -1844,7 +1797,10 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
           };
           return trivial_agg(item.expression);
         });
-    if (all_trivial_aggs && !statement.GroupBy().empty()) {
+    // Only a single base table makes "one row per unique key" true; with a
+    // join, MIN(s.y) per t.id still folds several joined rows.
+    if (all_trivial_aggs && !statement.GroupBy().empty() &&
+        statement.Sources().size() == 1) {
       // Check if all GROUP BY keys are the primary key column(s).
       // Use the first source table's schema to check for PK constraint.
       if (!statement.Sources().empty()) {
@@ -1869,9 +1825,10 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
                     // Match with or without table prefix.
                     const std::string col0_name =
                         table_schema.GetColumn(0).Name().name;
-                    return cname.name == col0_name ||
-                           cname.name == (src.table + "." + col0_name) ||
-                           cname.name == (src.alias + "." + col0_name);
+                    // ColumnName keeps the qualifier in `schema`.
+                    return cname.name == col0_name &&
+                           (cname.schema.empty() || cname.schema == src.table ||
+                            cname.schema == src.alias);
                   });
             }
           }

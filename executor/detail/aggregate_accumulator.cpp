@@ -317,7 +317,8 @@ Status AggregateAccumulator::TryApplyCore(
                                        value.value.int_value))
                                  : static_cast<__int128>(value.value.int_value);
           const __int128 next = prior + input;
-          if (next < 0 || next > std::numeric_limits<uint64_t>::max()) {
+          constexpr __int128 max_uint64 = std::numeric_limits<uint64_t>::max();
+          if (next < 0 || next > max_uint64) {
             return StatusError(StatusCode::kIsInfinity,
                                "uint64 overflow in SUM");
           }
@@ -618,7 +619,21 @@ Status AggregateAccumulator::TryElementwiseApply(const Value& arr) {
       ew_saw_double_[i] = true;
       ew_double_sum_[i] += element.value.double_value;
     } else {
-      ew_int_sum_[i] += element.value.int_value;
+      // GoogleSQL SUM raises on INT64 overflow rather than wrapping; keep
+      // ELEMENTWISE_SUM on the same contract. AVG (and SUM lanes already
+      // widened to DOUBLE) finish in double, so spill the addend there.
+      int64_t updated = 0;
+      if (__builtin_add_overflow(ew_int_sum_[i], element.value.int_value,
+                                 &updated)) {
+        if (expression->GetType() == AggregationType::kElementwiseSum &&
+            !ew_saw_double_[i]) {
+          return StatusError(StatusCode::kIsInfinity,
+                             "integer overflow in ELEMENTWISE_SUM");
+        }
+        ew_double_sum_[i] += static_cast<double>(element.value.int_value);
+      } else {
+        ew_int_sum_[i] = updated;
+      }
     }
   }
 
@@ -1329,7 +1344,8 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
                                  ? static_cast<__int128>(other.uint_total)
                                  : other.int_total;
       const __int128 next = left + right;
-      if (next < 0 || next > std::numeric_limits<uint64_t>::max()) {
+      constexpr __int128 max_uint64 = std::numeric_limits<uint64_t>::max();
+      if (next < 0 || next > max_uint64) {
         return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
       }
       sum_is_uint64 = true;
@@ -1468,7 +1484,7 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
                            {
                              const int c = CompareForOrderBy(a, b);
                              if (c == 0) {
-                               return false;
+                               continue;  // Tie: the next ORDER BY key decides.
                              }
                              const bool a_less = c < 0;
                              return term.ascending ? a_less : !a_less;

@@ -361,6 +361,11 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
     case TypeTag::kCaseExp:
     case TypeTag::kInExp:
     case TypeTag::kFunctionCallExp:
+    // CAST(a AS ...) and ARRAY[a, ...] wrap ordinary column references; an
+    // ambiguous or missing name inside them must be diagnosed here too
+    // instead of binding to the first matching column at run time.
+    case TypeTag::kCastExp:
+    case TypeTag::kArrayExp:
       break;
     case TypeTag::kAggregateExp: {
       Expression child = exp->AsAggregateExpression().Child();

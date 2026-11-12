@@ -1,0 +1,275 @@
+-- tinylamb-session-test v1
+-- seed: 14659168830181371313
+-- stmt: CREATE TABLE tbl0 (u INT64, c1 VARCHAR(8), c2 DOUBLE);
+-- stmt: INSERT INTO tbl0 VALUES (0, 'a', 0.5);
+-- stmt: INSERT INTO tbl0 VALUES (1, NULL, -2.5);
+-- stmt: INSERT INTO tbl0 VALUES (2, 'a', 1.5);
+-- stmt: INSERT INTO tbl0 VALUES (3, 'a', 1.0);
+-- ddl: CREATE INDEX idx_dual_tbl0 ON tbl0 KEY(1)
+-- stmt: CREATE TABLE tbl1 (u INT64, c1 DOUBLE, c2 INT64, c3 VARCHAR(8));
+-- stmt: INSERT INTO tbl1 VALUES (0, 1.0, 2, 'a');
+-- stmt: INSERT INTO tbl1 VALUES (1, 3.0, -2, 'a');
+-- stmt: INSERT INTO tbl1 VALUES (2, NULL, 2, 'a');
+-- stmt: INSERT INTO tbl1 VALUES (3, 1.0, -3, 'a');
+-- ddl: CREATE INDEX idx_dual_tbl1 ON tbl1 KEY(1)
+-- commit
+-- begin2
+-- stmt: INSERT INTO tbl0 VALUES (4, 'a', 1.5);
+-- stmt: UPDATE tbl0 SET c1 = (CASE WHEN ((c1 = 'a') AND (c2 >= 1.0)) THEN c1 ELSE 'bb' END) WHERE tbl0.u = 1;
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- check: tbl0
+-- checksql: SELECT c1 FROM tbl0 WHERE c1 = 'bb';
+-- expect: ["bb"]
+-- stmt2: INSERT INTO tbl1 VALUES (4, -3.0, -2, 'bb');
+-- commit
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- check: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, -2, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- checkpoint
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, -2, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- check2: tbl1
+-- checksql2: SELECT * FROM tbl1 WHERE c1 < 0.5;
+-- expect: [4, -3, -2, "bb"]
+-- stmt: INSERT INTO tbl0 VALUES (5, 'a', -2.5);
+-- stmt2: UPDATE tbl1 SET c2 = 3 WHERE tbl1.u = 1;
+-- stmt2: INSERT INTO tbl0 VALUES (6, 'a', 0.5);
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [5, "a", -2.5]
+-- check: tbl0
+-- checksql: SELECT * FROM tbl0 WHERE c1 = 'a';
+-- expect: [0, "a", 0.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [5, "a", -2.5]
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, NULL, -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [6, "a", 0.5]
+-- check2: tbl0
+-- checksql2: SELECT DISTINCT c1 FROM tbl0;
+-- expect: ["a"]
+-- expect: [NULL]
+-- commit2
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- stmt: DELETE FROM tbl1 WHERE tbl1.u = 1;
+-- stmt: DELETE FROM tbl1 WHERE tbl1.u = 2;
+-- fail2: DELETE FROM tbl1 WHERE tbl1.u = 1;
+-- abort2
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- stmt: INSERT INTO tbl1 VALUES (5, -0.5, 1, 'a');
+-- stmt2: INSERT INTO tbl1 VALUES (6, -3.0, NULL, 'a');
+-- fail2: DELETE FROM tbl0 WHERE tbl0.u = 2;
+-- abort
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- fail: UPDATE tbl1 SET c2 = (2 - u) WHERE tbl1.u = 1;
+-- commit2
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check: tbl0
+-- checksql: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl0;
+-- expect: ["a", "bb", 6]
+-- crash
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- stmt2: INSERT INTO tbl0 VALUES (7, 'a', NULL);
+-- crash
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- stmt: DELETE FROM tbl0 WHERE tbl0.u = 1;
+-- stmt2: INSERT INTO tbl0 VALUES (8, 'bb', -2.0);
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- expect: [8, "bb", -2]
+-- check2: tbl0
+-- checksql2: SELECT * FROM tbl0 WHERE c1 >= 'bb';
+-- expect: [1, "bb", -2.5]
+-- expect: [8, "bb", -2]
+-- check2: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- check2: tbl1
+-- checksql2: SELECT MIN(c1), MAX(c1), COUNT(c1) FROM tbl1;
+-- expect: [-3, 3, 5]
+-- fail2: UPDATE tbl0 SET c2 = c2 WHERE tbl0.u = 3;
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [1, "bb", -2.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- expect: [8, "bb", -2]
+-- check2: tbl0
+-- checksql2: SELECT DISTINCT c1 FROM tbl0;
+-- expect: ["a"]
+-- expect: ["bb"]
+-- stmt: INSERT INTO tbl0 VALUES (9, NULL, 2.0);
+-- stmt: INSERT INTO tbl1 VALUES (7, -1.0, NULL, NULL);
+-- commit
+-- check: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- expect: [9, NULL, 2]
+-- check: tbl1
+-- expect: [0, 1, 2, "a"]
+-- expect: [1, 3, 3, "a"]
+-- expect: [2, NULL, 2, "a"]
+-- expect: [3, 1, -3, "a"]
+-- expect: [4, -3, -2, "bb"]
+-- expect: [6, -3, NULL, "a"]
+-- expect: [7, -1, NULL, NULL]
+-- commit2
+-- check2: tbl0
+-- expect: [0, "a", 0.5]
+-- expect: [2, "a", 1.5]
+-- expect: [3, "a", 1]
+-- expect: [4, "a", 1.5]
+-- expect: [6, "a", 0.5]
+-- expect: [8, "bb", -2]
+-- expect: [9, NULL, 2]
+-- failure: auto-generated by sql_session_fuzzer | final state mismatch on tbl0 (txn 1) after step 42 | table tbl0: mirror has 7 rows, engine has 8 | expected: | [0, "a", 0.5] | [2, "a", 1.5] | [3, "a", 1] | [4, "a", 1.5] | [6, "a", 0.5] | [8, "bb", -2] | [9, NULL, 2] | actual: | [0, "a", 0.5] | [2, "a", 1.5] | [3, "a", 1] | [4, "a", 1.5] | [6, "a", 0.5] | [8, "bb", -2] | [8, "bb", -2] | [9, NULL, 2] | first diff at 6: expected [9, NULL, 2] vs actual [8, "bb", -2]

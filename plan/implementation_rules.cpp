@@ -2206,7 +2206,13 @@ std::vector<PlanAlternative> JoinAlternatives(
       // executor lowers to NestedLoopJoin.
       std::static_pointer_cast<ProductPlan>(product)->SetJoinNotes({},
                                                                    predicate);
-      if (kind == JoinAlternativeKind::kInner) {
+      // The nested-loop executor already filters every pair by the residual
+      // note; the Selection above re-evaluates the same predicate. That is
+      // only a cost for immutable predicates, but a volatile one (RAND())
+      // would be drawn twice per pair and keep a different row set than the
+      // AST reference, so it is evaluated by the join alone.
+      if (kind == JoinAlternativeKind::kInner &&
+          !ContainsVolatileCall(predicate)) {
         product = std::make_shared<SelectionPlan>(product, predicate,
                                                   product->GetStats());
       }
@@ -3297,7 +3303,8 @@ std::vector<PlanAlternative> BatchNestedLoopFor(
   }
   std::static_pointer_cast<ProductPlan>(join)->SetJoinNotes({}, predicate);
   std::static_pointer_cast<ProductPlan>(join)->PreferBatchNestedLoop();
-  if (wrap_selection) {
+  // See JoinAlternatives: never evaluate a volatile predicate twice.
+  if (wrap_selection && !ContainsVolatileCall(predicate)) {
     join = std::make_shared<SelectionPlan>(join, predicate, join->GetStats());
   }
   const auto estimated_rows = static_cast<double>(join->EmitRowCount());

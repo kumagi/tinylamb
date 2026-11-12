@@ -27,6 +27,8 @@ TEST(DiffOracleFuzzer, TqsBitmapAgreesAndRoundTrips) {
     EXPECT_EQ(parsed_seed, seed);
     EXPECT_EQ(parsed, trace);
   }
+  // Keep the generated regression trace deterministic.
+  // NOLINTNEXTLINE(cert-msc32-c,cert-msc51-cpp)
   std::mt19937 rng(3);
   DiffOracleTrace broken;
   ASSERT_EQ(RunTqsIteration(rng, false, nullptr, &broken), "");

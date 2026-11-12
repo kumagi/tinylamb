@@ -221,6 +221,9 @@ struct GroupedJoinFusionSpec {
   // Statement-level eligibility decided by the caller (no DISTINCT/
   // windows, mergeable aggregate kinds, no alias-resolution dependencies).
   bool eligible{false};
+  // Partial totals reused by parent grouping sets must have an exact integer
+  // proof from the actual joined inputs, not floating reassociation.
+  bool require_exact_integer_totals{false};
   // Set by BuildInput when the final join step actually fused.
   bool fired{false};
   // Optional post-HAVING filter over a projected SUM column.

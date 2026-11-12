@@ -3771,6 +3771,39 @@ TEST_F(QueryTest, SqlEngineMultiUseCteMaterializesOnceToCascades) {
   ctx.txn_.Abort();
 }
 
+TEST_F(QueryTest, LargeCteAvoidsDiscardedSpeculativeExecution) {
+  auto ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE cte_cost(k INT64, v INT64)");
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table,
+                        ctx.GetTable("cte_cost"));
+  for (int64_t i = 0; i < 2048; ++i) {
+    ASSERT_SUCCESS(
+        table->Insert(ctx.txn_, Row({Value(i), Value(i * 2)})).GetStatus());
+  }
+  ASSERT_SUCCESS(db_->RefreshStatistics(ctx, "cte_cost"));
+  SqlEngine engine(*db_);
+  for (const bool bounded : {false, true}) {
+    const std::string sql =
+        "WITH c AS (SELECT k, SUM(v) AS v FROM cte_cost GROUP BY k" +
+        std::string(bounded ? " ORDER BY k LIMIT 3" : "") +
+        ") SELECT x.k,x.v,y.v FROM c x JOIN c y ON x.k=y.k ORDER BY x.k";
+    ASSIGN_OR_ASSERT_FAIL(Executor, prepared, engine.Prepare(ctx, sql));
+    EXPECT_EQ(engine.LastCteMaterializationAttempts(), bounded ? 1U : 0U);
+    DataChunk chunk;
+    size_t count = 0;
+    while (prepared->NextBatch(&chunk) != 0) {
+      for (size_t r = 0; r < chunk.Size(); ++r) {
+        const auto row = chunk.RowAt(r);
+        const auto key = static_cast<int64_t>(count++);
+        EXPECT_EQ(row, Row({Value(key), Value(key * 2), Value(key * 2)}));
+      }
+    }
+    EXPECT_EQ(count, bounded ? 3U : 2048U);
+    ASSERT_SUCCESS(prepared->GetStatus());
+  }
+  ctx.Abort();
+}
+
 // M4 CTE predicate pushdown (TODO.md item 2a): the shared cell is narrowed
 // by the weakening over every reference site (here v >= min(20, 10) = 10);
 // each site keeps its own filter as the residual.

@@ -658,6 +658,16 @@ std::shared_ptr<SelectStatement> SubstituteInSelect(
   for (const NamedExpression& item : select.SelectList()) {
     items.emplace_back(item.name,
                        SubstituteParameters(item.expression, bindings));
+    // `* EXCEPT (...)` / `* REPLACE (...)` live beside the star expression;
+    // the 2-argument constructor drops them, which re-exposed excluded
+    // columns in TVF expansions.
+    if (item.star_modifiers) {
+      auto modifiers = std::make_shared<StarModifiers>(*item.star_modifiers);
+      for (StarReplaceItem& replace : modifiers->replace_items) {
+        replace.expression = SubstituteParameters(replace.expression, bindings);
+      }
+      items.back().star_modifiers = std::move(modifiers);
+    }
   }
   auto result = std::make_shared<SelectStatement>(
       std::move(items), select.FromClause(),
@@ -3085,6 +3095,24 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
                                         name);
     }
     parts = found->second;
+    // OVER (w ORDER BY ... ROWS ...) may only ADD clauses the base window
+    // lacks: GoogleSQL rejects PARTITION BY here, an ORDER BY when `w` has
+    // one, and any refinement of a window that already has a frame.
+    // Silently merging / replacing them changed the result.
+    if (spec.Child("PartitionBy") != nullptr) {
+      return AstError<NamedWindowParts>(
+          "GoogleSQL AST: PARTITION BY cannot refine named window " + name);
+    }
+    if (spec.Child("OrderBy") != nullptr && !parts.order_by.empty()) {
+      return AstError<NamedWindowParts>(
+          "GoogleSQL AST: ORDER BY cannot override named window " + name);
+    }
+    if (parts.has_frame && (spec.Child("OrderBy") != nullptr ||
+                            spec.Child("WindowFrame") != nullptr)) {
+      return AstError<NamedWindowParts>("GoogleSQL AST: named window " +
+                                        name + " with a frame cannot be "
+                                        "refined");
+    }
   }
   if (const GoogleSqlAstNode* partition = spec.Child("PartitionBy")) {
     for (const auto& child : partition->children) {
@@ -3108,9 +3136,25 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
                            ? WindowFrameUnit::kRange
                            : WindowFrameUnit::kRows;
     const auto bounds = frame->Children("WindowFrameExpr");
-    // GoogleSQL allows only `CURRENT ROW` as a single-bound frame; offset
-    // bounds require the full BETWEEN .. AND .. form (corpus row_number_3).
-    if (bounds.size() >= 2) {
+    // Single-bound frames (`ROWS UNBOUNDED PRECEDING`, `ROWS 3 PRECEDING`,
+    // `ROWS CURRENT ROW`) mean BETWEEN <bound> AND CURRENT ROW; a FOLLOWING
+    // start has no single-bound form. (Corpus row_number_3 rejects ROWS on
+    // ROW_NUMBER because ranking functions take no frame at all; see
+    // VisitAnalyticFunctionCall.)
+    if (bounds.size() == 1) {
+      parts.has_frame = true;
+      ASSIGN_OR_RETURN(WindowFrameBound, single_bound,
+                       (ParseFrameBound(*bounds[0])));
+      if (single_bound.type == WindowFrameBoundType::kOffsetFollowing ||
+          single_bound.type == WindowFrameBoundType::kUnboundedFollowing) {
+        return AstError<NamedWindowParts>(
+            "GoogleSQL AST: a single-bound window frame cannot start with "
+            "FOLLOWING");
+      }
+      parts.frame_start = std::move(single_bound);
+      parts.frame_end =
+          WindowFrameBound{.type = WindowFrameBoundType::kCurrentRow};
+    } else if (bounds.size() >= 2) {
       parts.has_frame = true;
       ASSIGN_OR_RETURN(WindowFrameBound, h_tmp_2564,
                        (ParseFrameBound(*bounds[0])));
@@ -3118,17 +3162,9 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
       ASSIGN_OR_RETURN(WindowFrameBound, h_tmp_2565,
                        (ParseFrameBound(*bounds[1])));
       parts.frame_end = std::move(h_tmp_2565);
-    } else if (bounds.size() == 1 &&
-               UpperCopy(bounds[0]->detail).find("CURRENT ROW") !=
-                   std::string::npos) {
-      parts.has_frame = true;
-      ASSIGN_OR_RETURN(WindowFrameBound, h_tmp_2570,
-                       (ParseFrameBound(*bounds[0])));
-      parts.frame_start = std::move(h_tmp_2570);
-      parts.frame_end = parts.frame_start;
     } else {
       return AstError<NamedWindowParts>(
-          "GoogleSQL AST: window frame requires BETWEEN x AND y");
+          "GoogleSQL AST: window frame has no bounds");
     }
   }
   return parts;
@@ -3235,6 +3271,17 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
       window->frame_start = parts.frame_start;
       window->frame_end = parts.frame_end;
       window->has_frame = parts.has_frame;
+    }
+  }
+  // Numbering and navigation functions take no window frame.
+  if (window->has_frame) {
+    const std::string fn = UpperCopy(window->function);
+    if (fn == "ROW_NUMBER" || fn == "RANK" || fn == "DENSE_RANK" ||
+        fn == "PERCENT_RANK" || fn == "CUME_DIST" || fn == "NTILE" ||
+        fn == "LAG" || fn == "LEAD") {
+      return AstError<Expression>(
+          "Window framing clause is not allowed for analytic function " +
+          Lower(fn));
     }
   }
   return window;
@@ -3588,7 +3635,11 @@ StatusOr<Expression> VisitExpression(
         return substituted;
       }
     }
-    if (path_name.find('.') == std::string::npos) {
+    // Qualified constant names (CREATE CONSTANT pkg.k AS 5) resolve through
+    // the same typed expression registry as unqualified ones; only the
+    // legacy string registry below stringified them ('5', or '' for a
+    // per-reference subquery constant).
+    {
       const auto& constants = SessionConstantExpressions();
       const auto found = constants.find(Lower(path_name));
       if (found != constants.end()) {
@@ -3953,11 +4004,20 @@ StatusOr<Expression> VisitExpression(
       return UnaryExpressionExp(std::move(unk_e), UnaryOperation::kIsNotNull);
     }
     ASSIGN_OR_RETURN(Expression, not_e, (VisitExpression(*node.children[0])));
+    // Unary plus is the identity on its numeric operand; it must not fall
+    // into the unary-minus default below.
+    if (node.detail == "+") {
+      return not_e;
+    }
     UnaryOperation op = UnaryOperation::kMinus;
     if (node.detail == "NOT") {
       op = UnaryOperation::kNot;
     } else if (node.detail == "~") {
       op = UnaryOperation::kBitwiseNot;
+    } else if (!node.detail.empty() && node.detail != "-") {
+      return StatusError(StatusCode::kNotImplemented,
+                         "GoogleSQL AST: unsupported unary operator " +
+                             std::string(node.detail));
     }
     return UnaryExpressionExp(std::move(not_e), op);
   }
@@ -4146,6 +4206,24 @@ StatusOr<Expression> VisitExpression(
     }
     if (operands.size() != 3) {
       return AstError<Expression>("GoogleSQL AST: BETWEEN arity");
+    }
+    // GoogleSQL evaluates X only once. The `X >= lo AND X <= hi` expansion
+    // below duplicates X, which changes the result when X is volatile
+    // (RAND() BETWEEN 0.3 AND 0.4 drew twice); route that case through
+    // __between(X, lo, hi), which evaluates each operand exactly once.
+    {
+      ASSIGN_OR_RETURN(Expression, probe, (VisitExpression(*operands[0])));
+      if (ContainsVolatileCall(probe)) {
+        ASSIGN_OR_RETURN(Expression, lo, (VisitExpression(*operands[1])));
+        ASSIGN_OR_RETURN(Expression, hi, (VisitExpression(*operands[2])));
+        Expression between = FunctionCallExp(
+            "__between", {std::move(probe), std::move(lo), std::move(hi)});
+        if (node.detail == "NOT BETWEEN") {
+          between =
+              UnaryExpressionExp(std::move(between), UnaryOperation::kNot);
+        }
+        return between;
+      }
     }
     ASSIGN_OR_RETURN(Expression, hv124406_0, (VisitExpression(*operands[1])));
     ASSIGN_OR_RETURN(Expression, hv124406_1, (VisitExpression(*operands[0])));
@@ -6978,19 +7056,31 @@ StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
       }
       return std::nullopt;
     }
-    if (auto folded_or = VisitExpression(node); folded_or.HasValue()) {
-      Expression folded = folded_or.MoveValue();
-      if (folded && folded->Type() == TypeTag::kConstantValue) {
-        const Value constant = folded->AsConstantValue().GetValue();
-        if (constant.type == ValueType::kInt64 && !constant.IsNull()) {
-          return constant.value.int_value;
-        }
-      }
+    // An expression operand (LIMIT 1+2, LIMIT CAST(x AS INT64)) is folded as
+    // a whole. Never fall back to the first integer literal found among its
+    // children: that turned LIMIT 1+2 into LIMIT 1.
+    auto folded_or = VisitExpression(node);
+    if (!folded_or.HasValue()) {
+      return std::nullopt;
     }
-    for (const auto& sub : node.children) {
-      if (auto found = fold_int(*sub)) {
-        return found;
+    Expression folded = folded_or.MoveValue();
+    if (!folded) {
+      return std::nullopt;
+    }
+    Value constant;
+    if (folded->Type() == TypeTag::kConstantValue) {
+      constant = folded->AsConstantValue().GetValue();
+    } else if (folded->TouchedColumns().empty()) {
+      StatusOr<Value> evaluated = folded->TryEvaluate(Row(), Schema());
+      if (!evaluated.HasValue()) {
+        return std::nullopt;
       }
+      constant = evaluated.MoveValue();
+    } else {
+      return std::nullopt;
+    }
+    if (constant.type == ValueType::kInt64 && !constant.IsNull()) {
+      return constant.value.int_value;
     }
     return std::nullopt;
   };

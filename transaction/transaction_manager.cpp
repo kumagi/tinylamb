@@ -496,13 +496,32 @@ Status TransactionManager::PreCommit(Transaction& txn,
       }
     }
     if (append_failed) {
-      if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
-        page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
+      // Same exception discipline as Abort(): the undo replay can throw
+      // (e.g. std::bad_alloc while restoring an image), and PreCommit's
+      // callers only understand a Status. Finish the cleanup regardless.
+      try {
+        if (page_manager_ != nullptr && !txn.staged_records_.empty()) {
+          page_manager_->ApplyTransactionAbort(txn.ID(), txn.staged_records_);
+        }
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "commit-failure undo threw for transaction " << txn.ID()
+                   << ": " << error.what();
+        if (page_manager_ != nullptr) {
+          fail_stop_.store(true, std::memory_order_release);
+        }
       }
       txn.staged_records_.clear();
       RemoveWaitForEdgesOf(txn.ID());
-      AbortVersions(txn);
-      ForgetTransaction(txn);
+      try {
+        AbortVersions(txn);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // Logged/fail-stopped above when it matters; keep releasing state.
+      }
+      try {
+        ForgetTransaction(txn);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // The destructor's FinishRunningNoexcept retries the release.
+      }
       return append_status;
     }
     try {
@@ -2671,11 +2690,12 @@ void TransactionManager::GarbageCollectVersions() {
       total_chains <= kGcFullScanChainLimit
           ? kVersionShardCount
           : std::max(kVersionShardCount / kGcPassDivisor, size_t{1});
-  const size_t begin_shard = gc_cursor_;
+  const size_t begin_shard =
+      gc_cursor_.fetch_add(shards_this_pass, std::memory_order_relaxed) %
+      kVersionShardCount;
   for (size_t i = 0; i < shards_this_pass; ++i) {
     collect_shard(version_shards_[(begin_shard + i) % kVersionShardCount]);
   }
-  gc_cursor_ = (begin_shard + shards_this_pass) % kVersionShardCount;
   MaybeWarnGcPin(oldest_snapshot, oldest_snapshot_txn, total_chains);
 }
 

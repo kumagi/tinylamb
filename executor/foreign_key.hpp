@@ -56,8 +56,9 @@ bool IsForeignKeyViolation(const ForeignKeyCounts& counts, const Value& key);
 // True when a non-null parent key is still referenced by a row of the child
 // table.  `ignore` holds positions already removed by the running statement
 // (NO ACTION is statement-end semantics: rows the statement itself deletes
-// do not keep the parent alive).
-bool IsParentKeyReferenced(Table& child, Transaction& txn, size_t child_offset,
+// do not keep the parent alive).  A failed child scan is an error, never a
+// "not referenced" verdict.
+StatusOr<bool> IsParentKeyReferenced(Table& child, Transaction& txn, size_t child_offset,
                            const Value& parent_key,
                            const std::vector<RowPosition>& ignore);
 

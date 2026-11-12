@@ -2520,9 +2520,10 @@ TEST_F(SkipScanDistinctTest, UniqueIndexNullKeysDecodeAsMultiValue) {
                         ConstantValueExp(Value(true)), table.GetSchema(), 0);
   const std::vector<Row> out = Drain(&scan);
   EXPECT_EQ(scan.GetStatus(), Status::kSuccess);
-  // DISTINCT sees keys {NULL, 1, 2}; how many rows the two NULL entries
-  // decode into depends on the multi-value list layout, but the non-NULL
-  // keys must appear exactly once each.
+  // DISTINCT sees keys {NULL, 1, 2}: whatever the multi-value list layout,
+  // the two NULL entries collapse into one row (DISTINCT treats NULLs as
+  // one value, like distinct_test's CollapsesNulls), and every non-NULL key
+  // appears exactly once.
   size_t null_rows = 0;
   size_t ones = 0;
   size_t twos = 0;
@@ -2537,8 +2538,7 @@ TEST_F(SkipScanDistinctTest, UniqueIndexNullKeysDecodeAsMultiValue) {
   }
   EXPECT_EQ(ones, 1U);
   EXPECT_EQ(twos, 1U);
-  EXPECT_GE(null_rows, 1U);
-  EXPECT_LE(null_rows, 2U);
+  EXPECT_EQ(null_rows, 1U);
 }
 
 TEST_F(SkipScanDistinctTest,

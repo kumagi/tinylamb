@@ -39,6 +39,9 @@ StatusOr<std::string_view> RowPage::Read(page_id_t page_id, Transaction& txn,
 
 StatusOr<slot_t> RowPage::Insert(page_id_t page_id, Transaction& txn,
                                  std::string_view record) {
+  if (IsColumnarStub()) {
+    return Status::kNoSpace;
+  }
   size_t locked_hole_bytes = 0;
   const auto row_max = static_cast<slot_t>(slots_.size());
   slot_t hole_slot = row_max;

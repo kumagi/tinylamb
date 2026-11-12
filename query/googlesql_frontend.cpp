@@ -1518,7 +1518,26 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
       return keys_res;
     }
 
-    if (!frontend_detail::InjectDistinctOnKeys(main_res.ast, keys_res.ast)) {
+    // Locate the SELECT keyword that owns this DISTINCT ON (the text before
+    // dist_start is unchanged in main_sql, so its offset matches the dump
+    // span of the owning Select node even when it is nested).
+    std::optional<size_t> owner_select;
+    {
+      const std::string mask = ToLowerCopy(MaskLiteralsAndComments(main_sql));
+      size_t p = dist_start;
+      while (p > 0 &&
+             std::isspace(static_cast<unsigned char>(mask[p - 1])) != 0) {
+        --p;
+      }
+      if (p >= 6 && mask.compare(p - 6, 6, "select") == 0 &&
+          (p == 6 ||
+           (std::isalnum(static_cast<unsigned char>(mask[p - 7])) == 0 &&
+            mask[p - 7] != '_'))) {
+        owner_select = p - 6;
+      }
+    }
+    if (!frontend_detail::InjectDistinctOnKeys(main_res.ast, keys_res.ast,
+                                               owner_select)) {
       main_res.ok = false;
       main_res.ast.clear();
       main_res.error = "cannot preserve DISTINCT ON: unrecognized parser AST";
@@ -1561,9 +1580,37 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
 }  // namespace
 
 bool frontend_detail::InjectDistinctOnKeys(std::string& ast,
-                                           const std::string& keys_ast) {
+                                           const std::string& keys_ast,
+                                           std::optional<size_t> select_offset) {
   size_t select_pos = std::string::npos;
+  if (select_offset.has_value()) {
+    // Nested DISTINCT ON (derived table, CTE body, UNION branch): attach the
+    // keys to exactly the Select whose source span starts at the owning
+    // SELECT keyword, never to whichever Select the dump lists first.
+    // Dump lines look like "Select [s-e]" or "Select(distinct=true) [s-e]".
+    const std::string span = " [" + std::to_string(*select_offset) + "-";
+    for (size_t at = ast.find(span); at != std::string::npos;
+         at = ast.find(span, at + 1)) {
+      size_t line_start = ast.rfind('\n', at);
+      line_start = line_start == std::string::npos ? 0 : line_start + 1;
+      while (line_start < at && ast[line_start] == ' ') {
+        ++line_start;
+      }
+      const std::string_view head(ast.data() + line_start, at - line_start);
+      if (head == "Select" ||
+          (head.starts_with("Select(") && head.ends_with(")"))) {
+        select_pos = line_start;
+        break;
+      }
+    }
+    if (select_pos == std::string::npos) {
+      return false;
+    }
+  }
   for (const char* pattern : {"Select(", "Select [", "Select\n", "Select "}) {
+    if (select_pos != std::string::npos) {
+      break;
+    }
     size_t found = ast.find(pattern);
     if (found != std::string::npos) {
       select_pos = found;

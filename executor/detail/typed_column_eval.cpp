@@ -550,6 +550,31 @@ bool TryBuildTypedDoubleExprOps(const Expression& expr,
 
 std::optional<TypedDoubleExprInput> TryCompileTypedDoubleExpr(
     const Expression& expr, const Schema& scan_schema) {
+  // COALESCE(expr, 0) and IFNULL(expr, 0) are the ROLLUP sales pattern.
+  // The fallback is a constant zero, so it has no side effects to skip.
+  if (expr && expr->Type() == TypeTag::kFunctionCallExp) {
+    const auto& function = expr->AsFunctionCallExpression();
+    const std::string& name = function.FuncName();
+    if ((name == "coalesce" || name == "ifnull") &&
+        function.Args().size() == 2 && function.Args()[1] &&
+        function.Args()[1]->Type() == TypeTag::kConstantValue) {
+      const Value& fallback = function.Args()[1]->AsConstantValue().GetValue();
+      const bool zero_int = !fallback.IsNull() && !fallback.IsUnsigned() &&
+                            fallback.type == ValueType::kInt64 &&
+                            fallback.value.int_value == 0;
+      const bool zero_double = !fallback.IsNull() &&
+                               fallback.type == ValueType::kDouble &&
+                               fallback.value.double_value == 0.0;
+      if ((zero_int || zero_double) && function.Args()[0]) {
+        std::optional<TypedDoubleExprInput> inner =
+            TryCompileTypedDoubleExpr(function.Args()[0], scan_schema);
+        if (inner.has_value()) {
+          inner->null_as_zero = true;
+          return inner;
+        }
+      }
+    }
+  }
   TypedDoubleExprInput compiled;
   bool saw_double_col = false;
   if (!TryBuildTypedDoubleExprOps(expr, scan_schema, &compiled.ops,
@@ -771,7 +796,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return {};
+          return expr.null_as_zero ? Value(0.0) : Value();
         }
         stack[sp++] = v.value.double_value;
         break;
@@ -779,7 +804,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadIntColAsDouble: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return {};
+          return expr.null_as_zero ? Value(0.0) : Value();
         }
         stack[sp++] = static_cast<double>(v.value.int_value);
         break;
@@ -1454,6 +1479,219 @@ bool TryCompilePositionalHavingConjuncts(
 // statement's grouping (see GroupedJoinFusionSpec).  Schema-dependent checks
 // (bytecode compilability against the joined schema) run at the join step in
 // BuildInput; this pass only decides whether the statement shape qualifies.
+std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(
+    const std::vector<const SelectStatement*>& sets) {
+  static const bool disabled =
+      std::getenv("TINYLAMB_DISABLE_EXACT_ROLLUP") != nullptr;
+  if (disabled || sets.size() < 3 || sets.size() > 32 ||
+      sets.front() == nullptr) {
+    return std::nullopt;
+  }
+  const auto& head = *sets.front();
+  if (head.Sources().size() < 2 || head.GroupBy().empty() ||
+      head.IsGroupAll() ||
+      !std::ranges::all_of(head.GroupBy(),
+                           [](const auto& key) {
+                             return key && key->Type() == TypeTag::kColumnValue;
+                           }) ||
+      std::ranges::any_of(sets, [](const auto* set) {
+        return set == nullptr || set->Having() || set->Qualify() ||
+               set->HasLimit() || set->Offset() != 0 || set->WithTies() ||
+               !set->OrderBy().empty() || !set->UnionAll().empty() ||
+               !set->WithQueries().empty() || set->Distinct() ||
+               set->HasDistinctOn() || HasWindowFunctions(*set) ||
+               StatementContainsVolatileFunction(*set);
+      })) {
+    return std::nullopt;
+  }
+  const auto input_shape = [](const SelectStatement& part) {
+    SelectStatement shape(part);
+    shape.SetSelectList({});
+    shape.SetGroupBy({});
+    shape.SetGroupAll(false);
+    shape.SetSetOperationTree(nullptr);
+    return std::string(shape.Fingerprint());
+  };
+  const auto shape = input_shape(head);
+  if (std::ranges::any_of(
+          sets, [&](const auto* set) { return input_shape(*set) != shape; })) {
+    return std::nullopt;
+  }
+  std::optional<SelectStatement> partial;
+  std::vector<SelectStatement> rewritten;
+  std::vector<Expression> arguments;
+  for (const auto& item : head.SelectList()) {
+    if (item.expression && item.expression->Type() == TypeTag::kAggregateExp) {
+      arguments.push_back(item.expression->AsAggregateExpression().Child());
+    }
+  }
+  bool eligible = !arguments.empty() && arguments.size() <= 4;
+  std::string prefix = "__partial_total";
+  while (std::ranges::any_of(head.GroupBy(), [&](const auto& key) {
+    return AsciiToLower(key->AsColumnValue().GetColumnName().name)
+        .starts_with(prefix);
+  })) {
+    prefix += '_';
+  }
+  const auto sum_name = [&](size_t a) {
+    return prefix + "_sum_" + std::to_string(a);
+  };
+  const auto count_name = [&](size_t a) {
+    return prefix + "_count_" + std::to_string(a);
+  };
+  for (const auto* set : sets) {
+    if (!eligible) {
+      break;
+    }
+    for (const auto& key : set->GroupBy()) {
+      if (set->IsGroupAll()) {
+        break;
+      }
+      eligible = eligible && key &&
+                 std::ranges::any_of(head.GroupBy(), [&](const auto& fine) {
+                   return key->ToString() == fine->ToString();
+                 });
+    }
+    std::vector<NamedExpression> items;
+    size_t aggregate_index = 0;
+    for (const auto& item : set->SelectList()) {
+      const auto& expression = item.expression;
+      if (!expression) {
+        eligible = false;
+        break;
+      }
+      if (expression->Type() == TypeTag::kConstantValue) {
+        items.push_back(item);
+        continue;
+      }
+      if (expression->Type() == TypeTag::kColumnValue) {
+        eligible = eligible &&
+                   std::ranges::any_of(set->GroupBy(), [&](const auto& key) {
+                     return key && key->ToString() == expression->ToString();
+                   });
+        items.push_back(item);
+        continue;
+      }
+      if (expression->Type() != TypeTag::kAggregateExp) {
+        eligible = false;
+        break;
+      }
+      const auto& aggregate = expression->AsAggregateExpression();
+      if (aggregate.GetType() != AggregationType::kAvg ||
+          aggregate.Distinct() || aggregate.WhereFilter() ||
+          aggregate.Having() != AggregateHavingModifier::kNone ||
+          !aggregate.InnerOrderBy().empty() || aggregate.SecondaryArg() ||
+          !aggregate.ExtraArgs().empty() || !aggregate.TrailingArgs().empty() ||
+          aggregate.NeedsGroupContext() || !aggregate.Child() ||
+          aggregate.Child()->Type() != TypeTag::kColumnValue ||
+          aggregate_index >= arguments.size() ||
+          aggregate.Child()->ToString() !=
+              arguments[aggregate_index]->ToString()) {
+        eligible = false;
+        break;
+      }
+      const auto sum = std::make_shared<AggregateExpression>(
+          AggregationType::kSum, ColumnValueExp(sum_name(aggregate_index)));
+      const auto count = std::make_shared<AggregateExpression>(
+          AggregationType::kSum, ColumnValueExp(count_name(aggregate_index)));
+      const auto denominator =
+          FunctionCallExp("nullif", {count, ConstantValueExp(Value(0))});
+      const auto numerator = BinaryExpressionExp(
+          sum, BinaryOperation::kMultiply, ConstantValueExp(Value(1.0)));
+      items.emplace_back(
+          item.name, BinaryExpressionExp(numerator, BinaryOperation::kDivide,
+                                         denominator));
+      ++aggregate_index;
+    }
+    eligible = eligible && aggregate_index == arguments.size();
+    rewritten.emplace_back(*set);
+    rewritten.back().SetSelectList(std::move(items));
+  }
+  if (eligible) {
+    partial.emplace(head);
+    std::vector<NamedExpression> items;
+    items.reserve(head.GroupBy().size() + (2 * arguments.size()));
+    for (size_t k = 0; k < head.GroupBy().size(); ++k) {
+      items.emplace_back(prefix + "_key_" + std::to_string(k),
+                         head.GroupBy()[k]);
+    }
+    for (size_t a = 0; a < arguments.size(); ++a) {
+      items.emplace_back(sum_name(a), std::make_shared<AggregateExpression>(
+                                          AggregationType::kSum, arguments[a]));
+      items.emplace_back(count_name(a),
+                         std::make_shared<AggregateExpression>(
+                             AggregationType::kCount, arguments[a]));
+    }
+    partial->SetSelectList(std::move(items));
+    if (BuildGroupedJoinFusionSpec(*partial).eligible) {
+      return ExactIntegerGroupingSets{.partial = std::move(*partial),
+                                      .sets = std::move(rewritten)};
+    }
+  }
+  return std::nullopt;
+}
+
+bool CanUseExactIntegerGroupingSets(TransactionContext& context,
+                                    const SelectStatement& statement) {
+  if (statement.UnionAll().size() < 2 || !statement.WithQueries().empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < statement.UnionAll().size(); ++i) {
+    const auto match = statement.MatchFor(i);
+    if (match.by_name || match.corresponding || !match.columns.empty() ||
+        (i < statement.SetOperationKinds().size() &&
+         statement.SetOperationKinds()[i] != SetOperationKind::kUnionAll)) {
+      return false;
+    }
+  }
+  SelectStatement head(statement);
+  head.ClearUnionAll();
+  head.SetSetOperationTree(nullptr);
+  head.SetOrderBy({});
+  head.SetLimit(std::nullopt);
+  head.SetOffset(0);
+  head.SetWithTies(false);
+  std::vector<const SelectStatement*> sets{&head};
+  for (const auto& branch : statement.UnionAll()) {
+    sets.push_back(branch.get());
+  }
+  auto plan = PlanExactIntegerGroupingSets(sets);
+  if (!plan) {
+    return false;
+  }
+  std::vector<Column> columns;
+  for (const auto& source : head.Sources()) {
+    if (source.table.empty() || source.query || source.unnest ||
+        source.is_lateral || source.sample || source.from_nested_join ||
+        !source.using_columns.empty() ||
+        (source.join_type != JoinType::kCross &&
+         source.join_type != JoinType::kInner)) {
+      return false;
+    }
+    auto table = context.GetTable(source.table);
+    if (!table.HasValue()) {
+      return false;
+    }
+    const auto& schema = table.Value()->GetSchema();
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      columns.push_back(schema.GetColumn(i));
+      columns.back().Name().schema =
+          source.alias.empty() ? source.table : source.alias;
+    }
+  }
+  const Schema schema("", std::move(columns));
+  return std::ranges::all_of(head.SelectList(), [&](const auto& item) {
+    if (item.expression->Type() != TypeTag::kAggregateExp) {
+      return true;
+    }
+    const auto& aggregate = item.expression->AsAggregateExpression();
+    const auto slot = LocalColumnOffset(
+        schema, aggregate.Child()->AsColumnValue().GetColumnName());
+    return slot && schema.GetColumn(*slot).Type() == ValueType::kInt64 &&
+           !schema.GetColumn(*slot).IsUnsigned();
+  });
+}
+
 GroupedJoinFusionSpec BuildGroupedJoinFusionSpec(
     const SelectStatement& statement) {
   GroupedJoinFusionSpec spec;

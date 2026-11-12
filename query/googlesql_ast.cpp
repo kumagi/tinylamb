@@ -69,7 +69,9 @@ std::unique_ptr<GoogleSqlAstNode> ParseNode(std::string label) {
 // Find their SQL closing quote before interpreting the dump's suffix.
 bool LabelContinues(std::string_view label) {
   const size_t first = label.find_first_not_of(' ');
-  if (first == std::string_view::npos) return false;
+  if (first == std::string_view::npos) {
+    return false;
+  }
   label.remove_prefix(first);
   if (label.starts_with("StringLiteral(") ||
       label.starts_with("StringLiteralComponent(") ||
@@ -78,11 +80,16 @@ bool LabelContinues(std::string_view label) {
     size_t cursor = label.find('(') + 1;
     while (cursor < label.size() &&
            (label[cursor] == 'r' || label[cursor] == 'R' ||
-            label[cursor] == 'b' || label[cursor] == 'B'))
+            label[cursor] == 'b' || label[cursor] == 'B')) {
       ++cursor;
-    if (cursor >= label.size()) return true;
+    }
+    if (cursor >= label.size()) {
+      return true;
+    }
     const char quote = label[cursor];
-    if (quote != '\'' && quote != '"') return false;
+    if (quote != '\'' && quote != '"') {
+      return false;
+    }
     const bool triple = cursor + 2 < label.size() &&
                         label[cursor + 1] == quote &&
                         label[cursor + 2] == quote;
@@ -103,10 +110,11 @@ bool LabelContinues(std::string_view label) {
   size_t open = 0;
   size_t close = 0;
   for (const char c : label) {
-    if (c == '(')
+    if (c == '(') {
       ++open;
-    else if (c == ')')
+    } else if (c == ')') {
       ++close;
+    }
   }
   return open > close;
 }

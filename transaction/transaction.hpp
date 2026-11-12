@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -693,6 +694,10 @@ class Transaction final {
   // entry has since been overwritten by another uncommitted transaction.
   bool FindPendingLsmWrite(page_id_t root, std::string_view key,
                            std::string* value, bool* deleted) const;
+
+  void ForEachPendingLsmWrite(
+      page_id_t root, std::string_view key,
+      const std::function<void(const LogRecord&)>& fn) const;
 
   void ReserveIndexUndoBytes(page_id_t pid, size_t bytes);
 

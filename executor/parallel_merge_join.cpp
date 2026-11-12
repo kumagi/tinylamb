@@ -124,6 +124,11 @@ int ParallelMergeJoin::CompareKeys(const Row& left,
     if (JoinValueEqual(lv, rv)) {
       continue;
     }
+    // Match the SortExecutor's cross-type key order (ValueType tag order);
+    // see MergeJoin::CompareKeys.
+    if (!lv.IsNull() && !rv.IsNull() && lv.type != rv.type) {
+      return static_cast<int>(lv.type) < static_cast<int>(rv.type) ? -1 : 1;
+    }
     return CompareForOrderBy(lv, rv) < 0 ? -1 : 1;
   }
   return 0;

@@ -25,16 +25,20 @@
 #include <string>
 
 #include "common/crc32c.hpp"
+#include "common/decoder.hpp"
+#include "common/encoder.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "common/test_util.hpp"
 #include "gtest/gtest.h"
 #include "page/page_ref.hpp"
 #include "page/page_type.hpp"
+#include "page/row_position.hpp"
 #include "recovery/logger.hpp"
 #include "recovery/recovery_manager.hpp"
 #include "transaction/transaction.hpp"
 #include "transaction/transaction_manager.hpp"
+#include "type/row.hpp"
 
 namespace tinylamb {
 namespace {
@@ -323,6 +327,106 @@ TEST_F(PageManagerTest, AuditAbortRestoresRowsAfterFreedSpaceIsReused) {
     EXPECT_EQ(restored->body.row_page.GetRow(survivor), enlarged);
     EXPECT_EQ(restored->body.row_page.RowCount(), 2U);
   }
+}
+
+struct TestIndexEntry {
+  RowPosition pos;
+  Row include;
+  friend Encoder& operator<<(Encoder& e, const TestIndexEntry& v) {
+    e << v.pos << v.include;
+    return e;
+  }
+  friend Decoder& operator>>(Decoder& d, TestIndexEntry& t) {
+    d >> t.pos >> t.include;
+    return d;
+  }
+};
+
+TEST_F(PageManagerTest,
+       MultiTxnNonUniqueIndexListDeltaIsolationCommitAbortAndRecovery) {
+  constexpr page_id_t tree = 77777;
+  const RowPosition pos0(11, 0);
+  const RowPosition pos1(11, 1);
+  const RowPosition pos2(11, 2);
+  const auto encode_positions = [](std::initializer_list<RowPosition> rps) {
+    std::vector<TestIndexEntry> entries;
+    for (const RowPosition& rp : rps) {
+      entries.push_back(TestIndexEntry{.pos = rp, .include = Row()});
+    }
+    return Encode(entries);
+  };
+  const auto decode_positions = [](std::string_view bytes) {
+    auto decoded = Decode<std::vector<TestIndexEntry>>(bytes).MoveValue();
+    std::vector<RowPosition> out;
+    out.reserve(decoded.size());
+    for (const TestIndexEntry& e : decoded) {
+      out.push_back(e.pos);
+    }
+    return out;
+  };
+
+  // Seed committed baseline [pos0] under "dup_key".
+  {
+    Transaction setup = tm_->Begin();
+    ASSERT_SUCCESS(
+        pm_->LsmInsert(setup, tree, "dup_key", encode_positions({pos0})));
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+
+  // T1 removes pos0 and inserts pos1 ([pos0] -> [] -> [pos1]).
+  // T2 concurrently reads the live list [pos1] and appends pos2 ([pos1, pos2]).
+  Transaction t1 = tm_->Begin();
+  Transaction t2 = tm_->Begin();
+  Transaction obs = tm_->Begin();
+  ASSERT_SUCCESS(pm_->LsmDelete(t1, tree, "dup_key"));
+  ASSERT_SUCCESS(pm_->LsmInsert(t1, tree, "dup_key", encode_positions({pos1})));
+  ASSERT_SUCCESS(
+      pm_->LsmUpdate(t2, tree, "dup_key", encode_positions({pos1, pos2})));
+
+  // Scan isolation:
+  // - T1 sees only its own changes: [pos1]
+  // - T2 sees committed baseline + its own delta: [pos0, pos2]
+  // - Observer sees committed baseline: [pos0]
+  const auto scan_t1 = pm_->LsmScanRange(tree, "dup_key", "dup_key", true, &t1);
+  ASSERT_EQ(scan_t1.size(), 1U);
+  EXPECT_EQ(decode_positions(scan_t1[0].second),
+            (std::vector<RowPosition>{pos1}));
+
+  const auto scan_t2 = pm_->LsmScanRange(tree, "dup_key", "dup_key", true, &t2);
+  ASSERT_EQ(scan_t2.size(), 1U);
+  EXPECT_EQ(decode_positions(scan_t2[0].second),
+            (std::vector<RowPosition>{pos0, pos2}));
+
+  const auto scan_obs =
+      pm_->LsmScanRange(tree, "dup_key", "dup_key", true, &obs);
+  ASSERT_EQ(scan_obs.size(), 1U);
+  EXPECT_EQ(decode_positions(scan_obs[0].second),
+            (std::vector<RowPosition>{pos0}));
+
+  // Commit T2 while T1 is still active: committed baseline must become
+  // [pos0, pos2] without baking in T1's uncommitted pos1 or deletion of pos0.
+  ASSERT_SUCCESS(t2.PreCommit());
+  const auto scan_obs_after_t2 =
+      pm_->LsmScanRange(tree, "dup_key", "dup_key", true, &obs);
+  ASSERT_EQ(scan_obs_after_t2.size(), 1U);
+  EXPECT_EQ(decode_positions(scan_obs_after_t2[0].second),
+            (std::vector<RowPosition>{pos0, pos2}));
+
+  // Abort T1: live memtable and committed state must both equal [pos0, pos2].
+  ASSERT_SUCCESS(t1.Abort());
+  ASSERT_SUCCESS(obs.Abort());
+
+  ASSIGN_OR_ASSERT_FAIL(std::string, live_after_abort,
+                        pm_->LsmRead(tree, "dup_key"));
+  EXPECT_EQ(decode_positions(live_after_abort),
+            (std::vector<RowPosition>{pos0, pos2}));
+
+  // Verify crash recovery also reconstructs [pos0, pos2] without phantom pos1.
+  pm_->DropAllState();
+  ASSERT_SUCCESS(rm_->RecoverFrom(0, tm_.get()));
+  ASSIGN_OR_ASSERT_FAIL(std::string, recovered, pm_->LsmRead(tree, "dup_key"));
+  EXPECT_EQ(decode_positions(recovered),
+            (std::vector<RowPosition>{pos0, pos2}));
 }
 
 }  // namespace

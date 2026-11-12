@@ -3162,7 +3162,10 @@ TEST(ExpressionAuditTest, SyntheticJsonNodesOwnRawText) {
 
 TEST(ExpressionAuditTest, JsonPathQuotedMembersAndInvalidSuffixes) {
   const auto root = json_doc::ParseDocument(R"({"a b":[10,20]})");
-  ASSERT_TRUE(root.has_value());
+  if (!root.has_value()) {
+    ADD_FAILURE() << "expected valid JSON document";
+    return;
+  }
   for (const char* path : {"$[\"a b\"][1]", "$['a b'][1]", "$.\"a b\"[1]"}) {
     const auto* selected = json_doc::NavigateJsonPath(*root, path);
     ASSERT_NE(selected, nullptr) << path;
@@ -3175,7 +3178,10 @@ TEST(ExpressionAuditTest, JsonPathQuotedMembersAndInvalidSuffixes) {
 
 TEST(ExpressionAuditTest, JsonPathIndexesNeverWrap) {
   auto document = json_doc::ParseDocument("[1,2,3]");
-  ASSERT_TRUE(document.has_value());
+  if (!document.has_value()) {
+    ADD_FAILURE() << "expected valid JSON document";
+    return;
+  }
   for (const std::string path : {"$[4294967297]", "$[18446744073709551617]",
                                  "$[9999999999999999999999999]"}) {
     EXPECT_EQ(json_doc::NavigateJsonPath(*document, path), nullptr) << path;
@@ -3188,14 +3194,14 @@ TEST(ExpressionAuditTest, JsonPathIndexesNeverWrap) {
 
 class AuditEvaluationContext final : public EvaluationContext {
  public:
-  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement&,
-                                           const Row*) override {
+  StatusOr<std::vector<Value>> RunSubquery(const SelectStatement& /*statement*/,
+                                           const Row* /*outer*/) override {
     return Status::kNotExists;
   }
-  const AggregateResultMap* CurrentAggregates() const override {
+  [[nodiscard]] const AggregateResultMap* CurrentAggregates() const override {
     return nullptr;
   }
-  Status GetOrAddFunction(std::string_view, int) override {
+  Status GetOrAddFunction(std::string_view /*name*/, int /*arity*/) override {
     return Status::kSuccess;
   }
 };

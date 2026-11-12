@@ -129,7 +129,10 @@ void AppendMemComparableValue(const Value& v, std::string* out,
   }
 }
 
-using Span = std::pair<uint32_t, uint32_t>;
+// 64-bit offsets: the in-memory key blob can exceed 4 GiB before the soft
+// memory limit forces a spill; 32-bit offsets wrapped and compared the
+// wrong windows (silently mis-ordered output).
+using Span = std::pair<size_t, size_t>;
 
 int CompareSpans(std::string_view a, std::string_view b) {
   const size_t common = std::min(a.size(), b.size());
@@ -308,9 +311,9 @@ class KeyOrdering {
       null_flags_.push_back(static_cast<uint8_t>(is_null));
       return;
     }
-    const auto begin = static_cast<uint32_t>(blob_.size());
+    const size_t begin = blob_.size();
     encoder_.AppendEncoded(row, &blob_, error);
-    spans_.emplace_back(begin, static_cast<uint32_t>(blob_.size() - begin));
+    spans_.emplace_back(begin, blob_.size() - begin);
   }
 
   void AppendEncodedTo(const Row& row, std::string* out,
@@ -602,7 +605,7 @@ Status SortExecutor::Materialize() {
       QueryMemoryCharge charge;
       std::vector<PositionedRow> rows;
       std::string keys;
-      std::vector<std::pair<uint32_t, uint32_t>> spans;
+      std::vector<std::pair<size_t, size_t>> spans;
       size_t index{0};
       size_t window_rows{0};
 
@@ -616,9 +619,9 @@ Status SortExecutor::Materialize() {
         PositionedRow item;
         while (rows.size() < window_rows && reader->Next(&item)) {
           charge.Add(EstimateRowBytes(item.first) + sizeof(RowPosition));
-          const auto begin = static_cast<uint32_t>(keys.size());
+          const size_t begin = keys.size();
           ord.AppendEncodedTo(item.first, &keys, error);
-          spans.emplace_back(begin, static_cast<uint32_t>(keys.size() - begin));
+          spans.emplace_back(begin, keys.size() - begin);
           rows.push_back(std::move(item));
         }
         return !rows.empty();

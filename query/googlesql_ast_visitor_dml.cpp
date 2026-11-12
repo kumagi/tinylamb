@@ -34,6 +34,7 @@
 
 #include "common/constants.hpp"
 #include "common/set_operation.hpp"
+#include "common/string_util.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -112,6 +113,10 @@ bool ContainsAggregate(const Expression& expression) {
         return ContainsAggregate(item);
       });
     }
+    // CAST(SUM(x) AS STRING) is aggregated (GROUP BY ALL must not use it as
+    // a key); mirror relational_detail::ContainsAggregate.
+    case TypeTag::kCastExp:
+      return ContainsAggregate(expression->AsCastExpression().Child());
     default:
       return false;
   }
@@ -904,8 +909,14 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
           CaseExpressionExp(std::move(when_clauses), ConstantValueExp(Value()));
 
       const std::string lower_fn = Lower(agg.func_name);
+      // Each PIVOT aggregate becomes AGG(CASE WHEN piv = v THEN arg END);
+      // that rewrite is exact for aggregates that ignore NULL inputs. Any
+      // other name must fail loudly: defaulting to SUM silently computed a
+      // different aggregate (BIT_AND(mask) returned SUM(mask)).
       AggregationType agg_type = AggregationType::kSum;
-      if (lower_fn == "count") {
+      if (lower_fn == "sum") {
+        agg_type = AggregationType::kSum;
+      } else if (lower_fn == "count") {
         agg_type = AggregationType::kCount;
       } else if (lower_fn == "avg") {
         agg_type = AggregationType::kAvg;
@@ -913,6 +924,19 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
         agg_type = AggregationType::kMin;
       } else if (lower_fn == "max") {
         agg_type = AggregationType::kMax;
+      } else if (lower_fn == "bit_and") {
+        agg_type = AggregationType::kBitAnd;
+      } else if (lower_fn == "bit_or") {
+        agg_type = AggregationType::kBitOr;
+      } else if (lower_fn == "bit_xor") {
+        agg_type = AggregationType::kBitXor;
+      } else if (lower_fn == "logical_and") {
+        agg_type = AggregationType::kLogicalAnd;
+      } else if (lower_fn == "logical_or") {
+        agg_type = AggregationType::kLogicalOr;
+      } else {
+        return AstError<SelectSource>(
+            "GoogleSQL AST: unsupported aggregate in PIVOT: " + agg.func_name);
       }
 
       Expression agg_expression =
@@ -1359,6 +1383,60 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
         columns.back().SetIntegerBits(integer_bits);
         columns.back().SetInterval(col_info.is_interval);
       }
+    }
+    // Table-level PRIMARY KEY (k): a single-column key rides the same
+    // column constraint slot as the column-level `k INT64 PRIMARY KEY`
+    // spelling, so uniqueness is enforced identically. Composite keys have
+    // no slot to live in; they stay declarative (unenforced) as before.
+    for (const GoogleSqlAstNode* pk : elements->Children("PrimaryKey")) {
+      if (pk->detail.find("NOT ENFORCED") != std::string::npos) {
+        continue;
+      }
+      const GoogleSqlAstNode* list = pk->Child("PrimaryKeyElementList");
+      if (list == nullptr) {
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: bad PRIMARY KEY");
+      }
+      std::vector<std::string> key_columns;
+      for (const GoogleSqlAstNode* element :
+           list->Children("PrimaryKeyElement")) {
+        const GoogleSqlAstNode* id = element->Child("Identifier");
+        if (id == nullptr) {
+          return AstError<std::unique_ptr<Statement>>(
+              "GoogleSQL AST: bad PRIMARY KEY element");
+        }
+        ASSIGN_OR_RETURN(std::string, h_key, (Identifier(*id)));
+        key_columns.push_back(std::move(h_key));
+      }
+      if (key_columns.size() != 1) {
+        continue;
+      }
+      auto target = std::ranges::find_if(columns, [&](const Column& column) {
+        return IdentifierEquals(column.Name().name, key_columns[0]);
+      });
+      if (target == columns.end()) {
+        return AstError<std::unique_ptr<Statement>>(
+            "PRIMARY KEY column not found: " + key_columns[0]);
+      }
+      const Constraint::ConstraintType existing =
+          target->GetConstraint().ctype;
+      if (existing == Constraint::kPrimaryKey) {
+        continue;
+      }
+      if (existing != Constraint::kNothing &&
+          existing != Constraint::kNotNull) {
+        return AstError<std::unique_ptr<Statement>>(
+            "column " + target->Name().name +
+            " cannot combine PRIMARY KEY with its existing constraint");
+      }
+      const bool was_unsigned = target->IsUnsigned();
+      const uint8_t integer_bits = target->IntegerBits();
+      const bool is_interval = target->IsInterval();
+      *target = Column(target->Name().name, target->Type(),
+                       Constraint(Constraint::kPrimaryKey));
+      target->SetUnsigned(was_unsigned);
+      target->SetIntegerBits(integer_bits);
+      target->SetInterval(is_interval);
     }
     for (const GoogleSqlAstNode* fk : elements->Children("ForeignKey")) {
       const GoogleSqlAstNode* child_list = fk->Child("ColumnList");

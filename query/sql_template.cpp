@@ -466,9 +466,35 @@ bool ContainsBindableConstant(
     }
     case TypeTag::kUnaryExp:
       return ContainsBindableConstant(expression->AsUnaryExpression().Child());
-    case TypeTag::kAggregateExp:
-      return std::ranges::any_of(ExpressionChildren(expression),
+    case TypeTag::kAggregateExp: {
+      // Mirror every attribute BindExpression consumes parameters from;
+      // ExpressionChildren(kAggregateExp) only yields Child().
+      const auto& aggregate = expression->AsAggregateExpression();
+      if (ContainsBindableConstant(aggregate.Child()) ||
+          ContainsBindableConstant(aggregate.SecondaryArg()) ||
+          std::ranges::any_of(aggregate.TrailingArgs(),
+                              ContainsBindableConstant)) {
+        return true;
+      }
+      if (aggregate.HasWhereFilter() &&
+          ContainsBindableConstant(aggregate.WhereFilter())) {
+        return true;
+      }
+      if (aggregate.Having() != AggregateHavingModifier::kNone &&
+          ContainsBindableConstant(aggregate.HavingCondition())) {
+        return true;
+      }
+      if (std::ranges::any_of(aggregate.InnerOrderBy(),
+                              [](const WindowOrderTerm& term) {
+                                return ContainsBindableConstant(
+                                    term.expression);
+                              })) {
+        return true;
+      }
+      return aggregate.HasInnerGroupBy() &&
+             std::ranges::any_of(aggregate.InnerGroupBy(),
                                  ContainsBindableConstant);
+    }
     case TypeTag::kCaseExp: {
       const auto& searched = expression->AsCaseExpression();
       for (const auto& clause : searched.when_clauses_) {

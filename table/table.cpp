@@ -899,9 +899,25 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
     }
     return failure;
   }
-  ASSIGN_OR_RETURN(PageRef, source_page,
-                   txn.GetPageManager()->GetPage(pos.page_id));
+  // Every index entry is gone at this point; a page that cannot be fetched
+  // must restore them before failing, or the surviving row is unreachable
+  // from its indexes ("row present x index entries gone").
+  const auto reinstate_indexes = [&]() {
+    for (size_t i = indexes_.size(); 0 < i; --i) {
+      LogCompensationFailure(
+          txn, "delete-rollback IndexInsert",
+          IndexInsert(txn, indexes_[i - 1], original_row, pos));
+    }
+  };
+  StatusOr<PageRef> source_page_or =
+      txn.GetPageManager()->GetPage(pos.page_id);
+  if (!source_page_or.HasValue()) {
+    reinstate_indexes();
+    return source_page_or.GetStatus();
+  }
+  PageRef source_page = source_page_or.MoveValue();
   if (source_page.IsNull()) {
+    reinstate_indexes();
     return Status::kNotExists;
   }
   txn.DebugSetPhase("rowpage-delete");
@@ -930,11 +946,7 @@ Status Table::Delete(Transaction& txn, RowPosition pos) {
   if (delete_status != Status::kSuccess && !indexes_.empty()) {
     // The physical delete failed after all keys were removed: reinstate them
     // so the surviving row stays reachable from every index.
-    for (size_t i = indexes_.size(); 0 < i; --i) {
-      LogCompensationFailure(
-          txn, "delete-rollback IndexInsert",
-          IndexInsert(txn, indexes_[i - 1], original_row, pos));
-    }
+    reinstate_indexes();
   }
   return delete_status;
 }
@@ -1288,6 +1300,20 @@ std::shared_ptr<const LSTableStore> Table::GetLSTableStore() const {
 void Table::SetLSTableStore(std::shared_ptr<const LSTableStore> store) const {
   if (incarnation_state_ != nullptr) {
     incarnation_state_->SetLSTableStoreRaw(std::move(store));
+  }
+}
+
+std::shared_ptr<const LSTableStore> Table::GetProjectedLSTableStore() const {
+  return incarnation_state_ == nullptr
+             ? nullptr
+             : std::static_pointer_cast<const LSTableStore>(
+                   incarnation_state_->GetProjectedLSTableStoreRaw());
+}
+
+void Table::SetProjectedLSTableStore(
+    std::shared_ptr<const LSTableStore> store) const {
+  if (incarnation_state_ != nullptr) {
+    incarnation_state_->SetProjectedLSTableStoreRaw(std::move(store));
   }
 }
 

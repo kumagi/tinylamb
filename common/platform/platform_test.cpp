@@ -172,6 +172,48 @@ TEST(PlatformFileIoTest, DataSyncAndPreallocate) {
   AdviseDontNeed(fd, 0, 3);  // best effort; must not crash
   CloseFile(fd);
   EXPECT_EQ(DataSync(fd), -1);  // closed descriptor reports failure
+
+  MemoryMap mapped;
+  ASSERT_EQ(mapped.Open(path), 0);
+  EXPECT_TRUE(mapped.IsValid());
+  ASSERT_EQ(mapped.Size(), 8192U);
+  ASSERT_NE(mapped.Data(), nullptr);
+  EXPECT_EQ(mapped.Data()[0], 'a');
+  EXPECT_EQ(mapped.Data()[1], 'b');
+  EXPECT_EQ(mapped.Data()[2], 'c');
+  mapped.AdviseSequential(0, mapped.Size());
+  mapped.AdviseWillNeed(0, 128);
+  mapped.AdviseRandom(0, mapped.Size());
+
+  MemoryMap moved(std::move(mapped));
+  // MemoryMap guarantees that moving releases the source handle.
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_FALSE(mapped.IsValid());
+  EXPECT_TRUE(moved.IsValid());
+  EXPECT_EQ(moved.Data()[0], 'a');
+  moved.Close();
+  EXPECT_FALSE(moved.IsValid());
+
+  const std::filesystem::path empty_path =
+      std::filesystem::temp_directory_path() /
+      ("platform_empty_map_" + std::to_string(GetPid()));
+  const int empty_fd = OpenFile(
+      empty_path,
+      {.mode = OpenMode::kReadWrite, .create = true, .truncate = true}, 0644);
+  ASSERT_GE(empty_fd, 0);
+  CloseFile(empty_fd);
+  MemoryMap empty_map;
+  ASSERT_EQ(empty_map.Open(empty_path), 0);
+  EXPECT_TRUE(empty_map.IsValid());
+  EXPECT_EQ(empty_map.Size(), 0U);
+  EXPECT_NE(empty_map.Data(), nullptr);
+  empty_map.Close();
+  std::filesystem::remove(empty_path);
+
+  MemoryMap missing;
+  EXPECT_EQ(missing.Open(path.string() + ".nonexistent"), -1);
+  EXPECT_FALSE(missing.IsValid());
+
   std::filesystem::remove(path);
 }
 

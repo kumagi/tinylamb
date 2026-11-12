@@ -97,6 +97,12 @@ AggregationExecutor::AggregationExecutor(
   for (const NamedExpression& named : aggregates_) {
     AggregateInput input;
     const auto& agg = named.expression->AsAggregateExpression();
+    // BIT_* only accept INT64; the typed column kernels CHECK-abort on a
+    // DOUBLE column, so keep such inputs on the generic loop, which reports
+    // the type error as a Status like every other route.
+    const bool bitwise = agg.GetType() == AggregationType::kBitAnd ||
+                         agg.GetType() == AggregationType::kBitOr ||
+                         agg.GetType() == AggregationType::kBitXor;
     if (IsTypedAggregate(agg.GetType()) && !agg.Distinct() &&
         !agg.WhereFilter() && !agg.NeedsGroupContext()) {
       if (IsCountStar(agg)) {
@@ -107,7 +113,8 @@ AggregationExecutor::AggregationExecutor(
         if (offset >= 0) {
           const ValueType declared =
               input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
-          if (declared == ValueType::kInt64 || declared == ValueType::kDouble) {
+          if (declared == ValueType::kInt64 ||
+              (declared == ValueType::kDouble && !bitwise)) {
             input.kind = AggregateInputKind::kTypedColumn;
             input.column = static_cast<size_t>(offset);
             input.type = declared;
@@ -115,8 +122,9 @@ AggregationExecutor::AggregationExecutor(
         }
       } else if (agg.Child()->Type() == TypeTag::kConstantValue) {
         Value constant = agg.Child()->AsConstantValue().GetValue();
-        if (!constant.IsNull() && (constant.type == ValueType::kInt64 ||
-                                   constant.type == ValueType::kDouble)) {
+        if (!constant.IsNull() &&
+            (constant.type == ValueType::kInt64 ||
+             (constant.type == ValueType::kDouble && !bitwise))) {
           input.kind = AggregateInputKind::kTypedConstant;
           input.constant = std::move(constant);
         }
@@ -596,6 +604,27 @@ StatusOr<bool> AggregationExecutor::TryFoldDateExtrema(Row* dst) {
 StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
   auto scan = std::dynamic_pointer_cast<ParallelScan>(child_);
   auto serial = std::dynamic_pointer_cast<FullScan>(child_);
+  if (scan && all_typed_ &&
+      std::ranges::all_of(inputs_, [](const AggregateInput& input) {
+        return input.kind == AggregateInputKind::kCountStar;
+      })) {
+    // This is the exact cardinality of the immutable visible-row store, not
+    // optimizer statistics. The scan rejects predicates and MVCC
+    // version chains before allowing a whole-store fold.
+    ASSIGN_OR_RETURN(
+        bool, counted,
+        scan->TryFoldLSTableStore([&](const LSTableStore& store) -> Status {
+          if (store.total_rows > static_cast<uint64_t>(INT64_MAX)) {
+            return Status::kIsInfinity;
+          }
+          *dst = Row(std::vector<Value>(
+              inputs_.size(), Value(static_cast<int64_t>(store.total_rows))));
+          return Status::kSuccess;
+        }));
+    if (counted) {
+      return true;
+    }
+  }
   if (scan && aggregates_.size() == 1) {
     const auto& agg = aggregates_[0].expression->AsAggregateExpression();
     if (agg.GetType() == AggregationType::kCount && agg.Distinct() &&
@@ -905,8 +934,16 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
       }
       return Status::kSuccess;
     };
+    std::vector<slot_t> required_columns;
+    required_columns.reserve(inputs_.size());
+    for (const auto& input : inputs_) {
+      if (input.kind != AggregateInputKind::kCountStar) {
+        required_columns.push_back(scan->TableColumnSlot(input.column));
+      }
+    }
     ASSIGN_OR_RETURN(bool, lstable_consumed,
-                     scan->TryFoldLSTableBlocks(worker_count, consume_lstable));
+                     scan->TryFoldLSTableBlocks(worker_count, consume_lstable,
+                                                &required_columns));
     consumed = lstable_consumed;
   }
   if (!consumed) {
@@ -1459,7 +1496,9 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
     if (AccumulateTypedBatch(&results, &counts, input_batch_)) {
       continue;
     }
-    if (GetStatus() != Status::kSuccess) return false;
+    if (GetStatus() != Status::kSuccess) {
+      return false;
+    }
     bool all_done = true;
     for (size_t k = 0; k < aggregates_.size(); ++k) {
       if (accumulators[k] == nullptr || !accumulators[k]->IsDone()) {
@@ -1632,7 +1671,14 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
               }
               results[i] = Value(next.Value());
             } else {
-              results[i] = results[i] + val;
+              // TryArithmetic reports INT64 overflow as a Status (the
+              // throwing operator+ would escape NextBatch as an exception).
+              StatusOr<Value> next =
+                  results[i].TryArithmetic(val, BinaryOperation::kAdd);
+              if (!next.HasValue()) {
+                return FailWith(next.GetStatus());
+              }
+              results[i] = next.MoveValue();
             }
             break;
           case AggregationType::kAvg:

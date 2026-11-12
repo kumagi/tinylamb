@@ -2310,7 +2310,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         check(item.expression);
       }
       check(statement.Having());
-      for (const auto& term : statement.OrderBy()) check(term.expression);
+      for (const auto& term : statement.OrderBy()) {
+        check(term.expression);
+      }
     }
     const bool simple_exists_projection =
         exists_only && statement.GroupBy().empty() &&
@@ -2787,8 +2789,11 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
               }
             }
           }
+          // A worker exception (e.g. std::bad_alloc while growing a group
+          // map) must not cross the StatusOr boundary of TryEvaluate; this
+          // builder's contract is "nullopt = take the generic path".
           if (build_error_ex) {
-            std::rethrow_exception(build_error_ex);
+            return std::nullopt;
           }
           for (const Status& st : build_errors) {
             if (st != Status::kSuccess) {
@@ -3232,8 +3237,7 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         if (!local_predicates.empty()) {
           Scope scope{.row = &row, .schema = &source.schema, .outer = nullptr};
           for (const Expression& predicate : local_predicates) {
-            if (iteration != Status::kSuccess ||
-                group_error != Status::kSuccess) {
+            if (group_error != Status::kSuccess) {
               return;
             }
             StatusOr<Value> keep =
@@ -3250,7 +3254,9 @@ std::optional<Relation> ExecuteCorrelatedSingleSource(
         const std::string key = EncodeJoinKey(row, created->local_columns);
         created->rows.emplace(key, row);
       });
-      if (group_error != Status::kSuccess) {
+      // A failed spill read leaves a partial multimap; caching it would make
+      // every later probe answer from the missing keys.
+      if (iteration != Status::kSuccess || group_error != Status::kSuccess) {
         return std::nullopt;  // Fall back to the generic (diagnostic) path.
       }
     }
@@ -4312,16 +4318,42 @@ void MaterializeCacheRowsParallel(const std::string& cache_key,
   cached->rows.resize(a.rows);
   const size_t workers = std::clamp<size_t>(
       QueryParallelWorkerLimit(std::thread::hardware_concurrency()), 1, 16);
-  std::vector<std::jthread> threads;
-  for (size_t w = 1; w < workers; ++w) {
-    threads.emplace_back([&, w] {
-      const size_t begin = a.rows * w / workers;
-      const size_t end = a.rows * (w + 1) / workers;
-      MaterializeArenaRange(a, cached->schema, begin, end, &cached->rows);
-    });
+  // An exception escaping a std::jthread body calls std::terminate. Capture
+  // the first worker failure (e.g. std::bad_alloc while boxing VARCHAR
+  // cells) and re-raise it on the calling thread after the join, exactly as
+  // the serial MaterializeCacheRowsIfNeeded would surface it.
+  std::mutex error_mu;
+  std::exception_ptr worker_error;
+  {
+    std::vector<std::jthread> threads;
+    for (size_t w = 1; w < workers; ++w) {
+      threads.emplace_back([&, w] {
+        try {
+          const size_t begin = a.rows * w / workers;
+          const size_t end = a.rows * (w + 1) / workers;
+          MaterializeArenaRange(a, cached->schema, begin, end, &cached->rows);
+        } catch (...) {
+          std::scoped_lock lock(error_mu);
+          if (!worker_error) {
+            worker_error = std::current_exception();
+          }
+        }
+      });
+    }
+    try {
+      MaterializeArenaRange(a, cached->schema, 0, a.rows / workers,
+                            &cached->rows);
+    } catch (...) {
+      std::scoped_lock lock(error_mu);
+      if (!worker_error) {
+        worker_error = std::current_exception();
+      }
+    }
   }
-  MaterializeArenaRange(a, cached->schema, 0, a.rows / workers, &cached->rows);
-  threads.clear();
+  if (worker_error) {
+    cached->rows.clear();
+    std::rethrow_exception(worker_error);
+  }
   a.rows_boxed = true;
 }
 

@@ -62,6 +62,7 @@
 #include "common/math_utils.hpp"
 #include "common/platform/time_format.hpp"
 #include "common/regex_guard.hpp"
+#include "common/string_util.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/evaluation_context.hpp"
@@ -243,7 +244,38 @@ StatusOr<int> ParseTimeZoneOffset(std::string_view zone,
       ct != nullptr ? ct->second : 0);
 }
 
-CivilTime ValueToCivilTime(const Value& val) {
+// Shifts a civil time by `delta_seconds` (day/month/year carries included).
+CivilTime ShiftCivilTimeSeconds(const CivilTime& ct, int64_t delta_seconds) {
+  const std::chrono::year_month_day ymd{
+      std::chrono::year{ct.year},
+      std::chrono::month{static_cast<unsigned>(ct.month)},
+      std::chrono::day{static_cast<unsigned>(ct.day)}};
+  const int64_t days = std::chrono::sys_days{ymd}.time_since_epoch().count();
+  const int64_t secs = (days * 86400) + (int64_t{ct.hour} * 3600) +
+                       (int64_t{ct.minute} * 60) + ct.second + delta_seconds;
+  int64_t out_days = secs / 86400;
+  int64_t day_secs = secs % 86400;
+  if (day_secs < 0) {
+    day_secs += 86400;
+    --out_days;
+  }
+  const std::chrono::year_month_day out_ymd{std::chrono::sys_days{
+      std::chrono::days{static_cast<int>(out_days)}}};
+  CivilTime out = ct;
+  out.year = int(out_ymd.year());
+  out.month = static_cast<int>(static_cast<unsigned>(out_ymd.month()));
+  out.day = static_cast<int>(static_cast<unsigned>(out_ymd.day()));
+  out.hour = static_cast<int>(day_secs / 3600);
+  out.minute = static_cast<int>((day_secs % 3600) / 60);
+  out.second = static_cast<int>(day_secs % 60);
+  return out;
+}
+
+// DATE / DATETIME / TIMESTAMP value -> civil time. An unparsable text is an
+// error (it used to fall back silently to 1970-01-01 00:00:00), and an
+// explicit zone suffix ("+09:00", "-05", "Z") fixes the instant: the result
+// is that instant in UTC, the same reading UNIX_SECONDS & co. apply.
+StatusOr<CivilTime> TryValueToCivilTime(const Value& val) {
   CivilTime ct;
   if (val.type == ValueType::kDate) {
     std::chrono::sys_days sys_d{std::chrono::days{val.DateDays()}};
@@ -253,10 +285,24 @@ CivilTime ValueToCivilTime(const Value& val) {
     ct.day = static_cast<int>(static_cast<unsigned>(ymd.day()));
     return ct;
   }
-  if (val.type == ValueType::kVarChar) {
-    std::string_view s(val.value.varchar_value);
-    ParseCivilTime(s, &ct);
-    return ct;
+  if (val.type != ValueType::kVarChar) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "requires DATE, DATETIME or TIMESTAMP");
+  }
+  const std::string_view s(val.value.varchar_value);
+  if (!ParseCivilTime(s, &ct)) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "invalid DATE, DATETIME or TIMESTAMP value: " +
+                           std::string(s));
+  }
+  if (s.size() > 10) {
+    for (size_t i = 10; i < s.size(); ++i) {
+      if ((s[i] == '+' || s[i] == '-') && i + 1 < s.size() &&
+          std::isdigit(static_cast<unsigned char>(s[i + 1])) != 0) {
+        ASSIGN_OR_RETURN(int, offset, (ParseTimeZoneOffset(s.substr(i), &ct)));
+        return ShiftCivilTimeSeconds(ct, -int64_t{offset});
+      }
+    }
   }
   return ct;
 }
@@ -694,7 +740,8 @@ std::string FormatFloatingForPrintfImpl(double value, char specifier,
 // scope-based relational evaluator (executor/detail/expression_eval.cpp) so
 // the AST ground truth stays semantically identical: NULL propagates from the
 // format string, any value argument, or a dynamic width/precision argument;
-// %t/%T render values in STRING form (strings quoted); %d/%i/%u/%x/%X/%o
+// %t renders the printable form (strings unquoted), %T the literal form
+// (strings quoted and escaped); %d/%i/%u/%x/%X/%o
 // take integers; %f/%g/%e/%E take numerics.  `%*` / `%.*` consume
 // width/precision from the argument list.
 StatusOr<Value> FormatFunction(const std::string& name,
@@ -840,7 +887,11 @@ StatusOr<Value> FormatFunction(const std::string& name,
       if (spec == 'T' || spec == 't') {
         if (arg.IsNull()) {
           formatted_item = "NULL";
+        } else if (arg.type == ValueType::kVarChar && spec == 't') {
+          // %t is the printable form: a STRING renders as its raw text.
+          formatted_item = raw_str(arg);
         } else if (arg.type == ValueType::kVarChar) {
+          // %T is the literal form: a STRING renders quoted and escaped.
           std::string s = raw_str(arg);
           formatted_item += "\"";
           for (char c : s) {
@@ -1073,8 +1124,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (std::isnan(val)) {
         return Value(val);
       }
-      const double factor = std::pow(10.0, digits);
-      return Value(std::round(val * factor) / factor);
+      return Value(ScaleRoundDouble(val, digits, /*truncate=*/false));
     }
     return StatusError(StatusCode::kInvalidArgument,
                        "ROUND requires numeric argument");
@@ -1090,7 +1140,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return v.value.int_value;
     }
     if (v.type == ValueType::kDouble) {
-      return static_cast<int64_t>(v.value.double_value);
+      return SaturatingDoubleToInt64(v.value.double_value);
     }
     if (v.type == ValueType::kVarChar) {
       try {
@@ -1270,6 +1320,22 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     return StatusError(StatusCode::kInvalidArgument,
                        "field not found: " + field);
+  }
+  if (name_view == "__between") {
+    // X BETWEEN lo AND hi with every operand evaluated exactly once (the
+    // frontend uses this form when X is volatile); same three-valued result
+    // as `X >= lo AND X <= hi`.
+    if (values.size() != 3) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "__between requires 3 arguments");
+    }
+    ASSIGN_OR_RETURN(Value, lower,
+                     TryEvaluateBinary(BinaryOperation::kGreaterThanEquals,
+                                       values[0], values[1]));
+    ASSIGN_OR_RETURN(Value, upper,
+                     TryEvaluateBinary(BinaryOperation::kLessThanEquals,
+                                       values[0], values[2]));
+    return TryEvaluateBinary(BinaryOperation::kAnd, lower, upper);
   }
   if (name_view == "__get_field_safe") {
     // Field access that tolerates NULL bases and missing members by
@@ -1642,7 +1708,9 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
           return values[0];
         }
         uint64_t scale = 1;
-        for (int64_t i = 0; i < -digits; ++i) {
+        // Negate in unsigned space: -digits overflows for INT64_MIN.
+        const uint64_t trunc_digits = uint64_t{0} - static_cast<uint64_t>(digits);
+        for (uint64_t i = 0; i < trunc_digits; ++i) {
           if (scale > std::numeric_limits<uint64_t>::max() / 10) {
             return Value(int64_t{0}).WithUnsigned();
           }
@@ -1673,8 +1741,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (std::isnan(val)) {
         return Value(val);
       }
-      const double factor = std::pow(10.0, digits);
-      return Value(std::trunc(val * factor) / factor);
+      return Value(ScaleRoundDouble(val, digits, /*truncate=*/true));
     }
     return StatusError(StatusCode::kInvalidArgument,
                        name + " requires numeric argument");
@@ -2365,15 +2432,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
+    const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    const size_t start = s.find_first_not_of(cutset);
-    if (start == std::string::npos) {
-      return Value(std::string());
-    }
-    const size_t end = s.find_last_not_of(cutset);
-    return Value(s.substr(start, end - start + 1));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
+                                            /*trailing=*/true)));
   }
   if (name_view == "ltrim") {
     if (values.empty() || values.size() > 2) {
@@ -2383,14 +2448,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
+    const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    const size_t start = s.find_first_not_of(cutset);
-    if (start == std::string::npos) {
-      return Value(std::string());
-    }
-    return Value(s.substr(start));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/true,
+                                            /*trailing=*/false)));
   }
   if (name_view == "rtrim") {
     if (values.empty() || values.size() > 2) {
@@ -2400,14 +2464,13 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     if (values[0].IsNull() || (values.size() == 2 && values[1].IsNull())) {
       return Value();
     }
-    std::string s = raw_str(values[0]);
+    const std::string s = raw_str(values[0]);
     const std::string cutset =
         values.size() == 2 ? raw_str(values[1]) : " \t\n\r\f\v";
-    const size_t end = s.find_last_not_of(cutset);
-    if (end == std::string::npos) {
-      return Value(std::string());
-    }
-    return Value(s.substr(0, end + 1));
+    // Code-point matching (see TrimCodePoints): byte-set matching cut
+    // multi-byte characters apart.
+    return Value(std::string(TrimCodePoints(s, cutset, /*leading=*/false,
+                                            /*trailing=*/true)));
   }
   if (name_view == "replace") {
     if (values.size() != 3) {
@@ -3506,24 +3569,28 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       }
       return Value(static_cast<int64_t>(static_cast<unsigned>(date.day())));
     }
-    const std::string date = values[0].type == ValueType::kDate
-                                 ? values[0].AsString()
-                                 : std::string(values[0].value.varchar_value);
-    if (date.size() < 10) {
-      return StatusError(StatusCode::kInvalidArgument, "invalid DATE value");
-    }
-    int64_t part = 0;
-    try {
-      if (name_view == "extract_year") {
-        part = std::stoll(date.substr(0, 4));
-      } else if (name_view == "extract_month") {
-        part = std::stoll(date.substr(5, 2));
-      } else {
-        part = std::stoll(date.substr(8, 2));
-      }
-    } catch (const std::logic_error&) {
+    // STRING input: validate the calendar date exactly like CAST(... AS
+    // DATE) does instead of slicing fixed columns (which mis-read 5-digit
+    // and negative years and accepted month 13 / day 45). A DATETIME /
+    // TIMESTAMP text contributes its date part.
+    const std::string_view text = values[0].value.varchar_value;
+    const size_t date_end = text.find_first_of(" Tt");
+    const std::string_view date_part =
+        date_end == std::string_view::npos ? text : text.substr(0, date_end);
+    StatusOr<int64_t> days_or = TryParseDateDays(date_part);
+    if (!days_or.HasValue()) {
       return StatusError(StatusCode::kInvalidArgument,
-                         "invalid DATE value: " + date);
+                         "invalid DATE value: " + std::string(text));
+    }
+    const std::chrono::year_month_day ymd{std::chrono::sys_days{
+        std::chrono::days{static_cast<int>(days_or.Value())}}};
+    int64_t part = 0;
+    if (name_view == "extract_year") {
+      part = static_cast<int>(ymd.year());
+    } else if (name_view == "extract_month") {
+      part = static_cast<unsigned>(ymd.month());
+    } else {
+      part = static_cast<unsigned>(ymd.day());
     }
     return Value(part);
   }
@@ -3537,7 +3604,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     std::tm utc{};
     platform::GmTime(static_cast<int64_t>(now), &utc);
     std::ostringstream output;
-    output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S");
+    output << std::put_time(&utc, "%Y-%m-%d %H:%M:%S") << "+00";
     return Value(output.str());
   }
   if (name_view == "user" || name_view == "session_user" ||
@@ -3617,7 +3684,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     if (values.size() == 2) {
-      CivilTime ct = ValueToCivilTime(values[0]);
+      ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(values[0])));
       std::string tz_str = raw_str(values[1]);
       ASSIGN_OR_RETURN(int, tz_offset_sec, (ParseTimeZoneOffset(tz_str, &ct)));
       ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
@@ -3651,7 +3718,7 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       return Value();
     }
     std::string fmt = raw_str(values[0]);
-    CivilTime ct = ValueToCivilTime(values[1]);
+    ASSIGN_OR_RETURN(CivilTime, ct, (TryValueToCivilTime(values[1])));
     int tz_offset_sec = 0;
     if (values.size() == 3) {
       if (values[2].IsNull()) {
@@ -5480,7 +5547,8 @@ Type FunctionCallExpression::ResultType(const Schema& schema) const {
       func_name_ == "regexp_instr" || func_name_ == "div" ||
       func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
       func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
-      func_name_ == "__shift_left" || func_name_ == "__shift_right") {
+      func_name_ == "__shift_left" || func_name_ == "__shift_right" ||
+      func_name_ == "__between") {
     return {TypeTag::kBigInt};
   }
 
@@ -5619,7 +5687,8 @@ Type FunctionCallExpression::ResultType(const Schema& left,
       func_name_ == "regexp_instr" || func_name_ == "div" ||
       func_name_.starts_with("extract_") || func_name_ == "__bit_and" ||
       func_name_ == "__bit_or" || func_name_ == "__bit_xor" ||
-      func_name_ == "__shift_left" || func_name_ == "__shift_right") {
+      func_name_ == "__shift_left" || func_name_ == "__shift_right" ||
+      func_name_ == "__between") {
     return {TypeTag::kBigInt};
   }
 

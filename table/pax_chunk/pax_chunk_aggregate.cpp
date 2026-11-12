@@ -1966,12 +1966,14 @@ bool ByteSliceColumnSum(const PaxChunk& chunk, slot_t col, uint32_t g,
   for (uint8_t b = 0; b < w; ++b) {
     const char* sl = region + 1 + static_cast<size_t>(b) * stride;
     uint64_t cnt = 0;
-    for (size_t i = 0; i < full; ++i)
+    for (size_t i = 0; i < full; ++i) {
       cnt += static_cast<uint64_t>(__builtin_popcount(
           static_cast<unsigned>(static_cast<unsigned char>(sl[i]))));
-    if (tail_bits != 0U)
+    }
+    if (tail_bits != 0U) {
       cnt += __builtin_popcount(
           static_cast<unsigned>(static_cast<uint8_t>(sl[full]) & tail_mask));
+    }
     sum += static_cast<__int128>(cnt) * (static_cast<__int128>(1) << b);
   }
 #endif
@@ -2079,7 +2081,9 @@ bool Chimp128ColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_chimp128 = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows > PaxChunk::kRowGroupSize) {
+      return false;
+    }
     if (rows == 0) {
       continue;
     }
@@ -2224,7 +2228,9 @@ bool AlpRdTansColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_alp_rd_tans = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows > PaxChunk::kRowGroupSize) {
+      return false;
+    }
     if (rows == 0) {
       continue;
     }
@@ -2371,7 +2377,9 @@ bool PatasColumnCountSum(const PaxChunk& chunk, slot_t col,
   bool has_patas = false;
   for (uint32_t group = 0; group < f.row_group_count; ++group) {
     const uint16_t rows = f.row_counts[group];
-    if (rows > PaxChunk::kRowGroupSize) return false;
+    if (rows > PaxChunk::kRowGroupSize) {
+      return false;
+    }
     if (rows == 0) {
       continue;
     }
@@ -7905,7 +7913,9 @@ inline void FillWords(uint64_t* p, size_t n, uint64_t v) {
     p[i] = v;
   }
 #else
-  for (size_t i = 0; i < n; ++i) p[i] = v;
+  for (size_t i = 0; i < n; ++i) {
+    p[i] = v;
+  }
 #endif
 }
 

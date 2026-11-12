@@ -280,8 +280,7 @@ TEST(ProtoTextSetFieldTest, AuditMalformedPayloadNeverBecomesReplacement) {
   }
   auto empty = TryProtoTextSetField("", {"a"}, Value(9), "");
   ASSERT_TRUE(empty.HasValue());
-  ASSERT_TRUE(empty.Value().has_value());
-  EXPECT_EQ(empty.Value().value(), "a: 9");
+  EXPECT_EQ(empty.Value(), std::optional<std::string>("a: 9"));
 }
 
 TEST(ProtoTextSetFieldTest, OuterBracesAreOptional) {

@@ -91,11 +91,16 @@ bool DumpMatches(const std::string& actual, const std::string& expected) {
     }
     const double av = strtod(a.c_str(), nullptr);
     const double ev = strtod(e.c_str(), nullptr);
-    const bool a_numeric = std::all_of(a.begin(), a.end(), [](char ch) {
-      return isdigit(static_cast<unsigned char>(ch)) != 0 || ch == '.' ||
-             ch == '-' || ch == '+' || ch == 'e';
-    });
-    if (!a_numeric ||
+    const auto numeric = [](const std::string& token) {
+      return !token.empty() &&
+             std::all_of(token.begin(), token.end(), [](char ch) {
+               return isdigit(static_cast<unsigned char>(ch)) != 0 ||
+                      ch == '.' || ch == '-' || ch == '+' || ch == 'e';
+             });
+    };
+    // Both sides must be numeric: strtod("NULL") is 0, so a one-sided check
+    // accepted an actual "0" where "NULL" was pinned.
+    if (!numeric(a) || !numeric(e) ||
         (av != ev &&
          std::abs(av - ev) > 1e-9 * std::max(std::abs(av), std::abs(ev)))) {
       return false;

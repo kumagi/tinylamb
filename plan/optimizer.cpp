@@ -1202,7 +1202,11 @@ Expression RewritePrefixLike(const Expression& expression) {
     return expression;
   }
   const Value pattern = binary.Right()->AsConstantValue().GetValue();
-  if (pattern.IsNull() || pattern.type != ValueType::kVarChar) {
+  // A case-insensitive pattern (COLLATE('abc%', 'und:ci') folded to a
+  // CI-tagged constant) makes LIKE compare folded text; the byte range below
+  // would drop 'ABCxyz'. Leave such predicates as LIKE.
+  if (pattern.IsNull() || pattern.type != ValueType::kVarChar ||
+      pattern.IsCaseInsensitive()) {
     return expression;
   }
   const std::string_view text = pattern.value.varchar_value;

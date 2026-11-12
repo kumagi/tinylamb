@@ -455,7 +455,12 @@ TEST_F(FullScanIteratorTest, WideStringDictionaryKeepsBytesAndSnapshot) {
     ASSERT_FALSE(store->dictionaries[1].active);
     size_t row_offset = 0;
     const auto& dictionary = store->dictionaries[1];
-    EXPECT_EQ(dictionary.wide_codes.size(), static_cast<size_t>(rows) * width);
+    ASSERT_NE(dictionary.packed_code_bits, 0);
+    EXPECT_EQ(
+        dictionary.wide_codes.size(),
+        ((static_cast<size_t>(rows) * dictionary.packed_code_bits + 7) / 8) +
+            7);
+    EXPECT_LT(dictionary.wide_codes.size(), static_cast<size_t>(rows) * width);
     for (const auto& block : store->blocks) {
       const auto& strings = block.columns[1];
       EXPECT_TRUE(strings.varchar_ends.empty());
@@ -706,6 +711,185 @@ TEST_F(FullScanIteratorTest, ReadVersionFailureTerminatesScanSticky) {
   }
   std::ignore = std::remove(db_name.c_str());
   tinylamb::RemoveLogAndSegments(log_name);
+}
+
+TEST_F(FullScanIteratorTest,
+       ProjectedStoreBoundsPayloadAndKeepsSnapshotIdentity) {
+  auto load = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(
+          load, Schema("Projected", {Column("k", ValueType::kInt64),
+                                     Column("payload", ValueType::kVarChar),
+                                     Column("d", ValueType::kDouble)})));
+  for (int64_t i = 0; i < 9000; ++i) {
+    ASSERT_SUCCESS(
+        table
+            .Insert(load.txn_, Row({i % 101 == 0 ? Value() : Value(i),
+                                    i % 17 == 0 ? Value()
+                                                : Value(std::to_string(i) +
+                                                        std::string(512, 'x')),
+                                    Value(static_cast<double>(i) / 2)}))
+            .GetStatus());
+  }
+  ASSERT_SUCCESS(load.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  constexpr uint64_t budget = uint64_t{256} * 1024;
+  EXPECT_EQ(BuildLSTableStore(reader.txn_, table, nullptr, budget), nullptr);
+  EXPECT_FALSE(table.LSTableCapacityRejected(table.LayoutGeneration()));
+  const std::vector<slot_t> numeric{2, 0};
+  const auto projected =
+      BuildLSTableStore(reader.txn_, table, &numeric, budget);
+  ASSERT_NE(projected, nullptr);
+  EXPECT_EQ(projected->total_rows, 9000U);
+  EXPECT_TRUE(projected->HasColumn(0));
+  EXPECT_FALSE(projected->HasColumn(1));
+  EXPECT_TRUE(projected->HasColumn(2));
+  EXPECT_EQ(table.GetLSTableStore(), nullptr);
+  EXPECT_EQ(projected->pax_chunk, nullptr);
+  int64_t i = 0;
+  for (const auto& block : projected->blocks) {
+    EXPECT_EQ(block.columns.Stored().size(), 2U);
+    EXPECT_EQ(block.columns.size(), 3U);
+    for (uint32_t r = 0; r < block.row_count; ++r, ++i) {
+      EXPECT_EQ(block.columns[0].IsNull(r), i % 101 == 0);
+      if (i % 101 != 0) {
+        EXPECT_EQ(block.columns[0].int_cells[r], i);
+      }
+      EXPECT_EQ(std::bit_cast<double>(block.columns[2].int_cells[r]),
+                static_cast<double>(i) / 2);
+    }
+  }
+  EXPECT_EQ(i, 9000);
+  // Model the production capacity verdict without allocating four GiB in a
+  // unit test. It is only a scheduling hint, never a visibility/row-count
+  // proof.
+  table.RejectLSTableCapacity(table.LayoutGeneration());
+  EXPECT_EQ(GetOrBuildLSTableStore(reader.txn_, table, true), nullptr);
+  EXPECT_EQ(GetOrBuildLSTableStore(reader.txn_, table, true, &numeric),
+            projected);
+  const std::vector<slot_t> text{1};
+  const auto strings = GetOrBuildLSTableStore(reader.txn_, table, true, &text);
+  ASSERT_NE(strings, nullptr);
+  EXPECT_NE(strings, projected);
+  EXPECT_EQ(table.GetProjectedLSTableStore(), strings);
+  EXPECT_FALSE(strings->HasColumn(0));
+  i = 0;
+  for (const auto& block : strings->blocks) {
+    for (uint32_t r = 0; r < block.row_count; ++r, ++i) {
+      EXPECT_EQ(block.columns[1].IsNull(r), i % 17 == 0);
+      if (i % 17 != 0) {
+        EXPECT_EQ(block.columns[1].VarcharAt(r),
+                  std::to_string(i) + std::string(512, 'x'));
+      }
+    }
+  }
+  const std::vector<slot_t> no_columns;
+  const auto count = BuildLSTableStore(reader.txn_, table, &no_columns, 1);
+  ASSERT_NE(count, nullptr);
+  EXPECT_EQ(count->total_rows, 9000U);
+  EXPECT_FALSE(count->HasColumn(0));
+  EXPECT_FALSE(count->HasColumn(1));
+  auto writer = db_->BeginContext();
+  ASSERT_SUCCESS(
+      table.Insert(writer.txn_, Row({Value(9000), Value("new"), Value(1.0)}))
+          .GetStatus());
+  ASSERT_SUCCESS(writer.PreCommit());
+  EXPECT_FALSE(table.LSTableCapacityRejected(table.LayoutGeneration()));
+  EXPECT_EQ(GetOrBuildLSTableStore(reader.txn_, table, true, &text), nullptr);
+  size_t old_rows = 0;
+  auto scan = table.BeginFullScan(reader.txn_);
+  while (scan.IsValid()) {
+    ++old_rows;
+    ++scan;
+  }
+  EXPECT_EQ(old_rows, 9000U);
+  ASSERT_SUCCESS(reader.PreCommit());
+  auto fresh = db_->BeginReadOnlyContext();
+  const auto full = GetOrBuildLSTableStore(fresh.txn_, table, true);
+  ASSERT_NE(full, nullptr);
+  EXPECT_EQ(full->total_rows, 9001U);
+  EXPECT_TRUE(full->loaded_columns.empty());
+  ASSERT_SUCCESS(fresh.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, StringDictionaryKeepsModestEstimatedSavings) {
+  constexpr int64_t cardinality = 1000;
+  constexpr int64_t rows = cardinality * 3;
+  const auto text = [](int64_t i) {
+    return std::string(12, 'x') + std::to_string(1000 + (i % cardinality));
+  };
+  {
+    auto setup = db_->BeginContext();
+    ASSERT_SUCCESS(
+        db_->CreateTable(setup, Schema("ModestStrings",
+                                       {Column("s", ValueType::kVarChar)}))
+            .GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(setup, "ModestStrings"));
+    for (int64_t i = 0; i < rows; ++i) {
+      ASSERT_SUCCESS(
+          table.Insert(setup.txn_, Row({Value(text(i))})).GetStatus());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "ModestStrings"));
+  const auto store = BuildLSTableStore(reader.txn_, table);
+  ASSERT_NE(store, nullptr);
+  const auto& dictionary = store->dictionaries[0];
+  ASSERT_EQ(dictionary.StringEntryCount(), cardinality);
+  const size_t encoded_bytes =
+      dictionary.wide_codes.size() +
+      (static_cast<size_t>(cardinality) * (sizeof(std::string) + 16));
+  constexpr size_t source_bytes =
+      static_cast<size_t>(rows) * (16 + sizeof(uint32_t));
+  EXPECT_LT(encoded_bytes, source_bytes);
+  EXPECT_GT(encoded_bytes, source_bytes - (source_bytes / 5));
+  for (int64_t i = 0; i < rows; ++i) {
+    const auto code = dictionary.DictionaryCodeAt(static_cast<size_t>(i));
+    ASSERT_LT(code, dictionary.StringEntryCount());
+    EXPECT_EQ(dictionary.StringEntryAt(code), text(i));
+  }
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, IntegerDictionaryCrossesFormerCardinalityLimit) {
+  constexpr int64_t cardinality = (int64_t{1} << 20) + 17;
+  constexpr int64_t rows = cardinality * 3;
+  {
+    auto setup = db_->BeginContext();
+    const Schema schema("LargeDictionary", {Column("k", ValueType::kInt64)});
+    ASSERT_SUCCESS(db_->CreateTable(setup, schema).GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(Table, table,
+                          db_->GetTable(setup, "LargeDictionary"));
+    for (int64_t i = 0; i < rows; ++i) {
+      ASSERT_SUCCESS(
+          table.Insert(setup.txn_, Row({Value(i % cardinality)})).GetStatus());
+    }
+    ASSERT_SUCCESS(table.Insert(setup.txn_, Row({Value()})).GetStatus());
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  auto reader = db_->BeginReadOnlyContext();
+  ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "LargeDictionary"));
+  const auto store = BuildLSTableStore(reader.txn_, table);
+  ASSERT_NE(store, nullptr);
+  const auto& dictionary = store->dictionaries[0];
+  ASSERT_EQ(dictionary.IntEntryCount(), static_cast<size_t>(cardinality));
+  EXPECT_EQ(dictionary.packed_code_bits, 21);
+  EXPECT_LT(dictionary.wide_codes.size() +
+                (dictionary.int_entries.size() * sizeof(int64_t)),
+            static_cast<size_t>(rows) * sizeof(int64_t) * 4 / 5);
+  for (size_t row = 0; row < static_cast<size_t>(rows); row += 997) {
+    const auto code = dictionary.DictionaryCodeAt(row);
+    ASSERT_LT(code, dictionary.IntEntryCount());
+    EXPECT_EQ(dictionary.IntEntryAt(code),
+              static_cast<int64_t>(row) % cardinality);
+  }
+  EXPECT_EQ(dictionary.DictionaryCodeAt(static_cast<size_t>(rows)),
+            cardinality);
+  EXPECT_EQ(dictionary.DictionaryCodeAt(static_cast<size_t>(rows + 1)),
+            UINT32_MAX);
+  ASSERT_SUCCESS(reader.PreCommit());
 }
 
 }  // namespace tinylamb

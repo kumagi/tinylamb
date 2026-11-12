@@ -78,6 +78,14 @@ int MergeJoin::CompareKeys(const Row& left, const Row& right) const {
     if (JoinValueEqual(lhs, rhs)) {
       continue;
     }
+    // The inputs arrive ordered by SortExecutor's memcomparable keys, whose
+    // cross-type order is the ValueType tag order (INT64 < VARCHAR < DOUBLE
+    // < DATE < ARRAY). CompareForOrderBy ranks DOUBLE before VARCHAR; walking
+    // with that order against tag-ordered input skips matching runs. Steer
+    // the cursors by the same order the inputs were sorted in.
+    if (!lhs.IsNull() && !rhs.IsNull() && lhs.type != rhs.type) {
+      return static_cast<int>(lhs.type) < static_cast<int>(rhs.type) ? -1 : 1;
+    }
     return CompareForOrderBy(lhs, rhs) < 0 ? -1 : 1;
   }
   return 0;

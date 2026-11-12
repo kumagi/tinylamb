@@ -580,10 +580,11 @@ inline Expression SlotizeLiterals(  // NOLINT(misc-no-recursion)
       }
       return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
     }
-    case TypeTag::kIntervalExp: {
-      const auto& interval = expression->AsIntervalExpression();
-      return IntervalExpressionExp(interval.Amount(), interval.Unit());
-    }
+    case TypeTag::kIntervalExp:
+      // An INTERVAL literal holds no parameter slot; keep the node as is.
+      // Rebuilding it from (Amount, Unit) dropped the raw text of composite
+      // literals: INTERVAL '1-2' YEAR TO MONTH became a zero interval.
+      return expression;
     default:
       *ok = false;
       return expression;

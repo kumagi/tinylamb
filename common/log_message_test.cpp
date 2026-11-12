@@ -41,6 +41,7 @@ TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {
 TEST(LogMessageTest, AuditConcurrentMessagesStayOnOneLine) {
   ::testing::internal::CaptureStderr();
   std::vector<std::thread> workers;
+  workers.reserve(8);
   for (int worker = 0; worker < 8; ++worker) {
     workers.emplace_back([worker] {
       const std::string marker(256, static_cast<char>('A' + worker));
@@ -49,7 +50,9 @@ TEST(LogMessageTest, AuditConcurrentMessagesStayOnOneLine) {
       }
     });
   }
-  for (auto& worker : workers) worker.join();
+  for (auto& worker : workers) {
+    worker.join();
+  }
   std::istringstream output(::testing::internal::GetCapturedStderr());
   std::string line;
   size_t count = 0;

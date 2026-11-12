@@ -15,8 +15,15 @@ struct DistinctRowEqual {
   bool operator()(const Row& left, const Row& right) const;
 };
 
+// Hash consistent with DistinctRowEqual: a case-insensitive VARCHAR hashes
+// its folded text, so 'ABC' and 'abc' (equal once folded) share a bucket.
+// std::hash<Row> hashes raw bytes and let CI peers slip into the set twice.
+struct DistinctRowHash {
+  size_t operator()(const Row& row) const;
+};
+
 using DistinctRowSet =
-    std::unordered_set<Row, std::hash<Row>, DistinctRowEqual>;
+    std::unordered_set<Row, DistinctRowHash, DistinctRowEqual>;
 
 class DistinctExecutor : public ExecutorBase {
  public:

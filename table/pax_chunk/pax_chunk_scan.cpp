@@ -841,9 +841,8 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
   uint64_t cnt = 0;
   uint64_t sum = 0;  // two's-complement u64 accumulator
   if (op == PaxChunk::CompareOp::kEq) {
-    // EQ is one binary search + one frequency read when the literal is hot
-    // (the tail cannot match: exceptions are non-hot by construction), and
-    // the tail alone when it is not -- never both halves.
+    // EQ is one binary search + one frequency read for the hot half, plus
+    // the exception tail (see below).
     uint32_t lo = 0;
     uint32_t hi = d;
     while (lo < hi) {
@@ -859,11 +858,14 @@ bool TopKRegionCountSum(const char* region, uint32_t n, uint32_t param,
           ReadBE16(region + 124 + (static_cast<size_t>(lo) * 2));
       cnt = fq;
       sum = static_cast<uint64_t>(hot_at(lo)) * fq;
-    } else {
-      eval_tail();
-      cnt = tail_cnt;
-      sum = tail_sum;
     }
+    // "Exceptions are never hot" is an encoder invariant that ValidateWalk
+    // does not re-check (it never decodes the exception values), while the
+    // decode path counts a hostile exception equal to a hot value. Always
+    // fold the tail so this fast path agrees with the decode path.
+    eval_tail();
+    cnt += tail_cnt;
+    sum += tail_sum;
   } else {
     // Hot fold: each entry is one compare + one count read; the ascending
     // order makes the passing codes one contiguous run but a linear scan is

@@ -2,6 +2,7 @@
 #include "common/parallel_work.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -46,13 +47,14 @@ Status Invoke(const std::function<void(size_t)>& task, size_t index) {
 struct TaskBatch {
   const std::function<void(size_t)>& task;
   size_t count;
-  size_t next{1};    // guarded by the pool mutex
-  size_t remaining;  // guarded by the completion mutex
+  size_t next{1};  // guarded by the pool mutex
+  std::atomic<size_t> remaining;
   QueryParallelismBudget budget{query_parallelism_budget};
   std::optional<platform::CpuSet> affinity{platform::CpuSet::CurrentThread()};
   std::mutex mutex{};
   std::condition_variable done{};
   Status error{Status::kSuccess};
+  bool completed{false};  // guarded by `mutex`
 };
 
 class ParallelPool {
@@ -72,20 +74,29 @@ class ParallelPool {
   }
 
   bool Submit(TaskBatch* batch) {
-    std::scoped_lock lock(mutex_);
-    const size_t helpers = std::min<size_t>(
-        batch->count - 1, std::max(1U, std::thread::hardware_concurrency()));
-    try {
-      while (threads_.size() < helpers) {
-        threads_.emplace_back([this] { Work(); });
+    size_t helpers = 0;
+    bool wake_all = false;
+    {
+      std::scoped_lock lock(mutex_);
+      helpers = std::min<size_t>(
+          batch->count - 1, std::max(1U, std::thread::hardware_concurrency()));
+      try {
+        while (threads_.size() < helpers) {
+          threads_.emplace_back([this] { Work(); });
+        }
+        batches_.push_back(batch);
+      } catch (...) {
+        // No work was published; the caller can execute all indices serially.
+        return false;
       }
-      batches_.push_back(batch);
-    } catch (...) {
-      // No work was published; the caller can execute all indices serially.
-      return false;
+      wake_all = (helpers >= threads_.size());
     }
-    for (size_t index = 0; index < helpers; ++index) {
-      ready_.notify_one();
+    if (wake_all) {
+      ready_.notify_all();
+    } else {
+      for (size_t index = 0; index < helpers; ++index) {
+        ready_.notify_one();
+      }
     }
     return true;
   }
@@ -123,13 +134,19 @@ class ParallelPool {
                                            budget.snapshot_reads);
         error = Invoke(batch->task, index);
       }
-      // Notify under this lock: after the final unlock the coordinator may
-      // destroy the batch, so the helper must never touch it again.
-      std::scoped_lock lock(batch->mutex);
-      if (batch->error.ok() && !error.ok()) {
-        batch->error = error;
+      if (!error.ok()) {
+        std::scoped_lock lock(batch->mutex);
+        if (batch->error.ok()) {
+          batch->error = error;
+        }
       }
-      if (--batch->remaining == 0) {
+      // Only the final helper takes `batch->mutex` to publish `completed` and
+      // notify: non-final helpers finish lock-free, and the coordinator waits
+      // on `completed` under `batch->mutex` so `batch` cannot be destroyed
+      // before this final unlock completes.
+      if (batch->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::scoped_lock lock(batch->mutex);
+        batch->completed = true;
         batch->done.notify_one();
       }
     }
@@ -143,6 +160,16 @@ class ParallelPool {
 };
 }  // namespace
 
+size_t ParallelWorkerCount(size_t tasks) {
+  size_t available = std::max(1U, std::thread::hardware_concurrency());
+  if (const auto cpus = platform::CpuSet::CurrentThread();
+      cpus && cpus->Count() > 0) {
+    available = std::min(available, static_cast<size_t>(cpus->Count()));
+  }
+  return std::min(std::max<size_t>(1, tasks),
+                  QueryParallelWorkerLimit(available));
+}
+
 Status RunParallelTasks(size_t count, const std::function<void(size_t)>& task) {
   if (count > 1 && !running_parallel_task) {
     TaskBatch batch{.task = task, .count = count, .remaining = count - 1};
@@ -150,7 +177,7 @@ Status RunParallelTasks(size_t count, const std::function<void(size_t)>& task) {
     if (pool.Submit(&batch)) {
       const Status caller_error = Invoke(task, 0);
       std::unique_lock lock(batch.mutex);
-      batch.done.wait(lock, [&] { return batch.remaining == 0; });
+      batch.done.wait(lock, [&] { return batch.completed; });
       return caller_error.ok() ? batch.error : caller_error;
     }
   }

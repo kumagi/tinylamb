@@ -5,12 +5,15 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -35,6 +38,7 @@
 #include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
@@ -86,6 +90,22 @@ namespace {
 
 using WindowNodeMap = std::map<const WindowFunctionCallExpression*,
                                size_t>;  // sorted: stable $win naming
+
+struct PhaseTimer {
+  double* slot{nullptr};
+  std::chrono::steady_clock::time_point begin{std::chrono::steady_clock::now()};
+  explicit PhaseTimer(double* slot_in) : slot(slot_in) {}
+  ~PhaseTimer() {
+    if (slot == nullptr) {
+      return;
+    }
+    *slot += std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - begin)
+                 .count();
+  }
+  PhaseTimer(const PhaseTimer&) = delete;
+  PhaseTimer& operator=(const PhaseTimer&) = delete;
+};
 
 const WindowFunctionCallExpression* AsWindow(const Expression& expression) {
   if (expression && expression->Type() == TypeTag::kWindowFunctionExp) {
@@ -1069,9 +1089,11 @@ struct WindowRuntime {
       Scope scope{.row = &row, .schema = schema, .outer = outer};
       // AGG(x WHERE cond) OVER (...): skip rows failing the filter.
       if (window.where_filter) {
-        StatusOr<Value> keep_or =
-            TryEvaluate(window.where_filter, scope, nullptr, context, *ctes);
-        const Value keep = keep_or.HasValue() ? keep_or.MoveValue() : Value();
+        // A raising filter is a query error, exactly as for the grouped
+        // AGG(x WHERE cond) path; it must not silently shrink the frame.
+        ASSIGN_OR_RETURN(
+            Value, keep,
+            (TryEvaluate(window.where_filter, scope, nullptr, context, *ctes)));
         if (!Truthy(keep)) {
           continue;
         }
@@ -1530,7 +1552,9 @@ struct WindowRuntime {
       return Value(acc);
     }
     const auto numeric_of = [&](const Value& v) -> StatusOr<double> {
-      if (v.type == ValueType::kDouble) return v.value.double_value;
+      if (v.type == ValueType::kDouble) {
+        return v.value.double_value;
+      }
       if (v.type == ValueType::kInt64) {
         return v.IsUnsigned() ? static_cast<double>(
                                     static_cast<uint64_t>(v.value.int_value))
@@ -1960,7 +1984,13 @@ std::string WindowLayoutKey(const WindowFunctionCallExpression& window) {
 
 StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     const WindowFunctionCallExpression& window, std::vector<Row>& rows,
-    const WindowRuntime& runtime) {
+    const WindowRuntime& runtime,
+    std::optional<size_t> rank_bound = std::nullopt) {
+  double* layout_ms = nullptr;
+  if (auto* runtime_stats = runtime.context.execution_runtime()) {
+    layout_ms = &runtime_stats->window_layout_ms;
+  }
+  PhaseTimer layout_timer(layout_ms);
   WindowOrderLayout layout;
   const auto column_offset =
       [&](const Expression& expression) -> std::optional<size_t> {
@@ -2006,19 +2036,113 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
   size_t integer_column = 0;
   const auto single_partition =
       partition_offsets.size() == 1 ? partition_offsets.front() : std::nullopt;
+  bool prove_integer_partition = false;
+  ValueType partition_type = ValueType::kNull;
   if (single_partition) {
     integer_column = *single_partition;
     const auto& column = runtime.schema->GetColumn(integer_column);
-    integer_partition =
-        !column.IsUnsigned() &&
-        (column.Type() == ValueType::kInt64 ||
-         column.Type() == ValueType::kDate) &&
-        std::ranges::all_of(rows, [&](const Row& row) {
-          const auto& value = row[integer_column];
-          return value.IsNull() ||
-                 (value.type == column.Type() && !value.IsUnsigned());
-        });
+    partition_type = column.Type();
+    prove_integer_partition =
+        !column.IsUnsigned() && (partition_type == ValueType::kInt64 ||
+                                 partition_type == ValueType::kDate);
   }
+  bool prove_direct_order =
+      !order_offsets.empty() &&
+      std::ranges::all_of(
+          order_offsets, [](const auto& offset) { return offset.has_value(); });
+  const auto integer_order_slot =
+      prove_direct_order && order_offsets.size() == 1 ? order_offsets.front()
+                                                      : std::nullopt;
+  bool prove_integer_order = false;
+  bool prove_double_order = false;
+  ValueType order_type = ValueType::kNull;
+  if (integer_order_slot) {
+    const auto& column = runtime.schema->GetColumn(*integer_order_slot);
+    order_type = column.Type();
+    prove_integer_order =
+        !column.IsUnsigned() &&
+        (order_type == ValueType::kInt64 || order_type == ValueType::kDate);
+    // A schema/runtime mismatch can still be an all-double column. Prove both
+    // and keep double only when the integer proof fails, matching the old
+    // separate scans.
+    prove_double_order = true;
+  }
+  // One pass proves every numeric fast path. Separate scans reread the same
+  // rows once per flag; a window over hundreds of thousands of groups was
+  // spending the layout on those proofs. The same pass records the integer
+  // partition domain so a compact key can use an array instead of a hash.
+  int64_t partition_min = 0;
+  int64_t partition_max = 0;
+  bool saw_partition_key = false;
+  if (prove_integer_partition || prove_direct_order || prove_integer_order ||
+      prove_double_order) {
+    for (const Row& row : rows) {
+      if (prove_integer_partition) {
+        const Value& value = row[integer_column];
+        if (!value.IsNull() &&
+            (value.type != partition_type || value.IsUnsigned())) {
+          prove_integer_partition = false;
+        } else if (!value.IsNull()) {
+          if (!saw_partition_key) {
+            partition_min = value.value.int_value;
+            partition_max = value.value.int_value;
+            saw_partition_key = true;
+          } else {
+            partition_min = std::min(partition_min, value.value.int_value);
+            partition_max = std::max(partition_max, value.value.int_value);
+          }
+        }
+      }
+      if (prove_direct_order) {
+        for (const auto& offset : order_offsets) {
+          const auto type = row[*offset].type;
+          if (type != ValueType::kNull && type != ValueType::kInt64 &&
+              type != ValueType::kDate && type != ValueType::kDouble) {
+            prove_direct_order = false;
+            prove_integer_order = false;
+            prove_double_order = false;
+            break;
+          }
+        }
+      }
+      if (prove_integer_order) {
+        const Value& value = row[*integer_order_slot];
+        if (!value.IsNull() &&
+            (value.type != order_type || value.IsUnsigned())) {
+          prove_integer_order = false;
+        }
+      }
+      if (prove_double_order) {
+        const Value& value = row[*integer_order_slot];
+        if (!value.IsNull() && value.type != ValueType::kDouble) {
+          prove_double_order = false;
+        }
+      }
+      if (!prove_integer_partition && !prove_direct_order &&
+          !prove_integer_order && !prove_double_order) {
+        break;
+      }
+    }
+  }
+  integer_partition = prove_integer_partition;
+  std::vector<uint32_t> dense_partition;
+  int64_t dense_partition_lo = 0;
+  bool use_dense_partition = false;
+  if (integer_partition && saw_partition_key &&
+      partition_max >= partition_min) {
+    const uint64_t span = static_cast<uint64_t>(partition_max) -
+                          static_cast<uint64_t>(partition_min);
+    if (span <= 1000000 &&
+        (rows.size() == 0 || span <= rows.size() * 4 || span <= 65536)) {
+      dense_partition.assign(static_cast<size_t>(span) + 1, UINT32_MAX);
+      dense_partition_lo = partition_min;
+      use_dense_partition = true;
+    }
+  }
+  const bool direct_order = prove_direct_order;
+  const bool integer_order = prove_integer_order && direct_order;
+  const bool double_order =
+      prove_double_order && direct_order && !integer_order;
   const bool direct_partition = std::ranges::all_of(
       partition_offsets, [](const auto& offset) { return offset.has_value(); });
   std::vector<size_t> direct_partition_columns;
@@ -2048,6 +2172,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
       direct_groups(0, hash_direct_partition, equal_direct_partition);
   FlatIntKeyMap<size_t> integer_groups;
   std::optional<size_t> null_partition;
+  const auto partition_started = std::chrono::steady_clock::now();
   for (size_t i = 0; i < rows.size(); ++i) {
     if (integer_partition) {
       const auto& value = rows[i][integer_column];
@@ -2058,6 +2183,14 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
           layout.partitions.emplace_back();
         }
         group = *null_partition;
+      } else if (use_dense_partition) {
+        uint32_t& slot = dense_partition[static_cast<size_t>(
+            value.value.int_value - dense_partition_lo)];
+        if (slot == UINT32_MAX) {
+          slot = static_cast<uint32_t>(layout.partitions.size());
+          layout.partitions.emplace_back();
+        }
+        group = slot;
       } else {
         bool inserted = false;
         auto* slot =
@@ -2098,38 +2231,15 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
     }
     layout.partitions[entry->second].ordered.push_back(i);
   }
+  if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
+      rows.size() >= 100000) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - partition_started)
+                          .count();
+    std::cerr << "[window] partition rows=" << rows.size()
+              << " parts=" << layout.partitions.size() << " ms=" << ms << "\n";
+  }
 
-  // Plain numeric ordering keys can be read from the input while sorting
-  // member indices. This avoids building and permuting a second key matrix
-  // (and two index arrays) for every small partition.
-  const bool direct_order =
-      !order_offsets.empty() &&
-      std::ranges::all_of(order_offsets, [&](const auto& offset) {
-        return offset && std::ranges::all_of(rows, [&](const Row& row) {
-                 const auto type = row[*offset].type;
-                 return type == ValueType::kNull || type == ValueType::kInt64 ||
-                        type == ValueType::kDate || type == ValueType::kDouble;
-               });
-      });
-  const auto integer_order_slot = direct_order && order_offsets.size() == 1
-                                      ? order_offsets.front()
-                                      : std::nullopt;
-  const bool integer_order =
-      integer_order_slot && std::ranges::all_of(rows, [&](const Row& row) {
-        const auto& value = row[*integer_order_slot];
-        const auto expected =
-            runtime.schema->GetColumn(*integer_order_slot).Type();
-        return value.IsNull() ||
-               ((expected == ValueType::kInt64 ||
-                 expected == ValueType::kDate) &&
-                value.type == expected && !value.IsUnsigned());
-      });
-  const bool double_order =
-      integer_order_slot && !integer_order &&
-      std::ranges::all_of(rows, [&](const Row& row) {
-        const auto& value = row[*integer_order_slot];
-        return value.IsNull() || value.type == ValueType::kDouble;
-      });
   // Sorting row indices otherwise follows two pointers to a tagged Value
   // at every comparison. Encode a proven numeric column once into compact
   // sortable keys; original row indices break ties in encounter order.
@@ -2172,18 +2282,43 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
       const bool ascending = window.order_by[0].ascending;
       const bool nulls_first =
           window.order_by[0].nulls_first.value_or(ascending);
+      const auto key_less = [&](size_t a, size_t b) {
+        if (numeric_has_null &&
+            (numeric_nulls[a] != 0 || numeric_nulls[b] != 0)) {
+          return numeric_nulls[a] != numeric_nulls[b] &&
+                 (numeric_nulls[a] != 0) == nulls_first;
+        }
+        const uint64_t x = numeric_keys[a];
+        const uint64_t y = numeric_keys[b];
+        return ascending ? x < y : x > y;
+      };
+      const auto ordered_less = [&](size_t a, size_t b) {
+        if (numeric_has_null &&
+            (numeric_nulls[a] != 0 || numeric_nulls[b] != 0)) {
+          return numeric_nulls[a] == numeric_nulls[b]
+                     ? a < b
+                     : (numeric_nulls[a] != 0) == nulls_first;
+        }
+        const uint64_t x = numeric_keys[a];
+        const uint64_t y = numeric_keys[b];
+        return x == y ? a < b : (ascending ? x < y : x > y);
+      };
+      if (rank_bound && *rank_bound < partition.ordered.size()) {
+        // Rank counts rows before a peer group. The Kth row identifies the
+        // final required peer; retain every tie, even beyond K, before the
+        // stable-by-input-position sort. No floating arithmetic is changed.
+        auto nth = partition.ordered.begin() +
+                   static_cast<std::ptrdiff_t>(*rank_bound - 1);
+        std::nth_element(partition.ordered.begin(), nth,
+                         partition.ordered.end(), ordered_less);
+        const size_t boundary = *nth;
+        const auto end = std::partition(
+            partition.ordered.begin(), partition.ordered.end(),
+            [&](size_t row) { return !key_less(boundary, row); });
+        partition.ordered.erase(end, partition.ordered.end());
+      }
       std::sort(partition.ordered.begin(), partition.ordered.end(),
-                [&](size_t a, size_t b) {
-                  if (numeric_has_null &&
-                      (numeric_nulls[a] != 0 || numeric_nulls[b] != 0)) {
-                    return numeric_nulls[a] == numeric_nulls[b]
-                               ? a < b
-                               : (numeric_nulls[a] != 0) == nulls_first;
-                  }
-                  const uint64_t x = numeric_keys[a];
-                  const uint64_t y = numeric_keys[b];
-                  return x == y ? a < b : (ascending ? x < y : x > y);
-                });
+                ordered_less);
 
       partition.order_values =
           WindowOrderValues(rows, partition.ordered, *integer_order_slot);
@@ -2967,6 +3102,11 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                      const SelectStatement& statement,
                                      Relation&& input, const Scope* outer,
                                      const CteMap& ctes) {
+  double* window_ms = nullptr;
+  if (auto* runtime_stats = context.execution_runtime()) {
+    window_ms = &runtime_stats->window_ms;
+  }
+  PhaseTimer window_timer(window_ms);
   WindowedInput result;
   result.statement = std::make_shared<SelectStatement>(statement);
 
@@ -2994,6 +3134,46 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
     return result;
   }
 
+  std::optional<size_t> rank_bound;
+  static const bool rank_bound_disabled =
+      std::getenv("TINYLAMB_DISABLE_RANK_BOUND") != nullptr;
+  if (!rank_bound_disabled && windows.size() == 1 && statement.Qualify()) {
+    const auto* window = windows.begin()->first;
+    std::unordered_map<std::string, Expression> aliases;
+    for (const auto& projection : statement.SelectList()) {
+      if (!projection.name.empty()) {
+        aliases.emplace(projection.name, projection.expression);
+      }
+    }
+    const auto qualify =
+        InlineAliases(statement.Qualify(), aliases, input.schema);
+    if (window->function == "RANK" && window->args.empty() &&
+        !window->where_filter && !window->distinct &&
+        window->inner_order_by.empty() && !window->inner_limit &&
+        !window->has_frame && !window->order_by.empty() &&
+        qualify->Type() == TypeTag::kBinaryExp) {
+      const auto& predicate = qualify->AsBinaryExpression();
+      if (AsWindow(predicate.Left()) == window && predicate.Right() &&
+          predicate.Right()->Type() == TypeTag::kConstantValue &&
+          (predicate.Op() == BinaryOperation::kLessThanEquals ||
+           predicate.Op() == BinaryOperation::kLessThan)) {
+        const auto& value = predicate.Right()->AsConstantValue().GetValue();
+        if (value.type == ValueType::kInt64 && !value.IsUnsigned() &&
+            value.value.int_value > 0) {
+          const int64_t bound =
+              value.value.int_value -
+              (predicate.Op() == BinaryOperation::kLessThan ? 1 : 0);
+          if (bound > 0 && std::in_range<size_t>(bound)) {
+            rank_bound = static_cast<size_t>(bound);
+            if (auto* runtime_stats = context.execution_runtime()) {
+              ++runtime_stats->rank_bounds;
+            }
+          }
+        }
+      }
+    }
+  }
+
   RETURN_IF_FAIL(input.FinishSpill());
   RETURN_IF_FAIL(input.GetStatus());
   std::vector<Row> rows;
@@ -3005,6 +3185,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
     rows.reserve(input.TotalRows());
     RETURN_IF_FAIL(
         input.ForEachRow([&rows](const Row& row) { rows.push_back(row); }));
+  }
+  if (auto* runtime_stats = context.execution_runtime()) {
+    runtime_stats->window_input_rows += rows.size();
   }
   const Schema base_schema = input.schema;
 
@@ -3034,8 +3217,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                             .outer = outer,
                             .ctes = &ctes,
                             .schema = &base_schema};
-      ASSIGN_OR_RETURN(WindowOrderLayout, built_layout,
-                       (BuildWindowOrderLayout(*window_node, rows, runtime)));
+      ASSIGN_OR_RETURN(
+          WindowOrderLayout, built_layout,
+          (BuildWindowOrderLayout(*window_node, rows, runtime, rank_bound)));
       layout_it->second = std::move(built_layout);
     }
     computed.emplace_back();
@@ -3043,17 +3227,43 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
                                         base_schema, outer, ctes,
                                         &computed.back(), &layout_it->second));
   }
-  for (size_t r = 0; r < rows.size(); ++r) {
-    rows[r].values_.reserve(base_width + windows.size());
-    for (size_t w = 0; w < windows.size(); ++w) {
-      rows[r].values_.push_back(std::move(computed[w][r]));
+  std::vector<uint8_t> retained;
+  if (rank_bound) {
+    retained.resize(rows.size());
+    for (size_t r = 0; r < rows.size(); ++r) {
+      const auto& rank = computed.front()[r];
+      retained[r] = static_cast<uint8_t>(
+          !rank.IsNull() &&
+          std::cmp_less_equal(rank.value.int_value, *rank_bound));
     }
   }
+  const size_t append_workers =
+      rows.size() < 16384
+          ? 1
+          : std::min<size_t>(
+                {8, rows.size() / 8192,
+                 QueryParallelWorkerLimit(std::thread::hardware_concurrency())});
+  RETURN_IF_FAIL(RunParallelTasks(append_workers, [&](size_t worker) {
+    const size_t begin = rows.size() * worker / append_workers;
+    const size_t end = rows.size() * (worker + 1) / append_workers;
+    for (size_t r = begin; r < end; ++r) {
+      if (rank_bound && retained[r] == 0) {
+        continue;
+      }
+      rows[r].values_.reserve(base_width + windows.size());
+      for (size_t w = 0; w < windows.size(); ++w) {
+        rows[r].values_.push_back(std::move(computed[w][r]));
+      }
+    }
+  }));
   // Fix hidden column types from the computed values.
   for (size_t w = 0; w < windows.size(); ++w) {
     Column& column = extended_columns[base_width + w];
-    for (const Row& row : rows) {
-      const Value& candidate = row.values_[base_width + w];
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (rank_bound && retained[r] == 0) {
+        continue;
+      }
+      const Value& candidate = rows[r].values_[base_width + w];
       if (!candidate.IsNull() && candidate.type != ValueType::kNull) {
         column = Column(column.Name(), ValueTypeOf(candidate));
         break;
@@ -3061,15 +3271,35 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
     }
   }
 
+  // The window columns were appended to the input rows. Rebuilding the
+  // relation one AddRow at a time recharges and recopies every survivor.
+  // Keep the existing charge when every row survives and nothing spilled.
+  const size_t extra_charge = rows.size() * windows.size() * 48;
+  const bool reuse_input =
+      !rank_bound && !input.HasSpill() &&
+      (extra_charge == 0 ||
+       QueryMemoryBudget::Global().CanReserve(extra_charge));
   Relation extended(context.execution_runtime());
-  extended.schema = Schema("", std::move(extended_columns));
-  CopyExecutionStats(&extended, input);
-  input.ResetContents();
-  for (Row& row : rows) {
-    extended.AddRow(std::move(row));
+  if (reuse_input) {
+    if (extra_charge != 0) {
+      QueryMemoryBudget::Global().ReserveForced(extra_charge);
+      input.charged_bytes_ += extra_charge;
+    }
+    input.rows = std::move(rows);
+    input.schema = Schema("", std::move(extended_columns));
+  } else {
+    extended.schema = Schema("", std::move(extended_columns));
+    CopyExecutionStats(&extended, input);
+    input.ResetContents();
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (!rank_bound || retained[r] != 0) {
+        extended.AddRow(std::move(rows[r]));
+      }
+    }
   }
-  RETURN_IF_FAIL(extended.FinishSpill());
-  RETURN_IF_FAIL(extended.GetStatus());
+  Relation& window_output = reuse_input ? input : extended;
+  RETURN_IF_FAIL(window_output.FinishSpill());
+  RETURN_IF_FAIL(window_output.GetStatus());
 
   // Rewrite the statement copy on top of a fresh replacement map (the map was
   // consumed by reference above).
@@ -3093,10 +3323,12 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
 
   if (statement.Qualify()) {
     Expression qualify = InlineAliases(
-        Rebuild(statement.Qualify(), replacements), aliases, extended.schema);
-    RETURN_IF_FAIL(FilterRelation(context, &extended, {qualify}, outer, ctes));
+        Rebuild(statement.Qualify(), replacements), aliases,
+        window_output.schema);
+    RETURN_IF_FAIL(
+        FilterRelation(context, &window_output, {qualify}, outer, ctes));
   }
-  result.input = std::move(extended);
+  result.input = std::move(window_output);
   result.hidden_columns = windows.size();
   return result;
 }

@@ -25,13 +25,17 @@ StatusOr<ForeignKeyCounts> BuildForeignKeyCounts(Table& parent,
                                                  size_t parent_offset) {
   ForeignKeyCounts counts;
   std::vector<slot_t> projection = {static_cast<slot_t>(parent_offset)};
-  for (auto it = parent.BeginFullScan(txn, projection); it.IsValid(); ++it) {
+  auto it = parent.BeginFullScan(txn, projection);
+  for (; it.IsValid(); ++it) {
     const Row& row = *it;
     if (row.values_.empty() || row[0].IsNull()) {
       continue;
     }
     ++counts[ForeignKeyString(row[0])];
   }
+  // IsValid() is also false after an I/O / corruption failure; a partial
+  // multiset would reject valid child keys.
+  RETURN_IF_FAIL(it.GetStatus());
   return counts;
 }
 
@@ -43,7 +47,8 @@ bool IsForeignKeyViolation(const ForeignKeyCounts& counts, const Value& key) {
   return found == counts.end() || found->second <= 0;
 }
 
-bool IsParentKeyReferenced(Table& child, Transaction& txn, size_t child_offset,
+StatusOr<bool> IsParentKeyReferenced(Table& child, Transaction& txn,
+                                     size_t child_offset,
                            const Value& parent_key,
                            const std::vector<RowPosition>& ignore) {
   if (parent_key.IsNull()) {
@@ -51,7 +56,8 @@ bool IsParentKeyReferenced(Table& child, Transaction& txn, size_t child_offset,
   }
   const std::string wanted = ForeignKeyString(parent_key);
   std::vector<slot_t> projection = {static_cast<slot_t>(child_offset)};
-  for (auto it = child.BeginFullScan(txn, projection); it.IsValid(); ++it) {
+  auto it = child.BeginFullScan(txn, projection);
+  for (; it.IsValid(); ++it) {
     if (!ignore.empty()) {
       bool skipped = false;
       for (const RowPosition& pos : ignore) {
@@ -72,6 +78,8 @@ bool IsParentKeyReferenced(Table& child, Transaction& txn, size_t child_offset,
       return true;
     }
   }
+  // A scan that stopped on an error proves nothing about the unread rows.
+  RETURN_IF_FAIL(it.GetStatus());
   return false;
 }
 

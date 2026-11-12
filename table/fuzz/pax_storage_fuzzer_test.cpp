@@ -80,6 +80,26 @@ TEST(PaxStorageFuzzerTest, MemcmpSeeds) {
   for (const auto& seed : MakeRowCodecSeeds()) {
     EXPECT_EQ(0, FuzzMemcmpOneInput(seed.data(), seed.size()));
   }
+  // Regression for crash-701fd9e9961b2a5720972128439912684e2205b3:
+  // kMemcomparableInterval (0x07) with all-zero 8-byte nanos/months payload
+  // decodes to INT64_MIN; IntervalValue::TryToString -> TryParse must round-
+  // trip INT64_MIN components without overflowing positive int64_t before
+  // applying the leading minus sign.
+  std::vector<uint8_t> interval_int64_min_repro(91, 0x00);
+  const std::vector<uint8_t> prefix = {
+      0x00, 0x00, 0x03, 0xff, 0xff, 0x49, 0x33, 0x32, 0x00, 0x00, 0x00, 0x07,
+      0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02};
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    interval_int64_min_repro[i] = prefix[i];
+  }
+  EXPECT_EQ(0, FuzzMemcmpOneInput(interval_int64_min_repro.data(),
+                                  interval_int64_min_repro.size()));
+
+  // Also test all-zero months, days, and nanos (all three = INT64_MIN).
+  std::vector<uint8_t> all_int64_min_interval(25, 0x00);
+  all_int64_min_interval[0] = 0x07;
+  EXPECT_EQ(0, FuzzMemcmpOneInput(all_int64_min_interval.data(),
+                                  all_int64_min_interval.size()));
 }
 
 TEST(PaxStorageFuzzerTest, PaxMutateSeeds) {

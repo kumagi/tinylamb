@@ -76,7 +76,6 @@ namespace tinylamb::relational_detail {
 
 namespace {
 
-constexpr size_t kParallelProbeMaxWorkers = 16;
 constexpr size_t kRawAggregateCapacity = 8;
 
 }  // namespace
@@ -200,6 +199,8 @@ struct FusedWorkerLocal {
   FlatIntKeyMap<size_t> int_offsets;
   std::vector<FusedGroup> groups;
   std::vector<CompactCountGroup> compact_counts;
+  size_t compact_count_inputs{0};
+  bool compact_count_log{false};
   std::deque<AggregateAccumulator> states;
   // Reusable probe key: avoids a fresh vector per probe row (see
   // accumulate_into).  The transparent group-key hash/equal pair accepts the
@@ -813,8 +814,8 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
               << " left_rows=" << effective_left_rows << "\n";
   }
   if (!disabled && fusion != nullptr && fusion->eligible &&
-      !fusion->aggregates.empty() && join_type == JoinType::kFull &&
-      deferred_left_probe == nullptr) {
+      !fusion->aggregates.empty() && !fusion->require_exact_integer_totals &&
+      join_type == JoinType::kFull && deferred_left_probe == nullptr) {
     return TryNullSignatureFullAggregate(context, left, right, predicates,
                                          outer, ctes, *fusion);
   }
@@ -1286,6 +1287,88 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
+  // A parent rollup may reassociate only exact partials. The Cartesian join
+  // bound covers duplicate build keys and LEFT padding without catalog PK
+  // assumptions; immutable scan bounds cover every possible filtered subset.
+  const auto exact_integer_total = [&](size_t aggregate) {
+    constexpr uint64_t kExactLimit = uint64_t{1} << 53;
+    const size_t build_bound = std::max<size_t>(1, right.rows.size());
+    if (effective_left_rows == 0 ||
+        effective_left_rows > kExactLimit / build_bound ||
+        child_shapes[aggregate].direct_column < 0) {
+      return false;
+    }
+    const uint64_t pairs =
+        static_cast<uint64_t>(effective_left_rows) * build_bound;
+    const auto slot =
+        static_cast<size_t>(child_shapes[aggregate].direct_column);
+    if (result.schema.GetColumn(slot).Type() != ValueType::kInt64 ||
+        result.schema.GetColumn(slot).IsUnsigned()) {
+      return false;
+    }
+    uint64_t maximum = 0;
+    const auto magnitude = [](int64_t value) {
+      const auto bits = static_cast<uint64_t>(value);
+      return value < 0 ? uint64_t{0} - bits : bits;
+    };
+    if (slot < left_width && deferred_left_probe != nullptr) {
+      const auto& probe = *deferred_left_probe;
+      if (!probe.store || slot >= probe.projection.size() ||
+          std::ranges::any_of(probe.pk_lookups, [&](const auto& lookup) {
+            return lookup.target_proj_col == slot;
+          })) {
+        return false;
+      }
+      const auto& store = *probe.store;
+      const slot_t column = probe.projection[slot];
+      if (!store.HasColumn(column) || store.blocks.empty() ||
+          column >= store.column_min_int.size() ||
+          column >= store.column_max_int.size() ||
+          column >= store.blocks.front().columns.size() ||
+          store.blocks.front().columns[column].type != ValueType::kInt64 ||
+          store.blocks.front().columns[column].is_unsigned ||
+          store.column_min_int[column] > store.column_max_int[column]) {
+        return false;
+      }
+      maximum = std::max(magnitude(store.column_min_int[column]),
+                         magnitude(store.column_max_int[column]));
+    } else {
+      const Relation& side = slot < left_width ? left : right;
+      const size_t column = slot < left_width ? slot : slot - left_width;
+      if (side.HasSpill()) {
+        return false;
+      }
+      for (const Row& row : side.rows) {
+        const Value& value = row[column];
+        if (value.IsNull()) {
+          continue;
+        }
+        if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
+          return false;
+        }
+        maximum = std::max(maximum, magnitude(value.value.int_value));
+      }
+    }
+    // Division avoids overflow even for INT64_MIN and excessive cardinality.
+    return maximum <= kExactLimit / pairs;
+  };
+  if (fusion->require_exact_integer_totals) {
+    const size_t build_bound = std::max<size_t>(1, right.rows.size());
+    if (!raw_sum_fusion ||
+        effective_left_rows > (uint64_t{1} << 53) / build_bound) {
+      return not_fusable("unproved partial totals");
+    }
+    for (size_t a = 0; a < fusion->aggregates.size(); ++a) {
+      if (raw_agg_kinds[a] == RawAggKind::kCountStar ||
+          raw_agg_kinds[a] == RawAggKind::kCountValue) {
+        continue;
+      }
+      if (raw_agg_kinds[a] != RawAggKind::kSumInt64 ||
+          !exact_integer_total(a)) {
+        return not_fusable("unproved partial integer sum");
+      }
+    }
+  }
   const bool skip_accumulator_states = raw_count_fusion || raw_sum_fusion;
   // For INNER joins over exact INT64/DATE equality keys, align join-key group
   // columns with the side that owns the remaining group keys so either
@@ -1751,7 +1834,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             std::chrono::days{static_cast<int>(c.value.int_value)}}};
         if (shape.extract_date_part == 0) {
           const int64_t year = static_cast<int>(ymd.year());
-          return Value(year >= -999 && year <= 9999 ? year : year / 10);
+          return Value(year);
         }
         if (shape.extract_date_part == 1) {
           return Value(
@@ -2388,14 +2471,39 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // A selective COUNT HAVING needs only a counter and borrowed key owners
   // while probing. Delay the much larger general aggregate state until the
   // worker counts have merged and the HAVING predicate has accepted a group.
+  std::optional<int64_t> compact_integer_threshold;
+  if (fusion->having && fusion->having->Type() == TypeTag::kBinaryExp) {
+    const auto& predicate = fusion->having->AsBinaryExpression();
+    if (predicate.Op() == BinaryOperation::kGreaterThan && predicate.Left() &&
+        predicate.Left()->Type() == TypeTag::kAggregateExp &&
+        predicate.Right() &&
+        predicate.Right()->Type() == TypeTag::kConstantValue &&
+        !ContainsParameterSlot(predicate.Right()) &&
+        std::ranges::find(fusion->aggregates,
+                          &predicate.Left()->AsAggregateExpression()) !=
+            fusion->aggregates.end()) {
+      const auto& threshold = predicate.Right()->AsConstantValue().GetValue();
+      if (threshold.type == ValueType::kInt64 && !threshold.IsUnsigned() &&
+          threshold.value.int_value >= 1) {
+        compact_integer_threshold = threshold.value.int_value;
+      }
+    }
+  }
   const bool compact_counts =
       raw_count_fusion && count_star_only && !bulk_raw_count &&
       all_direct_group_keys && !right.HasSpill() &&
       deferred_left_probe == nullptr && join_type == JoinType::kInner &&
-      fusion->post_having_active && !fusion->post_having_is_self_sum_factor &&
-      fusion->post_having_agg_slot == 0 &&
-      fusion->post_having_op == BinaryOperation::kGreaterThan &&
-      fusion->post_having_constant_or_factor >= 1.0;
+      (compact_integer_threshold.has_value() ||
+       (fusion->post_having_active && !fusion->post_having_is_self_sum_factor &&
+        fusion->post_having_agg_slot == 0 &&
+        fusion->post_having_op == BinaryOperation::kGreaterThan &&
+        fusion->post_having_constant_or_factor >= 1.0));
+  const auto compact_count_passes = [&](int64_t count) {
+    return compact_integer_threshold
+               ? count > *compact_integer_threshold
+               : static_cast<double>(count) >
+                     fusion->post_having_constant_or_factor;
+  };
   const auto compact_key_equal = [&](const CompactCountGroup& a,
                                      const CompactCountGroup& b) {
     return std::ranges::all_of(key_shapes, [&](const ProgramShape& shape) {
@@ -2482,7 +2590,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                   std::chrono::days{static_cast<int>(lv.value.int_value)}}};
               if (l_shape.extract_date_part == 0) {
                 const int64_t year = static_cast<int>(ymd.year());
-                l_val = year >= -999 && year <= 9999 ? year : year / 10;
+                l_val = year;
               } else if (l_shape.extract_date_part == 1) {
                 l_val =
                     static_cast<int64_t>(static_cast<unsigned>(ymd.month()));
@@ -2621,7 +2729,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                       std::chrono::days{static_cast<int>(c.value.int_value)}}};
                   if (key_shapes[key_index].extract_date_part == 0) {
                     const int64_t year = static_cast<int>(ymd.year());
-                    extracted = year >= -999 && year <= 9999 ? year : year / 10;
+                    extracted = year;
                   } else if (key_shapes[key_index].extract_date_part == 1) {
                     extracted = static_cast<int64_t>(
                         static_cast<unsigned>(ymd.month()));
@@ -2864,6 +2972,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     *out_group_index = group_index;
     return Status::kSuccess;
   };
+  bool compact_log_allowed = false;
   const auto accumulate_into = [&](FusedWorkerLocal& local, Row& scratch,
                                    const Row* left_row, const Row* right_row,
                                    bool masked,
@@ -2872,14 +2981,46 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       CompactCountGroup probe;
       probe.left = left_row;
       probe.right = right_row;
-      probe.hash = 0x9e3779b97f4a7c15ULL;
-      for (const auto& shape : key_shapes) {
-        const auto& value = get_pair_cell(
-            left_row, right_row, static_cast<slot_t>(shape.direct_column));
-        probe.hash = std::rotl(probe.hash, 7);
-        probe.hash ^= value.IsCaseInsensitive() ? DistinctValueHash{}(value)
-                                                : std::hash<Value>{}(value);
-        probe.hash *= 0x100000001b3ULL;
+      bool packed = false;
+      if (use_split_key_gid && left_row != nullptr && right_row != nullptr) {
+        const auto& value = (*left_row)[static_cast<size_t>(
+            key_shapes[split_left_k].direct_column)];
+        if (!value.IsNull() && !value.IsUnsigned() &&
+            (value.type == ValueType::kInt64 ||
+             value.type == ValueType::kDate) &&
+            std::in_range<int32_t>(value.value.int_value)) {
+          const uint32_t dimension = split_right_subgid[static_cast<size_t>(
+              right_row - right.rows.data())];
+          if (dimension != std::numeric_limits<uint32_t>::max()) {
+            probe.hash = (static_cast<uint64_t>(dimension) << 32U) |
+                         static_cast<uint32_t>(value.value.int_value);
+            packed = true;
+          }
+        }
+      }
+      if (!packed) {
+        probe.hash = 0x9e3779b97f4a7c15ULL;
+        for (const auto& shape : key_shapes) {
+          const auto& value = get_pair_cell(
+              left_row, right_row, static_cast<slot_t>(shape.direct_column));
+          probe.hash = std::rotl(probe.hash, 7);
+          probe.hash ^= value.IsCaseInsensitive() ? DistinctValueHash{}(value)
+                                                  : std::hash<Value>{}(value);
+          probe.hash *= 0x100000001b3ULL;
+        }
+      }
+      // When nearly every pair is a new group, local hashing barely reduces
+      // the transfer. Keep the sampled partials, then append records for the
+      // owning merge partition to fold exactly once. The sample only chooses
+      // an algorithm; full key equality still decides every final group.
+      if (compact_log_allowed && local.compact_count_inputs == 1024) {
+        local.compact_count_log = local.compact_counts.size() >= 820;
+      }
+      ++local.compact_count_inputs;
+      if (local.compact_count_log) {
+        probe.count = 1;
+        local.compact_counts.push_back(probe);
+        return Status::kSuccess;
       }
       bool inserted = false;
       size_t* slot = local.int_offsets.TryEmplace(
@@ -3092,10 +3233,19 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   // Returns true when the pair passed every residual and was accumulated.
   // A residual-rejected pair is NOT a match: LEFT semantics must still
   // null-extend the outer row when every bucket pair for it was rejected.
+  // Direct raw aggregates read the probe and build rows themselves. Copying
+  // every joined cell into the scratch row is then pure overhead.
+  const bool scratch_unused =
+      residual_programs.empty() && all_direct_group_keys && raw_sum_fusion &&
+      std::ranges::all_of(child_shapes, [](const ProgramShape& shape) {
+        return shape.direct_column >= 0;
+      });
   const auto process_pair =
       [&](FusedWorkerLocal& local, const Row& left_row, const Row& right_row,
           Row& scratch, size_t* cached_group = nullptr) -> StatusOr<bool> {
-    fill_scratch(scratch, left_row, &right_row);
+    if (!scratch_unused) {
+      fill_scratch(scratch, left_row, &right_row);
+    }
     for (size_t i = 0; i < residual_programs.size(); ++i) {
       ASSIGN_OR_RETURN(Value, verdict,
                        EvaluateProgramValue(residual_programs[i],
@@ -3118,11 +3268,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       (left.HasSpill() || (int_group_key && int_group_slot < left_width &&
                            !bulk_raw_count && total_left < 96000))
           ? 1
-          : std::max<size_t>(
-                1, std::min<size_t>({kParallelProbeMaxWorkers,
-                                     QueryParallelWorkerLimit(
-                                         std::thread::hardware_concurrency()),
-                                     ((total_left / 16384)) + 1}));
+          : ParallelWorkerCount((total_left / 16384) + 1);
   std::vector<FusedWorkerLocal> locals(workers);
   std::shared_ptr<QueryMemoryCharge> group_capacity_charge;
   if (all_direct_group_keys && !right_only_group_keys &&
@@ -3487,6 +3633,20 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     build_buckets();
   }
 
+  // A proven unique build bounds the append log by the number of probe
+  // rows. Charge vector growth slack before enabling it, and retain local
+  // aggregation when the query memory budget cannot cover the log.
+  static const bool compact_log_disabled =
+      std::getenv("TINYLAMB_DISABLE_COMPACT_COUNT_LOG") != nullptr;
+  auto compact_log_charge =
+      compact_counts && !compact_log_disabled && workers > 1 &&
+              !left.HasSpill() &&
+              (use_dense_int_rows || use_unique_int_table) &&
+              total_left <= SIZE_MAX / (2 * sizeof(CompactCountGroup))
+          ? TryReserveQueryMemory(total_left * 2 * sizeof(CompactCountGroup))
+          : nullptr;
+  compact_log_allowed = compact_log_charge != nullptr;
+
   constexpr uint32_t kInvalidGid = std::numeric_limits<uint32_t>::max();
   std::vector<uint32_t> right_row_gid;
   FusedRawArena pre_raw_arena;
@@ -3619,8 +3779,22 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
   }
-  const bool use_shared_direct_gid =
+  // One shared group array takes a lock on every probe row. Multi-aggregate
+  // probes keep a private partial per worker and fold them once. A lone
+  // SUM(double) stays on the shared input-ordered log so its prefixes do
+  // not change. Huge domains keep the shared array.
+  const bool many_direct_groups =
       use_direct_gid_agg && pre_group_count > 4096 && workers > 1;
+  const size_t private_partial_bytes =
+      workers * pre_group_count * std::max<size_t>(agg_count, 1) * 32;
+  // A lone SUM(double) keeps one shared array when the probe must follow
+  // input order. A deferred fact probe has no row order to preserve, so each
+  // worker keeps its own partial and the cells are added without a lock.
+  const bool private_partials =
+      many_direct_groups &&
+      (!single_double_sum || deferred_left_probe != nullptr) &&
+      private_partial_bytes <= (size_t{256} << 20);
+  const bool use_shared_direct_gid = many_direct_groups && !private_partials;
   const size_t direct_gid_worker_count =
       use_direct_gid_agg ? (use_shared_direct_gid ? 1 : workers) : 0;
   std::vector<DirectGidWorker> direct_gid_workers(direct_gid_worker_count);
@@ -3676,7 +3850,10 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     if (gid == kInvalidGid) [[unlikely]] {
       return Status::kSuccess;
     }
-    if (!mask_scratch || !scratch_cells.empty()) {
+    // The group id is already the build row's. COUNT(*) never reads a cell,
+    // so copying key strings into the scratch row on every fact row is wasted
+    // (Q23's item-description grouping).
+    if (!count_star_only && (!mask_scratch || !scratch_cells.empty())) {
       for (const slot_t cell : scratch_cells) {
         scratch.values_[cell] = cell < left_width
                                     ? left_row.values_[cell]
@@ -3906,11 +4083,22 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   std::vector<uint8_t> def_overwritten_by_pk;
   std::vector<PreparedDeferredPkLookup> prepared_pk_lookups;
   std::atomic<size_t> next_def_block{0};
+  // A global numeric aggregate whose dimension was absorbed into the
+  // runtime filter has no join key left. The fact stays columnar and every
+  // surviving row charges the single group. Grouped queries keep the keyed
+  // probe; a failed proof materializes the fact as before.
+  const bool scalar_fact_charge =
+      deferred_left_probe != nullptr && singleton_right_relation &&
+      fusion->group_keys.empty() && key_programs.empty() &&
+      equality_keys.empty() && deferred_left_probe->pk_lookups.empty() &&
+      deferred_left_probe->local_preds.empty() &&
+      deferred_left_probe->store != nullptr;
   if (deferred_left_probe != nullptr) {
-    if (join_type != JoinType::kInner || singleton_right_relation ||
-        left.HasSpill() || (!integer_key && !packed_2x32_int_key) ||
+    if (join_type != JoinType::kInner || left.HasSpill() ||
         deferred_left_probe->store == nullptr ||
-        deferred_left_probe->pk_lookups.size() > 4) {
+        deferred_left_probe->pk_lookups.size() > 4 ||
+        (singleton_right_relation && !scalar_fact_charge) ||
+        (!integer_key && !packed_2x32_int_key && !scalar_fact_charge)) {
       return not_fusable("deferred_left_probe unsupported");
     }
     const size_t base_proj_cols = deferred_left_probe->projection.size();
@@ -4006,8 +4194,208 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
 
+  // Preassigned groups already name the build row. Aggregates that only read
+  // left-side numeric columns can charge those cells without a scratch row
+  // or a bytecode evaluation.
+  struct LeftNumericAgg {
+    int32_t col0{-1};
+    int32_t col1{-1};
+    uint8_t op{255};
+    double scale{0};
+  };
+  std::array<LeftNumericAgg, kRawAggregateCapacity> left_numeric{};
+  bool left_numeric_probe = raw_sum_fusion && !ordered_sum_charge &&
+                            !use_partitioned_count_distinct && agg_count > 0 &&
+                            agg_count <= kRawAggregateCapacity;
+  const auto numeric_left_col = [&](int32_t col) {
+    if (col < 0 ||
+        std::cmp_greater_equal(static_cast<size_t>(col), left_width)) {
+      return false;
+    }
+    const Column& column = left.schema.GetColumn(static_cast<size_t>(col));
+    if (column.IsUnsigned()) {
+      return false;
+    }
+    const ValueType type = column.Type();
+    return type == ValueType::kInt64 || type == ValueType::kDouble;
+  };
+  const auto integer_left_col = [&](int32_t col) {
+    if (col < 0 ||
+        std::cmp_greater_equal(static_cast<size_t>(col), left_width)) {
+      return false;
+    }
+    const Column& column = left.schema.GetColumn(static_cast<size_t>(col));
+    return !column.IsUnsigned() && column.Type() == ValueType::kInt64;
+  };
+  if (left_numeric_probe) {
+    for (size_t i = 0; i < agg_count; ++i) {
+      if (child_shapes[i].case_cond != ProgramShape::CaseCondKind::kNone ||
+          child_shapes[i].profit_col0 >= 0) {
+        left_numeric_probe = false;
+        break;
+      }
+      LeftNumericAgg& op = left_numeric[i];
+      switch (raw_agg_kinds[i]) {
+        case RawAggKind::kCountStar:
+          op.op = 0;
+          break;
+        case RawAggKind::kConstantExtremum:
+          op.op = raw_constants[i].IsNull() ? 5 : 0;
+          break;
+        case RawAggKind::kCountValue:
+          if (numeric_left_col(child_shapes[i].direct_column)) {
+            op.op = 4;
+            op.col0 = child_shapes[i].direct_column;
+          } else if (numeric_left_col(child_shapes[i].mul_col0) &&
+                     numeric_left_col(child_shapes[i].mul_col1)) {
+            // COUNT(a * b): the product is NULL exactly when either factor is.
+            op.op = 7;
+            op.col0 = child_shapes[i].mul_col0;
+            op.col1 = child_shapes[i].mul_col1;
+          } else {
+            left_numeric_probe = false;
+          }
+          break;
+        case RawAggKind::kSumInt64:
+          if (!integer_left_col(child_shapes[i].direct_column)) {
+            left_numeric_probe = false;
+          } else {
+            op.op = 3;
+            op.col0 = child_shapes[i].direct_column;
+          }
+          break;
+        case RawAggKind::kSumDouble:
+        case RawAggKind::kAvgDouble:
+          if (child_shapes[i].mul_col0 >= 0 &&
+              numeric_left_col(child_shapes[i].mul_col0) &&
+              numeric_left_col(child_shapes[i].mul_col1)) {
+            op.op = 1;
+            op.col0 = child_shapes[i].mul_col0;
+            op.col1 = child_shapes[i].mul_col1;
+          } else if (child_shapes[i].mul_one_minus_col0 >= 0 &&
+                     numeric_left_col(child_shapes[i].mul_one_minus_col0) &&
+                     numeric_left_col(child_shapes[i].mul_one_minus_col1)) {
+            op.op = 6;
+            op.col0 = child_shapes[i].mul_one_minus_col0;
+            op.col1 = child_shapes[i].mul_one_minus_col1;
+            op.scale = child_shapes[i].mul_one_minus_const;
+          } else if (numeric_left_col(child_shapes[i].direct_column)) {
+            op.op = 2;
+            op.col0 = child_shapes[i].direct_column;
+          } else {
+            left_numeric_probe = false;
+          }
+          break;
+        default:
+          left_numeric_probe = false;
+          break;
+      }
+      if (!left_numeric_probe) {
+        break;
+      }
+    }
+  }
+  if (!(use_direct_gid_agg && !use_shared_direct_gid)) {
+    left_numeric_probe = false;
+  }
+  if (scalar_fact_charge) {
+    bool columns_ready = left_numeric_probe && prepared_pk_lookups.empty();
+    for (size_t i = 0; columns_ready && i < agg_count; ++i) {
+      const LeftNumericAgg& op = left_numeric[i];
+      const auto in_proj = [&](int32_t col) {
+        return col < 0 || (static_cast<size_t>(col) <
+                               deferred_left_probe->projection.size() &&
+                           def_overwritten_by_pk[col] == 0);
+      };
+      columns_ready = in_proj(op.col0) && in_proj(op.col1);
+    }
+    if (!columns_ready) {
+      return not_fusable("scalar fact charge");
+    }
+  }
+
   auto run_probe = [&](size_t w, FusedWorkerLocal& local,
                        Row& scratch) -> Status {
+    const auto add_dw_double = [](DirectGidWorker& dw, size_t slot, double dv) {
+      const double prev = dw.doubles[slot];
+      const double next = prev + dv;
+      if (std::isinf(next) && !std::isinf(prev) && !std::isinf(dv)) {
+        dw.inf_flags[slot] = 1;
+      }
+      dw.doubles[slot] = next;
+      dw.counts[slot] += 1;
+    };
+    const auto add_dw_int = [](DirectGidWorker& dw, size_t slot, int64_t iv) {
+      int64_t next = 0;
+      if (__builtin_add_overflow(dw.ints[slot], iv, &next)) {
+        dw.inf_flags[slot] = 1;
+      } else {
+        dw.ints[slot] = next;
+      }
+      dw.counts[slot] += 1;
+    };
+    const auto charge_numeric = [&](DirectGidWorker& dw, uint32_t gid,
+                                    auto&& as_double, auto&& as_int,
+                                    auto&& present) {
+      dw.matched[gid] = 1;
+      const size_t base = static_cast<size_t>(gid) * agg_count;
+      for (size_t i = 0; i < agg_count; ++i) {
+        const LeftNumericAgg& op = left_numeric[i];
+        const size_t slot = base + i;
+        switch (op.op) {
+          case 0:
+            dw.counts[slot] += 1;
+            break;
+          case 1:
+          case 6: {
+            double d0 = 0;
+            double d1 = 0;
+            if (!as_double(op.col0, &d0) || !as_double(op.col1, &d1)) {
+              break;
+            }
+            add_dw_double(dw, slot,
+                          op.op == 1 ? d0 * d1 : d0 * (op.scale - d1));
+            break;
+          }
+          case 2: {
+            double d0 = 0;
+            if (!as_double(op.col0, &d0)) {
+              break;
+            }
+            add_dw_double(dw, slot, d0);
+            break;
+          }
+          case 3: {
+            int64_t iv = 0;
+            if (!as_int(op.col0, &iv)) {
+              break;
+            }
+            add_dw_int(dw, slot, iv);
+            break;
+          }
+          case 4:
+            if (present(op.col0)) {
+              dw.counts[slot] += 1;
+            }
+            break;
+          case 7:
+            if (present(op.col0) && present(op.col1)) {
+              dw.counts[slot] += 1;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+    };
+    const Row* const right_base = right.rows.data();
+    const uint32_t* const right_gids =
+        identity_right_gid ? nullptr : right_row_gid.data();
+    const auto gid_of = [&](const Row* rptr) -> uint32_t {
+      const auto r_idx = static_cast<size_t>(rptr - right_base);
+      return right_gids == nullptr ? static_cast<uint32_t>(r_idx)
+                                   : right_gids[r_idx];
+    };
     if (deferred_left_probe != nullptr) {
       const LSTableStore& store = *deferred_left_probe->store;
       const size_t total_blocks = store.blocks.size();
@@ -4239,10 +4627,170 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
             return false;
         }
       };
+      if (scalar_fact_charge) {
+        DirectGidWorker& dw = direct_gid_workers[w];
+        while (true) {
+          const size_t bi =
+              next_def_block.fetch_add(1, std::memory_order_relaxed);
+          if (bi >= total_blocks) {
+            return Status::kSuccess;
+          }
+          const LSTablePageBlock& blk = store.blocks[bi];
+          if (blk.row_count == 0 ||
+              !blk.MatchesZoneMaps(peek_ptr, active_rf_group, full_rf_col)) {
+            continue;
+          }
+          for (size_t c = 0; c < base_proj_cols; ++c) {
+            const LSTableColumnBlock& cblk =
+                blk.columns[deferred_left_probe->projection[c]];
+            proj_cols[c] = &cblk;
+            proj_int_ptrs[c] = cblk.int_cells.data();
+            proj_has_null[c] = static_cast<uint8_t>(cblk.has_null);
+          }
+          const LSTableColumnBlock* const rf_col =
+              full_rf_col.has_value() ? &blk.columns[*full_rf_col] : nullptr;
+          struct ScalarExtraRf {
+            const LSTableColumnBlock* col{nullptr};
+            const uint64_t* dense_bits{nullptr};
+            int64_t lo{0};
+            int64_t hi{0};
+            bool has_null{false};
+            const RuntimeFilterGroup* group{nullptr};
+          };
+          std::array<ScalarExtraRf, 4> extra_rfs{};
+          size_t extra_rf_count = 0;
+          for (const ScanRuntimeFilter& ext : primary_rf.extra) {
+            if (!ext.enabled() || ext.column >= base_proj_cols ||
+                extra_rf_count >= extra_rfs.size()) {
+              continue;
+            }
+            const LSTableColumnBlock* ecol = proj_cols[ext.column];
+            const bool hd = ext.group->has_dense_bits();
+            extra_rfs[extra_rf_count++] = ScalarExtraRf{
+                .col = ecol,
+                .dense_bits = hd ? ext.group->dense_bits_data() : nullptr,
+                .lo = hd ? ext.group->Lo() : 0,
+                .hi = hd ? ext.group->Hi() : 0,
+                .has_null = ecol->has_null,
+                .group = ext.group.get(),
+            };
+          }
+          for (uint32_t r = 0; r < blk.row_count; ++r) {
+            if (std::ranges::any_of(deferred_left_probe->null_peeks,
+                                    [&](const NullPeekCompare& test) {
+                                      return blk.columns[test.column].IsNull(
+                                                 r) != test.expect_null;
+                                    })) {
+              continue;
+            }
+            if (rf_col != nullptr) {
+              if (rf_col->has_null && rf_col->IsNull(r)) {
+                continue;
+              }
+              const int64_t kv = rf_col->int_cells[r];
+              if (rf_has_dense) {
+                const uint64_t off =
+                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(rf_lo);
+                if (kv < rf_lo || kv > rf_hi ||
+                    (rf_dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
+                        0) {
+                  continue;
+                }
+              } else if (active_rf_group->Reject(kv)) {
+                continue;
+              }
+            }
+            bool extra_ok = true;
+            for (size_t ei = 0; ei < extra_rf_count; ++ei) {
+              const ScalarExtraRf& erf = extra_rfs[ei];
+              if (erf.has_null && erf.col->IsNull(r)) {
+                extra_ok = false;
+                break;
+              }
+              const int64_t kv = erf.col->int_cells[r];
+              if (erf.dense_bits != nullptr) {
+                if (kv < erf.lo || kv > erf.hi) {
+                  extra_ok = false;
+                  break;
+                }
+                const uint64_t off =
+                    static_cast<uint64_t>(kv) - static_cast<uint64_t>(erf.lo);
+                if ((erf.dense_bits[off >> 6] & (uint64_t{1} << (off & 63))) ==
+                    0) {
+                  extra_ok = false;
+                  break;
+                }
+              } else if (erf.group->Reject(kv)) {
+                extra_ok = false;
+                break;
+              }
+            }
+            if (!extra_ok) {
+              continue;
+            }
+            if (peek_ptr != nullptr) {
+              bool peek_ok = true;
+              for (const IntegerPeekCompare& pred : *peek_ptr) {
+                const LSTableColumnBlock& pcol = blk.columns[pred.column];
+                if ((pcol.has_null && pcol.IsNull(r)) ||
+                    !eval_int_peek(pred.op, pcol.int_cells[r], pred.constant)) {
+                  peek_ok = false;
+                  break;
+                }
+              }
+              if (!peek_ok) {
+                continue;
+              }
+            }
+            ++local.comparisons;
+            charge_numeric(
+                dw, 0,
+                [&](int32_t col, double* out) {
+                  if (proj_has_null[col] != 0 && proj_cols[col]->IsNull(r)) {
+                    return false;
+                  }
+                  const int64_t raw = proj_int_ptrs[col][r];
+                  if (def_base_types[col] == ValueType::kDouble) {
+                    *out = std::bit_cast<double>(raw);
+                  } else {
+                    *out = static_cast<double>(raw);
+                  }
+                  return true;
+                },
+                [&](int32_t col, int64_t* out) {
+                  if (proj_has_null[col] != 0 && proj_cols[col]->IsNull(r)) {
+                    return false;
+                  }
+                  *out = proj_int_ptrs[col][r];
+                  return true;
+                },
+                [&](int32_t col) {
+                  return proj_has_null[col] == 0 || !proj_cols[col]->IsNull(r);
+                });
+          }
+        }
+      }
       const slot_t jk0 = left_columns[0];
       const slot_t jk1 = packed_2x32_int_key ? left_columns[1] : 0;
       const int64_t off0 = left_key_offsets[0];
       const int64_t off1 = packed_2x32_int_key ? left_key_offsets[1] : 0;
+      bool charge_from_cells = left_numeric_probe &&
+                               prepared_pk_lookups.empty() &&
+                               use_dense_int_rows;
+      if (charge_from_cells) {
+        for (size_t ai = 0; ai < agg_count; ++ai) {
+          const LeftNumericAgg& op = left_numeric[ai];
+          if ((op.col0 >= 0 &&
+               (static_cast<size_t>(op.col0) >= base_proj_cols ||
+                def_overwritten_by_pk[op.col0] != 0)) ||
+              (op.col1 >= 0 &&
+               (static_cast<size_t>(op.col1) >= base_proj_cols ||
+                def_overwritten_by_pk[op.col1] != 0))) {
+            charge_from_cells = false;
+            break;
+          }
+        }
+      }
       while (true) {
         const size_t bi =
             next_def_block.fetch_add(1, std::memory_order_relaxed);
@@ -4273,6 +4821,26 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
         }
         if (extra_zm_reject) {
           continue;
+        }
+        // A dense unique build key occupies [dense_int_min, dense_int_min +
+        // span). A block whose join key is entirely outside that range cannot
+        // match an inner probe, including NULL keys (NULL never matches).
+        if (use_dense_int_rows && integer_key && !dense_int_rows.empty() &&
+            jk0 < base_proj_cols && left_key_offsets[0] == 0) {
+          const slot_t full_key = deferred_left_probe->projection[jk0];
+          if (full_key < blk.columns.size()) {
+            const LSTableColumnBlock& jk = blk.columns[full_key];
+            if (jk.has_min_max) {
+              const uint64_t span = dense_int_rows.size();
+              const bool above = jk.min_int >= dense_int_min &&
+                                 static_cast<uint64_t>(jk.min_int) -
+                                         static_cast<uint64_t>(dense_int_min) >=
+                                     span;
+              if (jk.max_int < dense_int_min || above) {
+                continue;
+              }
+            }
+          }
         }
         bool peek_all_pass = true;
         if (peek_ptr != nullptr) {
@@ -4564,6 +5132,61 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                  static_cast<uint64_t>(dense_int_min);
             const Row* rptr =
                 idx < dense_int_rows.size() ? dense_int_rows[idx] : nullptr;
+            // COUNT(*) and existence-only fusions never read a fact cell.
+            // The build row already carries the group, so a matched gid is
+            // the whole update.
+            if (rptr != nullptr && count_star_only && use_direct_gid_agg &&
+                prepared_pk_lookups.empty()) {
+              const uint32_t gid = gid_of(rptr);
+              if (gid != kInvalidGid) {
+                DirectGidWorker& dw =
+                    direct_gid_workers[use_shared_direct_gid ? 0 : w];
+                ++local.comparisons;
+                if (use_shared_direct_gid) {
+                  __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
+                  __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
+                } else {
+                  dw.matched[gid] = 1;
+                  dw.counts[gid] += 1;
+                }
+                continue;
+              }
+            }
+            if (rptr != nullptr && charge_from_cells) {
+              const uint32_t gid = gid_of(rptr);
+              if (gid != kInvalidGid) {
+                ++local.comparisons;
+                DirectGidWorker& dw = direct_gid_workers[w];
+                charge_numeric(
+                    dw, gid,
+                    [&](int32_t col, double* out) {
+                      if (proj_has_null[col] != 0 &&
+                          proj_cols[col]->IsNull(r)) {
+                        return false;
+                      }
+                      const int64_t raw = proj_int_ptrs[col][r];
+                      if (def_base_types[col] == ValueType::kDouble) {
+                        *out = std::bit_cast<double>(raw);
+                      } else {
+                        *out = static_cast<double>(raw);
+                      }
+                      return true;
+                    },
+                    [&](int32_t col, int64_t* out) {
+                      if (proj_has_null[col] != 0 &&
+                          proj_cols[col]->IsNull(r)) {
+                        return false;
+                      }
+                      *out = proj_int_ptrs[col][r];
+                      return true;
+                    },
+                    [&](int32_t col) {
+                      return proj_has_null[col] == 0 ||
+                             !proj_cols[col]->IsNull(r);
+                    });
+                continue;
+              }
+            }
             if (rptr != nullptr && materialize_current_left_row(r)) {
               ++local.comparisons;
               if (use_preassigned_build_groups) {
@@ -4707,6 +5330,114 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       }
     }
     if (integer_key || packed_2x32_int_key) {
+      // COUNT(*) with a dense unique build key only needs the foreign key.
+      // The group id was assigned on the build row, so the fact row's other
+      // cells and the scratch copy are not read.
+      if (integer_key && count_star_only && use_dense_int_rows &&
+          use_preassigned_build_groups && join_type == JoinType::kInner &&
+          !left.HasSpill() && !direct_gid_workers.empty()) {
+        const slot_t key_col = left_columns[0];
+        const int64_t bias = left_key_offsets[0];
+        DirectGidWorker& dw = direct_gid_workers[use_shared_direct_gid ? 0 : w];
+        const Row* const* dense = dense_int_rows.data();
+        const size_t dense_n = dense_int_rows.size();
+        const int64_t dense_base = dense_int_min;
+        while (true) {
+          const size_t chunk = next_chunk.fetch_add(1);
+          if (chunk >= chunk_count) {
+            return Status::kSuccess;
+          }
+          const size_t begin = chunk * chunk_rows;
+          const size_t end = std::min(total_left, begin + chunk_rows);
+          for (size_t ri = begin; ri < end; ++ri) {
+            const Value& cell = left.rows[ri].values_[key_col];
+            if (cell.IsNull()) {
+              continue;
+            }
+            const int64_t key = AddJoinKeyBias(cell.value.int_value, bias);
+            const uint64_t idx =
+                static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_base);
+            if (idx >= dense_n) {
+              continue;
+            }
+            const Row* rptr = dense[idx];
+            if (rptr == nullptr) {
+              continue;
+            }
+            const uint32_t gid = gid_of(rptr);
+            if (gid == kInvalidGid) {
+              continue;
+            }
+            ++local.comparisons;
+            if (use_shared_direct_gid) {
+              __atomic_store_n(&dw.matched[gid], 1, __ATOMIC_RELAXED);
+              __atomic_fetch_add(&dw.counts[gid], 1, __ATOMIC_RELAXED);
+            } else {
+              dw.matched[gid] = 1;
+              dw.counts[gid] += 1;
+            }
+          }
+        }
+      }
+      if (integer_key && left_numeric_probe && use_dense_int_rows &&
+          !left.HasSpill()) {
+        const slot_t key_col = left_columns[0];
+        const int64_t bias = left_key_offsets[0];
+        DirectGidWorker& dw = direct_gid_workers[w];
+        const Row* const* dense = dense_int_rows.data();
+        const size_t dense_n = dense_int_rows.size();
+        const int64_t dense_base = dense_int_min;
+        while (true) {
+          const size_t chunk = next_chunk.fetch_add(1);
+          if (chunk >= chunk_count) {
+            return Status::kSuccess;
+          }
+          const size_t begin = chunk * chunk_rows;
+          const size_t end = std::min(total_left, begin + chunk_rows);
+          for (size_t ri = begin; ri < end; ++ri) {
+            const Row& left_row = left.rows[ri];
+            const Value& cell = left_row.values_[key_col];
+            if (cell.IsNull()) {
+              continue;
+            }
+            const int64_t key = AddJoinKeyBias(cell.value.int_value, bias);
+            const uint64_t idx =
+                static_cast<uint64_t>(key) - static_cast<uint64_t>(dense_base);
+            if (idx >= dense_n) {
+              continue;
+            }
+            const Row* rptr = dense[idx];
+            if (rptr == nullptr) {
+              continue;
+            }
+            const uint32_t gid = gid_of(rptr);
+            if (gid == kInvalidGid) {
+              continue;
+            }
+            ++local.comparisons;
+            charge_numeric(
+                dw, gid,
+                [&](int32_t col, double* out) {
+                  const Value& value =
+                      left_row.values_[static_cast<size_t>(col)];
+                  return !value.IsNull() && cell_as_double(value, out);
+                },
+                [&](int32_t col, int64_t* out) {
+                  const Value& value =
+                      left_row.values_[static_cast<size_t>(col)];
+                  if (value.IsNull() || value.type != ValueType::kInt64 ||
+                      value.IsUnsigned()) {
+                    return false;
+                  }
+                  *out = value.value.int_value;
+                  return true;
+                },
+                [&](int32_t col) {
+                  return !left_row.values_[static_cast<size_t>(col)].IsNull();
+                });
+          }
+        }
+      }
       while (true) {
         const size_t chunk = next_chunk.fetch_add(1);
         if (chunk >= chunk_count) {
@@ -5139,41 +5870,190 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
   FusedRawArena merged_raw_arena;
   std::deque<AggregateAccumulator> states;
   if (compact_counts) {
-    auto merged = std::move(locals.front().compact_counts);
-    auto compact_offsets = std::move(locals.front().int_offsets);
-    for (size_t w = 1; w < locals.size(); ++w) {
-      for (const auto& group : locals[w].compact_counts) {
-        bool inserted = false;
-        size_t* slot = compact_offsets.TryEmplace(
-            std::bit_cast<int64_t>(group.hash), &inserted);
-        size_t matching = SIZE_MAX;
-        if (!inserted) {
-          for (size_t index = *slot; index != SIZE_MAX;
-               index = merged[index].next) {
-            if (compact_key_equal(merged[index], group)) {
-              matching = index;
-              break;
-            }
-          }
-        }
-        if (matching != SIZE_MAX) {
-          merged[matching].count += group.count;
-        } else {
-          auto added = group;
-          added.next = inserted ? SIZE_MAX : *slot;
-          *slot = merged.size();
-          merged.push_back(added);
+    size_t partial_count = 0;
+    for (const auto& local : locals) {
+      partial_count += local.compact_counts.size();
+    }
+    const size_t merge_workers =
+        std::min(locals.size(), ParallelWorkerCount(partial_count / 4096));
+    static const bool merge_disabled =
+        std::getenv("TINYLAMB_DISABLE_FUSED_PARTITION_MERGE") != nullptr;
+    auto merge_charge =
+        !merge_disabled && merge_workers > 1 && partial_count <= SIZE_MAX / 256
+            ? TryReserveQueryMemory(partial_count * 256)
+            : nullptr;
+    if (merge_charge) {
+      static const bool prefilter_disabled =
+          std::getenv("TINYLAMB_DISABLE_COUNT_PREFILTER") != nullptr;
+      uint8_t prefilter_limit = 0;
+      if (!prefilter_disabled) {
+        if (compact_integer_threshold && *compact_integer_threshold >= 3 &&
+            *compact_integer_threshold <= 254) {
+          prefilter_limit =
+              static_cast<uint8_t>(*compact_integer_threshold + 1);
+        } else if (!compact_integer_threshold &&
+                   fusion->post_having_constant_or_factor >= 3.0 &&
+                   fusion->post_having_constant_or_factor < 255.0) {
+          prefilter_limit = static_cast<uint8_t>(
+              static_cast<unsigned>(fusion->post_having_constant_or_factor) +
+              1U);
         }
       }
-    }
-    for (const auto& count : merged) {
-      if (static_cast<double>(count.count) >
-          fusion->post_having_constant_or_factor) {
+      struct Ref {
+        const CompactCountGroup* group;
+        size_t rank;
+      };
+      struct RankedCount {
+        CompactCountGroup group;
+        size_t rank;
+      };
+      std::vector<std::vector<Ref>> buckets(merge_workers);
+      size_t rank = 0;
+      for (const auto& local : locals) {
+        for (const auto& group : local.compact_counts) {
+          const size_t partition =
+              (group.hash ^ (group.hash >> 32U)) % merge_workers;
+          buckets[partition].push_back(Ref{.group = &group, .rank = rank++});
+        }
+      }
+      std::vector<std::vector<RankedCount>> accepted(merge_workers);
+      RETURN_IF_FAIL(RunParallelTasks(merge_workers, [&](size_t p) {
+        std::vector<Ref> candidates;
+        const auto* refs = &buckets[p];
+        if (prefilter_limit != 0 && buckets[p].size() >= 8192) {
+          // Counter collisions can only increase a frequency. Saturating at
+          // the acceptance bound therefore rejects only groups that cannot
+          // satisfy COUNT's HAVING predicate. Every candidate still uses the
+          // exact key comparison, exact count and original final predicate.
+          // The four arrays use at most four bytes per input reference,
+          // covered by the merge reservation above.
+          const size_t width = std::bit_ceil(buckets[p].size() / 2);
+          const size_t mask = width - 1;
+          std::vector<uint8_t> counts(width * 4);
+          const auto mixed_hash = [](uint64_t hash) {
+            hash ^= hash >> 30U;
+            hash *= 0xbf58476d1ce4e5b9ULL;
+            hash ^= hash >> 27U;
+            hash *= 0x94d049bb133111ebULL;
+            return hash ^ (hash >> 31U);
+          };
+          for (const auto& ref : buckets[p]) {
+            uint64_t hash = mixed_hash(ref.group->hash);
+            const auto add = static_cast<unsigned>(
+                std::min<int64_t>(ref.group->count, prefilter_limit));
+            for (size_t lane = 0; lane < 4; ++lane) {
+              auto& cell = counts[(lane * width) + (hash & mask)];
+              cell = static_cast<uint8_t>(std::min<unsigned>(
+                  prefilter_limit, static_cast<unsigned>(cell) + add));
+              hash = std::rotl(hash, 16);
+            }
+          }
+          candidates.reserve(std::min<size_t>(4096, buckets[p].size()));
+          for (const auto& ref : buckets[p]) {
+            uint64_t hash = mixed_hash(ref.group->hash);
+            bool possible = true;
+            for (size_t lane = 0; lane < 4; ++lane) {
+              if (counts[(lane * width) + (hash & mask)] < prefilter_limit) {
+                possible = false;
+                break;
+              }
+              hash = std::rotl(hash, 16);
+            }
+            if (possible) {
+              candidates.push_back(ref);
+            }
+          }
+          refs = &candidates;
+        }
+        FlatIntKeyMap<size_t> index;
+        std::vector<RankedCount> merged;
+        merged.reserve(refs->size());
+        index.Reserve(refs->size());
+        for (const auto& ref : *refs) {
+          const auto& group = *ref.group;
+          bool inserted = false;
+          size_t* slot =
+              index.TryEmplace(std::bit_cast<int64_t>(group.hash), &inserted);
+          size_t matching = SIZE_MAX;
+          if (!inserted) {
+            for (size_t candidate = *slot; candidate != SIZE_MAX;
+                 candidate = merged[candidate].group.next) {
+              if (compact_key_equal(merged[candidate].group, group)) {
+                matching = candidate;
+                break;
+              }
+            }
+          }
+          if (matching != SIZE_MAX) {
+            merged[matching].group.count += group.count;
+          } else {
+            auto added = group;
+            added.next = inserted ? SIZE_MAX : *slot;
+            *slot = merged.size();
+            merged.push_back(RankedCount{.group = added, .rank = ref.rank});
+          }
+        }
+        for (auto& group : merged) {
+          if (compact_count_passes(group.group.count)) {
+            accepted[p].push_back(group);
+          }
+        }
+      }));
+      std::vector<RankedCount> ordered;
+      for (auto& part : accepted) {
+        ordered.insert(ordered.end(), std::make_move_iterator(part.begin()),
+                       std::make_move_iterator(part.end()));
+      }
+      std::ranges::sort(ordered, {}, &RankedCount::rank);
+      for (const auto& entry : ordered) {
         FusedGroup group;
-        group.rep_left = count.left;
-        group.rep_right = count.right;
-        group.raw_count = count.count;
+        group.rep_left = entry.group.left;
+        group.rep_right = entry.group.right;
+        group.raw_count = entry.group.count;
         groups.push_back(std::move(group));
+      }
+    } else {
+      // A logged first worker can contain repeated keys. Rebuild its index
+      // too when the parallel merge cannot reserve memory.
+      const bool logged = std::ranges::any_of(
+          locals, [](const auto& local) { return local.compact_count_log; });
+      auto merged = logged ? std::vector<CompactCountGroup>{}
+                           : std::move(locals.front().compact_counts);
+      auto compact_offsets = logged ? FlatIntKeyMap<size_t>{}
+                                    : std::move(locals.front().int_offsets);
+      for (size_t w = logged ? 0 : 1; w < locals.size(); ++w) {
+        for (const auto& group : locals[w].compact_counts) {
+          bool inserted = false;
+          size_t* slot = compact_offsets.TryEmplace(
+              std::bit_cast<int64_t>(group.hash), &inserted);
+          size_t matching = SIZE_MAX;
+          if (!inserted) {
+            for (size_t index = *slot; index != SIZE_MAX;
+                 index = merged[index].next) {
+              if (compact_key_equal(merged[index], group)) {
+                matching = index;
+                break;
+              }
+            }
+          }
+          if (matching != SIZE_MAX) {
+            merged[matching].count += group.count;
+          } else {
+            auto added = group;
+            added.next = inserted ? SIZE_MAX : *slot;
+            *slot = merged.size();
+            merged.push_back(added);
+          }
+        }
+      }
+      for (const auto& count : merged) {
+        if (compact_count_passes(count.count)) {
+          FusedGroup group;
+          group.rep_left = count.left;
+          group.rep_right = count.right;
+          group.raw_count = count.count;
+          groups.push_back(std::move(group));
+        }
       }
     }
     fusion->post_having_applied = true;
@@ -5317,9 +6197,139 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       groups.push_back(std::move(grp));
     }
   }
+  const auto merge_raw = [&](FusedGroup& destination, FusedGroup& group) {
+    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
+      switch (raw_agg_kinds[i]) {
+        case RawAggKind::kCountStar:
+        case RawAggKind::kConstantExtremum:
+        case RawAggKind::kCountValue:
+          destination.RawCounts()[i] += group.RawCounts()[i];
+          break;
+        case RawAggKind::kSumInt64: {
+          int64_t next = 0;
+          if (__builtin_add_overflow(destination.RawInts()[i],
+                                     group.RawInts()[i], &next)) {
+            destination.RawInfFlags()[i] = 1;
+          } else {
+            destination.RawInts()[i] = next;
+          }
+          destination.RawCounts()[i] += group.RawCounts()[i];
+          destination.RawInfFlags()[i] |= group.RawInfFlags()[i];
+          break;
+        }
+        case RawAggKind::kSumDouble:
+        case RawAggKind::kAvgDouble: {
+          const double next =
+              destination.RawDoubles()[i] + group.RawDoubles()[i];
+          if (std::isinf(next) && !std::isinf(destination.RawDoubles()[i]) &&
+              !std::isinf(group.RawDoubles()[i])) {
+            destination.RawInfFlags()[i] = 1;
+          }
+          destination.RawDoubles()[i] = next;
+          destination.RawCounts()[i] += group.RawCounts()[i];
+          destination.RawInfFlags()[i] |= group.RawInfFlags()[i];
+          break;
+        }
+        case RawAggKind::kCountDistinctInt64:
+          if (group.raw_int_set) {
+            if (!destination.raw_int_set) {
+              destination.raw_int_set = std::move(group.raw_int_set);
+            } else {
+              group.raw_int_set->ForEach([&](int64_t v, uint8_t) {
+                destination.raw_int_set->TryEmplace(v);
+              });
+            }
+          }
+          break;
+        case RawAggKind::kNone:
+          break;
+      }
+    }
+  };
   size_t total_worker_groups = 0;
   for (const FusedWorkerLocal& local : locals) {
     total_worker_groups += local.groups.size();
+  }
+  const size_t merge_workers =
+      std::min(locals.size(), ParallelWorkerCount(total_worker_groups / 8192));
+  const bool partitionable =
+      merge_workers > 1 && groups.empty() && all_direct_group_keys &&
+      !int_group_key && (raw_sum_fusion || raw_count_fusion) &&
+      std::getenv("TINYLAMB_DISABLE_RAW_PARTITION_MERGE") == nullptr &&
+      std::ranges::all_of(locals, [](const FusedWorkerLocal& local) {
+        return std::ranges::all_of(local.groups, [](const FusedGroup& group) {
+          return group.has_key_hash;
+        });
+      });
+  auto partition_charge = partitionable && total_worker_groups <= SIZE_MAX / 128
+                              ? TryReserveQueryMemory(total_worker_groups * 128)
+                              : nullptr;
+  if (partition_charge) {
+    struct GroupRef {
+      FusedGroup* group;
+      size_t rank;
+    };
+    struct MergedRef {
+      GroupRef ref;
+      size_t next;
+    };
+    std::vector<std::vector<GroupRef>> partitions(merge_workers);
+    size_t rank = 0;
+    for (auto& local : locals) {
+      for (auto& group : local.groups) {
+        const size_t p =
+            (group.key_hash ^ (group.key_hash >> 32)) % merge_workers;
+        partitions[p].push_back({.group = &group, .rank = rank++});
+      }
+    }
+    std::vector<std::vector<MergedRef>> merged(merge_workers);
+    std::vector<FusedGroup*> first_groups(total_worker_groups, nullptr);
+    RETURN_IF_FAIL(RunParallelTasks(merge_workers, [&](size_t p) {
+      FlatIntKeyMap<size_t> index;
+      index.Reserve(partitions[p].size());
+      auto& output = merged[p];
+      output.reserve(partitions[p].size());
+      for (const auto& ref : partitions[p]) {
+        bool inserted = false;
+        size_t* head = index.TryEmplace(
+            std::bit_cast<int64_t>(ref.group->key_hash), &inserted);
+        size_t match = SIZE_MAX;
+        if (!inserted) {
+          for (size_t i = *head; i != SIZE_MAX; i = output[i].next) {
+            if (same_group_key(*output[i].ref.group, *ref.group)) {
+              match = i;
+              break;
+            }
+          }
+        }
+        if (match == SIZE_MAX) {
+          const size_t next = inserted ? SIZE_MAX : *head;
+          *head = output.size();
+          output.push_back({.ref = ref, .next = next});
+          first_groups[ref.rank] = ref.group;
+        } else if (raw_count_fusion) {
+          output[match].ref.group->raw_count += ref.group->raw_count;
+        } else {
+          merge_raw(*output[match].ref.group, *ref.group);
+        }
+      }
+    }));
+    // Preserve the historical first-worker/first-group emission order as well
+    // as the accumulation order within each group (including FLOAT prefixes).
+    groups.reserve(total_worker_groups);
+    for (auto* group : first_groups) {
+      if (group != nullptr) {
+        groups.push_back(std::move(*group));
+      }
+    }
+    for (auto& local : locals) {
+      local.groups.clear();
+    }
+    // Raw state blocks remain owned by locals until emission completes.
+    total_worker_groups = 0;
+    if (result.runtime() != nullptr) {
+      ++result.runtime()->partitioned_aggregate_merges;
+    }
   }
   if (total_worker_groups > 0) {
     groups.reserve(total_worker_groups);
@@ -5405,55 +6415,7 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
       } else if (raw_count_fusion) {
         groups[target_idx].raw_count += group.raw_count;
       } else if (raw_sum_fusion) {
-        FusedGroup& destination = groups[target_idx];
-        for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
-          switch (raw_agg_kinds[i]) {
-            case RawAggKind::kCountStar:
-            case RawAggKind::kConstantExtremum:
-            case RawAggKind::kCountValue:
-              destination.RawCounts()[i] += group.RawCounts()[i];
-              break;
-            case RawAggKind::kSumInt64: {
-              int64_t next = 0;
-              if (__builtin_add_overflow(destination.RawInts()[i],
-                                         group.RawInts()[i], &next)) {
-                destination.RawInfFlags()[i] = 1;
-              } else {
-                destination.RawInts()[i] = next;
-              }
-              destination.RawCounts()[i] += group.RawCounts()[i];
-              destination.RawInfFlags()[i] |= group.RawInfFlags()[i];
-              break;
-            }
-            case RawAggKind::kSumDouble:
-            case RawAggKind::kAvgDouble: {
-              const double next =
-                  destination.RawDoubles()[i] + group.RawDoubles()[i];
-              if (std::isinf(next) &&
-                  !std::isinf(destination.RawDoubles()[i]) &&
-                  !std::isinf(group.RawDoubles()[i])) {
-                destination.RawInfFlags()[i] = 1;
-              }
-              destination.RawDoubles()[i] = next;
-              destination.RawCounts()[i] += group.RawCounts()[i];
-              destination.RawInfFlags()[i] |= group.RawInfFlags()[i];
-              break;
-            }
-            case RawAggKind::kCountDistinctInt64:
-              if (group.raw_int_set) {
-                if (!destination.raw_int_set) {
-                  destination.raw_int_set = std::move(group.raw_int_set);
-                } else {
-                  group.raw_int_set->ForEach([&](int64_t v, uint8_t) {
-                    destination.raw_int_set->TryEmplace(v);
-                  });
-                }
-              }
-              break;
-            case RawAggKind::kNone:
-              break;
-          }
-        }
+        merge_raw(groups[target_idx], group);
       } else {
         FusedGroup& destination = groups[target_idx];
         for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
@@ -5642,6 +6604,26 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
           break;
         }
       }
+      // INT64 sums compare as doubles below; that is only exact while every
+      // group sum and the grand total stay within +-2^53. Otherwise leave
+      // HAVING to the canonical integer comparison (post_having_applied
+      // stays false).
+      if (!any_inf && akind == RawAggKind::kSumInt64) {
+        constexpr __int128 kExactLimit = __int128{1} << 53;
+        __int128 grand = 0;
+        for (const FusedGroup& grp : groups) {
+          if (grp.RawCounts()[agg_slot] <= 0) {
+            continue;
+          }
+          const __int128 v = grp.RawInts()[agg_slot];
+          grand += v;
+          if (v > kExactLimit || v < -kExactLimit || grand > kExactLimit ||
+              grand < -kExactLimit) {
+            any_inf = true;  // Reuse the "skip the shortcut" exit.
+            break;
+          }
+        }
+      }
       if (!any_inf) {
         auto group_sum_val = [&](const FusedGroup& grp) noexcept -> double {
           return akind == RawAggKind::kSumDouble
@@ -5812,16 +6794,18 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     }
   }
   result.rows.reserve(groups.size());
-  std::vector<Value> finished_aggs;
-  if (can_direct_emit && !raw_count_fusion) {
+  if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
+      effective_left_rows >= 100000) {
+    std::cerr << "[fusion] pre_emit_ms=" << ElapsedMs(join_begin)
+              << " groups=" << groups.size()
+              << " left=" << effective_left_rows << "\n";
+  }
+  const auto emit_direct = [&](size_t begin, size_t end,
+                               Relation* output) -> Status {
+    std::vector<Value> finished_aggs;
     finished_aggs.reserve(fusion->aggregates.size());
-  }
-  Row eval_rep_row;
-  if (!can_direct_emit) {
-    eval_rep_row.values_.resize(result.schema.ColumnCount());
-  }
-  for (const FusedGroup& group : groups) {
-    if (can_direct_emit) {
+    for (size_t index = begin; index < end; ++index) {
+      const FusedGroup& group = groups[index];
       Row output_row;
       output_row.values_.reserve(direct_emit.size());
       if (raw_count_fusion) {
@@ -5854,9 +6838,54 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
                                                   : rep_cell(group, d.index));
         }
       }
-      result.AddRow(std::move(output_row));
-      continue;
+      output->AddRow(std::move(output_row));
     }
+    RETURN_IF_FAIL(output->FinishSpill());
+    return output->GetStatus();
+  };
+  if (can_direct_emit) {
+    const size_t emit_workers =
+        (raw_count_fusion || raw_sum_fusion) &&
+                std::getenv("TINYLAMB_DISABLE_PARALLEL_FUSED_EMIT") == nullptr
+            ? ParallelWorkerCount(groups.size() / 8192)
+            : 1;
+    if (emit_workers > 1) {
+      // Finishing independent raw states does not reassociate their inputs.
+      // Contiguous shards retain the historical group order after the merge.
+      std::vector<ExecutionRuntime> runtimes(emit_workers);
+      std::vector<Relation> shards(emit_workers);
+      std::vector<Status> errors(emit_workers, Status::kSuccess);
+      for (size_t w = 0; w < emit_workers; ++w) {
+        shards[w].set_runtime(&runtimes[w]);
+      }
+      RETURN_IF_FAIL(RunParallelTasks(emit_workers, [&](size_t w) {
+        errors[w] =
+            emit_direct((groups.size() * w) / emit_workers,
+                        (groups.size() * (w + 1)) / emit_workers, &shards[w]);
+      }));
+      for (size_t w = 0; w < emit_workers; ++w) {
+        RETURN_IF_FAIL(errors[w]);
+        if (result.runtime() != nullptr) {
+          result.runtime()->relation_spills += runtimes[w].relation_spills;
+        }
+        if (shards[w].HasSpill()) {
+          RETURN_IF_FAIL(shards[w].ForEachRow(
+              [&](const Row& row) { result.AddRow(row); }));
+        } else {
+          result.MergeInMemoryShard(std::move(shards[w]));
+        }
+      }
+    } else {
+      RETURN_IF_FAIL(emit_direct(0, groups.size(), &result));
+    }
+  }
+  Row eval_rep_row;
+  if (!can_direct_emit) {
+    eval_rep_row.values_.resize(result.schema.ColumnCount());
+  }
+  for (size_t group_index = can_direct_emit ? groups.size() : 0;
+       group_index < groups.size(); ++group_index) {
+    const FusedGroup& group = groups[group_index];
     AggregateResultMap aggregate_results;
     aggregate_results.reserve(fusion->aggregates.size());
     if (raw_count_fusion) {
@@ -5919,7 +6948,37 @@ StatusOr<std::optional<Relation>> TryFusedGroupedJoin(
     ++runtime.grouped_join_fusions;
   }
   if (debug_fusion) {
-    std::cerr << "[fusion] fused groups=" << groups.size() << "\n";
+    std::cerr << "[fusion] fused groups=" << groups.size()
+              << " dense=" << use_dense_int_rows
+              << " unique=" << use_unique_int_table
+              << " ordered_sum=" << static_cast<bool>(ordered_sum_charge)
+              << " shared_gid=" << use_shared_direct_gid
+              << " workers=" << workers
+              << " single_double=" << single_double_sum
+              << " count_star=" << count_star_only
+              << " preassigned=" << use_preassigned_build_groups
+              << " right_keys=" << right_only_group_keys
+              << " residual=" << residual_programs.size()
+              << " numprobe=" << left_numeric_probe
+              << " deferred=" << (deferred_left_probe != nullptr) << " pk="
+              << (deferred_left_probe == nullptr
+                      ? 0
+                      : deferred_left_probe->pk_lookups.size())
+              << " raw=" << raw_sum_fusion << " aggs=" << agg_count
+              << " darith="
+              << (!double_arithmetic.empty() && double_arithmetic[0])
+              << " width=" << left_width << " keys=";
+    for (size_t ki = 0; ki < key_programs.size() && ki < 10; ++ki) {
+      std::cerr << key_shapes[ki].direct_column << ",";
+    }
+    std::cerr << " kinds=";
+    for (size_t ai = 0; ai < agg_count && ai < 4; ++ai) {
+      std::cerr << static_cast<int>(raw_agg_kinds[ai]) << ":"
+                << child_shapes[ai].mul_col0 << "/" << child_shapes[ai].mul_col1
+                << "/" << child_shapes[ai].direct_column << ",";
+    }
+    std::cerr << " pre_groups=" << pre_group_count
+              << " left=" << effective_left_rows << "\n";
   }
   return std::optional<Relation>(std::move(result));
 }

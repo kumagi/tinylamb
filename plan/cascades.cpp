@@ -4056,12 +4056,21 @@ const RuleSet& RuleSet::Default() {
             if (limited == group || limited == input_id) {
               continue;
             }
+            // The inner cut is a PREFIX: the window must still number the
+            // OFFSET rows the outer Limit later skips, so keep offset+count
+            // rows from the start and let only the outer Limit apply OFFSET.
+            size_t prefix_rows = 0;
+            if (__builtin_add_overflow(expression.limit_count,
+                                       expression.limit_offset,
+                                       &prefix_rows)) {
+              continue;
+            }
             memo.AddExpression(
                 limited,
                 LogicalExpression{.operation = LogicalOperator::kLimit,
                                   .children = {input_id},
-                                  .limit_count = expression.limit_count,
-                                  .limit_offset = expression.limit_offset});
+                                  .limit_count = prefix_rows,
+                                  .limit_offset = 0});
             const GroupId windowed =
                 memo.EnsureDerivedGroup(memo.Get(input_id).relations,
                                         "window-prefix-window:" + signature);
@@ -4151,6 +4160,14 @@ const RuleSet& RuleSet::Default() {
                 limited == sort_group_id) {
               continue;
             }
+            // Prefix cut: keep offset+count rows; OFFSET is applied once, by
+            // the outer Limit (see limit_prefix_unordered_window).
+            size_t prefix_rows = 0;
+            if (__builtin_add_overflow(expression.limit_count,
+                                       expression.limit_offset,
+                                       &prefix_rows)) {
+              continue;
+            }
             memo.AddExpression(
                 limited, LogicalExpression{
                              .operation = LogicalOperator::kTopN,
@@ -4158,8 +4175,8 @@ const RuleSet& RuleSet::Default() {
                              .target_list = sort_node->target_list,
                              .sort_ascending = sort_node->sort_ascending,
                              .sort_nulls_first = sort_node->sort_nulls_first,
-                             .limit_count = expression.limit_count,
-                             .limit_offset = expression.limit_offset,
+                             .limit_count = prefix_rows,
+                             .limit_offset = 0,
                              .with_ties = false});
             const GroupId windowed =
                 memo.EnsureDerivedGroup(memo.Get(window_group_id).relations,

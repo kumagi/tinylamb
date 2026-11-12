@@ -63,6 +63,19 @@ bool Transaction::FindPendingLsmWrite(page_id_t root, std::string_view key,
   return true;
 }
 
+void Transaction::ForEachPendingLsmWrite(
+    page_id_t root, std::string_view key,
+    const std::function<void(const LogRecord&)>& fn) const {
+  std::scoped_lock guard(chain_mu_);
+  for (const LogRecord& record : staged_records_) {
+    if (record.pid == root && record.key == key &&
+        (record.type == LogType::kLsmPut ||
+         record.type == LogType::kLsmDelete)) {
+      fn(record);
+    }
+  }
+}
+
 std::ostream& operator<<(std::ostream& o, const TransactionStatus& t) {
   switch (t) {
     case TransactionStatus::kUnknown:

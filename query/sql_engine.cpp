@@ -46,6 +46,7 @@
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/detail/typed_stream_aggregate.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
@@ -183,13 +184,40 @@ void QueryResult::Dump(std::ostream& output, int indent) const {
 
 void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
   const uint64_t epoch = database_->SchemaEpoch();
-  if (views_registered_epoch_ == epoch) {
+  // ViewRegistry() is thread_local, so "already registered at this epoch"
+  // must be tracked per thread too: a DROP VIEW on another connection
+  // thread only bumps the epoch, and this thread has to notice it and drop
+  // its own stale entry.
+  struct RegisteredState {
+    const SqlEngine* engine{nullptr};
+    const Database* database{nullptr};
+    uint64_t epoch{0};
+  };
+  static thread_local RegisteredState registered;
+  if (views_registered_epoch_ == epoch && registered.engine == this &&
+      registered.database == database_ && registered.epoch == epoch) {
     return;
   }
   StatusOr<std::vector<std::string>> names =
       database_->ListViewDefinitions(ctx);
   if (!names.HasValue()) {
     return;
+  }
+  {
+    // Forget views whose durable definition is gone (DROP VIEW elsewhere);
+    // FROM resolution consults the registry before the catalog.
+    std::unordered_set<std::string> live;
+    for (const std::string& name : names.Value()) {
+      std::string lowered = name;
+      for (char& c : lowered) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      live.insert(std::move(lowered));
+    }
+    auto& registry = ViewRegistry();
+    for (auto it = registry.begin(); it != registry.end();) {
+      it = live.contains(it->first) ? std::next(it) : registry.erase(it);
+    }
   }
   bool complete = true;
   for (const std::string& name : names.Value()) {
@@ -220,6 +248,8 @@ void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
   // the epoch. Successful individual definitions may already be registered.
   if (complete) {
     views_registered_epoch_ = epoch;
+    registered = RegisteredState{
+        .engine = this, .database = database_, .epoch = epoch};
   }
 }
 
@@ -2691,9 +2721,17 @@ StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
           Value, assigned,
           (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
                                           ctx, relational_detail::CteMap{})));
-      ASSIGN_OR_RETURN(std::optional<std::string>, rewritten,
-                       (SetStructPathByOrdinals(text, target.segments,
-                                                target.ordinals, 0, assigned)));
+      // Rows may store the same STRUCT members in different orders; resolve
+      // the path against this row's own member names first and only fall
+      // back to the shared ordinals for rows whose keys are anonymous (fN).
+      const std::optional<std::vector<int>> own_ordinals =
+          FindStructPathOrdinals(text, target.segments);
+      ASSIGN_OR_RETURN(
+          std::optional<std::string>, rewritten,
+          (SetStructPathByOrdinals(
+              text, target.segments,
+              own_ordinals.has_value() ? *own_ordinals : target.ordinals, 0,
+              assigned)));
       if (rewritten.has_value()) {
         cell = Value(std::move(*rewritten));
       }
@@ -3180,8 +3218,10 @@ StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
         if (key.IsNull()) {
           continue;
         }
-        if (IsParentKeyReferenced(*check.child, ctx.txn_, check.child_offset,
-                                  key, {})) {
+        ASSIGN_OR_RETURN(bool, referenced,
+                         IsParentKeyReferenced(*check.child, ctx.txn_,
+                                               check.child_offset, key, {}));
+        if (referenced) {
           return Status(Status::kConflicts,
                         "MERGE DELETE on table " + std::string(schema.Name()) +
                             " violates foreign key constraint (referenced by " +
@@ -5152,6 +5192,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       fused_sibling_aggregates_ = 0;
       cte_restriction_pushdowns_ = 0;
+      cte_materialization_attempts_ = 0;
       // A WITH list resolves in dependency order, so an entry may name a
       // sibling declared after it; a mutual reference between entries has no
       // evaluation order at all.  Reject it before any rewrite, so the error
@@ -5483,6 +5524,9 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       (void)MergeCompatibleUnionBranches(select.get(), ctx);
       if (!select->UnionAll().empty() && !has_value_table_operand &&
           select->WithQueries().empty() && sources_setop_safe) {
+        if (relational_detail::CanUseExactIntegerGroupingSets(ctx, *select)) {
+          return emit_relational();
+        }
         return ExecuteSetOperation(*select, ctx);
       }
       // Self-joins expose the same base relation under two aliases; the
@@ -6735,31 +6779,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                IdentifierEquals(target.name, column.Name().name)) &&
               (target.schema.empty() || target.schema == update.TableName())) {
             expression = set_clause[j].second;
-            const std::string lower_name = [&] {
-              std::string out = column.Name().name;
-              std::ranges::transform(out, out.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-              });
-              return out;
-            }();
-            if (lower_name.find("uint32") != std::string::npos ||
-                lower_name.find("int32") != std::string::npos ||
-                lower_name.find("uint16") != std::string::npos ||
-                lower_name.find("int16") != std::string::npos ||
-                lower_name.find("uint8") != std::string::npos ||
-                lower_name.find("int8") != std::string::npos ||
-                column.IsUnsigned() ||
-                lower_name.find("uint64") != std::string::npos) {
+            // Narrow / unsigned integer columns re-validate the assigned
+            // value through a CAST to the declared width. Decide from the
+            // column metadata (as INSERT does via IntegerValueFits), never
+            // from substrings of the column NAME: an INT64 column called
+            // point32 is not an INT32.
+            if (column.Type() == ValueType::kInt64 &&
+                (column.IsUnsigned() ||
+                 (column.IntegerBits() != 0 && column.IntegerBits() < 64))) {
+              const unsigned bits =
+                  column.IntegerBits() == 0 ? 64U : column.IntegerBits();
+              const std::string target_type =
+                  std::string(column.IsUnsigned() ? "UINT" : "INT") +
+                  std::to_string(bits);
               expression = std::make_shared<CastExpression>(
-                  std::move(expression),
-                  lower_name.find("uint32") != std::string::npos   ? "UINT32"
-                  : lower_name.find("int32") != std::string::npos  ? "INT32"
-                  : lower_name.find("uint16") != std::string::npos ? "UINT16"
-                  : lower_name.find("int16") != std::string::npos  ? "INT16"
-                  : lower_name.find("uint8") != std::string::npos  ? "UINT8"
-                  : lower_name.find("int8") != std::string::npos   ? "INT8"
-                                                                   : "UINT64",
-                  false);
+                  std::move(expression), target_type, false);
             }
             applied[j] = true;
             break;

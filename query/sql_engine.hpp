@@ -111,6 +111,11 @@ class SqlEngine {
     return cte_restriction_pushdowns_;
   }
 
+  // Speculative eager CTE drains during the most recent SELECT preparation.
+  [[nodiscard]] size_t LastCteMaterializationAttempts() const {
+    return cte_materialization_attempts_;
+  }
+
   // Compliance-driver hook: when enabled, INSERT statements emulate
   // first_column_is_primary_key semantics (duplicate-key errors, and
   // IGNORE/UPDATE/REPLACE conflict handling). Off by default; plain heap
@@ -258,6 +263,7 @@ class SqlEngine {
   std::string plan_cache_fingerprint_;
   size_t fused_sibling_aggregates_{0};
   size_t cte_restriction_pushdowns_{0};
+  size_t cte_materialization_attempts_{0};
 
   // True when this statement's WHERE/SET carried a subquery folded to
   // constants at prepare time (Bug 57): the folded values are valid only

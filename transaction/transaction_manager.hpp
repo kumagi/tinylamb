@@ -747,9 +747,9 @@ class TransactionManager {
   // Background GC (declared last so the worker thread only starts after
   // every member it may touch is fully constructed).
   std::atomic<uint64_t> commits_since_gc_{0};
-  // Rotating shard cursor for the incremental GC pass. Owned by the GC
-  // worker thread alone; no synchronization needed.
-  size_t gc_cursor_{0};
+  // Both the background worker and explicit columnar rebuild sweeps reserve
+  // incremental windows. Version contents remain protected by shard mutexes.
+  std::atomic<size_t> gc_cursor_{0};
   std::mutex gc_mutex_;
   std::condition_variable gc_cv_;
   std::thread gc_worker_;

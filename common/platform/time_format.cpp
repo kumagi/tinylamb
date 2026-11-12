@@ -18,6 +18,8 @@
 
 #include <array>
 #include <cctype>
+#include <climits>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -198,7 +200,10 @@ const char* SkipZoneName(const char* rp) {
   return rp;
 }
 
-#if defined(_WIN32)
+// Every non-glibc platform (Windows, macOS/BSD) parses through this
+// glibc-compatible implementation: BSD strptime applies %p in place and
+// lacks glibc extensions such as %s/%l, so the same PARSE_TIMESTAMP gave
+// different answers than on Linux.
 const char* ParseIntField(const char* rp, int max_digits, int min_val,
                           int max_val, int* out,
                           bool allow_leading_space = true) {
@@ -250,6 +255,11 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
   static constexpr std::array<const char*, 7> kDaysAbbr = {
       "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
+  // glibc semantics: %p is a FLAG applied after the whole format parsed,
+  // and only to a 12-hour (%I / %l) hour; applying it in place made
+  // "%p%I" disagree with Linux ("PM 3" -> 03:00 instead of 15:00).
+  bool have_twelve_hour = false;
+  int meridiem = -1;  // -1 none, 0 AM, 1 PM
   for (const char* fp = fmt; *fp != '\0'; ++fp) {
     if (IsSpace(*fp)) {
       while (IsSpace(*rp)) ++rp;
@@ -339,27 +349,90 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
         tm->tm_hour = h;
         break;
       }
-      case 'I': {
+      case 'k': {  // glibc: space-padded 24-hour clock
+        int h = 0;
+        rp = ParseIntField(rp, 2, 0, 23, &h);
+        if (rp == nullptr) return nullptr;
+        tm->tm_hour = h;
+        break;
+      }
+      case 'I':
+      case 'l': {  // %l: glibc space-padded 12-hour clock
         int h = 0;
         rp = ParseIntField(rp, 2, 1, 12, &h);
         if (rp == nullptr) return nullptr;
         tm->tm_hour = (h == 12) ? 0 : h;
+        have_twelve_hour = true;
         break;
       }
       case 'p': {
         while (IsSpace(*rp)) ++rp;
         size_t len = 0;
         if (StartsWithIgnoreCase(rp, "AM", &len)) {
-          if (tm->tm_hour == 12) tm->tm_hour = 0;
+          meridiem = 0;
           rp += len;
         } else if (StartsWithIgnoreCase(rp, "PM", &len)) {
-          if (tm->tm_hour < 12) tm->tm_hour += 12;
+          meridiem = 1;
           rp += len;
         } else {
           return nullptr;
         }
         break;
       }
+      case 's': {  // seconds since the Epoch (glibc: local time)
+        while (IsSpace(*rp)) ++rp;
+        bool neg = false;
+        if (*rp == '-' || *rp == '+') {
+          neg = (*rp == '-');
+          ++rp;
+        }
+        if (!IsDigit(*rp)) return nullptr;
+        long long secs = 0;
+        while (IsDigit(*rp)) {
+          if (secs > (LLONG_MAX - 9) / 10) return nullptr;
+          secs = (secs * 10) + (*rp - '0');
+          ++rp;
+        }
+        const auto t = static_cast<std::time_t>(neg ? -secs : secs);
+        LocalTime(t, tm);
+        break;
+      }
+      case 'U':
+      case 'W':
+      case 'V': {  // week numbers: parsed and ignored, as glibc does
+        int w = 0;
+        rp = ParseIntField(rp, 2, 0, 53, &w);
+        if (rp == nullptr) return nullptr;
+        break;
+      }
+      case 'G': {  // ISO week-based year: parsed and ignored
+        int y = 0;
+        rp = ParseIntField(rp, 4, 0, 9999, &y);
+        if (rp == nullptr) return nullptr;
+        break;
+      }
+      case 'g': {
+        int y = 0;
+        rp = ParseIntField(rp, 2, 0, 99, &y);
+        if (rp == nullptr) return nullptr;
+        break;
+      }
+      case 'r':  // C locale: %I:%M:%S %p
+        rp = PortableStrptime(rp, "%I:%M:%S %p", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'c':  // C locale
+        rp = PortableStrptime(rp, "%a %b %e %H:%M:%S %Y", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'x':
+        rp = PortableStrptime(rp, "%m/%d/%y", tm);
+        if (rp == nullptr) return nullptr;
+        break;
+      case 'X':
+        rp = PortableStrptime(rp, "%H:%M:%S", tm);
+        if (rp == nullptr) return nullptr;
+        break;
       case 'M': {
         int m = 0;
         rp = ParseIntField(rp, 2, 0, 59, &m);
@@ -425,9 +498,11 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
         return nullptr;
     }
   }
+  if (have_twelve_hour && meridiem == 1) {
+    tm->tm_hour += 12;  // %I parsed 12 as 0, so 12 PM -> 12 and 3 PM -> 15
+  }
   return rp;
 }
-#endif
 
 }  // namespace
 
@@ -437,11 +512,7 @@ const char* ParseTime(const char* input, const char* format, struct tm* tm) {
   const char* rp = input;
   auto flush = [&]() -> bool {
     if (piece.empty()) return true;
-#if defined(_WIN32)
     rp = PortableStrptime(rp, piece.c_str(), tm);
-#else
-    rp = ::strptime(rp, piece.c_str(), tm);
-#endif
     piece.clear();
     return rp != nullptr;
   };

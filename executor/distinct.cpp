@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,25 @@ bool DistinctEquals(const Row& a, const Row& b) {
 
 bool DistinctRowEqual::operator()(const Row& left, const Row& right) const {
   return DistinctEquals(left, right);
+}
+
+size_t DistinctRowHash::operator()(const Row& row) const {
+  size_t seed = row.values_.size();
+  for (const Value& value : row.values_) {
+    size_t h = 0;
+    if (value.type == ValueType::kVarChar && !value.IsNull() &&
+        !value.IsInterval()) {
+      // Fold every text cell, tagged or not: one CI-tagged side is enough
+      // for EqualUnderCollation to compare folded text, so both peers must
+      // land in the same bucket. Equal binary text still hashes equally.
+      h = std::hash<std::string>{}(
+          FoldCaseForCollation(value.value.varchar_value));
+    } else {
+      h = std::hash<Value>{}(value);
+    }
+    seed ^= h + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+  }
+  return seed;
 }
 
 size_t DistinctExecutor::NextBatch(DataChunk* destination, size_t max_rows) {

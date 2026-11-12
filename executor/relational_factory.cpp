@@ -53,6 +53,7 @@
 #include "executor/parallel_merge_join.hpp"
 #include "executor/parallel_scan.hpp"
 #include "executor/projection.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/recursive_cte.hpp"
 #include "executor/relational.hpp"
 #include "executor/selection.hpp"
@@ -432,6 +433,11 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
           case AggregationType::kLogicalOr:
             return agg.TrailingArgs().empty();
           default:
+            // Two-input DISTINCT statistics (CORR(DISTINCT x, y), ...) cannot
+            // be merged from deduped leading values alone; keep them serial.
+            if (agg.Distinct() && !agg.TrailingArgs().empty()) {
+              return false;
+            }
             return IsStatisticalAggregate(agg.GetType());
         }
       });
@@ -1711,7 +1717,29 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   // sequential too: the parallel executor has no null-safe key encoding.
   const bool any_null_safe =
       std::ranges::any_of(key_null_safe_, [](bool safe) { return safe; });
-  if (!dynamic_filter && !any_null_safe &&
+  // The shared-build parallel join keeps both inputs, the shared table and
+  // the output resident and has no spill path; the sequential HashJoin
+  // reacts to the query memory budget by partitioning to disk. Under a
+  // bounded budget that the inputs are estimated to exceed, prefer the
+  // spilling executor over an unbounded RSS climb / allocation failure.
+  const auto estimated_input_bytes = [&]() -> size_t {
+    constexpr size_t kBytesPerCell = 24;
+    const auto side = [&](const Plan& src) {
+      const size_t rows = src->EmitRowCount();
+      const size_t width =
+          std::max<size_t>(1, src->GetSchema().ColumnCount());
+      return rows > SIZE_MAX / (width * kBytesPerCell)
+                 ? SIZE_MAX
+                 : rows * width * kBytesPerCell;
+    };
+    const size_t l = side(left_src_);
+    const size_t r = side(right_src_);
+    return l > SIZE_MAX - r ? SIZE_MAX : l + r;
+  };
+  const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  const bool fits_budget = budget.Unlimited() ||
+                           estimated_input_bytes() <= budget.Remaining();
+  if (!dynamic_filter && !any_null_safe && fits_budget &&
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {
     const size_t workers = std::min<size_t>(

@@ -207,7 +207,9 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
   RETURN_IF_FAIL(prefix.FinishSpill());
   Status elements_status = Status::kSuccess;
   const Status prefix_status = prefix.ForEachRow([&](const Row& row) -> void {
-    if (elements_status != Status::kSuccess) return;
+    if (elements_status != Status::kSuccess) {
+      return;
+    }
     any_prefix_row = true;
     Scope scope{.row = &row, .schema = &prefix.schema, .outer = outer};
     Relation elements(context.execution_runtime());
@@ -244,7 +246,9 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
     // the initialized arity so every emitted row matches output.schema
     // exactly; Lookup and projection index rows by schema offsets.
     elements_status = elements.FinishSpill();
-    if (elements_status != Status::kSuccess) return;
+    if (elements_status != Status::kSuccess) {
+      return;
+    }
     const size_t prefix_width = row.values_.size();
     std::vector<char> element_matched(
         want_right_nulls ? elements.TotalRows() : 0, 0);
@@ -297,8 +301,12 @@ StatusOr<Relation> LateralExpandRelation(TransactionContext& context,
       matched = true;
       output.AddRow(std::move(combined));
     });
-    if (iteration != Status::kSuccess) elements_status = iteration;
-    if (elements_status != Status::kSuccess) return;
+    if (iteration != Status::kSuccess) {
+      elements_status = iteration;
+    }
+    if (elements_status != Status::kSuccess) {
+      return;
+    }
     if (!matched && left_outer &&
         (condition != nullptr || elements.TotalRows() == 0)) {
       std::vector<Value> nulls(output.schema.ColumnCount() - row.values_.size(),
@@ -649,7 +657,7 @@ std::shared_ptr<SelectStatement> RestrictUnionInput(
 // right duplicates must never multiply either the work or the output.
 StatusOr<std::optional<Relation>> TryUnmatchedLeftJoin(
     Relation& left, const Relation& right, const SelectSource& source,
-    slot_t null_column) {
+    slot_t null_column, bool emit_right_columns) {
   if (source.join_type != JoinType::kLeft || left.HasSpill() ||
       right.HasSpill() || left.using_columns || right.using_columns ||
       !source.using_columns.empty() || right.rows.size() > 1048576) {
@@ -710,23 +718,63 @@ StatusOr<std::optional<Relation>> TryUnmatchedLeftJoin(
   }
   Relation result(left.runtime());
   CopyExecutionStats(&result, left);
-  result.schema = left.schema + right.schema;
+  // The IS NULL filter already dropped every match. When no later expression
+  // reads the right side, keep the left rows in place instead of allocating
+  // a null-padded copy of every survivor.
+  result.schema = emit_right_columns ? left.schema + right.schema : left.schema;
   result.hash_joins += right.hash_joins + 1;
   result.in_memory_hash_joins += right.in_memory_hash_joins + 1;
   result.hybrid_hash_joins += right.hybrid_hash_joins;
   result.nested_loop_joins += right.nested_loop_joins;
   result.join_comparisons += right.join_comparisons;
-  for (Row& row : left.rows) {
-    if (!HasNullKey(row, left_columns)) {
-      const auto [begin, end] =
-          buckets.equal_range(EncodeCompositeIntKey(row, left_columns));
-      ++result.join_comparisons;
-      if (begin != end) {
-        continue;
+  const auto probe = [&](Relation& output, size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i) {
+      Row& row = left.rows[i];
+      if (!HasNullKey(row, left_columns)) {
+        const auto [first, last] =
+            buckets.equal_range(EncodeCompositeIntKey(row, left_columns));
+        ++output.join_comparisons;
+        if (first != last) {
+          continue;
+        }
       }
+      if (emit_right_columns) {
+        row.values_.resize(result.schema.ColumnCount());
+      }
+      output.AddRow(std::move(row));
     }
-    row.values_.resize(result.schema.ColumnCount());
-    result.AddRow(std::move(row));
+  };
+  const size_t workers =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_ANTI_PROBE") != nullptr
+          ? 1
+          : ParallelWorkerCount(left.rows.size() / 16384);
+  if (workers == 1) {
+    probe(result, 0, left.rows.size());
+  } else {
+    // Disjoint contiguous ranges preserve both left multiplicity and encounter
+    // order. Spill counters are worker-local, just like their output relations.
+    std::vector<ExecutionRuntime> runtimes(workers);
+    std::vector<Relation> shards(workers);
+    for (size_t w = 0; w < workers; ++w) {
+      shards[w].set_runtime(&runtimes[w]);
+      shards[w].schema = result.schema;
+    }
+    RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
+      const size_t chunk = left.rows.size() / workers;
+      const size_t begin = w * chunk;
+      const size_t end = w + 1 == workers ? left.rows.size() : begin + chunk;
+      shards[w].rows.reserve(end - begin);
+      probe(shards[w], begin, end);
+    }));
+    for (size_t w = 0; w < workers; ++w) {
+      RETURN_IF_FAIL(shards[w].FinishSpill());
+      RETURN_IF_FAIL(shards[w].GetStatus());
+      result.join_comparisons += shards[w].join_comparisons;
+      if (result.runtime() != nullptr) {
+        result.runtime()->relation_spills += runtimes[w].relation_spills;
+      }
+      result.MergeInMemoryShard(std::move(shards[w]));
+    }
   }
   result.peak_intermediate_rows =
       std::max({result.peak_intermediate_rows, right.peak_intermediate_rows,
@@ -734,6 +782,12 @@ StatusOr<std::optional<Relation>> TryUnmatchedLeftJoin(
   RETURN_IF_FAIL(result.FinishSpill());
   if (auto* runtime = result.runtime()) {
     runtime->join_ms += ElapsedMs(started);
+  }
+  if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
+      left.rows.size() >= 100000) {
+    std::cerr << "[anti] left=" << left.rows.size()
+              << " right=" << right.rows.size() << " out=" << result.TotalRows()
+              << " ms=" << ElapsedMs(started) << "\n";
   }
   return std::optional<Relation>(std::move(result));
 }
@@ -1149,6 +1203,29 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                               GroupedJoinFusionSpec* fusion,
                               bool ignore_projection_star) {
   *where_fully_applied = false;
+  struct BuildTimer {
+    std::chrono::steady_clock::time_point begin{
+        std::chrono::steady_clock::now()};
+    const SelectStatement* statement{nullptr};
+    ~BuildTimer() {
+      if (std::getenv("TINYLAMB_GROUP_PHASES") == nullptr) {
+        return;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+      if (ms < 15.0) {
+        return;
+      }
+      const auto& sources = statement->Sources();
+      std::cerr << "[build] ms=" << ms << " sources=" << sources.size();
+      if (!sources.empty()) {
+        std::cerr << " t0=" << (sources[0].alias.empty() ? sources[0].table
+                                                        : sources[0].alias);
+      }
+      std::cerr << "\n";
+    }
+  } build_timer{.statement = &statement};
   if (statement.Sources().empty()) {
     Relation singleton;
     singleton.rows.emplace_back();
@@ -1761,8 +1838,23 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     // another preserved source makes its key domain a necessary condition;
     // no predicate is pushed through a null-supplying boundary.
     std::vector<bool> loaded(relations.size(), false);
+    static const bool relative_filters_disabled =
+        std::getenv("TINYLAMB_DISABLE_RELATIVE_ORDERED_FILTERS") != nullptr;
+    std::vector<size_t> ordered_rows(relations.size());
+    size_t largest_scan = 0;
+    for (size_t i = 0; i < relations.size(); ++i) {
+      if (base_sources[i]) {
+        const auto stats = context.GetStats(statement.Sources()[i].table);
+        if (stats.HasValue()) {
+          ordered_rows[i] = stats.Value()->Rows();
+          largest_scan = std::max(largest_scan, ordered_rows[i]);
+        }
+      }
+    }
+    std::vector<std::shared_ptr<QueryMemoryCharge>> ordered_filter_charges;
     const auto ordered_binding = [&](size_t i) {
       std::optional<ScanRuntimeFilter> binding;
+      std::set<std::array<size_t, 3>> bound_edges;
       if (outer == nullptr && filter_safe[i] != 0 &&
           !statement.Sources()[i].sample) {
         for (const auto& predicate : ordered_predicates) {
@@ -1776,7 +1868,10 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           for (const size_t other : predicate.sources) {
             if (other == i || !loaded[other] || filter_safe[other] == 0 ||
                 relations[other].HasSpill() || relations[other].rows.empty() ||
-                relations[other].rows.size() > 4096 ||
+                relations[other].rows.size() >
+                    std::max<size_t>(4096, relative_filters_disabled
+                                               ? 0
+                                               : ordered_rows[i] / 2) ||
                 (binding && binding->extra.size() >= 7)) {
               continue;
             }
@@ -1800,7 +1895,27 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             if (projected == projections[i].end()) {
               continue;
             }
+            if (!relative_filters_disabled &&
+                !bound_edges.insert({other, keys[0].left, keys[0].right})
+                     .second) {
+              continue;
+            }
+            std::shared_ptr<QueryMemoryCharge> filter_charge;
+            if (relations[other].rows.size() > 4096) {
+              const size_t tracked =
+                  std::min(relations[other].rows.size(),
+                           RuntimeFilterBuilder::kMaxTrackedKeys);
+              // Retain the reservation through this BuildInput. It covers
+              // the temporary keys and the largest persistent filter shape;
+              // a failed reservation only declines this optional reduction.
+              filter_charge = TryReserveQueryMemory(
+                  (tracked * 64) + (RuntimeFilterGroup::kMaxDenseSpan / 8) + 8);
+              if (!filter_charge) {
+                continue;
+              }
+            }
             RuntimeFilterBuilder builder;
+            builder.Reserve(relations[other].rows.size());
             for (const auto& row : relations[other].rows) {
               const auto& key = row[keys[0].right];
               if (!key.IsNull()) {
@@ -1810,6 +1925,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             auto group = builder.Build(false);
             if (!group || group->empty()) {
               continue;
+            }
+            if (filter_charge) {
+              ordered_filter_charges.push_back(std::move(filter_charge));
             }
             ScanRuntimeFilter filter{
                 .group = std::move(group),
@@ -1847,7 +1965,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         }
         const auto stats = context.GetStats(statement.Sources()[i].table);
         if (!stats.HasValue() || stats.Value()->Rows() == 0 ||
-            stats.Value()->Rows() > 100000 ||
+            (stats.Value()->Rows() > 100000 &&
+             (relative_filters_disabled || ordered_local[i].empty() ||
+              stats.Value()->Rows() > largest_scan / 4)) ||
             stats.Value()->Rows() >= next_rows) {
           continue;
         }
@@ -1872,11 +1992,38 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       relations[next] = std::move(dimension);
       loaded[next] = true;
     }
+    // Source 0 stays loaded: it is the initial probe. A later numeric fact is
+    // left unloaded and probed from its columnar store, but ordering still
+    // sees the table statistics so an unloaded fact is not treated as empty.
+    std::vector<size_t> deferred_order_rows(relations.size(), 0);
     for (size_t i = 0; i < relations.size(); ++i) {
       if (loaded[i]) {
         continue;
       }
       if (base_sources[i]) {
+        const auto stats = context.GetStats(statement.Sources()[i].table);
+        if (i != 0 && stats.HasValue() && stats.Value()->Rows() >= 1000000 &&
+            !projections[i].empty() && projections[i].size() <= 8) {
+          bool numeric = true;
+          for (const slot_t column : projections[i]) {
+            if (column >= relations[i].schema.ColumnCount()) {
+              numeric = false;
+              break;
+            }
+            const Column& col = relations[i].schema.GetColumn(column);
+            const auto type = col.Type();
+            if (col.IsUnsigned() ||
+                (type != ValueType::kInt64 && type != ValueType::kDate &&
+                 type != ValueType::kDouble)) {
+              numeric = false;
+              break;
+            }
+          }
+          if (numeric) {
+            deferred_order_rows[i] = stats.Value()->Rows();
+            continue;
+          }
+        }
         auto binding = ordered_binding(i);
         ASSIGN_OR_RETURN(
             Relation, loaded_rel,
@@ -2020,10 +2167,14 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             continue;
           }
           const bool connected = connected_to(candidate, prefix);
-          const size_t rows = relations[candidate].TotalRows();
+          const size_t rows = deferred_order_rows[candidate] != 0
+                                  ? deferred_order_rows[candidate]
+                                  : relations[candidate].TotalRows();
+          const size_t start_rows = deferred_order_rows[start] != 0
+                                        ? deferred_order_rows[start]
+                                        : relations[start].TotalRows();
           if (!have_start || (connected && !start_connected) ||
-              (connected == start_connected &&
-               rows < relations[start].TotalRows())) {
+              (connected == start_connected && rows < start_rows)) {
             have_start = true;
             start = candidate;
             start_connected = connected;
@@ -2069,8 +2220,13 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             const bool cand_bindable = on_bindable(candidate, sim_joined);
             const bool cand_connected =
                 cand_bindable && connected_to(candidate, sim_joined);
-            const bool cheaper =
-                relations[candidate].TotalRows() < relations[next].TotalRows();
+            const size_t cand_rows = deferred_order_rows[candidate] != 0
+                                         ? deferred_order_rows[candidate]
+                                         : relations[candidate].TotalRows();
+            const size_t next_rows = deferred_order_rows[next] != 0
+                                         ? deferred_order_rows[next]
+                                         : relations[next].TotalRows();
+            const bool cheaper = cand_rows < next_rows;
             if ((cand_connected && !next_connected) ||
                 (cand_connected == next_connected && cand_bindable &&
                  !next_bindable) ||
@@ -2101,6 +2257,345 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     }
     Relation result = std::move(relations.front());
     std::unordered_set<size_t> available{0};
+    static const bool prune_columns_disabled =
+        std::getenv("TINYLAMB_DISABLE_ORDERED_COLUMN_PRUNE") != nullptr;
+    const bool can_prune_columns =
+        !prune_columns_disabled && !statement.HasDistinctOn() &&
+        !statement.ForUpdate() &&
+        std::ranges::all_of(statement.Sources(), [](const auto& source) {
+          return source.using_columns.empty() && !source.is_lateral &&
+                 !source.unnest && !source.from_nested_join;
+        });
+    const auto prune_consumed_columns = [&]() -> Status {
+      if (!can_prune_columns || available.size() == relations.size() ||
+          result.HasSpill() || result.using_columns) {
+        return Status::kSuccess;
+      }
+      // A final fused join/aggregate reads cells in place and emits groups;
+      // it does not construct the wide joined rows this pass would avoid.
+      if (fusion != nullptr && fusion->eligible &&
+          available.size() + 1 == relations.size()) {
+        return Status::kSuccess;
+      }
+      SelectStatement future(statement);
+      std::vector<SelectSource> remaining_sources;
+      for (size_t r = 0; r < statement.Sources().size(); ++r) {
+        if (!available.contains(r)) {
+          auto source = statement.Sources()[r];
+          if (lifted_inner_on[r]) {
+            source.join_condition.reset();
+          }
+          remaining_sources.push_back(std::move(source));
+        }
+      }
+      future.SetSources(std::move(remaining_sources));
+      std::vector<Expression> remaining_predicates;
+      // If any WHERE term stays above BuildInput, its caller re-evaluates
+      // the original whole WHERE. Keep that complete dependency set until
+      // every term has been placed, including query-bearing predicates.
+      if (!all_where_placed() && statement.WhereClause()) {
+        remaining_predicates.push_back(statement.WhereClause());
+      }
+      for (size_t p = 0; p < ordered_predicates.size(); ++p) {
+        if (!predicate_placed[p]) {
+          remaining_predicates.push_back(ordered_predicates[p].expression);
+        }
+      }
+      future.SetWhereClause(CombineConjuncts(remaining_predicates));
+      const auto columns = RequiredColumns(future, result.schema);
+      if (columns.size() == result.schema.ColumnCount()) {
+        return Status::kSuccess;
+      }
+      const size_t workers = ParallelWorkerCount(result.rows.size() / 8192);
+      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
+        const size_t begin = result.rows.size() * w / workers;
+        const size_t end = result.rows.size() * (w + 1) / workers;
+        for (size_t r = begin; r < end; ++r) {
+          auto& values = result.rows[r].values_;
+          // RequiredColumns is ascending, so forward compaction never
+          // overwrites an unread cell. Retain the buffer for the next join.
+          for (size_t c = 0; c < columns.size(); ++c) {
+            if (c != columns[c]) {
+              values[c] = std::move(values[columns[c]]);
+            }
+          }
+          values.resize(columns.size());
+        }
+      }));
+      // Keeping the old reservation is conservative until this Relation is
+      // consumed; no uncharged allocation or change to row order is needed.
+      result.schema = ProjectSchema(result.schema, columns);
+      return Status::kSuccess;
+    };
+    const auto try_stream_probe =
+        [&](size_t index,
+            const SelectSource& probed) -> StatusOr<std::optional<Relation>> {
+      if (probed.join_type != JoinType::kInner ||
+          !probed.using_columns.empty() || result.HasSpill() ||
+          result.rows.empty() || result.using_columns ||
+          projections[index].empty() ||
+          deferred_order_rows[index] < result.TotalRows() * 4) {
+        return std::optional<Relation>{};
+      }
+      const Schema projected =
+          ProjectSchema(relations[index].schema, projections[index]);
+      const auto predicates = SplitConjuncts(probed.join_condition);
+      if (predicates.empty() ||
+          !std::ranges::all_of(predicates, SafeToReduceEvaluationCount)) {
+        return std::optional<Relation>{};
+      }
+      const auto keys = EqualityKeys(result.schema, projected, predicates);
+      if (keys.empty() || keys.size() > CompositeIntKey::kMaxParts ||
+          std::ranges::any_of(keys, [](const EqualityKey& key) {
+            return key.null_safe || key.left_offset != 0 ||
+                   key.right_offset != 0;
+          })) {
+        return std::optional<Relation>{};
+      }
+      std::vector<slot_t> left_columns;
+      std::vector<slot_t> right_store;
+      for (const EqualityKey& key : keys) {
+        const Column& left_col = result.schema.GetColumn(key.left);
+        const Column& right_col = projected.GetColumn(key.right);
+        if (left_col.IsUnsigned() || right_col.IsUnsigned() ||
+            left_col.Type() != right_col.Type() ||
+            (left_col.Type() != ValueType::kInt64 &&
+             left_col.Type() != ValueType::kDate) ||
+            key.right >= projections[index].size()) {
+          return std::optional<Relation>{};
+        }
+        left_columns.push_back(static_cast<slot_t>(key.left));
+        right_store.push_back(projections[index][key.right]);
+      }
+      struct PartBits {
+        slot_t store_column{0};
+        int64_t lo{0};
+        uint64_t span{0};
+        std::vector<uint64_t> words;
+      };
+      std::vector<PartBits> parts(right_store.size());
+      for (size_t p = 0; p < right_store.size(); ++p) {
+        parts[p].store_column = right_store[p];
+        bool any = false;
+        int64_t lo = 0;
+        int64_t hi = 0;
+        for (const Row& row : result.rows) {
+          const Value& value = row[left_columns[p]];
+          if (value.IsNull()) {
+            continue;
+          }
+          const int64_t key = value.value.int_value;
+          if (!any) {
+            lo = hi = key;
+            any = true;
+          } else {
+            lo = std::min(lo, key);
+            hi = std::max(hi, key);
+          }
+        }
+        if (!any) {
+          return std::optional<Relation>{};
+        }
+        const uint64_t span =
+            static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+        if (span > 4000000ULL) {
+          return std::optional<Relation>{};
+        }
+        parts[p].lo = lo;
+        parts[p].span = span;
+        parts[p].words.assign(static_cast<size_t>(span >> 6) + 1, 0);
+      }
+      FlatJoinBuckets<CompositeIntKey, CompositeIntKeyHash> buckets;
+      buckets.reserve(result.rows.size());
+      size_t build_keys = 0;
+      for (const Row& row : result.rows) {
+        if (HasNullKey(row, left_columns)) {
+          continue;
+        }
+        CompositeIntKey key = EncodeCompositeIntKey(row, left_columns);
+        buckets.emplace(key, &row);
+        ++build_keys;
+        for (size_t p = 0; p < parts.size(); ++p) {
+          const uint64_t off = static_cast<uint64_t>(key.parts[p]) -
+                               static_cast<uint64_t>(parts[p].lo);
+          parts[p].words[off >> 6] |= uint64_t{1} << (off & 63);
+        }
+      }
+      if (build_keys == 0) {
+        return std::optional<Relation>{};
+      }
+      auto table = context.GetTable(probed.table);
+      if (!table.HasValue()) {
+        return std::optional<Relation>{};
+      }
+      auto store = GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+      if (store == nullptr || store->blocks.empty() ||
+          context.txn_.HasAnyPageVersionChains()) {
+        return std::optional<Relation>{};
+      }
+      const std::vector<Expression> residual =
+          ResidualJoinPredicates(result.schema, projected, predicates);
+      const Schema out_schema = result.schema + projected;
+      const CompiledScanFilter residual_filter =
+          CompileScanFilter(residual, out_schema);
+      const CompiledScanFilter local_filter =
+          CompileScanFilter(ordered_local[index], projected);
+      const size_t nblocks = store->blocks.size();
+      size_t workers = std::min<size_t>(
+          nblocks, QueryParallelWorkerLimit(std::min<size_t>(8, nblocks)));
+      workers = std::max<size_t>(1, workers);
+      std::vector<Relation> shards;
+      shards.reserve(workers);
+      for (size_t w = 0; w < workers; ++w) {
+        shards.emplace_back(context.execution_runtime());
+        shards.back().schema = out_schema;
+      }
+      std::vector<Status> worker_errors(workers, Status::kSuccess);
+      const auto cell_value = [](const LSTableColumnBlock& column,
+                                 uint32_t row) {
+        if (column.has_null && column.IsNull(row)) {
+          return Value();
+        }
+        if (column.type == ValueType::kDouble) {
+          return Value(std::bit_cast<double>(column.int_cells[row]));
+        }
+        if (column.type == ValueType::kDate) {
+          return Value::DateFromDays(column.int_cells[row]);
+        }
+        return Value(column.int_cells[row]);
+      };
+      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+        const size_t begin = nblocks * worker / workers;
+        const size_t end = nblocks * (worker + 1) / workers;
+        Status& filter_error = worker_errors[worker];
+        for (size_t b = begin; b < end && filter_error.ok(); ++b) {
+          const LSTablePageBlock& block = store->blocks[b];
+          if (block.row_count == 0) {
+            continue;
+          }
+          std::array<const int64_t*, CompositeIntKey::kMaxParts> cells{};
+          std::array<const LSTableColumnBlock*, CompositeIntKey::kMaxParts>
+              key_cols{};
+          bool columns_ok = true;
+          for (size_t p = 0; p < parts.size(); ++p) {
+            if (parts[p].store_column >= block.columns.size()) {
+              columns_ok = false;
+              break;
+            }
+            key_cols[p] = &block.columns[parts[p].store_column];
+            cells[p] = key_cols[p]->int_cells.data();
+          }
+          if (!columns_ok) {
+            filter_error = Status::kInvalidArgument;
+            break;
+          }
+          bool block_miss = false;
+          for (size_t p = 0; p < parts.size(); ++p) {
+            const LSTableColumnBlock& column = *key_cols[p];
+            if (!column.has_min_max) {
+              continue;
+            }
+            const int64_t lo = parts[p].lo;
+            if (column.max_int < lo ||
+                (column.min_int > lo && static_cast<uint64_t>(column.min_int) -
+                                                static_cast<uint64_t>(lo) >
+                                            parts[p].span)) {
+              block_miss = true;
+              break;
+            }
+            if (column.max_int == column.min_int) {
+              const uint64_t off = static_cast<uint64_t>(column.min_int) -
+                                   static_cast<uint64_t>(lo);
+              if (off > parts[p].span || (parts[p].words[off >> 6] &
+                                          (uint64_t{1} << (off & 63))) == 0) {
+                block_miss = true;
+                break;
+              }
+            }
+          }
+          if (block_miss) {
+            continue;
+          }
+          for (uint32_t r = 0; r < block.row_count; ++r) {
+            CompositeIntKey probe_key;
+            probe_key.count = static_cast<uint8_t>(parts.size());
+            bool key_ok = true;
+            for (size_t p = 0; p < parts.size(); ++p) {
+              if (key_cols[p]->has_null && key_cols[p]->IsNull(r)) {
+                key_ok = false;
+                break;
+              }
+              const int64_t value = cells[p][r];
+              const uint64_t off = static_cast<uint64_t>(value) -
+                                   static_cast<uint64_t>(parts[p].lo);
+              if (off > parts[p].span || (parts[p].words[off >> 6] &
+                                          (uint64_t{1} << (off & 63))) == 0) {
+                key_ok = false;
+                break;
+              }
+              probe_key.parts[p] = value;
+            }
+            if (!key_ok) {
+              continue;
+            }
+            const auto [match_begin, match_end] =
+                buckets.equal_range(probe_key);
+            if (match_begin == match_end) {
+              continue;
+            }
+            Row right_row;
+            right_row.values_.resize(projections[index].size());
+            for (size_t c = 0; c < projections[index].size(); ++c) {
+              const slot_t store_column = projections[index][c];
+              if (store_column >= block.columns.size()) {
+                filter_error = Status::kInvalidArgument;
+                break;
+              }
+              right_row.values_[c] = cell_value(block.columns[store_column], r);
+            }
+            if (!filter_error.ok()) {
+              break;
+            }
+            if (!ordered_local[index].empty() &&
+                !MatchScanFilter(right_row, projected, local_filter, outer,
+                                 context, ctes, &filter_error)) {
+              continue;
+            }
+            for (auto it = match_begin; it != match_end; ++it) {
+              Row combined = ConcatRows(*it->second, right_row);
+              if (!residual.empty() &&
+                  !MatchScanFilter(combined, out_schema, residual_filter, outer,
+                                   context, ctes, &filter_error)) {
+                continue;
+              }
+              shards[worker].AddRow(std::move(combined));
+            }
+          }
+        }
+      }));
+      for (const Status& worker_error : worker_errors) {
+        RETURN_IF_FAIL(worker_error);
+      }
+      Relation output(context.execution_runtime());
+      output.schema = out_schema;
+      size_t produced = 0;
+      for (Relation& shard : shards) {
+        produced += shard.TotalRows();
+        output.MergeInMemoryShard(std::move(shard));
+      }
+      if (produced == 0) {
+        return std::optional<Relation>{};
+      }
+      if (std::getenv("TINYLAMB_GROUP_PHASES") != nullptr) {
+        std::cerr << "[stream] table=" << probed.table
+                  << " left=" << result.TotalRows() << " out=" << produced
+                  << "\n";
+      }
+      RETURN_IF_FAIL(output.FinishSpill());
+      RETURN_IF_FAIL(output.GetStatus());
+      ++output.hash_joins;
+      return std::optional<Relation>(std::move(output));
+    };
     for (const size_t i : visit_order) {
       available.insert(i);
       SelectSource source = statement.Sources()[i];
@@ -2206,9 +2701,44 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           if (!column) {
             continue;
           }
+          bool emit_right_columns = true;
+          if (can_prune_columns && available.size() != relations.size() &&
+              !result.HasSpill() && !result.using_columns) {
+            SelectStatement future(statement);
+            std::vector<SelectSource> remaining_sources;
+            for (size_t r = 0; r < statement.Sources().size(); ++r) {
+              if (!available.contains(r)) {
+                auto remaining = statement.Sources()[r];
+                if (lifted_inner_on[r]) {
+                  remaining.join_condition.reset();
+                }
+                remaining_sources.push_back(std::move(remaining));
+              }
+            }
+            future.SetSources(std::move(remaining_sources));
+            std::vector<Expression> remaining_predicates;
+            if (!all_where_placed() && statement.WhereClause()) {
+              remaining_predicates.push_back(statement.WhereClause());
+            } else {
+              for (size_t q = 0; q < ordered_predicates.size(); ++q) {
+                if (!predicate_placed[q] && q != p) {
+                  remaining_predicates.push_back(
+                      ordered_predicates[q].expression);
+                }
+              }
+            }
+            future.SetWhereClause(CombineConjuncts(remaining_predicates));
+            const Schema joined = result.schema + relations[i].schema;
+            const auto needed = RequiredColumns(future, joined);
+            emit_right_columns =
+                std::ranges::any_of(needed, [&](slot_t column) {
+                  return column >= result.schema.ColumnCount();
+                });
+          }
           ASSIGN_OR_RETURN(std::optional<Relation>, candidate,
                            TryUnmatchedLeftJoin(result, relations[i], source,
-                                                static_cast<slot_t>(*column)));
+                                                static_cast<slot_t>(*column),
+                                                emit_right_columns));
           if (candidate) {
             unmatched = std::move(candidate);
             predicate_placed[p] = true;
@@ -2219,6 +2749,28 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       if (unmatched) {
         result = std::move(*unmatched);
         relations[i] = Relation(context.execution_runtime());
+      } else if (!loaded[i] && deferred_order_rows[i] != 0) {
+        ASSIGN_OR_RETURN(std::optional<Relation>, streamed,
+                         try_stream_probe(i, source));
+        if (streamed) {
+          result = std::move(*streamed);
+          loaded[i] = true;
+        } else {
+          auto binding = ordered_binding(i);
+          ASSIGN_OR_RETURN(
+              Relation, loaded_rel,
+              (LoadSource(
+                  context, statement.Sources()[i], outer, ctes, &projections[i],
+                  ordered_local[i].empty() ? nullptr : &ordered_local[i],
+                  binding ? &*binding : nullptr)));
+          relations[i] = std::move(loaded_rel);
+          loaded[i] = true;
+          ASSIGN_OR_RETURN(
+              Relation, result_r,
+              (Join(context, std::move(result), std::move(relations[i]), source,
+                    outer, ctes)));
+          result = std::move(result_r);
+        }
       } else {
         ASSIGN_OR_RETURN(Relation, result_r,
                          (Join(context, std::move(result),
@@ -2246,6 +2798,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         RETURN_IF_FAIL(
             FilterRelation(context, &result, post_join, outer, ctes));
       }
+      RETURN_IF_FAIL(prune_consumed_columns());
     }
     *where_fully_applied = all_where_placed();
     return result;
@@ -2834,6 +3387,83 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
       single_large_source && std::ranges::any_of(load_order, [&](size_t index) {
         return is_large_fact(index) && estimated_rows[index] >= 65536;
       });
+  static const bool dimension_preload_disabled =
+      std::getenv("TINYLAMB_DISABLE_DEFERRED_DIMENSION_PRELOAD") != nullptr;
+  size_t fact_rows = 0;
+  for (size_t i : load_order) {
+    if (is_large_fact(i)) {
+      fact_rows = std::max(fact_rows, estimated_rows[i]);
+    }
+  }
+  // A 1-column join key (customer_sk) is enough to build the group id.
+  // Preload it when every aggregate is a numeric column expression so the
+  // fact can stay in its column blocks and be charged without row objects.
+  const bool columnar_fact_aggs = [&] {
+    if (fusion == nullptr || !fusion->eligible || fusion->aggregates.empty() ||
+        fusion->aggregates.size() > 8) {
+      return false;
+    }
+    for (size_t i = 0; i < fusion->aggregates.size(); ++i) {
+      if (fusion->count_star[i]) {
+        continue;
+      }
+      const AggregateExpression* agg = fusion->aggregates[i];
+      if (agg == nullptr || agg->Distinct() || agg->HasWhereFilter() ||
+          agg->NeedsGroupContext()) {
+        return false;
+      }
+      const AggregationType type = agg->GetType();
+      if (type == AggregationType::kMin || type == AggregationType::kMax ||
+          type == AggregationType::kCount) {
+        if (!agg->Child()) {
+          return false;
+        }
+        if (agg->Child()->Type() == TypeTag::kColumnValue) {
+          continue;
+        }
+        // COUNT(a * b) is non-null exactly when both factors are.
+        if (type == AggregationType::kCount &&
+            agg->Child()->Type() == TypeTag::kBinaryExp) {
+          const auto& binary = agg->Child()->AsBinaryExpression();
+          if (binary.Op() == BinaryOperation::kMultiply && binary.Left() &&
+              binary.Right() &&
+              binary.Left()->Type() == TypeTag::kColumnValue &&
+              binary.Right()->Type() == TypeTag::kColumnValue) {
+            continue;
+          }
+        }
+        return false;
+      }
+      if (type != AggregationType::kSum && type != AggregationType::kAvg) {
+        return false;
+      }
+      const Expression& child = agg->Child();
+      if (!child) {
+        return false;
+      }
+      if (child->Type() == TypeTag::kColumnValue) {
+        continue;
+      }
+      if (child->Type() == TypeTag::kBinaryExp) {
+        const auto& binary = child->AsBinaryExpression();
+        if (binary.Op() == BinaryOperation::kMultiply && binary.Left() &&
+            binary.Right() && binary.Left()->Type() == TypeTag::kColumnValue &&
+            binary.Right()->Type() == TypeTag::kColumnValue) {
+          continue;
+        }
+      }
+      return false;
+    }
+    return true;
+  }();
+  const auto preload_dimension = [&](size_t index) {
+    return !dimension_preload_disabled && fusion != nullptr &&
+           fusion->eligible && single_large_source && base_sources[index] &&
+           !is_large_fact(index) &&
+           (projections[index].size() > 2 ||
+            (columnar_fact_aggs && projections[index].size() == 1)) &&
+           estimated_rows[index] <= fact_rows / 4;
+  };
   const auto load_rank = [&](size_t index) {
     const bool has_selective_neighbour = std::ranges::any_of(
         filter_neighbours[index],
@@ -2847,6 +3477,19 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     if (deferred_derived[index]) {
       return has_selective_neighbour ? 1 : 2;
     }
+    // A moderately sized dimension can unlock a deferred fact probe. Compare
+    // its size with the fact, rather than fixing a scale-specific row cutoff.
+    // Local fact filters keep the normal selective-first strategy.
+    if (is_large_fact(index) && local_predicates[index].empty() &&
+        std::ranges::any_of(load_order, [&](size_t other) {
+          return !loaded[other] && preload_dimension(other);
+        })) {
+      return 2;
+    }
+    if (preload_dimension(index)) {
+      return 0;
+    }
+
     if (!pk_absorption_disabled && local_predicates[index].empty() &&
         projections[index].size() == 2 && estimated_rows[index] <= 50000 &&
         !filter_neighbours[index].empty() &&
@@ -2913,7 +3556,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     CachedDriverFilter& entry = it->second;
     RuntimeFilterBuilder builder;
     builder.Reserve(relations[drel].TotalRows());
-    if (relations[drel].FinishSpill() != Status::kSuccess) return entry;
+    if (relations[drel].FinishSpill() != Status::kSuccess) {
+      return entry;
+    }
     const Status iteration = relations[drel].ForEachRow([&](const Row& row) {
       const Value& value = row[dcol];
       if (value.IsNull()) {
@@ -2947,6 +3592,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     return entry;
   };
   std::vector<uint8_t> absorbed(relations.size(), 0);
+  std::vector<uint8_t> payload_absorbed_into(relations.size(), 0);
   const bool selects_star = std::ranges::any_of(
       statement.SelectList(), [](const NamedExpression& proj) {
         return proj.expression &&
@@ -3003,6 +3649,19 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                : relations[r].TotalRows();
   };
   const auto materialize_deferred = [&]() -> Status {
+    struct DeferredTimer {
+      ExecutionRuntime* runtime{nullptr};
+      std::chrono::steady_clock::time_point begin{
+          std::chrono::steady_clock::now()};
+      ~DeferredTimer() {
+        if (runtime != nullptr) {
+          runtime->deferred_materialize_ms +=
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - begin)
+                  .count();
+        }
+      }
+    } deferred_timer{context.execution_runtime()};
     if (!deferred_probe_rel.has_value() || !deferred_probe.has_value()) {
       return Status::kSuccess;
     }
@@ -3015,6 +3674,20 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         Relation, loaded_rel,
         (LoadSource(context, statement.Sources()[d_idx], outer, ctes,
                     &dp.projection, &dp.local_preds, &dp.runtime_filter)));
+    // A sticky spill error means LoadSource dropped rows; never resolve
+    // lookups over a silently truncated relation.
+    RETURN_IF_FAIL(loaded_rel.GetStatus());
+    if (loaded_rel.HasSpill()) {
+      // The PK-lookup rewrite below edits `rows` in place and only sees the
+      // in-memory part; under memory pressure LoadSource may have spilled
+      // (EnsureSpill clears `rows`). Bring every row back before rewriting.
+      std::vector<Row> all_rows;
+      all_rows.reserve(loaded_rel.TotalRows());
+      RETURN_IF_FAIL(loaded_rel.ForEachRow(
+          [&](const Row& row) { all_rows.push_back(row); }));
+      loaded_rel.ResetContents();
+      loaded_rel.rows = std::move(all_rows);
+    }
     if (!dp.pk_lookups.empty()) {
       const size_t final_cols = saved_schema.ColumnCount();
       size_t out_idx = 0;
@@ -3800,6 +4473,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                     new_cols.push_back(std::move(new_payload_col));
                   }
                   tgt.schema = Schema("", std::move(new_cols));
+                  payload_absorbed_into[*target_rel] = 1;
                   invalidate_driver_filter_cache(*target_rel);
                   invalidate_driver_filter_cache(idx);
                   loaded[idx] = true;
@@ -4635,8 +5309,6 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                                          std::thread::hardware_concurrency()),
                                      n / 16384}));
     if (nw > 1) {
-      std::vector<std::jthread> threads;
-      threads.reserve(nw - 1);
       auto clear_chunk = [&](size_t w) {
         const size_t lo = (n * w) / nw;
         const size_t hi = (n * (w + 1)) / nw;
@@ -4644,6 +5316,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           std::vector<Value>().swap(rows[i].values_);
         }
       };
+      // Join the workers before destroying the callable they reference.
+      std::vector<std::jthread> threads;
+      threads.reserve(nw - 1);
       for (size_t w = 1; w < nw; ++w) {
         threads.emplace_back([&, w] { clear_chunk(w); });
       }
@@ -4651,6 +5326,195 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     }
     std::vector<Row>().swap(rows);
   };
+  // A deferred fact can borrow several columns from a unique dimension.
+  // Append payloads instead of overwriting the foreign key: other joins and
+  // runtime filters may still need its original domain.
+  if (!pk_absorption_disabled && deferred_probe_rel && deferred_probe &&
+      *where_fully_applied && plain_inner_sources && !selects_star &&
+      std::getenv("TINYLAMB_DISABLE_DEFERRED_MULTI_PAYLOAD") == nullptr) {
+    const size_t fact = *deferred_probe_rel;
+    for (size_t d = 0; d < relations.size(); ++d) {
+      if (std::ranges::count(absorbed, uint8_t{0}) <= 2) {
+        break;  // Keep one build relation for the fused grouped probe.
+      }
+      if (d == fact || absorbed[d] != 0 || !base_sources[d] ||
+          deferred_derived[d] || !loaded[d] || payload_absorbed_into[d] != 0 ||
+          relations[d].HasSpill() || relations[d].rows.empty() ||
+          projections[d].size() != relations[d].schema.ColumnCount()) {
+        continue;
+      }
+      std::optional<EqualityKey> edge;
+      bool safe = true;
+      for (const auto& predicate : predicates) {
+        if (!predicate.resolved || !predicate.sources.contains(d)) {
+          continue;
+        }
+        if (predicate.sources.size() == 1) {
+          safe = safe && locally_evaluable(predicate);
+          continue;
+        }
+        if (predicate.contains_query || predicate.sources.size() != 2 ||
+            !predicate.sources.contains(fact) ||
+            !IsColumnEqualityPredicate(predicate.expression) ||
+            predicate.expression->AsBinaryExpression().Op() !=
+                BinaryOperation::kEquals) {
+          safe = false;
+          break;
+        }
+        const auto keys =
+            EqualityKeys(relations[fact].schema, relations[d].schema,
+                         {predicate.expression});
+        if (keys.size() != 1 || keys[0].null_safe || keys[0].left_offset != 0 ||
+            keys[0].right_offset != 0 ||
+            (edge &&
+             (edge->left != keys[0].left || edge->right != keys[0].right))) {
+          safe = false;
+          break;
+        }
+        edge = keys[0];
+      }
+      if (!safe || !edge || edge->left >= deferred_probe->projection.size() ||
+          std::ranges::any_of(deferred_probe->pk_lookups,
+                              [&](const auto& lookup) {
+                                return lookup.target_proj_col == edge->left;
+                              }) ||
+          !SameSingleIntegerJoinKey(
+              relations[fact].schema, {static_cast<slot_t>(edge->left)},
+              relations[d].schema, {static_cast<slot_t>(edge->right)})) {
+        continue;
+      }
+      std::vector<slot_t> payloads;
+      for (const auto& name : outer_referenced) {
+        if (const auto column = LocalColumnOffset(relations[d].schema, name);
+            column && std::ranges::find(payloads, *column) == payloads.end()) {
+          payloads.push_back(*column);
+        }
+      }
+      std::ranges::sort(payloads);
+      if (payloads.size() < 2 ||
+          payloads.size() + deferred_probe->pk_lookups.size() > 4 ||
+          deferred_probe->runtime_filter.extra.size() >= 4 ||
+          relations[fact].schema.ColumnCount() + payloads.size() >
+              std::numeric_limits<slot_t>::max()) {
+        continue;
+      }
+      // Moving a nearly unique dimension tuple into the probe prevents the
+      // fused operator from factoring it into a build-side dictionary. Keep
+      // those dimensions as joins; append only sufficiently repeated tuples.
+      // Sampling chooses a plan, never removes a row or an equality check.
+      const size_t samples = std::min<size_t>(1024, relations[d].rows.size());
+      GroupKeyMap sampled_payloads;
+      for (size_t sample = 0; sample < samples; ++sample) {
+        const auto& row =
+            relations[d].rows[(sample * relations[d].rows.size()) / samples];
+        std::vector<Value> values;
+        values.reserve(payloads.size());
+        for (const slot_t column : payloads) {
+          values.push_back(CanonicalDistinctValue(row[column]));
+        }
+        sampled_payloads.emplace(Row(std::move(values)), 0);
+      }
+      if (samples > 64 && sampled_payloads.size() > samples / 8) {
+        continue;
+      }
+      auto table = context.GetTable(statement.Sources()[d].table);
+      if (!table.HasValue()) {
+        continue;
+      }
+      auto store = GetOrBuildLSTableStore(context.txn_, *table.Value(), true);
+      const auto pk = projections[d][edge->right];
+      bool valid =
+          store && store->total_rows > 0 &&
+          store->layout_generation == table.Value()->LayoutGeneration() &&
+          store->first_pid == table.Value()->FirstPageId() &&
+          pk < store->column_is_monotonic.size() &&
+          store->column_is_monotonic[pk] != 0 &&
+          store->column_is_unique_nonnull[pk] != 0 &&
+          store->column_has_null[pk] == 0;
+      if (valid) {
+        if (store->uncommitted_owner_txn != 0) {
+          valid = store->uncommitted_owner_txn == context.txn_.ID();
+        } else if (!context.txn_.IsReadOnly() &&
+                   !context.txn_.WriteSetEmpty()) {
+          valid = false;
+        } else if (context.txn_.HasAnyPageVersionChains()) {
+          valid = std::ranges::none_of(store->page_ids, [&](page_id_t pid) {
+            return context.txn_.HasPageVersionChains(pid);
+          });
+        }
+      }
+      if (!valid || std::ranges::any_of(payloads, [&](slot_t column) {
+            const auto& source = relations[d].schema.GetColumn(column);
+            return projections[d][column] >= store->column_min_int.size() ||
+                   relations[fact].schema.Offset(source.Name()) >= 0 ||
+                   (source.Type() != ValueType::kInt64 &&
+                    source.Type() != ValueType::kDate &&
+                    source.Type() != ValueType::kDouble &&
+                    source.Type() != ValueType::kVarChar) ||
+                   std::ranges::any_of(relations[d].rows, [&](const Row& row) {
+                     const auto& value = row[column];
+                     return !value.IsNull() &&
+                            (value.type != source.Type() ||
+                             value.IsUnsigned() != source.IsUnsigned() ||
+                             (value.type == ValueType::kVarChar &&
+                              value.Collation() != 0));
+                   });
+          })) {
+        continue;
+      }
+      std::vector<int64_t> keys;
+      keys.reserve(relations[d].rows.size());
+      for (const auto& row : relations[d].rows) {
+        const auto& key = row[edge->right];
+        if (!key.IsNull()) {
+          keys.push_back(key.value.int_value);
+        }
+      }
+      auto exact = RuntimeFilterBuilder::FromKeys(keys, 100000);
+      if (!exact ||
+          (!exact->has_dense_bits() && exact->ExactKeys() == nullptr)) {
+        continue;
+      }
+      std::vector<Column> columns;
+      columns.reserve(relations[fact].schema.ColumnCount() + payloads.size());
+      for (size_t c = 0; c < relations[fact].schema.ColumnCount(); ++c) {
+        columns.push_back(relations[fact].schema.GetColumn(c));
+      }
+      for (slot_t payload : payloads) {
+        const auto& source = relations[d].schema.GetColumn(payload);
+        deferred_probe->pk_lookups.push_back(DeferredLSTablePkLookup{
+            .store = store,
+            .pk_col = static_cast<slot_t>(edge->left),
+            .store_pk_col = pk,
+            .payload_col = projections[d][payload],
+            .target_proj_col = static_cast<slot_t>(columns.size()),
+            .payload_type = source.Type(),
+            .payload_unsigned = source.IsUnsigned(),
+        });
+        Column appended(source.Name(), source.Type(), Constraint(),
+                        source.Scale());
+        appended.SetUnsigned(source.IsUnsigned());
+        appended.SetInterval(source.IsInterval());
+        appended.SetIntegerBits(source.IntegerBits());
+        appended.SetHint(source.GetHint());
+        columns.push_back(std::move(appended));
+      }
+      deferred_probe->runtime_filter.extra.push_back(ScanRuntimeFilter{
+          .group = std::move(exact),
+          .column = static_cast<slot_t>(edge->left),
+          .type = relations[fact].schema.GetColumn(edge->left).Type()});
+      relations[fact].schema = Schema("", std::move(columns));
+      pinned_stores.push_back(std::move(store));
+      absorbed[d] = 1;
+      for (auto& predicate : predicates) {
+        if (predicate.resolved && predicate.sources.contains(d)) {
+          mark_applied(predicate.expression);
+          predicate.resolved = false;
+        }
+      }
+      parallel_clear_rows(relations[d].rows);
+    }
+  }
   if (!pk_absorption_disabled && *where_fully_applied && plain_inner_sources &&
       !selects_star && relations.size() >= 2) {
     bool absorbed_any = true;
@@ -5091,7 +5955,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 }
               }
             }
-            if (!t_col_referenced) {
+            if (!t_col_referenced &&
+                (deferred_probe_rel != *cand_t_rel ||
+                 (!has_payload_edges && payload_absorbed_into[d] == 0))) {
               d_pk_col = cand_pk;
               d_payload_col = cand_payload;
               target_rel = cand_t_rel;
@@ -5202,7 +6068,9 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
           }
           const uint64_t span =
               static_cast<uint64_t>(max_k) - static_cast<uint64_t>(min_k) + 1;
-          if (span == 0) continue;  // the full INT64 domain cannot be dense
+          if (span == 0) {
+            continue;  // the full INT64 domain cannot be dense
+          }
           const ValueType p_type = payload_col.Type();
           const bool can_small_ptr_path =
               relations[d].rows.size() <= 65536 && span <= 262144ULL;
@@ -5211,6 +6079,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             // snapshot-valid PAX lookup. Decoding the fact into Rows just to
             // replace its foreign key would defeat deferred scan fusion.
             if (!deferred_probe || append_payload ||
+                payload_absorbed_into[d] != 0 ||
                 deferred_probe->pk_lookups.size() >= 4 ||
                 deferred_probe->runtime_filter.extra.size() >= 4 ||
                 *target_col >= deferred_probe->projection.size() ||
@@ -5219,7 +6088,8 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
                 *d_payload_col >= projections[d].size() ||
                 std::ranges::any_of(
                     deferred_probe->pk_lookups, [&](const auto& lookup) {
-                      return lookup.target_proj_col == *target_col;
+                      return lookup.target_proj_col == *target_col ||
+                             lookup.pk_col == *target_col;
                     })) {
               continue;
             }
@@ -5743,6 +6613,7 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
             new_cols.push_back(std::move(new_payload_col));
           }
           tgt.schema = Schema("", std::move(new_cols));
+          payload_absorbed_into[*target_rel] = 1;
           driver_filter_cache.clear();
           if (!append_payload) {
             for (const ExactFilteredEdge& edge : exact_filtered_by[d]) {
@@ -5803,7 +6674,31 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
     }
   }
   if (deferred_probe_rel.has_value() && non_absorbed_count < 2) {
-    RETURN_IF_FAIL(materialize_deferred());
+    // The fact relation has not been moved yet. A global aggregate can
+    // charge its columns in place; anything else still becomes rows before
+    // the join loop starts.
+    bool scalar_done = false;
+    if (deferred_probe.has_value() && fusion != nullptr && fusion->eligible &&
+        fusion->group_keys.empty() && !fusion->fired && columnar_fact_aggs &&
+        *where_fully_applied && join_residual.empty()) {
+      Relation absorbed_dummy(context.execution_runtime());
+      absorbed_dummy.rows.emplace_back();
+      ASSIGN_OR_RETURN(
+          std::optional<Relation>, fused,
+          (TryFusedGroupedJoin(context, relations[*deferred_probe_rel],
+                               absorbed_dummy, {}, JoinType::kInner, outer,
+                               ctes, fusion, &*deferred_probe)));
+      if (fused.has_value()) {
+        relations[*deferred_probe_rel] = std::move(*fused);
+        deferred_probe.reset();
+        deferred_probe_rel.reset();
+        fusion->fired = true;
+        scalar_done = true;
+      }
+    }
+    if (!scalar_done && deferred_probe_rel.has_value()) {
+      RETURN_IF_FAIL(materialize_deferred());
+    }
   }
 
   std::optional<Relation> star_joined;
@@ -6143,12 +7038,15 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         next_connected = connected;
       }
     }
+    // A numeric fact probe is only consumed by the final fused aggregate.
+    // Materializing it to refine an intermediate estimate rebuilds every
+    // fact row that the columnar charge was meant to avoid.
     if ((!next_connected ||
          next_estimate >
              std::max(result.TotalRows(), relations[next].TotalRows()) * 2 ||
          next_estimate > 262144) &&
         deferred_probe_rel.has_value() && remaining.size() > 1 &&
-        remaining.contains(*deferred_probe_rel)) {
+        remaining.contains(*deferred_probe_rel) && !columnar_fact_aggs) {
       RETURN_IF_FAIL(materialize_deferred());
       for (size_t candidate : remaining) {
         std::unordered_set<size_t> after = joined;
@@ -6279,15 +7177,28 @@ StatusOr<Relation> BuildInput(TransactionContext& context,
         FilterRelation(context, &result, join_residual, outer, ctes));
   }
   if (!pinned_stores.empty()) {
-    for (Row& r : result.rows) {
-      for (Value& v : r.values_) {
-        if (v.type == ValueType::kVarChar && v.owned_data.empty() &&
-            !v.value.varchar_value.empty()) {
-          v.owned_data.assign(v.value.varchar_value);
-          v.value.varchar_value = v.owned_data;
+    // VARCHAR cells produced from these stores are views. Keep the stores
+    // alive for the rest of the query instead of copying every string onto
+    // the result rows. A missing runtime cannot hold the stores, so that
+    // path still materializes owned bytes before the locals die.
+    if (auto* runtime = context.execution_runtime()) {
+      runtime->retained_scan_stores.reserve(
+          runtime->retained_scan_stores.size() + pinned_stores.size());
+      for (auto& store : pinned_stores) {
+        runtime->retained_scan_stores.emplace_back(std::move(store));
+      }
+    } else {
+      for (Row& r : result.rows) {
+        for (Value& v : r.values_) {
+          if (v.type == ValueType::kVarChar && v.owned_data.empty() &&
+              !v.value.varchar_value.empty()) {
+            v.owned_data.assign(v.value.varchar_value);
+            v.value.varchar_value = v.owned_data;
+          }
         }
       }
     }
+    pinned_stores.clear();
   }
   {
     size_t total_dead_rows = 0;
