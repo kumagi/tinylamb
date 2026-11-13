@@ -1182,6 +1182,11 @@ Status AggregateAccumulator::SketchAdd(
         saw_null_param_ = true;
         return Status::kSuccess;
       }
+      if (precision.type != ValueType::kInt64) {
+        // Reading int_value of a DOUBLE/VARCHAR cell type-puns the union.
+        return StatusError(StatusCode::kInvalidArgument,
+                           "KLL/HLL precision must be an INT64");
+      }
       const int64_t p = precision.value.int_value;
       if (p < 1 || p > 200000000) {
         return StatusError(

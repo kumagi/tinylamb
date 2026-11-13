@@ -119,7 +119,7 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 - 保持した行数
 - 推定保持バイト数
 
-これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`MaterializeExecutor`、`HashJoin`、`BatchNestedLoopJoin`、`ParallelMergeJoin`、`DistributedAggFinalize` などが該当する。
+これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`IncrementalSortExecutor`、`HashJoin`、`ParallelHashJoin`、`BatchNestedLoopJoin`、`ParallelMergeJoin` などが該当する。
 
 ## 7. 問い合わせ作業メモリ
 

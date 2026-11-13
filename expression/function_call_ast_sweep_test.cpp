@@ -401,7 +401,7 @@ TEST(FunctionCallAstSweepTest, EvaluateEveryDispatchedFunction) {
       {"unix_millis", {Value(std::string("1970-01-01 00:00:01+00"))}, 1},
       {"unix_micros", {Value(std::string("1970-01-01 00:00:01+00"))}, 1},
       {"make_interval",
-       {Value(int64_t{1}), Value(int64_t{2}), Value(int64_t{3})},
+       {Value(int64_t{1}), Value(std::string("DAY")), Value(int64_t{3})},
        1},
       {"date_sub", {Value::Date("2026-01-02"), Value(std::string("5 day"))}, 0},
       {"generate_array", {Value(int64_t{1}), Value(int64_t{5})}, -1},

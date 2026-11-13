@@ -735,7 +735,7 @@ bool TpccWorkload::RequireRows(const std::vector<Row>& rows,
   if (!rows.empty() && rows.front().IsValid()) {
     return true;
   }
-  if (getenv("TPCC_ != nullptrSQL_TRACE") != nullptr) {
+  if (getenv("TPCC_SQL_TRACE") != nullptr) {
     [[maybe_unused]] const int printed =
         fprintf(stderr, "[tpcc-empty] %s\n", std::string(operation).c_str());
   }

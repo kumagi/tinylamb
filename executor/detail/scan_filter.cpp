@@ -25,8 +25,10 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
+#include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
@@ -195,9 +197,16 @@ bool FastLikeMatch(std::string_view value, std::string_view pattern) {
     if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
       wildcard = pattern_pos++;
       retry = value_pos;
+    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '_') {
+      // '_' matches one whole UTF-8 character, not one byte (same rule as
+      // the AST evaluator's Like); truncated trailing sequences count as
+      // that one character.
+      value_pos += std::min(
+          Utf8SequenceLength(static_cast<unsigned char>(value[value_pos])),
+          value.size() - value_pos);
+      ++pattern_pos;
     } else if (pattern_pos < pattern.size() &&
-               (pattern[pattern_pos] == '_' ||
-                pattern[pattern_pos] == value[value_pos])) {
+               pattern[pattern_pos] == value[value_pos]) {
       ++value_pos;
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
@@ -3021,7 +3030,7 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
   std::atomic<size_t> key_rejected{0};
   std::atomic<size_t> key_null_rejected{0};
   std::mutex error_mu;
-  std::exception_ptr error_ex;
+  Status error_ex{Status::kSuccess};
   const size_t chunk_rows = (source.rows.size() + workers - 1) / workers;
   {
     std::vector<std::jthread> threads;
@@ -3073,8 +3082,9 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
             }
           } catch (...) {
             std::scoped_lock lock(error_mu);
-            if (!error_ex) {
-              error_ex = std::current_exception();
+            if (error_ex == Status::kSuccess) {
+              error_ex =
+                  StatusFromCurrentException("parallel filter worker failed");
             }
           }
         });
@@ -3083,23 +3093,17 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
         // merge below drains empty shards and reports a clean result that is
         // silently missing every row the missing worker would have produced.
         std::scoped_lock lock(error_mu);
-        if (!error_ex) {
-          error_ex = std::current_exception();
+        if (error_ex == Status::kSuccess) {
+          error_ex =
+              StatusFromCurrentException("parallel filter worker failed");
         }
         break;
       }
     }
   }
-  if (error_ex) {
+  if (error_ex != Status::kSuccess) {
     if (error != nullptr && error->ok()) {
-      try {
-        std::rethrow_exception(error_ex);
-      } catch (const std::exception& ex) {
-        *error = StatusError(StatusCode::kRuntimeError, ex.what());
-      } catch (...) {
-        *error = StatusError(StatusCode::kRuntimeError,
-                             "parallel filter worker failed");
-      }
+      *error = error_ex;
     }
     return true;
   }
@@ -3905,6 +3909,8 @@ std::optional<bool> TryMatchSimpleCompareArena(
   return std::nullopt;
 }
 
+}  // namespace
+
 bool TryFilterArenaCache(
     TransactionContext& context, const BaseRelationArena& arena,
     const Schema& cached_schema, const CompiledScanFilter* filter,
@@ -3980,13 +3986,19 @@ bool TryFilterArenaCache(
 
   if (workers > 1) {
     std::vector<Relation> shards(workers);
-    std::vector<std::vector<Row>> deferred(workers);
+    // Deferred rows record how many accepted rows precede them so the merge
+    // below can reinsert them at their source position -- the same protocol
+    // TryParallelFilterRows uses.
+    struct DeferredRow {
+      size_t preceding_rows;
+      Row row;
+    };
+    std::vector<std::vector<DeferredRow>> deferred(workers);
     std::atomic<size_t> key_rejected{0};
     std::atomic<size_t> key_null_rejected{0};
     std::mutex error_mu;
-    std::exception_ptr error_ex;
-    const size_t chunk_rows =
-        std::max<size_t>(1, (arena.rows + (workers * 4) - 1) / (workers * 4));
+    Status error_ex{Status::kSuccess};
+    const size_t chunk_rows = (arena.rows + workers - 1) / workers;
     {
       std::vector<std::jthread> threads;
       threads.reserve(workers);
@@ -3997,41 +4009,41 @@ bool TryFilterArenaCache(
               auto& local = shards[w];
               size_t local_key_rej = 0;
               size_t local_key_null_rej = 0;
-              for (size_t chunk = w; chunk < workers * 4; chunk += workers) {
-                const size_t begin = chunk * chunk_rows;
-                if (begin >= arena.rows) {
-                  break;
+              size_t accepted_rows = 0;
+              // Each worker owns one contiguous range; merging the ranges in
+              // worker order then reproduces the serial scan's row order.
+              const size_t begin = w * chunk_rows;
+              const size_t end = std::min(arena.rows, begin + chunk_rows);
+              for (size_t r = begin; r < end; ++r) {
+                bool all_simple_decided = true;
+                if (!row_passes_arena_precheck(r, &local_key_rej,
+                                               &local_key_null_rej,
+                                               &all_simple_decided)) {
+                  continue;
                 }
-                const size_t end = std::min(arena.rows, begin + chunk_rows);
-                for (size_t r = begin; r < end; ++r) {
-                  bool all_simple_decided = true;
-                  if (!row_passes_arena_precheck(r, &local_key_rej,
-                                                 &local_key_null_rej,
-                                                 &all_simple_decided)) {
-                    continue;
+                Row row;
+                MaterializeSingleArenaRow(arena, cached_schema, r, &row);
+                if (!has_non_simple && all_simple_decided) {
+                  ++accepted_rows;
+                  local.AddRow(std::move(row));
+                  continue;
+                }
+                if (filter != nullptr && filter_view != nullptr &&
+                    programs.complete) {
+                  switch (MatchScanFilterWorker(row, *filter_view, *filter,
+                                                programs)) {
+                    case 0:
+                      break;
+                    case 1:
+                      ++accepted_rows;
+                      local.AddRow(std::move(row));
+                      break;
+                    default:
+                      deferred[w].push_back({accepted_rows, std::move(row)});
+                      break;
                   }
-                  Row row;
-                  MaterializeSingleArenaRow(arena, cached_schema, r, &row);
-                  if (!has_non_simple && all_simple_decided) {
-                    local.AddRow(std::move(row));
-                    continue;
-                  }
-                  if (filter != nullptr && filter_view != nullptr &&
-                      programs.complete) {
-                    switch (MatchScanFilterWorker(row, *filter_view, *filter,
-                                                  programs)) {
-                      case 0:
-                        break;
-                      case 1:
-                        local.AddRow(std::move(row));
-                        break;
-                      default:
-                        deferred[w].push_back(std::move(row));
-                        break;
-                    }
-                  } else {
-                    deferred[w].push_back(std::move(row));
-                  }
+                } else {
+                  deferred[w].push_back({accepted_rows, std::move(row)});
                 }
               }
               key_rejected.fetch_add(local_key_rej, std::memory_order_relaxed);
@@ -4039,30 +4051,25 @@ bool TryFilterArenaCache(
                                           std::memory_order_relaxed);
             } catch (...) {
               std::scoped_lock lock(error_mu);
-              if (!error_ex) {
-                error_ex = std::current_exception();
+              if (error_ex == Status::kSuccess) {
+                error_ex =
+                    StatusFromCurrentException("parallel filter worker failed");
               }
             }
           });
         } catch (...) {
           std::scoped_lock lock(error_mu);
-          if (!error_ex) {
-            error_ex = std::current_exception();
+          if (error_ex == Status::kSuccess) {
+            error_ex =
+                StatusFromCurrentException("parallel filter worker failed");
           }
           break;
         }
       }
     }
-    if (error_ex) {
+    if (error_ex != Status::kSuccess) {
       if (error != nullptr && error->ok()) {
-        try {
-          std::rethrow_exception(error_ex);
-        } catch (const std::exception& ex) {
-          *error = StatusError(StatusCode::kRuntimeError, ex.what());
-        } catch (...) {
-          *error = StatusError(StatusCode::kRuntimeError,
-                               "parallel arena filter worker failed");
-        }
+        *error = error_ex;
       }
       return true;
     }
@@ -4071,26 +4078,45 @@ bool TryFilterArenaCache(
         *error = std::move(status);
       }
     };
+    // Main-thread merge in worker order; deferred rows take the contextful
+    // MatchScanFilter path so error semantics are bit-identical to serial,
+    // and are reinserted at their source position via preceding_rows.
     for (size_t w = 0; w < workers; ++w) {
-      for (Row& row : deferred[w]) {
-        Status deferred_error{Status::kSuccess};
-        if (filter == nullptr ||
-            MatchScanFilter(row, *filter_view, *filter, outer, context, ctes,
-                            &deferred_error)) {
-          result->AddRow(std::move(row));
+      record_error(shards[w].FinishSpill());
+      if (deferred[w].empty() && !shards[w].HasSpill()) {
+        result->MergeInMemoryShard(std::move(shards[w]));
+      } else {
+        size_t accepted_rows = 0;
+        size_t deferred_index = 0;
+        const auto emit_deferred = [&] {
+          while (deferred_index < deferred[w].size() &&
+                 deferred[w][deferred_index].preceding_rows == accepted_rows) {
+            Row& row = deferred[w][deferred_index++].row;
+            Status deferred_error{Status::kSuccess};
+            if (filter == nullptr ||
+                MatchScanFilter(row, *filter_view, *filter, outer, context,
+                                ctes, &deferred_error)) {
+              result->AddRow(std::move(row));
+            }
+            record_error(std::move(deferred_error));
+          }
+        };
+        if (shards[w].HasSpill()) {
+          record_error(shards[w].ForEachRow([&](const Row& row) {
+            emit_deferred();
+            result->AddRow(row);
+            ++accepted_rows;
+          }));
+        } else {
+          for (Row& row : shards[w].rows) {
+            emit_deferred();
+            result->AddRow(std::move(row));
+            ++accepted_rows;
+          }
         }
-        record_error(std::move(deferred_error));
+        emit_deferred();
       }
       deferred[w].clear();
-      record_error(shards[w].FinishSpill());
-      if (shards[w].HasSpill()) {
-        record_error(
-            shards[w].ForEachRow([&](const Row& row) { result->AddRow(row); }));
-      } else {
-        for (Row& row : shards[w].rows) {
-          result->AddRow(std::move(row));
-        }
-      }
       record_error(shards[w].GetStatus());
       shards[w].ResetContents();
     }
@@ -4130,7 +4156,6 @@ bool TryFilterArenaCache(
   }
   return true;
 }
-}  // namespace
 
 StatusOr<Relation> LoadSource(TransactionContext& context,
                               const SelectSource& source, const Scope* outer,
@@ -4265,8 +4290,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           RETURN_IF_FAIL(key_error);
         } else {
           if (unboxed_arena != nullptr && unboxed_arena->rows >= 32768) {
-            MaterializeCacheRowsParallel(cache_key, &cached_relation,
-                                         context.execution_runtime());
+            RETURN_IF_FAIL(MaterializeCacheRowsParallel(
+                cache_key, &cached_relation, context.execution_runtime()));
           } else {
             MaterializeCacheRowsIfNeeded(cache_key, &cached_relation,
                                          context.execution_runtime());
@@ -4343,8 +4368,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           RETURN_IF_FAIL(eval_error);
         } else {
           if (unboxed_arena != nullptr && unboxed_arena->rows >= 32768) {
-            MaterializeCacheRowsParallel(cache_key, &cached_relation,
-                                         context.execution_runtime());
+            RETURN_IF_FAIL(MaterializeCacheRowsParallel(
+                cache_key, &cached_relation, context.execution_runtime()));
           } else {
             MaterializeCacheRowsIfNeeded(cache_key, &cached_relation,
                                          context.execution_runtime());

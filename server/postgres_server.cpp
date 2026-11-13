@@ -997,9 +997,11 @@ class PostgresServer::Impl {
         Queue(client, pgwire::ReadyForQuery(client.transaction_status));
         continue;
       }
+      // Unsupported extended-protocol messages get an ErrorResponse only;
+      // ReadyForQuery is owed by Sync so that one Sync always closes with
+      // exactly one RFQ (Parse+Sync must not yield two).
       Queue(client, pgwire::ErrorResponse(
                         "frontend message type is not supported", "0A000"));
-      Queue(client, pgwire::ReadyForQuery(client.transaction_status));
     }
   }
 
@@ -1517,17 +1519,28 @@ class PostgresServer::Impl {
 
   static std::vector<pgwire::ColumnDescription> BuildColumnDescriptions(
       const std::vector<std::string>& names, const Row& sample,
-      size_t fallback_count) {
+      size_t fallback_count,
+      const std::vector<ValueType>& declared_types) {
     size_t column_count = names.empty() ? fallback_count : names.size();
     if (!sample.values_.empty()) {
       column_count = sample.values_.size();
     }
+    const bool have_declared =
+        declared_types.size() == column_count &&
+        std::ranges::any_of(declared_types, [](ValueType t) {
+          return t != ValueType::kNull;
+        });
     std::vector<pgwire::ColumnDescription> columns(column_count);
     for (size_t i = 0; i < column_count; ++i) {
       columns[i].name =
           i < names.size() && !names[i].empty() ? names[i] : "?column?";
       columns[i].type = ValueType::kVarChar;
-      if (i < sample.values_.size() && !sample[i].IsNull()) {
+      // The plan's declared type is authoritative (it survives empty results
+      // and leading NULLs); a kNull/absent entry falls back to the row
+      // sample, then to text.
+      if (have_declared && declared_types[i] != ValueType::kNull) {
+        columns[i].type = declared_types[i];
+      } else if (i < sample.values_.size() && !sample[i].IsNull()) {
         columns[i].type = sample[i].type;
       }
     }
@@ -1536,12 +1549,14 @@ class PostgresServer::Impl {
 
   static StatusOr<std::string> StreamSelectResult(QueryResult& query_result) {
     const std::vector<std::string>& names = query_result.ColumnNames();
+    const std::vector<ValueType>& declared_types = query_result.ColumnTypes();
     std::string result;
     size_t row_count = 0;
     bool header_sent = false;
     bool row_limit_exceeded = false;
+    bool output_limit_exceeded = false;
     query_result.ForEach([&](const Row& row) {
-      if (row_limit_exceeded) {
+      if (row_limit_exceeded || output_limit_exceeded) {
         return;
       }
       if (++row_count > kMaxServerResultRows) {
@@ -1549,21 +1564,30 @@ class PostgresServer::Impl {
         return;
       }
       if (!header_sent) {
-        result += pgwire::RowDescription(
-            BuildColumnDescriptions(names, row, names.size()));
+        result += pgwire::RowDescription(BuildColumnDescriptions(
+            names, row, names.size(), declared_types));
         header_sent = true;
       }
       result += pgwire::DataRow(row);
+      // Bound the accumulation itself: Queue() only enforces
+      // kMaxQueuedOutputBytes after the whole response is built, so an
+      // unbounded `result` could allocate far past the documented DoS cap.
+      if (result.size() > kMaxQueuedOutputBytes) {
+        output_limit_exceeded = true;
+      }
     });
     if (row_limit_exceeded) {
       return Status(Status::kTooBigData, "result row limit exceeded");
+    }
+    if (output_limit_exceeded) {
+      return Status(Status::kTooBigData, "result size limit exceeded");
     }
     if (const Status st = query_result.GetStatus(); st != Status::kSuccess) {
       return st;
     }
     if (!header_sent) {
-      result += pgwire::RowDescription(
-          BuildColumnDescriptions(names, Row(), names.size()));
+      result += pgwire::RowDescription(BuildColumnDescriptions(
+          names, Row(), names.size(), declared_types));
     }
     result += pgwire::CommandComplete("SELECT " + std::to_string(row_count));
     return result;

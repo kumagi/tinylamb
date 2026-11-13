@@ -2353,7 +2353,7 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
   // as "answer by scan": native falls through to decode (VectorizedScanColumn
   // / XorRgMask pass-safe), WASM returns ~0ULL (inv) or a pass-all mask
   // (xor), so skipping these sections is never wrong, only slower on the
-  // queries they accelerate. Documented in docs/05-pax-chunk.md.
+  // queries they accelerate. Documented in docs/environment_variables.md.
   const bool kNoInvIdx = std::getenv("TINYLAMB_NO_INV_IDX") != nullptr;
   const bool kNoXor8 = std::getenv("TINYLAMB_NO_XOR8") != nullptr;
   // Adaptive-encoder env knobs, read once per build (getenv per call, never

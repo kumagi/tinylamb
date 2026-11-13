@@ -123,10 +123,9 @@ TEST(FunctionCallAstEdges, FormatSpecifiers) {
   ASSERT_TRUE(literal.HasValue());
   EXPECT_EQ(literal.Value().AsString(), "\"100%\"");
 
-  // Unknown specifiers surface verbatim instead of failing.
+  // GoogleSQL has no %q specifier; an unknown specifier is an error.
   auto unknown = Eval("format", {Str("%q"), Value(int64_t{1})});
-  ASSERT_TRUE(unknown.HasValue());
-  EXPECT_EQ(unknown.Value().AsString(), "\"%q\"");
+  EXPECT_FALSE(unknown.HasValue());
 }
 
 TEST(FunctionCallAstEdges, StringHelpersEdgeBranches) {
@@ -244,7 +243,7 @@ TEST(FunctionCallSqlEdges, ScalarBatteryOverTable) {
       {"SELECT generate_date_array(DATE '2026-01-01', DATE '2026-01-03') "
        "FROM t WHERE x = 9",
        true},
-      {"SELECT make_interval(1, 2, 3) FROM t WHERE x = 9", true},
+      {"SELECT make_interval(1, 'DAY', 3) FROM t WHERE x = 9", true},
       {"SELECT unix_date(DATE '2026-01-02') FROM t WHERE x = 9", true},
       {"SELECT format_date('%Y', DATE '2026-01-02') FROM t WHERE x = 9", true},
       {"SELECT parse_timestamp('%Y-%m-%d', '2026-01-02') FROM t WHERE x = 9",

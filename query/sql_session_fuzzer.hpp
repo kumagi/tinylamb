@@ -18,10 +18,11 @@ namespace tinylamb {
 // row-level mirror of every table in C++ and compares a full-table dump
 // against the engine after each INSERT / UPDATE / DELETE / DDL step.
 //
-// DML and CREATE/DROP TABLE run as SQL.  CREATE INDEX is not reachable
-// through the SQL frontend (the GoogleSQL AST visitor does not implement
-// it yet), so the harness drives it through the Database C++ API; the
-// recorded pseudo-DDL replays through the same API.
+// DML and CREATE/DROP TABLE run as SQL.  Index creation uses the harness's
+// own slot-based pseudo-DDL ("CREATE [UNIQUE] INDEX n ON t KEY(slots)
+// [INCLUDE(slots)]") driven through the Database C++ API rather than the
+// SQL CREATE INDEX spelling, so the recorded form replays deterministically;
+// the pseudo-DDL replays through the same API.
 //
 // A mismatch means some layer (MVCC visibility, WAL reflect, page
 // allocation, B+Tree/LSM index maintenance, catalog) lost a committed

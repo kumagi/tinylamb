@@ -276,7 +276,7 @@ StatusOr<QueryResult> SqlEngine::Execute(TransactionContext& ctx,
       return prepared.GetStatus();
     }
     return QueryResult(std::move(prepared.Value()), last_statement_type_,
-                       result_column_names_);
+                       result_column_names_, result_column_types_);
   } catch (const std::exception& e) {
     last_error_ = e.what();
     return Status::kUnknown;
@@ -1176,9 +1176,25 @@ class PlannedExplainExecutor final : public ExecutorBase {
   Executor inner_;
 };
 
-Executor WithPlanExplain(Executor executor, Plan plan) {
+std::vector<ValueType> SchemaColumnTypes(const Schema& schema) {
+  std::vector<ValueType> types;
+  types.reserve(schema.ColumnCount());
+  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+    types.push_back(schema.GetColumn(i).Type());
+  }
+  return types;
+}
+
+Executor WithPlanExplain(Executor executor, Plan plan,
+                         std::vector<ValueType>* output_types = nullptr) {
   if (executor == nullptr || plan == nullptr) {
     return executor;
+  }
+  if (output_types != nullptr) {
+    // The plan's output schema carries the declared column types; capture
+    // them before `plan` moves into the explain wrapper so wire consumers
+    // (e.g. pgwire RowDescription) see real types even for empty results.
+    *output_types = SchemaColumnTypes(plan->GetSchema());
   }
   return std::make_shared<PlannedExplainExecutor>(std::move(executor),
                                                   std::move(plan));
@@ -1738,6 +1754,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   last_statement_type_.reset();
   last_query_is_literal_constant_ = false;
   result_column_names_.clear();
+  result_column_types_.clear();
   shared_grouping_cores_.clear();
   // Persisted views expand at FROM-reference time in the visitor, so the
   // session registry must be current before the statement is visited.
@@ -3860,7 +3877,8 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     // Sequenced: emit while the plan is alive, then hand both to the
     // explain wrapper so the plan tree outlives the executor.
     Executor executor = relational_plan->EmitExecutor(ctx);
-    return WithPlanExplain(std::move(executor), std::move(relational_plan));
+    return WithPlanExplain(std::move(executor), std::move(relational_plan),
+                           &result_column_types_);
   };
   if (grouped_route_relational || depends_on_representative_row) {
     StatusOr<Executor> relational_executor = emit_relational();
@@ -3902,7 +3920,8 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     if (grouped.HasValue()) {
       Plan plan = std::move(grouped.Value());
       Executor executor = plan->EmitExecutor(ctx);
-      return WithPlanExplain(std::move(executor), std::move(plan));
+      return WithPlanExplain(std::move(executor), std::move(plan),
+                             &result_column_types_);
     }
   }
   Plan finish = std::make_shared<GroupByPlan>(
@@ -3910,7 +3929,8 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
       !select.GroupBy().empty(), finite_limit);
   finish->SetExplainInfo(core_plan->ExplainInfo());
   PlanBase& finish_ref = *finish;
-  return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish));
+  return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish),
+                         &result_column_types_);
 }
 
 namespace {
@@ -4222,7 +4242,8 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
         !select.GroupBy().empty(), finite_limit);
     finish->SetExplainInfo(core_plan->ExplainInfo());
     PlanBase& finish_ref = *finish;
-    return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish));
+    return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish),
+                         &result_column_types_);
   }
 
   bool has_star = false;
@@ -4300,6 +4321,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
       }
     }
     result_column_names_.clear();
+    result_column_types_.clear();
     result_column_names_.reserve(projection_items.size());
     for (const NamedExpression& item : projection_items) {
       result_column_names_.push_back(item.name);
@@ -4564,7 +4586,8 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     executor = std::make_shared<Projection>(std::move(visible), schema,
                                             std::move(executor));
   }
-  return WithPlanExplain(std::move(executor), std::move(explain_plan));
+  return WithPlanExplain(std::move(executor), std::move(explain_plan),
+                         &result_column_types_);
 }
 
 // `x op ANY/ALL (SELECT ...)` over a non-correlated subquery: run the inner
@@ -5368,7 +5391,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         PlanBase& relational_ref = *relational_plan;
         Executor emitted = relational_ref.EmitExecutor(ctx);
-        return WithPlanExplain(std::move(emitted), std::move(relational_plan));
+        return WithPlanExplain(std::move(emitted), std::move(relational_plan),
+                               &result_column_types_);
       };
       const bool sampled_relational_source = std::ranges::any_of(
           select->Sources(), [](const SelectSource& source) {
@@ -6053,6 +6077,7 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
           query.select_ = std::move(expanded);
           if (has_table_sample) {
             result_column_names_.clear();
+            result_column_types_.clear();
             result_column_names_.reserve(query.select_.size());
             for (const NamedExpression& item : query.select_) {
               result_column_names_.push_back(
@@ -6553,7 +6578,8 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
         }
         StoreThreadCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
       }
-      return WithPlanExplain(std::move(executor), std::move(plan));
+      return WithPlanExplain(std::move(executor), std::move(plan),
+                             &result_column_types_);
     }
     case StatementType::kUpdate: {
       const auto& update = dynamic_cast<const UpdateStatement&>(*statement);
@@ -7032,7 +7058,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
     }
     case StatementType::kDropTable: {
       const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
-      RETURN_IF_FAIL(database_->DropTable(ctx, drop.TableName()));
+      Status drop_status = database_->DropTable(ctx, drop.TableName());
+      if (drop.IfExists() && drop_status == Status::kNotExists) {
+        drop_status = Status::kSuccess;
+      }
+      RETURN_IF_FAIL(drop_status);
       ctx.tables_.erase(drop.TableName());
       ctx.stats_.erase(drop.TableName());
       return Executor(std::make_shared<ConstantExecutor>(
@@ -7117,6 +7147,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       StatusOr<std::string> definition =
           database_->GetMaterializedViewDefinition(ctx, drop.ViewName());
       if (!definition.HasValue()) {
+        if (drop.IfExists() &&
+            definition.GetStatus() == Status::kNotExists) {
+          return Executor(std::make_shared<ConstantExecutor>(
+              Row({Value("DROP MATERIALIZED VIEW"), Value(0)})));
+        }
         last_error_ =
             "materialized view " + drop.ViewName() + " does not exist";
         return Status::kNotExists;
@@ -7173,6 +7208,11 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       StatusOr<std::string> definition =
           database_->GetViewDefinition(ctx, drop.ViewName());
       if (!definition.HasValue()) {
+        if (drop.IfExists() &&
+            definition.GetStatus() == Status::kNotExists) {
+          return Executor(std::make_shared<ConstantExecutor>(
+              Row({Value("DROP VIEW"), Value(0)})));
+        }
         last_error_ = "view " + drop.ViewName() + " does not exist";
         return Status::kNotExists;
       }
@@ -7349,6 +7389,7 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         }
         last_statement_type_ = StatementType::kSelect;
         result_column_names_ = compiled->select_shape->column_names;
+        result_column_types_ = SchemaColumnTypes(compiled->plan->GetSchema());
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         Executor timed = std::make_shared<TimedSelectReuse>(
             std::move(*served), fingerprint, compiled);

@@ -49,11 +49,46 @@ int CompareRowKeys(const Row& lhs, const Row& rhs, const Schema& schema,
   return 0;
 }
 
+// Validates that every row's sort keys evaluate cleanly BEFORE sorting.
+// The comparator cannot abort mid-sort and std::sort requires a strict
+// weak ordering: a data-dependent "equal" answer for a failing row breaks
+// transitivity (Y~X and X~Z while Y<Z), which is the same UB class the
+// NaN comment below calls out.  Detecting failures up front keeps the
+// comparator total; the rows are left untouched when this returns an error.
+template <typename Rows, typename Project>
+Status ValidateSortKeys(const Rows& rows, const Schema& schema,
+                        const std::vector<SortExecutor::Key>& keys,
+                        Project&& project) {
+  for (const auto& entry : rows) {
+    const Row& row = project(entry);
+    for (const SortExecutor::Key& key : keys) {
+      StatusOr<Value> evaluated = key.expression->TryEvaluate(row, schema);
+      if (!evaluated.HasValue()) {
+        return evaluated.GetStatus();
+      }
+    }
+  }
+  return Status::kSuccess;
+}
+
 }  // namespace
 
 void PdqSort::Sort(std::vector<std::pair<Row, RowPosition>>& rows,
                    const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
+  if (error != nullptr) {
+    const Status validation = ValidateSortKeys(
+        rows, schema, keys,
+        [](const std::pair<Row, RowPosition>& entry) -> const Row& {
+          return entry.first;
+        });
+    if (validation != Status::kSuccess) {
+      if (*error == Status::kSuccess) {
+        *error = validation;
+      }
+      return;
+    }
+  }
   std::sort(rows.begin(), rows.end(),
             [&](const std::pair<Row, RowPosition>& a,
                 const std::pair<Row, RowPosition>& b) {
@@ -63,6 +98,17 @@ void PdqSort::Sort(std::vector<std::pair<Row, RowPosition>>& rows,
 
 void PdqSort::Sort(std::vector<Row>& rows, const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
+  if (error != nullptr) {
+    const Status validation =
+        ValidateSortKeys(rows, schema, keys,
+                         [](const Row& row) -> const Row& { return row; });
+    if (validation != Status::kSuccess) {
+      if (*error == Status::kSuccess) {
+        *error = validation;
+      }
+      return;
+    }
+  }
   std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
     return CompareRowKeys(a, b, schema, keys, error) < 0;
   });

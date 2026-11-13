@@ -144,6 +144,8 @@ TEST_F(SqlCastMatrixCoverageTest, BoolConversions) {
   ExpectCast("FALSE AS STRING", (Value(std::string("false"))));
   ExpectCast("'true' AS BOOL", (Value(true)));
   ExpectCast("'false' AS BOOL", (Value(false)));
+  // INT64 -> BOOL is an intentional divergence from GoogleSQL (which has no
+  // such cast signature); see sql_expression_matrix_test.cpp's note.
   ExpectCast("1 AS BOOL", (Value(true)));
   ExpectCast("0 AS BOOL", (Value(false)));
   ExpectCastError("'yes' AS BOOL");
@@ -178,7 +180,7 @@ TEST_F(SqlCastMatrixCoverageTest, CastsInExpressionsAndAggregates) {
   const auto rounded =
       RunSql(engine_.get(), context_.get(),
              "SELECT CAST(FLOOR(n) AS STRING) FROM c ORDER BY n");
-  ASSERT_EQ(rows.size(), 1U);
+  ASSERT_EQ(rounded.size(), 2U);
   EXPECT_EQ(rounded[0][0], (Value(std::string("1"))));
   EXPECT_EQ(rounded[1][0], (Value(std::string("2"))));
 }

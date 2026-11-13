@@ -682,8 +682,12 @@ inline OpStatus RemoveAtPath(JVal& root,
 }
 
 // Parses `text` fully (no trailing garbage) into a document, or returns
-// nullopt when the text is not valid JSON.  Callers turn that into either an
-// error (the mutating family) or NULL (the LAX_* family).  The `raw` views
+// nullopt when the text cannot be parsed at all.  NOTE: this is the
+// deliberately lenient document parser, NOT strict RFC 8259 validation --
+// it accepts spellings strict JSON rejects ('+1', '01', '{', '[').  Callers
+// that need strictness gate on json_text::IsValid first.  Parse failures
+// become either an error (the mutating family) or NULL (the LAX_* family).
+// The `raw` views
 // of the result (and its children) point into `text`, which must outlive the
 // document; canonical()/str/num stay self-contained.
 inline std::optional<JVal> ParseDocument(std::string_view text) {

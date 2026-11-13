@@ -14,7 +14,7 @@
 
 浮動小数点では、内部表現の異なるすべての `NaN` を一つの同値キーへ正規化し、`-0.0` と `+0.0` も同値にする。配列は要素の辞書式順序で比較する。符号なし整数は符号付き整数へ変換せず、本来の数値領域で比較する。
 
-ただし、`NaN` と通常値の相対位置は、現在の三つの処理で一致していない。`SortExecutor` のバイト列符号化は、昇順で `NaN` を非 NULL 値の先頭に置く。共通の `CompareForOrderBy` を使う Top-N と `PdqSort` は、昇順で `NaN` をすべての非 `NULL` 通常値より前に置く。`PartialSortExecutor` と `MergeAppendExecutor` の一部は、浮動小数点の大小演算を直接使う。この比較では、`NaN` と任意の数値のどちらも他方より小さくない。このため、`NaN` を含む入力では、物理方式によって相対順が異なる。
+ただし、`NaN` と通常値の相対位置は、現在の三つの処理で一致していない。`SortExecutor` のバイト列符号化は、昇順で `NaN` を非 NULL 値の先頭に置く。共通の `CompareForOrderBy` を使う Top-N と `PdqSort` は、昇順で `NaN` をすべての非 `NULL` 通常値より前に置く。`MergeAppendExecutor` の一部は、浮動小数点の大小演算を直接使う。この比較では、`NaN` と任意の数値のどちらも他方より小さくない。このため、`NaN` を含む入力では、物理方式によって相対順が異なる。
 
 ## 1.1 照合順序（collation）
 
@@ -24,7 +24,7 @@
 - 比較の照合順序は「どちらか一方が case-insensitive なら全体 case-insensitive」という規則で解決する。これは `=` 述語（`expression/binary_expression.cpp`）と同じ規則なので、述語と整列が「どの行が同値か」で食い違うことがない。
 - 大文字小文字の畳み込みは ASCII のみ（`FoldCaseForCollation`）。UTF-8 のマルチバイト列は畳み込まれないため、既存のバイト順・`interval` 表現順・適合 catalog の ENUM 固定順位（`TESTENUMNEGATIVE` 先行）は変わらない。ロケール／ICU の照合順序は未実装で、`en_US` や `en_US:cs` は case-insensitive として扱われる。これは「未対応は binary fallback」という範囲内の意図的な契約である。
 - 照合順序つきのキーは、比較可能なバイト列へ符号化する前に畳み込む（`SortExecutor` の `SortKeyEncoder`）。メモリ内整列も、外部マージの run も、マージ窓口も同じ符号化を使うため、spill を跨いでも順序が一致する。`Row` の直列化はタグを落とすが、マージ側は行に対して同じキー式を再評価するので `COLLATE` が付け直される。
-- 比較ベースのパスはすべて `SortKeyOrder` を使う: `TopNExecutor` のヒープ、`PdqSort`、`MergeAppendExecutor`、`PartialSortExecutor`、SQL 関係代数パスの三つの `ORDER BY` ソータ。NULL 位置・方向・照合順序が一つの型に集約されるので、方式が違っても答えが違わない。`IncrementalSortExecutor` の prefix 等価判定と `WITH TIES` の境界行は `EqualUnderCollation` を使う。
+- 比較ベースのパスはすべて `SortKeyOrder` を使う: `TopNExecutor` のヒープ、`PdqSort`、`MergeAppendExecutor`、SQL 関係代数パスの三つの `ORDER BY` ソータ。NULL 位置・方向・照合順序が一つの型に集約されるので、方式が違っても答えが違わない。`IncrementalSortExecutor` の prefix 等価判定と `WITH TIES` の境界行は `EqualUnderCollation` を使う。
 - `EqualUnderCollation` は `FLOAT64` を `NaN` 一つの peer 群・`±0.0` 同値に正規化し、case-insensitive な `VARCHAR` は畳み込み後に比較する。interval 相当テキストは `Value::operator==` に従い同値。`DISTINCT` / `GROUP BY` の `CanonicalDistinctValue` も同じ畳み込みを使う。
 
 optimizer 側は同じ契約を `PhysicalProperties::collation`（空文字がエンジン既定 = binary）で伝播する。`SortPlan` / `TopNPlan` は `PlanBase::OrderCollation()` で自分たちのキーがどの照合順序で作られたかを報告し、`SatisfiesOrderingCollation` が「要求された照合順序と同じ順序か」を判定する。case-insensitive な順序は binary な順序の代替にならない（`und:ci` では `a` が `B` より先に、`binary` では逆）ため、`ORDER BY x COLLATE 'und:ci'` は索引順や clustered order に畳めない。`ProjectionPlan` / `SelectionPlan` / `LimitPlan` は行成型ラッパーなのでこの主張を転送する。
@@ -103,23 +103,7 @@ Top-N の浮動小数点比較には `CompareForOrderBy` を使う。`NULL` の�
 
 ## 4. `PartialSortExecutor`
 
-`PartialSortExecutor` は二つの動作モードを持つ。
-
-### 4.1 固定ブロックモード
-
-`block_size > 0` の場合は、入力をその行数ごとの独立したブロックへ分ける。各ブロックを完全に整列する。`top_k` がブロック幅より小さい場合は、先頭の `top_k` 行だけを部分整列して返す。
-
-ブロック間では比較しないため、出力全体が整列キー順になるとは限らない。各ブロックがすでに上位キーの範囲ごとに分かれている場合や、ブロックごとの上位値だけが必要な場合に利用できる。このモードでは `offset` を適用しない。
-
-### 4.2 全入力から上位 K 行を求めるモード
-
-`block_size = 0` の場合は全入力を保持し、必要な範囲を `offset + top_k` とする。この範囲が入力行数より小さければ、`partial_sort` で先頭部分だけの順序を確定し、`offset` 以降の必要行を返す。`top_k = 0` の場合は全体を整列し、`offset` 以降をすべて返す。
-
-どちらも、全出力をメモリへ保持するパイプラインブレーカーである。入力行と位置の概算量を作業メモリへ計上する。
-
-比較式が失敗すると、最初のエラーを整列中に記録する。行 API は整列の完了後にそのエラーを返すが、バッチ API は記録済みのエラーを確認せず、保持している行を返す。また、全入力から上位 K 行を求めるモードで一行も得ないまま子が失敗すると、早期に処理を終えるため、子の状態を取り込まない。
-
-比較では、浮動小数点の `<` を両方向に直接適用する。そのため、`NaN` は通常のすべての数値と同順位であるかのように扱われる。この比較は厳密弱順序を満たさないので、`NaN` を含む結果の位置は保証されない。`offset + top_k` の加算には飽和処理がなく、極端に大きな値では整数が回り込む可能性もある。
+`PartialSortExecutor` は撤去済み。オフセットを含む上位 K 行の取得は `TopNExecutor`（§3）が担う。固定ブロック単位の部分整列という独立した演算子は存在しない。
 
 ## 5. `IncrementalSortExecutor`
 

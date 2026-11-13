@@ -475,8 +475,8 @@ void MaterializeCacheRowsIfNeeded(const std::string& cache_key,
 
 // Parallel variant for multi-million-row caches: boxes disjoint row ranges
 // across worker threads, then marks the arena rows_boxed.
-void MaterializeCacheRowsParallel(const std::string& cache_key,
-                                  Relation* cached, ExecutionRuntime* runtime);
+[[nodiscard]] Status MaterializeCacheRowsParallel(
+    const std::string& cache_key, Relation* cached, ExecutionRuntime* runtime);
 
 // Cache key shared by scalar/EXISTS result caching and IN membership caching.
 // The inherited CTE identities are part of the key because the same query

@@ -69,10 +69,12 @@ to copy.
   col=DEFAULT resolves the same way. Undeclared defaults are NULL. The single
   constraint slot prevents combining DEFAULT/FOREIGN KEY/PRIMARY KEY on a
   column; conflicting constraints must be rejected explicitly.
-- PRIMARY KEY in CREATE TABLE is metadata only: INSERT does not enforce its
-  uniqueness. `sql_dml_paths_coverage_test` pins this contract. Compliance mode
-  can tag the first column as a key for optimizer rules; that is not write-time
-  uniqueness enforcement either. Changing this is a semantic decision.
+- PRIMARY KEY in CREATE TABLE is parsed both as a column attribute
+  (`k INT64 PRIMARY KEY`) and as a table-level `PRIMARY KEY (k)` element, and
+  INSERT enforces the resulting uniqueness on both spellings (a duplicate key
+  fails with `kDuplicates`). `sql_dml_paths_coverage_test` pins this contract.
+  Compliance mode can additionally tag the first column as a key for optimizer
+  rules.
 - MERGE materializes its source, classifies WHEN actions, then applies deletes,
   updates and inserts. An extracted ON equality key hashes the source;
   otherwise it uses linear matching. Multiple source matches for target

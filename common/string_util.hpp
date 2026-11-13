@@ -124,15 +124,25 @@ namespace tinylamb {
   const auto in_cutset = [&](std::string_view point) {
     return std::ranges::find(points, point) != points.end();
   };
+  // A cutset byte that is not a complete sequence (e.g. a lone 0xAC from a
+  // BYTES literal) only ever forms a one-byte point. Match it byte by byte in
+  // the text even when the text byte is part of a well-formed sequence, so a
+  // BYTES cutset keeps byte semantics while a valid multi-byte STRING cutset
+  // keeps code-point semantics.
   if (leading) {
     while (!text.empty()) {
       const size_t len =
           std::min(Utf8SequenceLength(static_cast<unsigned char>(text[0])),
                    text.size());
-      if (!in_cutset(text.substr(0, len))) {
-        break;
+      if (in_cutset(text.substr(0, len))) {
+        text.remove_prefix(len);
+        continue;
       }
-      text.remove_prefix(len);
+      if (len > 1 && in_cutset(text.substr(0, 1))) {
+        text.remove_prefix(1);
+        continue;
+      }
+      break;
     }
   }
   if (trailing) {
@@ -148,10 +158,15 @@ namespace tinylamb {
         start = text.size() - 1;  // malformed tail: compare the last byte
         len = 1;
       }
-      if (!in_cutset(text.substr(start, len))) {
-        break;
+      if (in_cutset(text.substr(start, len))) {
+        text.remove_suffix(len);
+        continue;
       }
-      text.remove_suffix(len);
+      if (len > 1 && in_cutset(text.substr(text.size() - 1, 1))) {
+        text.remove_suffix(1);
+        continue;
+      }
+      break;
     }
   }
   return text;

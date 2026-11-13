@@ -326,7 +326,16 @@ QueryProfile RunQuery(tinylamb::Database& database, std::string_view name,
     context.Abort();
     return profile;
   }
-  profile.rows = result.Value().Drain();
+  try {
+    profile.rows = result.Value().Drain();
+  } catch (const std::exception& exception) {
+    // Match the tpch/tpcc harnesses: an executor that throws must be
+    // recorded as a query error, not allowed to terminate the run.
+    profile.error = std::string(name) + ": " + exception.what();
+    tinylamb::SqlEngine::SetThreadRuntimeProfiling(false);
+    context.Abort();
+    return profile;
+  }
   profile.milliseconds =
       std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
   if (result.Value().GetStatus() != tinylamb::Status::kSuccess) {

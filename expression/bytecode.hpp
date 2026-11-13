@@ -80,9 +80,11 @@ class BytecodeProgram {
   // interpreter (the caller retries with TryEvaluateRow; nothing was
   // consumed).
   enum class FastEval { kDone, kUnsupported, kError };
-  // Evaluates numeric programs (columns/constants, int64+double arithmetic,
-  // comparisons, unary, EXTRACT date parts) straight on the row cells without
-  // constructing intermediate Values.  Semantics mirror the canonical
+  // Fast-path evaluation straight on the row cells without constructing
+  // intermediate Values.  The opcode set covers loads/stores, int64+double
+  // arithmetic, comparisons, unary ops, control-flow jumps and EXTRACT date
+  // parts; VARCHAR/DATE operations delegate to the canonical scalar
+  // evaluator.  Semantics mirror the canonical
   // interpreter instruction-for-instruction; differential_test compares both
   // paths.  Only valid after a successful Compile (the shape flag is computed
   // there; hand-built programs report kUnsupported).

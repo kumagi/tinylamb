@@ -111,7 +111,8 @@ TEST_F(SqlIntervalCoverageTest, IntervalArithmetic) {
                Value("1-5 0 0:0:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '1' SECOND + INTERVAL '0.5' SECOND",
                Value("0-0 0 0:0:1.5").WithInterval());
-  ExpectScalar("SELECT make_interval(1, 2, 3, 4)",
+  // Extra arguments stay lenient, but the unit attribute must be a real one.
+  ExpectScalar("SELECT make_interval(1, 'DAY', 3, 4)",
                Value("0-0 1 0:0:0").WithInterval());
 }
 

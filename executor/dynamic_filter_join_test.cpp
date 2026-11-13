@@ -64,6 +64,10 @@
 #include "type/value.hpp"
 #include "type/value_type.hpp"
 
+// setenv/unsetenv below are POSIX APIs that <cstdlib> does not declare.
+// NOLINTNEXTLINE(modernize-deprecated-headers)
+#include <stdlib.h>
+
 namespace tinylamb {
 namespace {
 
@@ -384,20 +388,39 @@ TEST_F(DynamicFilterJoinTest, StaleIndexDoesNotChangeTheFilteredResult) {
 }
 
 TEST_F(DynamicFilterJoinTest, ParallelAndSerialScansAgree) {
-  // The filter is applied by the serial iterator AND by parallel scan workers
-  // (the group is immutable once built, so sharing it is safe). Both must
-  // produce the same rows.
+  // The runtime filter must prune identically whether the probe scan runs
+  // on the morsel-parallel ParallelScan or the serial FullScan.  ParallelScan
+  // is only planned at kParallelScanMinRows (8192) estimated rows, so top up
+  // `wide` and re-analyze; TINYLAMB_DISABLE_PARALLEL_SCAN then forces the
+  // serial operator for the very same statement.
+  TransactionContext bulk = database_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, wide, bulk.GetTable("wide"));
+  for (int64_t i = 200; i < 9000; ++i) {
+    ASSERT_SUCCESS(
+        wide->Insert(bulk.txn_, Row({Value(i), Value(i * 2)})).GetStatus());
+  }
+  ASSERT_SUCCESS(bulk.txn_.PreCommit());
+  std::vector<Row> reanalyzed;
+  ASSERT_SUCCESS(Run("ANALYZE", &reanalyzed));
+
   const std::string sql =
       "SELECT w.k, w.v, d.tag FROM wide w JOIN dim d ON w.k = d.k ORDER BY w.v";
-  std::vector<Row> serial;
-  ASSERT_SUCCESS(Run(sql, &serial));
-  // `wide` holds 200 distinct keys and `dim` three, so the parallel keyed scan
-  // path is eligible: the filter must prune identically there.
+  const std::string plan = Explain(sql);
+  EXPECT_NE(plan.find("ParallelScan"), std::string::npos) << plan;
   std::vector<Row> parallel;
   ASSERT_SUCCESS(Run(sql, &parallel));
-  EXPECT_EQ(Text(serial), Text(parallel));
-  EXPECT_EQ(Text(serial),
+  EXPECT_EQ(Text(parallel),
             (std::vector<std::string>{"1|2|10", "2|4|20", "3|6|30"}));
+
+  setenv("TINYLAMB_DISABLE_PARALLEL_SCAN", "1", 1);
+  const std::string serial_plan = Explain(sql);
+  EXPECT_EQ(serial_plan.find("ParallelScan"), std::string::npos)
+      << serial_plan;
+  std::vector<Row> serial;
+  const Status serial_status = Run(sql, &serial);
+  unsetenv("TINYLAMB_DISABLE_PARALLEL_SCAN");
+  ASSERT_SUCCESS(serial_status);
+  EXPECT_EQ(Text(serial), Text(parallel));
 }
 
 // ---------------------------------------------------------------------------

@@ -2,8 +2,10 @@
 #ifndef TINYLAMB_JSON_TEXT_HPP
 #define TINYLAMB_JSON_TEXT_HPP
 
-// Shared strict-JSON validation for the PARSE_JSON function and the JSON
-// function family's argument checks. Both function evaluators (the AST
+// Shared strict-JSON (RFC 8259) validation.  Used by PARSE_JSON and by the
+// JSON accessor argument checks that must reject malformed documents before
+// navigating them; the JSON document family itself parses through the
+// lenient json_doc parser instead.  Both function evaluators (the AST
 // ground-truth evaluator in expression/ and the relational evaluator in
 // executor/detail/) include this header so a text accepted by one route is
 // accepted by the other.

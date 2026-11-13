@@ -1,4 +1,4 @@
-[default_time_zone=America/Los_Angeles]
+[default default_time_zone=America/Los_Angeles]
 ==
 [name=cast_timestamp_to_date]
 

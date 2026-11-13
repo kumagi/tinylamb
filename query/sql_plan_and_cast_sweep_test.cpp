@@ -258,18 +258,23 @@ TEST_F(SqlPlanCacheSweepTest, RangeFrameBoundShapes) {
 
 // Struct-field UPDATE and EXPLAIN coverage over mixed plan shapes.
 TEST_F(SqlPlanCacheSweepTest, StructUpdateAndExplainShapes) {
-  // NOTE: INSERT into a CTAS-created table currently fails validation
-  // ("INSERT type mismatch for column id"), so the table stays empty and
-  // these statements exercise the parse/plan/rewrite paths on zero rows.
+  // The empty CTAS table now infers the SELECT literal's INT64 type, so
+  // typed INSERTs succeed and the struct-field UPDATEs below mutate a real
+  // stored row (previously pinned as zero-row no-ops).
   EXPECT_EQ(
       ScalarInt(engine_.get(), context_.get(), "SELECT COUNT(*) FROM st_t"), 0);
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO st_t VALUES (1, STRUCT(10 AS x, 'hi' AS y))");
   RunSql(engine_.get(), context_.get(), "UPDATE st_t SET s.x = 7");
   RunSql(engine_.get(), context_.get(),
          "UPDATE st_t SET s = STRUCT(5 AS x, 'five' AS y)");
   RunSql(engine_.get(), context_.get(),
          "UPDATE st_t SET id = id + 1 WHERE 1 = id");
-  EXPECT_EQ(
-      ScalarInt(engine_.get(), context_.get(), "SELECT COUNT(*) FROM st_t"), 0);
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT id, s FROM st_t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0].value.int_value, 2);
+  EXPECT_EQ(rows[0][1].AsStringView(), R"({"x":5,"y":"five"})");
   for (const auto& sql : {
            "EXPLAIN SELECT k FROM pc WHERE k = 1",
            "EXPLAIN SELECT x.k FROM pc x JOIN pcr y ON x.k = y.k",

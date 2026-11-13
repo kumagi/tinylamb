@@ -938,6 +938,33 @@ TEST(PdqSortTest, TiebreakAndNullPlacement) {
   EXPECT_TRUE(none.empty());
 }
 
+TEST(PdqSortTest, KeyEvaluationFailureAbortsBeforeSorting) {
+  const Schema schema(
+      "t", {Column("a", ValueType::kInt64), Column("b", ValueType::kInt64)});
+  // b == 0 makes the key expression fail.  The comparator cannot abort
+  // mid-sort, so the failure must be detected before std::sort runs:
+  // otherwise the failing row compares "equal" to everything and breaks
+  // strict weak ordering (UB).  The error is reported and the input order
+  // is preserved.
+  std::vector<Row> rows;
+  rows.emplace_back(Row({Value(int64_t{3}), Value(int64_t{1})}));
+  rows.emplace_back(Row({Value(int64_t{1}), Value(int64_t{0})}));
+  rows.emplace_back(Row({Value(int64_t{2}), Value(int64_t{2})}));
+  Status error = Status::kSuccess;
+  PdqSort::Sort(rows, schema,
+                {SortExecutor::Key{
+                    .expression = BinaryExpressionExp(
+                        ColumnValueExp("a"), BinaryOperation::kDivide,
+                        ColumnValueExp("b")),
+                    .ascending = true}},
+                &error);
+  EXPECT_NE(error, Status::kSuccess);
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0].value.int_value, 3);
+  EXPECT_EQ(rows[1][0].value.int_value, 1);
+  EXPECT_EQ(rows[2][0].value.int_value, 2);
+}
+
 // A child executor that fails the drain after a bounded number of rows, so
 // drain-error propagation can be exercised without a real I/O fault.
 class DrainFailingRows final : public ExecutorBase {

@@ -48,7 +48,7 @@ FUZZ_PATTERNS = (
 )
 
 
-def tracked_files(root: Path) -> set:
+def tracked_files(root: Path) -> set | None:
     try:
         out = subprocess.run(
             ["git", "ls-files"],
@@ -57,8 +57,12 @@ def tracked_files(root: Path) -> set:
             text=True,
             check=True,
         ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return set()
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        # Without the tracked set we cannot tell versioned fixtures from
+        # debris; the caller must not treat "unknown" as "untracked".
+        print(f"warning: git ls-files failed ({error}); tracked-file "
+              "protection is disabled", file=sys.stderr)
+        return None
     return {line for line in out.splitlines() if line}
 
 
@@ -97,8 +101,11 @@ def main() -> int:
                 relative = entry.resolve().relative_to(repo_root.resolve())
             except ValueError:
                 relative = None
-            if relative is not None and str(relative) in tracked:
-                continue  # a versioned fixture that merely looks like debris
+            if relative is not None:
+                if tracked is None:
+                    continue  # cannot prove the file is untracked debris
+                if str(relative) in tracked:
+                    continue  # a versioned fixture that merely looks like debris
             verb = "would remove" if args.dry_run else "removed"
             print(f"{verb}: {entry}")
             if not args.dry_run:

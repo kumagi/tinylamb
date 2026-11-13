@@ -11,12 +11,10 @@
 # and show side-by-side how changing the default time zone affects the
 # results of queries.
 #
-# TODO: Support a default default_time_zone correctly, i.e.,
-# [default default_time_zone=...], like we do other configuration settings,
-# and make [default_time_zone=...] be specific to the query it is part of.
-# Right now, [default_time_zone=...] acts like the default default (applies
-# to all queries after it).
-[default_time_zone=+00]
+# [default default_time_zone=...] sets the file-wide default (like other
+# "default"-prefixed settings); a bare [default_time_zone=...] applies only
+# to the query it is part of.
+[default default_time_zone=+00]
 [default global_labels=timestamp_type_and_functions,different_default_time_zone]
 
 [load_proto_files=googlesql/testdata/test_schema.proto]

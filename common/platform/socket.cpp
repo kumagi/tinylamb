@@ -433,9 +433,16 @@ int SetSocketTimeout(int fd, int optname, int timeout_ms) {
   return ::setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
 }
 
-bool IsCloseOnExec(int fd) { return (::fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0; }
+bool IsCloseOnExec(int fd) {
+  const int flags = ::fcntl(fd, F_GETFD);
+  // fcntl returns -1 on a bad fd; -1 & FD_CLOEXEC would masquerade as set.
+  return flags != -1 && (flags & FD_CLOEXEC) != 0;
+}
 
-bool IsNonBlocking(int fd) { return (::fcntl(fd, F_GETFL) & O_NONBLOCK) != 0; }
+bool IsNonBlocking(int fd) {
+  const int flags = ::fcntl(fd, F_GETFL);
+  return flags != -1 && (flags & O_NONBLOCK) != 0;
+}
 
 ssize_t SendNoSignal(int fd, const void* data, size_t size, int extra_flags) {
   return ::send(fd, data, size, kSendNoSignal | extra_flags);

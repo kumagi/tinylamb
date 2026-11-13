@@ -385,8 +385,10 @@ TEST_F(CatalogTest, GetTableNotExists) {
   ctx.txn_.Abort();
 }
 
-TEST_F(CatalogTest, PageStoragePoolCapacityFromEnvironment) {
-  // Arrange -- a pool capacity far above one page but below the default
+TEST_F(CatalogTest, PageStorageIgnoresRetiredPoolCapacityEnv) {
+  // TINYLAMB_PAGE_POOL_BYTES is retired: PageManager::Create discards its
+  // capacity argument. A stale value in the environment must not affect
+  // database creation.
   ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "8388608", 1), 0);
   {
     auto env_db_holder =
@@ -401,7 +403,7 @@ TEST_F(CatalogTest, PageStoragePoolCapacityFromEnvironment) {
   }
   unsetenv("TINYLAMB_PAGE_POOL_BYTES");
 
-  // Arrange -- an env value below one page falls back to the default pool
+  // Arrange -- a sub-page value is equally ignored
   ASSERT_EQ(setenv("TINYLAMB_PAGE_POOL_BYTES", "1000", 1), 0);
   {
     auto small_env_db_holder =

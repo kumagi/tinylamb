@@ -541,7 +541,7 @@ class TransactionManager {
   // D4: commit_lsn is the durable point of this commit's WAL record; it is
   // stamped onto every published version so readers can register a
   // durability dependency on it.
-  void CommitVersions(Transaction& txn, lsn_t commit_lsn);
+  [[nodiscard]] Status CommitVersions(Transaction& txn, lsn_t commit_lsn);
   void AbortVersions(Transaction& txn);
   void ForgetTransaction(Transaction& txn);
   void GarbageCollectVersions();
@@ -847,10 +847,6 @@ class TransactionManager {
   // Removes every edge whose holder matches (used on commit/abort so the
   // graph cannot keep dead references to terminated transactions).
   void RemoveWaitForEdgesOf(txn_id_t holder);
-  // Out-of-band victim selection: returns true when a waiter's strict wait
-  // should actually be "die" (Wait-Die) or "wound" (Wound-Wait). The
-  // policies are encoded here so the call site stays a one-liner.
-  bool ShouldAbortOnWait(txn_id_t waiter, txn_id_t holder) const;
 };
 
 }  // namespace tinylamb

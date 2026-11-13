@@ -418,8 +418,8 @@ StatusOr<CivilTime> ExplicitZoneTextToDefaultCivil(std::string_view text,
                      (ParseTimeZoneOffset(text.substr(tz_pos), &ct)));
     explicit_sec = parsed;
   }
-  const __int128 utc_ns = CivilTimeToNanos(ct) -
-                          (static_cast<__int128>(explicit_sec) * 1000000000);
+  const __int128 utc_ns =
+      CivilTimeToNanos(ct) - (static_cast<__int128>(explicit_sec) * 1000000000);
   const CivilTime utc_ct = NanosToCivilTime(utc_ns);
   ASSIGN_OR_RETURN(int, default_sec,
                    (ParseTimeZoneOffset(GetDefaultTimeZone(), &utc_ct)));
@@ -1550,37 +1550,30 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
             5) {
           int tz_offset_sec = 0;
           bool has_tz = false;
+          const CivilTime ct_parsed{.year = Y,
+                                    .month = M,
+                                    .day = D,
+                                    .hour = h,
+                                    .minute = m,
+                                    .second = static_cast<int>(sec)};
           size_t tz_pos = s.find_first_of("+-", 10);
           if (tz_pos != std::string::npos) {
-            char sign = s[tz_pos];
-            int tz_h = 0, tz_m = 0;
-            if (s.find(':', tz_pos) != std::string::npos) {
-              sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
-                  s.c_str() + tz_pos + 1, "%d:%d", &tz_h, &tz_m);
-            } else {
-              sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
-                  s.c_str() + tz_pos + 1, "%d", &tz_h);
-            }
-            tz_offset_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
+            // The canonical parser validates digits and ranges; the old
+            // sscanf fallback turned malformed offsets ('+abc', '+99:99')
+            // into a silent +00:00.
+            ASSIGN_OR_RETURN(
+                int, parsed_tz,
+                (ParseTimeZoneOffset(std::string_view(s).substr(tz_pos),
+                                     &ct_parsed)));
+            tz_offset_sec = parsed_tz;
             has_tz = true;
           } else if (s.ends_with('Z') || s.ends_with('z')) {
             has_tz = true;
           }
           if (arguments.size() == 2) {
             std::string tz2 = raw_str(arguments[1]);
-            int tz2_sec = 0;
-            if (!tz2.empty() && (tz2[0] == '+' || tz2[0] == '-')) {
-              char sign = tz2[0];
-              int tz_h = 0, tz_m = 0;
-              if (tz2.find(':') != std::string::npos) {
-                sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
-                    tz2.c_str() + 1, "%d:%d", &tz_h, &tz_m);
-              } else {
-                sscanf(  // NOLINT(cert-err33-c,cert-err34-c) - zero fallback.
-                    tz2.c_str() + 1, "%d", &tz_h);
-              }
-              tz2_sec = (tz_h * 3600 + tz_m * 60) * (sign == '-' ? -1 : 1);
-            }
+            ASSIGN_OR_RETURN(int, tz2_sec,
+                             (ParseTimeZoneOffset(tz2, &ct_parsed)));
             struct tm t = {};
             t.tm_year = Y - 1900;
             t.tm_mon = M - 1;
@@ -1600,15 +1593,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                 std::chrono::sys_days{ymd}.time_since_epoch().count());
           }
           if (has_tz) {
-            CivilTime ct_tmp{.year = Y,
-                             .month = M,
-                             .day = D,
-                             .hour = h,
-                             .minute = m,
-                             .second = static_cast<int>(sec)};
             ASSIGN_OR_RETURN(
                 int, default_tz_sec,
-                (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_tmp)));
+                (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct_parsed)));
             struct tm t = {};
             t.tm_year = Y - 1900;
             t.tm_mon = M - 1;
@@ -1645,8 +1632,7 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (arguments[0].type == ValueType::kDate) {
         return Value(FormatDateDays(arguments[0].DateDays()) + " 00:00:00");
       }
-      ASSIGN_OR_RETURN(CivilTime, parsed,
-                       (TryValueToCivilTime(arguments[0])));
+      ASSIGN_OR_RETURN(CivilTime, parsed, (TryValueToCivilTime(arguments[0])));
       // DATETIME(timestamp) == DATETIME(timestamp, <session default zone>).
       ASSIGN_OR_RETURN(
           CivilTime, ct,
@@ -2126,6 +2112,19 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     if (name_view == "__bit_xor") {
       return with_u(Value(lhs ^ rhs));
+    }
+    // An UNSIGNED shift count is a huge positive number, not a negative
+    // offset: counts >= 64 yield 0 just like the signed path.
+    if (arguments[1].IsUnsigned()) {
+      const uint64_t shift =
+          static_cast<uint64_t>(arguments[1].value.int_value);
+      if (shift >= 64) {
+        return with_u(Value(static_cast<int64_t>(0)));
+      }
+      const auto ulhs = static_cast<uint64_t>(lhs);
+      const uint64_t shifted =
+          name_view == "__shift_left" ? ulhs << shift : ulhs >> shift;
+      return with_u(Value(static_cast<int64_t>(shifted)));
     }
     if (rhs < 0) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -3555,8 +3554,9 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          name + " requires a STRING argument");
     }
     // Mirrors the AST ground truth (function_call_expression.cpp): text
-    // stays in composed form, so NFC/NFKC are accepted and the decomposed
-    // forms are rejected instead of silently mis-normalized.
+    // stays in composed form, so NFC/NFKC are accepted; decomposed input
+    // (combining diacriticals) is rejected instead of silently
+    // mis-normalized, and the decomposed normalization modes are rejected.
     if (arguments.size() == 2) {
       if (arguments[1].type != ValueType::kVarChar) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -3571,6 +3571,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         return StatusError(StatusCode::kNotImplemented,
                            name + " supports NFC/NFKC only, got " + mode);
       }
+    }
+    if (UnicodeContainsCombiningDiacritical(raw_str(arguments[0]))) {
+      return StatusError(
+          StatusCode::kNotImplemented,
+          name + " cannot compose decomposed input (combining marks)");
     }
     if (name_view == "normalize") {
       return arguments[0];
@@ -4203,7 +4208,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (elem.IsNull()) {
         return Value();
       }
-      int64_t cp = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (elem.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "CODE_POINTS_TO_STRING requires INT64 elements");
+      }
+      const int64_t cp = elem.value.int_value;
       if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -4245,7 +4254,11 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
       if (elem.IsNull()) {
         return Value();
       }
-      int64_t b = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (elem.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "CODE_POINTS_TO_BYTES requires INT64 elements");
+      }
+      const int64_t b = elem.value.int_value;
       if (b < 0 || b > 255) {
         return StatusError(
             StatusCode::kInvalidArgument,
@@ -5211,7 +5224,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
         }
         uint64_t scale = 1;
         // Negate in unsigned space: -digits overflows for INT64_MIN.
-        const uint64_t trunc_digits = uint64_t{0} - static_cast<uint64_t>(digits);
+        const uint64_t trunc_digits =
+            uint64_t{0} - static_cast<uint64_t>(digits);
         for (uint64_t i = 0; i < trunc_digits; ++i) {
           if (scale > std::numeric_limits<uint64_t>::max() / 10) {
             return Value(int64_t{0}).WithUnsigned();
@@ -6074,7 +6088,8 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
 
   if (name_view == "is_inf" || name_view == "is_nan") {
     if (arguments.size() != 1) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
     }
     const Value& arg = arguments[0];
     if (arg.IsNull()) {
@@ -6116,7 +6131,18 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
     }
     const Value& sketch = arguments[0];
     const Value& number = arguments[1];
-    if (number.IsNull() || number.value.int_value < 1) {
+    if (number.IsNull()) {
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "The second argument to KLL_QUANTILES.EXTRACT must be positive");
+    }
+    if (number.type != ValueType::kInt64) {
+      // Reading int_value of a DOUBLE/VARCHAR cell type-puns the union.
+      return StatusError(StatusCode::kInvalidArgument,
+                         "The second argument to KLL_QUANTILES.EXTRACT "
+                         "must be an INT64");
+    }
+    if (number.value.int_value < 1) {
       return StatusError(
           StatusCode::kInvalidArgument,
           "The second argument to KLL_QUANTILES.EXTRACT must be positive");

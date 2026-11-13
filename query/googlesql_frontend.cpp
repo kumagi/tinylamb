@@ -1731,11 +1731,16 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
     shard.cache.emplace(cache_key, parsed.ast);
     shard.negative_cache.erase(cache_key);
   } else {
-    if (shard.negative_cache.size() >= max_per_shard) {
-      shard.negative_cache.erase(shard.negative_cache.begin());
+    // A failure with no diagnostic is a transient child-process death, not
+    // a syntax error.  Caching it would defeat the caller's immediate retry
+    // (main.cpp re-executes once when LastError is empty).
+    if (!parsed.error.empty()) {
+      if (shard.negative_cache.size() >= max_per_shard) {
+        shard.negative_cache.erase(shard.negative_cache.begin());
+      }
+      shard.negative_cache.insert_or_assign(
+          cache_key, std::chrono::steady_clock::now());
     }
-    shard.negative_cache.insert_or_assign(cache_key,
-                                          std::chrono::steady_clock::now());
   }
   return parsed;
 #else

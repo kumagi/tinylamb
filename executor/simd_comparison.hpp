@@ -12,7 +12,7 @@
 namespace tinylamb {
 
 // SIMD and autovectorization-optimized vectorized comparison kernels for
-// primitive column vectors (int64_t, double, string prefix).
+// primitive column vectors (int64_t, double, string).
 class SimdComparisonKernel {
  public:
   // Vector-constant comparisons
@@ -24,7 +24,7 @@ class SimdComparisonKernel {
                             BinaryOperation op, double target,
                             ValidityBitmap* out_mask);
 
-  static void CompareStringPrefix(const std::string_view* data, size_t count,
+  static void CompareString(const std::string_view* data, size_t count,
                                   BinaryOperation op, std::string_view target,
                                   ValidityBitmap* out_mask);
 

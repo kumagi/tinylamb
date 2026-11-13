@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/exception_status.hpp"
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
 #include "common/parallel_work.hpp"
@@ -5848,8 +5849,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     }
     if (!fold_can_stream_arena && cached_relation->rows.empty()) {
-      MaterializeCacheRowsParallel(fold_cache_key, cached_relation.get(),
-                                   runtime);
+      RETURN_IF_FAIL(MaterializeCacheRowsParallel(
+          fold_cache_key, cached_relation.get(), runtime));
     }
   }
   std::vector<Status> worker_errors(worker_count, Status::kSuccess);
@@ -6999,8 +7000,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if ((kcol.Type() == ValueType::kInt64 ||
                kcol.Type() == ValueType::kDate) &&
               !kcol.IsUnsigned() &&
-              (active_rf_type == ValueType::kNull ||
-               active_rf_type == kcol.Type())) {
+              // kNull (unobserved build type) is only sound for a group
+              // that rejects unconditionally -- the AcceptsColumn contract.
+              (active_rf_type == kcol.Type() ||
+               (active_rf_type == ValueType::kNull &&
+                active_rf->RejectsAll()))) {
             lstable_rf = active_rf;
           }
         }
@@ -10042,7 +10046,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const auto aggregate_begin = std::chrono::steady_clock::now();
     std::vector<std::vector<Row>> worker_outputs(worker_count);
     std::vector<Status> emit_errors(worker_count, Status::kSuccess);
-    std::exception_ptr emit_exception;
+    Status emit_exception{Status::kSuccess};
     const auto emit_worker = [&](size_t w) {
       try {
         TypedWorkerGroups& local = workers[w];
@@ -10144,8 +10148,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
         local = TypedWorkerGroups{};
       } catch (...) {
-        if (!emit_exception) {
-          emit_exception = std::current_exception();
+        if (emit_exception == Status::kSuccess) {
+          emit_exception = StatusFromCurrentException("emit worker failed");
         }
       }
     };
@@ -10159,8 +10163,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
     emit_worker(0);
     emit_threads.clear();
-    if (emit_exception != nullptr) {
-      std::rethrow_exception(emit_exception);
+    if (emit_exception != Status::kSuccess) {
+      return emit_exception;
     }
     for (const Status& err : emit_errors) {
       if (err != Status::kSuccess) {

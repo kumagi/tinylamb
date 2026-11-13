@@ -399,8 +399,8 @@ class PaxChunk final {
                      // [base 8B BE][words param x u64 BE]; each word carries
                      // a 4-bit selector (BE bits 63..60) + a 60-bit payload
                      // of `base` offsets, first value in the high payload
-                     // bits. Selector table (bits x count): 0x240, 1x120,
-                     // 2x60, 3x30, 4x20, 5x15, 6x12, 7x10, 7x8, 8x7, 10x6,
+                     // bits. Selector table (bits x count): 0x240, 0x120,
+                     // 1x60, 2x30, 3x20, 4x15, 5x12, 6x10, 7x8, 8x7, 10x6,
                      // 12x5, 15x4, 20x3, 30x2, 60x1 -- so the word width
                      // adapts every <= 240 rows instead of every region
                      // (BitWeave) or every 128-row block (BP128), and a
@@ -1942,11 +1942,10 @@ class PaxChunk final {
   // out-of-range) column with an empty AggResult, instead of decoding
   // foreign bytes as if they were int64. Null `sc` keeps the old
   // caller-knows-best behavior.
-  static AggResult ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
-                                 bool parallel = false, int nthreads = 0,
-                                 uint32_t scan_sweeps = 1,
-                                 const Schema* sc = nullptr,
-                                 WorkloadTracker* workload = nullptr);
+  [[nodiscard]] static StatusOr<AggResult> ScanAggregate(
+      const PaxChunk& chunk, const AggPlan& plan, bool parallel = false,
+      int nthreads = 0, uint32_t scan_sweeps = 1, const Schema* sc = nullptr,
+      WorkloadTracker* workload = nullptr);
   friend std::ostream& operator<<(std::ostream& o, const PaxChunk& c);
 
  private:
@@ -2040,11 +2039,10 @@ struct ScanResult {
 // `col` is decoded as int64; pass `sc` to gate the call on that column's
 // declared type (empty ScanResult on a non-int64 column) instead of
 // silently decoding foreign region bytes.
-ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
-                                int64_t lit, bool parallel = false,
-                                int nthreads = 0, uint32_t scan_sweeps = 1,
-                                const Schema* sc = nullptr,
-                                WorkloadTracker* workload = nullptr);
+[[nodiscard]] StatusOr<ScanResult> VectorizedScanColumn(
+    const PaxChunk& chunk, slot_t col, ScanOp op, int64_t lit,
+    bool parallel = false, int nthreads = 0, uint32_t scan_sweeps = 1,
+    const Schema* sc = nullptr, WorkloadTracker* workload = nullptr);
 
 // Compressed-domain IN-list scan: `value IN (lits...)` evaluated once over
 // the column. Literals are deduplicated (set semantics — a duplicate entry
@@ -2054,11 +2052,10 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
 // the group once and binary-searches the sorted literals per row. Same
 // null-as-0, zone-prune and inverted-index semantics as
 // VectorizedScanColumn.
-ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
-                                      std::span<const int64_t> lits,
-                                      bool parallel = false, int nthreads = 0,
-                                      const Schema* sc = nullptr,
-                                      WorkloadTracker* workload = nullptr);
+[[nodiscard]] StatusOr<ScanResult> VectorizedScanColumnInList(
+    const PaxChunk& chunk, slot_t col, std::span<const int64_t> lits,
+    bool parallel = false, int nthreads = 0, const Schema* sc = nullptr,
+    WorkloadTracker* workload = nullptr);
 
 // Metadata-only aggregate: returns true if the whole-column SUM/COUNT could be
 // answered from footer statistics without decoding (int64 columns only).

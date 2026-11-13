@@ -958,8 +958,8 @@ std::vector<PlanAlternative> ScanAlternatives(
       // An unconstrained covering index is a valid access path as well.  It
       // is especially important for COUNT(*) and for ORDER BY/LIMIT shapes:
       // the index can provide the required order and the lazy executor can
-      // stop after the requested prefix without touching the heap.  Do not
-      // A filtered ordered LIMIT can also stop early after checking residual
+      // stop after the requested prefix without touching the heap.  A
+      // filtered ordered LIMIT can also stop early after checking residual
       // predicates. Its cost must account for rejected heap rows.
       const bool ordered_limit =
           !required.ordering.empty() &&

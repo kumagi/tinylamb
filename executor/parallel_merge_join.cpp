@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
@@ -381,7 +382,7 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
   if (partitions_.size() <= 1) {
     worker_func(0);
   } else {
-    std::exception_ptr worker_failure;
+    Status worker_failure{Status::kSuccess};
     std::mutex failure_mutex;
     std::vector<std::jthread> workers;
     workers.reserve(partitions_.size());
@@ -392,17 +393,19 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
             worker_func(p);
           } catch (...) {
             // An exception escaping a raw std::thread terminates the process;
-            // latch the first failure and rethrow on the joining thread.
+            // latch the first failure as a Status for the joining thread.
             std::scoped_lock guard(failure_mutex);
-            if (!worker_failure) {
-              worker_failure = std::current_exception();
+            if (worker_failure == Status::kSuccess) {
+              worker_failure =
+                  StatusFromCurrentException("parallel merge worker failed");
             }
           }
         });
       } catch (...) {
         std::scoped_lock guard(failure_mutex);
-        if (!worker_failure) {
-          worker_failure = std::current_exception();
+        if (worker_failure == Status::kSuccess) {
+          worker_failure =
+              StatusFromCurrentException("parallel merge worker failed");
         }
         break;
       }
@@ -410,18 +413,10 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
     for (auto& w : workers) {
       w.join();
     }
-    if (worker_failure) {
+    if (worker_failure != Status::kSuccess) {
       // Never let an exception cross the executor boundary: latch it as a
-      // sticky Status so consumers observe a failed materialization instead
-      // of an unwinding Next() (mirrors parallel_hash_join).
-      try {
-        std::rethrow_exception(worker_failure);
-      } catch (const std::exception& error) {
-        FailWith(StatusError(StatusCode::kRuntimeError, error.what()));
-      } catch (...) {
-        FailWith(StatusError(StatusCode::kRuntimeError,
-                             "parallel merge worker failed"));
-      }
+      // sticky Status so consumers observe a failed materialization.
+      FailWith(worker_failure);
       return;
     }
   }
@@ -444,6 +439,24 @@ void ParallelMergeJoin::ExecuteParallelMerge() {
 void ParallelMergeJoin::EnsureMaterialized() {
   if (materialized_) {
     return;
+  }
+  // ExecuteParallelMerge only emits for inner/outer/semi/anti; other kinds
+  // (kSingle, kMark, kNullAwareAnti) would drain both inputs and then
+  // silently produce an empty success, so reject them up front.
+  switch (kind_) {
+    case JoinKind::kInner:
+    case JoinKind::kLeftOuter:
+    case JoinKind::kRightOuter:
+    case JoinKind::kFullOuter:
+    case JoinKind::kSemi:
+    case JoinKind::kAnti:
+      break;
+    default:
+      residual_error_ =
+          StatusError(StatusCode::kInvalidArgument,
+                      "ParallelMergeJoin does not support this join kind");
+      materialized_ = true;
+      return;
   }
   left_rows_.clear();
   right_rows_.clear();
@@ -470,9 +483,8 @@ void ParallelMergeJoin::EnsureMaterialized() {
   if (left_width_ == 0 && !left_rows_.empty()) {
     left_width_ = left_rows_.front().first.values_.size();
   }
-  const bool preserve_left = kind_ == JoinKind::kLeftOuter ||
-                             kind_ == JoinKind::kFullOuter ||
-                             kind_ == JoinKind::kSingle;
+  const bool preserve_left =
+      kind_ == JoinKind::kLeftOuter || kind_ == JoinKind::kFullOuter;
   const bool preserve_right =
       kind_ == JoinKind::kRightOuter || kind_ == JoinKind::kFullOuter;
   if ((preserve_left && !left_rows_.empty() && right_rows_.empty() &&

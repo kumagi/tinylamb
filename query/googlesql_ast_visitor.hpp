@@ -3,6 +3,7 @@
 #define TINYLAMB_GOOGLESQL_AST_VISITOR_HPP
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -19,8 +20,10 @@ class Statement;
 // offset / UTC marker when present and the session default time zone
 // otherwise.  Shared by TIMESTAMP literals, typed array elements, and the
 // SQL-template binder (which must reproduce the literal normalization when
-// re-binding a cached template).
-std::string NormalizeTimestampText(const std::string& text);
+// re-binding a cached template).  Returns nullopt for literals the visitor
+// rejects (named zones, impossible dates, second >= 60) so the template
+// scanner can decline to cache them.
+std::optional<std::string> NormalizeTimestampText(const std::string& text);
 
 // Decodes the backslash escape sequences inside an already quote-stripped,
 // non-raw string literal body.  Shared by the AST visitor and the SQL

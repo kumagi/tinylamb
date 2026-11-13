@@ -1511,6 +1511,44 @@ TEST(ExpressionTest,
       std::runtime_error);
 }
 
+// bugreview #181: an UNSIGNED shift count >= 2^63 is a huge positive amount
+// (result 0), not a "negative offset" error; only a signed count can be
+// negative. The __shift_* function path already behaved this way.
+TEST(ExpressionTest, UnsignedHugeShiftCountYieldsZeroInOperatorPath) {
+  const Value huge =
+      Value(std::numeric_limits<int64_t>::min()).WithUnsigned();  // 2^63
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kShiftLeft, Value(1).WithUnsigned(),
+                           huge),
+            Value(0).WithUnsigned());
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kShiftRight,
+                           Value(1).WithUnsigned(), huge),
+            Value(0).WithUnsigned());
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kShiftLeft, Value(1).WithUnsigned(),
+                           Value(3).WithUnsigned()),
+            Value(8).WithUnsigned());
+}
+
+// bugreview #97 (reopened): mixed INT64/UINT64 add/sub/mul whose exact result
+// is negative must not wrap to a huge UINT64 on the AST fast path.
+TEST(ExpressionTest, MixedSignednessArithmeticKeepsNegativeResults) {
+  const Value neg5(-5);
+  const Value u2 = Value(2).WithUnsigned();
+  const Value u3 = Value(3).WithUnsigned();
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kAdd, neg5, u2), Value(-3));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kAdd, u2, neg5), Value(-3));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kMultiply, neg5, u3), Value(-15));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kSubtract, u3, Value(5)),
+            Value(-2));
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kSubtract, Value(3),
+                           Value(5).WithUnsigned()),
+            Value(-2));
+  // Non-negative exact results keep working.
+  EXPECT_EQ(EvaluateBinary(BinaryOperation::kSubtract, u3, neg5), Value(8));
+  EXPECT_EQ(
+      EvaluateBinary(BinaryOperation::kAdd, Value(3), Value(5).WithUnsigned()),
+      Value(8));
+}
+
 TEST(ExpressionTest, UnaryExpression_ResultType_InfersCorrectType) {
   Schema schema(
       "s", {Column("v", ValueType::kInt64), Column("d", ValueType::kDouble)});

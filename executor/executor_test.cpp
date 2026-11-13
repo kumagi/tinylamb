@@ -3017,7 +3017,7 @@ TEST_F(ExecutorTest, ParallelAggregationRespectsWhereFilter) {
   // ignored an aggregate's FILTER(WHERE) predicate, so a pushed-down filter
   // silently over-counted. The generic path must apply it.
   const Schema schema("synthetic", {Column("value", ValueType::kInt64)});
-  auto input = std::make_shared<SyntheticBatchExecutor>(100);  // values 1..100
+  auto input = std::make_shared<SyntheticBatchExecutor>(100);  // values 0..99
   auto sum = std::make_shared<AggregateExpression>(AggregationType::kSum,
                                                    ColumnValueExp("value"));
   sum->SetWhereFilter(BinaryExpressionExp(ColumnValueExp("value"),
@@ -3913,8 +3913,11 @@ TEST_F(ExecutorTest, RelationalCorrelatedExistsCacheHits) {
       "WHERE EXISTS (SELECT COUNT(*) FROM SampleTable WHERE o.key = key "
       "HAVING COUNT(*) > 0) ORDER BY o.key;");
   ASSERT_EQ(rows.size(), 16U);
-  for (const Row& row : rows) {
-    EXPECT_TRUE(row[0].value.int_value >= 0 && row[0].value.int_value <= 3);
+  // Every outer key survives (EXISTS is true for all four), repeated once
+  // per cross-join partner: a cache that served a stale key would show up
+  // as a wrong value or a missing multiplicity here.
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(rows[i][0], Value(static_cast<int64_t>(i / 4)));
   }
 }
 
@@ -4422,6 +4425,12 @@ TEST_F(ExecutorTest, RelationalCorrelatedDerivedSubqueryUsesApplyCache) {
       "WHERE i.key = o.key) > 0 ORDER BY o.key;";
   const auto rows = RelationalRun(*rs_, query);
   ASSERT_EQ(rows.size(), 16U);
+  // Same shape as RelationalCorrelatedExistsCacheHits: each outer key must
+  // appear exactly four times (one per cross-join partner), not merely stay
+  // inside the key domain.
+  for (size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(rows[i][0], Value(static_cast<int64_t>(i / 4)));
+  }
   const std::string plan = RelationalExplain(*rs_, query, true);
   EXPECT_GT(StatsValue(plan, "correlated_result_cache_hits="), 0) << plan;
 }

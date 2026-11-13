@@ -343,7 +343,10 @@ bool ValuesMatch(const Value& a, const Value& b) {
     if (std::isinf(a.value.double_value) && std::isinf(b.value.double_value)) {
       return (a.value.double_value > 0) == (b.value.double_value > 0);
     }
-    return std::abs(a.value.double_value - b.value.double_value) < 1e-9;
+    // Both sides run the same deterministic IEEE arithmetic (see
+    // expr_simplify_oracle.hpp): an epsilon would hide genuine last-ulp
+    // divergences such as a mis-rounded VM kernel.
+    return a.value.double_value == b.value.double_value;
   }
   return a == b;
 }

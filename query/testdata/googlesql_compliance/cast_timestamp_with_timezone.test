@@ -1,4 +1,4 @@
-[default_time_zone=Etc/GMT+7]
+[default default_time_zone=Etc/GMT+7]
 ==
 
 # Test that if AT TIME ZONE is not specified, the default time zone is used.

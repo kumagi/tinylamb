@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
@@ -4303,58 +4304,36 @@ void MaterializeCacheRowsIfNeeded(const std::string& cache_key,
   arena->second->rows_boxed = true;
 }
 
-void MaterializeCacheRowsParallel(const std::string& cache_key,
-                                  Relation* cached, ExecutionRuntime* runtime) {
+Status MaterializeCacheRowsParallel(const std::string& cache_key,
+                                    Relation* cached,
+                                    ExecutionRuntime* runtime) {
   if (cached == nullptr || runtime == nullptr || !cached->rows.empty()) {
-    return;
+    return Status::kSuccess;
   }
   const auto arena = runtime->base_relation_arenas.find(cache_key);
   if (arena == runtime->base_relation_arenas.end() ||
       arena->second->rows == 0 || !arena->second->published_rowsless ||
       arena->second->rows_boxed) {
-    return;
+    return Status::kSuccess;
   }
   BaseRelationArena& a = *arena->second;
-  cached->rows.resize(a.rows);
   const size_t workers = std::clamp<size_t>(
       QueryParallelWorkerLimit(std::thread::hardware_concurrency()), 1, 16);
-  // An exception escaping a std::jthread body calls std::terminate. Capture
-  // the first worker failure (e.g. std::bad_alloc while boxing VARCHAR
-  // cells) and re-raise it on the calling thread after the join, exactly as
-  // the serial MaterializeCacheRowsIfNeeded would surface it.
-  std::mutex error_mu;
-  std::exception_ptr worker_error;
-  {
-    std::vector<std::jthread> threads;
-    for (size_t w = 1; w < workers; ++w) {
-      threads.emplace_back([&, w] {
-        try {
-          const size_t begin = a.rows * w / workers;
-          const size_t end = a.rows * (w + 1) / workers;
-          MaterializeArenaRange(a, cached->schema, begin, end, &cached->rows);
-        } catch (...) {
-          std::scoped_lock lock(error_mu);
-          if (!worker_error) {
-            worker_error = std::current_exception();
-          }
-        }
-      });
-    }
-    try {
-      MaterializeArenaRange(a, cached->schema, 0, a.rows / workers,
-                            &cached->rows);
-    } catch (...) {
-      std::scoped_lock lock(error_mu);
-      if (!worker_error) {
-        worker_error = std::current_exception();
-      }
-    }
-  }
-  if (worker_error) {
+  // RunParallelTasks is the Status boundary for worker bodies: allocation
+  // failures while boxing VARCHAR cells surface as a failed Status after the
+  // join instead of terminating the process or unwinding across threads.
+  cached->rows.resize(a.rows);
+  const Status status = RunParallelTasks(workers, [&](size_t w) {
+    const size_t begin = a.rows * w / workers;
+    const size_t end = a.rows * (w + 1) / workers;
+    MaterializeArenaRange(a, cached->schema, begin, end, &cached->rows);
+  });
+  if (status != Status::kSuccess) {
     cached->rows.clear();
-    std::rethrow_exception(worker_error);
+    return status;
   }
   a.rows_boxed = true;
+  return Status::kSuccess;
 }
 
 namespace {

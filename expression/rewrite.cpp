@@ -1570,6 +1570,15 @@ const ExpressionRuleSet& ExpressionRuleSet::Default() {
           std::vector<Expression> items;
           bool changed = false;
           for (const Expression& item : in.list_) {
+            // Dropping a duplicate removes one evaluation of the item; for a
+            // volatile term (RAND/UUID/...) that changes the result
+            // distribution, so unsafe terms are never deduplicated.  Same()
+            // implies identical safety, so checking the incoming item covers
+            // every pair this rule could merge.
+            if (!SafeToReduceEvaluationCount(item)) {
+              items.push_back(item);
+              continue;
+            }
             if (std::ranges::any_of(items, [&](const Expression& kept) {
                   if (IsConstant(kept) && IsConstant(item) &&
                       kept->AsConstantValue().GetValue().Collation() !=

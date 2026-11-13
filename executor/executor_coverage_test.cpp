@@ -4,9 +4,9 @@
 //   - TopNExecutor: the with-ties sort path (boundary ties, NULLS FIRST/LAST,
 //     NaN ordering, descending keys, overflow-capacity guard, key evaluation
 //     failures), the limit == 0 fast path, and Dump.
-//   - MaterializeExecutor: the full cache/replay lifecycle (Next, NextBatch,
-//     Rewind, MaterializePipeline, accounting, Dump/Explain) over empty and
-//     non-empty children.
+//   - IncrementalSortExecutor: the materialize/pipeline lifecycle
+//     (MaterializePipeline, IsMaterialized, replay after rewind) over empty
+//     and non-empty children.
 
 #include <gtest/gtest.h>
 

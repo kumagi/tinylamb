@@ -550,31 +550,6 @@ bool TryBuildTypedDoubleExprOps(const Expression& expr,
 
 std::optional<TypedDoubleExprInput> TryCompileTypedDoubleExpr(
     const Expression& expr, const Schema& scan_schema) {
-  // COALESCE(expr, 0) and IFNULL(expr, 0) are the ROLLUP sales pattern.
-  // The fallback is a constant zero, so it has no side effects to skip.
-  if (expr && expr->Type() == TypeTag::kFunctionCallExp) {
-    const auto& function = expr->AsFunctionCallExpression();
-    const std::string& name = function.FuncName();
-    if ((name == "coalesce" || name == "ifnull") &&
-        function.Args().size() == 2 && function.Args()[1] &&
-        function.Args()[1]->Type() == TypeTag::kConstantValue) {
-      const Value& fallback = function.Args()[1]->AsConstantValue().GetValue();
-      const bool zero_int = !fallback.IsNull() && !fallback.IsUnsigned() &&
-                            fallback.type == ValueType::kInt64 &&
-                            fallback.value.int_value == 0;
-      const bool zero_double = !fallback.IsNull() &&
-                               fallback.type == ValueType::kDouble &&
-                               fallback.value.double_value == 0.0;
-      if ((zero_int || zero_double) && function.Args()[0]) {
-        std::optional<TypedDoubleExprInput> inner =
-            TryCompileTypedDoubleExpr(function.Args()[0], scan_schema);
-        if (inner.has_value()) {
-          inner->null_as_zero = true;
-          return inner;
-        }
-      }
-    }
-  }
   TypedDoubleExprInput compiled;
   bool saw_double_col = false;
   if (!TryBuildTypedDoubleExprOps(expr, scan_schema, &compiled.ops,
@@ -796,7 +771,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return expr.null_as_zero ? Value(0.0) : Value();
+          return {};
         }
         stack[sp++] = v.value.double_value;
         break;
@@ -804,7 +779,7 @@ Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
       case TypedDoubleExprOp::Kind::kLoadIntColAsDouble: {
         const Value& v = row[op.column];
         if (v.IsNull()) {
-          return expr.null_as_zero ? Value(0.0) : Value();
+          return {};
         }
         stack[sp++] = static_cast<double>(v.value.int_value);
         break;

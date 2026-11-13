@@ -21,13 +21,15 @@ namespace tinylamb {
 
 namespace {
 
-// Runs the strict and SAFE forms of one conversion.
-std::pair<StatusOr<Value>, Value> CastBoth(const Value& from,
-                                           const std::string& type) {
+// Runs the strict and SAFE forms of one conversion.  Both results stay
+// StatusOr so a SAFE_CAST contract violation (a Status error instead of a
+// NULL value) surfaces as a test failure instead of a MoveValue abort.
+std::pair<StatusOr<Value>, StatusOr<Value>> CastBoth(const Value& from,
+                                                     const std::string& type) {
   CastExpression strict(ConstantValueExp(from), type, false);
   CastExpression safe(ConstantValueExp(from), type, true);
   StatusOr<Value> result = strict.TryCast(from);
-  Value safe_result = safe.TryCast(from).MoveValue();
+  StatusOr<Value> safe_result = safe.TryCast(from);
   return {std::move(result), std::move(safe_result)};
 }
 
@@ -80,7 +82,11 @@ TEST(CastMatrixCoverage, SafeCastContractHoldsOverMatrix) {
   for (const Value& from : sources) {
     for (const char* type : targets) {
       SCOPED_TRACE(std::string(type));
-      auto [strict, safe] = CastBoth(from, type);
+      auto [strict, safe_or] = CastBoth(from, type);
+      ASSERT_TRUE(safe_or.HasValue())
+          << "SAFE_CAST returned a Status error for " << type << ": "
+          << safe_or.GetStatus().GetMessage();
+      const Value& safe = safe_or.Value();
       if (strict.HasValue()) {
         EXPECT_TRUE(safe == strict.Value());
       } else {
@@ -116,17 +122,19 @@ TEST(CastMatrixCoverage, PinnedConversionEdges) {
   EXPECT_EQ(CastBoth(Value(2.5), "STRING").first.MoveValue(), Value("2.5"));
   // NULL casts to NULL for every target without error.
   for (const char* type : {"INT64", "STRING", "DATE", "ARRAY<INT64>"}) {
-    auto [strict, safe] = CastBoth(Value(), type);
-    EXPECT_TRUE(strict.HasValue());
+    auto [strict, safe_or] = CastBoth(Value(), type);
+    ASSERT_TRUE(strict.HasValue());
+    ASSERT_TRUE(safe_or.HasValue());
     EXPECT_TRUE(strict.Value().IsNull());
-    EXPECT_TRUE(safe.IsNull());
+    EXPECT_TRUE(safe_or.Value().IsNull());
   }
   // Text-to-array conversion is not offered at the cast level; both forms
   // reject it (SAFE_CAST collapses the rejection to NULL).
   EXPECT_TRUE(CastBoth(Value("[1,2,3]"), "ARRAY<INT64>").first.HasValue() ==
               false);
-  auto arrayed_safe = CastBoth(Value("[1,2,3]"), "ARRAY<INT64>").second;
-  EXPECT_TRUE(arrayed_safe.IsNull());
+  auto arrayed_safe_or = CastBoth(Value("[1,2,3]"), "ARRAY<INT64>").second;
+  ASSERT_TRUE(arrayed_safe_or.HasValue());
+  EXPECT_TRUE(arrayed_safe_or.Value().IsNull());
   // Array sources convert to their element text form.
   auto array_to_string =
       CastBoth(Value::Array({Value(1), Value(2)}, "INT64"), "STRING").first;

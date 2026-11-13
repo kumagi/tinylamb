@@ -213,8 +213,13 @@ Executor FullScanPlan::EmitExecutor(TransactionContext& txn) const {
   //
   // DML source scans (lock_rows_) must resolve rows under a write intent; the
   // morsel-based ParallelScan has no such hook, so they stay on the
-  // single-threaded FullScan.
-  if (!lock_rows_ && MaxRows() == std::numeric_limits<size_t>::max() &&
+  // single-threaded FullScan.  TINYLAMB_DISABLE_PARALLEL_SCAN is an A/B hatch
+  // (read per call, not cached) so tests can compare the serial and morsel
+  // paths on one statement.
+  const bool parallel_scan_disabled =
+      std::getenv("TINYLAMB_DISABLE_PARALLEL_SCAN") != nullptr;
+  if (!lock_rows_ && !parallel_scan_disabled &&
+      MaxRows() == std::numeric_limits<size_t>::max() &&
       stats_.Rows() >= kParallelScanMinRows) {
     constexpr size_t kMaxParallelScanWorkers = 16;
     const size_t workers =

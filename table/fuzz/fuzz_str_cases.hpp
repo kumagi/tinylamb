@@ -38,8 +38,10 @@ struct StrCase {
   uint8_t nshapes;
 };
 
-// Every shape listed for a case must keep bit 2 set (the null-preserving bit
-// of MakeStorageRows) so the chunk always carries a null-bitmap section.
+// bit 3 of MakeStorageRows is keep_nulls: the ramp shapes set it so the chunk
+// still carries a null-bitmap section (non-ramp shapes get NULLs from the
+// i%7==3 rows for free).  Shape 5 deliberately omits it to cover the
+// no-null-bitmap ramp path.
 inline constexpr auto kStrCases = std::to_array<StrCase>({
     // ---- Varchar families (col 2) ----
     {.name = "FSST",

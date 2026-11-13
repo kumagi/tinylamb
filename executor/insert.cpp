@@ -178,7 +178,10 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
             Row updated = existing.MoveValue();
             if (!upsert_offsets_.empty()) {
               for (const size_t offset : upsert_offsets_) {
-                if (offset < updated.values_.size()) {
+                // Guard both sides: a narrow source row must not read past
+                // its end, and a narrow stored row must not be grown.
+                if (offset < updated.values_.size() &&
+                    offset < new_row.values_.size()) {
                   updated[offset] = new_row[offset];
                 }
               }

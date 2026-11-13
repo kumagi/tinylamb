@@ -1119,30 +1119,42 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               (*results)[i] = Value(acc.MoveValue());
             }
           } else {
-            const double scaled =
-                static_cast<double>(rows) * constant.value.double_value;
-            const double prior =
-                (*results)[i].IsNull() ? 0.0 : (*results)[i].value.double_value;
-            const double next = prior + scaled;
-            if (std::isfinite(constant.value.double_value) &&
-                std::isfinite(prior) && std::isinf(next)) {
-              return FailWith(StatusError(StatusCode::kIsInfinity,
-                                          "SUM overflow: result is infinite"));
+            // Fold the constant once per row exactly like the generic
+            // path: a bulk rows*constant multiply rounds differently and
+            // diverges from the row-order reference by ulps.
+            const double c = constant.value.double_value;
+            for (size_t r = 0; r < rows; ++r) {
+              if ((*results)[i].IsNull()) {
+                // The first contributing row assigns the constant outright
+                // (no CheckedDoubleAdd, matching the generic path).
+                (*results)[i] = Value(c);
+              } else {
+                StatusOr<double> next = CheckedDoubleAdd(
+                    (*results)[i].value.double_value, c);
+                if (!next.HasValue()) {
+                  return FailWith(next.GetStatus());
+                }
+                (*results)[i] = Value(next.Value());
+              }
             }
-            (*results)[i] = Value(next);
           }
           break;
-        case AggregationType::kAvg:
-          (*results)[i].value.double_value +=
-              static_cast<double>(rows) *
-              (constant.type == ValueType::kInt64
-                   ? (constant.IsUnsigned()
-                          ? static_cast<double>(
-                                static_cast<uint64_t>(constant.value.int_value))
-                          : static_cast<double>(constant.value.int_value))
-                   : constant.value.double_value);
+        case AggregationType::kAvg: {
+          // Same row-order folding for AVG: the generic path adds the
+          // constant once per row with a plain += (no overflow check).
+          const double c =
+              constant.type == ValueType::kInt64
+                  ? (constant.IsUnsigned()
+                         ? static_cast<double>(
+                               static_cast<uint64_t>(constant.value.int_value))
+                         : static_cast<double>(constant.value.int_value))
+                  : constant.value.double_value;
+          for (size_t r = 0; r < rows; ++r) {
+            (*results)[i].value.double_value += c;
+          }
           (*counts)[i] += static_cast<int64_t>(rows);
           break;
+        }
         case AggregationType::kMin:
         case AggregationType::kMax:
           // Constant argument: the result is the constant itself.

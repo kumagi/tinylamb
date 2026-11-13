@@ -175,7 +175,12 @@ bool BuildDatabase(const std::vector<std::string>& setup, ScopedDb* out) {
       return false;
     }
   }
-  ctx.txn_.PreCommit();
+  // A failed commit (e.g. WAL write error under disk pressure) leaves the
+  // tables empty; reporting mirror mismatches against that state would be a
+  // false positive, so skip the iteration instead.
+  if (ctx.txn_.PreCommit() != Status::kSuccess) {
+    return false;
+  }
   return true;
 }
 
@@ -349,7 +354,9 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
         return "mutation rejected on db_a: " + m;
       }
     }
-    ctx.txn_.PreCommit();
+    if (ctx.txn_.PreCommit() != Status::kSuccess) {
+      return "";
+    }
   }
   const std::vector<std::vector<Value>> r3 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
@@ -439,7 +446,9 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
         return "replay mutation failed: " + m;
       }
     }
-    ctx.txn_.PreCommit();
+    if (ctx.txn_.PreCommit() != Status::kSuccess) {
+      return "replay mutation commit failed";
+    }
   }
   const std::vector<std::vector<Value>> r3 =
       ExecuteAll(*db_a, trace.queries, &ok);
@@ -529,7 +538,15 @@ bool ParsePlanCacheTest(std::string_view text, uint64_t* seed,
     };
     std::string value;
     if (consume("-- seed: ", &value)) {
-      *seed = std::stoull(value);
+      try {
+        size_t used = 0;
+        *seed = std::stoull(value, &used);
+        if (used != value.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (consume("-- setup: ", &value)) {
       trace->setup.push_back(value);
     } else if (consume("-- query: ", &value)) {

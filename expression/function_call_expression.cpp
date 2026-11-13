@@ -87,8 +87,6 @@ namespace tinylamb {
 
 namespace {
 
-bool IdentifierEquals(std::string_view left, std::string_view right);
-
 struct CivilTime {
   int year{1970};
   int month{1};
@@ -718,7 +716,11 @@ std::string ConvertUnicodeCase(std::string_view value, UnicodeCaseMode mode,
 std::string FormatFloatingForPrintfImpl(double value, char specifier,
                                         int precision) {
   if (precision < 0) {
-    return std::to_string(value);
+    // printf/GoogleSQL default precision is 6 significant decimals for every
+    // float specifier.  %f with precision 6 renders identically to the old
+    // std::to_string shortcut; %e/%g now get their real default form
+    // (scientific / shortest-of-fixed-scientific) instead of fixed notation.
+    precision = 6;
   }
   std::ostringstream output;
   output.imbue(std::locale::classic());
@@ -784,14 +786,42 @@ StatusOr<Value> FormatFunction(const std::string& name,
         result.push_back('%');
         continue;
       }
+      // GoogleSQL flags may appear in any order and repeat freely:
+      // '-' left-justify, '+'/' ' sign forcing, '#' alternate, '0' zero pad,
+      // '\'' thousands grouping.
+      const auto is_format_flag = [](char c) {
+        return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' ||
+               c == '\'';
+      };
       bool hash_flag = false;
       bool zero_pad = false;
-      if (fmt[i] == '#') {
-        hash_flag = true;
-        ++i;
-      }
-      if (i < fmt.size() && fmt[i] == '0') {
-        zero_pad = true;
+      bool left_flag = false;
+      bool plus_flag = false;
+      bool space_flag = false;
+      bool group_flag = false;
+      while (i < fmt.size() && is_format_flag(fmt[i])) {
+        switch (fmt[i]) {
+          case '-':
+            left_flag = true;
+            break;
+          case '+':
+            plus_flag = true;
+            break;
+          case ' ':
+            space_flag = true;
+            break;
+          case '#':
+            hash_flag = true;
+            break;
+          case '0':
+            zero_pad = true;
+            break;
+          case '\'':
+            group_flag = true;
+            break;
+          default:
+            break;
+        }
         ++i;
       }
       int64_t width = 0;
@@ -991,13 +1021,10 @@ StatusOr<Value> FormatFunction(const std::string& name,
               "FORMAT: invalid argument type for float specifier");
         }
       } else {
-        if (result.size() + 2 > kMaxFormatOutputBytes) {
-          return StatusError(StatusCode::kInvalidArgument,
-                             "FORMAT output exceeds maximum allowed size");
-        }
-        result.push_back('%');
-        result.push_back(spec);
-        continue;
+        // GoogleSQL FORMAT accepts a fixed specifier set; anything else is
+        // an error, not a literal echo.
+        return StatusError(StatusCode::kInvalidArgument,
+                           "FORMAT: unsupported format specifier");
       }
 
       if (precision >= 0 && (spec == 't' || spec == 'T' || spec == 's')) {
@@ -1014,11 +1041,59 @@ StatusOr<Value> FormatFunction(const std::string& name,
         formatted_item.insert(
             0, static_cast<size_t>(precision) - formatted_item.size(), '0');
       }
-      if (width > 0 && formatted_item.size() < static_cast<size_t>(width)) {
-        const size_t pad_len =
-            static_cast<size_t>(width) - formatted_item.size();
-        char pad_char = zero_pad ? '0' : ' ';
-        formatted_item.insert(0, pad_len, pad_char);
+      // Sign ('+' / ' ') and grouping ('\'') flags apply to numeric
+      // specifiers only; irrelevant flags are ignored for %s/%t/%T.  They
+      // act on the rendered digits before field-width padding.
+      const bool int_spec =
+          spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' ||
+          spec == 'X' || spec == 'o';
+      const bool float_spec = spec == 'f' || spec == 'F' || spec == 'e' ||
+                              spec == 'E' || spec == 'g' || spec == 'G';
+      if (formatted_item != "NULL" && !formatted_item.empty()) {
+        if (group_flag && int_spec) {
+          size_t digit_begin = formatted_item[0] == '-' ? 1 : 0;
+          if (formatted_item.size() >= digit_begin + 2 &&
+              formatted_item[digit_begin] == '0' &&
+              (formatted_item[digit_begin + 1] == 'x' ||
+               formatted_item[digit_begin + 1] == 'X')) {
+            digit_begin += 2;
+          }
+          const size_t digits = formatted_item.size() - digit_begin;
+          if (digits > 3) {
+            std::string grouped;
+            grouped.reserve(digits + digits / 3);
+            for (size_t k = 0; k < digits; ++k) {
+              if (k != 0 && (digits - k) % 3 == 0) {
+                grouped.push_back(',');
+              }
+              grouped.push_back(formatted_item[digit_begin + k]);
+            }
+            formatted_item.replace(digit_begin, digits, grouped);
+          }
+        }
+        if ((plus_flag || space_flag) &&
+            (spec == 'd' || spec == 'i' || spec == 'u' || float_spec) &&
+            formatted_item[0] != '-' && formatted_item[0] != '+') {
+          formatted_item.insert(formatted_item.begin(),
+                                plus_flag ? '+' : ' ');
+        }
+      }
+      // printf semantics: '-' flag or a negative (dynamic) width means
+      // left-justify in a field of |width|, and '0' is ignored for it.
+      const bool left_justify = left_flag || width < 0;
+      const int64_t magnitude = width < 0 ? -width : width;
+      const size_t field_width =
+          magnitude > 0 ? static_cast<size_t>(magnitude) : 0;
+      if (formatted_item.size() < field_width) {
+        const size_t pad_len = field_width - formatted_item.size();
+        if (left_justify) {
+          formatted_item.append(pad_len, ' ');
+        } else {
+          // '0' pads numbers only; for %s/%t/%T it is ignored like any
+          // irrelevant flag.
+          formatted_item.insert(
+              0, pad_len, (zero_pad && (int_spec || float_spec)) ? '0' : ' ');
+        }
       }
       if (result.size() + formatted_item.size() > kMaxFormatOutputBytes) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -1597,8 +1672,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          name + " requires a STRING argument");
     }
     // The engine keeps text in composed form and has no decompose/compose
-    // tables: NFC/NFKC are identity-preserving for composed input, while
-    // the decomposed forms are rejected instead of silently mis-normalized.
+    // tables: NFC/NFKC are identity-preserving for composed input.  Decomposed
+    // input (combining diacriticals, e.g. 'e' + U+0301) is rejected instead of
+    // silently mis-normalized; the decomposed normalization modes are rejected
+    // outright.  NFKC compatibility mappings are likewise not applied.
     if (values.size() == 2) {
       if (values[1].type != ValueType::kVarChar) {
         return StatusError(StatusCode::kInvalidArgument,
@@ -1614,6 +1691,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
         return StatusError(StatusCode::kNotImplemented,
                            name + " supports NFC/NFKC only, got " + mode);
       }
+    }
+    if (UnicodeContainsCombiningDiacritical(raw_str(values[0]))) {
+      return StatusError(
+          StatusCode::kNotImplemented,
+          name + " cannot compose decomposed input (combining marks)");
     }
     if (name_view == "normalize") {
       return values[0];
@@ -2826,7 +2908,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (elem.IsNull()) {
         return Value();
       }
-      int64_t cp = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (elem.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "CODE_POINTS_TO_STRING requires INT64 elements");
+      }
+      const int64_t cp = elem.value.int_value;
       if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
         return StatusError(StatusCode::kInvalidArgument,
                            "invalid code point for CODE_POINTS_TO_STRING: " +
@@ -2868,7 +2954,11 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
       if (elem.IsNull()) {
         return Value();
       }
-      int64_t b = elem.type == ValueType::kInt64 ? elem.value.int_value : 0;
+      if (elem.type != ValueType::kInt64) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "CODE_POINTS_TO_BYTES requires INT64 elements");
+      }
+      const int64_t b = elem.value.int_value;
       if (b < 0 || b > 255) {
         return StatusError(
             StatusCode::kInvalidArgument,
@@ -3369,6 +3459,19 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
     }
     if (name_view == "__bit_xor") {
       return with_u(Value(lhs ^ rhs));
+    }
+    // An UNSIGNED shift count is a huge positive number, not a negative
+    // offset: counts >= 64 yield 0 just like the signed path.
+    if (values[1].IsUnsigned()) {
+      const uint64_t shift =
+          static_cast<uint64_t>(values[1].value.int_value);
+      if (shift >= 64) {
+        return with_u(Value(static_cast<int64_t>(0)));
+      }
+      const auto ulhs = static_cast<uint64_t>(lhs);
+      const uint64_t shifted =
+          name_view == "__shift_left" ? ulhs << shift : ulhs >> shift;
+      return with_u(Value(static_cast<int64_t>(shifted)));
     }
     if (rhs < 0) {
       return StatusError(StatusCode::kInvalidArgument,
@@ -4024,7 +4127,8 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
   // a working query into "not yet executable".
   if (name_view == "is_inf" || name_view == "is_nan") {
     if (values.size() != 1) {
-      return Value();
+      return StatusError(StatusCode::kInvalidArgument,
+                         std::string(name_view) + " requires 1 argument");
     }
     const Value& arg = values[0];
     if (arg.IsNull()) {
@@ -4609,6 +4713,25 @@ std::string UnicodeCaseFold(std::string_view value) {
   return result;
 }
 
+bool UnicodeContainsCombiningDiacritical(std::string_view value) {
+  for (size_t offset = 0; offset < value.size();) {
+    const std::optional<DecodedUtf8> decoded = DecodeUtf8(value, offset);
+    if (!decoded.has_value()) {
+      ++offset;
+      continue;
+    }
+    // U+0300..U+036F (Combining Diacritical Marks) carries the decomposed
+    // forms of the Latin accents this engine otherwise composes.  Other
+    // scripts' combining ranges are not covered; the NORMALIZE contract
+    // documents that residual.
+    if (decoded->code_point >= 0x0300 && decoded->code_point <= 0x036F) {
+      return true;
+    }
+    offset += decoded->length;
+  }
+  return false;
+}
+
 std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
                            bool has_delimiters) {
   return ConvertUnicodeCase(value, UnicodeCaseMode::kInitcap, delimiters,
@@ -4629,15 +4752,6 @@ namespace {
 
 bool IsJsonSpace(char c) {
   return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-bool IdentifierEquals(std::string_view left, std::string_view right) {
-  return left.size() == right.size() &&
-         std::equal(left.begin(), left.end(), right.begin(),
-                    [](char lhs, char rhs) {
-                      return std::tolower(static_cast<unsigned char>(lhs)) ==
-                             std::tolower(static_cast<unsigned char>(rhs));
-                    });
 }
 
 std::string TrimJson(std::string s) {

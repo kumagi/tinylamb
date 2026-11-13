@@ -335,8 +335,9 @@ TEST_F(SqlFunctionCoverageTest, SubstrBranches) {
   ExpectNullScalar("SELECT SUBSTR(NULL, 2)");
   ExpectNullScalar("SELECT SUBSTR('hello', NULL)");
   ExpectError("SELECT SUBSTR('hello', 2, -1)");
-  // Non-string starts are coerced; SUBSTR(1, 2) reads the text "1".
-  ExpectScalar("SELECT SUBSTR(1, 2)", Value(""));
+  // A non-STRING/BYTES first argument is a signature mismatch, exactly like
+  // the AST ground truth (it is not coerced from "1").
+  ExpectError("SELECT SUBSTR(1, 2)");
   ExpectError("SELECT SUBSTR('hello')");
 }
 
@@ -528,9 +529,11 @@ TEST_F(SqlFunctionCoverageTest, RegexpFamilyBranches) {
 // ---------------------------------------------------------------------------
 
 TEST_F(SqlFunctionCoverageTest, HashFamilyBranches) {
-  // LENGTH counts UTF-8 code points over the raw digest bytes, so raw-digest
-  // lengths land below the byte counts (16/20/32/64).  These constants pin
-  // the digests are present and NULL-propagating.
+  // KNOWN DIVERGENCE: GoogleSQL's MD5/SHA* return BYTES and LENGTH(BYTES)
+  // counts bytes (16/20/32/64).  Tinylamb has no BYTES value type, so the
+  // raw digest rides in a STRING value and LENGTH counts UTF-8 code points
+  // (12/18/27/51).  These constants pin that the digests are present and
+  // NULL-propagating; they are not a statement that the counts are correct.
   ExpectRow(
       "SELECT LENGTH(MD5('abc')), LENGTH(SHA1('abc')), "
       "LENGTH(SHA256('abc')), LENGTH(SHA512('abc'))",
@@ -698,6 +701,8 @@ TEST_F(SqlFunctionCoverageTest, CastToStringBranches) {
 TEST_F(SqlFunctionCoverageTest, CastBoolBranches) {
   ExpectRow("SELECT CAST(TRUE AS BOOL), CAST(FALSE AS BOOL)",
             Row({Value(true), Value(false)}));
+  // 'T'/'1' spellings and numeric -> BOOL are intentional divergences from
+  // GoogleSQL (no such cast signatures there); see sql_expression_matrix_test.
   ExpectRow(
       "SELECT CAST('true' AS BOOL), CAST('T' AS BOOL), "
       "CAST('1' AS BOOL), CAST('false' AS BOOL), CAST('0' AS BOOL)",
@@ -1010,10 +1015,12 @@ TEST_F(SqlFunctionCoverageTest, FormatSpecifierMatrix) {
   ExpectScalar("SELECT FORMAT('%s-%s', 'a', 'b')", Value("a-b"));
   ExpectScalar("SELECT FORMAT('%.3f', 3.14159)", Value("3.142"));
   ExpectScalar("SELECT FORMAT('%.2f', 3.14159)", Value("3.14"));
-  ExpectScalar("SELECT FORMAT('%e', 1500.0)", Value("1500.000000"));
-  ExpectScalar("SELECT FORMAT('%g', 0.0001)", Value("0.000100"));
+  ExpectScalar("SELECT FORMAT('%e', 1500.0)", Value("1.500000e+03"));
+  ExpectScalar("SELECT FORMAT('%g', 0.0001)", Value("0.0001"));
   ExpectScalar("SELECT FORMAT('100%%')", Value("100%"));
-  ExpectScalar("SELECT FORMAT('%t', 'str')", Value(R"sql("str")sql"));
+  // %t renders the printable form (a STRING is unquoted); %T is canonical
+  // and keeps the quoting (GoogleSQL: the two specifiers differ).
+  ExpectScalar("SELECT FORMAT('%t', 'str')", Value("str"));
   ExpectScalar("SELECT FORMAT('%T', 'str')", Value(R"sql("str")sql"));
   ExpectScalar("SELECT FORMAT('%t', 12)", Value("12"));
   ExpectScalar("SELECT FORMAT('%t', 1.5)", Value("1.500000"));
@@ -1058,7 +1065,9 @@ TEST_F(SqlFunctionCoverageTest, DateTimeFunctionFamily) {
       "SELECT FORMAT_DATETIME('%Y-%m-%d %H:%M:%S', "
       "DATETIME '2026-01-02 03:04:05', 'UTC')",
       Value("2026-01-02 03:04:05"));
-  ExpectScalar("SELECT MAKE_INTERVAL(1, 2)",
+  // make_interval's second argument is a unit keyword; attribute values must
+  // name a real unit now that an unknown unit is a parse error.
+  ExpectScalar("SELECT MAKE_INTERVAL(1, 'DAY')",
                Value("0-0 1 0:0:0").WithInterval());
   // CURRENT_* depend on the clock: only assert they evaluate to non-NULL.
   const auto now_rows = RunSql(engine_.get(), context_.get(),

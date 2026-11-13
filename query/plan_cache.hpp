@@ -184,6 +184,12 @@ inline Expression CloneWithPreparedValues(  // NOLINT(misc-no-recursion)
       }
       return ArrayExpressionExp(std::move(elements), array.ElementSqlType());
     }
+    case TypeTag::kCastExp: {
+      const auto& cast = expression->AsCastExpression();
+      return CastExpressionExp(
+          CloneWithPreparedValues(cast.Child(), values), cast.TargetTypeName(),
+          cast.ReturnNullOnError());
+    }
     default:
       return expression;
   }
@@ -248,6 +254,11 @@ inline bool ContainsNonDeterministicCall(  // NOLINT(misc-no-recursion)
         }
       }
       return false;
+    case TypeTag::kCastExp:
+      // A nondeterministic call hidden under a cast must still disqualify
+      // the artifact, or a replay would serve the fill-time value.
+      return ContainsNonDeterministicCall(
+          expression->AsCastExpression().Child());
     default:
       return false;
   }

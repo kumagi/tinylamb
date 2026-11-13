@@ -139,6 +139,10 @@ class ColumnStats {
 
   [[nodiscard]] double EstimateLessThan(const Value& value) const;
   void Duplicate(size_t multiplier);
+  // Reads everything through most_common_values_.  The correlation tail is
+  // the caller's job: a standalone payload probes Decoder::AtEnd(), while
+  // the TableStatistics vector decode knows the record version.
+  void DecodeFixedFields(Decoder& decoder);
 
   ValueType type_{ValueType::kNull};
   size_t non_null_count_{0};

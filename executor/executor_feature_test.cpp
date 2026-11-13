@@ -161,6 +161,33 @@ class FailingSource : public ExecutorBase {
   }
 };
 
+// A source that emits each row with an explicit RowPosition, for
+// position-propagation tests (ValuesExecutor only ever yields the invalid
+// default position, which cannot distinguish "propagated" from "dropped").
+class PositionedSource : public ExecutorBase {
+ public:
+  explicit PositionedSource(
+      std::vector<std::pair<Row, RowPosition>> rows)
+      : rows_(std::move(rows)) {}
+  size_t NextBatch(DataChunk* dst, size_t max_rows) override {
+    dst->Reset();
+    size_t emitted = 0;
+    while (offset_ < rows_.size() && emitted < max_rows) {
+      dst->Append(std::move(rows_[offset_].first), rows_[offset_].second);
+      ++offset_;
+      ++emitted;
+    }
+    return emitted;
+  }
+  void Dump(std::ostream& o, int /*indent*/) const override {
+    o << "PositionedSource";
+  }
+
+ private:
+  std::vector<std::pair<Row, RowPosition>> rows_;
+  size_t offset_{0};
+};
+
 // Sorted rows with a single INT64 key plus a payload, each key repeated
 // `dup` times.  Merge-join inputs must arrive ordered.
 std::vector<Row> SortedKeyRows(int64_t begin, int64_t end, int64_t dup) {
@@ -1453,25 +1480,45 @@ TEST(MergeJoinTest, OuterVariantsEmitNullPaddedRows) {
 
 TEST(MergeJoinTest, SemiAndAntiPreserveRowPositions) {
   {
-    MergeJoin semi(Src({IRow(1), IRow(2), IRow(5)}), {0},
-                   Src({IRow(2), IRow(3)}), {0}, JoinKind::kSemi, 1, 1);
+    // SEMI must surface the LEFT (probe) row's own position: the matching
+    // left row is IRow(2) at RowPosition(12, 1).
+    auto left = std::make_shared<PositionedSource>(
+        std::vector<std::pair<Row, RowPosition>>{
+            {IRow(1), RowPosition(11, 0)},
+            {IRow(2), RowPosition(12, 1)},
+            {IRow(5), RowPosition(13, 2)}});
+    MergeJoin semi(left, {0}, Src({IRow(2), IRow(3)}), {0}, JoinKind::kSemi, 1,
+                   1);
     Row row;
     RowPosition rp;
     size_t count = 0;
     while (semi.Next(&row, &rp)) {
       EXPECT_EQ(row[0], Value(2));
-      EXPECT_TRUE(rp.IsValid() || rp.page_id == RowPosition().page_id);
+      EXPECT_EQ(rp, RowPosition(12, 1));
       ++count;
     }
     EXPECT_EQ(count, 1U);
   }
   {
-    MergeJoin anti(Src({IRow(1), IRow(2), IRow(5)}), {0},
-                   Src({IRow(2), IRow(3)}), {0}, JoinKind::kAnti, 1, 1);
-    const std::vector<Row> out = Drain(&anti);
-    ASSERT_EQ(out.size(), 2U);
-    EXPECT_EQ(out[0][0], Value(1));
-    EXPECT_EQ(out[1][0], Value(5));
+    // ANTI keeps the non-matching left rows together with their positions.
+    auto left = std::make_shared<PositionedSource>(
+        std::vector<std::pair<Row, RowPosition>>{
+            {IRow(1), RowPosition(11, 0)},
+            {IRow(2), RowPosition(12, 1)},
+            {IRow(5), RowPosition(13, 2)}});
+    MergeJoin anti(left, {0}, Src({IRow(2), IRow(3)}), {0}, JoinKind::kAnti, 1,
+                   1);
+    Row row;
+    RowPosition rp;
+    std::vector<std::pair<int64_t, RowPosition>> emitted;
+    while (anti.Next(&row, &rp)) {
+      emitted.emplace_back(row[0].value.int_value, rp);
+    }
+    ASSERT_EQ(emitted.size(), 2U);
+    EXPECT_EQ(emitted[0].first, 1);
+    EXPECT_EQ(emitted[0].second, RowPosition(11, 0));
+    EXPECT_EQ(emitted[1].first, 5);
+    EXPECT_EQ(emitted[1].second, RowPosition(13, 2));
   }
 }
 
@@ -2321,12 +2368,12 @@ TEST(SimdComparisonKernelTest, StringPrefixCoversAllOperators) {
   };
   for (const Case& c : cases) {
     ValidityBitmap mask;
-    SimdComparisonKernel::CompareStringPrefix(data.data(), data.size(), c.op,
+    SimdComparisonKernel::CompareString(data.data(), data.size(), c.op,
                                               "banana", &mask);
     EXPECT_EQ(mask.CountTrue(), c.expected) << static_cast<int>(c.op);
   }
   ValidityBitmap cleared;
-  SimdComparisonKernel::CompareStringPrefix(
+  SimdComparisonKernel::CompareString(
       data.data(), data.size(), BinaryOperation::kAdd, "banana", &cleared);
   EXPECT_EQ(cleared.CountTrue(), 0U);
 }

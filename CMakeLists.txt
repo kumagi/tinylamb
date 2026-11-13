@@ -42,7 +42,10 @@ endif()
 
 # Architecture tuning: "native" compiles for the building machine (AVX-512
 # etc.); any other non-empty value is passed through as the -march argument
-# (e.g. x86-64-v3). Empty keeps the portable baseline default.
+# (e.g. x86-64-v3). Empty keeps the portable baseline default for the general
+# build -- but the PAX chunk sources below additionally get -mavx2 -mbmi2 on
+# x86_64 regardless of this flag, so those translation units always require
+# an AVX2/BMI2-capable x86_64 target.
 set(TINYLAMB_ARCH "" CACHE STRING
     "Architecture flag: empty (portable baseline) | native | <raw -march value>")
 if(NOT TINYLAMB_ARCH STREQUAL "")
@@ -1063,7 +1066,6 @@ add_simple_test(plan/cascades_rules_coverage_test.cpp)
 add_simple_test(type/interval_test.cpp)
 add_simple_test(transaction/transaction_coverage_test.cpp)
 add_simple_test(expression/expr_extra_test.cpp)
-add_simple_test(expression/function_coverage_test.cpp)
 add_simple_test(expression/function_call_ast_sweep_test.cpp)
 add_simple_test(expression/function_call_ast_edges_test.cpp)
 add_simple_test(expression/function_call_ast_deep_sweep_test.cpp)
@@ -1196,7 +1198,7 @@ function(add_replay_test file_path input_mode)
     target_compile_options(${target_name} PRIVATE -g ${fuzzer_option}
             -UNDEBUG)
     target_link_options(${target_name} PRIVATE ${fuzzer_option})
-    target_link_libraries(${target_name} PRIVATE gtest_main ${ARGN}
+    target_link_libraries(${target_name} PRIVATE GTest::gtest_main ${ARGN}
             tinylamb::core)
     if(input_mode STREQUAL "DIRECTORY")
         set(replay_input "${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay-${target_name}")

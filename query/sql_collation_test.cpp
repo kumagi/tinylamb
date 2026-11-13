@@ -281,8 +281,9 @@ TEST_F(SqlCollationTest, CollatedOrderReportsTheCollationInExplain) {
     plan += row[0].AsString();
     plan += "\n";
   }
-  // The plan still sorts (a case-insensitive order is not a storage order),
-  // and the ordering property it reports names the collation it was asked for.
+  // The plan still sorts: a case-insensitive order is not a storage order,
+  // so the engine cannot elide the Sort operator.  (EXPLAIN does not render
+  // the ordering's collation, so there is no collation name to assert here.)
   EXPECT_NE(plan.find("Sort keys=1"), std::string::npos);
 }
 

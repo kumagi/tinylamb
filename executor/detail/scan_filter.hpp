@@ -293,6 +293,18 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
                            Relation* result, Status* error,
                            Relation* movable_source = nullptr);
 
+// Arena-cache variant of TryParallelFilterRows: filters the typed
+// BaseRelationArena mirror of a cached base relation.  Same ordering
+// contract -- contiguous per-worker ranges merged in source order, with
+// deferred rows reinserted at their original position.  Returns false
+// (touching nothing) for arenas below the parallel threshold, unsigned
+// cached columns, or a decided-reject filter.
+bool TryFilterArenaCache(
+    TransactionContext& context, const BaseRelationArena& arena,
+    const Schema& cached_schema, const CompiledScanFilter* filter,
+    const Schema* filter_view, const Scope* outer, const CteMap& ctes,
+    const ScanRuntimeFilter* runtime_filter, Relation* result, Status* error);
+
 StatusOr<Relation> ApplyTableSample(TransactionContext& context,
                                     const SelectSource& source, Relation input);
 

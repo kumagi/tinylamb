@@ -192,9 +192,9 @@ TEST_F(SqlEngineExtraTest, UnnestSelectShapes) {
 
 TEST_F(SqlEngineExtraTest, CteNarrowingVersusMaterialization) {
   // The twice-referenced CTE shape goes through the materialized CTE path.
-  // NOTE: the single-reference narrowing shape currently leaks a
-  // "column a.k not found" exception out of Execute in-process; it is
-  // reported separately and intentionally not pinned here.
+  // The single-reference narrowing shape (inlined derived source) resolves
+  // alias-qualified columns through the outer scope; it used to leak a
+  // "column a.k not found" exception out of Execute and is pinned below.
   auto cte_db = Database::Create("sql_engine_extra_test-cte-" + RandomString())
                     .MoveValue();
   TransactionContext cte_ctx = cte_db->BeginContext();
@@ -217,6 +217,15 @@ TEST_F(SqlEngineExtraTest, CteNarrowingVersusMaterialization) {
   EXPECT_EQ(run("WITH x AS (SELECT k FROM t WHERE k > 1) SELECT COUNT(*) "
                 "FROM x"),
             std::vector<Row>({Row({Value(2)})}));
+  // Single-reference narrowing shapes: the inlined CTE body must resolve
+  // alias-qualified column references (previously threw out of Execute).
+  EXPECT_EQ(run("WITH x AS (SELECT k FROM t) SELECT a.k FROM x a "
+                "WHERE a.k > 1 ORDER BY a.k"),
+            std::vector<Row>({Row({Value(2)}), Row({Value(3)})}));
+  EXPECT_EQ(run("WITH x AS (SELECT k, s FROM t) SELECT a.k, a.s FROM x a "
+                "WHERE a.k > 1 ORDER BY a.k"),
+            std::vector<Row>({Row({Value(2), Value("b")}),
+                              Row({Value(3), Value("a")})}));
   cte_ctx.Abort();
 }
 

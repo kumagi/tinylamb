@@ -9,7 +9,8 @@
 - **`PageType::kUnknown` (0)** — uninitialized placeholder.
 - **`PageType::kRowPage` (1)** — in-memory slotted row block (`RowPage`), linked
   into per-table doubly-linked chains (`prev_page_id_`, `next_page_id_`) with
-  `page_lsn` and `rec_lsn` stamps.
+  a `page_lsn` stamp and per-row commit stamps (`committed_link_lsn_`,
+  `committed_lsns_`).
 - Retired B+Tree page types (`BranchPage`, `LeafPage`, `MetaPage`, `FreePage`)
   have been removed; all indexes and catalog maps are stored as LSM-Tree runs
   in `PageManager`.
@@ -29,7 +30,9 @@ temporary file + `fsync` + `rename` with the following layout:
 
 On startup, `RecoveryManager::RecoverFrom` loads `<dbname>.db` via
 `PageManager::LoadFuzzyCheckpoint` and replays WAL segments starting from
-`min(begin_lsn, min_dpt_rec_lsn, min_att_first_lsn)`.
+`min(checkpoint_lsn, replay_start_lsn)` — the caller's checkpoint LSN and the
+snapshot header's replay anchor, whichever is smaller (a zero caller value
+takes the snapshot anchor).
 
 ## PAX chunk checksums
 

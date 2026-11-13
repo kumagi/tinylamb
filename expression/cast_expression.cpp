@@ -512,6 +512,17 @@ std::string StructTrim(std::string_view text) {
   return std::string(text.substr(begin, end - begin));
 }
 
+// String->scalar casts tolerate the same surrounding ASCII whitespace for
+// every numeric/boolean target (the INT64 path pinned this contract first).
+std::string TrimCastWhitespace(std::string_view text) {
+  const size_t begin = text.find_first_not_of(" \t\r\n");
+  if (begin == std::string_view::npos) {
+    return {};
+  }
+  const size_t end = text.find_last_not_of(" \t\r\n");
+  return std::string(text.substr(begin, end - begin + 1));
+}
+
 std::vector<std::pair<std::string, std::string>> SplitStructMembers(
     const std::string& body) {
   std::vector<std::pair<std::string, std::string>> members;
@@ -1012,6 +1023,16 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
       return Value(std::move(rebuilt));
     }
   }
+  // A STRUCT target that survived the field-wise paths above -- scalar input
+  // to a multi-field target, or non-object text -- has no conversion.  Reject
+  // it here instead of letting it fall into the scalar passthrough below.
+  if (upper.starts_with("STRUCT")) {
+    if (safe) {
+      return Value();
+    }
+    return StatusError(StatusCode::kInvalidArgument,
+                       "cannot cast value to " + type_name);
+  }
   // ENUM-typed targets accept their textual member names verbatim: this
   // engine stores enums as their member-name strings.
   if (!is_bool && upper.find("ENUM") != std::string::npos &&
@@ -1175,7 +1196,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
         return Value(val.value.double_value != 0.0 ? int64_t{1} : int64_t{0});
       }
       if (val.type == ValueType::kVarChar) {
-        const std::string s = ToLower(std::string(val.value.varchar_value));
+        const std::string s =
+            ToLower(TrimCastWhitespace(val.value.varchar_value));
         if (s == "true" || s == "t" || s == "1") {
           return Value(int64_t{1});
         }
@@ -1231,14 +1253,11 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
           return Value(narrowed);
         }
         if (val.type == ValueType::kVarChar) {
-          std::string s(val.value.varchar_value);
-          size_t start = s.find_first_not_of(" \t\r\n");
-          if (start == std::string::npos) {
+          std::string s = TrimCastWhitespace(val.value.varchar_value);
+          if (s.empty()) {
             return StatusError(StatusCode::kInvalidArgument,
                                "cannot cast empty string to int");
           }
-          size_t end = s.find_last_not_of(" \t\r\n");
-          s = s.substr(start, end - start + 1);
 
           // GoogleSQL accepts hex literals in integer casts: an optional
           // sign followed by 0x / 0X and hexadecimal digits.
@@ -1360,7 +1379,8 @@ StatusOr<Value> TryCastValueCore(const Value& val, const std::string& type_name,
                                    : static_cast<double>(val.value.int_value));
         }
         if (val.type == ValueType::kVarChar) {
-          std::string s = ToLower(std::string(val.value.varchar_value));
+          std::string s =
+              ToLower(TrimCastWhitespace(val.value.varchar_value));
           if (s == "nan" || s == "+nan" || s == "-nan") {
             return finish_double(std::numeric_limits<double>::quiet_NaN());
           }

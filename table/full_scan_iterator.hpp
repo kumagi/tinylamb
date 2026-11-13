@@ -223,10 +223,14 @@ class FullScanIterator : public IteratorBase {
   [[nodiscard]] PlannedPeek BuildPeek(slot_t column) const;
   // Direct planned peek; nullopt = NULL or corrupt count (same contract as
   // Row::TryPeekInteger). kFallback signals a bitmap row: caller retries via
-  // Row::TryPeekInteger.
+  // Row::TryPeekInteger. kError carries the decode failure as a Status —
+  // the same channel Row::TryPeekInteger reports corruption through, so a
+  // corrupt image never escapes as a C++ exception across a StatusOr
+  // boundary.
   struct PeekOutcome {
-    enum class Kind : uint8_t { kValue, kNull, kFallback } kind;
+    enum class Kind : uint8_t { kValue, kNull, kFallback, kError } kind;
     int64_t value;
+    Status status{Status::kSuccess};
   };
   [[nodiscard]] static PeekOutcome PeekIntegerPlanned(const PlannedPeek& peek,
                                                       const char* row);

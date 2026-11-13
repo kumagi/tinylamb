@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -139,8 +140,12 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
           if ((col.Type() == ValueType::kInt64 ||
                col.Type() == ValueType::kDate) &&
               !col.IsUnsigned() &&
-              (runtime_filter_type == ValueType::kNull ||
-               runtime_filter_type == col.Type())) {
+              // kNull means the build side's type was never observed: only
+              // a group that rejects unconditionally is sound on an
+              // arbitrary INT64/DATE column (the AcceptsColumn contract).
+              (runtime_filter_type == col.Type() ||
+               (runtime_filter_type == ValueType::kNull &&
+                runtime_filter->RejectsAll()))) {
             active_lstable_rf = runtime_filter;
           }
         }
@@ -210,7 +215,7 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
   std::vector<std::vector<Row>> deferred_rows(worker_programs.complete ? workers
                                                                        : 0);
   std::mutex error_mu;
-  std::exception_ptr error_ex;
+  Status error_ex{Status::kSuccess};
   std::optional<std::vector<slot_t>> proj_opt;
   if (projection != nullptr) {
     proj_opt = *projection;
@@ -1587,8 +1592,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
       }
     } catch (...) {
       std::scoped_lock lock(error_mu);
-      if (!error_ex) {
-        error_ex = std::current_exception();
+      if (error_ex == Status::kSuccess) {
+        error_ex =
+            StatusFromCurrentException("parallel table scan worker failed");
       }
     }
   };
@@ -1599,16 +1605,9 @@ bool TryParallelTableScan(TransactionContext& context, Table& table,
     }
     return false;
   }
-  if (error_ex) {
+  if (error_ex != Status::kSuccess) {
     if (error != nullptr) {
-      try {
-        std::rethrow_exception(error_ex);
-      } catch (const std::exception& ex) {
-        *error = StatusError(StatusCode::kRuntimeError, ex.what());
-      } catch (...) {
-        *error = StatusError(StatusCode::kRuntimeError,
-                             "parallel table scan worker failed");
-      }
+      *error = error_ex;
     }
     return false;
   }

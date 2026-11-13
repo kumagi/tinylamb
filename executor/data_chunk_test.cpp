@@ -590,7 +590,7 @@ TEST(SimdComparisonKernelTest, IntegerDoubleStringComparison) {
 
   std::vector<std::string_view> strings = {"apple", "banana", "cherry", "date"};
   ValidityBitmap str_mask;
-  SimdComparisonKernel::CompareStringPrefix(strings.data(), strings.size(),
+  SimdComparisonKernel::CompareString(strings.data(), strings.size(),
                                             BinaryOperation::kEquals, "banana",
                                             &str_mask);
   EXPECT_EQ(str_mask.CountValid(), 1);

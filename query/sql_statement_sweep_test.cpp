@@ -10,8 +10,8 @@
 // the same status (see sql_expression_matrix_test.cpp).
 // Actual successful STRUCT/whole-row NULL inserts and nonempty field UPDATE
 // are covered by SqlAuditRegressionTest.StructInsertExpansionHasRealStoredRows.
-// The empty CTAS fixture st_t infers id as STRING; its INSERT errors below
-// check that specific mismatch, not STRUCT support.
+// The empty CTAS fixture st_t infers id as INT64 (the SELECT literal's type
+// survives the empty result); its INSERTs succeed and are pinned below.
 
 #include <gtest/gtest.h>
 
@@ -2895,6 +2895,18 @@ TEST_F(SqlStatementSweepTest, PinnedScalarTable) {
 
 // Pinned full-row dumps (row counts, shapes, and NULL placement).
 TEST_F(SqlStatementSweepTest, PinnedDumpTable) {
+  // The cases below include INSERT/UPDATE/DELETE against the shared fixture
+  // tables.  Mutating the suite-static database would make every later test
+  // (and this test under --gtest_shuffle) order-dependent, so this test
+  // bootstraps a private copy of the fixture instead.
+  auto dump_database =
+      Database::Create("sql_sweep_dump_test-" + RandomString()).MoveValue();
+  auto dump_context =
+      std::make_unique<TransactionContext>(dump_database->BeginContext());
+  auto dump_engine = std::make_unique<SqlEngine>(*dump_database);
+  for (const auto& ddl : Bootstrap()) {
+    RunSql(dump_engine.get(), dump_context.get(), ddl);
+  }
   const std::vector<std::pair<std::string, std::string>> cases = {
       {"SELECT a FROM t WHERE 'a' < c",
        "7 rows | [1] | [2] | [3] | [5] | [2] | [7] | [9]"},
@@ -3262,9 +3274,12 @@ TEST_F(SqlStatementSweepTest, PinnedDumpTable) {
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.first);
-    const auto rows = RunSql(engine_.get(), context_.get(), c.first);
+    const auto rows =
+        RunSql(dump_engine.get(), dump_context.get(), c.first);
     EXPECT_PRED2(DumpMatches, Dump(rows), c.second);
   }
+  dump_context.reset();
+  dump_database->DeleteAll();
 }
 
 // Statements that must raise: missing objects, ambiguous columns,
@@ -3299,17 +3314,20 @@ TEST_F(SqlStatementSweepTest, ErrorTable) {
   }
 }
 
-TEST_F(SqlStatementSweepTest, EmptyCtasStructInsertFailsForInferredIdType) {
+TEST_F(SqlStatementSweepTest, EmptyCtasStructInsertInfersLiteralTypes) {
+  // An empty CTAS result used to lose the SELECT literal's type and infer
+  // VARCHAR columns, so typed INSERTs failed "INSERT type mismatch".  The
+  // constant's type now survives and the rows store correctly.
   for (const char* sql :
        {"INSERT INTO st_t VALUES (1, STRUCT(10 AS x, 'hello' AS y))",
         "INSERT INTO st_t VALUES (2, NULL)",
         "INSERT INTO st_t (id, s) VALUES (3, STRUCT(20 AS x, 'three' AS y))"}) {
-    const auto prepared = engine_->Prepare(*context_, sql);
-    ASSERT_FALSE(prepared.HasValue()) << sql;
-    EXPECT_NE(engine_->LastError().find("INSERT type mismatch for column id"),
-              std::string::npos)
-        << engine_->LastError();
+    EXPECT_NO_THROW(RunSql(engine_.get(), context_.get(), sql)) << sql;
   }
+  EXPECT_EQ(RunSql(engine_.get(), context_.get(),
+                   "SELECT id FROM st_t ORDER BY id"),
+            std::vector<Row>({Row({Value(1)}), Row({Value(2)}),
+                              Row({Value(3)})}));
 }
 
 // EXPLAIN and nondeterministic statements: executed for coverage of

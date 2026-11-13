@@ -149,8 +149,14 @@ built.Add(Rule(
     "join_commutativity", Join(Any("left"), Any("right")),
     [](const Bindings&, Memo& memo, GroupId group,
        const LogicalExpression& expression) {
-      memo.AddExpression(group, memo.NewJoin(expression.children[1],
-                                             expression.children[0]));
+      if (memo.JoinEnumerationClaimed(group)) {
+        return;
+      }
+      memo.AddExpression(
+          group,
+          memo.NewJoin(
+              expression.children[1], expression.children[0],
+              expression.predicate ? *expression.predicate : Expression{}));
     },
     LogicalOperator::kJoin));
 ```
@@ -159,7 +165,7 @@ built.Add(Rule(
 説明します。
 
 - 第 2 引数の `Join(Any("left"), Any("right"))` は**パターン**の宣言です。2 つの子を持つ任意の `kJoin` 式に一致し、それぞれに `left` と `right` という名前を付けます。
-- ラムダ式の本体が**適用時の動作**です。一致した式の左右の子グループを入れ替えた新たな Join 式を生成し、`memo.AddExpression` によって**同一グループへ追記**します。既存の式を上書き・削除しない（追記のみ）点が Cascades の不変条件です。
+- ラムダ式の本体が**適用時の動作**です。一致した式の左右の子グループを入れ替えた新たな Join 式を生成し、`memo.AddExpression` によって**同一グループへ追記**します。既存の式を上書き・削除しない（追記のみ）点が Cascades の不変条件です。先頭の `JoinEnumerationClaimed` ガードは、結合順序の全列挙を専用ルール(`join_enumeration`)が引き受け済みのグループではこの交換を抑止し、同一形状の式が際限なく増えるのを防ぎます。
 - この適用により、前節の図における `Group#0` の内部に `Join(t1, t2)` と `Join(t2, t1)` の双方が併存する状態が作られます。
 
 物理 Rule は、論理式 `kJoin` に対して HashJoin、MergeJoin、NestedLoopJoin、

@@ -43,7 +43,8 @@ struct PollResult {
 };
 
 // Level-triggered readiness notification over file descriptors: epoll(7) on
-// Linux, kqueue(2) on macOS/BSD. Semantics follow epoll's level-triggered
+// Linux, kqueue(2) on macOS/BSD, WSAPoll on Windows. Semantics follow epoll's
+// level-triggered
 // mode: a descriptor is reported on every Wait while it stays ready, and at
 // most once per Wait (kqueue's separate read/write filters are merged).
 // kPollPeerClosed is only observable together with kPollReadable interest
@@ -87,7 +88,8 @@ class EventPoller {
 };
 
 // Cross-thread wake-up for an EventPoller: eventfd(2) on Linux, a
-// non-blocking pipe elsewhere. Register ReadFd() for kPollReadable; any
+// non-blocking pipe on macOS/BSD, a loopback TCP socket pair on Windows.
+// Register ReadFd() for kPollReadable; any
 // thread may call Wake(); the polling thread calls Drain() when ReadFd() is
 // reported readable.
 class Waker {

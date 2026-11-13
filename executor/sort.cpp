@@ -25,6 +25,7 @@
 
 #include "common/decoder.hpp"
 #include "common/exc_shim.hpp"
+#include "common/exception_status.hpp"
 #include "common/status_or.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
@@ -332,8 +333,8 @@ class KeyOrdering {
     return encoder_.GetKind();
   }
 
-  [[nodiscard]] std::vector<size_t> BuildPermutation(size_t rows,
-                                                     size_t workers) const {
+  [[nodiscard]] StatusOr<std::vector<size_t>> BuildPermutation(
+      size_t rows, size_t workers) const {
     std::vector<size_t> perm(rows);
     for (size_t i = 0; i < rows; ++i) {
       perm[i] = i;
@@ -393,7 +394,7 @@ class KeyOrdering {
     }
 
     const size_t run_size = (sortable_rows + workers - 1) / workers;
-    std::exception_ptr error;
+    Status error{Status::kSuccess};
     std::mutex error_mutex;
     std::vector<std::jthread> threads;
     threads.reserve(workers);
@@ -414,23 +415,21 @@ class KeyOrdering {
             }
           } catch (...) {
             std::scoped_lock lock(error_mutex);
-            if (!error) {
-              error = std::current_exception();
+            if (error == Status::kSuccess) {
+              error = StatusFromCurrentException("parallel sort worker failed");
             }
           }
         });
       } catch (...) {
         std::scoped_lock lock(error_mutex);
-        if (!error) {
-          error = std::current_exception();
+        if (error == Status::kSuccess) {
+          error = StatusFromCurrentException("parallel sort worker failed");
         }
         break;
       }
     }
     threads.clear();
-    if (error) {
-      std::rethrow_exception(error);
-    }
+    RETURN_IF_FAIL(error);
     for (size_t width = run_size; width < sortable_rows; width *= 2) {
       for (size_t begin = 0; begin < sortable_rows; begin += width * 2) {
         const size_t middle = std::min(sortable_rows, begin + width);
@@ -524,8 +523,9 @@ Status SortExecutor::Materialize() {
   KeyOrdering ordering(keys_, schema_);
   std::vector<SpillFile> runs;
   const auto write_sorted_run = [&]() -> Status {
-    ApplyPermutation(&rows_,
+    ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
                      ordering.BuildPermutation(rows_.size(), worker_count_));
+    ApplyPermutation(&rows_, std::move(permutation));
     SpillFile run;
     for (const auto& item : rows_) {
       RETURN_IF_FAIL(run.Append(item.first, item.second));
@@ -588,7 +588,9 @@ Status SortExecutor::Materialize() {
         rows_.size() < kParallelSortMinRows
             ? 1
             : std::min(worker_count_, std::max<size_t>(1, rows_.size()));
-    ApplyPermutation(&rows_, ordering.BuildPermutation(rows_.size(), workers));
+    ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
+                     ordering.BuildPermutation(rows_.size(), workers));
+    ApplyPermutation(&rows_, std::move(permutation));
     rows_charge_ = std::move(charge);
   } else {
     if (!rows_.empty()) {

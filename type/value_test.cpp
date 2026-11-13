@@ -270,13 +270,15 @@ TEST(ValueTest, StringCopiesDetachBeforeMutationAndDecode) {
        {std::string("small"), std::string(200, 'x')}) {
     const Value original{std::string(text)};
     const std::hash<Value> hash;
-    const auto expected_hash = std::hash<std::string_view>()(text);
+    // The engine owns its VARCHAR hash (value.cpp HashStringView); pin
+    // consistency against an equal-bytes Value, not std::hash<string_view>.
+    const size_t expected_hash = hash(Value(std::string(text)));
     EXPECT_EQ(hash(original), expected_hash);
     Value copied = original;
     copied.SetStringView(copied.AsStringView().substr(1));
     EXPECT_EQ(copied.AsStringView(), std::string_view(text).substr(1));
     EXPECT_EQ(hash(copied),
-              std::hash<std::string_view>()(std::string_view(text).substr(1)));
+              hash(Value(std::string(std::string_view(text).substr(1)))));
     EXPECT_EQ(hash(original), expected_hash);
     EXPECT_EQ(original.AsStringView(), text);
 

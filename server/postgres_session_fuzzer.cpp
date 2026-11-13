@@ -864,7 +864,10 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
         pgwire::AppendUint16(&body, 0);
       }
       std::vector<std::pair<char, std::string>> exchange;
-      if (!conn.Send(Frame(type, body))) {
+      // Extended-protocol messages are answered with ErrorResponse only;
+      // ReadyForQuery is owed by the closing Sync, exactly like a real
+      // driver pipeline (Parse/Bind/.../Sync).
+      if (!conn.Send(Frame(type, body) + Frame('S', ""))) {
         break;
       }
       if (!conn.ReadMessages(2000, true, &exchange)) {
@@ -872,9 +875,11 @@ void TryPostgresSession(const uint8_t* data, size_t size, bool verbose) {
       }
       error_seen = false;
       const char next = CheckExchange(exchange, &error_seen, &ready_count);
-      if (next != status) {
-        (void)fprintf(stderr, "extended message '%c' changed status %c -> %c\n",
-                      type, status, next);
+      if (next != status || ready_count != 1) {
+        (void)fprintf(stderr,
+                      "extended message '%c' changed status %c -> %c "
+                      "(ready=%zu)\n",
+                      type, status, next, ready_count);
         __builtin_trap();
       }
       bool saw_error = false;

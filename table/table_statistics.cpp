@@ -1434,18 +1434,22 @@ Encoder& operator<<(Encoder& encoder, const ColumnStats& stats) {
   return encoder;
 }
 
-Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
+void ColumnStats::DecodeFixedFields(Decoder& decoder) {
   uint64_t non_null = 0;
   uint64_t nulls = 0;
   uint64_t distinct = 0;
-  decoder >> stats.type_ >> non_null >> nulls >> distinct >> stats.histogram_ >>
-      stats.lowest_values_ >> stats.highest_values_ >>
-      stats.most_common_values_;
-  stats.non_null_count_ = non_null;
-  stats.null_count_ = nulls;
-  stats.distinct_count_ = distinct;
+  decoder >> type_ >> non_null >> nulls >> distinct >> histogram_ >>
+      lowest_values_ >> highest_values_ >> most_common_values_;
+  non_null_count_ = non_null;
+  null_count_ = nulls;
+  distinct_count_ = distinct;
+}
+
+Decoder& operator>>(Decoder& decoder, ColumnStats& stats) {
+  stats.DecodeFixedFields(decoder);
   // Payloads written before the correlation field carry no trailing bytes;
-  // keep them readable with the neutral (fully clustered) default.
+  // keep them readable with the neutral (fully clustered) default.  AtEnd
+  // is the right probe here because the ColumnStats IS the whole payload.
   stats.correlation_ = 1.0;
   if (!decoder.AtEnd()) {
     double correlation = 1.0;
@@ -1476,8 +1480,40 @@ Decoder& operator>>(Decoder& decoder, TableStatistics& stats) {
       decoder.Fail();
       return decoder;
     }
-    decoder >> rows >> stats.stats_;
+    decoder >> rows;
     stats.row_count_ = rows;
+    // stats_ is a vector<ColumnStats>, but whether each element carries the
+    // correlation tail depends on the record version: v3 writes it per
+    // column, v2 does not.  Decode the elements here so the flag reaches
+    // every column -- the generic vector decode cannot carry it, and the
+    // per-column AtEnd() probe only works when a ColumnStats is the whole
+    // payload (inside the vector it sees later columns' bytes, and for the
+    // last column it sees layout_generation_).
+    uint64_t column_count = 0;
+    decoder >> column_count;
+    constexpr uint64_t kMaxStatisticsColumns = 4096;
+    if (column_count > kMaxStatisticsColumns) {
+      decoder.Fail();
+      return decoder;
+    }
+    stats.stats_.clear();
+    stats.stats_.resize(static_cast<size_t>(column_count));
+    // v3 writes the correlation tail per column; v2 does not.  Read it
+    // explicitly per element -- AtEnd() inside operator>> would see the
+    // remaining columns (and, for the last one, layout_generation_) rather
+    // than this column's own fields.
+    const bool has_correlation = version == kStatisticsVersion;
+    for (ColumnStats& column : stats.stats_) {
+      column.DecodeFixedFields(decoder);
+      column.correlation_ = 1.0;
+      if (has_correlation) {
+        double correlation = 1.0;
+        decoder >> correlation;
+        if (!decoder.Failed()) {
+          column.correlation_ = std::clamp(correlation, 0.0, 1.0);
+        }
+      }
+    }
     // A v2 record predates the proof stamp; it describes whatever the chain
     // looked like in an earlier process, so it certifies nothing.
     stats.layout_generation_ = 0;

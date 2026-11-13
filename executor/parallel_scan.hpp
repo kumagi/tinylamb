@@ -26,8 +26,9 @@ namespace tinylamb {
 class Transaction;
 struct LSTableStore;
 
-// Morsel-driven scan: workers dynamically claim small page groups rather than
-// statically owning a table partition, which balances uneven page occupancy.
+// Morsel-driven scan: workers own morsels by static rotation (worker w takes
+// morsels w, w+W, w+2W, ...) and hand decoded chunks to the consumer in
+// morsel order, preserving the table's clustered scan order.
 class ParallelScan final : public ExecutorBase {
  public:
   // Non-copyable by design: instances are owned by smart pointers and
@@ -164,7 +165,7 @@ class ParallelScan final : public ExecutorBase {
   bool started_{false};
   bool typed_folded_{false};
   std::atomic<bool> cancelled_{false};
-  std::exception_ptr worker_error_;
+  Status worker_error_{Status::kSuccess};
   Status worker_status_{Status::kSuccess};
 
   std::optional<DataChunk> pending_;

@@ -9,7 +9,7 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 1. [実行モデル](10-execution-model.md) — 要求駆動型（pull 型）の反復子、ベクトル化、パイプライン、物理特性、誤りの伝播
 2. [データ表現と実行時資源](20-data-runtime.md) — 列バッチ、選択ベクトル、ゾーンマップ、式評価、メモリ、スピル、スケジューリング
 3. [走査と行生成](30-scan-source.md) — 表・索引・ビットマップ・行位置・遠隔入力・定数入力
-4. [単項変換と制御](40-unary-control.md) — 選択、射影、制限、実体化、行数検査、計測、UNNEST
+4. [単項変換と制御](40-unary-control.md) — 選択、射影、制限、行数検査、計測、UNNEST
 5. [結合](50-join.md) — 入れ子ループ、索引、ハッシュ、マージ、相関、時系列・区間結合
 6. [整列・重複除去・集合演算](60-sort-distinct-set.md) — `Sort`、Top-N、`Distinct`、集合演算、マージ連結
 7. [集約](70-aggregation.md) — 単一・並列・二段・分散・グルーピング集合・辞書集約
@@ -40,6 +40,8 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | `IndexOnlyScan` | 索引キーと付加列から出力を組み立てる | [索引のみ走査](30-scan-source.md#6-indexonlyscan索引のみ走査) |
 | `BitmapIndexScan` | 索引条件を物理行位置集合へ変換する | [ビットマップ走査](30-scan-source.md#7-bitmapindexscan-と-bitmapheapscan) |
 | `BitmapHeapScan` | 行位置集合を並べ、表から行を再検査する | [ビットマップ走査](30-scan-source.md#7-bitmapindexscan-と-bitmapheapscan) |
+| `MultiIndexCoveringScan` | 複数索引範囲を行位置で交差させ索引像から行を組み立てる | [複数索引被覆走査](30-scan-source.md#14-multiindexcoveringscan複数索引被覆走査) |
+| `TableSampleExecutor` | `TABLESAMPLE` の確率・リザーバ・系統サンプル行を返す | [表サンプル](30-scan-source.md#15-tablesampleexecutor表サンプル) |
 | `SkipScanDistinct` | 索引上で重複キー区間を飛び越える | [スキップ走査](30-scan-source.md#9-skipscandistinct-と-indexskipscanexecutor) |
 | `SkipScanDistinctExecutor` | `SkipScanDistinct` の公開別名 | [スキップ走査](30-scan-source.md#9-skipscandistinct-と-indexskipscanexecutor) |
 | `IndexSkipScanExecutor` | スキップ走査を計画表示境界で包む | [スキップ走査](30-scan-source.md#9-skipscandistinct-と-indexskipscanexecutor) |
@@ -55,7 +57,6 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 | `Selection` | 三値論理の述語で行を選ぶ | [選択](40-unary-control.md#1-selection) |
 | `Projection` | 式から出力列を作る | [射影](40-unary-control.md#2-projection) |
 | `LimitExecutor` | オフセット後の行数を制限する | [制限](40-unary-control.md#3-limitexecutor) |
-| `MaterializeExecutor` | 入力を保持し、巻き戻し可能にする | [実体化](40-unary-control.md#4-materializeexecutor) |
 | `RelationRenameExecutor` | スキーマ名だけを論理的に付け替える | [透過ラッパー](40-unary-control.md#6-透過ラッパー) |
 | `RetainedExecutor` | コンパイル済み計画の寿命を実行ストリームへ結び付ける | [透過ラッパー](40-unary-control.md#6-透過ラッパー) |
 | `UnnestExecutor` | 配列要素を行へ展開する | [配列展開](40-unary-control.md#9-unnestexecutor) |
@@ -83,7 +84,6 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 |---|---|---|
 | `SortExecutor` | 全体順序を作り、必要なら外部マージする | [全体整列](60-sort-distinct-set.md#2-sortexecutor) |
 | `TopNExecutor` | オフセットを含む上位 `K` 行を求める | [Top-N](60-sort-distinct-set.md#3-topnexecutor) |
-| `PartialSortExecutor` | 各固定ブロックだけを整列・切り出しする | [部分整列](60-sort-distinct-set.md#4-partialsortexecutor) |
 | `IncrementalSortExecutor` | 既整列の接頭辞ごとに残りのキーを整列する | [増分整列](60-sort-distinct-set.md#5-incrementalsortexecutor) |
 | `DistinctExecutor` | 最初に現れた異なるキーだけを通す | [重複除去](60-sort-distinct-set.md#7-distinctexecutor) |
 | `SortDistinctExecutor` | 隣接する同値行を除く | [整列済み重複除去](60-sort-distinct-set.md#8-sortdistinctexecutor) |

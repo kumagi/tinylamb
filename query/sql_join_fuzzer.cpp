@@ -161,14 +161,18 @@ std::string FormatJoined(const ProjCol& col, const FactRow* f, const DimRow* d,
 }
 
 struct ScopedQueryMemory {
-  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+  explicit ScopedQueryMemory(uint64_t budget_bytes)
+      : previous_limit_(QueryMemoryBudget::Global().Limit()) {
     QueryMemoryBudget::Global().ResetForTest(budget_bytes);
   }
-  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ~ScopedQueryMemory() {
+    QueryMemoryBudget::Global().ResetForTest(previous_limit_);
+  }
   ScopedQueryMemory(const ScopedQueryMemory&) = delete;
   ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
   ScopedQueryMemory(ScopedQueryMemory&&) = delete;
   ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+  size_t previous_limit_{0};
 };
 
 constexpr const char* kFactDdl =

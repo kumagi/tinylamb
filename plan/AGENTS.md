@@ -181,7 +181,7 @@ alias; without that merge the filter runs twice per row.  Revisit (a fused
 `CalcPlan`) only if profiling shows the Selection→Projection batch copy
 dominating.
 
-Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 45 physical
+Rule reachability audit: `docs/optimizer_rule_audit.md`. There are 46 physical
 registrations. Exploration retries dependent parents after a child changes.
 `OptimizeGrouping` lowers the supported single-table grouped SQL slice into the
 same scan/aggregate memo; `QueryData::grouping_keys_` carries resolved keys.

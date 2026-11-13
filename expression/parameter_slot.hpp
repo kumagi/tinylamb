@@ -339,6 +339,11 @@ inline bool ContainsParameterSlot(  // NOLINT(misc-no-recursion)
         }
       }
       return false;
+    case TypeTag::kCastExp:
+      // SlotizeLiterals still refuses to parameterize inside casts, but a
+      // hand-built or future-produced tree may carry one; SameQuerySubtrees
+      // already descends here, so the readers must agree.
+      return ContainsParameterSlot(expression->AsCastExpression().Child());
     default:
       return false;
   }
@@ -657,6 +662,9 @@ inline void AppendParameterSlots(  // NOLINT(misc-no-recursion)
            expression->AsArrayExpression().Elements()) {
         AppendParameterSlots(element, slots);
       }
+      return;
+    case TypeTag::kCastExp:
+      AppendParameterSlots(expression->AsCastExpression().Child(), slots);
       return;
     default:
       return;

@@ -177,14 +177,13 @@ EstimatedPlanNode MakeJoinNode(const EstimatedPlanNode& left,
   // Predicates that survive after consuming the equality keys are the
   // residual (e.g. `o.amount > l.qty`); the join executor evaluates them
   // per output row, so the estimated plan surfaces them next to the join.
-  std::vector<Expression> residual;
-  for (const Expression& predicate : predicates) {
-    if (IsColumnEqualityPredicate(predicate) &&
-        predicate->AsBinaryExpression().Op() == BinaryOperation::kEquals) {
-      continue;
-    }
-    residual.push_back(predicate);
-  }
+  // Use the executor's own residual computation: only exact INT64/DATE
+  // equality keys are elided there -- null-safe, unsigned, biased, or
+  // wider-than-four key sets keep their equalities as residual predicates
+  // that are re-verified per matched pair, and a nested-loop join (no keys)
+  // evaluates every predicate.
+  const std::vector<Expression> residual =
+      ResidualJoinPredicates(left.schema, right.schema, predicates);
   // Detect semi/anti/null-aware join from WHERE subquery patterns
   // when a QueryExpression is found in the predicates.
   EstimatedPlanNode out;

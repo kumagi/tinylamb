@@ -153,10 +153,8 @@ std::string EncodeStructJson(
             c = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
           }
         }
-        // Proto value-table cells use the generic VARCHAR channel.  Preserve
-        // their message shape when they are nested in a STRUCT instead of
-        // serializing the payload as an ordinary string.
-        // Keep proto text as a quoted payload here.  The compliance matcher
+        // Proto value-table cells use the generic VARCHAR channel.  Keep
+        // proto text as a quoted payload here: the compliance matcher
         // recognizes the payload as a nested proto, while retaining the
         // outer STRUCT's field boundaries even when repeated members occur.
         is_string = true;

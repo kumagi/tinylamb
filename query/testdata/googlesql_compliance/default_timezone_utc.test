@@ -1,4 +1,4 @@
-[default_time_zone=Etc/UTC]
+[default default_time_zone=Etc/UTC]
 ==
 [name=cast_timestamp_to_date]
 

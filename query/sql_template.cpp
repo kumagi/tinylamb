@@ -1040,7 +1040,17 @@ SqlTemplate ExtractSqlTemplate(std::string_view sql) {
       if (is_timestamp_kw &&
           (kw_end == 9 ||
            !IsIdentChar(static_cast<unsigned char>(sql[kw_end - 10])))) {
-        literal = NormalizeTimestampText(literal);
+        std::optional<std::string> normalized =
+            NormalizeTimestampText(literal);
+        if (!normalized.has_value()) {
+          // An invalid TIMESTAMP literal must not enter the template cache:
+          // a cached slot would rebind the raw text without the visitor's
+          // validation.  Decline templating so every run parses verbatim and
+          // surfaces the diagnostic.
+          result.templatable = false;
+          return result;
+        }
+        literal = std::move(*normalized);
       }
       result.parameters.emplace_back(std::move(literal));
       result.fingerprint += "'?'";

@@ -534,7 +534,20 @@ Status TransactionManager::PreCommit(Transaction& txn,
                                               txn.staged_records_);
       }
       txn.staged_records_.clear();
-      CommitVersions(txn, commit_end);
+      const Status published = CommitVersions(txn, commit_end);
+      if (published != Status::kSuccess) {
+        // Publication could not finish (memory exhaustion).  The versions
+        // may already be visible, so the commit stays kCommitted -- but the
+        // engine must stop and SAY WHY.
+        LOG(ERROR) << "PreCommit failed mid-publication for transaction "
+                   << txn.ID() << ": " << published;
+        fail_stop_.store(true, std::memory_order_release);
+        txn.SetStatus(TransactionStatus::kCommitted);
+        RemoveWaitForEdgesOf(txn.ID());
+        AbortVersions(txn);
+        ForgetTransaction(txn);
+        return Status::kRuntimeError;
+      }
       // The index-undo reservations protected this transaction's right to
       // ABORT; past CommitVersions the commit is irrevocable, no physical
       // undo will ever run, and a restart's loser-undo is single-threaded
@@ -2190,7 +2203,7 @@ void TransactionManager::PublishCommit(uint64_t ts) {
   }
 }
 
-void TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
+Status TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
   // Publish row versions one write-set entry at a time under that entry's
   // shard lock alone. Readers only ever inspect ONE chain under ONE shard
   // lock, so per-chain atomicity is all the protocol needs; the commit
@@ -2262,7 +2275,9 @@ void TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
       ++next;
     } catch (const std::bad_alloc&) {
       if (retried_bad_alloc) {
-        throw;
+        // Second allocation failure: the commit_ts stays registered as
+        // unpublished and the caller fail-stops the engine.
+        return Status::kNoSpace;
       }
       retried_bad_alloc = true;
       // Transient allocation failure mid-publication: retry the suffix. The
@@ -2285,6 +2300,7 @@ void TransactionManager::CommitVersions(Transaction& txn, lsn_t commit_lsn) {
   // commit_ts stays registered as unpublished: correct (snapshots stall at
   // the previous stable point), just conservatively slow.
   PublishCommit(commit_ts);
+  return Status::kSuccess;
 }
 
 void TransactionManager::AbortVersions(Transaction& txn) {

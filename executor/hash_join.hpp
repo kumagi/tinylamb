@@ -110,7 +110,12 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
-  void MaterializePipeline() override { Materialize(); }
+  // Route through MaterializeOrThrow so a failed materialization latches
+  // materialize_error_ instead of being discarded: a bare Materialize()
+  // leaves materialized_ false, and the next NextBatch would re-run intake
+  // over already-drained children and serve the partial/empty result as a
+  // success.
+  void MaterializePipeline() override { MaterializeOrThrow(); }
   [[nodiscard]] size_t MaterializedRowCount() const override;
   [[nodiscard]] size_t MaterializedBytes() const override;
 
@@ -262,18 +267,18 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   Status MaterializeSingle();
 
   Status IntakeBothSides();
-  void BuildShards();
+  [[nodiscard]] Status BuildShards();
   [[nodiscard]] uint32_t ShardOf(uint64_t hash) const;
   bool FetchNextProbe();
-  void SetupInMemoryJoin();
-  void SetupOneSideSpilled();
+  [[nodiscard]] Status SetupInMemoryJoin();
+  [[nodiscard]] Status SetupOneSideSpilled();
   Status SetupBothSpilled();
   template <typename RightCont>
   void JoinPartitionPair(
       const std::vector<std::pair<Row, RowPosition>>& left_part,
       const RightCont& right_part,
       std::vector<std::pair<Row, RowPosition>>* out);
-  void RunStripedProbe();
+  [[nodiscard]] Status RunStripedProbe();
   bool EmitNextMatch(Row* dst, RowPosition* rp);
 
   Executor left_;

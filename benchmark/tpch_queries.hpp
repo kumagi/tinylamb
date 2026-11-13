@@ -12,6 +12,13 @@ namespace tinylamb {
 
 // TPC-H query templates with fixed substitution parameters, expressed in the
 // GoogleSQL-compatible dialect accepted by tinylamb.
+//
+// Deviation from the official spec: Q6 uses `l_quantity < 25` where the
+// official TPC-H query uses `l_quantity < 24`. The `< 25` form has been the
+// benchmark's fixed parameter since before this note was added (see
+// docs/olap_oltp_comparison_2026-10-28.md); all comparison engines receive
+// the same SQL text, so cross-engine comparisons remain apples-to-apples,
+// but Q6 results are not comparable to official TPC-H validation output.
 inline constexpr std::array<std::string_view, 22> kTpchBenchmarkQueries = {
     R"sql(SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty,
       sum(l_extendedprice) AS sum_base_price,

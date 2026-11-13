@@ -126,6 +126,18 @@ Column ProjectionExpressionColumn(std::string_view name,
     }
     return result;
   }
+  if (expression->Type() == TypeTag::kConstantValue) {
+    // A literal's type is known statically; without it an empty result
+    // (WHERE false / LIMIT 0) leaves the column kNull and CTAS falls back
+    // to VARCHAR, rejecting later typed INSERTs.
+    const Value& constant = expression->AsConstantValue().GetValue();
+    if (!constant.IsNull()) {
+      Column result(name, constant.type);
+      result.SetUnsigned(constant.IsUnsigned());
+      result.SetInterval(constant.IsInterval());
+      return result;
+    }
+  }
   return Column(name, ValueType::kNull);
 }
 
@@ -1601,24 +1613,50 @@ StatusOr<Relation> Project(TransactionContext& context,
   // in its source statement, which is enough to identify this shape without
   // adding type metadata to Relation.
   bool proto_value_star = false;
-  for (const SelectSource& source : statement.Sources()) {
-    if (source.table.find("WithProtoValueTable") != std::string::npos) {
-      proto_value_star = true;
-    }
-    if (source.query && source.query->SelectList().size() == 1) {
-      const Expression& expression = source.query->SelectList()[0].expression;
-      if (expression->Type() == TypeTag::kFunctionCallExp &&
-          expression->AsFunctionCallExpression().FuncName() == "__proto_new" &&
-          !expression->AsFunctionCallExpression().Args().empty()) {
-        const Expression& type =
-            expression->AsFunctionCallExpression().Args().front();
-        if (type->Type() == TypeTag::kConstantValue &&
-            type->AsConstantValue().GetValue().type == ValueType::kVarChar &&
-            std::string(type->AsConstantValue().GetValue().value.varchar_value)
-                    .find("TestExtraPB") != std::string::npos) {
-          proto_value_star = true;
+  // A derived proto value table (an inlined WITH body) is recognized by the
+  // SELECT AS <proto> constructor it carries, recursively through set
+  // operations; only the TestExtraPB shape has the three fields expanded
+  // below, so other proto types stay on the ordinary star path.
+  const auto query_produces_test_extra_pb =
+      [](const SelectStatement& query, auto&& self) -> bool {
+    for (const NamedExpression& item : query.SelectList()) {
+      const Expression& expression = item.expression;
+      if (expression && expression->Type() == TypeTag::kFunctionCallExp) {
+        const FunctionCallExpression& call =
+            expression->AsFunctionCallExpression();
+        if ((call.FuncName() == "__proto_new" ||
+             call.FuncName() == "__value_table_proto") &&
+            !call.Args().empty()) {
+          const Expression& type = call.Args().front();
+          if (type->Type() == TypeTag::kConstantValue &&
+              type->AsConstantValue().GetValue().type == ValueType::kVarChar &&
+              std::string(type->AsConstantValue().GetValue()
+                              .value.varchar_value)
+                      .find("TestExtraPB") != std::string::npos) {
+            return true;
+          }
         }
       }
+    }
+    for (const auto& branch : query.UnionAll()) {
+      if (branch && self(*branch, self)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (const SelectSource& source : statement.Sources()) {
+    // Materialized proto value tables are catalog tables with no query to
+    // inspect; they are identified by their reserved compliance names only —
+    // an exact match, not a substring, so ordinary tables cannot collide.
+    if (source.table == "TestExtraPBValueTable" ||
+        source.table == "WithProtoValueTable") {
+      proto_value_star = true;
+    }
+    if (source.query &&
+        query_produces_test_extra_pb(*source.query,
+                                     query_produces_test_extra_pb)) {
+      proto_value_star = true;
     }
   }
   // A physical join may reorder inputs. Bare * still expands in FROM order,
@@ -1698,7 +1736,10 @@ StatusOr<Relation> Project(TransactionContext& context,
         }
         return false;
       };
-      if (proto_value_star && base_width == 1) {
+      // The proto payload column is VARCHAR; requiring it keeps a same-named
+      // non-proto table on the ordinary star expansion.
+      if (proto_value_star && base_width == 1 &&
+          input.schema.GetColumn(0).Type() == ValueType::kVarChar) {
         if (projection.star_modifiers) {
           return StatusError(StatusCode::kInvalidArgument,
                              "SELECT * EXCEPT/REPLACE over this table is "
@@ -2756,14 +2797,18 @@ Status ApplyOrderBy(TransactionContext& context,
     std::optional<slot_t> ordinal_column;
     if (expression && expression->Type() == TypeTag::kConstantValue) {
       const Value& ordinal_value = expression->AsConstantValue().GetValue();
-      if (ordinal_value.type == ValueType::kInt64 && !ordinal_value.IsNull() &&
-          ordinal_value.value.int_value >= 1) {
-        const auto ordinal = static_cast<size_t>(ordinal_value.value.int_value);
-        if (ordinal > output->schema.ColumnCount()) {
+      if (ordinal_value.type == ValueType::kInt64 && !ordinal_value.IsNull()) {
+        // Any bare integer ORDER BY item is a SELECT-list ordinal; values
+        // below 1 are out of range just like oversized ones (the Project
+        // path rejects both with the same error).
+        if (ordinal_value.value.int_value < 1 ||
+            static_cast<size_t>(ordinal_value.value.int_value) >
+                output->schema.ColumnCount()) {
           return StatusError(StatusCode::kInvalidArgument,
                              "ORDER BY ordinal out of range");
         }
-        ordinal_column = static_cast<slot_t>(ordinal - 1);
+        ordinal_column =
+            static_cast<slot_t>(ordinal_value.value.int_value - 1);
       }
     }
     ordinal_columns.push_back(ordinal_column);
@@ -4464,194 +4509,6 @@ std::shared_ptr<SelectStatement> FlattenGroupedDerivedBoundary(
   return rewritten;
 }
 
-// A scalar AVG/SUM/COUNT over UNION ALL is the sum of the branch aggregates.
-// Each branch then aggregates its own join instead of materializing every
-// sales row into the union. Double sums are reassociated only at the branch
-// boundary; callers compare those totals with a numeric tolerance.
-std::shared_ptr<SelectStatement> PushScalarAggregateThroughUnion(
-    const SelectStatement& statement, const SelectSource& source,
-    const SelectStatement& derived) {
-  if (statement.Sources().size() != 1 || statement.Having() ||
-      statement.Qualify() || statement.Distinct() ||
-      statement.HasDistinctOn() || !statement.GroupBy().empty() ||
-      !statement.UnionAll().empty() || statement.WhereClause() ||
-      !statement.OrderBy().empty() || HasWindowFunctions(statement) ||
-      StatementContainsVolatileFunction(statement) ||
-      derived.UnionAll().empty() || derived.Distinct() ||
-      derived.HasDistinctOn() || derived.HasLimit() || derived.Offset() != 0 ||
-      (derived.GetSetOperationTree() != nullptr &&
-       derived.GetSetOperationTree()->grouped)) {
-    return nullptr;
-  }
-  for (size_t i = 0; i < derived.UnionAll().size(); ++i) {
-    const SetOperationMatch match = derived.MatchFor(i);
-    if (match.by_name || match.corresponding || !match.columns.empty() ||
-        (i < derived.SetOperationKinds().size() &&
-         derived.SetOperationKinds()[i] != SetOperationKind::kUnionAll)) {
-      return nullptr;
-    }
-  }
-  const auto branch_ok = [](const SelectStatement& part) {
-    SelectStatement bare(part);
-    bare.ClearUnionAll();
-    bare.SetSetOperationTree(nullptr);
-    bare.SetOrderBy({});
-    bare.SetLimit(std::nullopt);
-    bare.SetOffset(0);
-    return IsFlattenableJoinedProjection(bare) || IsFlattenableProjection(bare);
-  };
-  if (!branch_ok(derived)) {
-    return nullptr;
-  }
-  for (const auto& branch : derived.UnionAll()) {
-    if (branch == nullptr || !branch_ok(*branch)) {
-      return nullptr;
-    }
-  }
-  struct Partial {
-    enum class Kind { kSum, kCount, kAvg };
-    Kind kind;
-    Expression argument;
-    std::string sum_name;
-    std::string count_name;
-  };
-  std::vector<Partial> partials;
-  std::vector<NamedExpression> outer_items;
-  const std::string derived_alias = source.alias.empty() ? "d" : source.alias;
-  for (size_t item = 0; item < statement.SelectList().size(); ++item) {
-    const NamedExpression& selected = statement.SelectList()[item];
-    if (!selected.expression || ContainsQuery(selected.expression)) {
-      return nullptr;
-    }
-    if (selected.expression->Type() != TypeTag::kAggregateExp) {
-      if (ContainsAggregate(selected.expression) ||
-          !selected.expression->TouchedColumns().empty()) {
-        return nullptr;
-      }
-      outer_items.push_back(selected);
-      continue;
-    }
-    const auto& aggregate = selected.expression->AsAggregateExpression();
-    if (aggregate.Distinct() || aggregate.HasWhereFilter() ||
-        aggregate.Having() != AggregateHavingModifier::kNone ||
-        !aggregate.InnerOrderBy().empty() || aggregate.SecondaryArg() ||
-        !aggregate.ExtraArgs().empty() || aggregate.NeedsGroupContext()) {
-      return nullptr;
-    }
-    const AggregationType type = aggregate.GetType();
-    if (type != AggregationType::kSum && type != AggregationType::kCount &&
-        type != AggregationType::kAvg) {
-      return nullptr;
-    }
-    if (!IsCountStar(aggregate) &&
-        (!aggregate.Child() || ContainsQuery(aggregate.Child()) ||
-         ContainsAggregate(aggregate.Child()))) {
-      return nullptr;
-    }
-    Partial partial;
-    partial.kind = type == AggregationType::kAvg   ? Partial::Kind::kAvg
-                   : type == AggregationType::kSum ? Partial::Kind::kSum
-                                                   : Partial::Kind::kCount;
-    partial.argument =
-        IsCountStar(aggregate) ? Expression{} : aggregate.Child();
-    const std::string id = std::to_string(partials.size());
-    partial.sum_name = "_pushed_sum_" + id;
-    partial.count_name = "_pushed_cnt_" + id;
-    if (partial.kind == Partial::Kind::kAvg) {
-      const Expression numerator = BinaryExpressionExp(
-          AggregateExpressionExp(AggregationType::kSum,
-                                 ColumnValueExp(partial.sum_name)),
-          BinaryOperation::kMultiply, ConstantValueExp(Value(1.0)));
-      const Expression denominator = FunctionCallExp(
-          "nullif", {AggregateExpressionExp(AggregationType::kSum,
-                                            ColumnValueExp(partial.count_name)),
-                     ConstantValueExp(Value(static_cast<int64_t>(0)))});
-      outer_items.emplace_back(
-          selected.name, BinaryExpressionExp(
-                             numerator, BinaryOperation::kDivide, denominator));
-    } else if (partial.kind == Partial::Kind::kSum) {
-      outer_items.emplace_back(
-          selected.name,
-          AggregateExpressionExp(AggregationType::kSum,
-                                 ColumnValueExp(partial.sum_name)));
-    } else {
-      outer_items.emplace_back(
-          selected.name,
-          AggregateExpressionExp(AggregationType::kSum,
-                                 ColumnValueExp(partial.count_name)));
-    }
-    partials.push_back(std::move(partial));
-  }
-  if (partials.empty()) {
-    return nullptr;
-  }
-  const auto make_branch =
-      [&](const SelectStatement& part) -> std::shared_ptr<SelectStatement> {
-    auto branch = std::make_shared<SelectStatement>(part);
-    branch->ClearUnionAll();
-    branch->SetSetOperationTree(nullptr);
-    branch->SetOrderBy({});
-    branch->SetLimit(std::nullopt);
-    branch->SetOffset(0);
-    branch->SetWithTies(false);
-    std::vector<NamedExpression> items;
-    for (const Partial& partial : partials) {
-      Expression argument;
-      if (partial.argument) {
-        bool valid = true;
-        argument = SubstituteProjectionColumns(partial.argument, *branch,
-                                               derived_alias, &valid);
-        if (!valid || !argument) {
-          return nullptr;
-        }
-      } else {
-        argument = ColumnValueExp("*");
-      }
-      if (partial.kind == Partial::Kind::kCount) {
-        items.emplace_back(partial.count_name,
-                           AggregateExpressionExp(AggregationType::kCount,
-                                                  std::move(argument)));
-      } else if (partial.kind == Partial::Kind::kSum) {
-        items.emplace_back(
-            partial.sum_name,
-            AggregateExpressionExp(AggregationType::kSum, std::move(argument)));
-      } else {
-        items.emplace_back(
-            partial.sum_name,
-            AggregateExpressionExp(AggregationType::kSum, argument));
-        items.emplace_back(partial.count_name,
-                           AggregateExpressionExp(AggregationType::kCount,
-                                                  std::move(argument)));
-      }
-    }
-    branch->SetSelectList(std::move(items));
-    branch->SetGroupBy({});
-    return branch;
-  };
-  auto union_head = make_branch(derived);
-  if (union_head == nullptr) {
-    return nullptr;
-  }
-  for (const auto& part : derived.UnionAll()) {
-    auto branch = make_branch(*part);
-    if (branch == nullptr) {
-      return nullptr;
-    }
-    union_head->AddUnionAll(std::move(branch));
-  }
-  SelectSource out_source = source;
-  out_source.query = std::move(union_head);
-  out_source.table.clear();
-  out_source.join_condition = nullptr;
-  out_source.sample.reset();
-  auto rewritten = std::make_shared<SelectStatement>(statement);
-  rewritten->SetSelectList(std::move(outer_items));
-  rewritten->SetSources({std::move(out_source)});
-  rewritten->SetWhereClause({});
-  rewritten->SetGroupBy({});
-  return rewritten;
-}
-
 }  // namespace
 
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
@@ -4674,10 +4531,11 @@ std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
        inherited_ctes.contains(inner_source.table))) {
     return nullptr;
   }
-  if (std::shared_ptr<SelectStatement> pushed =
-          PushScalarAggregateThroughUnion(statement, source, derived)) {
-    return pushed;
-  }
+  // NOTE: pushing a scalar SUM/AVG/COUNT through a UNION ALL derived table
+  // (summing each branch's aggregate) is deliberately NOT done here. Branch
+  // arithmetic runs in the branch's own column types, while the UNION promotes
+  // mixed types (e.g. INT64 * INT64 overflows where the promoted DOUBLE form
+  // does not), so the rewrite is not row-multiset preserving in general.
   auto rewritten = std::make_shared<SelectStatement>(statement);
 
   // Flatten SELECT column-list FROM one-table derived tables.  This is
@@ -7743,6 +7601,16 @@ void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
   std::shared_ptr<SelectStatement> explain_statement;
   const SelectStatement* effective = statement_.get();
   size_t collapsed_boundaries = 0;
+  // Execution materializes the statement's WITH entries into the inherited
+  // CTE map before boundary-flattening the body, so a derived source whose
+  // inner scan names a CTE is refused the flatten. Mirror that guard with
+  // the WITH names alone: OptimizeDerivedBoundaries only calls contains()
+  // on the map, never dereferences the relations.
+  relational_detail::CteMap explain_ctes;
+  for (const auto& [name, query] : statement_->WithQueries()) {
+    (void)query;
+    explain_ctes.emplace(name, nullptr);
+  }
   for (size_t iteration = 0; iteration < 32; ++iteration) {
     const bool had_derived_source = effective->Sources().size() == 1 &&
                                     effective->Sources()[0].query != nullptr;
@@ -7756,7 +7624,7 @@ void RelationalExecutor::Explain(std::ostream& output, int /*indent*/) const {
       }
     }
     std::shared_ptr<SelectStatement> next =
-        relational_detail::OptimizeDerivedBoundaries(*effective, {});
+        relational_detail::OptimizeDerivedBoundaries(*effective, explain_ctes);
     if (!next) {
       break;
     }

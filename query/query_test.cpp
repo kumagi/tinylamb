@@ -104,6 +104,11 @@ std::vector<Row> RunSql(TransactionContext& ctx, Database& db,
   while (prepared.Value()->Next(&row, nullptr)) {
     rows.push_back(row);
   }
+  // EOF and failure are distinct: an executor that errors mid-drain must not
+  // hand back a silently truncated result as if it were complete.
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess)
+      << sql << "\n"
+      << engine.LastError();
   return rows;
 }
 }  // namespace
@@ -453,6 +458,51 @@ TEST_F(QueryTest, ViewOrReplaceAndNameConflicts) {
   EXPECT_FALSE(not_a_view.HasValue());
   EXPECT_EQ(engine.LastError(), "view plain does not exist");
   ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, DropIfExistsOnMissingObjects) {
+  TransactionContext ctx = db_->BeginContext();
+  SqlEngine engine(*db_);
+  const auto drop_ok = [&](const std::string& sql, const char* tag) {
+    StatusOr<Executor> exec = engine.Prepare(ctx, sql);
+    EXPECT_TRUE(exec.HasValue()) << sql << ": " << engine.LastError();
+    if (!exec.HasValue()) {
+      return;
+    }
+    Row row;
+    while (exec.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_EQ(exec.Value()->GetStatus(), Status::kSuccess);
+    EXPECT_EQ(row[0], Value(tag));
+  };
+
+  // Missing objects: IF EXISTS turns the not-exists error into a no-op.
+  drop_ok("DROP TABLE IF EXISTS missing_t;", "DROP TABLE");
+  drop_ok("DROP VIEW IF EXISTS missing_v;", "DROP VIEW");
+  drop_ok("DROP MATERIALIZED VIEW IF EXISTS missing_mv;",
+          "DROP MATERIALIZED VIEW");
+
+  RunSql(ctx, *db_, "CREATE TABLE t_ifexist (x INT64);");
+  RunSql(ctx, *db_, "CREATE VIEW v_ifexist AS SELECT 1 AS one;");
+  RunSql(ctx, *db_, "CREATE TABLE mv_base (k INT64);");
+  RunSql(ctx, *db_,
+         "CREATE MATERIALIZED VIEW mv_ifexist AS SELECT k FROM mv_base;");
+  drop_ok("DROP TABLE IF EXISTS t_ifexist;", "DROP TABLE");
+  drop_ok("DROP VIEW IF EXISTS v_ifexist;", "DROP VIEW");
+  drop_ok("DROP MATERIALIZED VIEW IF EXISTS mv_ifexist;",
+          "DROP MATERIALIZED VIEW");
+  // Repeating the drops is still a successful no-op.
+  drop_ok("DROP TABLE IF EXISTS t_ifexist;", "DROP TABLE");
+  drop_ok("DROP VIEW IF EXISTS v_ifexist;", "DROP VIEW");
+  drop_ok("DROP MATERIALIZED VIEW IF EXISTS mv_ifexist;",
+          "DROP MATERIALIZED VIEW");
+
+  // Without IF EXISTS the same drops stay loud errors.
+  EXPECT_FALSE(engine.Prepare(ctx, "DROP TABLE t_ifexist;").HasValue());
+  EXPECT_FALSE(engine.Prepare(ctx, "DROP VIEW v_ifexist;").HasValue());
+  EXPECT_FALSE(
+      engine.Prepare(ctx, "DROP MATERIALIZED VIEW mv_ifexist;").HasValue());
+  ASSERT_SUCCESS(ctx.txn_.PreCommit());
 }
 
 // Sibling derived-aggregate fusion (TPC-H Q21 shape): two derived tables
@@ -1139,10 +1189,12 @@ TEST_F(QueryTest, DmlQuantifiedFoldMatchesRelationalRoute) {
           "UPDATE tgt SET v = v + 1 WHERE (" + std::string(kPred) + ");";
       std::string rows1;
       const std::string st1 = drain(engine1, ctx, sql, &rows1);
-      drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
+      const std::string sel1a =
+          drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
       ASSERT_SUCCESS(ctx.txn_.PreCommit());
       ctx = db1->BeginContext();
-      drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
+      const std::string sel1b =
+          drain(engine1, ctx, "SELECT k, v FROM tgt ORDER BY k;", &rows1);
 
       auto db2 = MakeDatabase();
       SqlEngine engine2(*db2);
@@ -1161,13 +1213,23 @@ TEST_F(QueryTest, DmlQuantifiedFoldMatchesRelationalRoute) {
       ctx2 = db2->BeginContext();
       std::string rows2;
       const std::string st2 = drain(engine2, ctx2, sql, &rows2);
-      drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
+      const std::string sel2a =
+          drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
       ASSERT_SUCCESS(ctx2.txn_.PreCommit());
       ctx2 = db2->BeginContext();
-      drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
+      const std::string sel2b =
+          drain(engine2, ctx2, "SELECT k, v FROM tgt ORDER BY k;", &rows2);
 
+      // Every statement in this differential must actually succeed: without
+      // a success check, a predicate broken on BOTH routes would compare two
+      // identical error strings and pass all 54 cases unchecked.
+      EXPECT_EQ(st1, "Success") << "cascades route failed";
+      EXPECT_EQ(sel1a, "Success") << "post-update select failed";
+      EXPECT_EQ(sel1b, "Success") << "post-commit select failed";
       EXPECT_EQ(st1, st2) << "prepare/drain status differs";
-      if (st1 == "Success") {
+      EXPECT_EQ(sel1a, sel2a) << "post-update select status differs";
+      EXPECT_EQ(sel1b, sel2b) << "post-commit select status differs";
+      if (st1 == "Success" && sel1a == "Success" && sel1b == "Success") {
         EXPECT_EQ(rows1, rows2) << "final table contents differ";
       }
     }
@@ -2409,6 +2471,20 @@ TEST_F(QueryTest, SqlEngineUnnestFlattenedStructFeedsProjectionAndAggregate) {
       (std::vector<Row>{Row({Value(1), Value(2)})}));
   EXPECT_EQ(RunSql(ctx, *db_, "SELECT SUM(y) FROM UNNEST([STRUCT(1 AS y)]) x;"),
             (std::vector<Row>{Row({Value(1)})}));
+  ctx.txn_.Abort();
+}
+
+TEST_F(QueryTest, SqlEngineUnnestStructFieldNameContainingColon) {
+  // A struct field name containing ':' must survive the JSON round-trip:
+  // the field splitter used to cut the key at the first ':' even inside the
+  // quoted name, so the anonymous sibling's f1 was renamed to a broken key
+  // and e.`a:b` resolved to NULL for it.
+  TransactionContext ctx = db_->BeginContext();
+  EXPECT_EQ(
+      RunSql(ctx, *db_,
+             "SELECT e.`a:b` AS v FROM UNNEST([STRUCT(1 AS `a:b`), "
+             "STRUCT(2)]) e ORDER BY v;"),
+      (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
   ctx.txn_.Abort();
 }
 
@@ -5355,6 +5431,9 @@ std::vector<Row> RunPrepared(SqlEngine* engine, TransactionContext* ctx,
   while (prepared.Value()->Next(&row, nullptr)) {
     rows.push_back(row);
   }
+  EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess)
+      << sql << "\n"
+      << engine->LastError();
   return rows;
 }
 }  // namespace
@@ -5600,7 +5679,17 @@ TEST_F(QueryTest, SqlEnginePlanCacheRejectsPreDdlSnapshotAtPostDdlEpoch) {
   RunSql(ddl, *db_, "CREATE TABLE " + table_name + " (k INT64, v INT64);");
   RunSql(ddl, *db_, "INSERT INTO " + table_name + " VALUES (5, 900);");
 
-  RunPrepared(&engine, &reader, sql);
+  {
+    // The pre-DDL snapshot must not serve the recreated table: the read
+    // fails (Conflicts) or yields nothing rather than the stale catalog
+    // image.  RunPrepared's success assertion does not apply here.
+    StatusOr<Executor> stale = engine.Prepare(reader, sql);
+    if (stale.HasValue()) {
+      Row stale_row;
+      while (stale.Value()->Next(&stale_row, nullptr)) {
+      }
+    }
+  }
   ASSERT_SUCCESS(reader.txn_.PreCommit());
   ASSERT_SUCCESS(ddl.txn_.PreCommit());
 
@@ -7106,6 +7195,20 @@ TEST_F(QueryTest, CancellationResourceLeakVerification) {
       ("tinylamb-spill-test-" + RandomString());
   std::filesystem::create_directories(spill_isolation_dir);
   setenv("TINYLAMB_TEMP", spill_isolation_dir.c_str(), 1);
+  // Restore the process-global budget cap and TINYLAMB_TEMP on every exit
+  // path: the ASSERT_* checks below return early on failure, and without
+  // this guard a failed assertion would leak both into later tests.
+  struct SpillIsolationGuard {
+    explicit SpillIsolationGuard(std::filesystem::path dir)
+        : dir_(std::move(dir)) {}
+    ~SpillIsolationGuard() {
+      QueryMemoryBudget::Global().ResetForTest(0);
+      unsetenv("TINYLAMB_TEMP");
+      std::error_code ec;
+      std::filesystem::remove_all(dir_, ec);
+    }
+    std::filesystem::path dir_;
+  } spill_guard{spill_isolation_dir};
   auto count_spill_files = []() -> size_t {
     size_t count = 0;
     std::error_code ec;

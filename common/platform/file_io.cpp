@@ -355,8 +355,12 @@ int DataSync(int fd) {
   if (!::FlushFileBuffers(reinterpret_cast<HANDLE>(raw))) {
     const DWORD err = ::GetLastError();
     if (err == ERROR_ACCESS_DENIED) {
-      // Read-only descriptor (e.g. WriteSegmentMetadata); the preceding writer
-      // handle already flushed its CRT stream.
+      // Read-only descriptor (e.g. WriteSegmentMetadata); the preceding
+      // writer handle already flushed its CRT stream.  Windows cannot flush
+      // through a read-only handle, so this reports success WITHOUT a real
+      // durability barrier -- a divergence from the POSIX paths, where
+      // fdatasync on an O_RDONLY fd still flushes the inode.  Callers that
+      // need a guarantee must DataSync a writable handle for the file.
       return 0;
     }
     errno = MapWin32ErrorToErrno(err);

@@ -40,7 +40,8 @@ class IndexScanPlan final : public PlanBase {
                 bool lock_rows = false, bool wait_for_write_intent = true,
                 size_t limit_hint = std::numeric_limits<size_t>::max());
   // Point-union access for constant IN lists: one [begin,end] pair per
-  // distinct value. Ordering credit only survives a single range.
+  // distinct value.  Ranges are sorted and disjoint, so scanning them in
+  // sequence preserves the advertised global key order.
   IndexScanPlan(
       const Table& table, const Index& index, const TableStatistics& ts,
       std::vector<std::pair<std::vector<Value>, std::vector<Value>>> ranges,

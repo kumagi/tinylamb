@@ -985,9 +985,13 @@ StatusOr<int> ThreeValuedEqualsImpl(const Value& left, const Value& right) {
 
 }  // namespace
 
-// Three-valued equality entry point shared by IN membership and quantified
-// comparisons.  Struct-shaped operands take the positional JSON path; plain
-// strings keep ordinary (never JSON-parsed) equality.
+// Three-valued equality entry point for quantified comparisons
+// (__quantified__ element tests): errors collapse to -1 (unknown), which is
+// what the quantified predicate expects.  IN membership and subquery IN do
+// NOT come through here — they propagate errors via TryBinary /
+// ThreeValuedEqualsImpl directly.  Struct-shaped operands take the
+// positional JSON path; plain strings keep ordinary (never JSON-parsed)
+// equality.
 int ThreeValuedEquals(const Value& left, const Value& right) {
   const auto compared = ThreeValuedEqualsImpl(left, right);
   return compared.HasValue() ? compared.Value() : -1;

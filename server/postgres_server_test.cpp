@@ -492,8 +492,11 @@ TEST(PostgresServerTest, ServerProtocolErrorResponses) {
     const int client = ConnectClient(server.BoundPort());
     ASSERT_GE(client, 0);
 
-    // Act -- send an unsupported frontend message type
-    ASSERT_TRUE(SendAll(client, std::string("F\0\0\0\4", 5)));
+    // Act -- send an unsupported frontend message type followed by Sync;
+    // the error is answered immediately but ReadyForQuery is owed by Sync
+    // (one Sync must close with exactly one RFQ).
+    ASSERT_TRUE(SendAll(client, std::string("F\0\0\0\4", 5) +
+                                     std::string("S\0\0\0\4", 5)));
     const std::string unsupported = ReadUntilReady(client);
     // Assert -- the server replies with an error and a ReadyForQuery
     EXPECT_NE(unsupported.find('E'), std::string::npos);
@@ -1994,22 +1997,26 @@ TEST(PostgresServerTest, ExtendedQueryMessagesRejectedKeepSessionAlive) {
     ASSERT_FALSE(ReadUntilReady(client).empty());
 
     // Act -- the extended query protocol is not implemented: Parse, Bind, and
-    // Execute messages are each rejected with an error plus ReadyForQuery.
+    // Execute messages are each rejected with an error; the closing Sync
+    // answers ReadyForQuery (exactly one RFQ per Sync).
     const std::string parse =
         std::string("P\0\0\0\21", 5) + std::string("\0", 1) +
-        std::string("SELECT 1;\0", 10) + std::string("\0\0", 2);
+        std::string("SELECT 1;\0", 10) + std::string("\0\0", 2) +
+        std::string("S\0\0\0\4", 5);
     ASSERT_TRUE(SendAll(client, parse));
     const std::string parsed = ReadUntilReady(client);
     EXPECT_NE(parsed.find('E'), std::string::npos);
     EXPECT_NE(parsed.find("not supported"), std::string::npos);
     EXPECT_NE(parsed.find('Z'), std::string::npos);
 
-    ASSERT_TRUE(SendAll(client, std::string("B\0\0\0\5", 5) + '\0'));
+    ASSERT_TRUE(SendAll(client, std::string("B\0\0\0\5", 5) + '\0' +
+                                     std::string("S\0\0\0\4", 5)));
     const std::string bound = ReadUntilReady(client);
     EXPECT_NE(bound.find('E'), std::string::npos);
     EXPECT_NE(bound.find('Z'), std::string::npos);
 
-    ASSERT_TRUE(SendAll(client, std::string("E\0\0\0\5", 5) + '\0'));
+    ASSERT_TRUE(SendAll(client, std::string("E\0\0\0\5", 5) + '\0' +
+                                     std::string("S\0\0\0\4", 5)));
     const std::string executed = ReadUntilReady(client);
     EXPECT_NE(executed.find('E'), std::string::npos);
     EXPECT_NE(executed.find('Z'), std::string::npos);

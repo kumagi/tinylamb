@@ -36,6 +36,7 @@
 #include "common/constants.hpp"
 #include "common/serdes.hpp"
 #include "common/status_or.hpp"
+#include "common/unwind_guard.hpp"
 #include "page/page_manager.hpp"
 #include "page/page_type.hpp"
 #include "page/row_position.hpp"
@@ -327,14 +328,18 @@ bool Transaction::AddWriteSet(const RowPosition& rp) {
     return true;
   }
   write_set_.insert(rp);
-  try {
-    if (transaction_manager_->AcquireWriteIntent(*this, rp, true)) {
+  {
+    // If the acquire path unwinds (e.g. allocation failure), drop both the
+    // intent and the write-set entry before the failure propagates.
+    UnwindGuard rollback([this, &rp] {
+      transaction_manager_->ReleaseWriteIntent(*this, rp);
+      write_set_.erase(rp);
+    });
+    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, true);
+    rollback.Disarm();
+    if (acquired) {
       return true;
     }
-  } catch (...) {
-    transaction_manager_->ReleaseWriteIntent(*this, rp);
-    write_set_.erase(rp);
-    throw;
   }
   write_set_.erase(rp);
   return false;
@@ -366,14 +371,18 @@ bool Transaction::AddWriteSet(const RowPosition& rp, std::string_view before) {
     return acquired;
   }
   write_set_.insert(rp);
-  try {
-    if (transaction_manager_->AcquireWriteIntent(*this, rp, true, before)) {
+  {
+    // If the acquire path unwinds (e.g. allocation failure), drop both the
+    // intent and the write-set entry before the failure propagates.
+    UnwindGuard rollback([this, &rp] {
+      transaction_manager_->ReleaseWriteIntent(*this, rp);
+      write_set_.erase(rp);
+    });
+    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, true, before);
+    rollback.Disarm();
+    if (acquired) {
       return true;
     }
-  } catch (...) {
-    transaction_manager_->ReleaseWriteIntent(*this, rp);
-    write_set_.erase(rp);
-    throw;
   }
   write_set_.erase(rp);
   return false;
@@ -397,14 +406,18 @@ bool Transaction::TryAddWriteSet(const RowPosition& rp) {
     return true;
   }
   write_set_.insert(rp);
-  try {
-    if (transaction_manager_->AcquireWriteIntent(*this, rp, false)) {
+  {
+    // If the acquire path unwinds (e.g. allocation failure), drop both the
+    // intent and the write-set entry before the failure propagates.
+    UnwindGuard rollback([this, &rp] {
+      transaction_manager_->ReleaseWriteIntent(*this, rp);
+      write_set_.erase(rp);
+    });
+    const bool acquired = transaction_manager_->AcquireWriteIntent(*this, rp, false);
+    rollback.Disarm();
+    if (acquired) {
       return true;
     }
-  } catch (...) {
-    transaction_manager_->ReleaseWriteIntent(*this, rp);
-    write_set_.erase(rp);
-    throw;
   }
   write_set_.erase(rp);
   return false;
@@ -515,8 +528,32 @@ StatusOr<std::string_view> Transaction::ReadVersion(
     }
     return *physical;
   }
+  std::optional<std::string> served = std::move(visible).MoveValue();
+  if (!served) {
+    // Unreachable: the nullopt branch above already returned a view of the
+    // physical image, so a disengaged optional cannot get here.
+    return Status::kNotExists;
+  }
   VersionCacheShard& shard = ThreadShard();
   std::scoped_lock shard_lock(shard.mutex);
+  constexpr size_t kMaxVersionReadCache = 4096;
+  constexpr size_t kMaxRetiredViews = 4096;
+  if (!read_only_) {
+    // Read-write transactions never consult the cache (the lookup above is
+    // read_only_-gated for the read-your-writes guarantee), so a keyed map
+    // entry would be write-only overhead.  The retired pool is already the
+    // bounded keep-alive for handed-out views; park the served string there
+    // directly and bound it the same way.
+    shard.retired.push_back(std::move(*served));
+    if (shard.retired.size() > kMaxRetiredViews) {
+      shard.retired.erase(
+          shard.retired.begin(),
+          shard.retired.begin() +
+              static_cast<std::ptrdiff_t>(shard.retired.size() -
+                                          (kMaxRetiredViews / 2)));
+    }
+    return std::string_view(shard.retired.back());
+  }
   const uint64_t epoch = write_epoch_.load(std::memory_order_acquire);
   // Retire the previously cached string for this key (if any): a caller may
   // still hold a view into it from an earlier read of the same row.
@@ -524,16 +561,8 @@ StatusOr<std::string_view> Transaction::ReadVersion(
   if (existing != shard.entries.end()) {
     shard.retired.push_back(std::move(existing->second.value));
   }
-  std::optional<std::string> served = std::move(visible).MoveValue();
-  if (!served) {
-    // Unreachable: the nullopt branch above already returned a view of the
-    // physical image, so a disengaged optional cannot get here.
-    return Status::kNotExists;
-  }
   auto [iter, inserted] = shard.entries.insert_or_assign(
       rp, VersionCacheEntry{.epoch = epoch, .value = std::move(*served)});
-  constexpr size_t kMaxVersionReadCache = 4096;
-  constexpr size_t kMaxRetiredViews = 4096;
   if (shard.entries.size() > kMaxVersionReadCache) {
     // Evict a single entry (never the one just inserted): the retired pool
     // keeps the evicted string readable for callers that still hold a view

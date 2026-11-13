@@ -71,8 +71,10 @@ namespace tinylamb::platform {
 // Descriptor flags applied at creation time. Linux sets them atomically
 // (SOCK_NONBLOCK/SOCK_CLOEXEC, accept4, pipe2). macOS has no such flags and
 // applies them with fcntl right after creation; the close-on-exec race this
-// opens against a concurrent fork/exec is closed for our own children by
-// InitSpawnAttributes (POSIX_SPAWN_CLOEXEC_DEFAULT).
+// opens against a concurrent fork/exec is closed only for children spawned
+// with InitSpawnAttributes (POSIX_SPAWN_CLOEXEC_DEFAULT) -- RunProcess does
+// not pass spawn attributes, so on macOS a descriptor created non-CLOEXEC
+// can still leak into a RunProcess child during the fcntl window.
 struct FdFlags {
   bool nonblocking{false};
   bool close_on_exec{true};

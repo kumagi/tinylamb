@@ -169,10 +169,10 @@ TEST(ParameterSlotTest, ContainsParameterSlotWalksEveryNodeKind) {
       InExpressionExp(slot(), {ConstantValueExp(Value(int64_t{1}))})));
   EXPECT_TRUE(ContainsParameterSlot(
       FunctionCallExp("concat", {ColumnValueExp("a"), slot()})));
-  // NOTE: the walker does not descend into cast nodes (plan-cache INSERT
-  // artifacts never contain them today); pinned so a widening of the walker
-  // is a conscious change.
-  EXPECT_FALSE(
+  // The walkers descend into cast nodes: SlotizeLiterals still refuses to
+  // parameterize inside a CAST today, but a slot that reaches one (hand-built
+  // IR, a future slotizer) must be found and rebound, not silently kept.
+  EXPECT_TRUE(
       ContainsParameterSlot(CastExpressionExp(slot(), "INT64", false)));
   // Nested two levels deep.
   EXPECT_TRUE(ContainsParameterSlot(
@@ -210,6 +210,11 @@ TEST(ParameterSlotTest, CloneWithPreparedValuesRewritesSlotsInPlace) {
   Expression in_list =
       InExpressionExp(slot(), {slot(), ConstantValueExp(Value(int64_t{5}))});
   EXPECT_NO_THROW((void)CloneWithPreparedValues(in_list, values));
+
+  // A slot under a CAST is rebound too: CAST(42 AS INT64) evaluates to 42.
+  Expression cast = CastExpressionExp(slot(), "INT64", false);
+  EXPECT_EQ(CloneWithPreparedValues(cast, values)->Evaluate(row, schema),
+            Value(int64_t{42}));
 
   // Trees without slots are returned untouched.
   Expression plain = ConstantValueExp(Value(int64_t{3}));

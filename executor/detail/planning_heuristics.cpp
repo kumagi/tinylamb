@@ -32,6 +32,7 @@
 
 #include "common/constants.hpp"
 #include "common/parallel_work.hpp"
+#include "common/platform/endian.hpp"
 #include "common/platform/hash.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -569,10 +570,24 @@ std::vector<EqualityKey> EqualityKeys(
       const auto lhs_right = LocalColumnOffset(right, lhs);
       const auto rhs_left = LocalColumnOffset(left, rhs);
       const auto rhs_right = LocalColumnOffset(right, rhs);
+      // Hash-key encodings only preserve equality inside one (type,
+      // signedness) domain: a mismatched pair can never collide, so using
+      // it as a key only poisons key filters and suppresses the residual
+      // evaluation that would raise the type error (or apply numeric
+      // promotion) the AST evaluator produces.  Leave it in the residual.
+      const auto key_compatible = [&](size_t lcol, size_t rcol) {
+        const Column& lc = left.GetColumn(lcol);
+        const Column& rc = right.GetColumn(rcol);
+        return lc.Type() == rc.Type() && !lc.IsUnsigned() && !rc.IsUnsigned();
+      };
       if (lhs_left && rhs_right) {
-        keys.push_back({*lhs_left, *rhs_right, null_safe});
+        if (key_compatible(*lhs_left, *rhs_right)) {
+          keys.push_back({*lhs_left, *rhs_right, null_safe});
+        }
       } else if (rhs_left && lhs_right) {
-        keys.push_back({*rhs_left, *lhs_right, null_safe});
+        if (key_compatible(*rhs_left, *lhs_right)) {
+          keys.push_back({*rhs_left, *lhs_right, null_safe});
+        }
       }
       continue;
     }
@@ -1251,7 +1266,15 @@ size_t SpillPartitionOf(const std::string& key, size_t partitions) {
 }
 
 size_t SpillPartitionOf(int64_t key, size_t partitions) {
-  return static_cast<size_t>(std::hash<int64_t>{}(key) % partitions);
+  // Same platform-stability contract as the string overload: partition
+  // assignment decides the order spilled rows come back in, so it must not
+  // depend on the standard library's std::hash.  Encode big-endian so the
+  // byte string (and therefore the hash) is identical on every endianness.
+  const uint64_t be = htobe64(static_cast<uint64_t>(key));
+  return static_cast<size_t>(
+      platform::StableHashBytes(
+          std::string_view(reinterpret_cast<const char*>(&be), sizeof(be))) %
+      partitions);
 }
 
 // DeWitt-style Hybrid Hash Join: keep partition 0 resident; spill the rest.

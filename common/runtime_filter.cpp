@@ -311,7 +311,7 @@ size_t RuntimeFilterGroup::DistinctKeys() const {
 }
 
 size_t RuntimeFilterGroup::MemoryBytes() const {
-  size_t bytes = sizeof(*this);
+  size_t bytes = sizeof(*this) + dense_bits_.size() * sizeof(uint64_t);
   for (const std::unique_ptr<RuntimeFilter>& part : parts_) {
     bytes += part->MemoryBytes();
   }
@@ -428,11 +428,14 @@ std::shared_ptr<const RuntimeFilterGroup> RuntimeFilterBuilder::Build(
         return std::make_shared<const RuntimeFilterGroup>(
             std::move(parts), std::move(dense_bits), lo_, hi_);
       }
+      // The dense span overflowed into the MinMax+stub-Bloom fallback: the
+      // stub rejects nothing (all bits set) and owns only 64 bytes, so it
+      // reports its resident footprint -- not the nominal size a real Bloom
+      // for these keys would have taken.
       parts.push_back(
           std::make_unique<MinMaxRuntimeFilter>(lo_, hi_, distinct_count));
       parts.push_back(std::make_unique<BloomRuntimeFilter>(
-          std::vector<uint64_t>(8, ~uint64_t{0}), 512, distinct_count,
-          BloomRuntimeFilter::BitsForKeys(distinct_count)));
+          std::vector<uint64_t>(8, ~uint64_t{0}), 512, distinct_count));
       return std::make_shared<const RuntimeFilterGroup>(
           std::move(parts), std::move(dense_bits), lo_, hi_);
     }

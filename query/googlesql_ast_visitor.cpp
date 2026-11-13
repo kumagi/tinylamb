@@ -3290,7 +3290,7 @@ StatusOr<Expression> VisitAnalyticFunctionCall(const GoogleSqlAstNode& node) {
 // Normalizes a TIMESTAMP string to UTC ("...+00"), interpreting an explicit
 // offset / UTC marker when present and the session default time zone
 // otherwise.  Shared by TIMESTAMP literals and typed array elements.
-std::string NormalizeTimestampTextImpl(const std::string& text) {
+std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
   std::string norm_ts = text;
   if (text.size() < 10) {
     return norm_ts;
@@ -3349,12 +3349,6 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
   if (base_time.size() > 10 && (base_time[10] == 'T' || base_time[10] == 't')) {
     base_time[10] = ' ';
   }
-  bool is_leap_sec = false;
-  if (base_time.find(":59:60") != std::string::npos) {
-    is_leap_sec = true;
-    size_t pos = base_time.find(":59:60");
-    base_time.replace(pos, 6, ":59:00");
-  }
   int Y = 0, M = 0, D = 0, h = 0, m = 0;
   double s_val = 0;
   // NOLINTNEXTLINE(cert-err34-c) `matched` is checked below
@@ -3367,14 +3361,60 @@ std::string NormalizeTimestampTextImpl(const std::string& text) {
   if (matched < 3) {
     return norm_ts;
   }
-  if (is_leap_sec) {
-    m += 1;
-    s_val = 0.0;
+  // Validate the calendar date and clock fields: TimeGm below normalizes
+  // out-of-range fields like mktime, so 2026-02-29 used to roll silently to
+  // March 1 and second=60 (leap second) used to advance a minute. BigQuery
+  // rejects both.
+  if (Y < 1 || Y > 9999 || M < 1 || M > 12 || h < 0 || h > 23 || m < 0 ||
+      m > 59 || s_val < 0 || s_val >= 60) {
+    return std::nullopt;
+  }
+  {
+    const std::chrono::year_month_day ymd{
+        std::chrono::year{Y}, std::chrono::month{static_cast<unsigned>(M)},
+        std::chrono::day{static_cast<unsigned>(D)}};
+    if (!ymd.ok()) {
+      return std::nullopt;
+    }
+  }
+  // TIMESTAMP literals accept only a numeric offset or the UTC/GMT/Z markers
+  // as the zone (BigQuery rejects named zones here). A trailing alphabetic
+  // name such as "JST" used to fall through sscanf and silently become UTC.
+  size_t zone_alpha = std::string::npos;
+  for (size_t i = 11; i < base_time.size(); ++i) {
+    if (std::isalpha(static_cast<unsigned char>(base_time[i])) != 0) {
+      zone_alpha = i;
+      break;
+    }
+  }
+  if (zone_alpha != std::string::npos) {
+    std::string tail_raw = base_time.substr(zone_alpha);
+    const size_t lead = tail_raw.find_first_not_of(" \t");
+    tail_raw =
+        lead == std::string::npos ? std::string() : tail_raw.substr(lead);
+    std::string tail = tail_raw;
+    for (char& ch : tail) {
+      ch = static_cast<char>(
+          std::toupper(static_cast<unsigned char>(ch)));
+    }
+    // A named zone is accepted only when it names a real zone in the tz
+    // database (Europe/London, America/New_York, ...); the UTC/GMT markers
+    // and their numeric forms stay allowed. An unknown abbreviation such as
+    // "JST" is rejected instead of silently becoming UTC.
+    const bool allowed =
+        tail == "Z" || tail == "UT" || tail == "UTC" || tail == "GMT" ||
+        tail.rfind("UTC+", 0) == 0 || tail.rfind("UTC-", 0) == 0 ||
+        tail.rfind("GMT+", 0) == 0 || tail.rfind("GMT-", 0) == 0 ||
+        tail == "ETC/GREENWICH" || tail == "ETC/UTC" || tail == "ETC/GMT" ||
+        platform::IsKnownTimeZone(tail_raw);
+    if (!allowed) {
+      return std::nullopt;
+    }
   }
   if (!has_explicit_tz) {
     total_offset_mins =
         ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
-                            static_cast<int>(s_val), -8 * 3600) /
+                            static_cast<int>(s_val)) /
         60;
   }
   struct tm t = {};
@@ -3421,16 +3461,19 @@ bool SplitJsonObjectFields(
   bool in_string = false;
   char quote = '\0';
   std::string current;
+  // Position in `current` of the key/value separator colon: the first ':'
+  // seen outside a string at depth 0.  A naive find(':') would cut inside a
+  // quoted key such as "a:b".
+  size_t sep_pos = std::string::npos;
   auto flush = [&]() {
-    const size_t colon = current.find(':');
-    if (colon == std::string::npos) {
+    if (sep_pos == std::string::npos) {
       return;
     }
-    std::string key = current.substr(0, colon);
+    std::string key = current.substr(0, sep_pos);
     if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
       key = key.substr(1, key.size() - 2);
     }
-    fields->emplace_back(std::move(key), current.substr(colon + 1));
+    fields->emplace_back(std::move(key), current.substr(sep_pos + 1));
   };
   for (size_t i = 0; i < body.size(); ++i) {
     const char c = body[i];
@@ -3457,9 +3500,13 @@ bool SplitJsonObjectFields(
     if (c == '}' || c == ']') {
       --depth;
     }
+    if (c == ':' && depth == 0 && sep_pos == std::string::npos) {
+      sep_pos = current.size();
+    }
     if (c == ',' && depth == 0) {
       flush();
       current.clear();
+      sep_pos = std::string::npos;
       continue;
     }
     current.push_back(c);
@@ -3749,7 +3796,13 @@ StatusOr<Expression> VisitExpression(
       return ConstantValueExp(Value(std::string(text)));
     }
     // TYPE_TIMESTAMP
-    return ConstantValueExp(Value(NormalizeTimestampTextImpl(text)));
+    std::optional<std::string> normalized_timestamp =
+        NormalizeTimestampTextImpl(text);
+    if (!normalized_timestamp.has_value()) {
+      return AstError<Expression>(
+          "GoogleSQL AST: invalid TIMESTAMP literal " + text);
+    }
+    return ConstantValueExp(Value(std::move(*normalized_timestamp)));
   }
 
   if (node.kind == "NullLiteral") {
@@ -3812,8 +3865,14 @@ StatusOr<Expression> VisitExpression(
       if (UpperCopy(element_type) == "TIMESTAMP" &&
           child->kind == "StringLiteral") {
         ASSIGN_OR_RETURN(std::string, hv110933_0, (DecodeString(*child)));
+        std::optional<std::string> normalized_element =
+            NormalizeTimestampTextImpl(hv110933_0);
+        if (!normalized_element.has_value()) {
+          return AstError<Expression>(
+              "GoogleSQL AST: invalid TIMESTAMP array element");
+        }
         elements.push_back(
-            ConstantValueExp(Value(NormalizeTimestampTextImpl(hv110933_0))));
+            ConstantValueExp(Value(std::move(*normalized_element))));
         continue;
       }
       ASSIGN_OR_RETURN(Expression, hv111075_0, (VisitExpression(*child)));
@@ -8100,7 +8159,7 @@ StatusOr<std::string> DecodeStringEscapes(std::string_view value, bool is_bytes,
   return DecodeStringEscapesImpl(value, is_bytes, is_triple, quote);
 }
 
-std::string NormalizeTimestampText(const std::string& text) {
+std::optional<std::string> NormalizeTimestampText(const std::string& text) {
   return NormalizeTimestampTextImpl(text);
 }
 
@@ -8370,8 +8429,10 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
           "GoogleSQL AST: bad DROP MATERIALIZED VIEW");
     }
     ASSIGN_OR_RETURN(std::string, hv243003_0, (Path(*path)));
+    const bool drop_mv_if_exists =
+        root.detail.find("is_if_exists") != std::string::npos;
     return std::make_unique<DropMaterializedViewStatement>(
-        std::move(hv243003_0));
+        std::move(hv243003_0), drop_mv_if_exists);
   }
   if (root.kind == "InsertStatement") {
     return VisitInsert(root);
@@ -8410,7 +8471,10 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
           "GoogleSQL AST: bad DROP VIEW");
     }
     ASSIGN_OR_RETURN(std::string, hv245001_0, (Path(*path)));
-    return std::make_unique<DropViewStatement>(std::move(hv245001_0));
+    const bool drop_view_if_exists =
+        root.detail.find("is_if_exists") != std::string::npos;
+    return std::make_unique<DropViewStatement>(std::move(hv245001_0),
+                                               drop_view_if_exists);
   }
   if (root.kind == "DropStatement" || root.kind == "DropStatement TABLE") {
     const GoogleSqlAstNode* path = root.Child("PathExpression");
@@ -8418,7 +8482,10 @@ StatusOr<std::unique_ptr<Statement>> GoogleSqlAstVisitor::Visit(
       return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad DROP");
     }
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
-    return std::make_unique<DropTableStatement>(std::move(h_tbl));
+    const bool drop_table_if_exists =
+        root.detail.find("is_if_exists") != std::string::npos;
+    return std::make_unique<DropTableStatement>(std::move(h_tbl),
+                                                drop_table_if_exists);
   }
   if (root.kind.starts_with("DropStatement")) {
     return AstError<std::unique_ptr<Statement>>(

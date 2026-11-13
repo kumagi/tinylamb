@@ -186,13 +186,41 @@ TEST_F(ArrayCompareTest, LexicographicElementwiseComparison) {
 }
 
 TEST_F(ArrayCompareTest, NullElementPropagationMatchesNullSemantics) {
-  // NULL participates as the smallest ordering element for < (NULL < 1 is
-  // NULL in SQL, but inside an array the lexicographic scan reports the
-  // comparison result of the element pair itself).
+  // Ordered array comparison is element-wise lexicographic through
+  // Value::TryLess: two NULL elements at the same position compare equal
+  // (NULL == NULL) and the scan moves on, so a NULL prefix does not decide
+  // the result by itself.
   EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
-                            "SELECT ARRAY[1, 2] < ARRAY[2, 2]")
+                            "SELECT ARRAY[NULL] < ARRAY[NULL]")
+                .front(),
+            "0");
+  EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
+                            "SELECT ARRAY[NULL, 2] < ARRAY[NULL, 3]")
                 .front(),
             "1");
+  // A shared prefix that includes NULLs still lets the longer array win.
+  EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
+                            "SELECT ARRAY[1, NULL] < ARRAY[1, NULL, 0]")
+                .front(),
+            "1");
+  // A NULL element compared against a non-NULL element is incomparable:
+  // TryLess reports a type mismatch.  The error may surface at Prepare
+  // (constant folding) or during execution; both routes must agree it is
+  // not a successful result.
+  for (const bool relational : {false, true}) {
+    engine_->SetForceRelationalFallback(relational);
+    StatusOr<Executor> prepared =
+        engine_->Prepare(*context_, "SELECT ARRAY[NULL] < ARRAY[1]");
+    bool ok = prepared.HasValue();
+    if (ok) {
+      Row row;
+      while (prepared.Value()->Next(&row, nullptr)) {
+      }
+      ok = prepared.Value()->GetStatus() == Status::kSuccess;
+    }
+    EXPECT_FALSE(ok);
+  }
+  engine_->SetForceRelationalFallback(false);
 }
 
 }  // namespace tinylamb

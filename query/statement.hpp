@@ -387,40 +387,57 @@ class CreateViewStatement : public Statement {
 
 class DropViewStatement : public Statement {
  public:
-  explicit DropViewStatement(std::string view_name)
-      : Statement(StatementType::kDropView), view_name_(std::move(view_name)) {}
+  explicit DropViewStatement(std::string view_name, bool if_exists = false)
+      : Statement(StatementType::kDropView),
+        view_name_(std::move(view_name)),
+        if_exists_(if_exists) {}
 
   [[nodiscard]] const std::string& ViewName() const { return view_name_; }
-  void Dump(std::ostream& o) const override { o << "view=" << view_name_; }
+  [[nodiscard]] bool IfExists() const { return if_exists_; }
+  void Dump(std::ostream& o) const override {
+    o << "view=" << view_name_ << (if_exists_ ? " if_exists" : "");
+  }
 
  private:
   std::string view_name_;
+  bool if_exists_;
 };
 
 class DropMaterializedViewStatement : public Statement {
  public:
-  explicit DropMaterializedViewStatement(std::string view_name)
+  explicit DropMaterializedViewStatement(std::string view_name,
+                                         bool if_exists = false)
       : Statement(StatementType::kDropMaterializedView),
-        view_name_(std::move(view_name)) {}
+        view_name_(std::move(view_name)),
+        if_exists_(if_exists) {}
 
   [[nodiscard]] const std::string& ViewName() const { return view_name_; }
-  void Dump(std::ostream& o) const override { o << "view=" << view_name_; }
+  [[nodiscard]] bool IfExists() const { return if_exists_; }
+  void Dump(std::ostream& o) const override {
+    o << "view=" << view_name_ << (if_exists_ ? " if_exists" : "");
+  }
 
  private:
   std::string view_name_;
+  bool if_exists_;
 };
 
 class DropTableStatement : public Statement {
  public:
-  explicit DropTableStatement(std::string table_name)
+  explicit DropTableStatement(std::string table_name, bool if_exists = false)
       : Statement(StatementType::kDropTable),
-        table_name_(std::move(table_name)) {}
+        table_name_(std::move(table_name)),
+        if_exists_(if_exists) {}
 
   [[nodiscard]] const std::string& TableName() const { return table_name_; }
-  void Dump(std::ostream& o) const override { o << "table=" << table_name_; }
+  [[nodiscard]] bool IfExists() const { return if_exists_; }
+  void Dump(std::ostream& o) const override {
+    o << "table=" << table_name_ << (if_exists_ ? " if_exists" : "");
+  }
 
  private:
   std::string table_name_;
+  bool if_exists_;
 };
 
 class SelectStatement : public Statement {

@@ -38,6 +38,7 @@
 
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
+#include "common/exception_status.hpp"
 #include "common/join_kind.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/executor_base.hpp"
@@ -1593,7 +1594,7 @@ Status HashJoin::IntakeBothSides() {
   return Status::kSuccess;
 }
 
-void HashJoin::BuildShards() {
+Status HashJoin::BuildShards() {
   JoinState& s = *state_;
   const std::vector<PositionedRow>& rows = *s.build_rows;
   CHECK_MSG(s.build_cols != nullptr, "hash join build side is not configured");
@@ -1674,9 +1675,9 @@ void HashJoin::BuildShards() {
 
   if (!parallel_build || shard_count == 1) {
     fill_range(0, ordered.size());
-    return;
+    return Status::kSuccess;
   }
-  std::exception_ptr error;
+  Status error{Status::kSuccess};
   std::mutex error_mutex;
   std::vector<std::jthread> threads;
   threads.reserve(shard_count);
@@ -1689,23 +1690,21 @@ void HashJoin::BuildShards() {
           fill_range(begin, end);
         } catch (...) {
           std::scoped_lock lock(error_mutex);
-          if (!error) {
-            error = std::current_exception();
+          if (error == Status::kSuccess) {
+            error = StatusFromCurrentException("hash join worker failed");
           }
         }
       });
     } catch (...) {
       std::scoped_lock lock(error_mutex);
-      if (!error) {
-        error = std::current_exception();
+      if (error == Status::kSuccess) {
+        error = StatusFromCurrentException("hash join worker failed");
       }
       break;
     }
   }
   threads.clear();
-  if (error) {
-    std::rethrow_exception(error);
-  }
+  return error;
 }
 
 uint32_t HashJoin::ShardOf(uint64_t hash) const {
@@ -1746,7 +1745,7 @@ bool HashJoin::FetchNextProbe() {
   return true;
 }
 
-void HashJoin::SetupInMemoryJoin() {
+Status HashJoin::SetupInMemoryJoin() {
   JoinState& s = *state_;
   // The dynamic filter path already chose the orientation (it had to, to know
   // which side to publish from); keep it instead of re-deciding from byte
@@ -1794,7 +1793,7 @@ void HashJoin::SetupInMemoryJoin() {
       s.linear_keys.push_back(std::move(key));
     }
   } else {
-    BuildShards();
+    RETURN_IF_FAIL(BuildShards());
   }
   actual_build_rows_ = s.build_rows == nullptr ? 0 : s.build_rows->size();
   actual_probe_rows_ = s.probe_rows == nullptr ? 0 : s.probe_rows->size();
@@ -1802,29 +1801,31 @@ void HashJoin::SetupInMemoryJoin() {
   s.right.charge.ReleaseAll();
   if (!s.defer_build && worker_count_ > 1 &&
       s.probe_rows->size() >= kParallelProbeMinRows) {
-    RunStripedProbe();
+    RETURN_IF_FAIL(RunStripedProbe());
   }
+  return Status::kSuccess;
 }
 
-void HashJoin::SetupOneSideSpilled() {
+Status HashJoin::SetupOneSideSpilled() {
   JoinState& s = *state_;
   s.left_builds = !s.left.Spilled();
   build_left_side_ = s.left_builds;
   if (s.left_builds) {
     s.build_rows = &s.left.rows;
     s.build_cols = &left_cols_;
-    BuildShards();
+    RETURN_IF_FAIL(BuildShards());
     s.probe_spills = &s.right.spills;
     s.probe_cols = &right_cols_;
   } else {
     s.build_rows = &s.right.rows;
     s.build_cols = &right_cols_;
-    BuildShards();
+    RETURN_IF_FAIL(BuildShards());
     s.probe_spills = &s.left.spills;
     s.probe_cols = &left_cols_;
   }
   s.left.charge.ReleaseAll();
   s.right.charge.ReleaseAll();
+  return Status::kSuccess;
 }
 
 template <typename RightCont>
@@ -1952,13 +1953,13 @@ Status HashJoin::SetupBothSpilled() {
   return Status::kSuccess;
 }
 
-void HashJoin::RunStripedProbe() {
+Status HashJoin::RunStripedProbe() {
   JoinState& s = *state_;
   const size_t n = s.probe_rows->size();
   const size_t workers = std::min(worker_count_, n);
   const size_t chunk = (n + workers - 1) / workers;
   std::vector<std::vector<PositionedRow>> outs(workers);
-  std::exception_ptr error;
+  Status error{Status::kSuccess};
   std::mutex error_mutex;
   std::vector<std::jthread> threads;
   threads.reserve(workers);
@@ -1995,23 +1996,21 @@ void HashJoin::RunStripedProbe() {
           }
         } catch (...) {
           std::scoped_lock lock(error_mutex);
-          if (!error) {
-            error = std::current_exception();
+          if (error == Status::kSuccess) {
+            error = StatusFromCurrentException("hash join worker failed");
           }
         }
       });
     } catch (...) {
       std::scoped_lock lock(error_mutex);
-      if (!error) {
-        error = std::current_exception();
+      if (error == Status::kSuccess) {
+        error = StatusFromCurrentException("hash join worker failed");
       }
       break;
     }
   }
   threads.clear();
-  if (error) {
-    std::rethrow_exception(error);
-  }
+  RETURN_IF_FAIL(error);
   size_t output_bytes = 0;
   for (const auto& stripe : outs) {
     for (const auto& item : stripe) {
@@ -2024,6 +2023,7 @@ void HashJoin::RunStripedProbe() {
   }
   output_charge_.Add(output_bytes);
   s.stripe_outputs = std::move(outs);
+  return Status::kSuccess;
 }
 
 Status HashJoin::MaterializeInMemory() {
@@ -2043,9 +2043,9 @@ Status HashJoin::MaterializeInMemoryTail() {
   if (left_spilled && right_spilled) {
     RETURN_IF_FAIL(SetupBothSpilled());
   } else if (left_spilled || right_spilled) {
-    SetupOneSideSpilled();
+    RETURN_IF_FAIL(SetupOneSideSpilled());
   } else {
-    SetupInMemoryJoin();
+    RETURN_IF_FAIL(SetupInMemoryJoin());
   }
 
   return Status::kSuccess;
@@ -2263,7 +2263,11 @@ bool HashJoin::EmitNextMatch(Row* dst, RowPosition* rp) {
       if (++s.nl_seen > kNestedLoopProbeLimit) {
         // Adaptive switch: the outer cardinality surprise makes linear
         // probing too expensive; build the hash index and continue indexed.
-        BuildShards();
+        const Status build_status = BuildShards();
+        if (build_status != Status::kSuccess) {
+          FailWith(build_status);
+          return false;
+        }
         s.defer_build = false;
         adaptive_switched_ = true;
       } else {

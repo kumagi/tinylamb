@@ -99,14 +99,15 @@ TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
       EXPECT_EQ(MatchSimpleCompare(row, *compiled), expected.Value().Truthy());
     }
   }
+  // An invalid date literal must not be folded into the fast path: the value
+  // matchers would treat the failed parse as "no match" and silently reject
+  // every row, whereas the checked evaluator reports the error.
   const auto invalid = TryCompileSimpleCompare(
       BinaryExpressionExp(ColumnValueExp("d"), BinaryOperation::kEquals,
                           ConstantValueExp(Value("invalid date"))),
       schema);
-  if (!invalid) {
-    FAIL() << "invalid literal comparison did not compile";
-  }
-  EXPECT_FALSE(invalid->date_string_payload);
+  EXPECT_FALSE(invalid.has_value())
+      << "an invalid date literal took the scan fast path";
 }
 
 TEST(ScanFilterTest, AuditDateNumericComparisonUsesCheckedEvaluator) {
@@ -141,8 +142,13 @@ TEST(ScanFilterTest, FastLikeMatchAsciiAndWildcards) {
   EXPECT_FALSE(FastLikeMatch("almond_green", "%green%almond%"));
   EXPECT_TRUE(FastLikeMatch("a1c", "a_c"));
   EXPECT_FALSE(FastLikeMatch("ab1c", "a_c"));
-  // Multi-byte UTF-8 is 2 bytes, so byte-wise '_' rejects a 2-byte char.
-  EXPECT_FALSE(FastLikeMatch("a\xC3\xA9z", "a_z"));
+  // '_' matches one whole UTF-8 character: 'é' is one character.
+  EXPECT_TRUE(FastLikeMatch("a\xC3\xA9z", "a_z"));
+  EXPECT_FALSE(FastLikeMatch("a\xC3\xA9\xC3\xA9z", "a_z"));
+  EXPECT_TRUE(FastLikeMatch("a\xC3\xA9z", "a%z"));
+  EXPECT_TRUE(FastLikeMatch("a\xC3\xA9z", "%_z"));
+  // A truncated trailing multi-byte sequence still counts as one character.
+  EXPECT_TRUE(FastLikeMatch("a\xC3", "a_"));
 }
 
 TEST(ScanFilterTest, TryDecideConstantConjunctFoldsCompileTimeConstants) {

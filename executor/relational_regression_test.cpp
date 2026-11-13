@@ -381,6 +381,63 @@ TEST_F(RelationalRegressionTest, AuditParallelFilterPreservesDeferredRowOrder) {
   }
 }
 
+TEST_F(RelationalRegressionTest, AuditArenaFilterPreservesRowOrder) {
+  auto context = rs_->BeginContext();
+  std::atomic<size_t> active{0};
+  ScopedQueryParallelismBudget budget(&active, 2);
+  struct RestoreBudget {
+    RestoreBudget() = default;
+    RestoreBudget(const RestoreBudget&) = delete;
+    RestoreBudget& operator=(const RestoreBudget&) = delete;
+    RestoreBudget(RestoreBudget&&) = delete;
+    RestoreBudget& operator=(RestoreBudget&&) = delete;
+    size_t limit = QueryMemoryBudget::Global().Limit();
+    ~RestoreBudget() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore;
+  for (bool spill_rows : {false, true}) {
+    QueryMemoryBudget::Global().ResetForTest(spill_rows ? 65536
+                                                        : restore.limit);
+    relational_detail::BaseRelationArena arena;
+    arena.stride = 2;
+    arena.slot_types = {ValueType::kInt64, ValueType::kInt64};
+    arena.null_bits.resize(2);
+    constexpr size_t kRows = 40000;
+    std::vector<int64_t> cells(kRows * 2);
+    std::vector<uint8_t> nulls(kRows * 2, 0);
+    for (size_t i = 0; i < kRows; ++i) {
+      cells[i * 2] = static_cast<int64_t>(i);
+      cells[i * 2 + 1] = (i % 7 == 3) ? 0 : 1;
+    }
+    arena.AppendRun(cells.data(), nulls.data(), kRows);
+    const Schema schema(
+        "f", {Column("k", ValueType::kInt64), Column("d", ValueType::kInt64)});
+    relational_detail::CompiledScanFilter filter;
+    filter.disjunctive_branches.resize(2);
+    filter.disjunctive_branches[0].residual.push_back(BinaryExpressionExp(
+        ConstantValueExp(Value(1)), BinaryOperation::kDivide,
+        ColumnValueExp(ColumnName("d"))));
+    // Same deferred-row shape as AuditParallelFilterPreservesDeferredRowOrder:
+    // `1/d` errors on d == 0 rows, which the empty second OR branch masks;
+    // workers defer those rows and the merge must reinsert them in place.
+    relational_detail::Relation result;
+    result.schema = schema;
+    Status error{Status::kSuccess};
+    ASSERT_TRUE(relational_detail::TryFilterArenaCache(
+        context, arena, schema, &filter, &schema, nullptr, {}, nullptr, &result,
+        &error));
+    ASSERT_SUCCESS(error);
+    ASSERT_SUCCESS(result.FinishSpill());
+    if (spill_rows) {
+      EXPECT_TRUE(result.HasSpill());
+    }
+    size_t count = 0;
+    ASSERT_SUCCESS(result.ForEachRow([&](const Row& row) {
+      EXPECT_EQ(row[0].value.int_value, static_cast<int64_t>(count++));
+    }));
+    EXPECT_EQ(count, kRows);
+  }
+}
+
 TEST_F(RelationalRegressionTest,
        AuditRelationalDumpDoesNotInventAdaptiveSwitch) {
   auto context = rs_->BeginContext();
@@ -11370,6 +11427,71 @@ TEST_F(RelationalRegressionTest, CompactPartitionPreservesFloatOrderAndHaving) {
     }
     context.set_execution_runtime(nullptr);
   }
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, JoinTypeMismatchedEqualityStaysResidual) {
+  // A column equality whose sides live in different type domains can never
+  // collide inside the hash-key encoding, so EqualityKeys must leave it in
+  // the residual: evaluated per candidate pair it raises the same error the
+  // AST evaluator produces, and as the sole join term the nested-loop path
+  // evaluates it for every pair (bugreview low #120).
+  RelationalRun(*rs_, "CREATE TABLE ResidualTypeA (k INT64, i INT64)");
+  RelationalRun(*rs_, "CREATE TABLE ResidualTypeB (k INT64, s VARCHAR)");
+  RelationalRun(*rs_, "INSERT INTO ResidualTypeA VALUES (1, 10)");
+  RelationalRun(*rs_, "INSERT INTO ResidualTypeB VALUES (1, 'x')");
+  TransactionContext context = rs_->BeginContext();
+  SqlEngine engine(*rs_);
+  engine.SetForceRelationalFallback(true);
+
+  // Sole mismatched equality: no usable equi key remains, so the join falls
+  // back to nested-loop evaluation and surfaces the type error.
+  auto sole = engine.Prepare(
+      context,
+      "SELECT a.k FROM ResidualTypeA a JOIN ResidualTypeB b ON a.i = b.s");
+  ASSERT_TRUE(sole.HasValue()) << engine.LastError();
+  Row row;
+  while (sole.Value()->Next(&row, nullptr)) {
+  }
+  EXPECT_NE(sole.Value()->GetStatus(), Status::kSuccess);
+
+  // Valid equi key plus the mismatched residual: the key collides, the
+  // candidate pair forms, and the residual raises the same error.
+  auto keyed =
+      engine.Prepare(context,
+                     "SELECT a.k FROM ResidualTypeA a JOIN ResidualTypeB b "
+                     "ON a.k = b.k AND a.i = b.s");
+  ASSERT_TRUE(keyed.HasValue()) << engine.LastError();
+  while (keyed.Value()->Next(&row, nullptr)) {
+  }
+  EXPECT_NE(keyed.Value()->GetStatus(), Status::kSuccess);
+  context.Abort();
+}
+
+TEST_F(RelationalRegressionTest, JoinNumericPromotionEqualityMatches) {
+  // INT64 = DOUBLE is equality-compatible through numeric promotion even
+  // though the hash-key encoding keeps the two type domains apart; leaving
+  // the predicate as a residual preserves the matches a type-blind key
+  // extraction would silently drop (bugreview low #120).
+  RelationalRun(*rs_, "CREATE TABLE ResidualNumA (i INT64)");
+  RelationalRun(*rs_, "CREATE TABLE ResidualNumB (d DOUBLE)");
+  RelationalRun(*rs_, "INSERT INTO ResidualNumA VALUES (10)");
+  RelationalRun(*rs_, "INSERT INTO ResidualNumB VALUES (10.0)");
+  TransactionContext context = rs_->BeginContext();
+  SqlEngine engine(*rs_);
+  engine.SetForceRelationalFallback(true);
+  auto prepared = engine.Prepare(
+      context,
+      "SELECT a.i FROM ResidualNumA a JOIN ResidualNumB b ON a.i = b.d");
+  ASSERT_TRUE(prepared.HasValue()) << engine.LastError();
+  std::vector<Row> rows;
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(row);
+  }
+  ASSERT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+  ASSERT_EQ(rows.size(), 1);
+  EXPECT_EQ(rows[0].values_[0].value.int_value, 10);
   context.Abort();
 }
 

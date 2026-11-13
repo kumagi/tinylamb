@@ -165,3 +165,15 @@
 ## 13. `AnalyzeScan`：統計収集走査
 
 `AnalyzeScan` は現行コードに存在しない。統計収集は `database/database.cpp` の ANALYZE 経路を参照する。
+
+## 14. `MultiIndexCoveringScan`：複数索引被覆走査
+
+`MultiIndexCoveringScan`（`executor/multi_index_covering_scan.*`）は、二つ以上の索引範囲を**物理行位置**で交差させ、索引イメージだけから出力行を組み立てる。各参加索引のエントリが版チェーンを持たない場合に限り、キーと INCLUDE 列の像で行を再構成し、単一索引では届かない被覆列の組み合わせを読む。
+
+最も狭い範囲の参加者のエントリを実体化し、残りの範囲に含まれない行位置は捨てる。交差結果は「すべての参加条件が認める行」の上位集合であり、生き残った行は被覆列に対する述語で再検査される。呼び出し側は全参加索引の読み取りガードを保持し、狭い順に渡す契約である（`plan/implementation_rules.cpp` の登録規則と `relational_factory.cpp` の `EmitExecutor` が配線する）。
+
+## 15. `TableSampleExecutor`：表サンプル
+
+`TableSampleExecutor`（`executor/table_sample.*`、`plan/sample_plan.hpp` 経由で配線）は、子演算子を包んで `TABLESAMPLE` の行を返す。方式は `BERNOULLI`（行ごとの確率判定）、`RESERVOIR`（優先度付きリザーバで指定行数を均等抽出）、`SYSTEM`（ブロック/パーティション単位の抽出）の三種で、単位は `PERCENT` または `ROWS` を取る。`WITH WEIGHT` 指定時は末尾に `DOUBLE` の重み列を追加する。
+
+`RESERVOIR` は行を `(priority, ordinal, partition)` で管理し、パーティションハッシュは `CanonicalDistinctValue` 正規化済みの行値に対する FNV-1a で計算する。サンプルは非決定的であり、同一問い合わせの再実行で行集合は変わり得る。

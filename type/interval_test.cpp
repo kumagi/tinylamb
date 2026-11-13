@@ -280,9 +280,11 @@ TEST(IntervalTest, ParseUnitRanges) {
             Iv(0, 1, 7384LL * 1000000000LL));
   EXPECT_EQ(IntervalValue::TryParse("1 2", "hour to minute").MoveValue(),
             Iv(0, 0, 3720LL * 1000000000LL));
-  // Wrong part counts fall back to the generic composite accumulation.
-  EXPECT_EQ(IntervalValue::TryParse("1 2 3", "year to month").MoveValue(),
-            Iv(12, 2, 0));
+  // A part count outside the unit range is a parse error: the extra field
+  // must not be dropped silently and reinterpreted (audit: "unexpected
+  // component").
+  EXPECT_FALSE(
+      IntervalValue::TryParse("1 2 3", "year to month").HasValue());
   // The range spelling with a mismatched part count defers to the generic
   // accumulation, which stores raw fields without a final re-check.
   EXPECT_EQ(

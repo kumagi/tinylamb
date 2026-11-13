@@ -3,6 +3,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -11,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/constants.hpp"
+#include "common/status_or.hpp"
 #include "expression/evaluation_context.hpp"
 #include "expression/expression.hpp"
 #include "type/column_name.hpp"
@@ -50,6 +53,37 @@ StatusOr<Value> TryCoerceArrayElement(Value value, std::string_view sql_type) {
   }
   if (type.starts_with("ARRAY<") && value.IsArray()) {
     return value;
+  }
+  // The inferred/declared element type must actually hold: silently keeping
+  // a mismatched storage type would diverge the array's element_sql_type tag
+  // from its contents (GoogleSQL rejects these mixes).  Only the
+  // unambiguous scalar tags are enforced; parameterized spellings
+  // (STRING(10), NUMERIC(10,2), ...) stay unchecked.
+  const std::string bare = type.substr(0, type.find('('));
+  std::optional<ValueType> expected;
+  if (bare == "INT64" || bare == "INT" || bare == "INTEGER" ||
+      bare == "SMALLINT" || bare == "BIGINT" || bare == "BOOL" ||
+      bare == "BOOLEAN" || bare == "UINT64" || bare == "UINT32" ||
+      bare == "UINT16" || bare == "UINT8") {
+    expected = ValueType::kInt64;
+  } else if (bare == "FLOAT64" || bare == "FLOAT" || bare == "FLOAT32" ||
+             bare == "DOUBLE" || bare == "REAL" || bare == "NUMERIC" ||
+             bare == "BIGNUMERIC") {
+    expected = ValueType::kDouble;
+  } else if (bare == "STRING" || bare == "VARCHAR" || bare == "TEXT" ||
+             bare == "CHAR" || bare == "JSON" || bare == "BYTES" ||
+             bare == "TIMESTAMP" || bare == "TIME" || bare == "DATETIME" ||
+             bare == "INTERVAL" || bare == "PROTO" || bare == "STRUCT") {
+    expected = ValueType::kVarChar;
+  } else if (bare == "DATE") {
+    expected = ValueType::kDate;
+  } else if (bare.starts_with("ARRAY<")) {
+    expected = ValueType::kArray;
+  }
+  if (expected.has_value() && value.type != *expected) {
+    return StatusError(
+        StatusCode::kInvalidArgument,
+        "array element type does not match the declared element type");
   }
   return value;
 }

@@ -25,7 +25,7 @@ bool WorkTableRowEqual::operator()(const Row& left, const Row& right) const {
 }
 
 size_t WorkTableRowHash::operator()(const Row& row) const {
-  uint64_t hash = 1469598103934665603ULL;  // FNV-1a offset basis
+  uint64_t hash = 14695981039346656037ULL;  // FNV-1a offset basis
   for (const Value& value : row.values_) {
     hash ^= std::hash<Value>()(CanonicalDistinctValue(value));
     hash *= 1099511628211ULL;  // FNV-1a prime

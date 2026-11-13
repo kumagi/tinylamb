@@ -463,14 +463,23 @@ class Transaction final {
   [[nodiscard]] bool IndexKeysMayBeStale(page_id_t index_root) const;
   [[nodiscard]] TransactionManager::IndexReadGuard AcquireIndexReadGuard(
       page_id_t index_root) const {
+    if (transaction_manager_ == nullptr) {
+      return TransactionManager::IndexReadGuard();
+    }
     return transaction_manager_->AcquireIndexReadGuard(index_root);
   }
   [[nodiscard]] std::unique_lock<std::shared_mutex> AcquireIndexWriteGuard(
       page_id_t index_root) const {
+    if (transaction_manager_ == nullptr) {
+      return {};
+    }
     return transaction_manager_->AcquireIndexWriteGuard(index_root);
   }
   [[nodiscard]] std::vector<std::unique_lock<std::shared_mutex>>
   AcquireIndexWriteGuards(const std::vector<page_id_t>& index_roots) const {
+    if (transaction_manager_ == nullptr) {
+      return {};
+    }
     return transaction_manager_->AcquireIndexWriteGuards(index_roots);
   }
   [[nodiscard]] bool HasPageVersionChains(page_id_t page_id) const {
@@ -708,15 +717,16 @@ class Transaction final {
 
   // Prepared mainly for testing.
   // Using this function is discouraged to get performance of flush pipelining.
-  // Note this waits only until the transaction's records are WRITTEN to the
-  // WAL (CommittedLSN), not fsynced — it is a visibility barrier, not a
-  // durability barrier; use Logger::WaitForDurable for the latter.
-  // Wait for the complete latest record and observed commit dependencies.
+  // Note this waits for WAL DURABILITY (fsync), not merely the committed-LSN
+  // visibility point: it blocks until the transaction's latest record and
+  // its observed commit dependencies are durable.
   // Returns WAL failure instead of polling forever when the writer stops.
   [[nodiscard]] Status CommitWait() const;
 
   PageManager* GetPageManager() {
-    return transaction_manager_->GetPageManager();
+    return transaction_manager_ == nullptr
+               ? nullptr
+               : transaction_manager_->GetPageManager();
   }
 
   // Drops MVCC version chains left by a previous incarnation of |pid|.

@@ -114,17 +114,13 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  try {
-    if (context.PreCommit() != tinylamb::Status::kSuccess) {
-      // Keep the cleanup symmetric with the Prepare failure path above.
-      std::cerr << "transaction commit failed\n";
-      context.Abort();
-      return 1;
-    }
-  } catch (const std::exception& error) {
-    // TransactionManager::PreCommit already released the locks and marked the
-    // transaction aborted before rethrowing, so no extra Abort() here.
-    std::cerr << "error during commit: " << error.what() << '\n';
+  // TransactionManager::PreCommit reports failures as a Status (it catches
+  // internally and never rethrows), so a non-success status is the only
+  // commit-failure channel here.
+  if (context.PreCommit() != tinylamb::Status::kSuccess) {
+    // Keep the cleanup symmetric with the Prepare failure path above.
+    std::cerr << "transaction commit failed\n";
+    context.Abort();
     return 1;
   }
   // Durability barrier passed; the buffered rows may now reach the user.

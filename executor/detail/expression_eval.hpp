@@ -87,9 +87,11 @@ using DistinctValueSet =
 // where raw IEEE bit patterns would otherwise count NaNs as distinct.
 [[nodiscard]] Value CanonicalDistinctValue(const Value& value);
 
-// SQL equality for group keys: NaN equals NaN and -0 equals +0, unlike raw
-// IEEE Value::operator== which never folds NaNs together. NULL equals NULL (a
-// NULL group key is one group), and two keys of different arity never match.
+// SQL equality for group keys: NaN equals NaN and -0 equals +0 — the same
+// canonicalization Value::operator== already applies to kDouble cells; the
+// explicit branch keeps the intent visible next to CanonicalDistinctValue.
+// NULL equals NULL (a NULL group key is one group), and two keys of
+// different arity never match.
 struct GroupKeyEqual {
   bool operator()(const Row& a, const Row& b) const;
 };

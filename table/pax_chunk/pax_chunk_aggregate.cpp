@@ -18,6 +18,7 @@
 #include <bit>
 #include <utility>
 
+#include "common/exception_status.hpp"
 #include "table/pax_chunk/pax_chunk.hpp"
 #include "table/pax_chunk/pax_chunk_internal.hpp"
 
@@ -2596,10 +2597,14 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
   }
 
   // APPROX_COUNT_DISTINCT: answered entirely from the footer HLL sketches
-  // — but only for an UNPREDICATED plan. The old fast path ran before any
-  // predicate evaluation and returned the whole-column estimate regardless
-  // of the WHERE clause.
-  if (plan.op == AggOp::kApproxDistinct && plan.preds.empty()) {
+  // — but only for an UNPREDICATED plan over a chunk that actually carries
+  // sketches.  The old fast path ran before any predicate evaluation and
+  // returned the whole-column estimate regardless of the WHERE clause; a
+  // chunk without hll_present would return a bogus 0, so it falls through
+  // to the exact distinct count like a predicated plan does.
+  if (plan.op == AggOp::kApproxDistinct && plan.preds.empty() &&
+      plan.col < chunk.GetFooter().column_count &&
+      chunk.GetFooter().hll_present) {
     res.approx_distinct = ApproxCountDistinct(chunk, plan.col);
     res.valid = true;
     return res;
@@ -3175,28 +3180,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           }
         }
       }
-      if (ts == Scheme::kSortDict && plan.op == AggOp::kSum &&
-          sel.count == rc && tr != nullptr && treg_end != nullptr) {
-        // Closed-form SUM: the psum table's LAST word is the wrapped total of
-        // the sorted view, and the rank plane is a bijection, so the row-order
-        // sum equals it -- one load, no decode (the first closed-form SUM for
-        // an UNORDERED column family). Exact ONLY over the full selection
-        // (same contract as the kArith arm: a subset has no window here
-        // because the selection is in row space, the table in sorted space).
-        SortDictRegion parsed;
-        if (ParseSortDictRegion(tr, rc, f.params[toff], treg_end, &parsed)) {
-          const uint8_t* tnulls = RgColNullBits(f, g, plan.col);
-          if (SelNonNullCount(sel, tnulls, 0, rc) == rc) {
-            if (!TryAccumulateScaledSum(
-                    plan.coeff,
-                    static_cast<int64_t>(SortDictPsum(parsed, parsed.nb)),
-                    &res.sum)) {
-              return ReduceResult{};
-            }
-            continue;
-          }
-        }
-      }
+      // kSortDict has no closed-form SUM here: the psum table's last word is
+      // only as trustworthy as the footer that carried it --
+      // ParseSortDictRegion pins nb/param/rw/widths/extent but never reconciles
+      // psum against the firsts+gaps stream, so a hand-built footer could
+      // return any total as a "success".  The generic decode below answers from
+      // the rank plane and gap walk instead, agreeing with every other reader
+      // on hostile input.
       if (ts == Scheme::kPostings && plan.op == AggOp::kSum &&
           sel.count == rc && tr != nullptr && treg_end != nullptr) {
         // Closed-form SUM: sum(dict[c]*count[c]) over the d lists in
@@ -3397,7 +3387,12 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
                   static_cast<uint64_t>(pos) + ReadBE32(q + 8);
               const uint32_t end =
                   (next > rc) ? rc : static_cast<uint32_t>(next);
-              const uint64_t w = SelPopcountRange(sel, pos, end);
+              // SUM weights count selected NON-NULL rows only: null cells
+              // decode as raw 0 and contribute nothing (the kRleBp arm's
+              // contract); MIN/MAX keep the any-selected-row gate.
+              const uint64_t w = plan.op == AggOp::kSum
+                                     ? SelNonNullCount(sel, tnulls, pos, end)
+                                     : SelPopcountRange(sel, pos, end);
               if (w > 0) {
                 if (plan.op == AggOp::kSum) {
                   if (!TryAccumulateScaledSum(
@@ -3494,8 +3489,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
             const uint32_t end = (next > rc) ? rc : static_cast<uint32_t>(next);
             const int64_t v = (code < d) ? dict_at(code) : 0;
             if (end > pos) {
+              // SUM weights count selected NON-NULL rows only (null cells
+              // decode as raw 0); MIN/MAX keep the any-selected-row gate.
               const uint64_t w =
-                  SelPopcountRange(sel, static_cast<uint32_t>(pos), end);
+                  plan.op == AggOp::kSum
+                      ? SelNonNullCount(sel, tnulls, static_cast<uint32_t>(pos),
+                                        end)
+                      : SelPopcountRange(sel, static_cast<uint32_t>(pos), end);
               if (w > 0) {
                 if (plan.op == AggOp::kSum) {
                   if (!TryAccumulateScaledSum(
@@ -3530,22 +3530,13 @@ ReduceResult ReduceColumn(const PaxChunk& chunk, const ReducePlan& plan,
           // below.
           HuffDictRegion hp;
           if (ParseHuffDictRegion(tr, rc, f.params[toff], treg_end, &hp)) {
-            if (sel.count == rc && SelNonNullCount(sel, tnulls, 0, rc) == rc) {
-              if (plan.op == AggOp::kSum) {
-                __int128 s = 0;
-                for (uint32_t sym = 0; sym < hp.d; ++sym) {
-                  s += static_cast<__int128>(HuffDictDictAt(hp, sym)) *
-                       static_cast<__int128>(HuffDictFreqAt(hp, sym));
-                }
-                if (!TryAccumulateScaledSum(plan.coeff, s, &res.sum)) {
-                  return ReduceResult{};
-                }
-              } else {
-                consider(HuffDictDictAt(hp, 0));
-                consider(HuffDictDictAt(hp, hp.d - 1));
-              }
-              continue;
-            }
+            // No closed form over the stored freq histogram or dictionary
+            // order: ParseHuffDictRegion proves the cell is in-bounds and
+            // Kraft-complete but NOT that freq matches the bitstream or that
+            // the dictionary is sorted, so SUM=dict*freq and MIN/MAX=
+            // dict[0]/dict[d-1] would trust unverified footer claims.  The
+            // walk below histograms the symbols the stream actually decodes,
+            // which agrees with the generic path on any footer.
             HuffDictTables ht;
             HuffDictBuildTables(hp, &ht);
             WordBitReader br(
@@ -4105,10 +4096,11 @@ bool FastColumnSum(const PaxChunk& chunk, slot_t col, int64_t* sum_out,
   return true;
 }
 
-ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
-                                int64_t lit, bool parallel, int nthreads,
-                                uint32_t scan_sweeps, const Schema* sc,
-                                WorkloadTracker* workload) {
+StatusOr<ScanResult> VectorizedScanColumn(const PaxChunk& chunk, slot_t col,
+                                          ScanOp op, int64_t lit, bool parallel,
+                                          int nthreads, uint32_t scan_sweeps,
+                                          const Schema* sc,
+                                          WorkloadTracker* workload) {
   // Clamp scan_sweeps like ReduceColumn: 0 would otherwise fall through both
   // the parallel gate and the sequential sweep loop, silently returning an
   // all-zero ScanResult for a perfectly healthy chunk.
@@ -4774,8 +4766,8 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
     // park it in the worker's OWN slot (a shared exception_ptr written by
     // two simultaneous throwers would itself be a data race) and rethrow
     // on the caller's thread after the join.
-    std::vector<std::exception_ptr> worker_errors(
-        static_cast<size_t>(nthreads));
+    std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
+                                      Status::kSuccess);
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
@@ -4786,16 +4778,17 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
             }
           }
         } catch (...) {
-          worker_errors[static_cast<size_t>(t)] = std::current_exception();
+          worker_errors[static_cast<size_t>(t)] =
+              StatusFromCurrentException("pax chunk scan worker failed");
         }
       });
     }
     for (auto& th : ths) {
       th.join();
     }
-    for (const auto& ep : worker_errors) {
-      if (ep != nullptr) {
-        std::rethrow_exception(ep);
+    for (const Status& worker_status : worker_errors) {
+      if (worker_status != Status::kSuccess) {
+        return worker_status;
       }
     }
     for (auto& r : res) {
@@ -4817,11 +4810,9 @@ ScanResult VectorizedScanColumn(const PaxChunk& chunk, slot_t col, ScanOp op,
   return total;
 }
 
-ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
-                                      std::span<const int64_t> lits,
-                                      bool parallel, int nthreads,
-                                      const Schema* sc,
-                                      WorkloadTracker* workload) {
+StatusOr<ScanResult> VectorizedScanColumnInList(
+    const PaxChunk& chunk, slot_t col, std::span<const int64_t> lits,
+    bool parallel, int nthreads, const Schema* sc, WorkloadTracker* workload) {
   const PaxChunk::Footer& f = chunk.GetFooter();
   const uint32_t rg = f.row_group_count;
   const uint16_t cc = f.column_count;
@@ -4866,6 +4857,23 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
     }
     const size_t zi = (static_cast<size_t>(g) * cc) + col;
     const bool has_null = RgColHasNull(f, g, col);
+    // Null cells decode as raw 0 on every path, so the run/const folds
+    // below must split each covered range into its non-null rows (which
+    // carry the stored value) and its null rows (which answer as 0).
+    const uint8_t* nulls = RgColNullBits(f, g, col);
+    const auto null_count = [&](uint32_t lo, uint32_t hi) -> uint64_t {
+      if (nulls == nullptr) {
+        return 0;
+      }
+      uint64_t cnt = 0;
+      for (uint32_t i = lo; i < hi; ++i) {
+        if (((static_cast<unsigned>(nulls[i >> 3]) >> (7U - (i & 7U))) & 1U) !=
+            0) {
+          ++cnt;
+        }
+      }
+      return cnt;
+    };
     if (f.all_zm_present && zi < f.all_zone_mins.size() &&
         zi < f.all_zone_maxs.size()) {
       // A group can match iff some literal falls inside its non-null zone
@@ -5176,13 +5184,20 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
         return;
       }
     }
-    // kConst: one membership test covers the whole group.
+    // kConst: one membership test covers the whole group.  Non-null rows
+    // carry the constant; null rows answer as raw 0 like the decode path.
     if (s == Scheme::kConst && region != nullptr && reg_end != nullptr &&
         reg_end - region >= 8) {
-      if (member(static_cast<int64_t>(ReadBE64(region)))) {
-        r.hit_count += rc;
+      const int64_t v = static_cast<int64_t>(ReadBE64(region));
+      const uint64_t nnull = null_count(0, rc);
+      const uint64_t nnonnull = rc - nnull;
+      if (member(v)) {
+        r.hit_count += nnonnull;
         r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                         (ReadBE64(region) * rc));
+                                         (static_cast<uint64_t>(v) * nnonnull));
+      }
+      if (zero_member) {
+        r.hit_count += nnull;  // null rows decode as 0; 0 adds nothing to sum
       }
       return;
     }
@@ -5200,10 +5215,18 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
           const uint64_t next = acc + len;
           const uint32_t take =
               (next > rc) ? rc - static_cast<uint32_t>(acc) : len;
+          // Null rows inside the run answer as raw 0, not as the run value.
+          const uint64_t nnull = null_count(static_cast<uint32_t>(acc),
+                                            static_cast<uint32_t>(acc) + take);
+          const uint64_t nnonnull = take - nnull;
           if (member(v)) {
-            r.hit_count += take;
-            r.hit_sum = static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
-                                             (static_cast<uint64_t>(v) * take));
+            r.hit_count += nnonnull;
+            r.hit_sum =
+                static_cast<int64_t>(static_cast<uint64_t>(r.hit_sum) +
+                                     (static_cast<uint64_t>(v) * nnonnull));
+          }
+          if (zero_member) {
+            r.hit_count += nnull;
           }
           acc += take;
           q += 12;
@@ -5243,8 +5266,8 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
     std::vector<std::thread> ths;
     ths.reserve(static_cast<size_t>(nthreads));
     std::vector<ScanResult> res(static_cast<size_t>(nthreads));
-    std::vector<std::exception_ptr> worker_errors(
-        static_cast<size_t>(nthreads));
+    std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
+                                      Status::kSuccess);
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
@@ -5253,16 +5276,17 @@ ScanResult VectorizedScanColumnInList(const PaxChunk& chunk, slot_t col,
             scan_rg(g, res[static_cast<size_t>(t)]);
           }
         } catch (...) {
-          worker_errors[static_cast<size_t>(t)] = std::current_exception();
+          worker_errors[static_cast<size_t>(t)] =
+              StatusFromCurrentException("pax chunk scan worker failed");
         }
       });
     }
     for (auto& th : ths) {
       th.join();
     }
-    for (const auto& ep : worker_errors) {
-      if (ep != nullptr) {
-        std::rethrow_exception(ep);
+    for (const Status& worker_status : worker_errors) {
+      if (worker_status != Status::kSuccess) {
+        return worker_status;
       }
     }
     for (auto& r : res) {
@@ -8084,10 +8108,11 @@ PaxSelectionVector BuildSelectionVector(const PaxChunk& chunk,
   return sv;
 }
 
-AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
-                                  bool parallel, int nthreads,
-                                  uint32_t scan_sweeps, const Schema* sc,
-                                  WorkloadTracker* workload) {
+StatusOr<AggResult> PaxChunk::ScanAggregate(const PaxChunk& chunk,
+                                            const AggPlan& plan, bool parallel,
+                                            int nthreads, uint32_t scan_sweeps,
+                                            const Schema* sc,
+                                            WorkloadTracker* workload) {
   // Same clamp as VectorizedScanColumn / ReduceColumn: 0 sweeps must not
   // short-circuit into an empty AggResult.
   scan_sweeps = std::max<uint32_t>(scan_sweeps, 1);
@@ -8320,8 +8345,8 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
     // shared exception_ptr: two simultaneous throwers would race) and
     // rethrow after the join instead of letting one escape into
     // std::terminate.
-    std::vector<std::exception_ptr> worker_errors(
-        static_cast<size_t>(nthreads));
+    std::vector<Status> worker_errors(static_cast<size_t>(nthreads),
+                                      Status::kSuccess);
     for (int t = 0; t < nthreads; ++t) {
       ths.emplace_back([&, t]() {
         try {
@@ -8332,16 +8357,17 @@ AggResult PaxChunk::ScanAggregate(const PaxChunk& chunk, const AggPlan& plan,
             }
           }
         } catch (...) {
-          worker_errors[static_cast<size_t>(t)] = std::current_exception();
+          worker_errors[static_cast<size_t>(t)] =
+              StatusFromCurrentException("pax chunk scan worker failed");
         }
       });
     }
     for (auto& th : ths) {
       th.join();
     }
-    for (const auto& ep : worker_errors) {
-      if (ep != nullptr) {
-        std::rethrow_exception(ep);
+    for (const Status& worker_status : worker_errors) {
+      if (worker_status != Status::kSuccess) {
+        return worker_status;
       }
     }
     for (auto& r : res) {

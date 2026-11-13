@@ -274,8 +274,11 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
     const size_t consumed =
         Value::SkipSerializedInto(payload, skip.type, &status);
     if (status != Status::kSuccess) [[unlikely]] {
-      // Preserve the canonical peek's corrupt-image failure behavior.
-      detail::ExcShimThrow("Value::SkipSerialized", status);
+      // Same corrupt-image failure channel as Row::TryPeekInteger: a Status,
+      // not a C++ exception across the caller's StatusOr boundary.
+      return {.kind = PeekOutcome::Kind::kError,
+              .value = 0,
+              .status = status};
     }
     payload += consumed + skip.fixed_after;
   }
@@ -322,6 +325,8 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
                     table_->GetSchema(), pred.column));
             cached_value = peeked;
           } break;
+          case PeekOutcome::Kind::kError:
+            return outcome.status;
         }
       } else {
         {
@@ -467,6 +472,9 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
                 peeked = Row::TryPeekInteger(
                     row->data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                     table_->GetSchema(), *key_column_);
+                break;
+              case PeekOutcome::Kind::kError:
+                peeked = outcome.status;
                 break;
             }
           } else {
@@ -1005,8 +1013,11 @@ const RuntimeFilterGroup* FullScanIterator::AcceptsColumn(
     return nullptr;
   }
   // A group that rejects unconditionally compares no values, so the build
-  // side's type (unknown when it had no comparable key) cannot mismatch.
-  if (type != ValueType::kNull && declared != type && !group->RejectsAll()) {
+  // side's type (unknown when it had no comparable key, i.e. kNull) cannot
+  // mismatch.  kNull is therefore accepted ONLY for such a group: on any
+  // other group an unknown build domain could reject probe keys that share
+  // the int64 bit pattern but not the comparison domain.
+  if (declared != type && !group->RejectsAll()) {
     return nullptr;
   }
   return group;

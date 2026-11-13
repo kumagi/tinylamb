@@ -397,9 +397,9 @@ TEST_F(WindowSqlCov, RangeIntervalFramesOnDateKeys) {
                                Row({Value::Date("2020-01-03"), Value(50)}),
                                Row({Value::Date("2020-01-04"), Value(70)})})));
 
-  // MONTH applies the same calendar arithmetic as DATE - INTERVAL: the
-  // January window reaches back to 2023-12-04, so every row sees the full
-  // group total.
+  // MONTH applies the same calendar arithmetic as DATE - INTERVAL: each
+  // frame opens one month before its key, so only the last row's window
+  // (opened at 2019-12-04) reaches back over the whole group.
   const auto monthly = TryRunSql(
       engine_.get(), context_.get(),
       "SELECT d, SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 MONTH "
@@ -407,7 +407,7 @@ TEST_F(WindowSqlCov, RangeIntervalFramesOnDateKeys) {
       "ORDER BY d");
   ASSERT_TRUE(monthly.HasValue()) << monthly.GetStatus().GetMessage();
   // Each frame opens at key - 1 month: only 2020-01-04's window (back to
-  // 2023-12-04) reaches the whole group.
+  // 2019-12-04) reaches the whole group.
   EXPECT_EQ(monthly.Value(),
             (std::vector<Row>({Row({Value::Date("2020-01-01"), Value(10)}),
                                Row({Value::Date("2020-01-02"), Value(30)}),

@@ -100,7 +100,7 @@ class ParallelIndexScan final : public ExecutorBase {
   size_t active_workers_{0};
   bool started_{false};
   std::atomic<bool> cancelled_{false};
-  std::exception_ptr worker_error_;
+  Status worker_error_{Status::kSuccess};
   Status worker_status_{Status::kSuccess};
 
   std::optional<DataChunk> pending_;

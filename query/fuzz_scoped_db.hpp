@@ -141,10 +141,11 @@ class ScopedDb {
   std::unique_ptr<Database> db_;
 };
 
-// The SQL frontend has no CREATE INDEX syntax, so fuzzers carry index specs
-// as text ("CREATE [UNIQUE] INDEX n ON t(cols)[ INCLUDE(cols)];") and apply
-// them through the catalog API here. Keeping the spec textual preserves the
-// self-contained .test regression format.
+// Fuzzers carry index specs as their own slot-based pseudo-DDL
+// ("CREATE [UNIQUE] INDEX n ON t(cols)[ INCLUDE(cols)];") — distinct from
+// the SQL CREATE INDEX spelling — and apply them through the catalog API
+// here. Keeping the spec textual preserves the self-contained .test
+// regression format.
 inline bool ApplyIndexSpec(Database& db, TransactionContext& ctx,
                            std::string_view ddl) {
   static const bool kTraceFuzzSql =

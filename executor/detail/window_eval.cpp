@@ -38,8 +38,8 @@
 #include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
-#include "executor/query_memory.hpp"
 #include "executor/detail/subquery_runtime.hpp"
+#include "executor/query_memory.hpp"
 #include "expression/array_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
@@ -2793,8 +2793,16 @@ Status ComputeOneWindowImpl(TransactionContext& context,
                     : "The offset to the function LEAD must not be negative");
           }
         }
-        const int64_t target = fn == "LAG" ? static_cast<int64_t>(k) - offset
-                                           : static_cast<int64_t>(k) + offset;
+        // offset >= 0.  LAG's subtraction cannot underflow (k >= 0 keeps the
+        // result >= -INT64_MAX); LEAD's addition can overflow for offsets
+        // near INT64_MAX, so saturate -- any out-of-range target takes the
+        // default-value branch below either way.
+        int64_t target = static_cast<int64_t>(k);
+        if (fn == "LAG") {
+          target -= offset;
+        } else if (__builtin_add_overflow(target, offset, &target)) {
+          target = std::numeric_limits<int64_t>::max();
+        }
         if (target < 0 || std::cmp_greater_equal(target, m)) {
           if (window.args.size() > 2) {
             ASSIGN_OR_RETURN(
@@ -3240,9 +3248,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   const size_t append_workers =
       rows.size() < 16384
           ? 1
-          : std::min<size_t>(
-                {8, rows.size() / 8192,
-                 QueryParallelWorkerLimit(std::thread::hardware_concurrency())});
+          : std::min<size_t>({8, rows.size() / 8192,
+                              QueryParallelWorkerLimit(
+                                  std::thread::hardware_concurrency())});
   RETURN_IF_FAIL(RunParallelTasks(append_workers, [&](size_t worker) {
     const size_t begin = rows.size() * worker / append_workers;
     const size_t end = rows.size() * (worker + 1) / append_workers;
@@ -3322,9 +3330,9 @@ StatusOr<WindowedInput> ApplyWindows(TransactionContext& context,
   result.statement->SetOrderBy(std::move(rewritten_order));
 
   if (statement.Qualify()) {
-    Expression qualify = InlineAliases(
-        Rebuild(statement.Qualify(), replacements), aliases,
-        window_output.schema);
+    Expression qualify =
+        InlineAliases(Rebuild(statement.Qualify(), replacements), aliases,
+                      window_output.schema);
     RETURN_IF_FAIL(
         FilterRelation(context, &window_output, {qualify}, outer, ctes));
   }

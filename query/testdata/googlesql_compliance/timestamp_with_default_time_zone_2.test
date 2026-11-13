@@ -6,7 +6,7 @@
 #
 # The "timestamp_type_and_functions" label applies to all queries in this
 # file related to the GoogleSQL V1 TIMESTAMP type.
-[default_time_zone=Pacific/Chatham]
+[default default_time_zone=Pacific/Chatham]
 [default global_labels=timestamp_type_and_functions,different_default_time_zone]
 
 [load_proto_files=googlesql/testdata/test_schema.proto]

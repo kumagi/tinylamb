@@ -579,7 +579,7 @@ void SimdComparisonKernel::CompareDouble(const double* data, size_t count,
   }
 }
 
-void SimdComparisonKernel::CompareStringPrefix(const std::string_view* data,
+void SimdComparisonKernel::CompareString(const std::string_view* data,
                                                size_t count, BinaryOperation op,
                                                std::string_view target,
                                                ValidityBitmap* out_mask) {

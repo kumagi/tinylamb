@@ -35,18 +35,6 @@
 
 namespace tinylamb {
 namespace {
-size_t PagePoolCapacityFromEnv() {
-  const char* env = std::getenv("TINYLAMB_PAGE_POOL_BYTES");
-  if (env == nullptr || env[0] == '\0') {
-    return kDefaultPagePoolCapacity;
-  }
-  const unsigned long long bytes = std::strtoull(env, nullptr, 10);
-  if (bytes < kPageSize) {
-    return kDefaultPagePoolCapacity;
-  }
-  return static_cast<size_t>(bytes / kPageSize);
-}
-
 // WAL segment size override for tests that exercise segment rollover or
 // recycling without writing tens of megabytes. 0 / unset keeps the default.
 size_t LogSegmentSizeFromEnv() {
@@ -66,9 +54,11 @@ StatusOr<std::unique_ptr<PageStorage>> PageStorage::Create(
     std::string_view dbname, size_t wal_sync_ms, bool preallocate_new_wal) {
   const std::string dbname_str(dbname);
   const size_t requested_segment_size = LogSegmentSizeFromEnv();
+  // PageManager::Create discards its capacity argument (pages live in RAM
+  // under PageManager), so no pool-size env override exists.
   ASSIGN_OR_RETURN(std::unique_ptr<PageManager>, pm,
                    PageManager::Create(dbname_str + ".db",
-                                       PagePoolCapacityFromEnv(), false));
+                                       /*capacity=*/0, false));
   ASSIGN_OR_RETURN(
       std::unique_ptr<Logger>, logger,
       Logger::Create(dbname_str + ".log", static_cast<size_t>(8 * 1024 * 1024),

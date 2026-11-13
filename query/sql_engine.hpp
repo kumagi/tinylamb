@@ -42,10 +42,12 @@ struct SqlRuntimeStats {
 class QueryResult {
  public:
   QueryResult(Executor executor, std::optional<StatementType> type,
-              std::vector<std::string> column_names)
+              std::vector<std::string> column_names,
+              std::vector<ValueType> column_types = {})
       : executor_(std::move(executor)),
         statement_type_(type),
-        column_names_(std::move(column_names)) {}
+        column_names_(std::move(column_names)),
+        column_types_(std::move(column_types)) {}
 
   bool Next(Row* row);
   [[nodiscard]] Status GetStatus() const {
@@ -62,11 +64,18 @@ class QueryResult {
   [[nodiscard]] const std::vector<std::string>& ColumnNames() const {
     return column_names_;
   }
+  // Declared output column types captured from the emitting plan. Empty when
+  // the producing route has no plan-level schema (consumers must fall back to
+  // row sampling). A kNull entry means "type unknown", not SQL NULL.
+  [[nodiscard]] const std::vector<ValueType>& ColumnTypes() const {
+    return column_types_;
+  }
 
  private:
   Executor executor_;
   std::optional<StatementType> statement_type_;
   std::vector<std::string> column_names_;
+  std::vector<ValueType> column_types_;
 };
 
 class SqlEngine {
@@ -260,6 +269,7 @@ class SqlEngine {
   bool last_query_is_literal_constant_{false};
   std::string last_dml_table_;
   std::vector<std::string> result_column_names_;
+  std::vector<ValueType> result_column_types_;
   std::string plan_cache_fingerprint_;
   size_t fused_sibling_aggregates_{0};
   size_t cte_restriction_pushdowns_{0};

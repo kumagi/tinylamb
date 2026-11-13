@@ -109,9 +109,6 @@ struct TypedDoubleExprInput {
   slot_t col2{0};
   double k0{0.0};
   double k1{0.0};
-  // COALESCE(expr, 0) / IFNULL(expr, 0). A NULL subexpression yields 0, not
-  // NULL, so SUM counts the row the same way the general COALESCE does.
-  bool null_as_zero{false};
   std::vector<TypedDoubleExprOp> ops;
 };
 

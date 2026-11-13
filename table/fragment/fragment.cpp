@@ -1165,6 +1165,7 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         acc->count += 1;
         break;
       }
+      bool any_term = false;
       for (const AggTerm& term : agg.terms) {
         auto product = static_cast<uint64_t>(term.coeff);
         bool null_term = false;
@@ -1180,8 +1181,14 @@ void AccumulateRow(const Aggregate& agg, const SurvivingRow& row,
         }
         acc->sum =
             std::bit_cast<int64_t>(static_cast<uint64_t>(acc->sum) + product);
+        any_term = true;
       }
-      acc->count += 1;
+      // count==0 is how callers detect "SUM is NULL" (same contract as the
+      // single-term path above): a row whose every term was NULL contributes
+      // nothing and must not be counted.
+      if (any_term) {
+        acc->count += 1;
+      }
       break;
     }
     case AggregateKind::kMin:
@@ -1693,8 +1700,11 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
                           static_cast<double>(eval.size());
     }
   }
-  if (report.rows_unknown == 0 && report.rows_in > 0 &&
-      fragment.conjuncts.empty()) {
+  if (fragment.conjuncts.empty()) {
+    // No conjuncts: every in-range row passes the (empty) filter trivially.
+    // Zone-map pruning already moved the proved-fail rows out, and with an
+    // empty eval set no group can be proved empty, so rows_proved_fail is 0
+    // here and the survivors are proved pass rather than unknown.
     report.rows_proved_pass = report.rows_in;
     report.rows_unknown = 0;
   }
@@ -1705,7 +1715,8 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
     report.coverage = Coverage::kPartial;
     report.duplicate_elimination = DuplicateElimination::kNotAccounted;
   }
-  report.output_rows = report.rows_unknown;
+  // Rows reaching the output are exactly the ones not proved fail.
+  report.output_rows = report.rows_proved_pass + report.rows_unknown;
   report.cardinality = Cardinality::kNotAccounted;
   report.output_bytes = report.output_rows * 8;
   (void)caps;

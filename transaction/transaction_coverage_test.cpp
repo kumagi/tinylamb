@@ -1577,12 +1577,12 @@ TEST_F(TransactionCoverageRecoveryTest,
   EXPECT_EQ(page->body.row_page.GetRow(1), "source");
 }
 
-TEST_F(TransactionCoverageRecoveryTest, AbortWalksUndoChainAndTerminates) {
+TEST_F(TransactionCoverageRecoveryTest, AbortReversesStagedRecordsAndTerminates) {
   Transaction txn = tm_->Begin();
-  // A non-page-manipulation record gives the undo walk real chain entries
-  // to read back without depending on page contents.  The FIRST record of a
-  // fresh WAL starts at LSN 0, which doubles as the "no chain" sentinel --
-  // append a second record so prev_lsn_ is a walkable non-zero LSN.
+  // Staged (in-memory) records are reversed by abort; there is no WAL undo
+  // walk.  Two kBegin appends give the abort terminator a non-zero PrevLSN
+  // chain position -- the FIRST record of a fresh WAL starts at LSN 0, which
+  // doubles as the "no chain" sentinel.
   ASSERT_TRUE(txn.AppendLog(LogRecord(txn.PrevLSN(), txn.ID(), LogType::kBegin))
                   .HasValue());
   ASSERT_TRUE(txn.AppendLog(LogRecord(txn.PrevLSN(), txn.ID(), LogType::kBegin))
@@ -1592,7 +1592,7 @@ TEST_F(TransactionCoverageRecoveryTest, AbortWalksUndoChainAndTerminates) {
 
   ASSERT_EQ(txn.Abort(), Status::kSuccess);
   EXPECT_TRUE(txn.IsFinished());
-  // The abort terminator was appended above the undone chain.
+  // The abort terminator was appended above the reversed staged records.
   EXPECT_GT(txn.PrevLSN(), 0U);
 }
 
@@ -1614,8 +1614,8 @@ TEST_F(TransactionCoverageRecoveryTest, AbortSurvivesUnreadableTailAndDeadWal) {
           .MoveValue();
   {
     RecoveryManager slow_rm(slow_log, slow_pm->GetPool());
-    // The recovery manager reads the live logger's ring buffer, so undo
-    // walks see their own records while they are still volatile.
+    // Keep the recovery manager wired to the live logger for parity with
+    // production; abort itself only reverses staged in-memory records.
     slow_rm.SetLogger(slow_logger.get());
     TransactionManager slow_tm(slow_pm.get(), slow_logger.get(), &slow_rm);
 
@@ -1647,16 +1647,17 @@ TEST_F(TransactionCoverageRecoveryTest, AbortSurvivesUnreadableTailAndDeadWal) {
 
     PointWalAtDevFull(slow_logger.get());
     // Scheduling decides whether the worker's first write attempt surfaced
-    // the dead fd before the abort: if not, the ring-resident chain is read
-    // from the ring, no CLR is owed (kBegin is not a page manipulation), and
-    // the terminator append is accepted into the buffer (kSuccess -- the
-    // abort pays no group-commit flush; the former pre-undo WaitForDurable
-    // surfaced the doomed fd through every abort, an fsync amplification the
-    // ring-read undo removed). If the worker surfaced it first, the
-    // terminator append hits the latched dead logger (kIOError). Either way
-    // the rollback is unaffected -- losing the volatile terminator to a
-    // crash replays the identical rollback as restart loser cleanup -- and
-    // the invariant under test is that the abort finishes cleanly.
+    // the dead fd before the abort.  Abort never reads the WAL: it reverses
+    // the staged in-memory records and appends only the kAbort terminator.
+    // If the dead fd has not surfaced yet, that append is accepted into the
+    // buffer (kSuccess -- the abort pays no group-commit flush; a pre-undo
+    // WaitForDurable used to surface the doomed fd through every abort, an
+    // fsync amplification the in-memory undo removed).  If the worker
+    // surfaced it first, the terminator append hits the latched dead logger
+    // (kIOError).  Either way the rollback is unaffected -- losing the
+    // volatile terminator to a crash replays the identical rollback as
+    // restart loser cleanup -- and the invariant under test is that the
+    // abort finishes cleanly.
     const Status doomed_abort = doomed.Abort();
     EXPECT_TRUE(doomed_abort == Status::kSuccess ||
                 doomed_abort == Status::kIOError)

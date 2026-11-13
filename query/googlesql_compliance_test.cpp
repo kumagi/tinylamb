@@ -397,6 +397,50 @@ ARRAY<STRUCT<id INT64>>[{7}]
             (std::vector<std::string>{"FullScan: orders"}));
 }
 
+TEST(GoogleSqlComplianceFile, DefaultTimeZoneScopeAndUnknownOptions) {
+  const std::vector<GoogleSqlComplianceCase> cases =
+      ParseGoogleSqlComplianceFile("tz.test", R"test(
+[default default_time_zone=UTC]
+[name=first]
+SELECT 1
+--
+ARRAY<INT64>[1]
+==
+[name=second]
+SELECT 1
+--
+ARRAY<INT64>[1]
+==
+[name=third]
+[default_time_zone=PST]
+SELECT 1
+--
+ARRAY<INT64>[1]
+==
+[name=fourth]
+SELECT 1
+--
+ARRAY<INT64>[1]
+==
+[name=fifth]
+[bogus_option=1]
+SELECT 2
+--
+ARRAY<INT64>[2]
+==
+)test");
+  ASSERT_EQ(cases.size(), 5U);
+  EXPECT_EQ(cases[0].default_time_zone, "UTC");
+  // "default default_time_zone" propagates to later segments.
+  EXPECT_EQ(cases[1].default_time_zone, "UTC");
+  // A bare "default_time_zone" is case-local and does not leak.
+  EXPECT_EQ(cases[2].default_time_zone, "PST");
+  EXPECT_EQ(cases[3].default_time_zone, "UTC");
+  // An unrecognized option key is not swallowed: it lands in the SQL text
+  // and fails loudly at parse time.
+  EXPECT_NE(cases[4].sql.find("[bogus_option=1]"), std::string::npos);
+}
+
 TEST(GoogleSqlComplianceFile, ParsesSecondaryIndexSetup) {
   constexpr std::string_view kFile = R"test(
 [prepare_database]

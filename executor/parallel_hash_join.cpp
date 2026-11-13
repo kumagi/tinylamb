@@ -233,6 +233,21 @@ uint64_t SharedBuildParallelHashJoin::HashKey(std::string_view key) {
 }
 
 Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
+  // ParallelProbe only emits for these kinds; anything else (right/full
+  // outer, mark, single) would drain both inputs and then silently produce
+  // an empty success, so reject it up front.
+  switch (kind_) {
+    case JoinKind::kInner:
+    case JoinKind::kSemi:
+    case JoinKind::kAnti:
+    case JoinKind::kNullAwareAnti:
+    case JoinKind::kLeftOuter:
+      break;
+    default:
+      return StatusError(
+          StatusCode::kInvalidArgument,
+          "SharedBuildParallelHashJoin does not support this join kind");
+  }
   std::vector<std::pair<Row, RowPosition>> left_tuples;
   std::vector<std::pair<Row, RowPosition>> right_tuples;
   DataChunk batch;
@@ -285,6 +300,15 @@ Status SharedBuildParallelHashJoin::BuildSharedHashTable() {
   // non-empty, mirroring the serial HashJoin width contract).
   if (right_width_ == 0 && !build_tuples.empty()) {
     right_width_ = build_tuples.front().first.values_.size();
+  }
+  // A left-outer join over an empty right side cannot infer the padding
+  // width from rows; without an explicit right_width the NULL-padded output
+  // would be narrower than the join schema promises (same contract as the
+  // serial HashJoin's "outer join requires the empty input width").
+  if (kind_ == JoinKind::kLeftOuter && right_width_ == 0 &&
+      build_tuples.empty() && !probe_tuples_.empty()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "outer join requires the empty input width");
   }
 
   // Decide the key mode once, before any insert: fixed-width int keys when

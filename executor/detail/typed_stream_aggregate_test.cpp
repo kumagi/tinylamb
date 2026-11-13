@@ -366,22 +366,14 @@ TEST(TypedStreamAggregateTest, TryCompileAndEvaluateTypedDoubleExpressions) {
       EvaluateTypedDoubleExprOnRow(*compiled_charge, row).value.double_value,
       189.0, 1e-9);
 
-  // COALESCE(price * discount, 0) substitutes 0 for a NULL factor.
-  const Expression coalesced = FunctionCallExp(
-      "coalesce", {mul_two, ConstantValueExp(Value(static_cast<int64_t>(0)))});
-  auto compiled_coalesce = TryCompileTypedDoubleExpr(coalesced, schema);
-  ASSERT_TRUE(compiled_coalesce.has_value());
-  EXPECT_TRUE(compiled_coalesce->null_as_zero);
-  EXPECT_DOUBLE_EQ(
-      EvaluateTypedDoubleExprOnRow(*compiled_coalesce, row).value.double_value,
-      20.0);
+  // A NULL factor leaves the typed double expression NULL; COALESCE(expr, 0)
+  // is intentionally not folded here, because the general COALESCE returns
+  // the fallback's own type (an INT64 0), which the dynamic SUM typing keeps
+  // observable. Compiling it as a double 0 would change that result type.
   const Row null_price(
       {Value(1), Value(10), Value(), Value(0.1), Value(0.05), Value("AIR")});
   EXPECT_TRUE(
       EvaluateTypedDoubleExprOnRow(*compiled_mul2, null_price).IsNull());
-  EXPECT_DOUBLE_EQ(EvaluateTypedDoubleExprOnRow(*compiled_coalesce, null_price)
-                       .value.double_value,
-                   0.0);
 }
 
 TEST(TypedStreamAggregateTest, TryCompilePositionalHavingAndConjuncts) {

@@ -193,6 +193,7 @@ def main():
     output = args.directory / "analysis"
     output.mkdir(exist_ok=True)
     scales = sorted({r["rows"] for r in records if r["kind"] == "olap" and r["suite"] == "micro"})
+    micro = {}
     for scale in scales:
         table, micro = olap_table(records, "micro", scale)
         (output / f"micro_{scale}.md").write_text(table)

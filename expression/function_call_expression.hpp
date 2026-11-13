@@ -37,6 +37,10 @@ std::string UnicodeLower(std::string_view value);
 // from lowercase for the sharp-s/final-sigma/micro-sign/ligature entries and
 // falls back to lowercase everywhere else.
 std::string UnicodeCaseFold(std::string_view value);
+// True when `value` contains a combining diacritical mark (U+0300..U+036F),
+// i.e. text that NFC/NFKC would have to compose.  NORMALIZE uses it to
+// reject decomposed input instead of returning silently mis-normalized text.
+bool UnicodeContainsCombiningDiacritical(std::string_view value);
 std::string UnicodeInitcap(std::string_view value, std::string_view delimiters,
                            bool has_delimiters);
 std::string FormatFloatingForPrintf(double value, char specifier,

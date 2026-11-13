@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/exception_status.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
@@ -821,8 +822,9 @@ void ParallelScan::Start(size_t batch_size) {
       // Thread creation can fail (e.g. resource_unavailable). Account only
       // for the workers that actually started and wake the consumer via
       // worker_error_ instead of blocking on active_workers_ forever.
-      if (!worker_error_) {
-        worker_error_ = std::current_exception();
+      if (worker_error_ == Status::kSuccess) {
+        worker_error_ =
+            StatusFromCurrentException("parallel scan worker failed");
       }
       break;
     }
@@ -1297,8 +1299,8 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
     }
   } catch (...) {
     std::scoped_lock lock(mutex_);
-    if (!worker_error_) {
-      worker_error_ = std::current_exception();
+    if (worker_error_ == Status::kSuccess) {
+      worker_error_ = StatusFromCurrentException("parallel scan worker failed");
     }
     cancelled_.store(true, std::memory_order_release);
   }
@@ -1360,23 +1362,17 @@ size_t ParallelScan::NextBatch(DataChunk* destination, size_t max_rows) {
 
     std::unique_lock lock(mutex_);
     ready_cv_.wait(lock, [&] {
-      return cancelled_.load(std::memory_order_relaxed) || worker_error_ ||
+      return cancelled_.load(std::memory_order_relaxed) ||
+             worker_error_ != Status::kSuccess ||
              worker_status_ != Status::kSuccess ||
              next_out_morsel_ >= morsels_.size() ||
              morsels_done_[next_out_morsel_] ||
              !inflight_[next_out_morsel_].empty();
     });
-    if (worker_error_) {
-      // Surface the worker failure as a sticky Status instead of unwinding
-      // through NextBatch (no-exception executor contract).
-      try {
-        std::rethrow_exception(worker_error_);
-      } catch (const std::exception& error) {
-        FailWith(StatusError(StatusCode::kRuntimeError, error.what()));
-      } catch (...) {
-        FailWith(StatusError(StatusCode::kRuntimeError,
-                             "parallel scan worker failed"));
-      }
+    if (worker_error_ != Status::kSuccess) {
+      // Surface the worker failure as a sticky Status (no-exception
+      // executor contract).
+      FailWith(worker_error_);
       return 0;
     }
     if (worker_status_ != Status::kSuccess) {

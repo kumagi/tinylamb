@@ -773,6 +773,7 @@ int main(int argc, char** argv) {
             << "dbgen=" << options.dbgen << '\n'
             << "official_sf="
             << (options.scale_factor == 1 || options.scale_factor == 10 ||
+                        options.scale_factor == 30 ||
                         options.scale_factor == 100 ||
                         options.scale_factor == 300 ||
                         options.scale_factor == 1000 ||
@@ -837,9 +838,6 @@ int main(int argc, char** argv) {
     RemoveDatabaseFiles(options.database_path);
   }
 
-  if (std::getenv("TINYLAMB_PAGE_POOL_BYTES") == nullptr) {
-    tinylamb::platform::SetEnv("TINYLAMB_PAGE_POOL_BYTES", "17179869184", 0);
-  }
   // Cap query working memory so join/agg/sort spill before the host thrashs.
   if (std::getenv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
     tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592",

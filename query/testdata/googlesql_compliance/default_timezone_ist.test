@@ -1,4 +1,4 @@
-[default_time_zone=Asia/Kolkata]
+[default default_time_zone=Asia/Kolkata]
 ==
 [name=cast_timestamp_to_date]
 

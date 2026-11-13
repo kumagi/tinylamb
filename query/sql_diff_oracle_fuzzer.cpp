@@ -203,7 +203,10 @@ bool Setup(Database& db, TransactionContext* ctx,
       return false;
     }
   }
-  (void)ctx->txn_.PreCommit();
+  if (ctx->txn_.PreCommit() != Status::kSuccess) {
+    *error = "setup commit failed";
+    return false;
+  }
   *ctx = db.BeginContext();
   return true;
 }
@@ -776,7 +779,15 @@ bool ParseDiffOracleTest(std::string_view text, uint64_t* seed,
     };
     std::string value;
     if (take("-- seed: ", &value)) {
-      *seed = std::stoull(value);
+      try {
+        size_t used = 0;
+        *seed = std::stoull(value, &used);
+        if (used != value.size()) {
+          return false;
+        }
+      } catch (const std::exception&) {
+        return false;
+      }
     } else if (take("-- kind: ", &value)) {
       trace->kind = value;
     } else if (take("-- setup: ", &value)) {

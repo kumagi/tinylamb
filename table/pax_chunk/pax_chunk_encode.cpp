@@ -1778,6 +1778,12 @@ EncodedCol EncFsstStr(const std::vector<std::string_view>& sv) {
     }
     ends[i] = static_cast<uint32_t>(stream.size());
   }
+  // ends[] and the total-stream-length field are u32: an input whose code
+  // stream exceeds 4 GiB would wrap both and emit a self-inconsistent
+  // region. Fail the encode (empty EncodedCol) instead.
+  if (stream.size() > UINT32_MAX) {
+    return {};
+  }
 
   size_t sym_bytes = 0;
   for (uint32_t c = 0; c < nsym; ++c) {
@@ -1879,6 +1885,13 @@ EncodedCol EncFrontCodeStr(const std::vector<std::string_view>& sv,
     AppendBE16(entries, static_cast<uint16_t>(slen));
     entries.insert(entries.end(), s.begin() + plen, s.end());
     prev.assign(s.begin(), s.end());
+  }
+  // stream_len and the restart offsets are u32, nrestart is u16: an input
+  // whose entries exceed 4 GiB (65535 x 65535-byte strings does) or whose
+  // restart count exceeds 64 K would wrap the fields and emit a
+  // self-inconsistent region. Fail the encode instead.
+  if (entries.size() > UINT32_MAX || restarts.size() > UINT16_MAX) {
+    return {};
   }
   e.param = restart_every | (sorted ? 0x8000U : 0U);
   AppendBE16(e.buf, static_cast<uint16_t>(restarts.size()));
@@ -5876,6 +5889,12 @@ EncodedCol EncDdRiceI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   const uint32_t C = kDeltaCheckpointEvery;
   const auto ncp = static_cast<uint32_t>(((n - 1) / C) + 1);
+  // ncp is written as u16 and the per-checkpoint bit offsets as u32: inputs
+  // past either bound would wrap the fields and emit a self-inconsistent
+  // region, so fail the encode instead.
+  if (ncp > UINT16_MAX) {
+    return {};
+  }
   // Second differences in zigzag domain (dd[1] = first delta itself).
   std::vector<uint64_t> zz(n, 0);
   uint64_t prev_d1 = 0;
@@ -5919,6 +5938,12 @@ EncodedCol EncDdRiceI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   if (best_bits == SIZE_MAX) {
     return {};  // quotients exceed the scan bound
+  }
+  // The checkpoint bit offsets are u32 bit positions: a stream at or past
+  // 2^32 bits would wrap them (and end_pos) into a self-inconsistent
+  // region. Fail the encode instead.
+  if (best_bits >= UINT32_MAX) {
+    return {};
   }
   // Exact region size: checkpoint count + (value, d1) per checkpoint +
   // bit offsets + Rice parameter + the unary-prefixed bitstream.

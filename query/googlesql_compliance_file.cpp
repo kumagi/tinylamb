@@ -167,8 +167,30 @@ std::vector<std::string> SplitCases(std::string_view contents) {
   return cases;
 }
 
+// ZetaSQL compliance option keys tinylamb does not implement.  They are part
+// of the upstream option vocabulary, so they are consumed (and ignored); a
+// leading "default " (the file-default spelling) is stripped before matching.
+// Anything outside this set and the handled keys above is not an option line.
+constexpr std::string_view kIgnoredOptionKeys[] = {
+    "labels",
+    "extract_labels",
+    "global_labels",
+    "forbidden_features",
+    "load_proto_files",
+    "load_proto_names",
+    "load_enum_names",
+    "prepare_database_additional_features",
+    "skip_required_feature_integrity_check",
+    "exclude_in_sql_builder_pipe_sql_equivalence_tests",
+    "use_test_database_copy",
+    "reserve_match_recognize",
+    "reserve_graph_table",
+    "unknown_order",
+};
+
 bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
-                       std::vector<std::string>* file_default_features) {
+                       std::vector<std::string>* file_default_features,
+                       bool* file_default_time_zone) {
   const std::string trimmed = Trim(line);
   if (trimmed.size() < 2 || trimmed.front() != '[' || trimmed.back() != ']') {
     return false;
@@ -261,11 +283,29 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
     }
     return true;
   }
-  if (key == "default_time_zone" || key == "default default_time_zone") {
+  if (key == "default_time_zone") {
+    // Case-local: applies only to the query it is part of.
     out->default_time_zone = value;
     return true;
   }
-  return true;
+  if (key == "default default_time_zone") {
+    // File-level default: the caller propagates it to later segments.
+    out->default_time_zone = value;
+    *file_default_time_zone = true;
+    return true;
+  }
+  std::string_view bare_key = key;
+  if (bare_key.starts_with("default ")) {
+    bare_key.remove_prefix(std::string_view("default ").size());
+  }
+  for (const std::string_view ignored : kIgnoredOptionKeys) {
+    if (bare_key == ignored) {
+      return true;
+    }
+  }
+  // Not an option line: the caller falls through to SQL so an unknown or
+  // misspelled key fails loudly instead of being silently swallowed.
+  return false;
 }
 
 bool ParseStructRow(std::string_view text, size_t* offset,
@@ -535,8 +575,10 @@ GoogleSqlComplianceCase ParseSegment(
       if (trimmed.front() == '[') {
         line = ReadLogicalOptionLine(&stream, line);
       }
-      if (ConsumeOptionLine(line, &test_case, default_features)) {
-        if (!test_case.default_time_zone.empty()) {
+      bool file_default_time_zone = false;
+      if (ConsumeOptionLine(line, &test_case, default_features,
+                            &file_default_time_zone)) {
+        if (file_default_time_zone && !test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
         continue;
@@ -562,8 +604,10 @@ GoogleSqlComplianceCase ParseSegment(
       if (trimmed.front() == '[') {
         line = ReadLogicalOptionLine(&stream, line);
       }
-      if (ConsumeOptionLine(line, &test_case, default_features)) {
-        if (!test_case.default_time_zone.empty()) {
+      bool file_default_time_zone = false;
+      if (ConsumeOptionLine(line, &test_case, default_features,
+                            &file_default_time_zone)) {
+        if (file_default_time_zone && !test_case.default_time_zone.empty()) {
           *current_default_tz = test_case.default_time_zone;
         }
         continue;
@@ -1259,20 +1303,31 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     if (unordered) {
       // The reference does not guarantee element order: match as a multiset.
-      std::vector<bool> used(elements.size(), false);
-      for (const Value& element : actual.ArrayElements()) {
-        bool found = false;
-        for (size_t i = 0; i < elements.size(); ++i) {
-          if (used[i]) {
+      // Token compatibility is asymmetric ("true" accepts any nonzero INT64
+      // while "1" accepts only INT64 1), so a greedy first-fit can consume a
+      // token a later element needed; use bipartite matching (Kuhn) instead.
+      const auto& elems = actual.ArrayElements();
+      const size_t m = elems.size();
+      std::vector<int64_t> match_actual(m, -1);
+      const auto try_match = [&](auto&& self, size_t expected_idx,
+                                 std::vector<char>& seen) -> bool {
+        for (size_t j = 0; j < m; ++j) {
+          if (seen[j] != 0 ||
+              !ComplianceValueMatches(elems[j], elements[expected_idx])) {
             continue;
           }
-          if (ComplianceValueMatches(element, elements[i])) {
-            used[i] = true;
-            found = true;
-            break;
+          seen[j] = 1;
+          if (match_actual[j] < 0 ||
+              self(self, static_cast<size_t>(match_actual[j]), seen)) {
+            match_actual[j] = static_cast<int64_t>(expected_idx);
+            return true;
           }
         }
-        if (!found) {
+        return false;
+      };
+      for (size_t e = 0; e < elements.size(); ++e) {
+        std::vector<char> seen(m, 0);
+        if (!try_match(try_match, e, seen)) {
           return false;
         }
       }
@@ -1341,10 +1396,15 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     if (std::isinf(got) || std::isinf(parsed)) {
       return got == parsed;
     }
+    if (parsed == 0.0) {
+      return got == 0.0;
+    }
     if (std::fabs(parsed) < 1e-300) {
       return std::fabs(got - parsed) <= 1e-5 * std::fabs(parsed);
     }
-    return std::fabs(got - parsed) <= 1e-6 * std::max(1.0, std::fabs(parsed));
+    // Purely relative: an absolute floor would let a golden like 1e-6 pass
+    // with a 100% relative error.
+    return std::fabs(got - parsed) <= 1e-6 * std::fabs(parsed);
   }
 
   if (actual.type == ValueType::kVarChar) {

@@ -1235,14 +1235,18 @@ struct ScopedEnv {
 };
 
 struct ScopedQueryMemory {
-  explicit ScopedQueryMemory(uint64_t budget_bytes) {
+  explicit ScopedQueryMemory(uint64_t budget_bytes)
+      : previous_limit_(QueryMemoryBudget::Global().Limit()) {
     QueryMemoryBudget::Global().ResetForTest(budget_bytes);
   }
-  ~ScopedQueryMemory() { QueryMemoryBudget::Global().ResetForTest(0); }
+  ~ScopedQueryMemory() {
+    QueryMemoryBudget::Global().ResetForTest(previous_limit_);
+  }
   ScopedQueryMemory(const ScopedQueryMemory&) = delete;
   ScopedQueryMemory& operator=(const ScopedQueryMemory&) = delete;
   ScopedQueryMemory(ScopedQueryMemory&&) = delete;
   ScopedQueryMemory& operator=(ScopedQueryMemory&&) = delete;
+  size_t previous_limit_{0};
 };
 
 // Executes a SELECT and returns its rows.  nullopt means the engine rejected
@@ -1573,6 +1577,31 @@ bool CheckTlpAgg(Database& db, TransactionContext& ctx,
   return true;
 }
 
+// True when the SELECT clause itself is a DISTINCT projection.  A bare
+// substring search for "DISTINCT" also matches "IS [NOT] DISTINCT FROM"
+// inside the WHERE predicate, which must not degrade the bag comparison
+// into a set comparison.
+bool HasDistinctProjection(const std::string& sql) {
+  const size_t select = sql.find("SELECT");
+  if (select == std::string::npos) {
+    return false;
+  }
+  size_t pos = select + 6;
+  while (pos < sql.size() &&
+         (sql[pos] == ' ' || sql[pos] == '\t' || sql[pos] == '\n' ||
+          sql[pos] == '\r')) {
+    ++pos;
+  }
+  if (sql.compare(pos, 8, "DISTINCT") != 0) {
+    return false;
+  }
+  const size_t end = pos + 8;
+  return end == sql.size() ||
+         !(sql[end] == '_' || (sql[end] >= '0' && sql[end] <= '9') ||
+           (sql[end] >= 'A' && sql[end] <= 'Z') ||
+           (sql[end] >= 'a' && sql[end] <= 'z'));
+}
+
 // UNION ALL partitioning: the engine itself must recombine the partitions.
 // Q[p] as a BAG equals part1 UNION ALL part2 UNION ALL part3 (the WHERE
 // splits are disjoint, so plain rows never duplicate across parts).  A
@@ -1596,7 +1625,7 @@ bool CheckUnionAll(Database& db, TransactionContext& ctx,
   }
   std::vector<std::string> s0 = SerializeSorted(*original);
   std::vector<std::string> s1 = SerializeSorted(*merged);
-  if (unionall[0].find("DISTINCT") != std::string::npos) {
+  if (HasDistinctProjection(unionall[0])) {
     s0.erase(std::unique(s0.begin(), s0.end()), s0.end());
     s1.erase(std::unique(s1.begin(), s1.end()), s1.end());
   }

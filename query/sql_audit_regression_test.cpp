@@ -419,6 +419,19 @@ TEST_F(SqlAuditRegressionTest, NamedWindowExtensionsKeepPartition) {
                               Row({Value(2), Value(2), Value(300)})}));
 }
 
+TEST_F(SqlAuditRegressionTest, NamedWindowRejectsClauseRefinement) {
+  Rows("CREATE TABLE audit_window_refine (k INT64, y INT64, x INT64)");
+  // GoogleSQL rejects re-specifying PARTITION BY on a named-window
+  // reference, and ORDER BY when the named window already has one.
+  EXPECT_FALSE(Run("SELECT SUM(x) OVER (w PARTITION BY y) FROM "
+                   "audit_window_refine WINDOW w AS (PARTITION BY k);")
+                   .HasValue());
+  EXPECT_FALSE(Run("SELECT SUM(x) OVER (w ORDER BY y) FROM "
+                   "audit_window_refine WINDOW w AS (PARTITION BY k "
+                   "ORDER BY y);")
+                   .HasValue());
+}
+
 TEST_F(SqlAuditRegressionTest, NestedQueryPreservesEnclosingNamedWindow) {
   Rows("CREATE TABLE audit_nested_window (k INT64, x INT64)");
   Rows("INSERT INTO audit_nested_window VALUES (1, 10), (2, 20)");

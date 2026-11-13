@@ -40,6 +40,7 @@
 
 #include "common/constants.hpp"
 #include "common/platform/time_format.hpp"
+#include "common/string_util.hpp"
 #include "expression/expression.hpp"
 #include "type/collation.hpp"
 #include "type/column_name.hpp"
@@ -375,9 +376,15 @@ bool Like(std::string_view value, std::string_view pattern) {
     if (pattern_pos < pattern.size() && pattern[pattern_pos] == '%') {
       wildcard = pattern_pos++;
       retry = value_pos;
+    } else if (pattern_pos < pattern.size() && pattern[pattern_pos] == '_') {
+      // '_' matches one whole UTF-8 character, not one byte; a truncated
+      // trailing sequence still counts as that one character.
+      value_pos += std::min(
+          Utf8SequenceLength(static_cast<unsigned char>(value[value_pos])),
+          value.size() - value_pos);
+      ++pattern_pos;
     } else if (pattern_pos < pattern.size() &&
-               (pattern[pattern_pos] == '_' ||
-                pattern[pattern_pos] == value[value_pos])) {
+               pattern[pattern_pos] == value[value_pos]) {
       ++value_pos;
       ++pattern_pos;
     } else if (wildcard != std::string_view::npos) {
@@ -723,11 +730,10 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           // One total order on instants for every operator: = and < can no
           // longer both hold for one pair (the former +-8h "equivalent
           // default zone" special case made equality non-transitive).
-          const int cmp = a->seconds != b->seconds
-                              ? (a->seconds < b->seconds ? -1 : 1)
-                              : (a->nanos != b->nanos
-                                     ? (a->nanos < b->nanos ? -1 : 1)
-                                     : 0);
+          const int cmp =
+              a->seconds != b->seconds
+                  ? (a->seconds < b->seconds ? -1 : 1)
+                  : (a->nanos != b->nanos ? (a->nanos < b->nanos ? -1 : 1) : 0);
           switch (op) {
             case BinaryOperation::kEquals:
               return Value(cmp == 0);
@@ -759,11 +765,14 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     const bool is_u = left.IsUnsigned() || right.IsUnsigned();
     auto with_u = [&](const Value& v) { return is_u ? v.WithUnsigned() : v; };
     const int64_t amount = right.value.int_value;
-    if (amount < 0) {
+    // An UNSIGNED shift count >= 2^63 is a huge positive amount (the result
+    // is 0), not a negative offset; only a signed count can be negative.
+    if (amount < 0 && !right.IsUnsigned()) {
       return StatusError(StatusCode::kInvalidArgument,
                          "Bitwise shift by negative offset.");
     }
-    if (amount >= 64) {
+    if (right.IsUnsigned() ? static_cast<uint64_t>(amount) >= 64
+                           : amount >= 64) {
       return with_u(Value(static_cast<int64_t>(0)));
     }
     const auto bits = static_cast<uint64_t>(left.value.int_value);
@@ -864,6 +873,18 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
           left.IsUnsigned() != right.IsUnsigned() &&
           ((!left.IsUnsigned() && left.value.int_value < 0) ||
            (!right.IsUnsigned() && right.value.int_value < 0))) {
+        return left.TryArithmetic(right, op);
+      }
+      // Mixed INT64/UINT64 add/sub/mul whose exact result can be negative
+      // must not take the raw uint64 wraparound below (-5 + 2u produced
+      // 18446744073709551613, -5 * 3u likewise, 3 - 5u wrapped). The exact
+      // 128-bit path in Value::TryArithmetic yields -3 / -15 / -2, or an
+      // overflow error when no 64-bit type holds the result.
+      if (op != BinaryOperation::kModulo &&
+          left.IsUnsigned() != right.IsUnsigned() &&
+          ((!left.IsUnsigned() && left.value.int_value < 0) ||
+           (!right.IsUnsigned() && right.value.int_value < 0) ||
+           (op == BinaryOperation::kSubtract && right.IsUnsigned()))) {
         return left.TryArithmetic(right, op);
       }
       const auto lhs = static_cast<uint64_t>(left.value.int_value);
@@ -1025,10 +1046,9 @@ StatusOr<Value> TryEvaluateBinary(BinaryOperation op, const Value& left,
     // INT64 is a type error for it (ADD/SUB already refuse it), not a
     // 2020-year interval.
     auto is_iv = [](std::string_view s) {
-      const bool timestamp_shaped = s.size() >= 10 && s[4] == '-' &&
-                                    s[7] == '-' &&
-                                    (s.size() == 10 || s[10] == ' ' ||
-                                     s[10] == 'T');
+      const bool timestamp_shaped =
+          s.size() >= 10 && s[4] == '-' && s[7] == '-' &&
+          (s.size() == 10 || s[10] == ' ' || s[10] == 'T');
       return !timestamp_shaped && s.find('-') != std::string_view::npos &&
              s.find(' ') != std::string_view::npos && s.find('-') < s.find(' ');
     };

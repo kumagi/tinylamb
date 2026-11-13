@@ -854,14 +854,16 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
     return {};
   }
 
+  // Key selection is direction-agnostic: |ascending| only reverses the
+  // output order below.  Both bounds are inclusive so a scan returns the
+  // same key set regardless of direction (descending callers reverse the
+  // iterator side, e.g. index/lsm_index.cpp).
   auto in_bounds = [&](std::string_view k) -> bool {
     if (!begin.empty() && k < begin) {
       return false;
     }
-    if (!end.empty()) {
-      if (ascending ? (end < k) : (end <= k)) {
-        return false;
-      }
+    if (!end.empty() && end < k) {
+      return false;
     }
     return true;
   };
@@ -874,7 +876,7 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
                                   [](const LsmSortedRun::Entry& e,
                                      std::string_view b) { return e.key < b; });
     for (; it != run.entries.end(); ++it) {
-      if (!end.empty() && (ascending ? (end < it->key) : (end <= it->key))) {
+      if (!end.empty() && end < it->key) {
         break;
       }
       if (in_bounds(it->key)) {
@@ -885,8 +887,7 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
   auto cmem_it = begin.empty() ? tree->committed_mem.begin()
                                : tree->committed_mem.lower_bound(begin);
   for (; cmem_it != tree->committed_mem.end(); ++cmem_it) {
-    if (!end.empty() &&
-        (ascending ? (end < cmem_it->first) : (end <= cmem_it->first))) {
+    if (!end.empty() && end < cmem_it->first) {
       break;
     }
     if (in_bounds(cmem_it->first)) {
@@ -896,8 +897,7 @@ std::vector<std::pair<std::string, std::string>> PageManager::LsmScanRange(
   auto mem_it = begin.empty() ? tree->memtable.begin()
                               : tree->memtable.lower_bound(begin);
   for (; mem_it != tree->memtable.end(); ++mem_it) {
-    if (!end.empty() &&
-        (ascending ? (end < mem_it->first) : (end <= mem_it->first))) {
+    if (!end.empty() && end < mem_it->first) {
       break;
     }
     if (!in_bounds(mem_it->first)) {
@@ -1719,6 +1719,15 @@ Status PageManager::LoadFuzzyCheckpoint(lsn_t* replay_start_lsn_out,
     committed_max_page_id_ = max_page_id_;
     blocks_[pid] = std::move(page);
   }
+
+  // A crafted or inconsistent checkpoint could list a free-list pid that
+  // aliases a live block or exceeds the allocated id space;
+  // AllocateNewPage would hand that pid out and PageInit would wipe the
+  // committed page.  Legitimate writers only push allocated pids <=
+  // max_page_id_, so drop anything else instead of trusting the list.
+  std::erase_if(free_pages_, [&](page_id_t fpid) {
+    return fpid > max_page_id_ || blocks_.contains(fpid);
+  });
 
   uint32_t num_trees = 0;
   if (!ConsumeU32(buf.data(), payload_size, &off, &num_trees) ||
