@@ -5,13 +5,15 @@
 namespace tinylamb {
 
 class SelectStatement;
+class TransactionContext;
 
-// Null-rejecting WHERE conjuncts make the NULL-padded rows of a LEFT JOIN
-// unreachable, so the outer join can be planned as an inner join. Rewrites
-// every source whose join_type is kLeft into kInner when the statement's
-// WHERE clause rejects its NULL padding (§7.5). Returns true when any join
-// kind changed.
-bool ReduceOuterJoins(SelectStatement* statement);
+// Null-rejecting WHERE conjuncts (or null-rejecting HAVING conjuncts when
+// every aggregate is a non-COUNT(*) strict fold over the padded side) make the
+// NULL-padded rows of an outer join unreachable, so the outer join can be
+// planned as an inner join (§7.5, Lean Theorem 4-3). Returns true when any
+// join kind changed.
+bool ReduceOuterJoins(SelectStatement* statement,
+                      TransactionContext* ctx = nullptr);
 
 }  // namespace tinylamb
 

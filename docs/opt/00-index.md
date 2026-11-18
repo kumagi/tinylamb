@@ -11,7 +11,7 @@
 - 第2部のファイルパスは `part2-rules/<種別>/<rule-name>.md`(表では種別列で省略)。
 - 分類(A〜K など)は暫定。執筆時に前後してもよい(AGENTS.md §11)。
 
-進捗サマリ: 全 171 ファイル（基礎編 7、第 2 部 162、管理文書 2。2026-11-11 実ファイル数）の原稿を作成済み。
+進捗サマリ: 全 182 ファイル（基礎編 7、第 2 部 173 [論理 91・実装 46・式個別 36]、管理文書 2。2026-11-18 照合）の原稿を作成済み。
 2026-09-20 に全原稿の日本語を再点検し、敬体の統一、重複の削除、直訳調・冗長表現の修正を実施した。内容とコード引用のレビュー状況は、以下の表にある各章の状態で管理する。
 
 ## 第1部 基礎編(`part1-foundations/`)
@@ -49,7 +49,7 @@
 - [limit_prefix_ordered_window](part2-rules/logical/limit_prefix_ordered_window.md)
 - [json_family_constant_fold](part2-rules/expression/json_family_constant_fold.md)
 
-### 論理 Rule(86 本)
+### 論理 Rule(91 本)
 
 | Rule 名 | 分類 | 状態 |
 |---|---|---|
@@ -130,12 +130,17 @@
 | `union_all_merge` | J 集合演算 | draft |
 | `values_fold_into_union` | J 集合演算 | draft |
 | `push_not_through_expression` | K その他 | draft |
-| `semi_reduction_pushdown_semi_join` | 現行登録 | 要更新 |
-| `semi_reduction_pushdown_anti_join` | 現行登録 | 要更新 |
-| `topn_push_through_proven_one_to_one_join` | 現行登録 | 要更新 |
-| `or_to_union` | 現行登録 | 要更新 |
-| `distinct_eager_over_join` | 現行登録 | 要更新 |
-| `topn_push_through_union_all` | 現行登録 | 要更新 |
+| `semi_reduction_pushdown_semi_join` | 現行登録 | draft |
+| `semi_reduction_pushdown_anti_join` | 現行登録 | draft |
+| `topn_push_through_proven_one_to_one_join` | 現行登録 | draft |
+| `or_to_union` | 現行登録 | draft |
+| `distinct_eager_over_join` | 現行登録 | draft |
+| `topn_push_through_union_all` | 現行登録 | draft |
+| `distinct_idempotent_aggregate_elimination` | F 集約 | draft |
+| `inner_join_to_semijoin_idempotent_aggs` | F 集約 | draft |
+| `having_extremum_bound_pushdown` | F 集約 | draft |
+| `outer_to_inner_join_on_null_rejecting_having` | H 結合種別 | draft |
+| `eager_aggregation_over_join` | F 集約 | draft |
 
 ### 実装 Rule(46 本)
 
@@ -181,17 +186,18 @@
 | `apply` | その他 | draft |
 | `recursive_cte` | その他 | draft |
 | `window` | その他 | draft |
-| `sample` | 現行登録 | 要更新 |
+| `sample` | 現行登録 | done |
 | `sort_incremental` | 現行登録 | draft |
-| `sort_external_merge` | 現行登録 | 要更新 |
-| `band_join` | 現行登録 | 要更新 |
-| `zigzag_join` | 現行登録 | 要更新 |
-| `late_materialization_join` | 現行登録 | 要更新 |
+| `sort_external_merge` | 現行登録 | draft |
+| `band_join` | 現行登録 | draft |
+| `zigzag_join` | 現行登録 | draft |
+| `late_materialization_join` | 現行登録 | draft |
 
-### 式書き換え Rule — 個別章(38 本)
+### 式書き換え Rule — 個別章(36 本、第 70 章 35 本と合わせて全 71 本)
 
 | Rule 名 | 状態 |
 |---|---|
+| `json_family_constant_fold` | review |
 | `de_morgan` | draft |
 | `not_comparison` | draft |
 | `not_like` | draft |

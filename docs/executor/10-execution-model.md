@@ -71,7 +71,7 @@ NextBatch(列指向バッチの出力先, 最大行数) -> 返した行数
 | 完全ストリーミング | `Selection`、`Projection`、`Limit` | 最初の入力行またはバッチ |
 | 片側をブロック | `HashJoin`、`NestedLoopJoin` | ハッシュ表の構築側または右側の実体化後 |
 | 全体をブロック | `Sort`、`Window`、グルーピング集合 | 全入力の読み終わり後 |
-| 明示的な境界 | `Materialize`、`Exchange` | 入力を保持または分配した後 |
+| OOC シンク境界 | `OocHashJoinSink`、`OocSortSink`、`OocGroupAggSink`、`OocWindowSink`、`OocSetOpSink`、`Relation` | `PipelineGraph` の上流ステージ完了・Finalize 後 |
 
 パイプライン化には三つの利点がある。
 
@@ -175,3 +175,11 @@ q-error = max(actual, estimated) / max(min(actual, estimated), 1)
 ```
 
 1 に近いほど推定が良く、大きいほど過大・過小推定が深刻である。行数プローブはデータを変えずにこの情報と経過時間を記録し、物理アルゴリズム選択の検証に使える。
+
+## 12. パイプライン実行と OOC シンク（現在の既定経路）
+
+`TINYLAMB_EXEC_ENGINE` が未設定または `!= legacy` の場合、`SqlEngine` は旧 `PlanBase::EmitExecutor` 木（Volcano プル型）を直接組み立てる代わりに、以下の 2 系統の既定経路を使用する（最上位は引き続き `ExecutorBase::NextBatch` 互換のプルカーソルとして公開される）。
+
+- **パイプライン低下 (`PipelineLowering` / `GroupedPipelineLowering`)**: `executor/pipeline_lowering.hpp` と `query/grouped_pipeline_lowering.hpp` が物理 `Plan` 木を `PipelineGraph`（`executor/detail/pipeline/pipeline_ir.hpp`）のステージ DAG へ変換する。ストリーミング葉（`FullScan`、`IndexScan` 等）は `StreamingExecutorSource` としてバッファなしで供給し、ブロッキング演算子は `executor/detail/pipeline/ooc_*.cpp` の OOC シンク/ソース（`OocSortSink`, `OocDistinctSink`, `OocHashJoinSink`, `OocGroupAggSink`, `OocWindowSink`, `OocSetOpSink`, `OocIncrementalSortSink`, `OocMergeJoinSource`, `OocBandJoinSource`, `OocRecursiveCteSource`, `OocApplySource` 等）へ低下する。
+- **直接 TLCS カラムナ高速経路 (`ColumnarTlcsScanExecutor`)**: 永続 TLCS ファイル上の単純スキャン・選択・Top-N に対して、行変換や一般実行器木を省いた直接スキャンを行う。
+- **`TINYLAMB_EXEC_ENGINE=legacy`**: §1〜§4 で述べた従来の `ExecutorBase` 演算子木（`relational_factory.cpp`）へ切り替える A/B 退避スイッチ。

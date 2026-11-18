@@ -98,12 +98,12 @@ Rule の処理本体は `memo.AddExpression(group, memo.NewJoin(expression.child
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `DefaultRulesEnumerateEquivalentJoinTreesInMemo`
+- `plan/cascades_test_part*.cpp` の `DefaultRulesEnumerateEquivalentJoinTreesInMemo`
   — 3 表の Group を探索すると `ExpressionCount(root) >= 4` となり、
   元の順・交換した順の式が揃うことを検査します。
-- `plan/cascades_test.cpp` の `AppliedRuleNamesTrackFiredRules` —
+- `plan/cascades_test_part*.cpp` の `AppliedRuleNamesTrackFiredRules` —
   `search.AppliedRuleNames().contains("join_commutativity")` で実際に
   発火したことを記録ベースで検査します。
-- `plan/optimizer_test.cpp` の `JoinChainMatchesGoldenResultUnderRuleSubsets`
+- `plan/optimizer_test_part*.cpp` の `JoinChainMatchesGoldenResultUnderRuleSubsets`
   — `join_commutativity` を含む 4 つの順序系 Rule を組み合わせで
   無効化しても結果行(golden)が変わらないことを検査します。

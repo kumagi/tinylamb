@@ -7,8 +7,7 @@
 // superset for the probe scan: a probe row whose join key is not in the build
 // key domain cannot produce a single join match, so the scan may drop it
 // before decoding, indexing, or feeding the probe hash lookup.  Three filter
-// shapes trade memory for rejection power (docs/todo.md Phase 2 "Dynamic
-// Filter Join / SIP / Bloom"):
+// shapes trade memory for rejection power (the dynamic filter join design):
 //
 //   kExactSet  information passing: the distinct build keys themselves.
 //              No false positives, 8 bytes/key, chosen while the domain is
@@ -211,7 +210,9 @@ class RejectAllRuntimeFilter final : public RuntimeFilter {
 // immutable once the group is built.
 class RuntimeFilterGroup final {
  public:
-  static constexpr uint64_t kMaxDenseSpan = 33'554'432ULL;
+  // 2^27 bits = 2^21 words = ~16 MiB of dense bitmap, matching the
+  // kMaxTrackedKeys scale. Beyond this the dense form is too large.
+  static constexpr uint64_t kMaxDenseSpan = 134'217'728ULL;
 
   RuntimeFilterGroup() = default;
   explicit RuntimeFilterGroup(
@@ -362,11 +363,12 @@ class RuntimeFilterBuilder {
   // range+membership pair; 4096 keys is 32 KiB, already more than the probe
   // scan saves in a typical plan.
   static constexpr size_t kMaxExactKeys = 4096;
-  // Hard cap on retained keys (2M keys = 16 MiB). Beyond it only the running
+  // Hard cap on retained keys (2M keys ~ 15.3 MiB). Beyond it only the running
   // [lo, hi] enclosure survives.
   static constexpr size_t kMaxTrackedKeys = 2000000;
 
   void Observe(int64_t key);
+  void Observe(std::span<const int64_t> keys);
   void Reserve(size_t count) {
     keys_.reserve(std::min(count, kMaxTrackedKeys));
   }

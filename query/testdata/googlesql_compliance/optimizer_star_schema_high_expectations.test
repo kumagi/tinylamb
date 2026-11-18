@@ -70,7 +70,7 @@ ARRAY<STRUCT<total INT64>>[{410}]
 ==
 
 # NOTE: Cascades column resolution bug (column type not found) - pre-existing
-# [star_join_orders_selective_dimensions_before_fact] removed temporarily
+# [star_join_orders_selective_dimensions_before_fact] removed temporarily (no tracking issue)
 
 [mode=explain]
 [plan_contains=HashJoin]

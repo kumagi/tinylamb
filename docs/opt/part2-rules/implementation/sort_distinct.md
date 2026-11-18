@@ -96,7 +96,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part2.cpp`:
   - `OptimizerTest.SortDistinctRuleAddsSortForUnorderedInput`: 未ソート入力に対して `"sort_distinct"` を適用した際、`SortDistinctPlan` の直下に `SortPlan` が自動挿入されることを検証。
 
 2026-10-02 更新: 連続する行の比較は hash set 構築より軽いとして、局所コストを

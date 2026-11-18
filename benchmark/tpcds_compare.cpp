@@ -31,33 +31,40 @@ using namespace tinylamb;
 std::string Json(std::string_view text) {
   std::string out = "\"";
   constexpr std::string_view hex = "0123456789abcdef";
-  for (const unsigned char c : text) {
+  for (const char raw_c : text) {
+    const auto c = static_cast<unsigned char>(raw_c);
     if (c == '"' || c == '\\') {
       out += '\\';
-      out += static_cast<char>(c);
+      out += raw_c;
     } else if (c < 32) {
       out += "\\u00";
-      out += hex[c >> 4];
-      out += hex[c & 15];
+      out += hex[static_cast<size_t>(c >> 4U)];
+      out += hex[static_cast<size_t>(c & 15U)];
     } else {
-      out += static_cast<char>(c);
+      out += raw_c;
     }
   }
   return out + '"';
 }
 
-std::vector<std::string_view> Split(std::string_view line) {
-  std::vector<std::string_view> fields;
+void SplitInto(std::string_view line, std::vector<std::string_view>& fields) {
+  fields.clear();
   size_t begin = 0;
   for (;;) {
     const size_t end = line.find('\t', begin);
     fields.push_back(
         line.substr(begin, end == std::string_view::npos ? end : end - begin));
     if (end == std::string_view::npos) {
-      return fields;
+      return;
     }
     begin = end + 1;
   }
+}
+
+std::vector<std::string_view> Split(std::string_view line) {
+  std::vector<std::string_view> fields;
+  SplitInto(line, fields);
+  return fields;
 }
 
 template <class T>
@@ -107,11 +114,14 @@ void Ddl(Database& db, std::string_view sql) {
   Check(ctx.PreCommit());
 }
 
-void Load(Database& db, const std::filesystem::path& directory) {
+void Load(Database& db, const std::filesystem::path& directory,
+          bool compact_after) {
   std::ifstream manifest(directory / "manifest.tsv");
   if (!manifest) {
     throw std::runtime_error("cannot read manifest");
   }
+  std::vector<std::string> loaded_tables;
+  std::vector<std::string_view> cells;
   std::string line;
   while (std::getline(manifest, line)) {
     const auto fields = Split(line);
@@ -122,6 +132,7 @@ void Load(Database& db, const std::filesystem::path& directory) {
     const std::string kinds(fields[1]);
     const auto expected = Number<size_t>(fields[2]);
     Ddl(db, fields[3]);
+    loaded_tables.push_back(table);
     std::ifstream input(directory / (table + ".tsv"));
     if (!input) {
       throw std::runtime_error("cannot read " + table);
@@ -135,7 +146,7 @@ void Load(Database& db, const std::filesystem::path& directory) {
     size_t count = 0;
     std::string record;
     while (std::getline(input, record)) {
-      const auto cells = Split(record);
+      SplitInto(record, cells);
       if (cells.size() != kinds.size()) {
         throw std::runtime_error("field count: " + table);
       }
@@ -169,6 +180,9 @@ void Load(Database& db, const std::filesystem::path& directory) {
       }
       if (++count % 10000 == 0) {
         Check(ctx.PreCommit());
+        if (count % 1000000 == 0) {
+          std::cerr << "loading " << table << ' ' << count << '\n';
+        }
         ctx = db.BeginContext();
         auto reopened = db.GetTable(ctx, table);
         if (!reopened.HasValue()) {
@@ -186,7 +200,19 @@ void Load(Database& db, const std::filesystem::path& directory) {
   if (!manifest.eof()) {
     throw std::runtime_error("manifest read failed");
   }
+  if (compact_after) {
+    for (const auto& table : loaded_tables) {
+      auto ctx = db.BeginContext();
+      Check(db.CompactTableToTlcs(ctx, table));
+      Check(ctx.PreCommit());
+      std::cerr << "compacted " << table << '\n';
+    }
+  }
   Ddl(db, "ANALYZE");
+  if (compact_after) {
+    Check(db.WriteCheckpoint().GetStatus());
+    std::cerr << "checkpointed\n";
+  }
 }
 
 void WriteValue(const Value& v) {
@@ -255,10 +281,12 @@ void Query(Database& db, std::string_view sql, bool profile) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  const std::string_view mode = argc >= 3 ? std::string_view(argv[2]) : "";
   if (argc < 4 || argc > 6 ||
-      (std::string_view(argv[2]) != "--load" &&
-       std::string_view(argv[2]) != "--serve")) {
-    std::cerr << "usage: tinylamb_tpcds_compare DB --load DATASET | DB --serve "
+      (mode != "--load" && mode != "--load-compact" && mode != "--serve" &&
+       mode != "--compact")) {
+    std::cerr << "usage: tinylamb_tpcds_compare DB --load DATASET | DB "
+                 "--load-compact DATASET | DB --compact TABLE | DB --serve "
                  "QUERY_DIR\n";
     return 2;
   }
@@ -266,7 +294,9 @@ int main(int argc, char** argv) {
     // Match the comparison drivers' UTC session, independently of the
     // engine's GoogleSQL-compatible default or the host's TZ environment.
     tinylamb::SetDefaultTimeZone("UTC");
-    const bool loading = std::string_view(argv[2]) == "--load";
+    const bool loading = mode == "--load" || mode == "--load-compact";
+    const bool load_compact = mode == "--load-compact";
+    const bool compacting = mode == "--compact";
     const bool exists = std::filesystem::exists(std::string(argv[1]) + ".db");
     if (loading == exists) {
       throw std::runtime_error(loading ? "database already exists"
@@ -278,7 +308,14 @@ int main(int argc, char** argv) {
     }
     auto& db = *opened.Value();
     if (loading) {
-      Load(db, argv[3]);
+      Load(db, argv[3], load_compact);
+    } else if (compacting) {
+      auto ctx = db.BeginContext();
+      Check(db.CompactTableToTlcs(ctx, argv[3]));
+      Check(ctx.PreCommit());
+      Ddl(db, "ANALYZE");
+      Check(db.WriteCheckpoint().GetStatus());
+      std::cerr << "compacted " << argv[3] << '\n';
     } else {
       const size_t threads = argc >= 5 ? Number<size_t>(argv[4]) : 1;
       if (threads == 0) {

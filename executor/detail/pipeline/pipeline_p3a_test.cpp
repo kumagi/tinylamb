@@ -211,7 +211,7 @@ TEST(PipelineP3aTest, OocGroupAggSinkSpillsCombinableDistinctAndHandlesSkew) {
     EXPECT_TRUE(out[0][1].IsNull());
   }
 
-  // High-cardinality combinable GROUP BY (COUNT, SUM, MIN, MAX) + heavy skew!
+  // High-cardinality combinable GROUP BY (COUNT, SUM) + heavy skew!
   {
     constexpr int kRows = 6000;
     std::vector<Row> input;
@@ -355,7 +355,7 @@ TEST(PipelineP3aTest, OocHashJoinCoversAllKindsSpillAndSkewFallback) {
     return std::make_pair(std::move(res), exec.Metrics());
   };
 
-  // Build > 64 KiB + skewed key 10 (500 duplicates in build & 4 in probe).
+  // Build > 64 KiB + skewed key 10 (480 duplicates in build & 1 in probe).
   const std::string pad(150, 'J');
   std::vector<Row> heavy_build;
   for (int i = 0; i < 600; ++i) {

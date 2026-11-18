@@ -55,3 +55,12 @@ stale edge cannot fabricate a phantom cycle.
   queues that make forward progress do not time out.
 - Version chains and write intents are sharded across 256 `VersionShard`s by
   `(page_id * 131 + slot) % 256`.
+
+## Statement timeout
+
+Long-running statements (including slow result consumers) can pin MVCC
+snapshots and WAL retention (`Transaction::BeginStatementTimer` /
+`CheckStatementTimeout` in `transaction/transaction.cpp`). Setting
+`TINYLAMB_STATEMENT_TIMEOUT_MS` (or calling
+`Transaction::SetStatementTimeout`) caps execution duration in milliseconds;
+`0` (the default) disables the per-statement deadline.

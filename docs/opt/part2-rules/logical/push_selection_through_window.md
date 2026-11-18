@@ -167,7 +167,7 @@ PARTITION BY 列でフィルタしても**パーティションの構成員が�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part3.cpp` の
   `CascadesTest.PushSelectionThroughWindowOnPartitionColumns` —
   `part_col = 10 AND rn <= 5` のうち `part_col = 10` が Window の下の
   Selection として現れる(部分押し込み)ことを検証します。

@@ -96,6 +96,6 @@ const double estimate =
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.CascadesSemiAndAntiJoinImplementationsUseHashJoinKind`: `kAntiJoin` が `AntiJoinKind` を保持してプローブ側スキーマ幅で生成されること。
-- `plan/optimizer_test.cpp` の `OptimizerTest.NotExistsBecomesAntiJoin` / `OptimizerTest.NotInWithNotNullKeysBecomesAntiJoin`: `NOT EXISTS` や NOT NULL キーの `NOT IN` が反結合へと変換されること。
-- `plan/optimizer_test.cpp` の `HashJoinKindTest.AntiJoinKeepsUnmatchedRowsOnly`: 実行時における反結合セマンティクスの厳密な充足。
+- `plan/optimizer_test_part*.cpp` の `OptimizerTest.CascadesSemiAndAntiJoinImplementationsUseHashJoinKind`: `kAntiJoin` が `AntiJoinKind` を保持してプローブ側スキーマ幅で生成されること。
+- `plan/optimizer_test_part*.cpp` の `OptimizerTest.NotExistsBecomesAntiJoin` / `OptimizerTest.NotInWithNotNullKeysBecomesAntiJoin`: `NOT EXISTS` や NOT NULL キーの `NOT IN` が反結合へと変換されること。
+- `plan/optimizer_test_part*.cpp` の `HashJoinKindTest.AntiJoinKeepsUnmatchedRowsOnly`: 実行時における反結合セマンティクスの厳密な充足。

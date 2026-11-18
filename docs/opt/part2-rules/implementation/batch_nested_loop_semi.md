@@ -124,4 +124,4 @@ return {PlanAlternative{.plan = std::move(join),
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: 非等値半結合が `SemiJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` に変換され、`BatchNestedLoopJoin` により 99 行の正しい結果が出力されることを検証。
+- `plan/optimizer_test_part2.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: 非等値半結合が `SemiJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` に変換され、`BatchNestedLoopJoin` により 99 行の正しい結果が出力されることを検証。

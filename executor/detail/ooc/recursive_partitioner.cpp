@@ -414,9 +414,14 @@ Status RecursivePartitioner::Finalize(PartitionLeafSet* result_out) {
   root_writers_.clear();
 
   const size_t budget = EffectiveBudgetBytes();
+  // The fanout is fixed at tree creation: recomputing it from the CURRENT
+  // budget would let an active-consumer change shrink or grow the split
+  // factor mid-tree, so children would no longer be refinements of the
+  // parent split and the root's leaf-size guarantee would erode (skew
+  // fallbacks spike). A budget change only re-sizes the writer buffers.
   size_t child_writer_buf = 16384;
-  const uint32_t child_fanout_bits =
-      ComputeFanoutBits(budget, &child_writer_buf);
+  (void)ComputeFanoutBits(budget, &child_writer_buf);
+  const uint32_t child_fanout_bits = root_fanout_bits_;
 
   while (!pending_guard.items.empty()) {
     PendingPartition part = pending_guard.items.back();

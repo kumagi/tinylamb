@@ -52,9 +52,6 @@ std::optional<uint64_t> ConstantRows(const Expression& expression) {
   if (!value.IsUnsigned() && value.value.int_value < 0) {
     return std::nullopt;
   }
-  if (value.IsUnsigned()) {
-    return static_cast<uint64_t>(value.value.int_value);
-  }
   return static_cast<uint64_t>(value.value.int_value);
 }
 

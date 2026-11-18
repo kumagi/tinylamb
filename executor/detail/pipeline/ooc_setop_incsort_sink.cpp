@@ -210,6 +210,12 @@ bool SameSetRow(const Row& left, const Row& right, size_t compare_cols) {
       if (CompareForOrderBy(a, b) != 0) {
         return false;
       }
+    } else if (a.type == ValueType::kVarChar) {
+      // Same SQL-equality contract as the legacy SetOperationRowEqual: a
+      // case-insensitive VARCHAR pair is one row, matching `=` and DISTINCT.
+      if (!EqualUnderCollation(a, b)) {
+        return false;
+      }
     } else if (!(a == b)) {
       return false;
     }
@@ -234,6 +240,13 @@ struct SetRowPrefixHash {
         uint64_t bits = 0;
         std::memcpy(&bits, &pos_zero, sizeof(double));
         h = std::hash<uint64_t>{}(bits);
+      } else if (v.type == ValueType::kVarChar && !v.IsInterval()) {
+        // EqualUnderCollation folds a case-insensitive VARCHAR pair, so both
+        // peers must land in the same bucket. Fold every text cell: a single
+        // CI tag resolves the comparison for both operands (distinct.cpp's
+        // DistinctRowHash pattern).
+        h = std::hash<std::string>{}(
+            FoldCaseForCollation(v.value.varchar_value));
       } else {
         h = std::hash<Value>{}(v);
       }
@@ -515,7 +528,7 @@ class OocSetOpOutputSource final : public PipelineSource {
           auto it = counts.find(tagged);
           if (it == counts.end()) {
             const size_t add_bytes =
-                EstimateRowMemoryBytes(tagged) * 2 + num_sources_ * 8 + 64;
+                (EstimateRowMemoryBytes(tagged) * 2) + (num_sources_ * 8) + 64;
             if (grant_cache_.has_value() && !ordered_keys.empty() &&
                 !grant_cache_->Reserve(add_bytes)) {
               grant_exhausted = true;
@@ -621,9 +634,13 @@ std::vector<ValueType> InferCommonTypes(
       if (c < inputs[s].schema.ColumnCount()) {
         StatusOr<ValueType> unified =
             CommonSetValueType(cur, inputs[s].schema.GetColumn(c).Type());
-        if (unified.HasValue()) {
-          cur = unified.Value();
+        if (!unified.HasValue()) {
+          // Carry the failure as an invalid type; Open() reports it instead
+          // of silently coercing every branch to the first branch's type.
+          cur = ValueType::kNull;
+          break;
         }
+        cur = unified.Value();
       }
     }
     types[c] = cur;
@@ -643,6 +660,12 @@ OocConcatSource::OocConcatSource(std::vector<OocSetOpInputStream> inputs,
       common_types_(InferCommonTypes(inputs_, common_types)) {}
 
 Status OocConcatSource::Open(PipelineContext* ctx) {
+  for (const ValueType type : common_types_) {
+    if (type == ValueType::kNull) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "set operation inputs have incompatible types");
+    }
+  }
   opened_ = true;
   active_idx_ = 0;
   if (!inputs_.empty()) {
@@ -852,9 +875,11 @@ OocSetOpCoordinator::OocSetOpCoordinator(SetOperationKind operation,
         if (c < child_schemas[s].ColumnCount()) {
           StatusOr<ValueType> unified =
               CommonSetValueType(cur, child_schemas[s].GetColumn(c).Type());
-          if (unified.HasValue()) {
-            cur = unified.Value();
+          if (!unified.HasValue()) {
+            cur = ValueType::kNull;
+            break;
           }
+          cur = unified.Value();
         }
       }
       common_types_[c] = cur;
@@ -913,6 +938,12 @@ Status OocSetOpCoordinator::TransitionToSpill(PipelineContext* ctx) {
 Status OocSetOpCoordinator::ConsumeFromSource(PipelineContext* ctx,
                                               size_t source_idx,
                                               const DataChunk& input) {
+  for (const ValueType type : common_types_) {
+    if (type == ValueType::kNull) {
+      return StatusError(StatusCode::kInvalidArgument,
+                         "set operation inputs have incompatible types");
+    }
+  }
   if (!initialized_) {
     initialized_ = true;
     consumer_guard_.emplace(&ctx->grant);
@@ -1776,6 +1807,10 @@ Status OocMultiIndexCoveringSource::BuildFallbackScan(PipelineContext* ctx) {
                        "MultiIndexCoveringScan fallback factory unavailable");
   }
   fallback_source_ = fallback_factory_(ctx);
+  if (fallback_source_ == nullptr) {
+    return StatusError(StatusCode::kUnknown,
+                       "MultiIndexCoveringScan fallback factory returned no source");
+  }
   return Status::kSuccess;
 }
 

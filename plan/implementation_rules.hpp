@@ -11,7 +11,7 @@
 
 namespace tinylamb {
 
-// Default physical implementation rules (Phase 4): scans, joins and the
+// Default physical implementation rules: scans, joins and the
 // root-layer operators read their filter / condition payloads from the memo
 // and their catalog data from the explicit RuleContext (D4) instead of a
 // thread-local closure.

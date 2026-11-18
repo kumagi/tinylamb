@@ -152,6 +152,22 @@ TEST_F(MergeTest, InsertColumnListReordersAndLeavesMissingCellsNull) {
   EXPECT_EQ(CellText(rows[0], 2), "7");
 }
 
+TEST_F(MergeTest, NotMatchedInsertAppliesDeclaredDefaultsToOmittedColumns) {
+  // Omitted columns take the declared DEFAULT, matching the INSERT
+  // statement path; a column the clause assigns NULL keeps NULL.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE dflt (a INT64, b INT64 DEFAULT 42, s STRING);");
+  RunSql(engine_.get(), context_.get(),
+         "MERGE INTO dflt USING (SELECT 99 AS k, CAST(NULL AS STRING) AS nv) "
+         "AS s ON dflt.a = s.k "
+         "WHEN NOT MATCHED THEN INSERT (a, s) VALUES (s.k, s.nv);");
+  const std::vector<Row> rows = RunSql(
+      engine_.get(), context_.get(), "SELECT a, b, s FROM dflt WHERE a = 99;");
+  ASSERT_EQ(rows.size(), 1);
+  EXPECT_EQ(CellText(rows[0], 1), "42");
+  EXPECT_TRUE(rows[0].values_[2].IsNull());
+}
+
 TEST_F(MergeTest, MultipleMatchingSourceRowsAreRejected) {
   RunSql(engine_.get(), context_.get(), "INSERT INTO src VALUES (2, 'dup2');");
   try {
@@ -225,6 +241,193 @@ TEST_F(MergeTest, ForeignKeyEnforcedOnInsertAndUpdate) {
     EXPECT_NE(std::string(error.what()).find("foreign key"), std::string::npos)
         << error.what();
   }
+}
+
+TEST_F(MergeTest, ForeignKeyEnforcedOnParentKeyUpdate) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE parent (pk INT64, PRIMARY KEY (pk));");
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE child (fk INT64, FOREIGN KEY (fk) REFERENCES "
+         "parent (pk));");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO parent VALUES (10), (20);");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO child VALUES (10);");
+  // Rekeying a parent row that a child still references must fail on the
+  // MERGE path, exactly like a plain UPDATE does in executor/update.cpp.
+  try {
+    RunSql(engine_.get(), context_.get(),
+           "MERGE INTO parent USING (SELECT 10 AS k) AS s ON parent.pk = s.k "
+           "WHEN MATCHED THEN UPDATE SET pk = 30;");
+    FAIL() << "expected a foreign key rejection";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("referenced by"),
+              std::string::npos)
+        << error.what();
+  }
+  // The desugared UPDATE...FROM goes through the same machinery.
+  try {
+    RunSql(engine_.get(), context_.get(),
+           "UPDATE parent SET pk = 30 FROM (SELECT 10 AS k) AS s "
+           "WHERE parent.pk = s.k;");
+    FAIL() << "expected a foreign key rejection";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("referenced by"),
+              std::string::npos)
+        << error.what();
+  }
+  // Both rejections left the parent untouched.
+  EXPECT_EQ(RunSql(engine_.get(), context_.get(),
+                   "SELECT pk FROM parent ORDER BY pk;")
+                .size(),
+            2);
+  // Rekeying a parent row nobody references is still allowed.
+  RunSql(engine_.get(), context_.get(),
+         "MERGE INTO parent USING (SELECT 20 AS k) AS s ON parent.pk = s.k "
+         "WHEN MATCHED THEN UPDATE SET pk = 40;");
+  const std::vector<Row> rows = RunSql(engine_.get(), context_.get(),
+                                       "SELECT pk FROM parent ORDER BY pk;");
+  ASSERT_EQ(rows.size(), 2);
+  EXPECT_EQ(CellText(rows[0], 0), "10");
+  EXPECT_EQ(CellText(rows[1], 0), "40");
+}
+
+TEST_F(MergeTest, SelfReferencingForeignKeyAcceptsInStatementForwardKey) {
+  // A self-referencing edge (mgr REFERENCES emp(id) on emp itself) reads the
+  // multiset the statement is extending. executor/insert.cpp publishes every
+  // row it inserts (note_inserted_row), so INSERT INTO emp VALUES (2,1),
+  // (3,2) accepts the forward reference; MERGE must not be stricter.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE emp (id INT64, mgr INT64, FOREIGN KEY (mgr) REFERENCES "
+         "emp (id));");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO emp VALUES (1, NULL);");
+  RunSql(engine_.get(), context_.get(),
+         "MERGE INTO emp USING (SELECT 2 AS id, 1 AS mgr UNION ALL "
+         "SELECT 3 AS id, 2 AS mgr) AS s ON emp.id = s.id "
+         "WHEN NOT MATCHED THEN INSERT (id, mgr) VALUES (s.id, s.mgr);");
+  const std::vector<Row> rows =
+      RunSql(engine_.get(), context_.get(), "SELECT id, mgr FROM emp;");
+  ASSERT_EQ(rows.size(), 3);
+
+  // Plain INSERT keeps the same answer (the asymmetry this pins).
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE emp2 (id INT64, mgr INT64, FOREIGN KEY (mgr) REFERENCES "
+         "emp2 (id));");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO emp2 VALUES (1, NULL), (2, 1), (3, 2);");
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT id FROM emp2;").size(), 3);
+  // A key no row publishes is still rejected inside one statement.
+  try {
+    RunSql(engine_.get(), context_.get(),
+           "MERGE INTO emp2 USING (SELECT 4 AS id, 77 AS mgr) AS s "
+           "ON emp2.id = s.id "
+           "WHEN NOT MATCHED THEN INSERT (id, mgr) VALUES (s.id, s.mgr);");
+    FAIL() << "expected a foreign key rejection";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("foreign key"), std::string::npos)
+        << error.what();
+  }
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT id FROM emp2;").size(), 3);
+}
+
+TEST_F(MergeTest, SelfReferencingForeignKeyFollowsUpdateReweys) {
+  // The parent multiset must be re-seeded after the UPDATE phase: an UPDATE
+  // that rekeys this very table removes the old key and publishes the new
+  // one, so a later INSERT of the same statement may reference the new key
+  // and must not be allowed to reference the removed one.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE e2 (id INT64, mgr INT64, FOREIGN KEY (mgr) REFERENCES "
+         "e2 (id));");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO e2 VALUES (1, NULL);");
+  RunSql(engine_.get(), context_.get(),
+         "MERGE INTO e2 USING (SELECT 1 AS id, 0 AS mgr UNION ALL "
+         "SELECT 9 AS id, 5 AS mgr) AS s ON e2.id = s.id "
+         "WHEN MATCHED THEN UPDATE SET id = 5 "
+         "WHEN NOT MATCHED THEN INSERT (id, mgr) VALUES (s.id, s.mgr);");
+  const std::vector<Row> rows =
+      RunSql(engine_.get(), context_.get(), "SELECT id, mgr FROM e2;");
+  ASSERT_EQ(rows.size(), 2);
+  // The UPDATE phase rekeyed row 1 to 5 and the INSERT phase followed it.
+  bool saw_five = false;
+  bool saw_nine_on_five = false;
+  for (const Row& row : rows) {
+    saw_five = saw_five || CellText(row, 0) == "5";
+    saw_nine_on_five = saw_nine_on_five ||
+                       (CellText(row, 0) == "9" && CellText(row, 1) == "5");
+  }
+  EXPECT_TRUE(saw_five) << "rekeyed parent row missing";
+  EXPECT_TRUE(saw_nine_on_five) << "insert must see the rekeyed parent";
+
+  // Same shape, but the INSERT references the key the UPDATE removed.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE e3 (id INT64, mgr INT64, FOREIGN KEY (mgr) REFERENCES "
+         "e3 (id));");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO e3 VALUES (1, NULL);");
+  try {
+    RunSql(engine_.get(), context_.get(),
+           "MERGE INTO e3 USING (SELECT 1 AS id, 0 AS mgr UNION ALL "
+           "SELECT 9 AS id, 1 AS mgr) AS s ON e3.id = s.id "
+           "WHEN MATCHED THEN UPDATE SET id = 5 "
+           "WHEN NOT MATCHED THEN INSERT (id, mgr) VALUES (s.id, s.mgr);");
+    FAIL() << "expected a foreign key rejection";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("foreign key"), std::string::npos)
+        << error.what();
+  }
+  // The rejected INSERT never landed, whatever the statement-time rollback
+  // does with the UPDATE phase that already ran.
+  const std::vector<Row> survivors =
+      RunSql(engine_.get(), context_.get(), "SELECT id, mgr FROM e3;");
+  bool saw_nine = false;
+  for (const Row& survivor : survivors) {
+    saw_nine = saw_nine || CellText(survivor, 0) == "9";
+  }
+  EXPECT_FALSE(saw_nine) << "rejected INSERT row must not be visible";
+}
+
+TEST_F(MergeTest, SelfReferencingDeleteIgnoresRowsThisStatementRemoves) {
+  // NO ACTION is statement-end semantics: the rows the statement itself
+  // removes no longer keep a parent key alive. Executor::Delete passes its
+  // pending positions to FindReferencedParentKey; this MERGE arm passed none,
+  // so deleting a chain in one statement was rejected as "referenced by"
+  // itself while the identical plain DELETE succeeded.
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE emp (k INT64, mgr INT64, FOREIGN KEY (mgr) REFERENCES "
+         "emp (k))");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO emp VALUES (1, NULL), (2, 1)");
+  // Baseline: the plain DELETE of both rows succeeds.
+  RunSql(engine_.get(), context_.get(), "DELETE FROM emp WHERE k IN (1, 2)");
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM emp;")[0][0],
+      Value(0));
+  // Same shape through MERGE must not be stricter.
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO emp VALUES (1, NULL), (2, 1)");
+  RunSql(engine_.get(), context_.get(),
+         "MERGE INTO emp USING (SELECT 1 AS k UNION ALL SELECT 2 AS k) AS s "
+         "ON emp.k = s.k WHEN MATCHED THEN DELETE;");
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM emp;")[0][0],
+      Value(0));
+  // Control: deleting only the referenced parent is still rejected, and the
+  // surviving child row keeps it that way.
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO emp VALUES (1, NULL), (2, 1)");
+  try {
+    RunSql(engine_.get(), context_.get(),
+           "MERGE INTO emp USING (SELECT 1 AS k) AS s ON emp.k = s.k "
+           "WHEN MATCHED THEN DELETE;");
+    FAIL() << "expected a foreign key rejection";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("referenced by"),
+              std::string::npos)
+        << error.what();
+  }
+  EXPECT_EQ(
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM emp;")[0][0],
+      Value(2));
 }
 
 TEST_F(MergeTest, TruncateTableDropsRowsAndKeepsSchema) {

@@ -38,17 +38,12 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
   return files;
 }
 
-}  // namespace
-
-TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
+void RunSeededAggregateRange(uint32_t begin_seed, uint32_t end_seed) {
   int group_queries = 0;
   int window_queries = 0;
   int primary_key_group_queries = 0;
-  const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS");
-  const int kIterations =
-      (scale != nullptr) ? static_cast<int>(std::strtol(scale, nullptr, 10))
-                         : 48;
-  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
+  const int count = static_cast<int>(end_seed - begin_seed);
+  for (uint32_t seed = begin_seed; seed < end_seed; ++seed) {
     std::mt19937 rng(seed);
     AggStats stats;
     AggTrace trace;
@@ -69,9 +64,26 @@ TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirror) {
     window_queries += stats.window_queries;
     primary_key_group_queries += stats.primary_key_group_queries;
   }
-  EXPECT_GT(group_queries, kIterations) << "GROUP BY oracle almost never ran";
+  EXPECT_GT(group_queries, count) << "GROUP BY oracle almost never ran";
   EXPECT_GT(window_queries, 0) << "window oracle never ran";
-  EXPECT_EQ(primary_key_group_queries, kIterations);
+  EXPECT_EQ(primary_key_group_queries, count);
+}
+
+}  // namespace
+
+TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard0) {
+  uint32_t end_seed = 24;
+  if (const char* scale = std::getenv("TINYLAMB_FUZZ_ITERS")) {
+    end_seed = static_cast<uint32_t>(std::strtoul(scale, nullptr, 10));
+  }
+  RunSeededAggregateRange(0, end_seed);
+}
+
+TEST(SqlAggregateFuzzer, SeededAggregatesMatchMirrorShard1) {
+  if (std::getenv("TINYLAMB_FUZZ_ITERS") != nullptr) {
+    return;
+  }
+  RunSeededAggregateRange(24, 48);
 }
 
 TEST(SqlAggregateFuzzer, TestFileRoundTripDetectsMismatch) {

@@ -51,6 +51,7 @@
 #include "common/crc32c.hpp"
 #include "common/log_message.hpp"
 #include "common/platform/endian.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "common/status_or.hpp"
 #include "table/sorted_run/sorted_run.hpp"
 #include "table/workload/workload.hpp"
@@ -315,7 +316,7 @@ struct Bp128Block {
   uint32_t width{0};
   int64_t minimum{0};
   int64_t maximum{0};
-  __int128 sum{0};
+  platform::Int128 sum{0};
 };
 struct Bp128Region {
   std::array<Bp128Block, kBp128MaxBlocks> blocks{};
@@ -364,7 +365,7 @@ class FastMod64 {
       return 0;
     }
     const auto quotient = static_cast<uint64_t>(
-        (static_cast<unsigned __int128>(reciprocal_) * n) >> 64);
+        (static_cast<platform::UInt128>(reciprocal_) * n) >> 64);
     uint64_t remainder = n - (quotient * divisor_);
     if (remainder >= divisor_) {
       remainder -= divisor_;
@@ -1184,7 +1185,7 @@ struct FastPforBlock {
   uint32_t nexc{0};
   int64_t minimum{0};
   int64_t maximum{0};
-  __int128 sum{0};
+  platform::Int128 sum{0};
 };
 struct FastPforRegion {
   uint32_t n{0};
@@ -1210,7 +1211,7 @@ struct DeltaFastPforBlock {
   int64_t base{0};     // value at the block's first row (the replay seed)
   int64_t minimum{0};  // TRUE value brackets over the block, base row included
   int64_t maximum{0};
-  __int128 sum{0};
+  platform::Int128 sum{0};
   uint64_t dmin{0};  // minimum delta in SIGNED order, as its uint64 bit pattern
 };
 struct DeltaFastPforRegion {
@@ -1329,6 +1330,11 @@ struct RgColumnProfile {
   // Stats domain accumulators.
   uint64_t count = 0;
   int64_t sum = 0;
+  // Set once `sum` left the int64 domain while serializing this row group:
+  // `sum` itself then holds a wrapped value and every metadata fold built
+  // from it must be refused instead of published (the row-level SUM path
+  // raises "integer overflow in SUM").
+  bool sum_overflow = false;
   int64_t mn = INT64_MAX, mx = INT64_MIN;
   uint64_t bloom = 0;
   uint64_t null_count = 0;
@@ -1371,6 +1377,7 @@ struct RgColumnProfile {
     has_null = false;
     count = 0;
     sum = 0;
+    sum_overflow = false;
     mn = INT64_MAX;
     mx = INT64_MIN;
     bloom = 0;
@@ -1575,30 +1582,31 @@ uint64_t WaveletRRangeSum(const WaveletRRegion& p, uint32_t level,
                           uint32_t remaining, uint64_t low, uint64_t high);
 bool WaveletRRegionFold(const WaveletRRegion& p, PaxChunk::CompareOp op,
                         int64_t literal, uint64_t* count_out, int64_t* sum_out);
-__int128 QppModelValue(const QppPage& p, uint32_t index);
+platform::Int128 QppModelValue(const QppPage& p, uint32_t index);
 bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
                     const char* end, QppRegion* out);
 int64_t QppValueAt(const QppRegion& region, uint32_t index);
 bool QppMatch(PaxChunk::CompareOp op, int64_t literal, int64_t value);
 size_t QppSegments(const QppPage& page, std::array<QppSegment, 2>& segments);
 uint32_t QppFirstGe(const QppPage& page, const QppSegment& segment,
-                    __int128 target);
+                    platform::Int128 target);
 uint32_t QppFirstGt(const QppPage& page, const QppSegment& segment,
-                    __int128 target);
-__int128 QppChoose3(uint32_t value);
-__int128 QppModelSum(const QppPage& page, uint32_t begin, uint32_t end);
+                    platform::Int128 target);
+platform::Int128 QppChoose3(uint32_t value);
+platform::Int128 QppModelSum(const QppPage& page, uint32_t begin, uint32_t end);
 uint32_t QppFirstLe(const QppPage& page, const QppSegment& segment,
-                    __int128 target);
+                    platform::Int128 target);
 uint32_t QppFirstLt(const QppPage& page, const QppSegment& segment,
-                    __int128 target);
-size_t QppModelRanges(const QppPage& page, __int128 low, __int128 high,
-                      std::array<QppRange, 2>& ranges);
+                    platform::Int128 target);
+size_t QppModelRanges(const QppPage& page, platform::Int128 low,
+                      platform::Int128 high, std::array<QppRange, 2>& ranges);
 void QppPatchExceptionCount(const QppRegion& region, PaxChunk::CompareOp op,
-                            int64_t literal, __int128 low, __int128 high,
-                            int64_t* count, __int128* sum);
+                            int64_t literal, platform::Int128 low,
+                            platform::Int128 high, int64_t* count,
+                            platform::Int128* sum);
 bool QppScanMatch(int64_t value, ScanOp op, int64_t literal);
 void QppSetMaskRange(uint64_t* out, uint32_t begin, uint32_t end);
-__int128 QppRegionSumAll(const QppRegion& region);
+platform::Int128 QppRegionSumAll(const QppRegion& region);
 void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
                       uint64_t* out);
 void DecodeQppAll(const QppRegion& region, int64_t* out);
@@ -1633,7 +1641,7 @@ bool ParseSforRegion(const char* r, uint32_t n, uint32_t param, const char* end,
 uint64_t SforDeltaAt(const SforRegion& p, uint32_t g, uint32_t t,
                      uint64_t boff);
 uint32_t SforGroupLowerBound(const SforRegion& p, uint32_t g, uint64_t boff,
-                             __int128 x);
+                             platform::Int128 x);
 int64_t SforValueAt(const SforRegion& p, uint32_t i);
 void DecodeSforAll(const SforRegion& p, int64_t* out);
 void DecodeS4All(const S4Region& p, int64_t* out);
@@ -1708,6 +1716,13 @@ bool AlpRdTansDecodePfor(const char* leaf, size_t leaf_len, uint32_t raw_len,
                          uint32_t width, std::vector<int64_t>* values);
 bool AlpRdTansDecodeBp128(const char* leaf, size_t leaf_len, uint32_t raw_len,
                           uint32_t leaf_param, std::vector<int64_t>* values);
+// Decodes at most `out.size()` values into a caller-provided buffer; returns
+// false if the block is corrupt or needs more rows than the buffer holds.
+// `rows_out`, when non-null, receives the decoded row count. The fixed-capacity
+// form is what row-at-a-time random access uses to avoid a heap allocation per
+// probe.
+bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
+                          std::span<uint64_t> out, uint32_t* rows_out = nullptr);
 bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
                           std::vector<uint64_t>* values);
 bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
@@ -1738,7 +1753,7 @@ bool AnsForStep(const AnsForRegion& A, uint32_t* x, uint32_t* pos,
 bool InnerSchemeOk(uint8_t s);
 bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
                       const char* end, Bp128Region* out);
-__int128 Bp128BlockSum(const Bp128Block& block);
+platform::Int128 Bp128BlockSum(const Bp128Block& block);
 int64_t Bp128ValueAt(const Bp128Region& region, uint32_t index);
 void DecodeBp128Block64(const Bp128Block& decoded, int64_t* output);
 void DecodeBp128Block(const Bp128Region& region, uint32_t block,
@@ -1796,8 +1811,8 @@ int64_t Int64AtPla(const char* r, uint32_t param, uint32_t n, uint32_t idx,
 bool ParseModRegion(const char* r, uint32_t n, uint32_t param,
                     const char* region_end, ModRegion* out);
 int64_t ModValueAt(const ModRegion& p, uint32_t idx);
-unsigned __int128 ModFloorSum(unsigned __int128 n, unsigned __int128 a,
-                              unsigned __int128 b, unsigned __int128 m);
+platform::UInt128 ModFloorSum(platform::UInt128 n, platform::UInt128 a,
+                              platform::UInt128 b, platform::UInt128 m);
 uint64_t ModGcd(uint64_t x, uint64_t y);
 uint64_t ModInv(uint64_t u, uint64_t q);
 int64_t Int64AtMod(const char* r, uint32_t param, uint32_t n, uint32_t idx,
@@ -1832,11 +1847,11 @@ bool ParseInterpRegion(const char* r, uint32_t n, uint32_t param,
                        const char* end, InterpRegion* out);
 void InterpDecodeBlock(const InterpRegion& p, uint32_t b, int64_t* out);
 void DecodeInterpAll(const InterpRegion& p, int64_t* out);
-bool InterpWindowForValue(PaxChunk::CompareOp op, int64_t lit, __int128* plo,
-                          __int128* phi);
-void InterpEvalBlock(const InterpRegion& p, uint32_t b, __int128 plo,
-                     __int128 phi, uint64_t* bits, bool want_sum,
-                     uint64_t* cnt_out, __int128* sum_out);
+bool InterpWindowForValue(PaxChunk::CompareOp op, int64_t lit,
+                          platform::Int128* plo, platform::Int128* phi);
+void InterpEvalBlock(const InterpRegion& p, uint32_t b, platform::Int128 plo,
+                     platform::Int128 phi, uint64_t* bits, bool want_sum,
+                     uint64_t* cnt_out, platform::Int128* sum_out);
 bool PBitSOrderedMatch(PaxChunk::CompareOp op, uint64_t value,
                        uint64_t literal);
 bool CellIsNull(const PaxChunk::Footer& f, uint32_t g, uint32_t c,
@@ -2027,7 +2042,7 @@ void InterpEmit(const std::vector<int64_t>& vals, uint32_t i0, uint32_t i1,
                 uint64_t lo, uint64_t hi, BitWriter* w);
 EncodedCol EncInterpI64(const std::vector<int64_t>& vals,
                         size_t budget = kNoEncodeBudget);
-bool QppFitsI64(__int128 value);
+bool QppFitsI64(platform::Int128 value);
 bool QppAdaptiveApplicable(const std::vector<int64_t>& values);
 EncodedCol EncQppI64(const std::vector<int64_t>& vals,
                      size_t budget = kNoEncodeBudget);
@@ -2061,6 +2076,22 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
 }  // namespace pax_detail
 
 using namespace pax_detail;
+
+// The decode-and-fold pushdown kernels below treat a kInt64 column as a
+// *signed* domain: raw cells are read back as int64 and accumulated in
+// platform::Int128. A UINT64 column occupies those same cells as the bit-cast
+// unsigned value, and its ground truth is unsigned (AggregateAccumulator sums
+// in uint128 with an "uint64 overflow in SUM" error and orders MIN/MAX
+// unsigned), so `2^63 + 5` would decode negative and silently invert zone-map
+// pruning, kEq end-bounds and MIN/MAX. A kernel whose column this refuses must
+// decline and let the caller fall back to the row path.
+inline bool IsSignedInt64PushdownColumn(const Schema& sc, slot_t column) {
+  if (column >= sc.ColumnCount()) {
+    return false;
+  }
+  const Column& c = sc.GetColumn(column);
+  return c.Type() == ValueType::kInt64 && !c.IsUnsigned();
+}
 
 void OpDictWindowForValue(const char* region, uint32_t n, uint32_t param,
                           PaxChunk::CompareOp op, int64_t lit, uint64_t* lo,
@@ -2101,22 +2132,23 @@ bool Rle8FillPredicateMask(const Rle8Region& p, PaxChunk::CompareOp op,
                            uint64_t* out_bits);
 bool Rle8SumMask(const Rle8Region& p, const uint64_t* bits, int64_t* sum_out);
 bool Rle8SumMaskWide(const Rle8Region& p, const uint64_t* bits,
-                     __int128* sum_out);
+                     platform::Int128* sum_out);
 bool Rle8SelectedSum(const char* region, uint32_t n, uint32_t param,
                      const char* region_end, const uint8_t* null_bmp,
-                     const uint64_t* selected, __int128* sum_out);
+                     const uint64_t* selected, platform::Int128* sum_out);
 bool RleDeltaSelectedSum(const char* region, uint32_t n, uint32_t param,
                          const char* region_end, const uint8_t* null_bmp,
-                         const uint64_t* selected, __int128* sum_out);
+                         const uint64_t* selected, platform::Int128* sum_out);
 bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
                          const char* region_end, PaxChunk::CompareOp op,
                          int64_t lit, uint64_t* count_out, int64_t* sum_out);
-__int128 DeltaPForBracketSum(const char* bracket);
+platform::Int128 DeltaPForBracketSum(const char* bracket);
 
 // Adds coefficient * subtotal if both the product and result fit in signed
 // 128 bits. On overflow, returns false and leaves *total unchanged.
 [[nodiscard]] bool TryAccumulateScaledSum(int64_t coefficient,
-                                          __int128 subtotal, __int128* total);
+                                          platform::Int128 subtotal,
+                                          platform::Int128* total);
 
 }  // namespace tinylamb
 

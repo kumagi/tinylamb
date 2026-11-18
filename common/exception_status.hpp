@@ -16,15 +16,16 @@
 
 namespace tinylamb {
 
-// Must be called from inside a catch handler.  std::bad_alloc maps to
-// kNoSpace, other std::exceptions keep their what() text as kRuntimeError, and
-// anything else reports `fallback_message`.
+// Must be called from inside a catch handler.  std::bad_alloc (an out-of-memory
+// condition) maps to kMemoryLimitExceeded, other std::exceptions keep their
+// what() text as kRuntimeError, and anything else reports `fallback_message`.
+// kNoSpace is reserved for genuine disk/page-space exhaustion (see ADR 0012).
 [[nodiscard]] inline Status StatusFromCurrentException(
     std::string_view fallback_message) {
   try {
     throw;
   } catch (const std::bad_alloc&) {
-    return Status::kNoSpace;
+    return Status::kMemoryLimitExceeded;
   } catch (const std::exception& error) {
     return StatusError(StatusCode::kRuntimeError, error.what());
   } catch (...) {

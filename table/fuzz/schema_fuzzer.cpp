@@ -56,7 +56,7 @@ struct Lcg {
   explicit Lcg(uint64_t seed) : s(seed) {}
   uint64_t Next() {
     s = (s * 6364136223846793005ULL) + 1442695040888963407ULL;
-    return s >> 17;
+    return s;
   }
   uint32_t Below(uint32_t n) { return static_cast<uint32_t>(Next() % n); }
 };

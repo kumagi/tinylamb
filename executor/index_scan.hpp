@@ -53,7 +53,7 @@ class IndexScan : public ExecutorBase {
             bool wait_for_write_intent = true,
             TransactionManager::IndexReadGuard index_read_guard = {},
             bool prefetch = true);
-  // Point-union access (Phase 8 IN lists): scans each [begin,end] key range
+  // Point-union access (IN lists): scans each [begin,end] key range
   // in sequence. Ranges must be sorted and disjoint for ordered output.
   IndexScan(
       Transaction& txn, const Table& table, const Index& index,
@@ -79,7 +79,7 @@ class IndexScan : public ExecutorBase {
   void CompileIntegerPeeks();
   void OpenRange(const std::vector<Value>& begin_key,
                  const std::vector<Value>& end_key);
-  // PrefetchingIndexScan: (re)builds the look-ahead cursor for a range and
+  // IndexScan prefetch: (re)builds the look-ahead cursor for a range and
   // primes it |kIndexScanPrefetchDistance| entries ahead of the main
   // iterator.  A no-op when the A/B hatch disables prefetching.
   void OpenPrefetch(const std::vector<Value>& begin_key,
@@ -105,7 +105,7 @@ class IndexScan : public ExecutorBase {
   size_t pending_offset_{0};
   TransactionManager::IndexReadGuard index_read_guard_;
   std::unique_ptr<IndexScanIterator> iter_;
-  // PrefetchingIndexScan: look-ahead cursor running
+  // IndexScan prefetch: look-ahead cursor running
   // |kIndexScanPrefetchDistance| entries ahead of |iter_|; null when
   // prefetching is off (A/B hatch).
   std::unique_ptr<IndexScanIterator> prefetch_iter_;

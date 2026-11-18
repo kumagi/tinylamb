@@ -29,6 +29,13 @@ std::optional<UtcTimestampTruncUnit> CompileUtcTimestampTrunc(
 std::optional<int64_t> TryUtcTimestampTruncKey(
     std::string_view text, UtcTimestampTruncUnit unit) noexcept;
 
+// Direct scalar component extraction only for canonical UTC civil text.
+// A rejected signature/value keeps the ordinary temporal evaluator.
+std::optional<UtcTimestampTruncUnit> CompileUtcTimestampExtract(
+    const FunctionCallExpression& call);
+std::optional<int64_t> TryUtcTimestampExtractKey(
+    std::string_view text, UtcTimestampTruncUnit unit) noexcept;
+
 StatusOr<Value> FormatUtcTimestampTruncKey(int64_t key);
 
 }  // namespace tinylamb::relational_detail

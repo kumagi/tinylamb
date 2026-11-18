@@ -765,6 +765,21 @@ StatusOr<std::shared_ptr<SelectStatement>> ExpandGroupingSetsWithWindows(
   return wrapper;
 }
 
+// The expanders replace the caller's whole SelectSource with the PIVOT /
+// UNPIVOT subquery source. Everything that describes how this source joins
+// to its siblings must survive that replacement, otherwise a PIVOT on the
+// right operand of a JOIN silently turns the join into a cross product.
+static void CarryPivotJoinContext(const SelectSource& from, SelectSource* to) {
+  to->join_type = from.join_type;
+  to->join_condition = from.join_condition;
+  to->unnest = from.unnest;
+  to->offset_alias = from.offset_alias;
+  to->is_lateral = from.is_lateral;
+  to->from_nested_join = from.from_nested_join;
+  to->using_columns = from.using_columns;
+  to->sample = from.sample;
+}
+
 StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
                                          const GoogleSqlAstNode& pivot) {
   // The parser has no catalog schema. Inferring no grouping keys for a base
@@ -831,7 +846,10 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   std::vector<NamedExpression> projections;
   std::unordered_set<std::string> agg_column_names;
   for (const auto& agg : aggs) {
-    if ((agg.arg_node != nullptr) && agg.arg_node->kind != "Star") {
+    // Only a plain column-reference aggregate argument is an implicit GROUP BY
+    // candidate. COUNT(1) / COUNTIF(p) / MAX(CASE ...) etc. are expressions;
+    // calling Path() on them fails with "empty path expression".
+    if (agg.arg_node != nullptr && agg.arg_node->kind == "PathExpression") {
       ASSIGN_OR_RETURN(std::string, hv157400_0, (Path(*agg.arg_node)));
       agg_column_names.insert(Lower(hv157400_0));
     }
@@ -885,9 +903,17 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
         col_name = agg.agg_alias + "_" + val_alias;
       }
 
-      Expression condition =
-          BinaryExpressionExp(ColumnValueExp(ColumnName(pivot_col_name)),
-                              BinaryOperation::kEquals, val_expr);
+      // A NULL in the PIVOT IN list matches rows whose pivot column is NULL,
+      // which plain `=` can never do (three-valued logic). Use null-safe
+      // equality for that value, matching GoogleSQL PIVOT semantics.
+      const bool null_pivot_value =
+          val_expr && val_expr->Type() == TypeTag::kConstantValue &&
+          val_expr->AsConstantValue().GetValue().IsNull();
+      Expression condition = BinaryExpressionExp(
+          ColumnValueExp(ColumnName(pivot_col_name)),
+          null_pivot_value ? BinaryOperation::kIsNotDistinctFrom
+                           : BinaryOperation::kEquals,
+          val_expr);
       Expression inner_arg;
       if ((agg.arg_node != nullptr) && agg.arg_node->kind != "Star") {
         ASSIGN_OR_RETURN(Expression, hv159410_0,
@@ -941,6 +967,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   auto pivot_subquery = std::make_shared<SelectStatement>();
   pivot_subquery->SetSelectList(std::move(projections));
   std::string saved_alias = base.alias;
+  const SelectSource saved_join_context = base;  // base is moved into the subquery
   pivot_subquery->SetSources({std::move(base)});
   if (!group_by_exprs.empty()) {
     pivot_subquery->SetGroupBy(std::move(group_by_exprs));
@@ -958,6 +985,7 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
   pivot_subquery->MarkComplex();
 
   SelectSource result;
+  CarryPivotJoinContext(saved_join_context, &result);
   result.query = std::move(pivot_subquery);
   result.alias = saved_alias.empty() ? "pivot_table" : saved_alias;
   return result;
@@ -970,6 +998,13 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
   const GoogleSqlAstNode* in_items = unpivot.Child("UnpivotInItemList");
   if (val_cols == nullptr || name_col_node == nullptr || in_items == nullptr) {
     return AstError<SelectSource>("GoogleSQL AST: malformed UnpivotClause");
+  }
+  // Only the single-value-column shape is implemented below. Reading just
+  // children[0] of a multi-column list would silently drop the other value
+  // columns and return wrong rows, so reject that shape explicitly.
+  if (val_cols->children.size() > 1) {
+    return AstError<SelectSource>(
+        "GoogleSQL AST: multi-column UNPIVOT value list is not supported");
   }
   std::string val_col_name = "val";
   if (!val_cols->children.empty()) {
@@ -1036,6 +1071,7 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     return AstError<SelectSource>("GoogleSQL AST: empty UNPIVOT IN list");
   }
   SelectSource result;
+  CarryPivotJoinContext(base, &result);
   result.query = std::move(root_branch);
   result.alias = saved_alias.empty() ? "unpivot_table" : saved_alias;
   return result;
@@ -1250,6 +1286,16 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
   if (path == nullptr) {
     return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad CREATE");
   }
+  // The pinned parser emits "is_if_not_exists" / "is_or_replace" in the
+  // CreateStatement detail (same convention as CREATE VIEW); drop neither.
+  const bool if_not_exists =
+      root.detail.find("is_if_not_exists") != std::string::npos;
+  const bool or_replace =
+      root.detail.find("is_or_replace") != std::string::npos;
+  if (if_not_exists && or_replace) {
+    return AstError<std::unique_ptr<Statement>>(
+        "CREATE TABLE cannot combine IF NOT EXISTS with OR REPLACE");
+  }
   RETURN_IF_FAIL(ValidateCreateTableOptions(root));
   const GoogleSqlAstNode* elements = root.Child("TableElementList");
   if (elements != nullptr) {
@@ -1286,6 +1332,10 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       std::optional<Value> column_default;
       const GoogleSqlAstNode* column_schema =
           definition->Child("SimpleColumnSchema");
+      if (column_schema == nullptr) {
+        // ARRAY columns carry their DEFAULT under ArrayColumnSchema.
+        column_schema = definition->Child("ArrayColumnSchema");
+      }
       if (column_schema != nullptr) {
         for (const auto& child : column_schema->children) {
           const std::string& kind = child->kind;
@@ -1335,6 +1385,9 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
       }
       columns.push_back(std::move(col));
       const GoogleSqlAstNode* schema = definition->Child("SimpleColumnSchema");
+      if (schema == nullptr) {
+        schema = definition->Child("ArrayColumnSchema");
+      }
       const GoogleSqlAstNode* attrs =
           schema != nullptr ? schema->Child("ColumnAttributeList") : nullptr;
       if (attrs != nullptr) {
@@ -1469,7 +1522,7 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
     }
     // Single-column foreign keys ride the column's constraint slot in the
     // canonical "parent(col)" form so catalog persistence and the existing
-    // optimizer readers (ForeignKeyTarget and friends) see them without
+    // optimizer readers (ForeignKeyDef and friends) see them without
     // new schema plumbing.  Multi-column keys have no slot and are
     // rejected; a column claimed by two keys is ambiguous, also rejected.
     for (const ForeignKeyDef& fk : foreign_keys) {
@@ -1513,7 +1566,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
     }
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
     return std::make_unique<CreateTableStatement>(
-        std::move(h_tbl), std::move(columns), std::move(foreign_keys));
+        std::move(h_tbl), std::move(columns), std::move(foreign_keys),
+        if_not_exists, or_replace);
   }
   const GoogleSqlAstNode* query = root.Child("Query");
   if (query != nullptr) {
@@ -1521,8 +1575,8 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
                      (VisitQuery(*query)));
     auto statement = std::move(hv214435_0);
     ASSIGN_OR_RETURN(std::string, h_tbl, (Path(*path)));
-    return std::make_unique<CreateTableStatement>(std::move(h_tbl),
-                                                  std::move(statement));
+    return std::make_unique<CreateTableStatement>(
+        std::move(h_tbl), std::move(statement), if_not_exists, or_replace);
   }
   return AstError<std::unique_ptr<Statement>>("GoogleSQL AST: bad CREATE");
 }
@@ -1548,7 +1602,12 @@ StatusOr<int64_t> AssertRowsModifiedValue(const GoogleSqlAstNode& node) {
     return AstError<int64_t>(
         "GoogleSQL AST: ASSERT_ROWS_MODIFIED without count");
   }
-  return ParseIntLiteral(*literal);
+  ASSIGN_OR_RETURN(int64_t, count, ParseIntLiteral(*literal));
+  if (count < 0) {
+    return AstError<int64_t>(
+        "GoogleSQL AST: ASSERT_ROWS_MODIFIED count must be non-negative");
+  }
+  return count;
 }
 
 }  // namespace
@@ -1558,6 +1617,10 @@ StatusOr<std::unique_ptr<Statement>> VisitInsert(const GoogleSqlAstNode& root) {
   if (path == nullptr) {
     return AstError<std::unique_ptr<Statement>>(
         "GoogleSQL AST: INSERT table missing");
+  }
+  if (root.Child("ReturningClause") != nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: INSERT ... RETURNING is not supported");
   }
   std::vector<std::string> columns;
   if (const GoogleSqlAstNode* list = root.Child("ColumnList")) {
@@ -1607,7 +1670,9 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
   std::vector<NestedDmlItem> nested_items;
   // Extracts "WHERE <expr>" plus an optional ASSERT_ROWS_MODIFIED from a
   // nested DELETE/UPDATE statement node; remaining children are ignored
-  // because nested targets are columns, not relations (no alias/RETURNING).
+  // because nested targets are columns, not relations (no alias support).
+  // A nested RETURNING clause is rejected explicitly above so it cannot be
+  // silently dropped.
   auto parse_nested_tail = [](const GoogleSqlAstNode& node,
                               Expression* predicate,
                               int64_t* assert_rows) -> Status {
@@ -1621,7 +1686,11 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
           child->kind == "AssertRowsModified") {
         continue;
       }
-      if (child->kind == "Alias" || child->kind == "ReturningClause" ||
+      if (child->kind == "ReturningClause") {
+        return AstStatus(
+            "GoogleSQL AST: nested DML RETURNING is not supported");
+      }
+      if (child->kind == "Alias" ||
           child->kind == "FromClause") {
         continue;
       }
@@ -1749,10 +1818,14 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
   }
   // The WHERE clause is the single remaining child once the target path and
   // the assignment list are removed. Table aliases, ASSERT_ROWS_MODIFIED,
-  // THEN RETURN and UPDATE...FROM siblings are recognized but not mapped
-  // (returning/join-update are gated features); they must not masquerade as
-  // WHERE candidates.
+  // and UPDATE...FROM siblings are recognized but not mapped (join-update is
+  // a gated feature); they must not masquerade as WHERE candidates. A
+  // RETURNING clause is rejected explicitly so it cannot be silently dropped.
   std::vector<const GoogleSqlAstNode*> where_candidates;
+  if (root.Child("ReturningClause") != nullptr) {
+    return AstError<std::unique_ptr<Statement>>(
+        "GoogleSQL AST: UPDATE ... RETURNING is not supported");
+  }
   for (const auto& child : root.children) {
     // The target is skipped by IDENTITY: `WHERE flag` also arrives as a
     // PathExpression, and a kind-based skip dropped bare-column predicates
@@ -1760,7 +1833,7 @@ StatusOr<std::unique_ptr<Statement>> VisitUpdate(const GoogleSqlAstNode& root) {
     if (child.get() == path || child->kind == "UpdateItemList" ||
         child->kind == "Location" || child->kind == "Hint" ||
         child->kind == "Alias" || child->kind == "AssertRowsModified" ||
-        child->kind == "ReturningClause" || child->kind == "FromClause") {
+        child->kind == "FromClause") {
       continue;
     }
     where_candidates.push_back(child.get());
@@ -1897,9 +1970,12 @@ StatusOr<std::unique_ptr<Statement>> VisitDelete(const GoogleSqlAstNode& root) {
     // whole table).
     if (child.get() == path || child->kind == "Location" ||
         child->kind == "Hint" || child->kind == "Alias" ||
-        child->kind == "AssertRowsModified" ||
-        child->kind == "ReturningClause") {
+        child->kind == "AssertRowsModified") {
       continue;
+    }
+    if (child->kind == "ReturningClause") {
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: DELETE ... RETURNING is not supported");
     }
     if (child->kind == "FromClause") {
       // GoogleSQL has no DELETE ... USING.  Dropping the clause silently would
@@ -2036,6 +2112,15 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
     }
     ASSIGN_OR_RETURN(std::string, source_name, Path(*source_path));
     source_alias = source_name;
+    // `USING src AS s` attaches an Alias node to the table expression; use it
+    // so ON `s.k` resolves (VisitUpdate does the same for UPDATE ... FROM).
+    if (const GoogleSqlAstNode* alias_node = source_table->Child("Alias");
+        alias_node != nullptr) {
+      ASSIGN_OR_RETURN(std::string, table_alias_tmp, (Alias(*alias_node)));
+      if (!table_alias_tmp.empty()) {
+        source_alias = std::move(table_alias_tmp);
+      }
+    }
     // A bare table source reads as SELECT * FROM <table>; the star expands
     // during the prepare-time relation materialization in SqlEngine.
     source = std::make_shared<SelectStatement>(
@@ -2103,9 +2188,13 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
           "GoogleSQL AST: bad MERGE action");
     }
     for (const auto& child : clause_node->children) {
+      // Skip the action and the non-expression wrapper nodes (by identity /
+      // kind, mirroring the UPDATE/DELETE WHERE candidate scans). Breaking
+      // here dropped the search condition whenever a Location/Hint preceded
+      // it, so `WHEN MATCHED AND <pred>` behaved like an unconditional WHEN.
       if (child.get() == action_node || child->kind == "Location" ||
-          child->kind == "Hint") {
-        break;
+          child->kind == "Hint" || child->kind == "Alias") {
+        continue;
       }
       // Search conditions precede the action; at most one condition node.
       Expression condition;
@@ -2182,6 +2271,14 @@ StatusOr<std::unique_ptr<Statement>> VisitMerge(const GoogleSqlAstNode& root) {
       if (row == nullptr) {
         return AstError<std::unique_ptr<Statement>>(
             "GoogleSQL AST: MERGE INSERT ... SELECT is not supported");
+      }
+      if (row->children.empty()) {
+        // `THEN INSERT ROW` (no explicit columns/values) means "copy the whole
+        // source row", which this MERGE IR cannot express. Silently accepting
+        // it would insert an all-NULL ghost row.
+        return AstError<std::unique_ptr<Statement>>(
+            "GoogleSQL AST: MERGE INSERT ROW (source-row copy) is not "
+            "supported");
       }
       for (const auto& value : row->children) {
         Expression expression;

@@ -19,9 +19,11 @@
 
 #include <cstdint>
 #include <ios>
+#include <istream>
 #include <memory>
-#include <sstream>
+#include <streambuf>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/constants.hpp"
@@ -53,7 +55,14 @@ class Decoder {
       is_->setstate(std::ios::failbit);
       return *this;
     }
-    vec.resize(static_cast<size_t>(size));
+    try {
+      vec.resize(static_cast<size_t>(size));
+    } catch (const std::bad_alloc&) {
+      // A corrupt length (or a large element type) can make even the bounded
+      // resize fail; surface it as a stream failure at the Status boundary.
+      is_->setstate(std::ios::failbit);
+      return *this;
+    }
     for (uint64_t i = 0; i < size; ++i) {
       *this >> vec[i];
     }
@@ -81,18 +90,40 @@ class Decoder {
   std::istream* is_;
 };
 
+namespace detail {
+
+// Non-owning get area over a caller-owned byte range so Decode() can parse
+// in place: the previous std::string copy plus std::stringstream double-
+// copied every payload (index-key decode runs per entry on scan hot paths).
+// The default underflow() reports EOF once the area is consumed, which is
+// exactly the failbit behaviour the istream-based Decoder relies on, and
+// peek()-at-end keeps AtEnd()'s optional-trailing-field contract intact.
+class StringViewBuffer final : public std::streambuf {
+ public:
+  explicit StringViewBuffer(std::string_view src) {
+    if (!src.empty()) {
+      auto* data = const_cast<char*>(
+          src.data());  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+      setg(data, data, data + src.size());
+    }
+  }
+};
+
+}  // namespace detail
+
 // Decode an object from its in-memory encoded form. Returns a Corrupt status
 // when the stream runs out mid-decode so callers never receive a partially
 // built object. T must be default constructible and provide `Decoder&
-// operator>>(Decoder&, T&)`.
+// operator>>(Decoder&, T&)`. |src| must outlive the call (it always does:
+// decoding completes before Decode returns).
 template <typename T>
 StatusOr<T> Decode(std::string_view src) {
-  std::string buffer(src);
-  std::stringstream ss(buffer);
-  Decoder dec(ss);
+  detail::StringViewBuffer buffer(src);
+  std::istream is(&buffer);
+  Decoder dec(is);
   T ret;
   dec >> ret;
-  if (!ss) {
+  if (!is) {
     return StatusError(StatusCode::kCorrupt,
                        "Decode failed: truncated or corrupt input");
   }

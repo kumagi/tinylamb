@@ -48,9 +48,9 @@
 namespace tinylamb::platform {
 #ifdef __SIZEOF_INT128__
 TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
-  const unsigned __int128 sign_bit = static_cast<unsigned __int128>(1) << 127;
-  const auto maximum = static_cast<__int128>(sign_bit - 1);
-  const __int128 minimum = -maximum - 1;
+  const UInt128 sign_bit = static_cast<UInt128>(1) << 127;
+  const auto maximum = static_cast<Int128>(sign_bit - 1);
+  const Int128 minimum = -maximum - 1;
   EXPECT_EQ(SaturatingDoubleToInt128(-0x1p127), minimum);
   EXPECT_EQ(SaturatingDoubleToInt128(-0x1p128), minimum);
   EXPECT_EQ(SaturatingDoubleToInt128(0x1p127), maximum);
@@ -59,8 +59,7 @@ TEST(Int128ConversionAuditTest, SignedAndUnsignedBoundarySaturation) {
   EXPECT_EQ(SaturatingDoubleToInt128(42.75), 42);
   EXPECT_EQ(DoubleToUInt128Magnitude(0x1p127), sign_bit);
   EXPECT_EQ(DoubleToUInt128Magnitude(0x1.8p127), sign_bit + (sign_bit >> 1));
-  EXPECT_EQ(DoubleToUInt128Magnitude(0x1p128),
-            ~static_cast<unsigned __int128>(0));
+  EXPECT_EQ(DoubleToUInt128Magnitude(0x1p128), ~static_cast<UInt128>(0));
   EXPECT_EQ(SaturatingDoubleToInt128(std::numeric_limits<double>::quiet_NaN()),
             0);
   EXPECT_EQ(SaturatingDoubleToInt128(-std::numeric_limits<double>::infinity()),
@@ -356,6 +355,12 @@ TEST(PlatformCpuAffinityTest, CurrentThreadMatchesSupport) {
   EXPECT_GE(current->Count(), 1);
   const int first = current->First();
   ASSERT_GE(first, 0);
+  // Restore the original affinity on every exit path: a fatal assertion
+  // below must not leave the whole test binary pinned to a single CPU.
+  struct AffinityRestore {
+    ~AffinityRestore() { (void)set.ApplyToCurrentThread(); }
+    CpuSet set;
+  } affinity_restore{*current};
   ASSERT_TRUE(CpuSet::Single(first).ApplyToCurrentThread());
   const std::optional<CpuSet> pinned = CpuSet::CurrentThread();
   ASSERT_TRUE(pinned.has_value());
@@ -414,6 +419,98 @@ TEST(PlatformSyncedStreamTest, FlushesOnDestruction) {
     SyncedOStream(target) << "b=" << 2 << '\n';
   }
   EXPECT_EQ(target.str(), "a=1\nb=2\n");
+}
+
+TEST(PlatformUnlinkedTempFileTest, ReadsWritesAndLeavesNoDirectoryEntries) {
+  std::error_code ec;
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path(ec) /
+      ("tinylamb_unlinked_test_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  ASSERT_TRUE(std::filesystem::create_directories(dir, ec)) << ec.message();
+  struct DirCleanup {
+    explicit DirCleanup(std::filesystem::path p) : path(std::move(p)) {}
+    DirCleanup(const DirCleanup&) = delete;
+    DirCleanup& operator=(const DirCleanup&) = delete;
+    DirCleanup(DirCleanup&&) = delete;
+    DirCleanup& operator=(DirCleanup&&) = delete;
+    ~DirCleanup() {
+      std::error_code clean_ec;
+      std::filesystem::remove_all(path, clean_ec);
+    }
+    std::filesystem::path path;
+  } cleanup{dir};
+
+  const int fd = OpenUnlinkedTempFile(dir);
+  ASSERT_GE(fd, 0) << "errno=" << errno;
+  // Directory must remain empty even while `fd` is open.
+  EXPECT_TRUE(std::filesystem::is_empty(dir, ec)) << ec.message();
+
+  const std::string payload = "hello_unlinked_spill_block";
+  ASSERT_EQ(Pwrite(fd, payload.data(), payload.size(), 64),
+            static_cast<ssize_t>(payload.size()));
+  int64_t fsize = -1;
+  ASSERT_EQ(FileSize(fd, &fsize), 0);
+  EXPECT_EQ(fsize, 64 + static_cast<int64_t>(payload.size()));
+
+  std::string out(payload.size(), '\0');
+  ASSERT_EQ(Pread(fd, out.data(), out.size(), 64),
+            static_cast<ssize_t>(payload.size()));
+  EXPECT_EQ(out, payload);
+
+  AdviseDontNeed(fd, 0, fsize);
+  ASSERT_EQ(Truncate(fd, 0), 0);
+  ASSERT_EQ(FileSize(fd, &fsize), 0);
+  EXPECT_EQ(fsize, 0);
+
+  EXPECT_EQ(CloseFile(fd), 0);
+  EXPECT_TRUE(std::filesystem::is_empty(dir, ec)) << ec.message();
+}
+
+TEST(PlatformUnlinkedTempFileTest, NonexistentDirectoryFailsCleanly) {
+  // Unique name (the negative test must not depend on a fixed path being
+  // absent in a shared temp dir).
+  const std::filesystem::path missing =
+      std::filesystem::temp_directory_path() /
+      ("tinylamb_missing_unlinked_dir_" + std::to_string(GetPid()) + "_" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  ASSERT_FALSE(std::filesystem::exists(missing));
+  const int fd = OpenUnlinkedTempFile(missing);
+  EXPECT_LT(fd, 0);
+}
+
+// #982: the memory budget's RSS gate calls this to reclaim freed-but-retained
+// heap before refusing a reservation, so concurrent waiters must not all pay
+// for the purge: only the first caller inside a ~20 ms window purges.
+TEST(PlatformHeapPurgeTest, ReleaseFreeHeapToOsIsRateLimited) {
+#ifndef __linux__
+  GTEST_SKIP() << "purge hook is only compiled on Linux builds";
+#elif !defined(__GLIBC__)
+  if (!ReleaseFreeHeapToOs()) {
+    GTEST_SKIP() << "no purge hook on this libc";
+  }
+#else
+  // The ~20 ms rate-limit window is process-global: another thread (or an
+  // earlier caller) may hold it when this test starts, and a concurrent
+  // caller can steal it between our checks.  Wait out any active window and
+  // retry a bounded number of times instead of asserting single-shot wins.
+  bool purged = false;
+  for (int attempt = 0; attempt < 10 && !purged; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    purged = ReleaseFreeHeapToOs();
+  }
+  ASSERT_TRUE(purged) << "purge window never became available to this thread";
+  EXPECT_FALSE(ReleaseFreeHeapToOs())
+      << "second immediate call must be rate-limited";
+  purged = false;
+  for (int attempt = 0; attempt < 10 && !purged; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    purged = ReleaseFreeHeapToOs();
+  }
+  EXPECT_TRUE(purged) << "purge must become available again after the window";
+#endif
 }
 
 }  // namespace

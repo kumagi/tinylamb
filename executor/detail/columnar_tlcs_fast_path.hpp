@@ -38,7 +38,6 @@ struct ContainsPrecheck {
 struct DictFilterMask {
   slot_t full_col{0};
   std::array<uint64_t, 4> allowed{};
-  bool all_allowed{false};
 };
 
 struct ColumnarPredicateSet {

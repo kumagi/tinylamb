@@ -145,6 +145,13 @@ TEST_F(SqlUdfTest, CorrelatedSubqueryBodySeesParameter) {
                            "SELECT UdfIdentityCorrelated('z') UNION ALL SELECT "
                            "UdfIdentityCorrelated('y')");
   ASSERT_EQ(rows.size(), 2U);
+  std::vector<Value> seen;
+  seen.reserve(rows.size());
+for (const Row& row : rows) {
+    seen.push_back(row[0]);
+  }
+  std::sort(seen.begin(), seen.end());
+  EXPECT_EQ(seen, (std::vector<Value>{Value("y"), Value("z")}));
 }
 
 TEST_F(SqlUdfTest, TemplatedParameterAcceptsAnyType) {
@@ -182,6 +189,15 @@ TEST_F(SqlUdfTest, AggregateFunctionRespectsGrouping) {
       "SELECT k, UdaCountAll() FROM "
       "(SELECT 1 AS k UNION ALL SELECT 1 UNION ALL SELECT 2) GROUP BY k");
   ASSERT_EQ(rows.size(), 2U);
+  // The aggregate must respect the GROUP BY key: k=1 has two rows, k=2 one.
+  std::vector<std::pair<int64_t, int64_t>> observed;
+  observed.reserve(rows.size());
+for (const Row& row : rows) {
+    observed.emplace_back(row[0].value.int_value, row[1].value.int_value);
+  }
+  std::sort(observed.begin(), observed.end());
+  EXPECT_EQ(observed,
+            (std::vector<std::pair<int64_t, int64_t>>{{1, 2}, {2, 1}}));
 }
 
 TEST_F(SqlUdfTest, RecursiveDefinitionFailsInsteadOfHanging) {
@@ -212,6 +228,33 @@ TEST_F(SqlUdfTest, TempViewResolvesThroughFromClause) {
       RunSql(engine_.get(), context_.get(), "SELECT * FROM UdfTestView");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{41}));
+}
+
+TEST_F(SqlUdfTest, TempViewJoinKeepsJoinTypeAndCondition) {
+  // The view expansion once dropped join_type/join_condition, degrading
+  // `t JOIN v ON ...` to an unconditional CROSS JOIN.
+  EXPECT_NO_THROW(RunSql(engine_.get(), context_.get(),
+                         "CREATE TEMP VIEW UdfJoinView AS "
+                         "SELECT 1 AS a UNION ALL SELECT 2 AS a"));
+  const auto inner = RunSql(engine_.get(), context_.get(),
+                            "SELECT t.a, v.a FROM (SELECT 1 AS a) AS t "
+                            "JOIN UdfJoinView AS v ON t.a = v.a");
+  ASSERT_EQ(inner.size(), 1U);
+  EXPECT_EQ(inner[0][0], Value(int64_t{1}));
+  EXPECT_EQ(inner[0][1], Value(int64_t{1}));
+
+  // LEFT JOIN must keep producing NULLs for unmatched left rows rather than
+  // collapsing to a cross product.
+  const auto left = RunSql(engine_.get(), context_.get(),
+                           "SELECT t.a, v.a FROM (SELECT 1 AS a UNION ALL "
+                           "SELECT 9 AS a) AS t "
+                           "LEFT JOIN UdfJoinView AS v ON t.a = v.a "
+                           "ORDER BY t.a");
+  ASSERT_EQ(left.size(), 2U);
+  EXPECT_EQ(left[0][0], Value(int64_t{1}));
+  EXPECT_EQ(left[0][1], Value(int64_t{1}));
+  EXPECT_EQ(left[1][0], Value(int64_t{9}));
+  EXPECT_TRUE(left[1][1].IsNull());
 }
 
 TEST_F(SqlUdfTest, TempViewBodyExpandsUdfCalls) {
@@ -393,6 +436,53 @@ TEST_F(WindowSqlTest, AvgOverPartitionDividesByCount) {
   EXPECT_EQ(rows[4], (Row({Value(2), Value(50), Value(50.0)})));
 }
 
+// Regression: the frame SUM/AVG arms treated UINT64 cells as raw signed
+// int64, so SUM(u) OVER () wrapped UINT64_MAX to -1 while SUM(u) over the
+// same rows answered 18446744073709551615 with the UINT64 tag. The frame
+// arms must mirror AggregateAccumulator: exact Int128 accumulation bounded
+// to the uint64 range, a UINT64-tagged result, and tag-respecting AVG casts.
+TEST_F(WindowSqlTest, UnsignedSumOverFrameMatchesGroupedSum) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE wmax (v UINT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO wmax VALUES (18446744073709551615);");
+  const Value umax = Value(int64_t{-1}).WithUnsigned();
+  const auto max_rows =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT SUM(v) OVER (), SUM(v), AVG(v) OVER () FROM wmax;");
+  ASSERT_EQ(max_rows.size(), 1U);
+  EXPECT_EQ(max_rows[0][0], umax);
+  EXPECT_EQ(max_rows[0][1], umax);
+  EXPECT_DOUBLE_EQ(max_rows[0][2].value.double_value,
+                   static_cast<double>(18446744073709551615ULL));
+
+  // In-range sliding frames stay exact and keep the UINT64 tag; AVG casts
+  // each cell through its unsigned magnitude.
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE wu (v UINT64);");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO wu VALUES (1), (2), (3);");
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT "
+      "ROW), AVG(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT "
+      "ROW) FROM wu ORDER BY v;");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}).WithUnsigned());
+  EXPECT_EQ(rows[1][0], Value(int64_t{3}).WithUnsigned());
+  EXPECT_EQ(rows[2][0], Value(int64_t{5}).WithUnsigned());
+  EXPECT_DOUBLE_EQ(rows[0][1].value.double_value, 1.0);
+  EXPECT_DOUBLE_EQ(rows[1][1].value.double_value, 1.5);
+  EXPECT_DOUBLE_EQ(rows[2][1].value.double_value, 2.5);
+
+  // 18446744073709551615 + 2 leaves the uint64 range: the frame arm raises
+  // the same error the grouped SUM raises.
+  RunSql(engine_.get(), context_.get(), "INSERT INTO wmax VALUES (2);");
+  EXPECT_THROW(
+      RunSql(engine_.get(), context_.get(), "SELECT SUM(v) OVER () FROM wmax;"),
+      std::runtime_error);
+  EXPECT_THROW(
+      RunSql(engine_.get(), context_.get(), "SELECT SUM(v) FROM wmax;"),
+      std::runtime_error);
+}
+
 TEST_F(WindowSqlTest, AggregateOfAggregateOverPartition) {
   // Window over the grouped rows: avg(sum(v)) per g partition, with k left
   // out of the select list but present in GROUP BY.
@@ -410,6 +500,22 @@ TEST_F(WindowSqlTest, AggregateOfAggregateOverPartition) {
   EXPECT_EQ(rows[2],
             (Row({Value(1), Value(40), Value(100.0 / 3.0), Value(40)})));
   EXPECT_EQ(rows[3], (Row({Value(2), Value(50), Value(50.0), Value(50)})));
+}
+
+TEST_F(WindowSqlTest, DistinctSeesComputedWindowValue) {
+  // Window-over-aggregate runs the grouped pass with NULL placeholders where
+  // the window columns will go. DISTINCT must wait for pass 3: two groups
+  // share (g=1, SUM=30) and differ only in ROW_NUMBER, so a premature dedup
+  // would drop one of them.
+  const auto rows = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT DISTINCT g, SUM(v) sv, ROW_NUMBER() OVER (ORDER BY g, k) rn "
+      "FROM w GROUP BY g, k ORDER BY rn;");
+  ASSERT_EQ(rows.size(), 4U);
+  EXPECT_EQ(rows[0], (Row({Value(1), Value(30), Value(1)})));
+  EXPECT_EQ(rows[1], (Row({Value(1), Value(30), Value(2)})));
+  EXPECT_EQ(rows[2], (Row({Value(1), Value(40), Value(3)})));
+  EXPECT_EQ(rows[3], (Row({Value(2), Value(50), Value(4)})));
 }
 
 TEST_F(WindowSqlTest, MixedAggregateAndWindowItem) {
@@ -918,17 +1024,46 @@ TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
   EXPECT_NE(first.Fingerprint(), second.Fingerprint());
 }
 
+TEST_F(AggregateHavingTest, StatementTimeoutAbortsLongQueryAndAllowsFollowup) {
+  context_->txn_.SetStatementTimeout(std::chrono::milliseconds(20));
+  StatusOr<Executor> exec =
+      engine_->Prepare(*context_,
+                       "SELECT COUNT(*) FROM GENERATE_SERIES(1, 50000) a "
+                       "CROSS JOIN GENERATE_SERIES(1, 500) b");
+  if (exec.HasValue()) {
+    Row row;
+    while (exec.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_EQ(exec.Value()->GetStatus().GetCode(), StatusCode::kRuntimeError);
+    EXPECT_NE(exec.Value()->GetStatus().GetMessage().find("timeout"),
+              std::string::npos);
+  } else {
+    EXPECT_EQ(exec.GetStatus().GetCode(), StatusCode::kRuntimeError);
+  }
+
+  // Subsequent statement with a generous timeout succeeds cleanly.
+  context_->txn_.SetStatementTimeout(std::chrono::milliseconds(5000));
+  const auto rows =
+      RunSql(engine_.get(), context_.get(), "SELECT COUNT(*) FROM t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{5}));
+}
+
 TEST_F(SqlUdfTest, QualifiedStarOverDerivedSource) {
   RunSql(engine_.get(), context_.get(), "CREATE TABLE xy (a INT64, b INT64)");
   RunSql(engine_.get(), context_.get(), "INSERT INTO xy VALUES (7, 9)");
+  // A lone `t.*` over a derived source is wrapped in __value_table_value by
+  // the AST visitor; the relational path must unwrap and expand it.
   const auto rows = RunSql(engine_.get(), context_.get(),
                            "SELECT t.* FROM (SELECT a, b FROM xy) t");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{7}));
   EXPECT_EQ(rows[0][1], Value(int64_t{9}));
-  const auto filtered = RunSql(
-      engine_.get(), context_.get(),
-      "SELECT t.* FROM (SELECT a, b FROM xy) t WHERE t.a > 0");
+  // With a WHERE that prunes to one column the old path silently returned a
+  // wrong single-column result instead of failing.
+  const auto filtered =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT t.* FROM (SELECT a, b FROM xy) t WHERE t.a > 0");
   ASSERT_EQ(filtered.size(), 1U);
   EXPECT_EQ(filtered[0][0], Value(int64_t{7}));
   EXPECT_EQ(filtered[0][1], Value(int64_t{9}));

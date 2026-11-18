@@ -126,5 +126,5 @@ Union-Find の構築と項の選別です。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `RedundantJoinPredicateElimination` —
+- `plan/cascades_test_part*.cpp` の `RedundantJoinPredicateElimination` —
   推移的に冗長な等値項が除去されることを検査します。

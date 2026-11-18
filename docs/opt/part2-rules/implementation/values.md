@@ -88,7 +88,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.DummyScanAndValuesHavePhysicalImplementationRules`: `kValues` 式が `ValuesPlan` に正常に実装されることを検証。
 - `plan/plan_test.cpp`:
   - `PlanTest.ValuesPlanEmitsTypedMultiColumnRowsAndValidatesWidth`: `ValuesPlan` が型付き複数列タプルを正確に出力しスキーマ幅を検証することをテスト。

@@ -112,6 +112,6 @@ std::vector<Expression> PushSingleRelationConjuncts(
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.PushSelectionThroughJoinMovesSingleRelationConjuncts`: 単一表連言 `a.x = 1` がスキャンフィルタにマージされ、結合条件 `a.y = b.z` が残差として上位 Selection に残ることを検証。
 

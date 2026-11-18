@@ -1,0 +1,11 @@
+-- sql_ooc_fuzzer regression
+-- seed: 228
+-- profile: pool=65536 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: crash recovery failed to reopen the database | status: Corrupt :: op 6 `crash`: crash recovery failed to reopen the database |   status: Corrupt
+create t8 56 209 2112 1000 1000000 0
+compact t8
+create t9 3 121 2176 1000 2 0
+ins_bulk t9 83 234 287
+snap open rw
+checkpoint
+crash

@@ -18,8 +18,11 @@
 #define TINYLAMB_TABLE_STATISTICS_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <iosfwd>
+#include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "expression/expression.hpp"
@@ -27,6 +30,7 @@
 #include "type/value.hpp"
 
 namespace tinylamb {
+struct Row;
 class Table;
 class Transaction;
 class Encoder;
@@ -92,7 +96,7 @@ class ColumnStats {
   // column is stored in sorted order (range scans over an index on this
   // column are mostly sequential heap reads); ~0.5 means random order.
   // Used by the optimizer to penalize range index scans over unclustered
-  // columns (TODO.md item 1). Never affects correctness.
+  // columns. Never affects correctness.
   [[nodiscard]] double Correlation() const { return correlation_; }
   // Direction-independent locality for range I/O costing. Ascending and
   // descending runs both have sequential locality; random adjacency is weak.
@@ -205,7 +209,7 @@ class TableStatistics {
   [[nodiscard]] TableStatistics ScaleToRows(size_t rows) const;
   // Same row-count and NDV scaling as ScaleToRows, without copying histogram
   // or MCV payloads. Join costing only reads row counts and distinct counts;
-  // the histogram vectors were the dominant allocation in HashJoinStats.
+  // the histogram vectors were the dominant allocation in join costing.
   [[nodiscard]] TableStatistics ScaleCardinality(size_t rows) const;
 
   void Concat(const TableStatistics& rhs);
@@ -226,6 +230,27 @@ class TableStatistics {
   size_t row_count_{0};
   std::vector<ColumnStats> stats_;
   uint64_t layout_generation_{0};
+};
+
+// Incremental row-at-a-time statistics builder using the same collector and
+// reservoir logic as TableStatistics::Update.
+class StreamingStatsCollector {
+ public:
+  explicit StreamingStatsCollector(const Schema& schema);
+  ~StreamingStatsCollector();
+  StreamingStatsCollector(const StreamingStatsCollector&) = delete;
+  StreamingStatsCollector& operator=(const StreamingStatsCollector&) = delete;
+  StreamingStatsCollector(StreamingStatsCollector&&) noexcept;
+  StreamingStatsCollector& operator=(StreamingStatsCollector&&) noexcept;
+
+  void AddRow(const Row& row);
+  [[nodiscard]] uint64_t RowCount() const noexcept;
+  [[nodiscard]] std::vector<ColumnStats> FinishStats() const;
+  [[nodiscard]] std::string FinishEncoded() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace tinylamb

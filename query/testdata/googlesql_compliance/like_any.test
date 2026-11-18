@@ -540,7 +540,7 @@ ARRAY<STRUCT<Value STRING, BOOL, BOOL, BOOL, BOOL, BOOL>>[known order:
 ==
 
 [required_features=LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_SUBQUERY]
-[name=like_any_string_constant_patterns_in_non_paranthesized_scalar_subquery]
+[name=like_any_string_constant_patterns_in_non_parenthesized_scalar_subquery]
 SELECT
   Value,
   Value LIKE ANY (SELECT 'Value1'),
@@ -555,7 +555,7 @@ ARRAY<STRUCT<Value STRING, BOOL, BOOL>>[known order:
 ==
 
 [required_features=LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_SUBQUERY]
-[name=not_like_any_string_constant_patterns_in_non_paranthesized_scalar_subquery]
+[name=not_like_any_string_constant_patterns_in_non_parenthesized_scalar_subquery]
 SELECT
   Value,
   Value NOT LIKE ANY (SELECT 'Value1'),

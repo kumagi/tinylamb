@@ -168,7 +168,7 @@ int CompareChunkRowAgainstHeapKey(const TlcsFile::DecodedColumnChunk& chunk,
 }
 
 // Strict weak ordering: returns true iff `a` precedes `b` in the requested
-// ORDER BY sequence. Note that `std::push_heap` with `ComesFirst(a, b)` places
+// ORDER BY sequence. Note that `std::push_heap` with `TopKWinnerComesFirst(a, b, specs)` places
 // the *last* (worst) element at `heap.front()` for O(1) Top-K eviction, and
 // `std::partial_sort` with the same comparator orders winners best-first.
 bool TopKWinnerComesFirst(
@@ -782,6 +782,14 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
       }
     };
 
+    // CompareVarCharForOrderBy re-keys ENUM spellings ("TESTENUM"+rank byte)
+    // below every printable byte, but the block bounds and the cutoff below
+    // use raw bytes. If either side is in that band the two orders disagree
+    // and pruning would silently drop correct rows -- disable the cutoff
+    // (the sibling relational_sort_limit.cpp bails out on the same band).
+    const auto in_enum_band = [](std::string_view sv) noexcept {
+      return sv.size() >= 9 && sv.size() <= 18 && sv.starts_with("TESTENUM");
+    };
     auto publish_v_cutoff = [&](const std::string& worst_str) {
       if (!use_varchar_cutoff) {
         return;
@@ -838,6 +846,12 @@ class ColumnarTlcsScanExecutor final : public ExecutorBase {
               local_v_cut = v_cutoff_str;
               local_v_seq = v_cutoff_seq.load(std::memory_order_relaxed);
             }
+            // The cutoff is compared with raw bytes below; an ENUM-rekeyed
+            // spelling would order differently from the winner heap and must
+            // never prune blocks.
+            if (in_enum_band(local_v_cut)) {
+              // fall through to full decode for this block
+            } else
             if (bm.vbound.is_const_null) {
               if (!key0_nf) {
                 continue;

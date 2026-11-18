@@ -126,7 +126,7 @@ SELECT C FROM T ORDER BY ISERROR(1/A)
 --
 ARRAY<STRUCT<C DOUBLE>>[unknown order:{100}, {200}, {0}]
 ==
-# This is a non-computation error: the subquery returns mutliple rows instead
+# This is a non-computation error: the subquery returns multiple rows instead
 # of one.
 [name=iserror_in_where_clause_handles_scalar_subquery_returning_multiple_rows]
 SELECT C FROM T WHERE ISERROR(B = (SELECT 10*A FROM T))

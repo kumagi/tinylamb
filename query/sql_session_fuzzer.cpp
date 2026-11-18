@@ -130,7 +130,7 @@ struct SPred {
   // kExistsSub: the OUTER row's own column index (correlated equality).
   // kInSubquery: qualified LHS ("tbl0.u").  An unqualified name that also
   // exists in the subquery's table makes the engine treat the predicate as
-  // correlated and reject it (next-actions D-8); qualifying keeps it
+  // correlated and reject it ; qualifying keeps it
   // decorrelatable.
   std::string lhs_qual;
 
@@ -2379,6 +2379,12 @@ std::string RunSessionIteration(std::mt19937& rng, bool verbose,
             return "unique-violating UPDATE unexpectedly accepted at step " +
                    std::to_string(step) + ": " + sql + "\n";
           }
+          t.steps.push_back({.must_fail = true, .sql = sql});
+          break;
+        }
+        // The row mirror wraps int64 arithmetic on overflow while the engine
+        // rejects it; such a rejection is expected, not an oracle mismatch.
+        if (!ok && why.find("integer overflow on") != std::string::npos) {
           t.steps.push_back({.must_fail = true, .sql = sql});
           break;
         }

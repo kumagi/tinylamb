@@ -126,7 +126,7 @@ TEST_F(SqlRelationalEvalCoverageTest, DatePartPlainFunctionAliases) {
   ExpectScalar("SELECT ISOWEEK(DATE '2026-01-01')", Value(int64_t{1}));
   ExpectScalar("SELECT ISOYEAR(DATE '2026-01-01')", Value(int64_t{2026}));
   // GROUP BY over the aliased spelling shares the extract path: Sunday (7)
-  // and Monday (1) each take one row.
+  // is selected by the HAVING filter below.
   ExpectScalar(
       "SELECT COUNT(*) FROM (SELECT WEEKDAY(d), COUNT(*) FROM (SELECT"
       " DATE '2026-01-04' d UNION ALL SELECT DATE '2026-01-05')"

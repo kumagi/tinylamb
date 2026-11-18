@@ -1146,7 +1146,7 @@ ARRAY<STRUCT<
 ==
 
 [required_features=ANALYTIC_FUNCTIONS,NULL_HANDLING_MODIFIER_IN_ANALYTIC]
-[name=analytic_percentile_disc_partition_resepect_nulls]
+[name=analytic_percentile_disc_partition_respect_nulls]
 SELECT row_id, value, str,
        PERCENTILE_DISC(row_id, -0.0 RESPECT NULLS) OVER (PARTITION BY str),
        PERCENTILE_DISC(value, 0 RESPECT NULLS) OVER (PARTITION BY str),

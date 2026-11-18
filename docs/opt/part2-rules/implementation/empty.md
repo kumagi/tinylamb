@@ -94,6 +94,6 @@ return std::vector<PlanAlternative>{PlanAlternative{
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 FALSE の選択述語が `EmptyPlan` に変換され、下位の `FullScanPlan` が除去されることを検証。
-- `plan/optimizer_test.cpp` の `OptimizerTest.ContradictoryConjunctsBecomeEmptyResult`: 矛盾する AND 条件が `EmptyResult` として計画されることを検証。
-- `plan/cascades_test.cpp` の `CascadesTest.JoinEmptySimplification`: 空リレーションを含む結合の論理簡約を検証。
+- `plan/optimizer_test_part1.cpp` の `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 FALSE の選択述語が `EmptyPlan` に変換され、下位の `FullScanPlan` が除去されることを検証。
+- `plan/optimizer_test_part1.cpp` の `OptimizerTest.ContradictoryConjunctsBecomeEmptyResult`: 矛盾する AND 条件が `EmptyResult` として計画されることを検証。
+- `plan/cascades_test_part2.cpp` の `CascadesTest.JoinEmptySimplification`: 空リレーションを含む結合の論理簡約を検証。

@@ -263,7 +263,10 @@ void EvaluateScalarDoubleAvx2(const double* data, size_t count,
       EvaluateScalarDoubleAvx2Op<_CMP_EQ_OQ>(data, count, target, op, out_mask);
       return;
     case BinaryOperation::kNotEquals:
-      EvaluateScalarDoubleAvx2Op<_CMP_NEQ_UQ>(data, count, target, op,
+      // OQ (quiet, ordered) matches the IEEE scalar tail where NaN != NaN is
+      // false. UQ would report true for NaN and split the result depending on
+      // whether the row landed in the vector body or the scalar tail.
+      EvaluateScalarDoubleAvx2Op<_CMP_NEQ_OQ>(data, count, target, op,
                                               out_mask);
       return;
     case BinaryOperation::kLessThan:

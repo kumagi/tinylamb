@@ -45,6 +45,8 @@ class Projection : public ExecutorBase {
   size_t NextBatch(DataChunk* destination,
                    size_t max_rows = kDefaultVectorSize) override;
   void Dump(std::ostream& o, int indent) const override;
+  void DumpHeader(std::ostream& o, int indent,
+                  bool leading_indent = false) const;
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
   [[nodiscard]] const std::vector<size_t>& CseUseCounts() const {
     return cse_use_counts_;
@@ -68,14 +70,20 @@ class Projection : public ExecutorBase {
   std::vector<std::optional<BytecodeProgram>> bytecodes_;
   struct JitProjectionState {
     bool eligible{false};
+    bool branchless_eligible{false};
     bool attempted{false};
     uint16_t column{0};
     int64_t multiplier{1};
     int64_t addend{0};
     size_t rows_seen{0};
     std::optional<JitInt64Kernels> kernel;
+    std::optional<JitBranchlessProgram> branchless;
   };
   std::vector<JitProjectionState> jit_states_;
+  std::vector<int64_t> jit_out_values_;
+  std::vector<uint8_t> jit_out_nulls_;
+  std::vector<std::vector<uint8_t>> jit_null_scratch_;
+  std::vector<JitColumnInput> jit_col_inputs_;
   size_t jit_threshold_rows_;
   size_t jit_batches_{0};
 };

@@ -114,6 +114,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.MergeProjectionsComposesTargetLists`: 内側出力の定義式を用いて外側のターゲットリストが合成され、単一の射影式が生成されることを検証。
   - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の RuleSet 内に `merge_projections` が正しく登録されていることを検証。

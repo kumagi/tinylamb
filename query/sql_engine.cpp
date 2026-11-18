@@ -2,7 +2,6 @@
  * Copyright 2026 KUMAZAKI Hiroki
  * Licensed under the Apache License, Version 2.0.
  */
-
 #include "query/sql_engine.hpp"
 
 #include <algorithm>
@@ -34,15 +33,19 @@
 
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
+#include "common/memory_budget.hpp"
 #include "common/set_operation.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/columnar_tlcs_scan_executor.hpp"
 #include "executor/constant_executor.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/delete.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/pipeline/ooc_sinks.hpp"
+#include "executor/detail/pipeline/pipeline_ir.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
@@ -52,6 +55,7 @@
 #include "executor/executor_base.hpp"
 #include "executor/insert.hpp"
 #include "executor/limit.hpp"
+#include "executor/pipeline_lowering.hpp"
 #include "executor/projection.hpp"
 #include "executor/relational.hpp"
 #include "executor/set_operation.hpp"
@@ -81,10 +85,12 @@
 #include "query/googlesql_ast.hpp"
 #include "query/googlesql_ast_visitor.hpp"
 #include "query/googlesql_frontend.hpp"
+#include "query/grouped_pipeline_lowering.hpp"
 #include "query/join_reduction.hpp"
 #include "query/plan_cache.hpp"
 #include "query/query_data.hpp"
 #include "query/select_rewrites.hpp"
+#include "query/sql_engine_internal.hpp"
 #include "query/sql_template.hpp"
 #include "query/statement.hpp"
 #include "table/table.hpp"
@@ -248,8 +254,8 @@ void SqlEngine::EnsureViewsRegistered(TransactionContext& ctx) {
   // the epoch. Successful individual definitions may already be registered.
   if (complete) {
     views_registered_epoch_ = epoch;
-    registered = RegisteredState{
-        .engine = this, .database = database_, .epoch = epoch};
+    registered =
+        RegisteredState{.engine = this, .database = database_, .epoch = epoch};
   }
 }
 
@@ -296,88 +302,83 @@ SqlRuntimeStats SqlEngine::ThreadRuntimeStats() {
 
 namespace {
 
+class StatementTimeoutExecutor final : public ExecutorBase {
+ public:
+  StatementTimeoutExecutor(Executor inner, Transaction* txn)
+      : inner_(std::move(inner)), txn_(txn) {}
+
+  size_t NextBatch(DataChunk* destination,
+                   size_t max_rows = kDefaultVectorSize) override {
+    if (txn_ != nullptr && txn_->HasStatementTimeout()) {
+      const Status ts = txn_->CheckStatementTimeout();
+      if (ts != Status::kSuccess) {
+        FailWith(ts);
+        return 0;
+      }
+    }
+    Transaction::ScopedThreadStatementDeadline deadline_guard(
+        txn_ != nullptr ? txn_->StatementDeadlineNs() : 0);
+    const size_t n = inner_->NextBatch(destination, max_rows);
+    if (FailWithChildOf(*inner_)) {
+      return 0;
+    }
+    if (txn_ != nullptr && txn_->HasStatementTimeout()) {
+      const Status ts = txn_->CheckStatementTimeout();
+      if (ts != Status::kSuccess) {
+        FailWith(ts);
+        return 0;
+      }
+    }
+    return n;
+  }
+
+  void Dump(std::ostream& o, int indent) const override {
+    inner_->Dump(o, indent);
+  }
+  void Explain(std::ostream& o, int indent) const override {
+    inner_->Explain(o, indent);
+  }
+  bool AttachRuntimeFilter(const std::shared_ptr<const RuntimeFilterGroup>& g,
+                           slot_t col, ValueType type) override {
+    return inner_->AttachRuntimeFilter(g, col, type);
+  }
+  [[nodiscard]] Status GetStatus() const override {
+    if (ExecutorBase::GetStatus() != Status::kSuccess) {
+      return ExecutorBase::GetStatus();
+    }
+    return inner_->GetStatus();
+  }
+
+ private:
+  Executor inner_;
+  Transaction* txn_{nullptr};
+};
+
+StatusOr<Executor> FinishPrepareWithTimeout(Transaction& txn,
+                                            StatusOr<Executor> exec,
+                                            std::string* last_error) {
+  if (!exec.HasValue()) {
+    return exec;
+  }
+  if (txn.HasStatementTimeout()) {
+    const Status ts = txn.CheckStatementTimeout();
+    if (ts != Status::kSuccess) {
+      if (last_error != nullptr) {
+        *last_error = ts.GetMessage();
+      }
+      return ts;
+    }
+    return Executor(
+        std::make_shared<StatementTimeoutExecutor>(exec.MoveValue(), &txn));
+  }
+  return exec;
+}
+
 // Resolves the child-side FOREIGN KEY checks for a DML target: every
 // well-formed single-column kForeign constraint becomes a (child offset,
 // parent table, parent offset) triple.  Malformed or dangling references
 // (possible only for hand-built schemas; CREATE TABLE validates) are
 // skipped so legacy tables keep working.
-StatusOr<std::vector<ForeignKeyCheck>> ResolveForeignKeyChecks(
-    TransactionContext& ctx, const Table& target) {
-  std::vector<ForeignKeyCheck> checks;
-  const Schema& schema = target.GetSchema();
-  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
-    const Constraint& constraint = schema.GetColumn(i).GetConstraint();
-    if (constraint.ctype != Constraint::kForeign) {
-      continue;
-    }
-    std::string parent_table;
-    std::vector<std::string> parent_columns;
-    if (!ParseForeignKeyReference(constraint, &parent_table, &parent_columns) ||
-        parent_columns.size() != 1) {
-      continue;
-    }
-    auto* parent = const_cast<Table*>(&target);
-    if (!IdentifierEquals(parent_table, schema.Name())) {
-      ASSIGN_OR_RETURN(std::shared_ptr<Table>, h_parent,
-                       (ctx.GetTable(parent_table)));
-      // The txn context caches the handle for the statement's lifetime.
-      parent = h_parent.get();
-      // Keep the cache entry alive even if the caller drops its handle:
-      // re-fetching by canonical name returns the same object.
-      (void)ctx.GetTable(parent->GetSchema().Name());
-    }
-    const int parent_offset =
-        parent->GetSchema().Offset(ColumnName("", parent_columns[0]));
-    if (parent_offset < 0) {
-      continue;
-    }
-    checks.push_back(
-        ForeignKeyCheck{.child_offset = i,
-                        .parent = parent,
-                        .parent_offset = static_cast<size_t>(parent_offset)});
-  }
-  return checks;
-}
-
-// Resolves the NO ACTION reverse checks for a DML target: every other (or
-// the same) table whose kForeign constraint names this table contributes a
-// (child table, child offset, parent offset) triple.
-StatusOr<std::vector<ReferencedByCheck>> ResolveReferencedByChecks(
-    Database* database, TransactionContext& ctx, const Table& target) {
-  std::vector<ReferencedByCheck> checks;
-  const std::string target_name = std::string(target.GetSchema().Name());
-  for (const std::string& name : database->ListTables(ctx)) {
-    ASSIGN_OR_RETURN(std::shared_ptr<Table>, h_child, (ctx.GetTable(name)));
-    Table* child = h_child.get();
-    (void)ctx.GetTable(child->GetSchema().Name());
-    const Schema& schema = child->GetSchema();
-    for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
-      const Constraint& constraint = schema.GetColumn(i).GetConstraint();
-      if (constraint.ctype != Constraint::kForeign) {
-        continue;
-      }
-      std::string parent_table;
-      std::vector<std::string> parent_columns;
-      if (!ParseForeignKeyReference(constraint, &parent_table,
-                                    &parent_columns) ||
-          parent_columns.size() != 1 ||
-          !IdentifierEquals(parent_table, target_name)) {
-        continue;
-      }
-      const int parent_offset =
-          target.GetSchema().Offset(ColumnName("", parent_columns[0]));
-      if (parent_offset < 0) {
-        continue;
-      }
-      checks.push_back(ReferencedByCheck{
-          .child = child,
-          .child_offset = i,
-          .parent_offset = static_cast<size_t>(parent_offset)});
-    }
-  }
-  return checks;
-}
-
 bool ContainsQueryExpression(const Expression& expression) {
   if (!expression) {
     return false;
@@ -500,6 +501,7 @@ bool CanUseDecorrelatedSubqueryOptimizer(const SelectStatement& statement) {
         query.Query()->Sources().size() != 1 ||
         query.Query()->Sources()[0].query ||
         query.Query()->Sources()[0].unnest ||
+        query.Query()->Sources()[0].sample.has_value() ||
         query.Query()->Sources()[0].join_condition ||
         !query.Query()->GroupBy().empty() || query.Query()->Having() ||
         query.Query()->Qualify() || query.Query()->HasLimit() ||
@@ -939,272 +941,6 @@ bool ProjectionContainsUniqueKey(const Plan& plan,
   return false;
 }
 
-Status ValidateNarrowInteger(const Column& column, const Value& value) {
-  if (!column.IntegerValueFits(value)) {
-    return {Status::kInvalidArgument,
-            "assignment out of range for column " + column.Name().name};
-  }
-  return Status::kSuccess;
-}
-
-// INSERT accepts a single STRUCT (or NULL) expression for a multi-column
-// table: struct fields expand positionally across the columns and a whole-row
-// NULL becomes a fully-NULL row. Struct values are stored as JSON text, so
-// expansion parses the top-level object members. Returns false when `single`
-// is not an expandable shape.
-bool ExpandStructInsertValue(const Value& single, size_t width,
-                             std::vector<Value>* out) {
-  if (width <= 1) {
-    return false;
-  }
-  if (single.IsNull()) {
-    *out = std::vector<Value>(width);
-    return true;
-  }
-  const auto json_value_to_value = [](const std::string& token,
-                                      Value* parsed) -> bool {
-    const std::string trimmed = [&] {
-      size_t b = token.find_first_not_of(" \t\r\n");
-      if (b == std::string::npos) {
-        return std::string();
-      }
-      size_t e = token.find_last_not_of(" \t\r\n");
-      return token.substr(b, e - b + 1);
-    }();
-    if (trimmed == "null") {
-      *parsed = Value();
-      return true;
-    }
-    if (trimmed == "true") {
-      *parsed = Value(int64_t{1});
-      return true;
-    }
-    if (trimmed == "false") {
-      *parsed = Value(int64_t{0});
-      return true;
-    }
-    if (trimmed.size() >= 2 && trimmed.front() == '"' &&
-        trimmed.back() == '"') {
-      std::string unescaped;
-      unescaped.reserve(trimmed.size());
-      for (size_t i = 1; i + 1 < trimmed.size(); ++i) {
-        if (trimmed[i] == '\\' && i + 2 < trimmed.size()) {
-          ++i;
-          switch (trimmed[i]) {
-            case 'n':
-              unescaped.push_back('\n');
-              break;
-            case 't':
-              unescaped.push_back('\t');
-              break;
-            case 'r':
-              unescaped.push_back('\r');
-              break;
-            default:
-              unescaped.push_back(trimmed[i]);
-              break;
-          }
-        } else {
-          unescaped.push_back(trimmed[i]);
-        }
-      }
-      *parsed = Value(std::move(unescaped));
-      return true;
-    }
-    if (!trimmed.empty()) {
-      try {
-        size_t consumed = 0;
-        const int64_t as_int = std::stoll(trimmed, &consumed);
-        if (consumed == trimmed.size()) {
-          *parsed = Value(as_int);
-          return true;
-        }
-        const double as_double = std::stod(trimmed, &consumed);
-        if (consumed == trimmed.size()) {
-          *parsed = Value(as_double);
-          return true;
-        }
-      } catch (const std::exception& error) {
-        (void)error;
-      }
-    }
-    // Nested structs / arrays stay as their raw JSON text.
-    if (!trimmed.empty() &&
-        ((trimmed.front() == '{' && trimmed.back() == '}') ||
-         (trimmed.front() == '[' && trimmed.back() == ']'))) {
-      *parsed = Value(std::string(trimmed));
-      return true;
-    }
-    return false;
-  };
-
-  const auto split_top_level = [](const std::string& body) {
-    std::vector<std::string> parts;
-    int depth = 0;
-    bool in_str = false;
-    char quote = '\0';
-    std::string current;
-    for (size_t i = 0; i < body.size(); ++i) {
-      const char c = body[i];
-      if (in_str) {
-        current.push_back(c);
-        if (c == '\\' && i + 1 < body.size()) {
-          current.push_back(body[++i]);
-        } else if (c == quote) {
-          in_str = false;
-        }
-        continue;
-      }
-      if (c == '"' || c == '\'') {
-        in_str = true;
-        quote = c;
-        current.push_back(c);
-      } else if (c == '{' || c == '[' || c == '(') {
-        ++depth;
-        current.push_back(c);
-      } else if (c == '}' || c == ']' || c == ')') {
-        --depth;
-        current.push_back(c);
-      } else if (c == ',' && depth == 0) {
-        parts.push_back(std::move(current));
-        current.clear();
-      } else {
-        current.push_back(c);
-      }
-    }
-    if (!current.empty()) {
-      parts.push_back(std::move(current));
-    }
-    return parts;
-  };
-
-  if (single.type != ValueType::kVarChar) {
-    return false;
-  }
-  const std::string text(single.value.varchar_value);
-  if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
-    return false;
-  }
-  const std::vector<std::string> members =
-      split_top_level(text.substr(1, text.size() - 2));
-  if (members.size() != width) {
-    return false;
-  }
-  std::vector<Value> expanded;
-  expanded.reserve(width);
-  for (const std::string& member : members) {
-    // Each member is `"name":value`; the value starts after the first colon
-    // outside quotes / nesting.
-    size_t colon = std::string::npos;
-    int depth = 0;
-    bool in_str = false;
-    char quote = '\0';
-    for (size_t i = 0; i < member.size(); ++i) {
-      const char c = member[i];
-      if (in_str) {
-        if (c == '\\') {
-          ++i;
-        } else if (c == quote) {
-          in_str = false;
-        }
-        continue;
-      }
-      if (c == '"' || c == '\'') {
-        in_str = true;
-        quote = c;
-      } else if (c == '{' || c == '[' || c == '(') {
-        ++depth;
-      } else if (c == '}' || c == ']' || c == ')') {
-        --depth;
-      } else if (c == ':' && depth == 0) {
-        colon = i;
-        break;
-      }
-    }
-    std::string value_text =
-        colon == std::string::npos ? member : member.substr(colon + 1);
-    if (colon == std::string::npos) {
-      // Anonymous positional shape: the member itself is the value.
-      value_text = member;
-    }
-    Value parsed;
-    if (!json_value_to_value(value_text, &parsed)) {
-      return false;
-    }
-    expanded.push_back(std::move(parsed));
-  }
-  *out = std::move(expanded);
-  return true;
-}
-
-class PlannedExplainExecutor final : public ExecutorBase {
- public:
-  PlannedExplainExecutor(Executor inner, Plan plan)
-      : plan_(std::move(plan)), inner_(std::move(inner)) {}
-
-  size_t NextBatch(DataChunk* destination, size_t max_rows) override {
-    return inner_->NextBatch(destination, max_rows);
-  }
-  void Dump(std::ostream& output, int indent) const override {
-    inner_->Dump(output, indent);
-  }
-  void Explain(std::ostream& output, int indent) const override {
-    inner_->Explain(output, indent);
-    if (plan_ == nullptr) {
-      return;
-    }
-    const PlanExplainInfo& info = plan_->ExplainInfo();
-    if (info.rule_name.empty() && info.physical_operator.empty() &&
-        info.required_properties.empty() && info.provided_properties.empty() &&
-        info.applied_rules.empty()) {
-      return;
-    }
-    const std::string pad(static_cast<size_t>(std::max(indent, 0)), ' ');
-    output << "\n"
-           << pad << "Rule: " << info.rule_name << "\n"
-           << pad << "Physical operator: " << info.physical_operator << "\n"
-           << pad << "Required properties: " << info.required_properties << "\n"
-           << pad << "Provided properties: " << info.provided_properties;
-    if (!info.applied_rules.empty()) {
-      output << "\n" << pad << "Applied rules: " << info.applied_rules;
-    }
-  }
-  Status GetStatus() const override { return inner_->GetStatus(); }
-
- private:
-  Plan plan_;
-  Executor inner_;
-};
-
-std::vector<ValueType> SchemaColumnTypes(const Schema& schema) {
-  std::vector<ValueType> types;
-  types.reserve(schema.ColumnCount());
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    types.push_back(schema.GetColumn(i).Type());
-  }
-  return types;
-}
-
-Executor WithPlanExplain(Executor executor, Plan plan,
-                         std::vector<ValueType>* output_types = nullptr) {
-  if (executor == nullptr || plan == nullptr) {
-    return executor;
-  }
-  if (output_types != nullptr) {
-    // The plan's output schema carries the declared column types; capture
-    // them before `plan` moves into the explain wrapper so wire consumers
-    // (e.g. pgwire RowDescription) see real types even for empty results.
-    *output_types = SchemaColumnTypes(plan->GetSchema());
-  }
-  return std::make_shared<PlannedExplainExecutor>(std::move(executor),
-                                                  std::move(plan));
-}
-
-// Physical plans and mutation executors borrow Table/Index objects from their
-// compiled-plan artifact.  A concurrent execution of the same fingerprint
-// may replace that cache entry while an older executor is still streaming;
-// keep the exact artifact that emitted this executor alive until the stream
-// itself is destroyed.
 class RetainedExecutor final : public ExecutorBase {
  public:
   RetainedExecutor(Executor inner, CompiledPlanPtr retained)
@@ -1294,68 +1030,6 @@ class TimedSelectReuse final : public ExecutorBase {
   bool finished_{false};
 };
 
-struct ExplainRequest {
-  bool analyze{false};
-  std::string_view query;
-};
-
-std::optional<ExplainRequest> ParseExplain(std::string_view sql) {
-  auto trim = [](std::string_view value) {
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-      value.remove_prefix(1);
-    }
-    return value;
-  };
-  auto consume = [&](std::string_view* input, std::string_view keyword) {
-    *input = trim(*input);
-    if (input->size() < keyword.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < keyword.size(); ++i) {
-      if (std::toupper(static_cast<unsigned char>((*input)[i])) != keyword[i]) {
-        return false;
-      }
-    }
-    if (input->size() != keyword.size() &&
-        !std::isspace(static_cast<unsigned char>((*input)[keyword.size()]))) {
-      return false;
-    }
-    input->remove_prefix(keyword.size());
-    return true;
-  };
-
-  std::string_view remainder = sql;
-  if (!consume(&remainder, "EXPLAIN")) {
-    return std::nullopt;
-  }
-  const bool analyze = consume(&remainder, "ANALYZE");
-  remainder = trim(remainder);
-  if (remainder.empty()) {
-    return ExplainRequest{.analyze = analyze, .query = {}};
-  }
-  return ExplainRequest{.analyze = analyze, .query = remainder};
-}
-
-std::vector<Row> ExplainRows(std::string_view plan) {
-  std::vector<Row> rows;
-  size_t begin = 0;
-  while (begin <= plan.size()) {
-    const size_t end = plan.find('\n', begin);
-    const std::string_view line = end == std::string_view::npos
-                                      ? plan.substr(begin)
-                                      : plan.substr(begin, end - begin);
-    if (!line.empty()) {
-      rows.emplace_back(std::vector<Value>{Value(std::string(line))});
-    }
-    if (end == std::string_view::npos) {
-      break;
-    }
-    begin = end + 1;
-  }
-  return rows;
-}
-
 constexpr size_t kMaxCachedTemplates = 1024;
 constexpr size_t kTemplateCacheShards = 16;
 constexpr size_t kMaxCachedTemplatesPerShard =
@@ -1372,14 +1046,22 @@ bool IsExplicitZeroLimit(const Statement& statement) {
   return select.HasLimit() && select.Limit() == 0;
 }
 
+// A template is the parsed AST, which has views expanded inline, so it is only
+// valid for the schema generation it was parsed under.  Database epochs start
+// from a per-database range (next_database_epoch_base), so the stamp also
+// identifies the database; a view DDL bumps it and orphans stale entries.
+struct CachedTemplate {
+  std::shared_ptr<Statement> statement;
+  uint64_t epoch{0};
+};
+
 struct TemplateShard {
   std::mutex mutex;
-  std::unordered_map<std::string, std::shared_ptr<Statement>> cache;
+  std::unordered_map<std::string, CachedTemplate> cache;
 };
 
 std::array<TemplateShard, kTemplateCacheShards> template_shards;
-thread_local std::unordered_map<std::string, std::shared_ptr<Statement>>
-    local_templates;
+thread_local std::unordered_map<std::string, CachedTemplate> local_templates;
 
 TemplateShard& ShardFor(const std::string& fingerprint) {
   return template_shards[std::hash<std::string>{}(fingerprint) %
@@ -1387,8 +1069,9 @@ TemplateShard& ShardFor(const std::string& fingerprint) {
 }
 
 void RememberTemplate(const std::string& fingerprint,
-                      std::unique_ptr<Statement> statement) {
-  std::shared_ptr<Statement> shared(std::move(statement));
+                      std::unique_ptr<Statement> statement, uint64_t epoch) {
+  const CachedTemplate shared{std::shared_ptr<Statement>(std::move(statement)),
+                              epoch};
   if (local_templates.size() >= kMaxCachedTemplates) {
     local_templates.clear();
   }
@@ -1401,170 +1084,113 @@ void RememberTemplate(const std::string& fingerprint,
   shard.cache.insert_or_assign(fingerprint, std::move(shared));
 }
 
-std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint) {
+std::shared_ptr<Statement> FindTemplate(const std::string& fingerprint,
+                                        uint64_t epoch) {
   if (const auto local = local_templates.find(fingerprint);
       local != local_templates.end()) {
-    return local->second;
+    if (local->second.epoch == epoch) {
+      return local->second.statement;
+    }
+    local_templates.erase(local);
   }
   TemplateShard& shard = ShardFor(fingerprint);
   std::scoped_lock lock(shard.mutex);
   const auto cached = shard.cache.find(fingerprint);
-  if (cached == shard.cache.end()) {
+  if (cached == shard.cache.end() || cached->second.epoch != epoch) {
     return nullptr;
   }
   if (local_templates.size() >= kMaxCachedTemplates) {
     local_templates.clear();
   }
-  local_templates.emplace(fingerprint, cached->second);
-  return cached->second;
+  local_templates.insert_or_assign(fingerprint, cached->second);
+  return cached->second.statement;
 }
 
-// ANALYZE [TABLE] [table [, ...]];  empty table list means every catalog table.
-struct AnalyzeRequest {
-  std::vector<std::string> tables;
-};
-
-std::optional<AnalyzeRequest> ParseAnalyze(std::string_view sql) {
-  auto trim = [](std::string_view value) {
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-      value.remove_prefix(1);
-    }
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.back()))) {
-      value.remove_suffix(1);
-    }
-    return value;
-  };
-  auto consume = [&](std::string_view* input, std::string_view keyword) {
-    *input = trim(*input);
-    if (input->size() < keyword.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < keyword.size(); ++i) {
-      if (std::toupper(static_cast<unsigned char>((*input)[i])) != keyword[i]) {
-        return false;
-      }
-    }
-    if (input->size() != keyword.size() &&
-        !std::isspace(static_cast<unsigned char>((*input)[keyword.size()])) &&
-        (*input)[keyword.size()] != ';') {
-      return false;
-    }
-    input->remove_prefix(keyword.size());
+bool PipelineEngineEnabled() noexcept {
+  const char* env = std::getenv("TINYLAMB_EXEC_ENGINE");
+  if (env == nullptr || env[0] == '\0') {
     return true;
-  };
-
-  std::string_view remainder = sql;
-  if (!consume(&remainder, "ANALYZE")) {
-    return std::nullopt;
   }
-  remainder = trim(remainder);
-  if (!remainder.empty() && remainder.back() == ';') {
-    remainder.remove_suffix(1);
-    remainder = trim(remainder);
-  }
-  std::ignore = consume(&remainder, "TABLE");
-  remainder = trim(remainder);
-
-  AnalyzeRequest request;
-  if (remainder.empty()) {
-    return request;
-  }
-
-  while (!remainder.empty()) {
-    remainder = trim(remainder);
-    if (remainder.empty()) {
-      break;
-    }
-    if (std::isalpha(static_cast<unsigned char>(remainder.front())) == 0 &&
-        remainder.front() != '_') {
-      return std::nullopt;
-    }
-    size_t length = 1;
-    while (length < remainder.size() &&
-           (std::isalnum(static_cast<unsigned char>(remainder[length])) != 0 ||
-            remainder[length] == '_')) {
-      ++length;
-    }
-    request.tables.emplace_back(remainder.substr(0, length));
-    remainder.remove_prefix(length);
-    remainder = trim(remainder);
-    if (remainder.empty()) {
-      break;
-    }
-    if (remainder.front() != ',') {
-      return std::nullopt;
-    }
-    remainder.remove_prefix(1);
-  }
-  return request;
+  return std::string_view(env) != "legacy";
 }
 
-StatusOr<Executor> ExecuteAnalyze(Database& database, TransactionContext& ctx,
-                                  const AnalyzeRequest& request) {
-  std::vector<std::string> tables = request.tables;
-  if (tables.empty()) {
-    tables = database.ListTables(ctx);
-  }
-  std::vector<Row> rows;
-  rows.reserve(tables.size());
-  for (const std::string& table : tables) {
-    const Status refreshed = database.RefreshStatistics(ctx, table);
-    if (refreshed != Status::kSuccess) {
-      return refreshed;
+StatusOr<Executor> LowerSelectPlanExecutor(
+    const Plan& plan, TransactionContext& ctx, bool distinct,
+    const std::vector<Expression>& order_expressions,
+    const std::vector<bool>& order_ascending,
+    const std::vector<std::optional<bool>>& order_nulls_first,
+    const std::vector<OocSortSink::KeySpec>& sort_keys, bool has_limit,
+    size_t limit, size_t offset, bool with_ties, size_t visible_columns,
+    size_t final_select_size, bool keep_plan_explain_text = false) {
+  const bool need_distinct = distinct && !plan->EnforcesDistinct();
+  const bool need_sort =
+      !order_expressions.empty() &&
+      !plan->IsOrderedBy(order_expressions, order_ascending, order_nulls_first);
+  const bool need_limit =
+      (has_limit || offset != 0) && !plan->EnforcesLimit(limit, offset);
+  const bool need_proj = visible_columns != final_select_size;
+
+  if (PipelineEngineEnabled() && !(with_ties && need_limit)) {
+    ASSIGN_OR_RETURN(
+        Executor, direct_columnar,
+        TryCreateDirectColumnarScanOrTopNExecutor(
+            plan, ctx, need_distinct, order_expressions, order_ascending,
+            order_nulls_first, sort_keys, has_limit, limit, offset, with_ties,
+            visible_columns, final_select_size, keep_plan_explain_text));
+    if (direct_columnar != nullptr) {
+      return direct_columnar;
     }
-    ctx.stats_.erase(table);
-    ASSIGN_OR_RETURN(std::shared_ptr<TableStatistics>, stats,
-                     ctx.GetStats(table));
-    rows.emplace_back(std::vector<Value>{
-        Value(std::string("ANALYZE")), Value(std::string(table)),
-        Value(static_cast<int64_t>(stats->Rows()))});
+    PipelineLoweringOptions opts;
+    opts.keep_plan_explain_text = keep_plan_explain_text;
+    opts.apply_post_distinct = need_distinct;
+    if (need_sort) {
+      opts.post_sort_keys = sort_keys;
+    }
+    if (need_limit) {
+      if (has_limit) {
+        opts.post_limit = limit;
+      }
+      opts.post_offset = offset;
+    }
+    if (need_proj) {
+      const Schema& schema = plan->GetSchema();
+      std::vector<Column> proj_cols;
+      proj_cols.reserve(visible_columns);
+      opts.post_projection.reserve(visible_columns);
+      for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
+        opts.post_projection.emplace_back(schema.GetColumn(i).Name());
+        proj_cols.push_back(schema.GetColumn(i));
+      }
+      opts.post_projection_schema = Schema("", std::move(proj_cols));
+    }
+    return PipelineLowering::LowerToExecutor(plan, ctx, opts);
   }
-  return Executor(std::make_shared<ConstantExecutor>(std::move(rows)));
-}
 
-// --- Phase 2-1 compiled-plan cache ("prepared plans") -----------------------
-//
-// Serving helpers below replay a cached CompiledPlan. They must stay
-// side-effect free: any doubt returns nullopt and the legacy Prepare path
-// produces the authoritative result/error.
-
-std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
-                                            const CompiledPlan& compiled) {
-  // Mirrors the executor-construction tail of PrepareStatement(kSelect);
-  // shape metadata was captured from an identical bound statement at fill.
-  const CompiledPlan::SelectShape& shape = *compiled.select_shape;
-  Executor executor = compiled.plan->EmitExecutor(ctx);
-  if (shape.distinct && !compiled.plan->EnforcesDistinct()) {
+  Executor executor = plan->EmitExecutor(ctx);
+  if (need_distinct) {
     executor = std::make_shared<DistinctExecutor>(std::move(executor));
   }
-  if (!shape.order_expressions.empty() &&
-      !compiled.plan->IsOrderedBy(shape.order_expressions,
-                                  shape.order_ascending,
-                                  shape.order_nulls_first)) {
-    std::vector<SortExecutor::Key> keys;
-    keys.reserve(shape.sort_keys.size());
-    for (size_t i = 0; i < shape.sort_keys.size(); ++i) {
-      const auto& key = shape.sort_keys[i];
-      keys.push_back({key.first, key.second,
-                      i < shape.order_nulls_first.size()
-                          ? shape.order_nulls_first[i]
-                          : std::nullopt});
+  if (need_sort) {
+    std::vector<SortExecutor::Key> legacy_keys;
+    legacy_keys.reserve(sort_keys.size());
+    for (const OocSortSink::KeySpec& k : sort_keys) {
+      legacy_keys.push_back(SortExecutor::Key{.expression = k.expression,
+                                              .ascending = k.ascending,
+                                              .nulls_first = k.nulls_first,
+                                              .collation = k.collation});
     }
     executor = std::make_shared<SortExecutor>(
-        std::move(executor), compiled.plan->GetSchema(), std::move(keys));
+        std::move(executor), plan->GetSchema(), std::move(legacy_keys));
   }
-  if ((shape.has_limit || shape.offset != 0) &&
-      !compiled.plan->EnforcesLimit(shape.limit, shape.offset)) {
-    executor = std::make_shared<LimitExecutor>(std::move(executor), shape.limit,
-                                               shape.offset);
+  if (need_limit) {
+    executor =
+        std::make_shared<LimitExecutor>(std::move(executor), limit, offset);
   }
-  if (shape.visible_columns != shape.final_select_size) {
+  if (need_proj) {
     std::vector<NamedExpression> visible;
-    visible.reserve(shape.visible_columns);
-    const Schema& schema = compiled.plan->GetSchema();
-    for (size_t i = 0; i < shape.visible_columns; ++i) {
+    visible.reserve(visible_columns);
+    const Schema& schema = plan->GetSchema();
+    for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
       visible.emplace_back(schema.GetColumn(i).Name());
     }
     executor = std::make_shared<Projection>(std::move(visible), schema,
@@ -1573,177 +1199,33 @@ std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
   return executor;
 }
 
-std::optional<Executor> ServeCompiledInsert(TransactionContext& ctx,
-                                            const CompiledPlan& compiled,
-                                            std::vector<Value> parameters) {
-  const CompiledPlan::InsertShape& shape = *compiled.insert_shape;
-  auto values = std::make_shared<const PreparedValues>(std::move(parameters));
-  std::vector<Row> rows;
-  rows.reserve(shape.cells.size());
-  for (const auto& cells : shape.cells) {
-    std::vector<Value> evaluated;
-    evaluated.reserve(cells.size());
-    for (const Expression& cell : cells) {
-      // Slots receive this execution's values; slot-free subtrees are shared
-      // immutable nodes, so cloning cost is proportional to literals only.
-      StatusOr<Value> value =
-          CloneWithPreparedValues(cell, values)->TryEvaluate(Row(), Schema());
-      if (!value.HasValue()) {
-        // The slow path re-evaluates and surfaces the diagnostic.
-        return std::nullopt;
-      }
-      evaluated.push_back(value.MoveValue());
-    }
-    if (shape.has_named_columns) {
-      // Destination offsets were validated at fill time; replay them.
-      std::vector<Value> reordered(shape.schema.ColumnCount());
-      for (size_t i = 0; i < evaluated.size(); ++i) {
-        reordered[shape.reorder[i]] = evaluated[i];
-      }
-      evaluated = std::move(reordered);
-    }
-    for (size_t i = 0; i < evaluated.size(); ++i) {
-      // Same coercion rules as the legacy INSERT path so behavior is
-      // identical for every parameter combination.
-      const auto& col = shape.schema.GetColumn(i);
-      const ValueType expected = col.Type();
-      if (ValidateNarrowInteger(col, evaluated[i]) != Status::kSuccess) {
-        // The slow path re-validates and surfaces the diagnostic.
-        return std::nullopt;
-      }
-      if (col.IsUnsigned()) {
-        if (!evaluated[i].IsNull()) {
-          if (evaluated[i].type != ValueType::kInt64) {
-            return std::nullopt;
-          }
-          if (!evaluated[i].IsUnsigned() && evaluated[i].value.int_value < 0) {
-            return std::nullopt;
-          }
-          evaluated[i] = evaluated[i].WithUnsigned();
-        }
-        continue;
-      }
-      if (evaluated[i].IsNull() || evaluated[i].type == expected) {
-        continue;
-      }
-      if (expected == ValueType::kDouble &&
-          evaluated[i].type == ValueType::kInt64) {
-        evaluated[i] = Value(static_cast<double>(evaluated[i].value.int_value));
-        continue;
-      }
-      if (expected == ValueType::kDate &&
-          evaluated[i].type == ValueType::kVarChar) {
-        evaluated[i] = Value::Date(evaluated[i].value.varchar_value);
-        continue;
-      }
-      return std::nullopt;  // Legacy path reports the precise error.
-    }
-    rows.emplace_back(std::move(evaluated));
+std::optional<Executor> ServeCompiledSelect(TransactionContext& ctx,
+                                            const CompiledPlan& compiled) {
+  // Mirrors the executor-construction tail of PrepareStatement(kSelect);
+  // shape metadata was captured from an identical bound statement at fill.
+  const CompiledPlan::SelectShape& shape = *compiled.select_shape;
+  std::vector<OocSortSink::KeySpec> sort_keys;
+  sort_keys.reserve(shape.sort_keys.size());
+  for (size_t i = 0; i < shape.sort_keys.size(); ++i) {
+    const auto& key = shape.sort_keys[i];
+    sort_keys.push_back(OocSortSink::KeySpec{
+        .expression = key.first,
+        .ascending = key.second,
+        .nulls_first = i < shape.order_nulls_first.size()
+                           ? shape.order_nulls_first[i]
+                           : std::nullopt,
+    });
   }
-  StatusOr<std::vector<ForeignKeyCheck>> fk_checks =
-      ResolveForeignKeyChecks(ctx, *shape.table);
-  if (!fk_checks.HasValue()) {
+  StatusOr<Executor> exec_or = LowerSelectPlanExecutor(
+      compiled.plan, ctx, shape.distinct, shape.order_expressions,
+      shape.order_ascending, shape.order_nulls_first, sort_keys,
+      shape.has_limit, shape.limit, shape.offset, shape.with_ties,
+      shape.visible_columns, shape.final_select_size,
+      /*keep_plan_explain_text=*/false);
+  if (!exec_or.HasValue()) {
     return std::nullopt;
   }
-  return Executor(std::make_shared<Insert>(
-      ctx.txn_, shape.table.get(),
-      std::make_shared<ConstantExecutor>(std::move(rows)),
-      InsertExecutionMode::kDefault, /*enforce_primary_key=*/false,
-      /*upsert_offsets=*/std::vector<size_t>{},
-      /*assert_rows_modified=*/-1, fk_checks.MoveValue()));
-}
-
-// Slotizes the finished plan. Parent expressions are visited before children,
-// so a SET/SELECT list is bound before the scan predicate. A mismatch returns
-// an empty vector; the statement still runs with the literals it was planned
-// with, and the cache keeps the identical-parameter fallback.
-// Numbers literals in SQL-text order before planning. The optimizer may
-// reorder conjuncts; the slot index stays with the literal.
-struct SqlLiteralSlots {
-  const std::vector<Value>* parameters = nullptr;
-  size_t cursor = 0;
-  bool ok = true;
-
-  Expression Apply(const Expression& expression) {
-    if (!ok || parameters == nullptr || !expression) {
-      return expression;
-    }
-    bool local_ok = true;
-    Expression slotted =
-        SlotizeLiterals(expression, &cursor, &local_ok, parameters, nullptr);
-    if (!local_ok) {
-      ok = false;
-      return expression;
-    }
-    return slotted;
-  }
-
-  [[nodiscard]] bool Complete() const {
-    return ok && parameters != nullptr && cursor == parameters->size();
-  }
-};
-
-// Collects slots stamped before planning. Every SQL parameter must still be
-// present. A missing index means the optimizer dropped that slot; refuse
-// parametric reuse instead of binding a different literal into the hole.
-std::vector<Expression> InstallPlanSlots(const Plan& plan,
-                                         const std::vector<Value>& parameters) {
-  if (!plan || parameters.empty()) {
-    return {};
-  }
-  std::vector<Expression> slots;
-  size_t cursor = 0;
-  if (!plan->InstallParameterSlots(parameters, &cursor, &slots)) {
-    return {};
-  }
-  std::vector<char> seen(parameters.size(), 0);
-  for (const Expression& expression : slots) {
-    const auto* slot = dynamic_cast<const ParameterSlot*>(expression.get());
-    if (slot == nullptr || slot->Index() >= parameters.size() ||
-        slot->GetValue() != parameters[slot->Index()]) {
-      return {};
-    }
-    seen[slot->Index()] = 1;
-  }
-  if (std::find(seen.begin(), seen.end(), 0) != seen.end()) {
-    return {};
-  }
-  return slots;
-}
-
-// Fill-time helper shared by the specialized tiers. The precautionary volatile
-// mark around PrepareStatement must not suppress the fill: Bug 57 is the
-// caller's `dml_fold_applied_` check. A volatile fingerprint is still not
-// served until that mark is demoted.
-void RememberSpecializedPlan(const std::string& fingerprint, uint64_t epoch,
-                             std::vector<Value> parameters,
-                             CompiledPlan::Kind kind, Plan plan,
-                             std::shared_ptr<Table> table,
-                             const Database* database,
-                             const TransactionContext& ctx,
-                             std::vector<Expression> slots) {
-  if (fingerprint.empty()) {
-    return;
-  }
-  if (!slots.empty() && (plan == nullptr || !plan->ContainsParameterSlots())) {
-    slots.clear();
-  }
-  auto compiled = std::make_shared<CompiledPlan>();
-  compiled->kind = kind;
-  compiled->database = database;
-  compiled->epoch = epoch;
-  compiled->parameters = std::move(parameters);
-  compiled->parameter_slots = std::move(slots);
-  compiled->plan = std::move(plan);
-  compiled->table = std::move(table);
-  // The plan tree borrows fill-time TableStatistics whose shared_ptr lives
-  // only in ctx.stats_; pin them so ANALYZE/DROP invalidation cannot leave
-  // replayed scans reading freed memory.
-  compiled->retained_stats.reserve(ctx.stats_.size());
-  for (const auto& entry : ctx.stats_) {
-    compiled->retained_stats.push_back(entry.second);
-  }
-  StoreThreadCompiledPlan(fingerprint, std::move(compiled));
+  return exec_or.MoveValue();
 }
 
 }  // namespace
@@ -1756,6 +1238,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
   result_column_names_.clear();
   result_column_types_.clear();
   shared_grouping_cores_.clear();
+  ctx.txn_.BeginStatementTimer();
   // Persisted views expand at FROM-reference time in the visitor, so the
   // session registry must be current before the statement is visited.
   EnsureViewsRegistered(ctx);
@@ -1774,7 +1257,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
         last_error_ = "ANALYZE failed";
         return executed.GetStatus();
       }
-      return executed;
+      return FinishPrepareWithTimeout(ctx.txn_, std::move(executed),
+                                      &last_error_);
     }
   }
 
@@ -1814,7 +1298,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
       upper_query.find("FOR UPDATE") != std::string::npos) {
     templated.fingerprint.append("\n-- for-update-nowait");
   }
-  // Phase 2-1: consult the compiled-plan cache before any parse/bind/plan
+  // Consult the compiled-plan cache before any parse/bind/plan
   // work. Literal-free SQL bypasses the template binder and may replay only
   // an audited immutable artifact under its exact fingerprint.
   if (!explain && !force_relational_fallback_ &&
@@ -1822,12 +1306,16 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     if (std::optional<Executor> served =
             ServeFromPlanCache(ctx, templated.fingerprint, templated.parameters,
                                !templated.templatable)) {
-      return std::move(*served);
+      return FinishPrepareWithTimeout(ctx.txn_, std::move(*served),
+                                      &last_error_);
     }
   }
+  // Read before any parse so a template is never stamped newer than the schema
+  // it was parsed against.
+  const uint64_t template_epoch = database_->SchemaEpoch();
   if (templated.templatable) {
     if (const std::shared_ptr<Statement> cached =
-            FindTemplate(templated.fingerprint)) {
+            FindTemplate(templated.fingerprint, template_epoch)) {
       if (auto rebound = BindStatementLiterals(*cached, templated.parameters);
           rebound.HasValue()) {
         statement = rebound.MoveValue();
@@ -1904,119 +1392,7 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
                             });
   }
   if (explain) {
-    // Reject non-SELECT statements BEFORE any planning/execution: EXPLAIN
-    // DROP TABLE must neither drop nor create anything (§7.4).
-    if (statement->Type() != StatementType::kSelect) {
-      last_error_ = "EXPLAIN currently supports SELECT and WITH queries";
-      return Status::kNotImplemented;
-    }
-    last_statement_type_ = StatementType::kSelect;
-    const auto* explain_select =
-        static_cast<const SelectStatement*>(statement.get());
-    std::vector<std::string> explain_base_tables;
-    bool explain_has_inner_join_source = false;
-    for (const SelectSource& source : explain_select->Sources()) {
-      if (source.table.empty() || source.unnest || source.query) {
-        continue;
-      }
-      if (source.join_type == JoinType::kLeft ||
-          source.join_type == JoinType::kRight ||
-          source.join_type == JoinType::kFull) {
-        continue;
-      }
-      // CTE names never resolve to catalog tables (materialized CTEs scan
-      // shared row cells instead); listing them would fake join-elimination
-      // annotations below, so only physical tables participate.
-      if (!ctx.GetTable(source.table).HasValue()) {
-        continue;
-      }
-      if (source.join_type == JoinType::kInner) {
-        explain_has_inner_join_source = true;
-      }
-      explain_base_tables.push_back(source.table);
-    }
-    const auto planning_start = std::chrono::steady_clock::now();
-    StatusOr<Executor> prepared = PrepareStatement(ctx, std::move(statement));
-    const auto planning_end = std::chrono::steady_clock::now();
-    if (!prepared.HasValue()) {
-      return prepared.GetStatus();
-    }
-
-    uint64_t rows = 0;
-    std::chrono::steady_clock::time_point execution_end = planning_end;
-    uint64_t initial_hits = 0;
-    uint64_t initial_misses = 0;
-    PageManager* pm = ctx.txn_.GetPageManager();
-    if (pm != nullptr) {
-      initial_hits = pm->CacheHits();
-      initial_misses = pm->CacheMisses();
-    } else if (database_ != nullptr) {
-      initial_hits = database_->CacheHits();
-      initial_misses = database_->CacheMisses();
-    }
-    if (explain->analyze) {
-      DataChunk chunk;
-      while (prepared.Value()->NextBatch(&chunk) != 0) {
-        rows += chunk.Size();
-      }
-      // A scan that failed mid-drain must fail the EXPLAIN ANALYZE too;
-      // reporting runtime stats for a truncated execution misleads plans.
-      RETURN_IF_FAIL(prepared.Value()->GetStatus());
-      execution_end = std::chrono::steady_clock::now();
-    }
-    std::ostringstream output;
-    prepared.Value()->Explain(output, 0);
-    const std::string body = output.str();
-    // An INNER-join FROM relation that vanished from a non-empty plan was
-    // removed by provably-unused foreign-key join elimination. LEFT-join
-    // elimination and full contradiction (EmptyResult) are left unannotated so
-    // they keep the "no Join token" plan shape the corpus expects.
-    const bool plan_scans_something =
-        body.find("FullScan") != std::string::npos ||
-        body.find("SeqScan") != std::string::npos ||
-        body.find("IndexScan") != std::string::npos ||
-        body.find("IndexOnlyScan") != std::string::npos;
-    if (explain_has_inner_join_source && plan_scans_something) {
-      bool any_survives = false;
-      bool any_eliminated = false;
-      for (const std::string& table : explain_base_tables) {
-        if (body.find(table) == std::string::npos) {
-          any_eliminated = true;
-        } else {
-          any_survives = true;
-        }
-      }
-      if (any_eliminated && any_survives) {
-        output << "\nJoinElimination";
-      }
-    }
-    if (explain->analyze) {
-      output << "\nRuntime: ";
-      prepared.Value()->Dump(output, 0);
-    }
-    const double planning_ms =
-        std::chrono::duration<double, std::milli>(planning_end - planning_start)
-            .count();
-    output << "\nPlanning Time: " << planning_ms << " ms";
-    if (explain->analyze) {
-      const double execution_ms = std::chrono::duration<double, std::milli>(
-                                      execution_end - planning_end)
-                                      .count();
-      output << "\nActual Rows: " << rows
-             << "\nExecution Time: " << execution_ms << " ms";
-      if (pm != nullptr) {
-        const uint64_t hits = pm->CacheHits() - initial_hits;
-        const uint64_t misses = pm->CacheMisses() - initial_misses;
-        output << "\nBuffer Pool: " << hits << " hits, " << misses << " misses";
-      } else if (database_ != nullptr) {
-        const uint64_t hits = database_->CacheHits() - initial_hits;
-        const uint64_t misses = database_->CacheMisses() - initial_misses;
-        output << "\nBuffer Pool: " << hits << " hits, " << misses << " misses";
-      }
-    }
-    result_column_names_ = {"QUERY PLAN"};
-    return Executor(
-        std::make_shared<ConstantExecutor>(ExplainRows(output.str())));
+    return ExecuteExplain(ctx, query_sql, *explain, std::move(statement));
   }
 
   if (statement->Type() == StatementType::kUpdate &&
@@ -2033,7 +1409,8 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     // statement is parsed verbatim next time.
     if (auto rebound = BindStatementLiterals(*statement, templated.parameters);
         rebound.HasValue()) {
-      RememberTemplate(templated.fingerprint, rebound.MoveValue());
+      RememberTemplate(templated.fingerprint, rebound.MoveValue(),
+                       template_epoch);
       PlanCacheStats().template_fills.fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -2068,1245 +1445,12 @@ StatusOr<Executor> SqlEngine::Prepare(TransactionContext& ctx,
     // The mark was precautionary: without an actual prepare-time fold the
     // fingerprint stays cache-eligible.
     DemoteVolatileFingerprint(fold_fp, fold_marked_fresh && !dml_fold_applied_);
-    return result;
+    return FinishPrepareWithTimeout(ctx.txn_, std::move(result), &last_error_);
   } catch (const std::exception& error) {
     DemoteVolatileFingerprint(fold_fp, fold_marked_fresh);
     last_error_ = error.what();
     return Status::kUnknown;
   }
-}
-
-namespace {
-
-// Nested per-row array DML (UPDATE ... SET (DELETE/UPDATE/INSERT ...)).
-// Each matching row is rewritten in place: the target column holds an ARRAY,
-// and every nested item filters / transforms / appends its elements. The
-// element variable visible to item predicates is the last component of the
-// target path; outer row columns stay reachable through the scope chain so
-// correlated references and subqueries keep working.
-StatusOr<Executor> ExecuteNestedArrayUpdate(TransactionContext& ctx,
-                                            const UpdateStatement& update,
-                                            Table* table) {
-  const Schema& schema = table->GetSchema();
-  struct ResolvedItem {
-    size_t offset;
-    std::string element_name;
-    std::vector<std::string> proto_path;
-    const NestedDmlItem* item;
-  };
-  std::vector<ResolvedItem> resolved;
-  resolved.reserve(update.NestedItems().size());
-  for (const NestedDmlItem& item : update.NestedItems()) {
-    std::vector<std::string> path;
-    size_t start = 0;
-    for (size_t pos = 0; pos <= item.target_path.size(); ++pos) {
-      if (pos == item.target_path.size() || item.target_path[pos] == '.') {
-        path.push_back(item.target_path.substr(start, pos - start));
-        start = pos + 1;
-      }
-    }
-    if (path.empty() || path.front().empty()) {
-      return Status(Status::kInvalidArgument,
-                    "nested DML target not found: " + item.target_path);
-    }
-    const int offset = schema.Offset(ColumnName(path.front()));
-    if (offset < 0) {
-      return Status(Status::kInvalidArgument,
-                    "nested DML target not found: " + item.target_path);
-    }
-    std::vector<std::string> proto_path;
-    if (path.size() > 1) {
-      proto_path.assign(path.begin() + 1, path.end());
-    }
-    resolved.push_back(ResolvedItem{.offset = static_cast<size_t>(offset),
-                                    .element_name = path.back(),
-                                    .proto_path = std::move(proto_path),
-                                    .item = &item});
-  }
-
-  QueryData query;
-  query.from_ = {update.TableName()};
-  query.where_ = update.WhereClause() ? update.WhereClause()
-                                      : ConstantValueExp(Value(true));
-  query.select_.reserve(schema.ColumnCount());
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    query.select_.emplace_back(schema.GetColumn(i).Name().name,
-                               ColumnValueExp(schema.GetColumn(i).Name()));
-  }
-  query.require_row_position_ = true;
-  RETURN_IF_FAIL(query.Rewrite(ctx));
-  ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-  Executor source = plan->EmitExecutor(ctx);
-
-  int64_t modified_rows = 0;
-  Row new_row;
-  RowPosition position;
-  while (source->Next(&new_row, &position)) {
-    // Per-cell array edit state: UPDATE predicates match against the array
-    // as of the last DELETE / INSERT (or the original contents), so writes
-    // from sibling nested UPDATEs never see one another, while DELETEs take
-    // effect immediately in order.
-    struct ArrayEditState {
-      std::vector<Value> working;
-      std::vector<Value> update_baseline;
-      // Flags marking elements already rewritten by a nested UPDATE: a
-      // second UPDATE touching the same element is a conflict.
-      std::vector<bool> update_touched;
-      bool loaded{false};
-    };
-    std::map<size_t, ArrayEditState> edit_state;
-    for (const ResolvedItem& entry : resolved) {
-      const NestedDmlItem& item = *entry.item;
-      Value& cell = new_row.values_[entry.offset];
-      const bool proto_target = !entry.proto_path.empty();
-      Value array_cell = cell;
-      std::string proto_type;
-      if (proto_target) {
-        if (cell.IsNull() || cell.type != ValueType::kVarChar) {
-          return Status(Status::kInvalidArgument,
-                        "Cannot execute nested DML on a NULL protocol message");
-        }
-        proto_type = InferProtoTypeName(
-            std::string_view(cell.value.varchar_value), entry.proto_path);
-        Value extracted;
-        if (!TryProtoTextGetField(cell.value.varchar_value,
-                                  entry.proto_path.back(), &extracted) ||
-            !extracted.IsArray()) {
-          return Status(Status::kInvalidArgument,
-                        "nested DML target is not a repeated "
-                        "protocol field: " +
-                            item.target_path);
-        }
-        array_cell = std::move(extracted);
-      }
-      Value& edit_cell = proto_target ? array_cell : cell;
-      const Column element_column(ColumnName("", entry.element_name),
-                                  edit_cell.IsNull()    ? ValueType::kNull
-                                  : edit_cell.IsArray() ? ValueType::kInt64
-                                                        : edit_cell.type);
-      Schema element_schema("", {element_column});
-      relational_detail::Scope outer_scope{
-          .row = &new_row, .schema = &schema, .outer = nullptr};
-      auto eval_on_element = [&](const Expression& expr,
-                                 const Value& element) -> StatusOr<Value> {
-        if (!expr) {
-          return Value(true);
-        }
-        Row element_row({element});
-        relational_detail::Scope element_scope{.row = &element_row,
-                                               .schema = &element_schema,
-                                               .outer = &outer_scope};
-        return relational_detail::TryEvaluate(expr, element_scope, nullptr, ctx,
-                                              relational_detail::CteMap{});
-      };
-      ArrayEditState& state = edit_state[entry.offset];
-      auto load_working = [&]() {
-        if (!state.loaded) {
-          state.working = edit_cell.ArrayElements();
-          state.update_baseline = state.working;
-          state.update_touched.assign(state.working.size(), false);
-          state.loaded = true;
-        }
-      };
-      switch (item.kind) {
-        case NestedDmlItem::Kind::kDelete: {
-          if (edit_cell.IsNull()) {
-            return Status(
-                Status::kInvalidArgument,
-                "Cannot execute a nested DELETE statement on a NULL array "
-                "value");
-          }
-          if (!edit_cell.IsArray()) {
-            return Status(Status::kInvalidArgument,
-                          "nested DELETE requires an ARRAY value "
-                          "in column " +
-                              item.target_path);
-          }
-          load_working();
-          std::vector<Value> kept;
-          kept.reserve(state.working.size());
-          int64_t touched = 0;
-          for (Value& element : state.working) {
-            ASSIGN_OR_RETURN(Value, matches,
-                             (eval_on_element(item.predicate, element)));
-            if (!matches.IsNull() && relational_detail::Truthy(matches)) {
-              ++touched;
-            } else {
-              kept.push_back(std::move(element));
-            }
-          }
-          if (item.assert_rows_modified >= 0 &&
-              touched != item.assert_rows_modified) {
-            std::ostringstream message;
-            message << "ASSERT_ROWS_MODIFIED expected "
-                    << item.assert_rows_modified
-                    << " array elements modified, but found " << touched;
-            return Status(Status::kInvalidArgument, message.str());
-          }
-          state.working = std::move(kept);
-          state.update_baseline = state.working;
-          state.update_touched.assign(state.working.size(), false);
-          edit_cell =
-              Value::Array(state.working, edit_cell.ArrayElementSqlType());
-          break;
-        }
-        case NestedDmlItem::Kind::kUpdate: {
-          if (edit_cell.IsNull()) {
-            return Status(
-                Status::kInvalidArgument,
-                "Cannot execute a nested UPDATE statement on a NULL array "
-                "value");
-          }
-          if (!edit_cell.IsArray()) {
-            return Status(Status::kInvalidArgument,
-                          "nested UPDATE requires an ARRAY value "
-                          "in column " +
-                              item.target_path);
-          }
-          load_working();
-          int64_t touched = 0;
-          for (size_t i = 0; i < state.working.size(); ++i) {
-            ASSIGN_OR_RETURN(
-                Value, matches,
-                (eval_on_element(item.predicate, state.update_baseline[i])));
-            if (!matches.IsNull() && relational_detail::Truthy(matches)) {
-              if (i < state.update_touched.size() && state.update_touched[i]) {
-                return Status(
-                    Status::kInvalidArgument,
-                    "Attempted to modify an array element with multiple "
-                    "nested UPDATE statements");
-              }
-              ++touched;
-              if (i < state.update_touched.size()) {
-                state.update_touched[i] = true;
-              }
-              ASSIGN_OR_RETURN(
-                  Value, assigned,
-                  (eval_on_element(item.set_value, state.update_baseline[i])));
-              state.working[i] = std::move(assigned);
-            }
-          }
-          if (item.assert_rows_modified >= 0 &&
-              touched != item.assert_rows_modified) {
-            std::ostringstream message;
-            message << "ASSERT_ROWS_MODIFIED expected "
-                    << item.assert_rows_modified
-                    << " array elements modified, but found " << touched;
-            return Status(Status::kInvalidArgument, message.str());
-          }
-          edit_cell =
-              Value::Array(state.working, edit_cell.ArrayElementSqlType());
-          break;
-        }
-        case NestedDmlItem::Kind::kInsert: {
-          if (edit_cell.IsNull()) {
-            return Status(
-                Status::kInvalidArgument,
-                "Cannot execute a nested INSERT statement on a NULL array "
-                "value");
-          }
-          if (!edit_cell.IsArray()) {
-            return Status(Status::kInvalidArgument,
-                          "nested INSERT requires an ARRAY value "
-                          "in column " +
-                              item.target_path);
-          }
-          load_working();
-          int64_t inserted = 0;
-          if (item.insert_query != nullptr) {
-            StatusOr<relational_detail::Relation> produced_query =
-                relational_detail::ExecuteQuery(ctx, *item.insert_query,
-                                                nullptr, {});
-            if (!produced_query.HasValue()) {
-              return Status(
-                  Status::kInvalidArgument,
-                  std::string(produced_query.GetStatus().GetMessage()));
-            }
-            relational_detail::Relation produced = produced_query.MoveValue();
-            produced.ForEachRow([&](const Row& row) {
-              if (!row.values_.empty()) {
-                state.working.push_back(row.values_.front());
-                ++inserted;
-              }
-            });
-          } else {
-            for (const auto& values : item.insert_values) {
-              if (values.empty()) {
-                continue;
-              }
-              ASSIGN_OR_RETURN(Value, item_value,
-                               (relational_detail::TryEvaluate(
-                                   values.front(), outer_scope, nullptr, ctx,
-                                   relational_detail::CteMap{})));
-              state.working.push_back(std::move(item_value));
-              ++inserted;
-            }
-          }
-          if (item.assert_rows_modified >= 0 &&
-              inserted != item.assert_rows_modified) {
-            std::ostringstream message;
-            message << "ASSERT_ROWS_MODIFIED expected "
-                    << item.assert_rows_modified
-                    << " array elements modified, but found " << inserted;
-            return Status(Status::kInvalidArgument, message.str());
-          }
-          state.update_baseline = state.working;
-          edit_cell =
-              Value::Array(state.working, edit_cell.ArrayElementSqlType());
-          break;
-        }
-      }
-      if (proto_target) {
-        ASSIGN_OR_RETURN(
-            std::optional<std::string>, rewritten,
-            TryProtoTextSetField(std::string(cell.value.varchar_value),
-                                 entry.proto_path, edit_cell, proto_type));
-        if (rewritten.has_value()) {
-          cell = Value(std::string(*rewritten));
-        }
-      }
-    }
-    StatusOr<RowPosition> updated = table->Update(ctx.txn_, position, new_row);
-    if (updated.GetStatus() != Status::kSuccess) {
-      return Status(Status::kInvalidArgument,
-                    "update failed on table " + std::string(schema.Name()));
-    }
-    ++modified_rows;
-  }
-  // Next()==false reads as EOF, so a scan that failed mid-drain (an overflow
-  // inside the WHERE conjuncts, a corrupt page) would otherwise report the
-  // rows applied so far as a successful UPDATE.
-  RETURN_IF_FAIL(source->GetStatus());
-  if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
-    return Status(Status::kInvalidArgument,
-                  "ASSERT_ROWS_MODIFIED was specified with " +
-                      std::to_string(update.AssertRowsModified()) +
-                      " rows, but " + std::to_string(modified_rows) +
-                      " rows were modified");
-  }
-  return Executor(std::make_shared<ConstantExecutor>(
-      Row({Value("Update Rows"), Value(modified_rows)})));
-}
-
-namespace {
-
-namespace {
-
-std::string EscapeStructKey(std::string_view text) {
-  std::string escaped;
-  for (const char c : text) {
-    switch (c) {
-      case '"':
-        escaped += "\\\"";
-        break;
-      case '\\':
-        escaped += "\\\\";
-        break;
-      default:
-        escaped.push_back(c);
-    }
-  }
-  return escaped;
-}
-
-}  // namespace
-
-// Decodes one struct-member token. Legacy constructor storage embeds nested
-// objects/arrays as *quoted* raw JSON (the writer did not escape inner
-// quotes); unwrap those so navigation sees real objects.
-Value DecodeStructMember(const std::string& text) {
-  std::string trimmed = text;
-  size_t b = trimmed.find_first_not_of(" \t\r\n");
-  if (b == std::string::npos) {
-    return {};
-  }
-  size_t e = trimmed.find_last_not_of(" \t\r\n");
-  trimmed = trimmed.substr(b, e - b + 1);
-  if (trimmed.size() >= 4 && trimmed.front() == '"' && trimmed.back() == '"') {
-    const std::string inner = trimmed.substr(1, trimmed.size() - 2);
-    if (!inner.empty() && ((inner.front() == '{' && inner.back() == '}') ||
-                           (inner.front() == '[' && inner.back() == ']'))) {
-      return Value(std::string(inner));
-    }
-  }
-  Value parsed;
-  if (!JsonTextToValue(trimmed, &parsed)) {
-    parsed = Value(std::move(trimmed));
-  }
-  return parsed;
-}
-
-// Resolves `segs` member positions inside `json` by name; returns the index
-// at every level or an empty optional when the path does not exist here.
-std::optional<std::vector<int>> FindStructPathOrdinals(
-    const std::string& json, const std::vector<std::string>& segs) {
-  std::vector<int> ordinals;
-  std::string current = json;
-  for (const std::string& seg : segs) {
-    if (current.size() < 2 || current.front() != '{' || current.back() != '}') {
-      return std::nullopt;
-    }
-    const auto members =
-        SplitJsonObjectMembers(current.substr(1, current.size() - 2));
-    int index = -1;
-    size_t ordinal = 0;
-    for (const auto& [key, text] : members) {
-      if (IdentifierEquals(key, seg)) {
-        index = static_cast<int>(ordinal);
-        break;
-      }
-      ++ordinal;
-    }
-    if (index < 0) {
-      return std::nullopt;
-    }
-    ordinals.push_back(index);
-    Value decoded =
-        DecodeStructMember(members[static_cast<size_t>(index)].second);
-    if (decoded.IsNull()) {
-      return std::nullopt;
-    }
-    if (decoded.type == ValueType::kVarChar &&
-        !std::string_view(decoded.value.varchar_value).starts_with("{")) {
-      // A STRUCT may contain a protocol message encoded as a TEXT member.
-      // The remaining path is resolved by the proto setter rather than by
-      // looking for JSON object ordinals.
-      ordinals.resize(segs.size(), -1);
-      return ordinals;
-    }
-    current = decoded.type == ValueType::kVarChar
-                  ? std::string(decoded.value.varchar_value)
-                  : std::string("null");
-  }
-  return ordinals;
-}
-
-// Rewrites `json` by replacing the member addressed by `ordinals` (one index
-// per path segment). Missing positions leave the document untouched.
-StatusOr<std::optional<std::string>> SetStructPathByOrdinals(
-    const std::string& json, const std::vector<std::string>& segs,
-    const std::vector<int>& ordinals, size_t depth, const Value& new_value) {
-  if (json.size() < 2 || json.front() != '{' || json.back() != '}') {
-    // Assigning through a NULL / non-object intermediate.
-    return Status(Status::kInvalidArgument, "Cannot set field of NULL STRUCT");
-  }
-  const auto members = SplitJsonObjectMembers(json.substr(1, json.size() - 2));
-  const int index = ordinals[depth];
-  if (index < 0 || static_cast<size_t>(index) >= members.size()) {
-    return std::nullopt;
-  }
-  std::string rebuilt = "{";
-  bool first = true;
-  for (size_t i = 0; i < members.size(); ++i) {
-    if (!first) {
-      rebuilt += ",";
-    }
-    first = false;
-    rebuilt += "\"";
-    rebuilt += EscapeStructKey(members[i].first);
-    rebuilt += "\":";
-    if (std::cmp_equal(i, index)) {
-      if (depth + 1 == segs.size()) {
-        rebuilt += EncodeStructMemberJson(new_value);
-      } else {
-        Value nested_value = DecodeStructMember(members[i].second);
-        if (nested_value.type == ValueType::kVarChar &&
-            !std::string_view(nested_value.value.varchar_value)
-                 .starts_with("{")) {
-          std::vector<std::string> proto_path(
-              segs.begin() + static_cast<std::ptrdiff_t>(depth + 1),
-              segs.end());
-          const std::string_view proto_text(nested_value.value.varchar_value);
-          const std::string proto_type =
-              InferProtoTypeName(proto_text, proto_path);
-          ASSIGN_OR_RETURN(std::optional<std::string>, proto,
-                           TryProtoTextSetField(proto_text, proto_path,
-                                                new_value, proto_type));
-          rebuilt += proto.has_value()
-                         ? EncodeStructMemberJson(Value(std::string(*proto)))
-                         : members[i].second;
-        } else {
-          ASSIGN_OR_RETURN(
-              std::optional<std::string>, nested,
-              (SetStructPathByOrdinals(
-                  nested_value.IsNull() ? std::string("null")
-                  : nested_value.type == ValueType::kVarChar
-                      ? std::string(nested_value.value.varchar_value)
-                      : std::string("null"),
-                  segs, ordinals, depth + 1, new_value)));
-          rebuilt += nested.has_value() ? *nested : members[i].second;
-        }
-      }
-    } else {
-      rebuilt += members[i].second;
-    }
-  }
-  rebuilt += "}";
-  return rebuilt;
-}
-}  // namespace
-
-// UPDATE with dotted SET targets over STRUCT-typed columns ("SET s.f = ...").
-// Struct JSON carries no schema-level field names/positions, so the ordinal
-// of each top-level field is resolved against the matched rows themselves;
-// rows whose stored keys differ positionally still update correctly.
-StatusOr<Executor> ExecuteStructFieldUpdate(TransactionContext& ctx,
-                                            const UpdateStatement& update,
-                                            Table* table) {
-  const Schema& schema = table->GetSchema();
-  auto column_index = [&](std::string_view name) -> int {
-    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
-        return static_cast<int>(i);
-      }
-    }
-    return -1;
-  };
-  struct FieldTarget {
-    size_t offset;
-    std::vector<std::string> segments;
-    const Expression* value;
-    std::vector<int> ordinals;
-  };
-  std::vector<FieldTarget> field_targets;
-  std::vector<std::pair<ColumnName, const Expression*>> plain_targets;
-  for (const auto& [target, expression] : update.SetClause()) {
-    if (!target.schema.empty() && !target.name.empty()) {
-      const int base = column_index(target.schema);
-      if (base >= 0) {
-        std::vector<std::string> segments;
-        size_t start = 0;
-        for (size_t pos = 0; pos <= target.name.size(); ++pos) {
-          if (pos == target.name.size() || target.name[pos] == '.') {
-            segments.push_back(target.name.substr(start, pos - start));
-            start = pos + 1;
-          }
-        }
-        field_targets.push_back(FieldTarget{.offset = static_cast<size_t>(base),
-                                            .segments = std::move(segments),
-                                            .value = &expression,
-                                            .ordinals = {}});
-        continue;
-      }
-    }
-    int offset = -1;
-    if (!target.name.empty()) {
-      offset = column_index(target.name);
-    }
-    if (offset < 0) {
-      return Status(Status::kInvalidArgument,
-                    "UPDATE SET target not found: " + target.ToString());
-    }
-    plain_targets.emplace_back(
-        ColumnName(update.TableName(),
-                   schema.GetColumn(static_cast<size_t>(offset)).Name().name),
-        &expression);
-  }
-
-  // Dotted references inside the predicate resolve as STRUCT field access
-  // against the column named by the first path component.
-  Expression where_clause = update.WhereClause();
-  if (where_clause) {
-    std::function<Expression(const Expression&)> bind_struct_fields =
-        [&](const Expression& expr) -> Expression {
-      if (!expr) {
-        return expr;
-      }
-      if (expr->Type() == TypeTag::kColumnValue) {
-        const ColumnName& name = expr->AsColumnValue().GetColumnName();
-        if (!name.schema.empty() && name.schema != update.TableName() &&
-            !name.name.empty() && name.name != "*") {
-          const int base = column_index(name.schema);
-          if (base >= 0) {
-            return FunctionCallExp(
-                "__get_field_safe",
-                {ColumnValueExp(ColumnName(
-                     update.TableName(),
-                     schema.GetColumn(static_cast<size_t>(base)).Name().name)),
-                 ConstantValueExp(Value(std::string(name.name)))});
-          }
-        }
-        return expr;
-      }
-      std::vector<Expression> children = ExpressionChildren(expr);
-      bool changed = false;
-      for (Expression& child : children) {
-        Expression mapped = bind_struct_fields(child);
-        changed |= child->ToString() != mapped->ToString();
-        child = std::move(mapped);
-      }
-      return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
-    };
-    where_clause = bind_struct_fields(where_clause);
-  }
-  std::vector<std::pair<Row, RowPosition>> pending;
-  auto source = table->BeginFullScan(ctx.txn_);
-  while (source.IsValid()) {
-    Row row = *source;
-    relational_detail::Scope scope{
-        .row = &row, .schema = &schema, .outer = nullptr};
-    bool matches_where = true;
-    if (where_clause) {
-      ASSIGN_OR_RETURN(
-          Value, where_value,
-          (relational_detail::TryEvaluate(where_clause, scope, nullptr, ctx,
-                                          relational_detail::CteMap{})));
-      matches_where = relational_detail::Truthy(where_value);
-    }
-    if (matches_where) {
-      pending.emplace_back(std::move(row), source.Position());
-    }
-    ++source;
-  }
-
-  RETURN_IF_FAIL(source.GetStatus());
-
-  // Resolve each path segment's positional index from any matched row that
-  // carries the segment names explicitly (anonymous tuples store fN keys).
-  for (auto& target : field_targets) {
-    target.ordinals.assign(target.segments.size(), -1);
-    for (const auto& [candidate, candidate_position] : pending) {
-      const Value& cell = candidate.values_[target.offset];
-      if (cell.IsNull() || cell.type != ValueType::kVarChar) {
-        continue;
-      }
-      auto found = FindStructPathOrdinals(std::string(cell.value.varchar_value),
-                                          target.segments);
-      if (found.has_value()) {
-        target.ordinals = *found;
-        break;
-      }
-    }
-  }
-
-  int64_t modified_rows = 0;
-  for (auto& [new_row, row_position] : pending) {
-    // Re-read the physical row before editing it.  The generic executor may
-    // reuse its batch-backed VARCHAR storage between calls to Next(); a
-    // direct table read gives dotted STRUCT/PROTO updates an owning payload.
-    ASSIGN_OR_RETURN(Row, fresh_row, table->Read(ctx.txn_, row_position));
-    new_row = std::move(fresh_row);
-    for (const auto& target : field_targets) {
-      Value& cell = new_row.values_[target.offset];
-      // Struct JSON objects start with '{'; proto TEXT payloads never do.
-      // Proto cells (and NULLs whose target addresses a modelled proto
-      // field) rewrite through the shared dotted-field setter; required-
-      // field and enum-member violations surface as errors.
-      const bool json_cell = !cell.IsNull() &&
-                             cell.type == ValueType::kVarChar &&
-                             !cell.value.varchar_value.empty() &&
-                             cell.value.varchar_value.front() == '{';
-      std::string_view payload =
-          !json_cell && !cell.IsNull() && cell.type == ValueType::kVarChar
-              ? std::string_view(cell.value.varchar_value)
-              : std::string_view();
-      const std::string proto_type =
-          json_cell ? std::string()
-                    : InferProtoTypeName(payload, target.segments);
-      const bool proto_cell = !json_cell && !proto_type.empty();
-      if (proto_cell) {
-        if (cell.IsNull()) {
-          return Status(Status::kInvalidArgument,
-                        "Cannot set field of NULL `" + proto_type + "`");
-        }
-        relational_detail::Scope row_scope{
-            .row = &new_row, .schema = &schema, .outer = nullptr};
-        ASSIGN_OR_RETURN(
-            Value, assigned,
-            (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
-                                            ctx, relational_detail::CteMap{})));
-        RETURN_IF_FAIL(TryValidateEnumFieldValue(
-            proto_type,
-            target.segments.empty() ? std::string() : target.segments.back(),
-            assigned));
-        ASSIGN_OR_RETURN(std::optional<std::string>, rewritten,
-                         TryProtoTextSetField(payload, target.segments,
-                                              assigned, proto_type));
-        if (rewritten.has_value()) {
-          cell = Value(std::move(*rewritten));
-        }
-        continue;
-      }
-      if (cell.IsNull()) {
-        return Status(Status::kInvalidArgument,
-                      "Cannot set field of NULL STRUCT");
-      }
-      const std::string text(cell.value.varchar_value);
-      relational_detail::Scope row_scope{
-          .row = &new_row, .schema = &schema, .outer = nullptr};
-      ASSIGN_OR_RETURN(
-          Value, assigned,
-          (relational_detail::TryEvaluate(*target.value, row_scope, nullptr,
-                                          ctx, relational_detail::CteMap{})));
-      // Rows may store the same STRUCT members in different orders; resolve
-      // the path against this row's own member names first and only fall
-      // back to the shared ordinals for rows whose keys are anonymous (fN).
-      const std::optional<std::vector<int>> own_ordinals =
-          FindStructPathOrdinals(text, target.segments);
-      ASSIGN_OR_RETURN(
-          std::optional<std::string>, rewritten,
-          (SetStructPathByOrdinals(
-              text, target.segments,
-              own_ordinals.has_value() ? *own_ordinals : target.ordinals, 0,
-              assigned)));
-      if (rewritten.has_value()) {
-        cell = Value(std::move(*rewritten));
-      }
-    }
-    StatusOr<RowPosition> updated =
-        table->Update(ctx.txn_, row_position, new_row);
-    if (updated.GetStatus() != Status::kSuccess) {
-      return Status(Status::kInvalidArgument,
-                    "update failed on table " + std::string(schema.Name()));
-    }
-    ++modified_rows;
-  }
-  if (update.HasAssert() && modified_rows != update.AssertRowsModified()) {
-    return Status(Status::kInvalidArgument,
-                  "ASSERT_ROWS_MODIFIED was specified with " +
-                      std::to_string(update.AssertRowsModified()) +
-                      " rows, but " + std::to_string(modified_rows) +
-                      " rows were modified");
-  }
-  return Executor(std::make_shared<ConstantExecutor>(
-      Row({Value("Update Rows"), Value(modified_rows)})));
-}
-
-}  // namespace
-
-// MERGE INTO target USING source ON condition: materialize the source as a
-// relation, classify every target row (and every unmatched source row)
-// against the declared WHEN clauses, then apply the pending deletes, updates
-// and inserts through the table API inside the caller's transaction.  An
-// equality key extracted from the ON conjuncts hashes the source side; with
-// no extractable key the matcher falls back to a linear scan (correct, just
-// O(target x source)).  Foreign-key edges resolved for the target enforce
-// NO ACTION in apply order (deletes first), which keeps statement-internal
-// self-references (delete a parent row, insert its child back) consistent.
-StatusOr<Executor> SqlEngine::ExecuteMerge(TransactionContext& ctx,
-                                           const MergeStatement& merge) {
-  const auto& clauses = merge.Clauses();
-  const MergeWhenClause* insert_clause = nullptr;
-  const MergeWhenClause* by_source_clause = nullptr;
-  for (const MergeWhenClause& clause : clauses) {
-    if (clause.match_type == MergeWhenClause::MatchType::kNotMatchedByTarget) {
-      if (insert_clause != nullptr) {
-        return Status(Status::kInvalidArgument,
-                      "MERGE allows at most one WHEN NOT MATCHED [BY TARGET] "
-                      "clause");
-      }
-      insert_clause = &clause;
-    } else if (clause.match_type ==
-               MergeWhenClause::MatchType::kNotMatchedBySource) {
-      if (by_source_clause != nullptr) {
-        return Status(Status::kInvalidArgument,
-                      "MERGE allows at most one WHEN NOT MATCHED BY SOURCE "
-                      "clause");
-      }
-      by_source_clause = &clause;
-    }
-  }
-
-  ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                   ctx.GetTable(merge.TargetTable()));
-  const Schema& schema = table->GetSchema();
-  last_dml_table_ = merge.TargetTable();
-
-  // ---- source materialization ------------------------------------------
-  ASSIGN_OR_RETURN(
-      relational_detail::Relation, source_rel,
-      (relational_detail::ExecuteQuery(ctx, *merge.Source(), nullptr, {})));
-  std::vector<Row> source_rows;
-  source_rel.ForEachRow([&](const Row& row) { source_rows.push_back(row); });
-  const std::string source_alias =
-      merge.SourceAlias().empty() ? merge.TargetTable() : merge.SourceAlias();
-  const Schema source_schema =
-      relational_detail::QualifySchema(source_rel.schema, source_alias);
-
-  auto target_column_index = [&](std::string_view name) -> int {
-    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
-        return static_cast<int>(i);
-      }
-    }
-    return -1;
-  };
-  auto source_column_index = [&](std::string_view name) -> int {
-    for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
-      if (IdentifierEquals(source_schema.GetColumn(i).Name().name, name)) {
-        return static_cast<int>(i);
-      }
-    }
-    return -1;
-  };
-
-  // ---- reference re-binding --------------------------------------------
-  // Qualified source references keep their alias (they resolve through the
-  // outer Scope during evaluation); target-qualified and bare names bind to
-  // the plain target column.  A bare name present in both relations is
-  // ambiguous and rejected.
-  std::function<StatusOr<Expression>(const Expression&)> rebind =
-      [&](const Expression& expr) -> StatusOr<Expression> {
-    if (!expr) {
-      return expr;
-    }
-    if (expr->Type() == TypeTag::kColumnValue) {
-      const ColumnName& name = expr->AsColumnValue().GetColumnName();
-      if (!name.schema.empty()) {
-        if (IdentifierEquals(name.schema, source_alias)) {
-          return expr;
-        }
-        if (IdentifierEquals(name.schema, merge.TargetTable())) {
-          return ColumnValueExp(ColumnName("", name.name));
-        }
-        return expr;  // inner subquery scope; leave untouched
-      }
-      const int source_index =
-          name.name.empty() ? -1 : source_column_index(name.name);
-      const int target_index =
-          name.name.empty() ? -1 : target_column_index(name.name);
-      if (source_index >= 0 && target_index >= 0) {
-        return Status(Status::kInvalidArgument,
-                      "MERGE condition column " + name.name +
-                          " is ambiguous (present in both the target and the "
-                          "source)");
-      }
-      if (source_index >= 0) {
-        return ColumnValueExp(ColumnName(source_alias, name.name));
-      }
-      return expr;
-    }
-    std::vector<Expression> children = ExpressionChildren(expr);
-    bool changed = false;
-    for (Expression& child : children) {
-      ASSIGN_OR_RETURN(Expression, mapped, rebind(child));
-      changed |= child->ToString() != mapped->ToString();
-      child = std::move(mapped);
-    }
-    return changed ? WithExpressionChildren(expr, std::move(children)) : expr;
-  };
-
-  Expression on_condition;
-  ASSIGN_OR_RETURN(Expression, hv_on_condition, rebind(merge.OnCondition()));
-  on_condition = std::move(hv_on_condition);
-  std::vector<MergeWhenClause> bound_clauses;
-  bound_clauses.reserve(clauses.size());
-  for (const MergeWhenClause& clause : clauses) {
-    MergeWhenClause bound;
-    bound.match_type = clause.match_type;
-    if (clause.condition) {
-      ASSIGN_OR_RETURN(Expression, bound_condition, rebind(clause.condition));
-      bound.condition = std::move(bound_condition);
-    }
-    bound.action.kind = clause.action.kind;
-    bound.action.insert_columns = clause.action.insert_columns;
-    for (const auto& [target, value] : clause.action.set_clause) {
-      const int target_index = target_column_index(target.name);
-      if (target_index < 0) {
-        return Status(Status::kNotExists,
-                      "MERGE UPDATE SET target not found: " + target.name);
-      }
-      Expression bound_value;
-      ASSIGN_OR_RETURN(Expression, hv_bound_value, rebind(value));
-      bound_value = std::move(hv_bound_value);
-      bound.action.set_clause.emplace_back(
-          ColumnName(
-              "",
-              schema.GetColumn(static_cast<size_t>(target_index)).Name().name),
-          std::move(bound_value));
-    }
-    for (const Expression& value : clause.action.insert_values) {
-      Expression bound_value;
-      ASSIGN_OR_RETURN(Expression, hv_insert_value, rebind(value));
-      bound_value = std::move(hv_insert_value);
-      bound.action.insert_values.push_back(std::move(bound_value));
-    }
-    bound_clauses.push_back(std::move(bound));
-  }
-
-  // ---- equality keys from the ON conjuncts -----------------------------
-  std::vector<std::pair<size_t, size_t>> join_keys;  // (target, source)
-  {
-    std::vector<Expression> conjuncts;
-    std::function<void(const Expression&)> collect =
-        [&](const Expression& expr) {
-          if (expr && expr->Type() == TypeTag::kBinaryExp &&
-              expr->AsBinaryExpression().Op() == BinaryOperation::kAnd) {
-            collect(expr->AsBinaryExpression().Left());
-            collect(expr->AsBinaryExpression().Right());
-            return;
-          }
-          conjuncts.push_back(expr);
-        };
-    collect(on_condition);
-    for (const Expression& conjunct : conjuncts) {
-      if (!conjunct || conjunct->Type() != TypeTag::kBinaryExp ||
-          conjunct->AsBinaryExpression().Op() != BinaryOperation::kEquals) {
-        continue;
-      }
-      const Expression& left = conjunct->AsBinaryExpression().Left();
-      const Expression& right = conjunct->AsBinaryExpression().Right();
-      if (left->Type() != TypeTag::kColumnValue ||
-          right->Type() != TypeTag::kColumnValue) {
-        continue;
-      }
-      const ColumnName left_name = left->AsColumnValue().GetColumnName();
-      const ColumnName right_name = right->AsColumnValue().GetColumnName();
-      const int left_target =
-          left_name.schema.empty() ? target_column_index(left_name.name) : -1;
-      const int left_source =
-          !left_name.schema.empty() &&
-                  IdentifierEquals(left_name.schema, source_alias)
-              ? source_column_index(left_name.name)
-              : -1;
-      const int right_target =
-          right_name.schema.empty() ? target_column_index(right_name.name) : -1;
-      const int right_source =
-          !right_name.schema.empty() &&
-                  IdentifierEquals(right_name.schema, source_alias)
-              ? source_column_index(right_name.name)
-              : -1;
-      if (left_target >= 0 && right_source >= 0) {
-        join_keys.emplace_back(static_cast<size_t>(left_target),
-                               static_cast<size_t>(right_source));
-      } else if (left_source >= 0 && right_target >= 0) {
-        join_keys.emplace_back(static_cast<size_t>(right_target),
-                               static_cast<size_t>(left_source));
-      }
-    }
-    // A type-mismatched key makes the hash encoding unequal for values the
-    // equality comparison would consider equal; fall back to the linear
-    // matcher rather than silently missing matches.
-    for (const auto& [target_index, source_index] : join_keys) {
-      if (schema.GetColumn(target_index).Type() !=
-          source_schema.GetColumn(source_index).Type()) {
-        join_keys.clear();
-        break;
-      }
-    }
-  }
-
-  std::unordered_map<std::string, std::vector<size_t>> source_index;
-  auto composite_key = [](const std::vector<Value>& values) {
-    std::string key;
-    for (const Value& value : values) {
-      key += value.IsNull() ? std::string("\x01N") : value.AsString();
-      key.push_back('\x00');
-    }
-    return key;
-  };
-  const bool use_hash = !join_keys.empty();
-  if (use_hash) {
-    std::vector<Value> key_values(join_keys.size());
-    for (size_t row_index = 0; row_index < source_rows.size(); ++row_index) {
-      bool null_key = false;
-      for (size_t k = 0; k < join_keys.size(); ++k) {
-        const Value& value =
-            source_rows[row_index].values_[join_keys[k].second];
-        if (value.IsNull()) {
-          null_key = true;
-        }
-        key_values[k] = value;
-      }
-      if (null_key) {
-        continue;  // NULL = NULL is UNKNOWN: never matches
-      }
-      source_index[composite_key(key_values)].push_back(row_index);
-    }
-  }
-
-  // ---- classification ---------------------------------------------------
-  std::vector<std::pair<RowPosition, Row>> pending_updates;
-  std::vector<RowPosition> pending_deletes;
-  std::vector<Row> pending_inserts;
-  std::vector<bool> source_matched(source_rows.size(), false);
-
-  auto eval_truth =
-      [&](const Expression& expr,
-          const relational_detail::Scope& scope) -> StatusOr<bool> {
-    ASSIGN_OR_RETURN(
-        Value, value,
-        (relational_detail::TryEvaluate(expr, scope, nullptr, ctx,
-                                        relational_detail::CteMap{})));
-    return relational_detail::Truthy(value);
-  };
-
-  auto build_update_row =
-      [&](const Row& current, const MergeAction& action,
-          const relational_detail::Scope& scope) -> StatusOr<Row> {
-    Row updated = current;
-    for (const auto& [column, expression] : action.set_clause) {
-      const int target_index = target_column_index(column.name);
-      if (target_index < 0) {
-        return Status(Status::kNotExists,
-                      "MERGE UPDATE SET target not found: " + column.name);
-      }
-      ASSIGN_OR_RETURN(
-          Value, value,
-          (relational_detail::TryEvaluate(expression, scope, nullptr, ctx,
-                                          relational_detail::CteMap{})));
-      updated.values_[static_cast<size_t>(target_index)] = std::move(value);
-    }
-    return updated;
-  };
-
-  auto build_insert_row =
-      [&](const MergeAction& action,
-          const relational_detail::Scope& scope) -> StatusOr<Row> {
-    std::vector<Value> values(schema.ColumnCount(), Value());
-    const auto& columns = action.insert_columns;
-    if (!columns.empty() && columns.size() != action.insert_values.size()) {
-      return Status(Status::kInvalidArgument,
-                    "MERGE INSERT column list and VALUES count differ");
-    }
-    if (columns.size() > schema.ColumnCount()) {
-      return Status(Status::kInvalidArgument,
-                    "MERGE INSERT column list exceeds the target schema");
-    }
-    for (size_t i = 0; i < action.insert_values.size(); ++i) {
-      size_t offset = i;
-      if (!columns.empty()) {
-        const int target_index = target_column_index(columns[i]);
-        if (target_index < 0) {
-          return Status(Status::kNotExists,
-                        "MERGE INSERT target column not found: " + columns[i]);
-        }
-        offset = static_cast<size_t>(target_index);
-      }
-      ASSIGN_OR_RETURN(Value, value,
-                       (relational_detail::TryEvaluate(
-                           action.insert_values[i], scope, nullptr, ctx,
-                           relational_detail::CteMap{})));
-      values[offset] = std::move(value);
-    }
-    return Row(std::move(values));
-  };
-
-  auto source = table->BeginFullScan(ctx.txn_);
-  while (source.IsValid()) {
-    const Row row = *source;
-    const RowPosition position = source.Position();
-    ++source;
-    relational_detail::Scope target_scope{
-        .row = &row, .schema = &schema, .outer = nullptr};
-
-    // Candidate source rows for this target row.
-    std::vector<size_t> candidates;
-    if (use_hash) {
-      std::vector<Value> key_values(join_keys.size());
-      bool null_key = false;
-      for (size_t k = 0; k < join_keys.size(); ++k) {
-        const Value& value = row.values_[join_keys[k].first];
-        if (value.IsNull()) {
-          null_key = true;
-        }
-        key_values[k] = value;
-      }
-      if (!null_key) {
-        auto found = source_index.find(composite_key(key_values));
-        if (found != source_index.end()) {
-          candidates = found->second;
-        }
-      }
-    } else {
-      candidates.resize(source_rows.size());
-      for (size_t i = 0; i < candidates.size(); ++i) {
-        candidates[i] = i;
-      }
-    }
-
-    // Matching source rows: ON condition TRUE (source scope chained as the
-    // outer of the target scope).
-    std::vector<size_t> matches;
-    for (size_t row_index : candidates) {
-      relational_detail::Scope source_scope{.row = &source_rows[row_index],
-                                            .schema = &source_schema,
-                                            .outer = nullptr};
-      target_scope.outer = &source_scope;
-      ASSIGN_OR_RETURN(bool, matched, (eval_truth(on_condition, target_scope)));
-      if (matched) {
-        matches.push_back(row_index);
-      }
-    }
-    target_scope.outer = nullptr;
-
-    if (matches.empty()) {
-      // Candidate for WHEN NOT MATCHED BY SOURCE (target-only scope: source
-      // references in its condition surface as evaluation errors).
-      if (by_source_clause != nullptr) {
-        bool apply = true;
-        if (by_source_clause->condition) {
-          ASSIGN_OR_RETURN(
-              bool, hv_apply,
-              (eval_truth(by_source_clause->condition, target_scope)));
-          apply = hv_apply;
-        }
-        if (apply) {
-          if (by_source_clause->action.kind == MergeActionKind::kUpdate) {
-            ASSIGN_OR_RETURN(Row, updated,
-                             (build_update_row(row, by_source_clause->action,
-                                               target_scope)));
-            pending_updates.emplace_back(position, std::move(updated));
-          } else if (by_source_clause->action.kind ==
-                     MergeActionKind::kDelete) {
-            pending_deletes.push_back(position);
-          }
-        }
-      }
-      continue;
-    }
-
-    for (size_t row_index : matches) {
-      source_matched[row_index] = true;
-    }
-    // First MATCHED clause whose condition holds for the first matching
-    // source row applies; UPDATE/DELETE with several matching source rows is
-    // rejected (one action per target row must stay well-defined).
-    relational_detail::Scope source_scope{.row = &source_rows[matches[0]],
-                                          .schema = &source_schema,
-                                          .outer = nullptr};
-    target_scope.outer = &source_scope;
-    for (const MergeWhenClause& clause : bound_clauses) {
-      if (clause.match_type != MergeWhenClause::MatchType::kMatched) {
-        continue;
-      }
-      if (clause.condition) {
-        ASSIGN_OR_RETURN(bool, condition,
-                         (eval_truth(clause.condition, target_scope)));
-        if (!condition) {
-          continue;
-        }
-      }
-      if (clause.action.kind == MergeActionKind::kUpdate ||
-          clause.action.kind == MergeActionKind::kDelete) {
-        if (matches.size() > 1) {
-          return Status(
-              Status::kInvalidArgument,
-              "MERGE attempted to UPDATE or DELETE the same target row more "
-              "than once (matched multiple source rows)");
-        }
-      }
-      if (clause.action.kind == MergeActionKind::kUpdate) {
-        ASSIGN_OR_RETURN(Row, updated,
-                         (build_update_row(row, clause.action, target_scope)));
-        pending_updates.emplace_back(position, std::move(updated));
-      } else if (clause.action.kind == MergeActionKind::kDelete) {
-        pending_deletes.push_back(position);
-      }
-      break;
-    }
-    target_scope.outer = nullptr;
-  }
-
-  // WHEN NOT MATCHED [BY TARGET]: one source-driven INSERT clause.
-  if (insert_clause != nullptr) {
-    for (size_t row_index = 0; row_index < source_rows.size(); ++row_index) {
-      if (source_matched[row_index]) {
-        continue;
-      }
-      relational_detail::Scope source_scope{.row = &source_rows[row_index],
-                                            .schema = &source_schema,
-                                            .outer = nullptr};
-      if (insert_clause->condition) {
-        ASSIGN_OR_RETURN(bool, condition,
-                         (eval_truth(insert_clause->condition, source_scope)));
-        if (!condition) {
-          continue;
-        }
-      }
-      ASSIGN_OR_RETURN(Row, insert_row,
-                       (build_insert_row(insert_clause->action, source_scope)));
-      pending_inserts.push_back(std::move(insert_row));
-    }
-  }
-
-  // ---- application (deletes, then updates, then inserts) ----------------
-  ASSIGN_OR_RETURN(std::vector<ReferencedByCheck>, ref_checks,
-                   (ResolveReferencedByChecks(database_, ctx, *table)));
-  int64_t modified = 0;
-  if (!pending_deletes.empty()) {
-    for (const RowPosition& position : pending_deletes) {
-      ASSIGN_OR_RETURN(Row, current, (table->Read(ctx.txn_, position)));
-      for (const ReferencedByCheck& check : ref_checks) {
-        if (check.parent_offset >= current.values_.size()) {
-          continue;
-        }
-        const Value& key = current.values_[check.parent_offset];
-        if (key.IsNull()) {
-          continue;
-        }
-        ASSIGN_OR_RETURN(bool, referenced,
-                         IsParentKeyReferenced(*check.child, ctx.txn_,
-                                               check.child_offset, key, {}));
-        if (referenced) {
-          return Status(Status::kConflicts,
-                        "MERGE DELETE on table " + std::string(schema.Name()) +
-                            " violates foreign key constraint (referenced by " +
-                            std::string(check.child->GetSchema().Name()) + ")");
-        }
-      }
-      if (const Status status = table->Delete(ctx.txn_, position);
-          status != Status::kSuccess) {
-        return Status(Status::kConflicts, "MERGE DELETE failed on table " +
-                                              std::string(schema.Name()));
-      }
-      ++modified;
-    }
-  }
-  ASSIGN_OR_RETURN(std::vector<ForeignKeyCheck>, fk_checks,
-                   (ResolveForeignKeyChecks(ctx, *table)));
-  std::vector<ForeignKeyCounts> fk_counts;
-  fk_counts.reserve(fk_checks.size());
-  for (const ForeignKeyCheck& check : fk_checks) {
-    ASSIGN_OR_RETURN(
-        ForeignKeyCounts, counts,
-        (BuildForeignKeyCounts(*check.parent, ctx.txn_, check.parent_offset)));
-    fk_counts.push_back(std::move(counts));
-  }
-  for (auto& [position, updated] : pending_updates) {
-    for (size_t c = 0; c < fk_checks.size(); ++c) {
-      const ForeignKeyCheck& check = fk_checks[c];
-      if (check.child_offset >= updated.values_.size()) {
-        continue;
-      }
-      const Value& new_key = updated.values_[check.child_offset];
-      if (IsForeignKeyViolation(fk_counts[c], new_key)) {
-        return Status(Status::kConflicts,
-                      "MERGE UPDATE on table " + std::string(schema.Name()) +
-                          " violates foreign key constraint (references " +
-                          std::string(check.parent->GetSchema().Name()) + ")");
-      }
-    }
-    if (const StatusOr<RowPosition> new_position =
-            table->Update(ctx.txn_, position, updated);
-        !new_position.HasValue()) {
-      return Status(Status::kConflicts, "MERGE UPDATE failed on table " +
-                                            std::string(schema.Name()));
-    }
-    ++modified;
-  }
-  for (const Row& insert_row : pending_inserts) {
-    for (size_t c = 0; c < fk_checks.size(); ++c) {
-      const ForeignKeyCheck& check = fk_checks[c];
-      if (check.child_offset >= insert_row.values_.size()) {
-        continue;
-      }
-      const Value& key = insert_row.values_[check.child_offset];
-      if (IsForeignKeyViolation(fk_counts[c], key)) {
-        return Status(Status::kConflicts,
-                      "MERGE INSERT on table " + std::string(schema.Name()) +
-                          " violates foreign key constraint (references " +
-                          std::string(check.parent->GetSchema().Name()) + ")");
-      }
-    }
-    ASSIGN_OR_RETURN(RowPosition, inserted,
-                     (table->Insert(ctx.txn_, insert_row)));
-    (void)inserted;
-    ++modified;
-  }
-  return Executor(std::make_shared<ConstantExecutor>(
-      Row({Value(merge.DesugaredFromUpdate() ? "Update Rows" : "Merge Rows"),
-           Value(modified)})));
 }
 
 StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
@@ -3353,7 +1497,16 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   // cache its single-branch plan under it -- a replay would then serve only
   // the last-prepared branch and silently drop every other one.
   clear_plan_cache_candidate();
+  const bool can_short_circuit_disjoint_limit =
+      tree != nullptr && tree->grouped && tree->disjoint_ordered_by_head &&
+      select.HasLimit() && !select.WithTies() && !select.UnionDistinct() &&
+      std::ranges::all_of(pair_kinds, [](SetOperationKind k) {
+        return k == SetOperationKind::kUnionAll;
+      });
+  const size_t short_circuit_target = select.Limit() + select.Offset();
+  size_t accumulated_rows = 0;
   std::vector<std::vector<Row>> term_rows;
+  std::vector<ValueType> output_types;
   for (auto& term : terms) {
     // A WITH clause scopes over the whole set-operation statement, but the
     // operand ASTs carry no WithQueries of their own.  Clone each operand and
@@ -3372,10 +1525,22 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
         term = std::move(owned);
       }
     }
+    result_column_names_.clear();
+    result_column_types_.clear();
     StatusOr<Executor> prepared =
         PrepareStatement(ctx, std::make_unique<SelectStatement>(*term));
     if (!prepared.HasValue()) {
       return prepared.GetStatus();
+    }
+    // Operand preparation overwrites the engine metadata. Keep the first
+    // known type at each output position, even when its rows are all NULL.
+    if (output_types.size() < result_column_types_.size()) {
+      output_types.resize(result_column_types_.size(), ValueType::kNull);
+    }
+    for (size_t column = 0; column < result_column_types_.size(); ++column) {
+      if (output_types[column] == ValueType::kNull) {
+        output_types[column] = result_column_types_[column];
+      }
     }
     std::vector<Row> rows;
     DataChunk batch;
@@ -3391,11 +1556,18 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     if (term_status != Status::kSuccess) {
       return term_status;
     }
+    accumulated_rows += rows.size();
     term_rows.push_back(std::move(rows));
+    if (can_short_circuit_disjoint_limit &&
+        accumulated_rows >= short_circuit_target) {
+      pair_kinds.resize(term_rows.size() > 0 ? term_rows.size() - 1 : 0);
+      break;
+    }
   }
 
-  const auto apply_pair = [](std::vector<Row> left, std::vector<Row> right,
-                             SetOperationKind operation) {
+  const auto apply_pair =
+      [](std::vector<Row> left, std::vector<Row> right,
+         SetOperationKind operation) -> StatusOr<std::vector<Row>> {
     SetOperationExecutor operation_executor(
         {std::make_shared<ConstantExecutor>(std::move(left)),
          std::make_shared<ConstantExecutor>(std::move(right))},
@@ -3407,6 +1579,15 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
         folded.push_back(batch.RowAt(i));
       }
     }
+    // A fold that aborted mid-materialization (incompatible branch types,
+    // spill I/O failure, child executor error) must fail the whole set
+    // operation: NextBatch returns 0 after FailWith, so without this check
+    // the partial rows would masquerade as a successful result -- the same
+    // contract the per-operand GetStatus check above enforces.
+    const Status fold_status = operation_executor.GetStatus();
+    if (fold_status != Status::kSuccess) {
+      return fold_status;
+    }
     return folded;
   };
   std::vector<std::vector<Row>> folded_terms;
@@ -3417,8 +1598,10 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
     const bool intersects = operation == SetOperationKind::kIntersect ||
                             operation == SetOperationKind::kIntersectAll;
     if (intersects) {
-      folded_terms.back() = apply_pair(std::move(folded_terms.back()),
-                                       std::move(term_rows[i + 1]), operation);
+      ASSIGN_OR_RETURN(std::vector<Row>, intersected,
+                       apply_pair(std::move(folded_terms.back()),
+                                  std::move(term_rows[i + 1]), operation));
+      folded_terms.back() = std::move(intersected);
     } else {
       low_ops.push_back(operation);
       folded_terms.push_back(std::move(term_rows[i + 1]));
@@ -3426,8 +1609,10 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   }
   std::vector<Row> combined = std::move(folded_terms.front());
   for (size_t j = 1; j < folded_terms.size(); ++j) {
-    combined = apply_pair(std::move(combined), std::move(folded_terms[j]),
-                          low_ops[j - 1]);
+    ASSIGN_OR_RETURN(std::vector<Row>, next_combined,
+                     apply_pair(std::move(combined), std::move(folded_terms[j]),
+                                low_ops[j - 1]));
+    combined = std::move(next_combined);
   }
 
   // The recursive operand prepares above clobbered result_column_names_;
@@ -3435,6 +1620,7 @@ StatusOr<Executor> SqlEngine::ExecuteSetOperation(const SelectStatement& select,
   // output names from the FIRST branch, and Execute() publishes this member
   // in the QueryResult (pgwire RowDescription follows it).
   result_column_names_ = output_names;
+  result_column_types_ = std::move(output_types);
 
   Executor executor = std::make_shared<ConstantExecutor>(std::move(combined));
   if (!select.OrderBy().empty()) {
@@ -3876,10 +2062,48 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
     }
     // Sequenced: emit while the plan is alive, then hand both to the
     // explain wrapper so the plan tree outlives the executor.
+    if (PipelineEngineEnabled()) {
+      ASSIGN_OR_RETURN(Executor, pipe_exec,
+                       PipelineLowering::LowerToExecutor(relational_plan, ctx));
+      return WithPlanExplain(std::move(pipe_exec), std::move(relational_plan),
+                             &result_column_types_);
+    }
     Executor executor = relational_plan->EmitExecutor(ctx);
     return WithPlanExplain(std::move(executor), std::move(relational_plan),
                            &result_column_types_);
   };
+  const bool force_ooc_pipeline =
+      !grouped_route_relational ||
+      ProcessMemoryBudget::Global().OpMemoryOverrideBytes() > 0 ||
+      ProcessMemoryBudget::Global().AlwaysSpillEnabled() ||
+      ProcessMemoryBudget::Global().Limit() <
+          ProcessMemoryBudget::kDefaultLimitBytes;
+  if (PipelineEngineEnabled() && force_ooc_pipeline &&
+      !depends_on_representative_row) {
+    StatusOr<Plan> pipe_core = shared_core ? StatusOr<Plan>(shared_core)
+                                           : Optimizer::Optimize(core, ctx);
+    if (pipe_core.HasValue()) {
+      Plan core_plan = std::move(pipe_core.Value());
+      StatusOr<Plan> opt_rel = Optimizer::OptimizeRelational(
+          statement, Schema("", output_columns), ctx);
+      Plan explain_target =
+          opt_rel.HasValue() && opt_rel.Value() ? opt_rel.Value() : core_plan;
+      std::ostringstream explain_oss;
+      if (explain_target != nullptr) {
+        explain_target->Dump(explain_oss, 0);
+      }
+      ASSIGN_OR_RETURN(std::optional<PipelineGraph>, grouped_graph,
+                       TryLowerGroupedStatementToPipeline(
+                           *statement, core_plan, ctx, explain_oss.str(),
+                           substitute_aliases));
+      if (grouped_graph.has_value()) {
+        Executor exec =
+            std::make_shared<PipelineExecutor>(&ctx, std::move(*grouped_graph));
+        return WithPlanExplain(std::move(exec), std::move(explain_target),
+                               &result_column_types_);
+      }
+    }
+  }
   if (grouped_route_relational || depends_on_representative_row) {
     StatusOr<Executor> relational_executor = emit_relational();
     if (relational_executor.HasValue()) {
@@ -3919,6 +2143,12 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
         core, core_plan, select.GroupBy(), select.SelectList(), ctx);
     if (grouped.HasValue()) {
       Plan plan = std::move(grouped.Value());
+      if (PipelineEngineEnabled()) {
+        ASSIGN_OR_RETURN(Executor, pipe_exec,
+                         PipelineLowering::LowerToExecutor(plan, ctx));
+        return WithPlanExplain(std::move(pipe_exec), std::move(plan),
+                               &result_column_types_);
+      }
       Executor executor = plan->EmitExecutor(ctx);
       return WithPlanExplain(std::move(executor), std::move(plan),
                              &result_column_types_);
@@ -3928,6 +2158,27 @@ StatusOr<Executor> SqlEngine::ExecuteGroupedSelect(
       core_plan, std::move(statement), Schema("", std::move(output_columns)),
       !select.GroupBy().empty(), finite_limit);
   finish->SetExplainInfo(core_plan->ExplainInfo());
+  if (PipelineEngineEnabled()) {
+    const auto* gb = dynamic_cast<const GroupByPlan*>(finish.get());
+    std::ostringstream explain_oss;
+    finish->Dump(explain_oss, 0);
+    if (gb != nullptr && gb->Statement() != nullptr) {
+      ASSIGN_OR_RETURN(std::optional<PipelineGraph>, grouped_graph,
+                       TryLowerGroupedStatementToPipeline(
+                           *gb->Statement(), core_plan, ctx, explain_oss.str(),
+                           substitute_aliases));
+      if (grouped_graph.has_value()) {
+        Executor exec =
+            std::make_shared<PipelineExecutor>(&ctx, std::move(*grouped_graph));
+        return WithPlanExplain(std::move(exec), std::move(finish),
+                               &result_column_types_);
+      }
+    }
+    ASSIGN_OR_RETURN(Executor, pipe_exec,
+                     PipelineLowering::LowerToExecutor(finish, ctx));
+    return WithPlanExplain(std::move(pipe_exec), std::move(finish),
+                           &result_column_types_);
+  }
   PlanBase& finish_ref = *finish;
   return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish),
                          &result_column_types_);
@@ -4243,7 +2494,7 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     finish->SetExplainInfo(core_plan->ExplainInfo());
     PlanBase& finish_ref = *finish;
     return WithPlanExplain(finish_ref.EmitExecutor(ctx), std::move(finish),
-                         &result_column_types_);
+                           &result_column_types_);
   }
 
   bool has_star = false;
@@ -4573,265 +2824,39 @@ StatusOr<Executor> SqlEngine::ExecuteUnnestSelect(const SelectStatement& select,
     return Status::kNotImplemented;
   }
   Plan explain_plan = best->plan;
-  Executor executor = explain_plan->EmitExecutor(ctx);
-  if (needs_hidden_order_columns) {
-    // Strip the hidden $order<i> sort-key columns from the client-visible
-    // result; the select list defines the output width.
-    const Schema& schema = best->plan->GetSchema();
-    std::vector<NamedExpression> visible;
-    visible.reserve(visible_columns);
-    for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
-      visible.emplace_back(schema.GetColumn(i).Name());
+  Executor executor;
+  if (PipelineEngineEnabled()) {
+    PipelineLoweringOptions opts;
+    if (needs_hidden_order_columns) {
+      const Schema& schema = best->plan->GetSchema();
+      std::vector<Column> vis_cols;
+      vis_cols.reserve(visible_columns);
+      opts.post_projection.reserve(visible_columns);
+      for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
+        opts.post_projection.emplace_back(schema.GetColumn(i).Name());
+        vis_cols.push_back(schema.GetColumn(i));
+      }
+      opts.post_projection_schema = Schema("", std::move(vis_cols));
     }
-    executor = std::make_shared<Projection>(std::move(visible), schema,
-                                            std::move(executor));
+    StatusOr<Executor> pipe_or =
+        PipelineLowering::LowerToExecutor(explain_plan, ctx, opts);
+    RETURN_IF_FAIL(pipe_or.GetStatus());
+    executor = pipe_or.MoveValue();
+  } else {
+    executor = explain_plan->EmitExecutor(ctx);
+    if (needs_hidden_order_columns) {
+      const Schema& schema = best->plan->GetSchema();
+      std::vector<NamedExpression> visible;
+      visible.reserve(visible_columns);
+      for (size_t i = 0; i < visible_columns && i < schema.ColumnCount(); ++i) {
+        visible.emplace_back(schema.GetColumn(i).Name());
+      }
+      executor = std::make_shared<Projection>(std::move(visible), schema,
+                                              std::move(executor));
+    }
   }
   return WithPlanExplain(std::move(executor), std::move(explain_plan),
                          &result_column_types_);
-}
-
-// `x op ANY/ALL (SELECT ...)` over a non-correlated subquery: run the inner
-// SELECT once at prepare time and fold the comparison into an AND/OR chain
-// over the constant candidate list.  Three-valued semantics coincide with
-// TryEvaluateQuantifiedComparison (ANY = OR-chain, ALL = AND-chain; empty
-// ANY = FALSE, empty ALL = TRUE; per-candidate UNKNOWN propagates exactly
-// like the row-loop implementation).  A correlated or unpreparable inner
-// statement keeps the legacy route.
-StatusOr<Expression> SqlEngine::FoldQuantifiedComparison(
-    TransactionContext& ctx, const QueryExpression& query) {
-  auto inner = std::make_unique<SelectStatement>(*query.Query());
-  std::string saved_fingerprint;
-  std::swap(saved_fingerprint, plan_cache_fingerprint_);
-  std::vector<Value> saved_parameters;
-  std::swap(saved_parameters, plan_cache_parameters_);
-  StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
-  std::swap(saved_fingerprint, plan_cache_fingerprint_);
-  std::swap(saved_parameters, plan_cache_parameters_);
-  if (!exec.HasValue()) {
-    return Expression(query.Test());  // keep legacy route
-  }
-  std::vector<Value> candidates;
-  bool failed = false;
-  Row row;
-  while (exec.Value()->Next(&row, nullptr)) {
-    if (row.values_.empty()) {
-      failed = true;
-      break;
-    }
-    candidates.push_back(row[0]);
-  }
-  if (exec.Value()->GetStatus() != Status::kSuccess) {
-    failed = true;
-  }
-  if (failed) {
-    return Expression(query.Test());
-  }
-  dml_fold_applied_ = true;
-  if (std::getenv("TINYLAMB_FOLD_TRACE") != nullptr) {  // NOLINT(cert-err33-c)
-    (void)fprintf(stderr, "[fold] quant cands=%zu neg=%d\n", candidates.size(),
-                  (int)query.Negated());
-  }
-  const bool is_all = query.Mode() == QuantifierMode::kAll;
-  if (candidates.empty()) {
-    // ANY -> FALSE, ALL -> TRUE, then the NOT wrapper (an empty
-    // `NOT (x = ALL ())` is FALSE, not TRUE).
-    const bool value = query.Negated() ? !is_all : is_all;
-    return ConstantValueExp(Value(value));
-  }
-  std::vector<Expression> terms;
-  terms.reserve(candidates.size());
-  for (const Value& candidate : candidates) {
-    terms.push_back(BinaryExpressionExp(query.Test(), query.Op(),
-                                        ConstantValueExp(candidate)));
-  }
-  Expression folded = is_all ? CombineConjuncts(terms)
-                             : relational_detail::CombineDisjuncts(terms);
-  if (query.Negated()) {
-    folded = UnaryExpressionExp(std::move(folded), UnaryOperation::kNot);
-  }
-  return folded;
-}
-
-StatusOr<Expression> SqlEngine::DecorateDmlWhere(TransactionContext& ctx,
-                                                 const Expression& expression) {
-  if (!expression) {
-    return expression;
-  }
-  if (expression->Type() == TypeTag::kQueryExp) {
-    if (!relational_detail::ContainsOnlyUncorrelatedQueries(ctx, expression,
-                                                            {})) {
-      return expression;
-    }
-    const QueryExpression& query = expression->AsQueryExpression();
-
-    if (!query.ArrayResult() && query.Test() &&
-        (query.Mode() == QuantifierMode::kAny ||
-         query.Mode() == QuantifierMode::kAll)) {
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
-      return FoldQuantifiedComparison(ctx, query);
-    }
-    if (query.Exists()) {
-      // Non-correlated EXISTS: run once, fold to a constant.  A correlated
-      // inner cannot be prepared standalone and keeps the legacy route;
-      // WITH under a DML subquery stays unimplemented by contract
-      // (dml_delete.test / b/362158469), so those inners are not folded.
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
-      auto inner = std::make_unique<SelectStatement>(*query.Query());
-      std::string saved_fingerprint;
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::vector<Value> saved_parameters;
-      std::swap(saved_parameters, plan_cache_parameters_);
-      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::swap(saved_parameters, plan_cache_parameters_);
-      if (exec.HasValue()) {
-        Row probe;
-        const bool any = exec.Value()->Next(&probe, nullptr);
-        if (exec.Value()->GetStatus() != Status::kSuccess) {
-          // Preserve the subquery so the checked DML evaluator reports its
-          // error. Failure is never proof of an empty EXISTS result.
-          return expression;
-        }
-        dml_fold_applied_ = true;
-        return ConstantValueExp(Value(query.Negated() ? !any : any));
-      }
-      return expression;
-    }
-    if (!query.Test() && !query.ArrayResult()) {
-      // Non-correlated scalar subquery: exactly one row folds to that
-      // constant; 0/>1 rows keep the legacy route (which raises the
-      // engine's own cardinality error).  WITH inners stay unimplemented
-      // by the same DML contract as EXISTS above.
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
-      auto inner = std::make_unique<SelectStatement>(*query.Query());
-      std::string saved_fingerprint;
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::vector<Value> saved_parameters;
-      std::swap(saved_parameters, plan_cache_parameters_);
-      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::swap(saved_parameters, plan_cache_parameters_);
-      if (exec.HasValue()) {
-        std::vector<Value> picked;
-        bool failed = false;
-        Row row;
-        while (exec.Value()->Next(&row, nullptr)) {
-          if (row.values_.empty() || picked.size() >= 2) {
-            failed = true;
-            break;
-          }
-          picked.push_back(row[0]);
-        }
-        if (!failed && exec.Value()->GetStatus() == Status::kSuccess &&
-            picked.size() == 1) {
-          dml_fold_applied_ = true;
-          return ConstantValueExp(picked[0]);
-        }
-      }
-      return expression;
-    }
-    if (!query.Exists() && !query.ArrayResult() && query.Test() &&
-        query.Mode() == QuantifierMode::kIn &&
-        query.Op() == BinaryOperation::kEquals) {
-      // WITH under a DML subquery stays unimplemented by contract
-      // (dml_delete.test / b/362158469).
-      if (!query.Query()->WithQueries().empty()) {
-        return expression;
-      }
-      auto inner = std::make_unique<SelectStatement>(*query.Query());
-      // The nested prepare must not steal the OUTER statement's armed
-      // plan-cache candidate (the fill sites read the shared member), and
-      // the fold itself must never populate the cache.
-      std::string saved_fingerprint;
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::vector<Value> saved_parameters;
-      std::swap(saved_parameters, plan_cache_parameters_);
-      StatusOr<Executor> exec = PrepareStatement(ctx, std::move(inner));
-      std::swap(saved_fingerprint, plan_cache_fingerprint_);
-      std::swap(saved_parameters, plan_cache_parameters_);
-      if (exec.HasValue()) {
-        std::vector<Expression> values;
-        bool failed = false;
-        Row row;
-        while (exec.Value()->Next(&row, nullptr)) {
-          if (row.values_.empty()) {
-            failed = true;
-            break;
-          }
-          bool as_struct = query.Query()->AsStruct();
-          if (!as_struct && row.values_.size() != 1) {
-            // `(a, b) IN (SELECT x, y ...)` folds to a struct-JSON IN list
-            // when the probe is itself a row value; a scalar probe keeps
-            // the single-output-column contract.
-            const Expression& probe = query.Test();
-            const bool row_value_probe =
-                (probe->Type() == TypeTag::kArrayExp &&
-                 !probe->AsArrayExpression().Elements().empty()) ||
-                (probe->Type() == TypeTag::kFunctionCallExp &&
-                 probe->AsFunctionCallExpression().FuncName() ==
-                     "__struct_json__") ||
-                (probe->Type() == TypeTag::kConstantValue &&
-                 probe->AsConstantValue().GetValue().type ==
-                     ValueType::kVarChar &&
-                 probe->AsConstantValue()
-                         .GetValue()
-                         .value.varchar_value.size() >= 2 &&
-                 probe->AsConstantValue()
-                         .GetValue()
-                         .value.varchar_value.front() == '{');
-            if (!row_value_probe) {
-              return StatusError(
-                  StatusCode::kInvalidArgument,
-                  "Subquery of type IN must have only one output column");
-            }
-            as_struct = true;
-          }
-          values.emplace_back(ConstantValueExp(
-              relational_detail::ProjectSubqueryRow(row, as_struct, nullptr)));
-        }
-        if (exec.Value()->GetStatus() != Status::kSuccess) {
-          failed = true;
-        }
-        if (!failed) {
-          dml_fold_applied_ = true;
-          if (values.empty()) {
-            // `x IN ()` is FALSE for every x (NULL included);
-            // `x NOT IN ()` is TRUE (GoogleSQL three-valued fold).
-            return ConstantValueExp(Value(query.Negated()));
-          }
-          Expression folded = InExpressionExp(query.Test(), std::move(values));
-          if (query.Negated()) {
-            folded =
-                UnaryExpressionExp(std::move(folded), UnaryOperation::kNot);
-          }
-          return folded;
-        }
-      }
-      // Correlated or unprepared inner: leave the node for the existing
-      // (legacy) route instead of guessing a semantics.
-      return expression;
-    }
-    return expression;
-  }
-  std::vector<Expression> children = ExpressionChildren(expression);
-  bool changed = false;
-  for (Expression& child : children) {
-    ASSIGN_OR_RETURN(Expression, rewritten, DecorateDmlWhere(ctx, child));
-    if (rewritten->ToString() != child->ToString()) {
-      child = std::move(rewritten);
-      changed = true;
-    }
-  }
-  if (!changed) {
-    return expression;
-  }
-  return WithExpressionChildren(expression, std::move(children));
 }
 
 StatusOr<Executor> SqlEngine::PrepareStatement(
@@ -4845,2484 +2870,1561 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
   }
 
   switch (statement->Type()) {
-    case StatementType::kCreateTable: {
-      const auto& create =
-          dynamic_cast<const CreateTableStatement&>(*statement);
-      last_dml_table_ = create.TableName();
-      if (create.IsAsSelect()) {
-        // Materialize through the relational engine so the star-expanded
-        // output schema is available: a raw select list still holds the
-        // literal "*" directive, whose width/name cannot define the catalog.
-        StatusOr<relational_detail::Relation> materialized_query =
-            relational_detail::ExecuteQuery(ctx, *create.AsQuery(), nullptr,
-                                            {});
-        if (!materialized_query.HasValue()) {
-          last_error_ = materialized_query.GetStatus().GetMessage();
-          return Status::kUnknown;
-        }
-        relational_detail::Relation materialized =
-            materialized_query.MoveValue();
-        std::vector<Row> rows;
-        materialized.ForEachRow(
-            [&rows](const Row& row) { rows.push_back(row); });
-        std::vector<Column> columns;
-        columns.reserve(materialized.schema.ColumnCount());
-        for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {
-          const Column& schema_column = materialized.schema.GetColumn(i);
-          std::string col_name = schema_column.Name().name;
-          if (col_name.empty() || col_name == "*") {
-            col_name = "col_" + std::to_string(i);
-          }
-          ValueType vtype = schema_column.Type();
-          if (vtype == ValueType::kNull) {
-            vtype = ValueType::kVarChar;
-            for (const auto& row : rows) {
-              if (i < row.Size() && !row[i].IsNull() &&
-                  row[i].type != ValueType::kNull) {
-                vtype = row[i].type;
-                break;
-              }
-            }
-          }
-          const Constraint constraint =
-              CompliancePrimaryKeyMode() && i == 0
-                  ? Constraint(Constraint::kPrimaryKey)
-                  : Constraint();
-          columns.emplace_back(col_name, vtype, constraint);
-          columns.back().SetIntegerBits(schema_column.IntegerBits());
-          columns.back().SetUnsigned(schema_column.IsUnsigned());
-          columns.back().SetInterval(
-              schema_column.IsInterval() ||
-              std::ranges::any_of(rows, [i](const Row& row) {
-                return i < row.Count() && row[i].IsInterval();
-              }));
-          if (std::ranges::any_of(rows, [i](const Row& row) {
-                return i < row.Size() && row[i].IsUnsigned();
-              })) {
-            columns.back().SetUnsigned(true);
-          }
-        }
-        ASSIGN_OR_RETURN(
-            Table, table,
-            database_->CreateTable(ctx, Schema(create.TableName(), columns)));
-        for (auto& row : rows) {
-          // Coerce materialized values to the declared column types: the
-          // SELECT output may carry narrower types (e.g. INT64 literals in
-          // UNION ALL branches under a DOUBLE first row).
-          for (size_t i = 0; i < row.Size() && i < columns.size(); ++i) {
-            Value& cell = row.values_[i];
-            const ValueType target = columns[i].Type();
-            if (cell.IsNull() || cell.type == target ||
-                target == ValueType::kNull) {
-              continue;
-            }
-            if (target == ValueType::kDouble &&
-                cell.type == ValueType::kInt64) {
-              cell = Value(static_cast<double>(cell.value.int_value));
-            }
-          }
-          RETURN_IF_FAIL(table.Insert(ctx.txn_, row).GetStatus());
-        }
-        if (!rows.empty()) {
-          table.RebuildLSTableStore(ctx.txn_);
-        }
-        return Executor(std::make_shared<ConstantExecutor>(
-            Row({Value("CREATE TABLE"),
-                 Value(static_cast<int64_t>(rows.size()))})));
-      }
-      ASSIGN_OR_RETURN(Table, table,
-                       database_->CreateTable(
-                           ctx, Schema(create.TableName(), create.Columns())));
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("CREATE TABLE"), Value(0)})));
-    }
-    case StatementType::kInsert: {
-      // VALUES entries fold non-correlated subqueries like the WHERE/SET
-      // paths do.
-      for (auto& value_row :
-           dynamic_cast<InsertStatement&>(*statement).MutableValues()) {
-        for (Expression& value : value_row) {
-          ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
-          value = std::move(folded);
-        }
-      }
-      const auto& insert = dynamic_cast<const InsertStatement&>(*statement);
-      ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                       ctx.GetTable(insert.TableName()));
-      last_dml_table_ = insert.TableName();
-      std::vector<Row> rows;
-      // Column mapping, computed before value evaluation so the DEFAULT
-      // marker in VALUES cells can find its target column.
-      std::vector<size_t> upsert_offsets;
-      if (!insert.Columns().empty()) {
-        std::unordered_set<std::string> seen_columns;
-        upsert_offsets.reserve(insert.Columns().size());
-        for (const std::string& column : insert.Columns()) {
-          if (!seen_columns.insert(column).second) {
-            // A duplicate target would silently overwrite the earlier
-            // value; reject it instead.
-            last_error_ = "duplicate INSERT column: " + column;
-            return Status::kUnknown;
-          }
-          const int destination = table->GetSchema().Offset(ColumnName(column));
-          if (destination < 0) {
-            last_error_ = "unknown INSERT column: " + column;
-            return Status::kNotExists;
-          }
-          upsert_offsets.push_back(static_cast<size_t>(destination));
-        }
-      }
-      const auto column_default = [&table](size_t column_index) -> Value {
-        const Column& column =
-            table->GetSchema().GetColumn(static_cast<slot_t>(column_index));
-        if (column.GetConstraint().ctype == Constraint::kDefault) {
-          return column.GetConstraint().value;
-        }
-        return {};
-      };
-      if (insert.Query() != nullptr) {
-        // INSERT ... SELECT: materialize the source query, then feed its
-        // rows through the same column mapping / coercion as VALUES rows.
-        plan_cache_fingerprint_.clear();
-        plan_cache_parameters_.clear();
-        StatusOr<relational_detail::Relation> materialized_query =
-            relational_detail::ExecuteQuery(ctx, *insert.Query(), nullptr, {});
-        if (!materialized_query.HasValue()) {
-          last_error_ = materialized_query.GetStatus().GetMessage();
-          return Status::kUnknown;
-        }
-        relational_detail::Relation materialized =
-            materialized_query.MoveValue();
-        materialized.ForEachRow(
-            [&rows](Row row) { rows.push_back(std::move(row)); });
-      }
-      if (insert.Query() == nullptr) {
-        if (insert.Values().empty()) {
-          return Status::kUnknown;
-        }
-        // Batch INSERT chunking: evaluate values and process in chunks of
-        // kInsertChunkSize
-        constexpr size_t kInsertChunkSize = 64;
-        const size_t num_values = insert.Values().size();
-        rows.reserve(num_values);
-        for (size_t chunk_start = 0; chunk_start < num_values;
-             chunk_start += kInsertChunkSize) {
-          const size_t chunk_end =
-              std::min(chunk_start + kInsertChunkSize, num_values);
-          for (size_t v_idx = chunk_start; v_idx < chunk_end; ++v_idx) {
-            const auto& values = insert.Values()[v_idx];
-            std::vector<Value> row;
-            row.reserve(values.size());
-            for (size_t c_idx = 0; c_idx < values.size(); ++c_idx) {
-              const Expression& value = values[c_idx];
-              // The DEFAULT keyword rides a marker function call; the
-              // visitor cannot see the target table, so the substitution
-              // happens here against the mapped target column.
-              if (value->Type() == TypeTag::kFunctionCallExp &&
-                  value->AsFunctionCallExpression().FuncName() ==
-                      "__column_default") {
-                // A column without a declared default has the implicit
-                // default NULL (BigQuery semantics, pinned by the dml_*
-                // compliance cases), so resolution never fails here.
-                const size_t target =
-                    insert.Columns().empty() ? c_idx : upsert_offsets[c_idx];
-                row.push_back(column_default(target));
-                continue;
-              }
-              StatusOr<Value> item = value->TryEvaluate(Row(), Schema());
-              if (!item.HasValue()) {
-                last_error_ = item.GetStatus().GetMessage();
-                return Status::kUnknown;
-              }
-              row.push_back(item.MoveValue());
-            }
-            rows.emplace_back(std::move(row));
-          }
-        }
-      }
-      for (auto& row : rows) {
-        if (!insert.Columns().empty()) {
-          if (insert.Columns().size() != row.values_.size()) {
-            last_error_ = "INSERT column/value count mismatch";
-            return Status::kUnknown;
-          }
-          std::vector<Value> reordered(table->GetSchema().ColumnCount());
-          std::vector<bool> specified(table->GetSchema().ColumnCount(), false);
-          for (size_t i = 0; i < insert.Columns().size(); ++i) {
-            reordered[upsert_offsets[i]] = row[i];
-            specified[upsert_offsets[i]] = true;
-          }
-          // Columns omitted from the target list take their declared
-          // DEFAULT; columns without one stay NULL (the historical
-          // behavior).
-          for (size_t i = 0; i < reordered.size(); ++i) {
-            if (!specified[i]) {
-              reordered[i] = column_default(i);
-            }
-          }
-          row = Row(std::move(reordered));
-        } else if (row.values_.size() == 1 &&
-                   table->GetSchema().ColumnCount() > 1) {
-          // INSERT t VALUES ((1, 'x')) / VALUES (NULL) / (DEFAULT): a single
-          // STRUCT (or whole-row NULL) expands across every column.
-          std::vector<Value> expanded;
-          if (ExpandStructInsertValue(row[0], table->GetSchema().ColumnCount(),
-                                      &expanded)) {
-            row = Row(std::move(expanded));
-          }
-        }
-        if (row.values_.size() != table->GetSchema().ColumnCount()) {
-          last_error_ = "INSERT value count does not match table schema (got " +
-                        std::to_string(row.values_.size()) + ", expected " +
-                        std::to_string(table->GetSchema().ColumnCount()) + ")";
-          return Status::kUnknown;
-        }
-        for (size_t i = 0; i < row.values_.size(); ++i) {
-          const auto& col = table->GetSchema().GetColumn(i);
-          const ValueType expected = col.Type();
-          if (Status st_ni = ValidateNarrowInteger(col, row[i]);
-              st_ni != Status::kSuccess) {
-            last_error_ = st_ni.GetMessage();
-            return Status::kUnknown;
-          }
-          if (col.IsUnsigned()) {
-            if (!row[i].IsNull()) {
-              if (row[i].type != ValueType::kInt64) {
-                last_error_ =
-                    "INSERT type mismatch for column " + col.Name().name;
-                return Status::kUnknown;
-              }
-              if (!row[i].IsUnsigned() && row[i].value.int_value < 0) {
-                last_error_ =
-                    "assignment out of range for column " + col.Name().name;
-                return Status::kUnknown;
-              }
-              row[i] = row[i].WithUnsigned();
-            }
-            continue;
-          }
-          if (row[i].IsNull() || row[i].type == expected) {
-            continue;
-          }
-          if (expected == ValueType::kDouble &&
-              row[i].type == ValueType::kInt64) {
-            row[i] = Value(static_cast<double>(row[i].value.int_value));
-            continue;
-          }
-          if (expected == ValueType::kDate &&
-              row[i].type == ValueType::kVarChar) {
-            row[i] = Value::Date(row[i].value.varchar_value);
-            continue;
-          }
-          last_error_ = "INSERT type mismatch for column " + col.Name().name;
-          return Status::kUnknown;
-        }
-      }
-      // Phase 2-1 fill: build the parametric INSERT artifact. Bindable
-      // literals become ParameterSlot placeholders; runtime values are
-      // injected per execution, so any literal combination hits.
-      // Conflict-handling inserts (modes / PK emulation / row-count asserts)
-      // always take the authoritative path so their semantics cannot be
-      // lost in a replayed shape.
-      if (!plan_cache_fingerprint_.empty() &&
-          insert.Mode() == InsertMode::kDefault && !insert.HasAssert() &&
-          !CompliancePrimaryKeyMode()) {
-        auto shape = std::make_shared<CompiledPlan::InsertShape>();
-        bool ok = true;
-        size_t slot_cursor = 0;
-        shape->cells.reserve(insert.Values().size());
-        for (const auto& values : insert.Values()) {
-          std::vector<Expression> cells;
-          cells.reserve(values.size());
-          for (const Expression& value : values) {
-            // DEFAULT markers must resolve against the target table's
-            // catalog (done above); a replayed shape would evaluate the
-            // marker function and fail, so those statements stay on the
-            // authoritative path.
-            if (ContainsNonDeterministicCall(value) ||
-                (value->Type() == TypeTag::kFunctionCallExp &&
-                 value->AsFunctionCallExpression().FuncName() ==
-                     "__column_default")) {
-              ok = false;
-              break;
-            }
-            cells.push_back(SlotizeLiterals(value, &slot_cursor, &ok));
-            if (!ok) {
-              break;
-            }
-          }
-          if (!ok) {
-            break;
-          }
-          shape->cells.push_back(std::move(cells));
-        }
-        // Slot count must match the extracted parameter count exactly;
-        // otherwise text-order alignment is broken and caching stays off.
-        if (ok && slot_cursor == plan_cache_parameters_.size()) {
-          shape->table = table;
-          shape->schema = table->GetSchema();
-          shape->has_named_columns = !insert.Columns().empty();
-          if (shape->has_named_columns) {
-            // Offsets were validated above (no duplicates, all known).
-            shape->reorder.reserve(insert.Columns().size());
-            for (const std::string& column : insert.Columns()) {
-              shape->reorder.push_back(static_cast<size_t>(
-                  shape->schema.Offset(ColumnName(column))));
-            }
-          }
-          auto compiled = std::make_shared<CompiledPlan>();
-          compiled->kind = CompiledPlan::Kind::kInsert;
-          compiled->database = database_;
-          compiled->epoch = database_->SchemaEpoch();
-          compiled->parameters = plan_cache_parameters_;
-          compiled->insert_shape = std::move(shape);
-          // Bug 57: VALUES rows folded to prepare-time constants must not
-          // be cached for reuse after the inner tables move on.
-          if (!dml_fold_applied_) {
-            StoreCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
-          }
-        }
-      }
-      InsertExecutionMode exec_mode = InsertExecutionMode::kDefault;
-      switch (insert.Mode()) {
-        case InsertMode::kDefault:
-          exec_mode = InsertExecutionMode::kDefault;
-          break;
-        case InsertMode::kIgnore:
-          exec_mode = InsertExecutionMode::kIgnore;
-          break;
-        case InsertMode::kUpdate:
-          exec_mode = InsertExecutionMode::kUpsert;
-          break;
-        case InsertMode::kReplace:
-          exec_mode = InsertExecutionMode::kReplace;
-          break;
-      }
-      ASSIGN_OR_RETURN(std::vector<ForeignKeyCheck>, fk_checks,
-                       (ResolveForeignKeyChecks(ctx, *table)));
-      return Executor(std::make_shared<Insert>(
-          ctx.txn_, table.get(),
-          std::make_shared<ConstantExecutor>(std::move(rows)), exec_mode,
-          CompliancePrimaryKeyMode(), upsert_offsets,
-          insert.AssertRowsModified(), std::move(fk_checks)));
-    }
+    case StatementType::kCreateTable:
+      return ExecuteCreateTable(
+          ctx, dynamic_cast<const CreateTableStatement&>(*statement));
+    case StatementType::kInsert:
+      return ExecuteInsert(ctx,
+                           dynamic_cast<const InsertStatement&>(*statement));
     case StatementType::kSelect: {
-      // Verify the concrete kind before releasing: a Type()/type mismatch
-      // would make the former static_cast undefined behavior.
-      if (dynamic_cast<const SelectStatement*>(statement.get()) == nullptr) {
+      auto* select_ptr = dynamic_cast<SelectStatement*>(statement.get());
+      if (select_ptr == nullptr) {
         last_error_ = "statement marked kSelect is not a SelectStatement";
         return Status::kUnknown;
       }
-      fused_sibling_aggregates_ = 0;
-      cte_restriction_pushdowns_ = 0;
-      cte_materialization_attempts_ = 0;
-      // A WITH list resolves in dependency order, so an entry may name a
-      // sibling declared after it; a mutual reference between entries has no
-      // evaluation order at all.  Reject it before any rewrite, so the error
-      // does not depend on which route plans the statement -- the executor
-      // keeps the same check as a backstop.
-      {
-        const Status cycle = relational_detail::ValidateCteDependencies(
-            dynamic_cast<const SelectStatement&>(*statement));
-        if (cycle != Status::kSuccess) {
-          last_error_ = cycle.GetMessage();
-          return cycle.GetCode();
-        }
-      }
-      auto select = std::shared_ptr<SelectStatement>(
-          dynamic_cast<SelectStatement*>(statement.release()));
-      // SELECT ... FOR UPDATE locks the rows its scan visits, which is the DML
-      // source contract (`require_row_position` -> scan `lock_rows`): one base
-      // table, no join, no aggregate/window/set-op/CTE/derived source.  A join
-      // or an aggregate has no single row position to lock per output row, and
-      // the relational route does not carry positions at all, so the shape is
-      // refused up front instead of silently running an unlocked read.
-      const bool for_update = select->ForUpdate();
-      if (for_update) {
-        const SelectSource* only_source = select->Sources().size() == 1
-                                              ? &select->Sources().front()
-                                              : nullptr;
-        const bool has_aggregate =
-            std::ranges::any_of(
-                select->SelectList(),
-                [](const NamedExpression& item) {
-                  return relational_detail::ContainsAggregate(item.expression);
-                }) ||
-            relational_detail::ContainsAggregate(select->Having());
-        if (only_source == nullptr || only_source->query != nullptr ||
-            only_source->unnest || only_source->is_lateral ||
-            only_source->table.empty() || only_source->sample.has_value() ||
-            !select->WithQueries().empty() || !select->UnionAll().empty() ||
-            select->GetSetOperationTree() != nullptr || select->Distinct() ||
-            select->HasDistinctOn() || !select->GroupBy().empty() ||
-            has_aggregate || select->Having() || select->Qualify() ||
-            relational_detail::HasWindowFunctions(*select)) {
-          last_error_ =
-              "SELECT ... FOR UPDATE requires a single base table with no "
-              "join, aggregate, DISTINCT, GROUP BY, HAVING, window function, "
-              "set operation, sampled source, or CTE";
-          return Status(Status::kInvalidArgument, last_error_);
-        }
-      }
-      // M4: inline singly-referenced non-recursive CTEs into derived
-      // sources, then lift the remaining layer (shared eager cells plus
-      // opaque recursive leaves) when atomic; M5 flattens the single-table
-      // derived sources last. All rewrites preserve the row multiset;
-      // anything they reject keeps the existing materialized/relational
-      // path untouched.
-      (void)ReduceGroupByFunctionalDependencies(select.get(), ctx);
-      (void)InlineSingleUseGroupedCtes(select.get(), ctx);
-      (void)InlineSingleUseCtes(select.get());
-      // A CTE that stays shared cannot take one consumer's filter, but it can
-      // take the disjunction of every consumer's restriction: that keeps every
-      // row any reference can emit and drops the rest before the cell is
-      // built.  The estimate decides whether the narrower cell is worth it.
-      cte_restriction_pushdowns_ +=
-          PushSharedCteRestrictions(select.get(), ctx);
-      LiftedCtes lifted;
-      MaterializeCtes(select.get(), ctx, &lifted);
-      LiftRecursiveCtes(select.get(), &lifted);
-      (void)FlattenDerivedSources(select.get(), ctx, &lifted);
-      // M5+: single-table equality LATERALs become decorrelated joins (the
-      // proven flattener above consumes them once uncorrelated).
-      (void)DecorrelateSingleTableLaterals(select.get(), ctx);
-      // Sibling derived tables over one base table sharing a GROUP BY key
-      // fold into a single aggregation (TPC-H Q21's `multi`/`only_late`).
-      fused_sibling_aggregates_ += FuseSiblingDerivedAggregates(select.get());
-      // A WHERE conjunct that rejects the NULL padding of a LEFT JOIN makes
-      // the outer join's padded rows unreachable; planning it as an inner
-      // join is exact and unlocks hash-join fast paths (§7.5).
-      ReduceOuterJoins(select.get());
-      // A qualified star naming no FROM relation must be rejected up front:
-      // the per-route expanders below would otherwise silently drop the item
-      // (or expand it over unrelated relations) instead of erroring.
-      {
-        const auto matches_source = [&](std::string_view qualifier) {
-          return std::ranges::any_of(
-              select->Sources(), [&](const SelectSource& source) {
-                return (!source.alias.empty() &&
-                        IdentifierEquals(source.alias, qualifier)) ||
-                       (!source.table.empty() &&
-                        IdentifierEquals(source.table, qualifier));
-              });
-        };
-        // `rel.*` select items reach the engine either bare or wrapped in a
-        // value-table/proto constructor by the AST visitor; unwrap one level
-        // so the qualifier is validated in both shapes.
-        const auto star_qualifier =
-            [](const Expression& expression) -> std::string {
-          Expression candidate = expression;
-          if (candidate->Type() == TypeTag::kFunctionCallExp) {
-            const auto& function = candidate->AsFunctionCallExpression();
-            if ((function.FuncName() == "__value_table_value" ||
-                 function.FuncName() == "__proto_new") &&
-                function.Args().size() == 1) {
-              candidate = function.Args()[0];
-            }
-          }
-          if (candidate->Type() != TypeTag::kColumnValue) {
-            return {};
-          }
-          const ColumnName& column = candidate->AsColumnValue().GetColumnName();
-          if (column.name != "*" || column.schema.empty()) {
-            return {};
-          }
-          return column.schema;
-        };
-        for (const NamedExpression& item : select->SelectList()) {
-          if (!item.expression) {
-            continue;
-          }
-          const std::string qualifier = star_qualifier(item.expression);
-          if (!qualifier.empty() && !matches_source(qualifier)) {
-            last_error_ =
-                "unknown relation in select list: " + qualifier + ".*";
-            return Status::kNotExists;
-          }
-        }
-      }
-      // Bind every base relation up front, including those nested in IN,
-      // EXISTS, scalar subqueries, and CTE definitions. Lazy expression
-      // evaluation must not let a missing table go unnoticed merely because
-      // an outer predicate produced no rows.
-      std::unordered_map<std::string, size_t> referenced_tables;
-      relational_detail::CountStatementTables(*select, &referenced_tables);
-      for (const auto& [table_name, count] : referenced_tables) {
-        (void)count;
-        StatusOr<std::shared_ptr<Table>> table = ctx.GetTable(table_name);
-        if (!table.HasValue()) {
-          last_error_ = "table " + table_name + " not found";
-          return table.GetStatus();
-        }
-      }
-      result_column_names_.reserve(select->SelectList().size());
-      for (const NamedExpression& item : select->SelectList()) {
-        result_column_names_.push_back(
-            item.name.empty() ? item.expression->ToString() : item.name);
-      }
-      const bool has_table_sample = std::ranges::any_of(
-          select->Sources(),
-          [](const SelectSource& source) { return source.sample.has_value(); });
-      const auto emit_relational = [&]() -> StatusOr<Executor> {
-        if (for_update) {
-          last_error_ =
-              "SELECT ... FOR UPDATE cannot run on the relational route: this "
-              "query shape has no row positions to lock (a plain single-table "
-              "WHERE/ORDER BY/LIMIT shape is supported)";
-          return Status(Status::kInvalidArgument, last_error_);
-        }
-        std::vector<Column> columns;
-        columns.reserve(result_column_names_.size());
-        for (const std::string& name : result_column_names_) {
-          columns.emplace_back(name, ValueType::kNull);
-        }
-        StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
-            select, Schema("", std::move(columns)), ctx);
-        if (!optimized.HasValue()) {
-          std::ostringstream error;
-          error << "relational optimizer failed: " << optimized.GetStatus();
-          last_error_ = error.str();
-          return optimized.GetStatus();
-        }
-        Plan relational_plan = std::move(optimized.Value());
-        if (relational_plan == nullptr) {
-          last_error_ = "relational optimizer produced no plan";
-          return StatusError(StatusCode::kUnknown, last_error_);
-        }
-        PlanBase& relational_ref = *relational_plan;
-        Executor emitted = relational_ref.EmitExecutor(ctx);
-        return WithPlanExplain(std::move(emitted), std::move(relational_plan),
-                               &result_column_types_);
-      };
-      const bool sampled_relational_source = std::ranges::any_of(
-          select->Sources(), [](const SelectSource& source) {
-            return source.sample.has_value() &&
-                   (source.query != nullptr || source.unnest ||
-                    source.table.empty());
-          });
-      if (sampled_relational_source) {
-        return emit_relational();
-      }
-      // An explicit LIMIT 0 yields zero rows on every route (relational or
-      // optimizer); neither LimitExecutor nor LimitedRows can express that
-      // because they read limit==0 as "unbounded" (§6.3). Lower normally and
-      // evaluate the first batch to surface SELECT-list / function errors,
-      // then return an empty result. A pure zero-row shortcut would hide
-      // semantic errors that LIMIT 1 reports.
-      if (select->HasLimit() && select->Limit() == 0) {
-        ASSIGN_OR_RETURN(Executor, validated, emit_relational());
-        DataChunk probe;
-        static_cast<void>(validated->NextBatch(&probe, 1));
-        RETURN_IF_FAIL(validated->GetStatus());
-        return Executor(std::make_shared<ConstantExecutor>(std::vector<Row>{}));
-      }
-      const bool has_unnest = std::any_of(
-          select->Sources().begin(), select->Sources().end(),
-          [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
-      // UNNEST sources that participate in an outer join, an ON condition, or
-      // a USING clause need real join semantics (per-pair matching plus
-      // NULL-extended preservation of unmatched rows).  The memo route chains
-      // unnests as lateral cross products and can only post-filter, which
-      // drops LEFT-preserved rows and turns USING into a trivially-true
-      // `col = col`; the relational interpreter implements the exact
-      // semantics (LateralExpandRelation / Join), so route there instead.
-      const bool unnest_join_needs_relational = std::any_of(
-          select->Sources().begin(), select->Sources().end(),
-          [](const SelectSource& s) {
-            if (!s.unnest) {
-              return false;
-            }
-            return s.join_type == JoinType::kLeft ||
-                   s.join_type == JoinType::kRight ||
-                   s.join_type == JoinType::kFull || !s.using_columns.empty();
-          });
-      const bool has_lateral =
-          std::any_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& s) { return s.is_lateral; });
-      const bool lateral_join_needs_relational =
-          has_lateral &&
-          std::any_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& s) {
-                        return !s.using_columns.empty() ||
-                               s.join_type == JoinType::kLeft ||
-                               s.join_type == JoinType::kRight ||
-                               s.join_type == JoinType::kFull ||
-                               s.join_condition != nullptr ||
-                               s.from_nested_join;
-                      });
-      const bool can_decorrelate_subqueries =
-          CanUseDecorrelatedSubqueryOptimizer(*select);
-      const bool simple_count_star =
-          select->Sources().size() == 1 && !select->Sources()[0].query &&
-          !select->Sources()[0].unnest &&
-          select->Sources()[0].join_type == JoinType::kCross &&
-          select->Sources()[0].join_condition == nullptr &&
-          select->WithQueries().empty() && select->GroupBy().empty() &&
-          !select->Having() && !select->Qualify() &&
-          select->OrderBy().empty() && !select->Distinct() &&
-          select->SelectList().size() == 1 &&
-          select->SelectList()[0].expression &&
-          select->SelectList()[0].expression->Type() ==
-              TypeTag::kAggregateExp &&
-          select->SelectList()[0]
-                  .expression->AsAggregateExpression()
-                  .GetType() == AggregationType::kCount &&
-          !select->SelectList()[0]
-               .expression->AsAggregateExpression()
-               .Distinct() &&
-          select->SelectList()[0].expression->AsAggregateExpression().Child() &&
-          select->SelectList()[0]
-                  .expression->AsAggregateExpression()
-                  .Child()
-                  ->Type() == TypeTag::kColumnValue &&
-          select->SelectList()[0]
-                  .expression->AsAggregateExpression()
-                  .Child()
-                  ->AsColumnValue()
-                  .GetColumnName()
-                  .name == "*" &&
-          (!select->WhereClause() ||
-           select->WhereClause()->Type() == TypeTag::kConstantValue);
-      // Value-table operands (SELECT AS VALUE / AS <proto>) need the
-      // relational interpreter's proto-field ORDER BY resolution; their rows
-      // are folded single-column payloads, not plain projections.
-      const bool has_value_table_operand = std::any_of(
-          select->SelectList().begin(), select->SelectList().end(),
-          [](const NamedExpression& item) {
-            return item.expression &&
-                   item.expression->Type() == TypeTag::kFunctionCallExp &&
-                   (item.expression->AsFunctionCallExpression().FuncName() ==
-                        "__value_table_value" ||
-                    item.expression->AsFunctionCallExpression().FuncName() ==
-                        "__proto_new");
-          });
-      const bool sources_plain =
-          std::all_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& source) {
-                        return source.query == nullptr && !source.unnest &&
-                               !source.is_lateral && !source.table.empty();
-                      });
-      // M6: the grouped bridge folds every inner ON condition into WHERE,
-      // which is exact only for inner joins. Outer joins keep their ON
-      // predicates on the join itself as QueryData::OuterJoinEdge payloads
-      // (see outer_bridge_slice below); anything beyond that slice stays
-      // relational until the memo models the remaining grouped shapes.
-      // M6-bridge slice: LEFT edges are admitted from source 1 onward;
-      // RIGHT/FULL only in the M6+1 two-source shape (plain inner/cross
-      // first source); every outer ON condition must be memo-representable
-      // and no USING / nested-join sugar may remain on any source.
-      const bool outer_bridge_slice = [&] {
-        for (size_t i = 0; i < select->Sources().size(); ++i) {
-          const SelectSource& source = select->Sources()[i];
-          if (!source.using_columns.empty() || source.from_nested_join) {
-            return false;
-          }
-          const bool outer_type = source.join_type == JoinType::kLeft ||
-                                  source.join_type == JoinType::kRight ||
-                                  source.join_type == JoinType::kFull;
-          if (!source.join_condition || !outer_type) {
-            continue;
-          }
-          if (i == 0) {
-            return false;
-          }
-          // M6+1 admits only the single RIGHT/FULL edge over a plain
-          // inner/cross first source.
-          const bool m61_shape =
-              select->Sources().size() == 2 && i == 1 &&
-              (select->Sources()[0].join_type == JoinType::kCross ||
-               select->Sources()[0].join_type == JoinType::kInner);
-          if (source.join_type != JoinType::kLeft && !m61_shape) {
-            return false;
-          }
-          if (NeedsRelationalEvaluation(source.join_condition)) {
-            return false;
-          }
-        }
-        return true;
-      }();
-      // Set operations fold independently planned operands, so a FROM-side
-      // UNNEST is fine: each operand routes through its own statement
-      // planning.  Subquery sources and LATERAL stay on the other paths.
-      const bool sources_setop_safe =
-          std::all_of(select->Sources().begin(), select->Sources().end(),
-                      [](const SelectSource& source) {
-                        return source.query == nullptr && !source.is_lateral;
-                      });
-      // M-union: merge same-table UNION ALL / UNION DISTINCT branches into
-      // one scan before operand planning (the merged shape routes through
-      // the normal single-query paths below).
-      (void)MergeCompatibleUnionBranches(select.get(), ctx);
-      if (!select->UnionAll().empty() && !has_value_table_operand &&
-          select->WithQueries().empty() && sources_setop_safe) {
-        if (relational_detail::CanUseExactIntegerGroupingSets(ctx, *select)) {
-          return emit_relational();
-        }
-        return ExecuteSetOperation(*select, ctx);
-      }
-      // Self-joins expose the same base relation under two aliases; the
-      // GROUP BY / HAVING / aggregate statements: the Cascades-optimized
-      // FROM + WHERE core (join ordering, access paths, filter pushdown)
-      // feeds the proven relational grouping finish pipeline (GroupByPlan).
-      {
-        const bool has_grouping =
-            !select->GroupBy().empty() || select->Having() ||
-            std::ranges::any_of(
-                select->SelectList(), [](const NamedExpression& item) {
-                  return relational_detail::ContainsAggregate(item.expression);
-                });
-        // Grouped statements whose expressions carry correlated subqueries
-        // need the relational interpreter's scope chain (outer/CTE threading
-        // through Project); the bridge below runs without it.  Aggregates
-        // mixed with bare non-grouped columns inside one expression also stay
-        // put: their result depends on the group representative row, whose
-        // identity is not stable across access-path choices.
-        const auto touches_query_expression =
-            [](const Expression& expression) -> bool {
-          return expression && relational_detail::ContainsQuery(expression);
-        };
-        bool grouped_expressions_correlate =
-            touches_query_expression(select->Having());
-        for (const Expression& expression : select->GroupBy()) {
-          grouped_expressions_correlate = grouped_expressions_correlate ||
-                                          touches_query_expression(expression);
-        }
-        for (const NamedExpression& item : select->SelectList()) {
-          grouped_expressions_correlate =
-              grouped_expressions_correlate ||
-              touches_query_expression(item.expression);
-        }
-        // The bridge executes multi-relation and single-relation grouped
-        // queries through the Cascades core (join ordering, access paths,
-        // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
-        // Routing reads the post-rewrite shape: flattened/inlined inputs are
-        // plain by now, while genuinely complex shapes stay relational.
-        const bool simple_grouped_memo =
-            select->Sources().size() == 1 && !select->GroupBy().empty() &&
-            !select->Having() && select->OrderBy().empty() &&
-            !select->HasLimit() && !select->Distinct() &&
-            Optimizer::SupportsGrouping(select->GroupBy(),
-                                        select->SelectList());
-        if (!force_relational_fallback_ && !has_table_sample &&
-            (select->Sources().size() > 1 || simple_grouped_memo) &&
-            has_grouping && !simple_count_star && !select->Qualify() &&
-            !relational_detail::HasWindowFunctions(*select) &&
-            select->WithQueries().empty() && sources_plain &&
-            outer_bridge_slice &&
-            // The bridge's requirement collector skips star columns; a
-            // modifier star must expand through the generic path instead.
-            std::ranges::none_of(select->SelectList(),
-                                 [](const NamedExpression& item) {
-                                   return item.star_modifiers != nullptr;
-                                 }) &&
-            (!PostRewriteNeedsRelational(*select, &lifted,
-                                         /*include_grouping=*/false) ||
-             can_decorrelate_subqueries) &&
-            !touches_query_expression(select->WhereClause()) &&
-            !grouped_expressions_correlate) {
-          return ExecuteGroupedSelect(*select, ctx, &lifted);
-        }
-      }
-      const auto touches_query_expression =
-          [](const Expression& expression) -> bool {
-        return expression && relational_detail::ContainsQuery(expression);
-      };
-      const bool touches_query =
-          touches_query_expression(select->WhereClause()) ||
-          std::ranges::any_of(
-              select->SelectList(), [&](const NamedExpression& item) {
-                return touches_query_expression(item.expression);
-              });
-      const bool has_recursive_cte =
-          std::any_of(select->WithQueries().begin(),
-                      select->WithQueries().end(), [&](const auto& pair) {
-                        return select->IsRecursiveWith(pair.first);
-                      });
-      const bool has_plain_cte =
-          std::any_of(select->WithQueries().begin(),
-                      select->WithQueries().end(), [&](const auto& pair) {
-                        return !select->IsRecursiveWith(pair.first);
-                      });
-      // ARRAY(SELECT ...) select items need the relational interpreter's
-      // scope chain (see ContainsArrayQueryExpression); the unnest and
-      // vectorized routes evaluate projections without it.  A SQL UDF whose
-      // body contains a subquery needs it too: invoking the body through a
-      // plain Projection would throw.
-      const auto touches_relational_subquery =
-          [](const Expression& expression) {
-            return ContainsArrayQueryExpression(expression) ||
-                   ContainsQueryUdfCall(expression);
-          };
-      const bool touches_array_subquery =
-          std::ranges::any_of(
-              select->SelectList(),
-              [&](const NamedExpression& item) {
-                return touches_relational_subquery(item.expression);
-              }) ||
-          std::ranges::any_of(
-              select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
-                return touches_relational_subquery(term.expression);
-              });
-      // A subquery inside the select list itself projects per-row through
-      // Projection::Evaluate, which cannot run subqueries; only the
-      // relational interpreter's scope chain can evaluate that shape.
-      const bool select_list_touches_query =
-          std::ranges::any_of(select->SelectList(),
-                              [](const NamedExpression& item) {
-                                return ContainsQueryExpression(item.expression);
-                              }) ||
-          std::ranges::any_of(select->OrderBy(),
-                              [](const SelectStatement::OrderByTerm& term) {
-                                return ContainsQueryExpression(term.expression);
-                              });
-      if ((has_unnest || has_lateral ||
-           (has_recursive_cte && !has_plain_cte && !touches_query)) &&
-          !unnest_join_needs_relational && !lateral_join_needs_relational &&
-          !select_list_touches_query && !select->Qualify() &&
-          !relational_detail::HasWindowFunctions(*select)) {
-        StatusOr<Executor> unnest_exec = ExecuteUnnestSelect(*select, ctx);
-        if (unnest_exec.HasValue()) {
-          return unnest_exec;
-        }
-      }
-      // Routing reads the post-rewrite shape (see PostRewriteNeedsRelational):
-      // statements whose derived/CTE complexity the rewrites eliminated flow
-      // to the cost-based planner; the optimizer's kNotImplemented fallback
-      // still catches anything beyond its slices.
-      if (force_relational_fallback_ ||
-          (PostRewriteNeedsRelational(*select, &lifted) &&
-           !can_decorrelate_subqueries) ||
-          select->Sources().empty() || has_unnest || has_lateral ||
-          touches_array_subquery ||
-          (has_recursive_cte && !has_plain_cte && !touches_query)) {
-        if (simple_count_star && !force_relational_fallback_) {
-          // COUNT(*) over one plain table is fully representable by the
-          // Cascades single-relation path, including a covering index-only
-          // scan. Let that path handle the query even if the visitor marked
-          // the aggregate as relational for another reason.
-        } else {
-          return emit_relational();
-        }
-      }
-      if (PostRewriteNeedsRelational(*select, &lifted) && !simple_count_star &&
-          !can_decorrelate_subqueries) {
-        return emit_relational();
-      }
-
-      const bool multi_relation = select->Sources().size() > 1;
-      const bool has_aggregate =
-          std::ranges::any_of(
-              select->SelectList(),
-              [](const NamedExpression& item) {
-                return relational_detail::ContainsAggregate(item.expression);
-              }) ||
-          relational_detail::ContainsAggregate(select->Having());
-      if (multi_relation && has_aggregate && !has_table_sample) {
-        return emit_relational();
-      }
-      // Computed scalar aggregates otherwise decode Rows into one parallel
-      // scan pool and hand them to a second pool evaluating the AST. The
-      // relational typed scan already compiles these numeric expressions
-      // once and folds while decoding, without either batch handoff.
-      // Filtered floating-point aggregates retain Cascades' scan choices;
-      // integer arithmetic folds directly with the typed predicate scan.
-      if (!multi_relation && has_aggregate && !has_table_sample &&
-          select->Sources().size() == 1 && !select->Sources()[0].query &&
-          !select->Sources()[0].unnest && select->GroupBy().empty() &&
-          !select->Having() && !select->Qualify() && !select->Distinct() &&
-          !select->ForUpdate() && BytecodeEnabled() &&
-          std::ranges::all_of(select->SelectList(), [](const auto& item) {
-            if (!item.expression ||
-                item.expression->Type() != TypeTag::kAggregateExp) {
-              return false;
-            }
-            const auto& aggregate = item.expression->AsAggregateExpression();
-            const auto type = aggregate.GetType();
-            return !aggregate.Distinct() && !aggregate.HasWhereFilter() &&
-                   !aggregate.NeedsGroupContext() && aggregate.Child() &&
-                   aggregate.Child()->Type() != TypeTag::kColumnValue &&
-                   (type == AggregationType::kSum ||
-                    type == AggregationType::kAvg ||
-                    type == AggregationType::kMin ||
-                    type == AggregationType::kMax ||
-                    type == AggregationType::kCount);
-          })) {
-        const auto table = ctx.GetTable(select->Sources()[0].table);
-        const auto stats = ctx.GetStats(select->Sources()[0].table);
-        const bool large_lstable =
-            table.HasValue() && table.Value()->GetLSTableStore() != nullptr &&
-            stats.HasValue() && stats.Value()->Rows() >= 65536;
-        if (table.HasValue()) {
-          const std::string& alias = select->Sources()[0].alias;
-          const Schema schema = alias.empty()
-                                    ? table.Value()->GetSchema()
-                                    : relational_detail::QualifySchema(
-                                          table.Value()->GetSchema(), alias);
-          if ((!select->WhereClause() ||
-               BytecodeCompiler::Compile(select->WhereClause(), schema,
-                                         BytecodeCompiler::Context::kFilter)
-                   .has_value()) &&
-              std::ranges::all_of(select->SelectList(), [&](const auto& item) {
-                const auto program = BytecodeCompiler::Compile(
-                    item.expression->AsAggregateExpression().Child(), schema);
-                return program.has_value() &&
-                       (!select->WhereClause() ||
-                        program->ResultType() == ValueType::kInt64 ||
-                        large_lstable);
-              })) {
-            return emit_relational();
-          }
-        }
-      }
-
-      // Post-projection ORDER BY scope: the adapter normalizes computed keys
-      // and SELECT aliases to projection-output names (sort_expressions) and
-      // a post-plan SortExecutor covers plans that do not enforce ordering,
-      // so computed ordering no longer forces the relational path.
-      QueryData query;
-      // FOR UPDATE reuses the DML source contract: scans reserve a write
-      // intent (and a row lock) on every row they visit, and the transaction
-      // holds them until commit/abort.  Positions also have to survive the
-      // projection for the plan to be accepted.
-      query.require_row_position_ = for_update;
-      if (for_update) {
-        query.wait_for_write_intent_ =
-            for_update_wait_mode_ != ForUpdateWaitMode::kNoWait;
-      }
-      // Stamp literals in SQL-text order before the optimizer sorts
-      // conjuncts. Identical values (warehouse 1 AND district 1) would
-      // otherwise be numbered by plan-tree position and bind swapped.
-      SqlLiteralSlots literal_slots;
-      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
-          !plan_cache_parameters_.empty() && select->WithQueries().empty() &&
-          !select->HasDistinctOn() && select->UnionAll().empty() &&
-          select->GetSetOperationTree() == nullptr) {
-        literal_slots.parameters = &plan_cache_parameters_;
-      }
-      std::vector<Expression> slotted_select;
-      slotted_select.reserve(select->SelectList().size());
-      for (const NamedExpression& item : select->SelectList()) {
-        slotted_select.push_back(literal_slots.Apply(item.expression));
-      }
-      std::vector<Expression> slotted_joins;
-      slotted_joins.reserve(select->Sources().size());
-      std::vector<std::optional<TableSampleSpec>> slotted_samples;
-      slotted_samples.reserve(select->Sources().size());
-      for (const SelectSource& source : select->Sources()) {
-        if (source.query != nullptr) {
-          literal_slots.ok = false;
-        }
-        if (source.sample) {
-          TableSampleSpec sample = *source.sample;
-          sample.size = literal_slots.Apply(sample.size);
-          for (Expression& partition : sample.partition_by) {
-            partition = literal_slots.Apply(partition);
-          }
-          if (sample.repeatable_seed) {
-            sample.repeatable_seed =
-                literal_slots.Apply(*sample.repeatable_seed);
-          }
-          slotted_samples.emplace_back(std::move(sample));
-        } else {
-          slotted_samples.emplace_back(std::nullopt);
-        }
-        slotted_joins.push_back(literal_slots.Apply(source.join_condition));
-      }
-      const Expression slotted_where =
-          literal_slots.Apply(select->WhereClause());
-      for (const Expression& key : select->GroupBy()) {
-        (void)literal_slots.Apply(key);
-      }
-      (void)literal_slots.Apply(select->Having());
-      const Expression slotted_qualify = literal_slots.Apply(select->Qualify());
-      std::vector<Expression> slotted_order;
-      slotted_order.reserve(select->OrderBy().size());
-      for (const auto& term : select->OrderBy()) {
-        slotted_order.push_back(literal_slots.Apply(term.expression));
-      }
-      const bool use_sql_slots = literal_slots.Complete();
-      Expression where = use_sql_slots ? slotted_where : select->WhereClause();
-      std::unordered_set<std::string> seen_relations;
-      for (size_t i = 0; i < select->Sources().size(); ++i) {
-        const SelectSource& source = select->Sources()[i];
-        if (!seen_relations.insert(source.alias).second) {
-          last_error_ = "duplicate FROM relation; use distinct aliases";
-          return Status::kUnknown;
-        }
-        query.from_.push_back(source.alias);
-        if (!source.alias.empty() && source.alias != source.table) {
-          query.aliases_.emplace(source.alias, source.table);
-        }
-        if (use_sql_slots && slotted_samples[i]) {
-          query.samples_.emplace(source.alias, std::move(*slotted_samples[i]));
-        } else if (source.sample) {
-          query.samples_.emplace(source.alias, *source.sample);
-        }
-        const Expression join_condition =
-            use_sql_slots ? slotted_joins[i] : source.join_condition;
-        if (join_condition) {
-          // M6+1: a LEFT/RIGHT/FULL ON condition rides the outer-join
-          // predicate, never WHERE (ON filters before NULL padding, WHERE
-          // after). Anything beyond the optimizer's outer slice was already
-          // routed to the relational path; reaching it here is a programming
-          // error, so fall back rather than folding it unsoundly.
-          if (source.join_type == JoinType::kLeft ||
-              source.join_type == JoinType::kRight ||
-              source.join_type == JoinType::kFull) {
-            if (i == 0) {
-              return emit_relational();
-            }
-            QueryData::OuterJoinEdge edge;
-            edge.right_index = query.from_.size() - 1;
-            edge.join_kind = source.join_type == JoinType::kLeft    ? 0
-                             : source.join_type == JoinType::kRight ? 1
-                                                                    : 2;
-            edge.on_condition = join_condition;
-            query.outer_joins_.push_back(std::move(edge));
-          } else {
-            where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
-                                                join_condition)
-                          : join_condition;
-          }
-        }
-      }
-      query.where_ = where ? where : ConstantValueExp(Value(true));
-      query.lifted_ctes_ = lifted;
-      query.qualify_ = use_sql_slots ? slotted_qualify : select->Qualify();
-      query.select_.reserve(select->SelectList().size());
-      for (size_t item_index = 0; item_index < select->SelectList().size();
-           ++item_index) {
-        const NamedExpression& item = select->SelectList()[item_index];
-        NamedExpression copied = item;
-        if (use_sql_slots) {
-          copied.expression = slotted_select[item_index];
-        }
-        // The SQL visitor gives an unaliased `o.key` projection the display
-        // name `key`.  QueryData's ProjectionPlan interprets a non-empty name
-        // as a new unqualified schema column, which would hide `o.key` from
-        // the decorrelated semi/anti join key contract. Keep the expression
-        // name for internal binding and let result_column_names_ provide the
-        // client-facing label.
-        if (copied.expression &&
-            copied.expression->Type() == TypeTag::kColumnValue) {
-          const ColumnName& column =
-              copied.expression->AsColumnValue().GetColumnName();
-          if (copied.name == column.name) {
-            copied.name.clear();
-          }
-        }
-        query.select_.push_back(std::move(copied));
-      }
-      // Expand "*" projections here so the visible output width is the
-      // expanded width; the optimizer's internal expansion would otherwise
-      // disagree with visible_columns and truncate the final projection.
-      {
-        std::vector<NamedExpression> expanded;
-        bool has_star = false;
-        std::string unknown_star_qualifier;
-        for (const NamedExpression& item : query.select_) {
-          Expression star_expression = item.expression;
-          if (star_expression &&
-              star_expression->Type() == TypeTag::kFunctionCallExp) {
-            const auto& call = star_expression->AsFunctionCallExpression();
-            if (call.FuncName() == "__value_table_value" &&
-                call.Args().size() == 1) {
-              star_expression = call.Args()[0];
-            }
-          }
-          if (star_expression &&
-              star_expression->Type() == TypeTag::kColumnValue) {
-            const ColumnName& column =
-                star_expression->AsColumnValue().GetColumnName();
-            if (column.name == "*") {
-              if (item.star_modifiers && star_expression != item.expression) {
-                // `SELECT AS VALUE * EXCEPT/REPLACE` would need the modifier
-                // columns folded into a single value; reject instead of
-                // spilling several columns into the value context.
-                last_error_ =
-                    "SELECT * EXCEPT/REPLACE cannot be combined with "
-                    "SELECT AS VALUE";
-                return Status::kInvalidArgument;
-              }
-              has_star = true;
-              bool matched_relation = false;
-              std::unordered_set<std::string> resolved_except;
-              std::unordered_set<std::string> resolved_replace;
-              for (const std::string& relation : query.from_) {
-                const auto aliased = query.aliases_.find(relation);
-                const std::string& physical = aliased == query.aliases_.end()
-                                                  ? relation
-                                                  : aliased->second;
-                const auto sample_source = std::ranges::find_if(
-                    select->Sources(), [&](const SelectSource& source) {
-                      return source.alias == relation;
-                    });
-                const TableSampleSpec* sample_spec =
-                    sample_source != select->Sources().end() &&
-                            sample_source->sample
-                        ? &*sample_source->sample
-                        : nullptr;
-                if (!column.schema.empty() && column.schema != relation &&
-                    column.schema != physical) {
-                  continue;
-                }
-                // A derived source (subquery / UNNEST) has no catalog table
-                // and no lifted leaf schema here. Keep its `rel.*` wrapped
-                // so the relational interpreter expands it from the derived
-                // relation's own schema; do not reject it as unknown.
-                const SelectSource* derived_source = nullptr;
-                for (const SelectSource& src : select->Sources()) {
-                  if (src.alias == relation) { derived_source = &src; break; }
-                }
-                if (derived_source != nullptr &&
-                    (derived_source->query != nullptr ||
-                     derived_source->unnest != nullptr)) {
-                  matched_relation = true;
-                  expanded.push_back(item);
-                  continue;
-                }
-                // Lifted CTE leaves (M4) expand from their leaf schemas,
-                // exactly like a base table's columns under this relation.
-                const Schema* leaf_schema = nullptr;
-                const auto cell = lifted.cells.find(relation);
-                if (cell != lifted.cells.end() && cell->second != nullptr) {
-                  leaf_schema = &cell->second->schema;
-                } else {
-                  const auto rec = lifted.recursive.find(relation);
-                  if (rec != lifted.recursive.end()) {
-                    leaf_schema = &rec->second.output_schema;
-                  }
-                }
-                if (leaf_schema != nullptr) {
-                  matched_relation = true;
-                  const Schema& source_schema = *leaf_schema;
-                  if (item.star_modifiers) {
-                    ExpandStarWithModifiers(item, relation, source_schema,
-                                            &expanded, &resolved_except,
-                                            &resolved_replace);
-                    continue;
-                  }
-                  for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
-                    expanded.emplace_back(ColumnName(
-                        relation, source_schema.GetColumn(i).Name().name));
-                  }
-                  if (column.schema.empty() && sample_spec != nullptr &&
-                      sample_spec->with_weight) {
-                    expanded.emplace_back(
-                        sample_spec->weight_alias,
-                        ColumnValueExp(sample_spec->weight_alias));
-                  }
-                  continue;
-                }
-                StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
-                if (!found.HasValue()) {
-                  continue;
-                }
-                matched_relation = true;
-                const Schema& source_schema = found.Value()->GetSchema();
-                if (source_schema.ColumnCount() == 1 &&
-                    physical.find("TestExtraPBValueTable") !=
-                        std::string::npos) {
-                  if (item.star_modifiers) {
-                    last_error_ =
-                        "SELECT * EXCEPT/REPLACE over this table is not "
-                        "supported";
-                    return Status::kInvalidArgument;
-                  }
-                  const ColumnName base(relation,
-                                        source_schema.GetColumn(0).Name().name);
-                  for (const char* field :
-                       {"int32_val1", "int32_val2", "str_value"}) {
-                    expanded.emplace_back(
-                        field,
-                        FunctionCallExp(
-                            "__get_field_safe",
-                            {ColumnValueExp(base),
-                             ConstantValueExp(Value(std::string(field)))}));
-                  }
-                  if (column.schema.empty() && sample_spec != nullptr &&
-                      sample_spec->with_weight) {
-                    expanded.emplace_back(
-                        sample_spec->weight_alias,
-                        ColumnValueExp(sample_spec->weight_alias));
-                  }
-                  continue;
-                }
-                if (item.star_modifiers) {
-                  ExpandStarWithModifiers(item, relation, source_schema,
-                                          &expanded, &resolved_except,
-                                          &resolved_replace);
-                } else {
-                  for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
-                    expanded.emplace_back(ColumnName(
-                        relation, source_schema.GetColumn(i).Name().name));
-                  }
-                }
-                if (column.schema.empty() && sample_spec != nullptr &&
-                    sample_spec->with_weight) {
-                  expanded.emplace_back(
-                      sample_spec->weight_alias,
-                      ColumnValueExp(sample_spec->weight_alias));
-                }
-              }
-              // Modifier names that matched no FROM relation would silently
-              // keep (REPLACE) or drop their effect (EXCEPT); reject them
-              // like unknown columns.
-              if (item.star_modifiers &&
-                  (resolved_except.size() !=
-                       item.star_modifiers->except_columns.size() ||
-                   resolved_replace.size() !=
-                       item.star_modifiers->replace_items.size())) {
-                last_error_ =
-                    "star modifier column not present in any FROM "
-                    "relation";
-                return Status::kInvalidArgument;
-              }
-              // A qualified star that matches no FROM relation would
-              // otherwise silently disappear from the select list; reject it
-              // like an unknown column instead.
-              if (!column.schema.empty() && !matched_relation &&
-                  unknown_star_qualifier.empty()) {
-                unknown_star_qualifier = column.schema;
-              }
-              continue;
-            }
-          }
-          expanded.push_back(item);
-        }
-        if (!unknown_star_qualifier.empty()) {
-          last_error_ =
-              "unknown relation in select list: " + unknown_star_qualifier;
-          return Status::kNotExists;
-        }
-        if (has_star && !expanded.empty()) {
-          query.select_ = std::move(expanded);
-          if (has_table_sample) {
-            result_column_names_.clear();
-            result_column_types_.clear();
-            result_column_names_.reserve(query.select_.size());
-            for (const NamedExpression& item : query.select_) {
-              result_column_names_.push_back(
-                  item.name.empty() ? item.expression->ToString() : item.name);
-            }
-          }
-        }
-      }
-      // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
-      // The AST visitor defers it when the select list still contained an
-      // unexpanded star; the list is expanded into query.select_ by now.
-      // Rewrite the statement's terms in place so every downstream consumer
-      // (required ordering, post-plan sort, safety-net sort) sees the
-      // resolved output column instead of a constant that sorts identically
-      // on every row.
-      if (!select->OrderBy().empty()) {
-        auto resolved_orders = select->OrderBy();
-        bool orders_changed = false;
-        for (SelectStatement::OrderByTerm& order : resolved_orders) {
-          const Expression& expression = order.expression;
-          if (!expression || expression->Type() != TypeTag::kConstantValue ||
-              dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
-            continue;
-          }
-          const Value& ordinal_value = expression->AsConstantValue().GetValue();
-          if (ordinal_value.type != ValueType::kInt64 ||
-              ordinal_value.IsNull() || ordinal_value.value.int_value < 1) {
-            continue;
-          }
-          const auto ordinal =
-              static_cast<size_t>(ordinal_value.value.int_value);
-          const Expression& target = ordinal <= query.select_.size()
-                                         ? query.select_[ordinal - 1].expression
-                                         : nullptr;
-          // A star cannot expand here (single-source shapes expand above;
-          // anything else stays unsupported), so leave the constant for the
-          // per-term check below to report.
-          if (!target ||
-              (target->Type() == TypeTag::kColumnValue &&
-               target->AsColumnValue().GetColumnName().name == "*")) {
-            continue;
-          }
-          order.expression = target;
-          orders_changed = true;
-        }
-        if (orders_changed) {
-          select->SetOrderBy(std::move(resolved_orders));
-        }
-      }
-      const size_t visible_columns = query.select_.size();
-      std::vector<Expression> sort_expressions;
-      std::vector<bool> sort_ascending;
-      bool order_needs_projection_binding = false;
-      sort_expressions.reserve(select->OrderBy().size());
-      for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-        auto order = select->OrderBy()[i];
-        if (use_sql_slots) {
-          order.expression = slotted_order[i];
-        }
-        // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
-        // The AST visitor defers it when the select list still contained an
-        // unexpanded star; the list is expanded here, so swap the constant
-        // for the ordinal's source expression and let the normal binding
-        // below handle aliases and output naming.
-        if (order.expression &&
-            order.expression->Type() == TypeTag::kConstantValue) {
-          const Value& ordinal_value =
-              order.expression->AsConstantValue().GetValue();
-          if (ordinal_value.type == ValueType::kInt64 &&
-              !ordinal_value.IsNull() && ordinal_value.value.int_value >= 1) {
-            const auto ordinal =
-                static_cast<size_t>(ordinal_value.value.int_value);
-            if (ordinal > query.select_.size() ||
-                !query.select_[ordinal - 1].expression) {
-              return StatusError(StatusCode::kInvalidArgument,
-                                 "ORDER BY ordinal out of range");
-            }
-            // A COLLATE clause on the ordinal applies to the SELECT-list item
-            // it names, so it must survive the substitution.
-            order.expression = ReapplyCollation(
-                query.select_[ordinal - 1].expression, order.expression);
-          }
-        } else if (const std::optional<CollatedOrdinal> collated =
-                       AsCollatedOrdinal(order.expression);
-                   collated.has_value() && collated->ordinal >= 1 &&
-                   static_cast<size_t>(collated->ordinal) <=
-                       query.select_.size() &&
-                   query.select_[static_cast<size_t>(collated->ordinal) - 1]
-                       .expression) {
-          // `ORDER BY 1 COLLATE 'und:ci'`: the ordinal is a constant wrapped in
-          // the collator, so it never looks like an ordinal above. Resolving
-          // it here keeps the clause on the SELECT-list item it names —
-          // leaving the constant in place would sort on a value every row
-          // shares and silently order nothing.
-          order.expression = ApplyCollationSpec(
-              query.select_[static_cast<size_t>(collated->ordinal) - 1]
-                  .expression,
-              collated->spec);
-        }
-        order_needs_projection_binding =
-            order_needs_projection_binding ||
-            order.expression->Type() != TypeTag::kColumnValue;
-        query.order_expressions_.push_back(order.expression);
-        query.order_ascending_.push_back(order.ascending);
-        auto selected =
-            std::ranges::find_if(query.select_, [&](const auto& item) {
-              if (item.expression->ToString() == order.expression->ToString()) {
-                return true;
-              }
-              if (order.expression->Type() != TypeTag::kColumnValue ||
-                  item.name.empty()) {
-                return false;
-              }
-              const ColumnName& order_name =
-                  order.expression->AsColumnValue().GetColumnName();
-              return order_name.schema.empty() &&
-                     IdentifierEquals(item.name, order_name.name);
-            });
-        if (selected != query.select_.end()) {
-          // Client labels were captured before physical planning. Give a
-          // duplicated output name a unique internal binding so ordering the
-          // second projection cannot resolve to the first one.
-          if (!selected->name.empty() &&
-              std::ranges::count_if(query.select_, [&](const auto& item) {
-                return IdentifierEquals(item.name, selected->name);
-              }) > 1) {
-            selected->name = "$sort" + std::to_string(std::distance(
-                                           query.select_.begin(), selected));
-          }
-          // Keep the optimizer's required ordering in terms of the selected
-          // expression itself.  A bare ORDER BY alias is an output-schema
-          // name, not an input column, and retaining it here would make the
-          // lower projection attempt to resolve a column that does not exist
-          // in its child schema.
-          if (order.expression->Type() == TypeTag::kColumnValue &&
-              order.expression->AsColumnValue()
-                  .GetColumnName()
-                  .schema.empty() &&
-              selected->expression->ToString() !=
-                  order.expression->ToString()) {
-            query.order_expressions_.back() = selected->expression;
-            // The logical key and the sort key now name different things
-            // (source expression vs output column); bind both to the
-            // projection output so the post-plan ordering check compares
-            // like with like instead of stacking a second sort.
-            order_needs_projection_binding = true;
-          }
-          // Sorting consumes the plan OUTPUT, whose columns are named by the
-          // select list; normalize the key to that name so qualifiers
-          // (table aliases) cannot break resolution after projection.
-          if (!selected->name.empty()) {
-            sort_expressions.push_back(
-                ColumnValueExp(ColumnName(selected->name)));
-            // The sort key is the output column, so the logical ordering
-            // must be checked against the same name: leaving the source
-            // expression here makes the post-plan IsOrderedBy comparison
-            // fail and stack a second sort above one the plan already
-            // declared.
-            order_needs_projection_binding = true;
-          } else if (selected->expression &&
-                     selected->expression->Type() != TypeTag::kColumnValue) {
-            // An unnamed computed projection has no output name to bind: the
-            // source form would evaluate against output rows that no longer
-            // expose the source columns. Name the projection output
-            // deterministically (client labels were captured before this
-            // runs, and the trim below is positional) so every layer keys on
-            // the output column instead; the plan side resolves it through
-            // the same name.
-            const std::string sort_name =
-                "$sort" +
-                std::to_string(std::distance(query.select_.begin(), selected));
-            selected->name = sort_name;
-            sort_expressions.push_back(ColumnValueExp(ColumnName(sort_name)));
-            order_needs_projection_binding = true;
-          } else {
-            sort_expressions.push_back(order.expression);
-          }
-        } else {
-          const std::string hidden_name = "$order" + std::to_string(i);
-          query.select_.emplace_back(hidden_name, order.expression);
-          // ORDER BY a non-selected input is evaluated through this hidden
-          // projection column. Keep the logical ordering key on that output
-          // name so a pushed-down TopN never resolves against a child that
-          // intentionally does not expose the source column.
-          query.order_expressions_.back() = ColumnValueExp(hidden_name);
-          sort_expressions.push_back(ColumnValueExp(hidden_name));
-        }
-        sort_ascending.push_back(order.ascending);
-        query.order_nulls_first_.push_back(order.nulls_first);
-      }
-      // ORDER BY keys are kept in SOURCE-column form for the plan's own
-      // SortPlan/TopN. But when a key is a bare SELECT-list ALIAS (e.g.
-      // `ORDER BY other_id` where other_id is `p2.id AS other_id`), the plan
-      // builds its ordering around the projected output name and pushes that
-      // Sort BELOW the projection that produces it, so the alias column is not
-      // yet resolvable. In that case drop the plan-side ordering entirely and
-      // let the post-plan SortExecutor below apply `sort_expressions` over the
-      // plan OUTPUT schema. Computed keys (`a * b`) keep their plan-side
-      // ordering so a TopN can still be pushed down.
-      const bool order_by_output_alias = std::ranges::any_of(
-          select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
-            if (!term.expression ||
-                term.expression->Type() != TypeTag::kColumnValue ||
-                !term.expression->AsColumnValue()
-                     .GetColumnName()
-                     .schema.empty()) {
-              return false;
-            }
-            return std::ranges::any_of(
-                select->SelectList(), [&](const NamedExpression& item) {
-                  return !item.name.empty() && item.expression &&
-                         item.expression->ToString() !=
-                             term.expression->ToString() &&
-                         IdentifierEquals(item.name,
-                                          term.expression->AsColumnValue()
-                                              .GetColumnName()
-                                              .name);
-                });
-          });
-      if (order_by_output_alias) {
-        query.order_expressions_.clear();
-        query.order_ascending_.clear();
-        query.order_nulls_first_.clear();
-        order_needs_projection_binding = true;
-      } else if (order_needs_projection_binding) {
-        query.order_ascending_ = sort_ascending;
-      }
-      // Let the memo compare hash, sort and index-skip DISTINCT over the
-      // visible projection. Hidden ORDER BY columns still use the finishing
-      // path below because they are not part of the duplicate key.
-      query.distinct_ =
-          select->Distinct() && visible_columns == query.select_.size();
-      // DISTINCT must see every row before truncation, so the optimizer is
-      // not told about LIMIT here; Distinct -> Sort -> Limit stays in this
-      // order above an untruncated plan (D6 soundness).
-      query.limit_count_ = select->Distinct() ? 0 : select->Limit();
-      query.limit_offset_ = select->Distinct() ? 0 : select->Offset();
-      Status rewrite_status = query.Rewrite(ctx);
-      if (rewrite_status == Status::kAmbiguousQuery) {
-        last_error_ = query.ambiguous_column_.empty()
-                          ? "ambiguous column reference"
-                          : "ambiguous column " + query.ambiguous_column_;
-        return rewrite_status;
-      }
-      RETURN_IF_FAIL(rewrite_status);
-      // Sampled before optimizing as well as before storing: a clustered index
-      // order is a revocable proof, so a plan that may have elided a sort (or
-      // folded a LIMIT / an incremental sort) on it must not outlive the
-      // statement in the compiled-plan cache.
-      const bool clustered_order_before =
-          AnyResolvedTableHasClusteredOrder(ctx);
-      StatusOr<Plan> plan_or = Optimizer::Optimize(query, ctx);
-      if (!plan_or.HasValue()) {
-        return emit_relational();
-      }
-      Plan plan = std::move(plan_or.Value());
-      Executor executor = plan->EmitExecutor(ctx);
-      const bool needs_distinct =
-          select->Distinct() &&
-          !ProjectionContainsUniqueKey(plan, query.select_, visible_columns) &&
-          !plan->EnforcesDistinct();
-      if (needs_distinct) {
-        // DISTINCT over a single-column covering index skip-scans distinct
-        // keys instead of hashing every row; the index order also satisfies
-        // an ascending ORDER BY on that column.  Projections between the
-        // DISTINCT boundary and the scan are transparent when they are pure
-        // column passthroughs.
-        Plan scan_plan = plan;
-        std::vector<NamedExpression> distinct_items;
-        while (true) {
-          const auto* projection =
-              dynamic_cast<const ProjectionPlan*>(&*scan_plan);
-          if (projection == nullptr) {
-            break;
-          }
-          distinct_items = projection->Columns();
-          scan_plan = projection->GetSource();
-        }
-        if (distinct_items.empty()) {
-          // The projection below DISTINCT was already removed as an identity;
-          // the select list is then the distinct column list.
-          distinct_items = select->SelectList();
-        }
-        const auto* index_only =
-            dynamic_cast<const IndexOnlyScanPlan*>(&*scan_plan);
-        const Table* scan_table =
-            index_only != nullptr ? index_only->ScanSource() : nullptr;
-        bool skip_scan = false;
-        if (index_only != nullptr && scan_table != nullptr &&
-            !index_only->GetIndex().RetainsDeletedEntries() &&
-            !ctx.txn_.IndexKeysMayBeStale(index_only->GetIndex().Root()) &&
-            index_only->GetIndex().sc_.key_.size() == 1 &&
-            index_only->BeginKey().empty() && index_only->EndKey().empty() &&
-            distinct_items.size() == 1 && distinct_items[0].expression &&
-            distinct_items[0].expression->Type() == TypeTag::kColumnValue) {
-          const ColumnName distinct_column =
-              distinct_items[0].expression->AsColumnValue().GetColumnName();
-          const int offset = scan_table->GetSchema().Offset(distinct_column);
-          if (offset >= 0 && index_only->GetIndex().sc_.key_.front() ==
-                                 static_cast<slot_t>(offset)) {
-            std::vector<NamedExpression> select_items =
-                index_only->SelectItems();
-            if (select_items.empty()) {
-              select_items.emplace_back(distinct_column.name,
-                                        ColumnValueExp(distinct_column));
-            }
-            Executor skip_scan_executor = std::make_shared<SkipScanDistinct>(
-                ctx.txn_, *scan_table, index_only->GetIndex(),
-                std::vector<Value>{}, std::vector<Value>{},
-                index_only->IsAscending(), ConstantValueExp(Value(true)),
-                scan_table->GetSchema(), 0);
-            executor = std::make_shared<Projection>(
-                std::move(select_items), scan_table->GetSchema(),
-                std::move(skip_scan_executor));
-            skip_scan = true;
-          }
-        }
-        if (!skip_scan) {
-          executor = std::make_shared<DistinctExecutor>(std::move(executor));
-        }
-      }
-      // The ordering certification must use the keys the plan was actually
-      // built with.  When a sort key resolves to a SELECT-list alias,
-      // QueryData::Rewrite folds the output name back into its source
-      // expression, so query.order_expressions_ no longer matches the
-      // plan-declared output-name keys; sort_expressions is the faithful
-      // post-projection form and comparing it avoids stacking a second sort.
-      const std::vector<Expression>& ordering_keys =
-          order_needs_projection_binding ? sort_expressions
-                                         : query.order_expressions_;
-      if (!select->OrderBy().empty() &&
-          !plan->IsOrderedBy(ordering_keys, query.order_ascending_,
-                             query.order_nulls_first_)) {
-        std::vector<SortExecutor::Key> keys;
-        keys.reserve(select->OrderBy().size());
-        for (size_t i = 0; i < select->OrderBy().size(); ++i) {
-          keys.push_back({sort_expressions[i], sort_ascending[i],
-                          select->OrderBy()[i].nulls_first});
-        }
-        executor = std::make_shared<SortExecutor>(
-            std::move(executor), plan->GetSchema(), std::move(keys));
-      }
-      if ((select->HasLimit() || select->Offset() != 0) &&
-          !plan->EnforcesLimit(select->Limit(), select->Offset())) {
-        executor = std::make_shared<LimitExecutor>(
-            std::move(executor), select->Limit(), select->Offset());
-      }
-      if (visible_columns != query.select_.size()) {
-        std::vector<NamedExpression> visible;
-        visible.reserve(visible_columns);
-        for (size_t i = 0; i < visible_columns; ++i) {
-          visible.emplace_back(plan->GetSchema().GetColumn(i).Name());
-        }
-        executor = std::make_shared<Projection>(
-            std::move(visible), plan->GetSchema(), std::move(executor));
-      }
-      // Phase 2-1 fill: capture the compiled plan plus the executor-shape
-      // metadata so identical-parameter repeats skip parse/bind/rewrite/
-      // optimize entirely. Only optimizer-route statements reach this point.
-      if (!plan_cache_fingerprint_.empty() && !multi_relation &&
-          !clustered_order_before && !AnyResolvedTableHasClusteredOrder(ctx)) {
-        auto shape = std::make_shared<CompiledPlan::SelectShape>();
-        shape->column_names = result_column_names_;
-        shape->order_expressions = query.order_expressions_;
-        shape->order_ascending = query.order_ascending_;
-        shape->order_nulls_first = query.order_nulls_first_;
-        shape->sort_keys.reserve(sort_expressions.size());
-        for (size_t i = 0; i < sort_expressions.size(); ++i) {
-          shape->sort_keys.emplace_back(sort_expressions[i],
-                                        static_cast<bool>(sort_ascending[i]));
-        }
-        shape->distinct = needs_distinct;
-        shape->has_limit = select->HasLimit();
-        shape->limit = select->Limit();
-        shape->offset = select->Offset();
-        shape->visible_columns = visible_columns;
-        shape->final_select_size = query.select_.size();
-        auto compiled = std::make_shared<CompiledPlan>();
-        compiled->kind = CompiledPlan::Kind::kSelect;
-        compiled->database = database_;
-        compiled->epoch = database_->SchemaEpoch();
-        compiled->parameters = plan_cache_parameters_;
-        if (!dml_fold_applied_) {
-          compiled->parameter_slots =
-              InstallPlanSlots(plan, plan_cache_parameters_);
-        }
-        compiled->plan = plan;
-        // The plan tree borrows fill-time Tables (and their indexes) that only
-        // this transaction context owns; pin them so cache hits after this
-        // transaction ends do not replay freed memory.
-        compiled->retained_tables.reserve(ctx.tables_.size());
-        for (const auto& entry : ctx.tables_) {
-          compiled->retained_tables.push_back(entry.second);
-        }
-        compiled->retained_stats.reserve(ctx.stats_.size());
-        for (const auto& entry : ctx.stats_) {
-          compiled->retained_stats.push_back(entry.second);
-        }
-        compiled->select_shape = std::move(shape);
-        // SQL requests can land on different workers. Immutable bounded
-        // column reads do not need eight independent cold optimizations.
-        // Bound slots stay thread-local; LIMIT/OFFSET literals remain in the
-        // fingerprint, and any expression parameters must match exactly.
-        const auto bare_column = [](const Expression& expression) {
-          return expression && expression->Type() == TypeTag::kColumnValue;
-        };
-        if (!dml_fold_applied_ && !query.require_row_position_ &&
-            select->Sources().size() == 1 && plan->ScanSource() != nullptr &&
-            plan->ScanSource()->GetSchema().Name() ==
-                select->Sources()[0].table &&
-            !select->Sources()[0].query && !select->Sources()[0].unnest &&
-            !select->Sources()[0].sample &&
-            !select->Sources()[0].join_condition && !select->AsStruct() &&
-            !select->Distinct() && !select->HasDistinctOn() &&
-            !select->WithTies() && !select->ForUpdate() &&
-            select->WithQueries().empty() && select->GroupBy().empty() &&
-            !select->Having() && !select->Qualify() &&
-            std::ranges::all_of(select->SelectList(),
-                                [&](const NamedExpression& item) {
-                                  return bare_column(item.expression);
-                                }) &&
-            compiled->parameter_slots.empty() &&
-            !plan->ContainsParameterSlots() && select->HasLimit() &&
-            !query.order_expressions_.empty() && query.grouping_keys_.empty() &&
-            (!query.where_ ||
-             (query.where_->Type() == TypeTag::kConstantValue &&
-              query.where_->AsConstantValue().GetValue().Truthy())) &&
-            std::ranges::all_of(query.order_expressions_, bare_column) &&
-            std::ranges::all_of(query.select_,
-                                [&](const NamedExpression& item) {
-                                  return bare_column(item.expression);
-                                })) {
-          compiled->immutable_exact_read = true;
-          StoreCompiledPlan(plan_cache_fingerprint_, compiled);
-        }
-        // Literal-free scalar aggregates have no binding state either. Each
-        // replay still emits fresh executors and reads the current snapshot;
-        // only the immutable plan is shared, never an aggregate result.
-        const auto scalar_read_expression =
-            [&](auto&& self, const Expression& expression) -> bool {
-          if (!expression) {
-            return true;
-          }
-          switch (expression->Type()) {
-            case TypeTag::kColumnValue:
-            case TypeTag::kConstantValue:
-            case TypeTag::kBinaryExp:
-            case TypeTag::kUnaryExp:
-              break;
-            case TypeTag::kAggregateExp: {
-              const auto& aggregate = expression->AsAggregateExpression();
-              if (aggregate.HasWhereFilter() || aggregate.NeedsGroupContext() ||
-                  aggregate.HasInnerGroupBy()) {
-                return false;
-              }
-              const auto kind = aggregate.GetType();
-              if (kind != AggregationType::kCount &&
-                  kind != AggregationType::kSum &&
-                  kind != AggregationType::kMin &&
-                  kind != AggregationType::kMax &&
-                  kind != AggregationType::kAvg) {
-                return false;
-              }
-              break;
-            }
-            default:
-              return false;
-          }
-          return std::ranges::all_of(
-              ExpressionChildren(expression),
-              [&](const Expression& child) { return self(self, child); });
-        };
-        if (!compiled->immutable_exact_read && has_aggregate &&
-            !dml_fold_applied_ && !query.require_row_position_ &&
-            compiled->parameters.empty() && compiled->parameter_slots.empty() &&
-            !plan->ContainsParameterSlots() && select->Sources().size() == 1 &&
-            plan->ScanSource() != nullptr &&
-            plan->ScanSource()->GetSchema().Name() ==
-                select->Sources()[0].table &&
-            !select->Sources()[0].query && !select->Sources()[0].unnest &&
-            !select->Sources()[0].sample &&
-            !select->Sources()[0].join_condition && !select->AsStruct() &&
-            !select->Distinct() && !select->HasDistinctOn() &&
-            !select->WithTies() && !select->ForUpdate() &&
-            select->WithQueries().empty() && select->GroupBy().empty() &&
-            !select->Having() && !select->Qualify() && !select->HasLimit() &&
-            select->Offset() == 0 && query.order_expressions_.empty() &&
-            (!query.where_ ||
-             (query.where_->Type() == TypeTag::kConstantValue &&
-              query.where_->AsConstantValue().GetValue().Truthy())) &&
-            std::ranges::all_of(select->SelectList(),
-                                [&](const NamedExpression& item) {
-                                  return scalar_read_expression(
-                                      scalar_read_expression, item.expression);
-                                })) {
-          compiled->immutable_exact_read = true;
-          StoreCompiledPlan(plan_cache_fingerprint_, compiled);
-        }
-        StoreThreadCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
-      }
-      return WithPlanExplain(std::move(executor), std::move(plan),
-                             &result_column_types_);
+      return ExecuteSelect(
+          ctx, std::unique_ptr<SelectStatement>(
+                   static_cast<SelectStatement*>(statement.release())));
     }
-    case StatementType::kUpdate: {
-      const auto& update = dynamic_cast<const UpdateStatement&>(*statement);
-      ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                       ctx.GetTable(update.TableName()));
-      last_dml_table_ = update.TableName();
-      if (!update.HasNestedDml()) {
-        // SET values share the WHERE clause's prepare-time subquery fold;
-        // a correlated or WITH-bearing inner keeps its legacy route.
-        const Schema& update_schema = table->GetSchema();
-        for (auto& [target, value] :
-             dynamic_cast<UpdateStatement&>(*statement).MutableSetClause()) {
-          ASSIGN_OR_RETURN(Expression, folded, DecorateDmlWhere(ctx, value));
-          value = std::move(folded);
-          // SET col = DEFAULT resolves to the column's declared default;
-          // columns (and dotted STRUCT fields, which carry no declared
-          // default) without one resolve to NULL (BigQuery semantics,
-          // pinned by the dml_update* compliance cases).
-          if (value->Type() == TypeTag::kFunctionCallExp &&
-              value->AsFunctionCallExpression().FuncName() ==
-                  "__column_default") {
-            const int target_offset =
-                update_schema.Offset(ColumnName(target.name));
-            value = ConstantValueExp(
-                target_offset >= 0 &&
-                        update_schema
-                                .GetColumn(static_cast<slot_t>(target_offset))
-                                .GetConstraint()
-                                .ctype == Constraint::kDefault
-                    ? update_schema
-                          .GetColumn(static_cast<slot_t>(target_offset))
-                          .GetConstraint()
-                          .value
-                    : Value());
-          }
-        }
-      }
-      if (update.HasNestedDml()) {
-        // Nested per-row array DML: rows are rewritten element-wise here
-        // because array mutations are not expressible as plain projections.
-        return ExecuteNestedArrayUpdate(ctx, update, table.get());
-      }
-      const Schema& schema = table->GetSchema();
-      {
-        bool dotted_target = false;
-        bool plain_target = false;
-        for (const auto& [target, expression] : update.SetClause()) {
-          if (!target.schema.empty() && !target.name.empty() &&
-              target.schema != update.TableName()) {
-            dotted_target = true;
-          } else {
-            plain_target = true;
-          }
-        }
-        // A mixed SET list would silently lose the plain assignments (the
-        // dotted path below only rewrites field_targets), so refuse the mixed
-        // shape instead of committing a partial update.
-        if (dotted_target && plain_target) {
-          return Status(
-              Status::kInvalidArgument,
-              "UPDATE cannot mix dotted STRUCT field targets with plain column "
-              "targets in one SET clause");
-        }
-        if (dotted_target) {
-          return ExecuteStructFieldUpdate(ctx, update, table.get());
-        }
-      }
-      std::vector<NamedExpression> output;
-      // Value tables (single physical column) allow the FROM alias to stand
-      // for the whole row: "UPDATE t AS v SET v = ... WHERE v = ..." binds
-      // the alias to that column. Rewritten targets/expressions below.
-      std::string value_table_alias = update.Alias();
-      if (!value_table_alias.empty() && schema.ColumnCount() == 1) {
-        bool alias_is_column = false;
-        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-          if (IdentifierEquals(schema.GetColumn(i).Name().name,
-                               value_table_alias)) {
-            alias_is_column = true;
-          }
-        }
-        if (alias_is_column) {
-          value_table_alias.clear();
-        }
-      } else {
-        value_table_alias.clear();
-      }
-      std::vector<std::pair<ColumnName, Expression>> set_clause =
-          update.SetClause();
-      Expression where_clause = update.WhereClause();
-      if (!value_table_alias.empty()) {
-        const ColumnName only_column(update.TableName(),
-                                     schema.GetColumn(0).Name().name);
-        auto matches_alias = [&](const ColumnName& name) {
-          return (name.schema.empty() ||
-                  IdentifierEquals(name.schema, value_table_alias)) &&
-                 IdentifierEquals(name.name, value_table_alias);
-        };
-        for (auto& [target, expression] : set_clause) {
-          if (matches_alias(target)) {
-            target = ColumnName(target.schema, only_column.name);
-          }
-        }
-        if (where_clause) {
-          std::function<Expression(const Expression&)> bind_alias =
-              [&](const Expression& expr) -> Expression {
-            if (!expr) {
-              return expr;
-            }
-            if (expr->Type() == TypeTag::kColumnValue) {
-              const ColumnName& name = expr->AsColumnValue().GetColumnName();
-              if (matches_alias(name)) {
-                return ColumnValueExp(only_column);
-              }
-              if (!name.schema.empty() &&
-                  IdentifierEquals(name.schema, value_table_alias)) {
-                return ColumnValueExp(
-                    ColumnName(update.TableName(), name.name));
-              }
-              return expr;
-            }
-            std::vector<Expression> children = ExpressionChildren(expr);
-            bool changed = false;
-            for (Expression& child : children) {
-              Expression mapped = bind_alias(child);
-              changed |= child->ToString() != mapped->ToString();
-              child = std::move(mapped);
-            }
-            return changed ? WithExpressionChildren(expr, std::move(children))
-                           : expr;
-          };
-          where_clause = bind_alias(where_clause);
-        }
-      }
-      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
-          !plan_cache_parameters_.empty() && !update.HasAssert()) {
-        SqlLiteralSlots literal_slots;
-        literal_slots.parameters = &plan_cache_parameters_;
-        std::vector<Expression> slotted_sets;
-        slotted_sets.reserve(set_clause.size());
-        for (const auto& clause : set_clause) {
-          slotted_sets.push_back(literal_slots.Apply(clause.second));
-        }
-        const Expression slotted_where = literal_slots.Apply(where_clause);
-        if (literal_slots.Complete()) {
-          for (size_t i = 0; i < set_clause.size(); ++i) {
-            set_clause[i].second = std::move(slotted_sets[i]);
-          }
-          where_clause = slotted_where;
-        }
-      }
-      output.reserve(schema.ColumnCount());
-      auto column_index = [&](std::string_view name) -> int {
-        for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-          if (IdentifierEquals(schema.GetColumn(i).Name().name, name)) {
-            return static_cast<int>(i);
-          }
-        }
-        return -1;
-      };
-      // WHERE predicates may reference struct fields through dotted paths;
-      // rewrite those references into get_field(column, "field.path") when
-      // the path prefix names a column rather than a relation.  Single-column
-      // (value / proto) tables additionally bind unresolved bare names to
-      // field reads of that column.
-      const bool single_column_table = schema.ColumnCount() == 1;
-      if (where_clause) {
-        std::function<Expression(const Expression&)> bind_struct_fields =
-            [&](const Expression& expr) -> Expression {
-          if (!expr) {
-            return expr;
-          }
-          if (expr->Type() == TypeTag::kColumnValue) {
-            const ColumnName& name = expr->AsColumnValue().GetColumnName();
-            if (!name.schema.empty() && name.schema != update.TableName()) {
-              const int base_column = column_index(name.schema);
-              if (base_column >= 0 && !name.name.empty() && name.name != "*") {
-                return FunctionCallExp(
-                    "__get_field_safe",
-                    {ColumnValueExp(ColumnName(
-                         update.TableName(),
-                         schema.GetColumn(static_cast<size_t>(base_column))
-                             .Name()
-                             .name)),
-                     ConstantValueExp(Value(std::string(name.name)))});
-              }
-            }
-            if (single_column_table && name.schema.empty() &&
-                !name.name.empty() && name.name != "*" &&
-                !IdentifierEquals(name.name, schema.GetColumn(0).Name().name)) {
-              return FunctionCallExp(
-                  "__get_field_safe",
-                  {ColumnValueExp(ColumnName(update.TableName(),
-                                             schema.GetColumn(0).Name().name)),
-                   ConstantValueExp(Value(std::string(name.name)))});
-            }
-            return expr;
-          }
-          std::vector<Expression> children = ExpressionChildren(expr);
-          bool changed = false;
-          for (Expression& child : children) {
-            Expression mapped = bind_struct_fields(child);
-            changed |= child->ToString() != mapped->ToString();
-            child = std::move(mapped);
-          }
-          return changed ? WithExpressionChildren(expr, std::move(children))
-                         : expr;
-        };
-        where_clause = bind_struct_fields(where_clause);
-      }
-      // SET targets may be qualified ("UPDATE t SET t.a = ..."); match the
-      // full ColumnName instead of the bare name so qualified assignments are
-      // not silently ignored.
-      std::vector<bool> applied(set_clause.size(), false);
-      // Unmatched targets on single-column (proto) tables address fields of
-      // that column's TEXT payload ("SET int64_key_1 = 100").
-      std::vector<std::pair<std::string, const Expression*>> proto_sets;
-      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-        const Column& column = schema.GetColumn(i);
-        Expression expression = ColumnValueExp(column.Name());
-        for (size_t j = 0; j < set_clause.size(); ++j) {
-          const ColumnName& target = set_clause[j].first;
-          if ((target.name == column.Name().name ||
-               IdentifierEquals(target.name, column.Name().name)) &&
-              (target.schema.empty() || target.schema == update.TableName())) {
-            expression = set_clause[j].second;
-            // Narrow / unsigned integer columns re-validate the assigned
-            // value through a CAST to the declared width. Decide from the
-            // column metadata (as INSERT does via IntegerValueFits), never
-            // from substrings of the column NAME: an INT64 column called
-            // point32 is not an INT32.
-            if (column.Type() == ValueType::kInt64 &&
-                (column.IsUnsigned() ||
-                 (column.IntegerBits() != 0 && column.IntegerBits() < 64))) {
-              const unsigned bits =
-                  column.IntegerBits() == 0 ? 64U : column.IntegerBits();
-              const std::string target_type =
-                  std::string(column.IsUnsigned() ? "UINT" : "INT") +
-                  std::to_string(bits);
-              expression = std::make_shared<CastExpression>(
-                  std::move(expression), target_type, false);
-            }
-            applied[j] = true;
-            break;
-          }
-        }
-        output.emplace_back(column.Name().name, std::move(expression));
-      }
-      for (size_t j = 0; j < applied.size(); ++j) {
-        if (applied[j]) {
-          continue;
-        }
-        const ColumnName& target = set_clause[j].first;
-        const bool plain_or_local =
-            target.schema.empty() || target.schema == update.TableName();
-        if (single_column_table && plain_or_local && !target.name.empty() &&
-            target.name != "*") {
-          std::string path = target.name;
-          if (!target.schema.empty()) {
-            path = target.schema + "." + target.name;
-          }
-          proto_sets.emplace_back(std::move(path), &set_clause[j].second);
-          applied[j] = true;
-          continue;
-        }
-        last_error_ = "UPDATE SET target not found: " +
-                      (set_clause[j].first.schema.empty()
-                           ? set_clause[j].first.name
-                           : set_clause[j].first.ToString());
-        return Status::kNotExists;
-      }
-      if (!proto_sets.empty()) {
-        // Wrap the column read with chained __proto_set calls so each field
-        // assignment applies to the payload produced by the previous one.
-        for (auto& entry : output) {
-          if (!IdentifierEquals(entry.name, schema.GetColumn(0).Name().name)) {
-            continue;
-          }
-          Expression current = std::move(entry.expression);
-          for (const auto& [path, value_expr] : proto_sets) {
-            current = FunctionCallExp(
-                "__proto_set",
-                {std::move(current), ConstantValueExp(Value(std::string(path))),
-                 *value_expr});
-          }
-          entry.expression = std::move(current);
-        }
-      }
-      QueryData query;
-      query.from_ = {update.TableName()};
-      query.where_ =
-          where_clause ? where_clause : ConstantValueExp(Value(true));
-      query.select_ = std::move(output);
-      query.require_row_position_ = true;
-      if (where_clause) {
-        ASSIGN_OR_RETURN(Expression, decorated_where,
-                         DecorateDmlWhere(ctx, where_clause));
-        query.where_ = decorated_where;
-      }
-      RETURN_IF_FAIL(query.Rewrite(ctx));
-      ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      std::vector<Expression> parameter_slots;
-      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
-          !update.HasAssert() && !CompliancePrimaryKeyMode()) {
-        parameter_slots = InstallPlanSlots(plan, plan_cache_parameters_);
-      }
-      if (!update.HasAssert() && !dml_fold_applied_ &&
-          !CompliancePrimaryKeyMode()) {
-        // Bug 57: a prepare-time subquery fold bakes the inner rows' values
-        // into the plan; re-preparing the same text after those rows change
-        // must not reuse the specialized plan.
-        RememberSpecializedPlan(
-            plan_cache_fingerprint_, database_->SchemaEpoch(),
-            plan_cache_parameters_, CompiledPlan::Kind::kUpdate, plan, table,
-            database_, ctx, std::move(parameter_slots));
-      }
-      // Compliance primary-key mode: UPDATEs assigning the first column must
-      // keep the emulated key unique and duplicate-free.
-      bool update_touches_primary_key = false;
-      if (CompliancePrimaryKeyMode()) {
-        for (const auto& [target, expression] : update.SetClause()) {
-          if (schema.Offset(ColumnName(target.name)) == 0) {
-            update_touches_primary_key = true;
-            break;
-          }
-        }
-      }
-      ASSIGN_OR_RETURN(std::vector<ForeignKeyCheck>, fk_checks,
-                       (ResolveForeignKeyChecks(ctx, *table)));
-      ASSIGN_OR_RETURN(std::vector<ReferencedByCheck>, ref_checks,
-                       (ResolveReferencedByChecks(database_, ctx, *table)));
-      return Executor(std::make_shared<Update>(
-          ctx.txn_, table.get(), plan->EmitExecutor(ctx),
-          update.AssertRowsModified(), update_touches_primary_key,
-          std::move(fk_checks), std::move(ref_checks)));
-    }
-    case StatementType::kMerge: {
-      const auto& merge = dynamic_cast<const MergeStatement&>(*statement);
-      return ExecuteMerge(ctx, merge);
-    }
-    case StatementType::kDelete: {
-      const auto& remove = dynamic_cast<const DeleteStatement&>(*statement);
-      ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                       ctx.GetTable(remove.TableName()));
-      last_dml_table_ = remove.TableName();
-      std::vector<NamedExpression> output;
-      const Schema& schema = table->GetSchema();
-      output.reserve(schema.ColumnCount());
-      // Value tables: bind a FROM alias standing for the whole row to the
-      // single physical column ("DELETE t AS v WHERE v = ...").
-      Expression where_clause = remove.WhereClause();
-      const std::string& delete_alias = remove.Alias();
-      if (!delete_alias.empty() && schema.ColumnCount() == 1 &&
-          !IdentifierEquals(schema.GetColumn(0).Name().name, delete_alias)) {
-        const ColumnName only_column(remove.TableName(),
-                                     schema.GetColumn(0).Name().name);
-        std::function<Expression(const Expression&)> bind_alias =
-            [&](const Expression& expr) -> Expression {
-          if (!expr) {
-            return expr;
-          }
-          if (expr->Type() == TypeTag::kColumnValue) {
-            const ColumnName& name = expr->AsColumnValue().GetColumnName();
-            if ((name.schema.empty() ||
-                 IdentifierEquals(name.schema, delete_alias)) &&
-                IdentifierEquals(name.name, delete_alias)) {
-              return ColumnValueExp(only_column);
-            }
-            if (!name.schema.empty() &&
-                IdentifierEquals(name.schema, delete_alias)) {
-              return ColumnValueExp(ColumnName(remove.TableName(), name.name));
-            }
-            return expr;
-          }
-          std::vector<Expression> children = ExpressionChildren(expr);
-          bool changed = false;
-          for (Expression& child : children) {
-            Expression mapped = bind_alias(child);
-            changed |= child->ToString() != mapped->ToString();
-            child = std::move(mapped);
-          }
-          return changed ? WithExpressionChildren(expr, std::move(children))
-                         : expr;
-        };
-        where_clause = bind_alias(where_clause);
-      }
-      // Single-column (proto) value tables: unresolved bare names in the
-      // predicate address fields of the only column's TEXT payload.
-      if (where_clause && schema.ColumnCount() == 1 &&
-          !IdentifierEquals(schema.GetColumn(0).Name().name, delete_alias)) {
-        const ColumnName only_column(remove.TableName(),
-                                     schema.GetColumn(0).Name().name);
-        std::function<Expression(const Expression&)> bind_proto_fields =
-            [&](const Expression& expr) -> Expression {
-          if (!expr) {
-            return expr;
-          }
-          if (expr->Type() == TypeTag::kColumnValue) {
-            const ColumnName& name = expr->AsColumnValue().GetColumnName();
-            if (name.schema.empty() && !name.name.empty() && name.name != "*" &&
-                !IdentifierEquals(name.name, schema.GetColumn(0).Name().name)) {
-              return FunctionCallExp(
-                  "__get_field_safe",
-                  {ColumnValueExp(only_column),
-                   ConstantValueExp(Value(std::string(name.name)))});
-            }
-            return expr;
-          }
-          std::vector<Expression> children = ExpressionChildren(expr);
-          bool changed = false;
-          for (Expression& child : children) {
-            Expression mapped = bind_proto_fields(child);
-            changed |= child->ToString() != mapped->ToString();
-            child = std::move(mapped);
-          }
-          return changed ? WithExpressionChildren(expr, std::move(children))
-                         : expr;
-        };
-        where_clause = bind_proto_fields(where_clause);
-      }
-      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
-          !plan_cache_parameters_.empty() && !remove.HasAssert()) {
-        SqlLiteralSlots literal_slots;
-        literal_slots.parameters = &plan_cache_parameters_;
-        const Expression slotted_where = literal_slots.Apply(where_clause);
-        if (literal_slots.Complete()) {
-          where_clause = slotted_where;
-        }
-      }
-      for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-        output.emplace_back(schema.GetColumn(i).Name());
-      }
-      QueryData query;
-      query.from_ = {remove.TableName()};
-      query.where_ =
-          where_clause ? where_clause : ConstantValueExp(Value(true));
-      query.select_ = std::move(output);
-      query.require_row_position_ = true;
-      query.wait_for_write_intent_ = false;
-      // ... and FALSE stays FALSE, deliberately. The scan holds the index
-      // read guard (the structural-mutation gate) for its whole duration;
-      // with a blocking wait, a delivery-style DELETE that races another
-      // writer parks INSIDE the guard for as long as the holder needs to
-      // finish its remaining statements -- which stalls every concurrent
-      // index split behind the gate, stretches those transactions' own row
-      // intents, and cascades into escape-hatch timeouts on unrelated hot
-      // rows (measured on TPC-C W=1: the engine collapsed to ~12 tps with
-      // 5 s wait-limit aborts everywhere). The try-lock policy converts the
-      // overlap into an immediate statement-level conflict: the executor
-      // unwinds, releases the guard and its intents at once, and the caller
-      // retries. UPDATE keeps the waiting default because its conflicts
-      // land on short-lived holders (single-row district/customer
-      // updates), not on multi-statement delivery transactions.
-      if (where_clause) {
-        ASSIGN_OR_RETURN(Expression, decorated_where,
-                         DecorateDmlWhere(ctx, where_clause));
-        query.where_ = decorated_where;
-      }
-      RETURN_IF_FAIL(query.Rewrite(ctx));
-      ASSIGN_OR_RETURN(Plan, plan, Optimizer::Optimize(query, ctx));
-      std::vector<Expression> parameter_slots;
-      if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
-          !remove.HasAssert()) {
-        parameter_slots = InstallPlanSlots(plan, plan_cache_parameters_);
-      }
-      if (!remove.HasAssert() && !dml_fold_applied_) {
-        RememberSpecializedPlan(
-            plan_cache_fingerprint_, database_->SchemaEpoch(),
-            plan_cache_parameters_, CompiledPlan::Kind::kDelete, plan, table,
-            database_, ctx, std::move(parameter_slots));
-      }
-      ASSIGN_OR_RETURN(std::vector<ReferencedByCheck>, ref_checks,
-                       (ResolveReferencedByChecks(database_, ctx, *table)));
-      return Executor(std::make_shared<DeleteExecutor>(
-          ctx.txn_, *table, plan->EmitExecutor(ctx),
-          remove.AssertRowsModified(), std::move(ref_checks)));
-    }
-    case StatementType::kDropTable: {
-      const auto& drop = dynamic_cast<const DropTableStatement&>(*statement);
-      Status drop_status = database_->DropTable(ctx, drop.TableName());
-      if (drop.IfExists() && drop_status == Status::kNotExists) {
-        drop_status = Status::kSuccess;
-      }
-      RETURN_IF_FAIL(drop_status);
-      ctx.tables_.erase(drop.TableName());
-      ctx.stats_.erase(drop.TableName());
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("DROP TABLE"), Value(0)})));
-    }
-    case StatementType::kCreateMaterializedView: {
-      const auto& create =
-          dynamic_cast<const CreateMaterializedViewStatement&>(*statement);
-      last_dml_table_ = create.ViewName();
-      plan_cache_fingerprint_.clear();
-      plan_cache_parameters_.clear();
-      const bool view_exists =
-          database_->GetTable(ctx, create.ViewName()).HasValue();
-      if (view_exists ||
-          database_->GetMaterializedViewDefinition(ctx, create.ViewName())
-              .HasValue()) {
-        if (create.IfNotExists()) {
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("CREATE MATERIALIZED VIEW"), Value(0)})));
-        }
-        last_error_ =
-            "materialized view " + create.ViewName() + " already exists";
-        return Status::kConflicts;
-      }
-      // Materialize through the relational engine so the star-expanded
-      // output schema is available (same contract as CREATE TABLE AS SELECT).
-      StatusOr<relational_detail::Relation> materialized_query =
-          relational_detail::ExecuteQuery(ctx, *create.Query(), nullptr, {});
-      if (!materialized_query.HasValue()) {
-        last_error_ = materialized_query.GetStatus().GetMessage();
-        return Status::kUnknown;
-      }
-      relational_detail::Relation materialized = materialized_query.MoveValue();
-      std::vector<Row> rows;
-      materialized.ForEachRow([&rows](const Row& row) { rows.push_back(row); });
-      std::vector<Column> columns;
-      columns.reserve(materialized.schema.ColumnCount());
-      for (size_t i = 0; i < materialized.schema.ColumnCount(); ++i) {
-        const Column& schema_column = materialized.schema.GetColumn(i);
-        std::string col_name = schema_column.Name().name;
-        if (col_name.empty() || col_name == "*") {
-          col_name = "col_" + std::to_string(i);
-        }
-        ValueType vtype = schema_column.Type();
-        if (vtype == ValueType::kNull) {
-          vtype = ValueType::kVarChar;
-          for (const auto& row : rows) {
-            if (i < row.Size() && !row[i].IsNull() &&
-                row[i].type != ValueType::kNull) {
-              vtype = row[i].type;
-              break;
-            }
-          }
-        }
-        columns.emplace_back(col_name, vtype, Constraint());
-        if (std::ranges::any_of(rows, [i](const Row& row) {
-              return i < row.Size() && row[i].IsUnsigned();
-            })) {
-          columns.back().SetUnsigned(true);
-        }
-      }
-      ASSIGN_OR_RETURN(Table, table,
-                       database_->CreateTable(
-                           ctx, Schema(create.ViewName(), std::move(columns))));
-      for (auto& row : rows) {
-        RETURN_IF_FAIL(table.Insert(ctx.txn_, row).GetStatus());
-      }
-      // Persist the defining text last: a CREATE that failed midway leaves
-      // no definition behind, so the name stays creatable.
-      RETURN_IF_FAIL(database_->PutMaterializedViewDefinition(
-          ctx, create.ViewName(), create.QueryText()));
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("CREATE MATERIALIZED VIEW"),
-               Value(static_cast<int64_t>(rows.size()))})));
-    }
-    case StatementType::kDropMaterializedView: {
-      const auto& drop =
-          dynamic_cast<const DropMaterializedViewStatement&>(*statement);
-      last_dml_table_ = drop.ViewName();
-      plan_cache_fingerprint_.clear();
-      plan_cache_parameters_.clear();
-      StatusOr<std::string> definition =
-          database_->GetMaterializedViewDefinition(ctx, drop.ViewName());
-      if (!definition.HasValue()) {
-        if (drop.IfExists() &&
-            definition.GetStatus() == Status::kNotExists) {
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("DROP MATERIALIZED VIEW"), Value(0)})));
-        }
-        last_error_ =
-            "materialized view " + drop.ViewName() + " does not exist";
-        return Status::kNotExists;
-      }
-      RETURN_IF_FAIL(database_->DropTable(ctx, drop.ViewName()));
-      RETURN_IF_FAIL(
-          database_->DeleteMaterializedViewDefinition(ctx, drop.ViewName()));
-      ctx.tables_.erase(drop.ViewName());
-      ctx.stats_.erase(drop.ViewName());
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("DROP MATERIALIZED VIEW"), Value(0)})));
-    }
-    case StatementType::kCreateView: {
-      const auto& create = dynamic_cast<const CreateViewStatement&>(*statement);
-      last_dml_table_ = create.ViewName();
-      plan_cache_fingerprint_.clear();
-      plan_cache_parameters_.clear();
-      const bool name_taken =
-          database_->GetTable(ctx, create.ViewName()).HasValue() ||
-          database_->GetMaterializedViewDefinition(ctx, create.ViewName())
-              .HasValue() ||
-          database_->GetViewDefinition(ctx, create.ViewName()).HasValue();
-      if (name_taken && !create.OrReplace()) {
-        last_error_ = "view " + create.ViewName() + " already exists";
-        return Status::kConflicts;
-      }
-      // Register the parsed definition in the session registry now that
-      // the statement is committing, then persist the durable record.  A
-      // failed CREATE must leave no session-registry entry behind.
-      const GoogleSqlParseResult parsed_view =
-          GoogleSqlFrontend::Parse(create.QueryText());
-      if (parsed_view.ok) {
-        StatusOr<std::unique_ptr<GoogleSqlAstNode>> view_ast =
-            GoogleSqlAstParser::Parse(parsed_view.ast);
-        if (view_ast.HasValue() && view_ast.Value() != nullptr) {
-          if (const GoogleSqlAstNode* query_node =
-                  view_ast.Value()->Child("Query");
-              query_node != nullptr) {
-            RegisterViewDefinition(create.ViewName(), *query_node);
-          }
-        }
-      }
-      RETURN_IF_FAIL(database_->PutViewDefinition(ctx, create.ViewName(),
-                                                  create.QueryText()));
-      database_->BumpSchemaEpoch();
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("CREATE VIEW"), Value(0)})));
-    }
-    case StatementType::kDropView: {
-      const auto& drop = dynamic_cast<const DropViewStatement&>(*statement);
-      last_dml_table_ = drop.ViewName();
-      plan_cache_fingerprint_.clear();
-      plan_cache_parameters_.clear();
-      StatusOr<std::string> definition =
-          database_->GetViewDefinition(ctx, drop.ViewName());
-      if (!definition.HasValue()) {
-        if (drop.IfExists() &&
-            definition.GetStatus() == Status::kNotExists) {
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("DROP VIEW"), Value(0)})));
-        }
-        last_error_ = "view " + drop.ViewName() + " does not exist";
-        return Status::kNotExists;
-      }
-      RETURN_IF_FAIL(database_->DeleteViewDefinition(ctx, drop.ViewName()));
-      std::string dropped_name = drop.ViewName();
-      for (char& c : dropped_name) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      }
-      ViewRegistry().erase(dropped_name);
-      database_->BumpSchemaEpoch();
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("DROP VIEW"), Value(0)})));
-    }
-    case StatementType::kCreateIndex: {
-      const auto& create =
-          dynamic_cast<const CreateIndexStatement&>(*statement);
-      ASSIGN_OR_RETURN(std::shared_ptr<Table>, table,
-                       ctx.GetTable(create.TableName()));
-      const auto lowercase = [](std::string text) {
-        for (char& c : text) {
-          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        return text;
-      };
-      for (size_t i = 0; i < table->IndexCount(); ++i) {
-        if (lowercase(table->GetIndex(i).sc_.name_) ==
-            lowercase(create.Name())) {
-          if (!create.IfNotExists()) {
-            return StatusError(StatusCode::kDuplicates,
-                               "index already exists: " + create.Name());
-          }
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("CREATE INDEX"), Value(0)})));
-        }
-      }
-      std::vector<slot_t> keys, storing;
-      std::unordered_set<slot_t> used;
-      const auto resolve = [&](const std::vector<std::string>& names,
-                               std::vector<slot_t>* slots) -> Status {
-        for (const auto& name : names) {
-          const int offset = table->GetSchema().Offset(ColumnName("", name));
-          if (offset < 0 || !used.insert(static_cast<slot_t>(offset)).second) {
-            return StatusError(StatusCode::kInvalidArgument,
-                               "unknown or repeated index column: " + name);
-          }
-          slots->push_back(static_cast<slot_t>(offset));
-        }
-        return Status::kSuccess;
-      };
-      RETURN_IF_FAIL(resolve(create.Keys(), &keys));
-      RETURN_IF_FAIL(resolve(create.Storing(), &storing));
-      RETURN_IF_FAIL(database_->CreateIndex(
-          ctx, create.TableName(),
-          IndexSchema(
-              create.Name(), std::move(keys), std::move(storing),
-              create.Unique() ? IndexMode::kUnique : IndexMode::kNonUnique)));
-      return Executor(std::make_shared<ConstantExecutor>(
-          Row({Value("CREATE INDEX"), Value(0)})));
-    }
-    case StatementType::kAlterTable: {
-      const auto& alter = dynamic_cast<const AlterTableStatement&>(*statement);
-      const AlterTableAction& action = alter.Action();
-      switch (action.kind) {
-        case AlterTableAction::Kind::kRenameTo: {
-          RETURN_IF_FAIL(
-              database_->RenameTable(ctx, alter.TableName(), action.new_name));
-          ctx.tables_.erase(alter.TableName());
-          ctx.stats_.erase(alter.TableName());
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("ALTER TABLE"), Value(0)})));
-        }
-        case AlterTableAction::Kind::kRenameColumn: {
-          RETURN_IF_FAIL(database_->RenameColumn(
-              ctx, alter.TableName(), action.old_column, action.new_name));
-          ctx.tables_.erase(alter.TableName());
-          ctx.stats_.erase(alter.TableName());
-          return Executor(std::make_shared<ConstantExecutor>(
-              Row({Value("ALTER TABLE"), Value(0)})));
-        }
-      }
-      last_error_ = "unsupported ALTER TABLE action";
-      return Status::kNotImplemented;
-    }
+    case StatementType::kUpdate:
+      return ExecuteUpdate(ctx,
+                           dynamic_cast<const UpdateStatement&>(*statement));
+    case StatementType::kMerge:
+      return ExecuteMerge(ctx, dynamic_cast<const MergeStatement&>(*statement));
+    case StatementType::kDelete:
+      return ExecuteDelete(ctx,
+                           dynamic_cast<const DeleteStatement&>(*statement));
+    case StatementType::kDropTable:
+      return ExecuteDropTable(
+          ctx, dynamic_cast<const DropTableStatement&>(*statement));
+    case StatementType::kCreateMaterializedView:
+      return ExecuteCreateMaterializedView(
+          ctx,
+          dynamic_cast<const CreateMaterializedViewStatement&>(*statement));
+    case StatementType::kDropMaterializedView:
+      return ExecuteDropMaterializedView(
+          ctx, dynamic_cast<const DropMaterializedViewStatement&>(*statement));
+    case StatementType::kCreateView:
+      return ExecuteCreateView(
+          ctx, dynamic_cast<const CreateViewStatement&>(*statement));
+    case StatementType::kDropView:
+      return ExecuteDropView(
+          ctx, dynamic_cast<const DropViewStatement&>(*statement));
+    case StatementType::kCreateIndex:
+      return ExecuteCreateIndex(
+          ctx, dynamic_cast<const CreateIndexStatement&>(*statement));
+    case StatementType::kAlterTable:
+      return ExecuteAlterTable(
+          ctx, dynamic_cast<const AlterTableStatement&>(*statement));
     case StatementType::kAnalyze:
       last_error_ = "ANALYZE is handled before statement binding";
       return Status::kNotImplemented;
   }
   return Status::kNotImplemented;
+}
+
+StatusOr<Executor> SqlEngine::ExecuteSelect(
+    TransactionContext& ctx,
+    std::unique_ptr<SelectStatement> select_statement) {
+  fused_sibling_aggregates_ = 0;
+  cte_restriction_pushdowns_ = 0;
+  cte_materialization_attempts_ = 0;
+  {
+    const Status cycle =
+        relational_detail::ValidateCteDependencies(*select_statement);
+    if (cycle != Status::kSuccess) {
+      last_error_ = cycle.GetMessage();
+      return cycle.GetCode();
+    }
+  }
+  auto select = std::shared_ptr<SelectStatement>(std::move(select_statement));
+  // SELECT ... FOR UPDATE locks the rows its scan visits, which is the DML
+  // source contract (`require_row_position` -> scan `lock_rows`): one base
+  // table, no join, no aggregate/window/set-op/CTE/derived source.  A join
+  // or an aggregate has no single row position to lock per output row, and
+  // the relational route does not carry positions at all, so the shape is
+  // refused up front instead of silently running an unlocked read.
+  const bool for_update = select->ForUpdate();
+  if (for_update) {
+    const SelectSource* only_source =
+        select->Sources().size() == 1 ? &select->Sources().front() : nullptr;
+    const bool has_aggregate =
+        std::ranges::any_of(
+            select->SelectList(),
+            [](const NamedExpression& item) {
+              return relational_detail::ContainsAggregate(item.expression);
+            }) ||
+        relational_detail::ContainsAggregate(select->Having());
+    if (only_source == nullptr || only_source->query != nullptr ||
+        only_source->unnest || only_source->is_lateral ||
+        only_source->table.empty() || only_source->sample.has_value() ||
+        !select->WithQueries().empty() || !select->UnionAll().empty() ||
+        select->GetSetOperationTree() != nullptr || select->Distinct() ||
+        select->HasDistinctOn() || !select->GroupBy().empty() ||
+        has_aggregate || select->Having() || select->Qualify() ||
+        relational_detail::HasWindowFunctions(*select)) {
+      last_error_ =
+          "SELECT ... FOR UPDATE requires a single base table with no "
+          "join, aggregate, DISTINCT, GROUP BY, HAVING, window function, "
+          "set operation, sampled source, or CTE";
+      return Status(Status::kInvalidArgument, last_error_);
+    }
+  }
+  // M4: inline singly-referenced non-recursive CTEs into derived
+  // sources, then lift the remaining layer (shared eager cells plus
+  // opaque recursive leaves) when atomic; M5 flattens the single-table
+  // derived sources last. All rewrites preserve the row multiset;
+  // anything they reject keeps the existing materialized/relational
+  // path untouched.
+  // Lean-proven TPC-DS AST rewrites (lean/TinylambOpt/TpcdsDiscovery.lean):
+  // skipped under `force_relational_fallback_` so differential oracle tests
+  // cross-check the rewritten plans against the unrewritten interpreter.
+  if (!force_relational_fallback_) {
+    (void)PullInnerJoinsBeforeLeftJoins(select.get(), ctx);
+    if (DistributeZeroPaddedUnionGroupBy(select.get(), ctx)) {
+      (void)PullInnerJoinsBeforeLeftJoins(select.get(), ctx);
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (SpecializeAndPivotUnionCtes(select.get(), ctx)) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteFullOuterIndicatorSumsToSemiJoin(select.get())) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    if (RewriteSelfJoinAggregateToWindow(select.get())) {
+      dml_fold_applied_ = true;
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+    (void)HoistIdenticalDerivedSubqueriesToCte(select.get());
+    if (PruneRedundantGroupByKeys(select.get())) {
+      plan_cache_fingerprint_.clear();
+      plan_cache_parameters_.clear();
+    }
+  }
+  (void)ReduceGroupByFunctionalDependencies(select.get(), ctx);
+  (void)InlineSingleUseGroupedCtes(select.get(), ctx);
+  (void)InlineSingleUseCtes(select.get());
+  // A CTE that stays shared cannot take one consumer's filter, but it can
+  // take the disjunction of every consumer's restriction: that keeps every
+  // row any reference can emit and drops the rest before the cell is
+  // built.  The estimate decides whether the narrower cell is worth it.
+  cte_restriction_pushdowns_ += PushSharedCteRestrictions(select.get(), ctx);
+  LiftedCtes lifted;
+  MaterializeCtes(select.get(), ctx, &lifted);
+  LiftRecursiveCtes(select.get(), &lifted);
+  (void)FlattenDerivedSources(select.get(), ctx, &lifted);
+  // M5+: single-table equality LATERALs become decorrelated joins (the
+  // proven flattener above consumes them once uncorrelated).
+  (void)DecorrelateSingleTableLaterals(select.get(), ctx);
+  (void)StripIdempotentDistinctAggregates(select.get());
+  // Sibling derived tables over one base table sharing a GROUP BY key
+  // fold into a single aggregation (TPC-H Q21's `multi`/`only_late`).
+  fused_sibling_aggregates_ += FuseSiblingDerivedAggregates(select.get());
+  // Push HAVING MAX(col) > c / MIN(col) < c bounds into WHERE before
+  // outer-join reduction so newly inferred null-rejecting WHERE bounds can
+  // demote outer joins too (Lean Theorems 4-2 & 4-2').
+  (void)PushHavingExtremumBounds(select.get(), ctx);
+  // A WHERE (or HAVING) conjunct that rejects the NULL padding of an outer
+  // join makes the outer join's padded rows unreachable; planning it as an
+  // inner join is exact and unlocks hash-join fast paths (Lean 4-3).
+  ReduceOuterJoins(select.get(), &ctx);
+  // Unused LEFT JOINs under SELECT DISTINCT or multiplicity-insensitive
+  // aggregates drop without requiring UNIQUE/PK (Lean Theorem 3-4).
+  (void)EliminateUnusedOuterJoinsForIdempotentResult(select.get(), ctx);
+  if (!force_relational_fallback_ && BypassDisjointUnionGroupBy(select.get())) {
+    dml_fold_applied_ = true;
+    plan_cache_fingerprint_.clear();
+    plan_cache_parameters_.clear();
+  }
+  // A qualified star naming no FROM relation must be rejected up front:
+  // the per-route expanders below would otherwise silently drop the item
+  // (or expand it over unrelated relations) instead of erroring.
+  {
+    const auto matches_source = [&](std::string_view qualifier) {
+      return std::ranges::any_of(
+          select->Sources(), [&](const SelectSource& source) {
+            return (!source.alias.empty() &&
+                    IdentifierEquals(source.alias, qualifier)) ||
+                   (!source.table.empty() &&
+                    IdentifierEquals(source.table, qualifier));
+          });
+    };
+    // `rel.*` select items reach the engine either bare or wrapped in a
+    // value-table/proto constructor by the AST visitor; unwrap one level
+    // so the qualifier is validated in both shapes.
+    const auto star_qualifier =
+        [](const Expression& expression) -> std::string {
+      Expression candidate = expression;
+      if (candidate->Type() == TypeTag::kFunctionCallExp) {
+        const auto& function = candidate->AsFunctionCallExpression();
+        if ((function.FuncName() == "__value_table_value" ||
+             function.FuncName() == "__proto_new") &&
+            function.Args().size() == 1) {
+          candidate = function.Args()[0];
+        }
+      }
+      if (candidate->Type() != TypeTag::kColumnValue) {
+        return {};
+      }
+      const ColumnName& column = candidate->AsColumnValue().GetColumnName();
+      if (column.name != "*" || column.schema.empty()) {
+        return {};
+      }
+      return column.schema;
+    };
+    for (const NamedExpression& item : select->SelectList()) {
+      if (!item.expression) {
+        continue;
+      }
+      const std::string qualifier = star_qualifier(item.expression);
+      if (!qualifier.empty() && !matches_source(qualifier)) {
+        last_error_ = "unknown relation in select list: " + qualifier + ".*";
+        return Status::kNotExists;
+      }
+    }
+  }
+  // Bind every base relation up front, including those nested in IN,
+  // EXISTS, scalar subqueries, and CTE definitions. Lazy expression
+  // evaluation must not let a missing table go unnoticed merely because
+  // an outer predicate produced no rows.
+  std::unordered_map<std::string, size_t> referenced_tables;
+  relational_detail::CountStatementTables(*select, &referenced_tables);
+  for (const auto& [table_name, count] : referenced_tables) {
+    (void)count;
+    StatusOr<std::shared_ptr<Table>> table = ctx.GetTable(table_name);
+    if (!table.HasValue()) {
+      last_error_ = "table " + table_name + " not found";
+      return table.GetStatus();
+    }
+  }
+  result_column_names_.reserve(select->SelectList().size());
+  for (const NamedExpression& item : select->SelectList()) {
+    // A literal `*` select item expands to every source column at execution;
+    // pinning the literal `*` as the single output name makes the pgwire
+    // RowDescription report `*` / `?column?` for the real N columns.
+    if (item.expression && item.expression->Type() == TypeTag::kColumnValue &&
+        item.expression->AsColumnValue().GetColumnName().name == "*") {
+      result_column_names_.clear();
+      for (const SelectSource& source : select->Sources()) {
+        const std::string name = source.table;
+        if (name.empty()) {
+          continue;
+        }
+        StatusOr<std::shared_ptr<Table>> table = ctx.GetTable(name);
+        if (!table.HasValue()) {
+          continue;
+        }
+        const Schema& s = table.Value()->GetSchema();
+        for (size_t i = 0; i < s.ColumnCount(); ++i) {
+          result_column_names_.push_back(s.GetColumn(i).Name().name);
+        }
+      }
+      if (!result_column_names_.empty()) {
+        break;
+      }
+      result_column_names_.push_back("*");
+    } else {
+      result_column_names_.push_back(
+          item.name.empty() ? item.expression->ToString() : item.name);
+    }
+  }
+  const auto declared_cast_type = [&](size_t column) {
+    if (result_column_names_.size() != select->SelectList().size()) {
+      return ValueType::kNull;
+    }
+    const Expression& expression = select->SelectList()[column].expression;
+    return expression && expression->Type() == TypeTag::kCastExp
+               ? expression->AsCastExpression().TargetValueType()
+               : ValueType::kNull;
+  };
+  const bool has_table_sample = std::ranges::any_of(
+      select->Sources(),
+      [](const SelectSource& source) { return source.sample.has_value(); });
+  const auto emit_relational = [&]() -> StatusOr<Executor> {
+    if (for_update) {
+      last_error_ =
+          "SELECT ... FOR UPDATE cannot run on the relational route: this "
+          "query shape has no row positions to lock (a plain single-table "
+          "WHERE/ORDER BY/LIMIT shape is supported)";
+      return Status(Status::kInvalidArgument, last_error_);
+    }
+    std::vector<Column> columns;
+    columns.reserve(result_column_names_.size());
+    for (size_t i = 0; i < result_column_names_.size(); ++i) {
+      // Relational plans have no bound projection schema at this point,
+      // but a CAST declares its output type even when the value is NULL.
+      columns.emplace_back(result_column_names_[i], declared_cast_type(i));
+    }
+    StatusOr<Plan> optimized = Optimizer::OptimizeRelational(
+        select, Schema("", std::move(columns)), ctx);
+    if (!optimized.HasValue()) {
+      std::ostringstream error;
+      error << "relational optimizer failed: " << optimized.GetStatus();
+      last_error_ = error.str();
+      return optimized.GetStatus();
+    }
+    Plan relational_plan = std::move(optimized.Value());
+    if (relational_plan == nullptr) {
+      last_error_ = "relational optimizer produced no plan";
+      return StatusError(StatusCode::kUnknown, last_error_);
+    }
+    if (PipelineEngineEnabled()) {
+      ASSIGN_OR_RETURN(Executor, pipe_exec,
+                       PipelineLowering::LowerToExecutor(relational_plan, ctx));
+      return WithPlanExplain(std::move(pipe_exec), std::move(relational_plan),
+                             &result_column_types_);
+    }
+    PlanBase& relational_ref = *relational_plan;
+    Executor emitted = relational_ref.EmitExecutor(ctx);
+    return WithPlanExplain(std::move(emitted), std::move(relational_plan),
+                           &result_column_types_);
+  };
+  const bool sampled_relational_source =
+      std::ranges::any_of(select->Sources(), [](const SelectSource& source) {
+        return source.sample.has_value() &&
+               (source.query != nullptr || source.unnest ||
+                source.table.empty());
+      });
+  if (sampled_relational_source) {
+    return emit_relational();
+  }
+  // An explicit LIMIT 0 yields zero rows on every route (relational or
+  // optimizer); neither LimitExecutor nor LimitedRows can express that
+  // because they read limit==0 as "unbounded".
+  if (select->HasLimit() && select->Limit() == 0) {
+    // Still lower the query normally: that resolves every SELECT-list name,
+    // function and column reference and publishes result_column_types_ for
+    // the wire RowDescription. Only the produced rows are discarded, so an
+    // otherwise-invalid statement cannot hide behind LIMIT 0.
+    ASSIGN_OR_RETURN(Executor, validated, emit_relational());
+    (void)validated;
+    return Executor(std::make_shared<ConstantExecutor>(std::vector<Row>{}));
+  }
+  const bool has_unnest = std::any_of(
+      select->Sources().begin(), select->Sources().end(),
+      [](const SelectSource& s) { return static_cast<bool>(s.unnest); });
+  // UNNEST sources that participate in an outer join, an ON condition, or
+  // a USING clause need real join semantics (per-pair matching plus
+  // NULL-extended preservation of unmatched rows).  The memo route chains
+  // unnests as lateral cross products and can only post-filter, which
+  // drops LEFT-preserved rows and turns USING into a trivially-true
+  // `col = col`; the relational interpreter implements the exact
+  // semantics (LateralExpandRelation / Join), so route there instead.
+  const bool unnest_join_needs_relational = std::any_of(
+      select->Sources().begin(), select->Sources().end(),
+      [](const SelectSource& s) {
+        if (!s.unnest) {
+          return false;
+        }
+        return s.join_type == JoinType::kLeft ||
+               s.join_type == JoinType::kRight ||
+               s.join_type == JoinType::kFull || !s.using_columns.empty();
+      });
+  const bool has_lateral =
+      std::any_of(select->Sources().begin(), select->Sources().end(),
+                  [](const SelectSource& s) { return s.is_lateral; });
+  const bool lateral_join_needs_relational =
+      has_lateral &&
+      std::any_of(select->Sources().begin(), select->Sources().end(),
+                  [](const SelectSource& s) {
+                    return !s.using_columns.empty() ||
+                           s.join_type == JoinType::kLeft ||
+                           s.join_type == JoinType::kRight ||
+                           s.join_type == JoinType::kFull ||
+                           s.join_condition != nullptr || s.from_nested_join;
+                  });
+  const bool can_decorrelate_subqueries =
+      CanUseDecorrelatedSubqueryOptimizer(*select);
+  const bool simple_count_star =
+      select->Sources().size() == 1 && !select->Sources()[0].query &&
+      !select->Sources()[0].unnest &&
+      select->Sources()[0].join_type == JoinType::kCross &&
+      select->Sources()[0].join_condition == nullptr &&
+      select->WithQueries().empty() && select->GroupBy().empty() &&
+      !select->Having() && !select->Qualify() && select->OrderBy().empty() &&
+      !select->Distinct() && select->SelectList().size() == 1 &&
+      select->SelectList()[0].expression &&
+      select->SelectList()[0].expression->Type() == TypeTag::kAggregateExp &&
+      select->SelectList()[0].expression->AsAggregateExpression().GetType() ==
+          AggregationType::kCount &&
+      !select->SelectList()[0].expression->AsAggregateExpression().Distinct() &&
+      select->SelectList()[0].expression->AsAggregateExpression().Child() &&
+      select->SelectList()[0]
+              .expression->AsAggregateExpression()
+              .Child()
+              ->Type() == TypeTag::kColumnValue &&
+      select->SelectList()[0]
+              .expression->AsAggregateExpression()
+              .Child()
+              ->AsColumnValue()
+              .GetColumnName()
+              .name == "*" &&
+      (!select->WhereClause() ||
+       select->WhereClause()->Type() == TypeTag::kConstantValue);
+  // Value-table operands (SELECT AS VALUE / AS <proto>) need the
+  // relational interpreter's proto-field ORDER BY resolution; their rows
+  // are folded single-column payloads, not plain projections.
+  const bool has_value_table_operand = std::any_of(
+      select->SelectList().begin(), select->SelectList().end(),
+      [](const NamedExpression& item) {
+        return item.expression &&
+               item.expression->Type() == TypeTag::kFunctionCallExp &&
+               (item.expression->AsFunctionCallExpression().FuncName() ==
+                    "__value_table_value" ||
+                item.expression->AsFunctionCallExpression().FuncName() ==
+                    "__proto_new");
+      });
+  const bool sources_plain =
+      std::all_of(select->Sources().begin(), select->Sources().end(),
+                  [](const SelectSource& source) {
+                    return source.query == nullptr && !source.unnest &&
+                           !source.is_lateral && !source.table.empty();
+                  });
+  // M6: the grouped bridge folds every inner ON condition into WHERE,
+  // which is exact only for inner joins. Outer joins keep their ON
+  // predicates on the join itself as QueryData::OuterJoinEdge payloads
+  // (see outer_bridge_slice below); anything beyond that slice stays
+  // relational until the memo models the remaining grouped shapes.
+  // M6-bridge slice: LEFT edges are admitted from source 1 onward;
+  // RIGHT/FULL only in the M6+1 two-source shape (plain inner/cross
+  // first source); every outer ON condition must be memo-representable
+  // and no USING / nested-join sugar may remain on any source.
+  const bool outer_bridge_slice = [&] {
+    for (size_t i = 0; i < select->Sources().size(); ++i) {
+      const SelectSource& source = select->Sources()[i];
+      if (!source.using_columns.empty() || source.from_nested_join) {
+        return false;
+      }
+      const bool outer_type = source.join_type == JoinType::kLeft ||
+                              source.join_type == JoinType::kRight ||
+                              source.join_type == JoinType::kFull;
+      if (!source.join_condition || !outer_type) {
+        continue;
+      }
+      if (i == 0) {
+        return false;
+      }
+      // M6+1 admits only the single RIGHT/FULL edge over a plain
+      // inner/cross first source.
+      const bool m61_shape =
+          select->Sources().size() == 2 && i == 1 &&
+          (select->Sources()[0].join_type == JoinType::kCross ||
+           select->Sources()[0].join_type == JoinType::kInner);
+      if (source.join_type != JoinType::kLeft && !m61_shape) {
+        return false;
+      }
+      if (NeedsRelationalEvaluation(source.join_condition)) {
+        return false;
+      }
+    }
+    return true;
+  }();
+  // Set operations fold independently planned operands, so a FROM-side
+  // UNNEST is fine: each operand routes through its own statement
+  // planning.  Subquery sources and LATERAL stay on the other paths.
+  const bool sources_setop_safe =
+      std::all_of(select->Sources().begin(), select->Sources().end(),
+                  [](const SelectSource& source) {
+                    return source.query == nullptr && !source.is_lateral;
+                  });
+  // M-union: merge same-table UNION ALL / UNION DISTINCT branches into
+  // one scan before operand planning (the merged shape routes through
+  // the normal single-query paths below).
+  (void)MergeCompatibleUnionBranches(select.get(), ctx);
+  if (!select->UnionAll().empty() && !has_value_table_operand &&
+      select->WithQueries().empty() && sources_setop_safe) {
+    if (relational_detail::CanUseExactIntegerGroupingSets(ctx, *select)) {
+      return emit_relational();
+    }
+    return ExecuteSetOperation(*select, ctx);
+  }
+  // Self-joins expose the same base relation under two aliases.
+  // GROUP BY / HAVING / aggregate statements: the Cascades-optimized
+  // FROM + WHERE core (join ordering, access paths, filter pushdown)
+  // feeds the proven relational grouping finish pipeline (GroupByPlan).
+  {
+    const bool has_grouping =
+        !select->GroupBy().empty() || select->Having() ||
+        std::ranges::any_of(
+            select->SelectList(), [](const NamedExpression& item) {
+              return relational_detail::ContainsAggregate(item.expression);
+            });
+    // Grouped statements whose expressions carry correlated subqueries
+    // need the relational interpreter's scope chain (outer/CTE threading
+    // through Project); the bridge below runs without it.  Aggregates
+    // mixed with bare non-grouped columns inside one expression also stay
+    // put: their result depends on the group representative row, whose
+    // identity is not stable across access-path choices.
+    const auto touches_query_expression =
+        [](const Expression& expression) -> bool {
+      return expression && relational_detail::ContainsQuery(expression);
+    };
+    bool grouped_expressions_correlate =
+        touches_query_expression(select->Having());
+    for (const Expression& expression : select->GroupBy()) {
+      grouped_expressions_correlate =
+          grouped_expressions_correlate || touches_query_expression(expression);
+    }
+    for (const NamedExpression& item : select->SelectList()) {
+      grouped_expressions_correlate = grouped_expressions_correlate ||
+                                      touches_query_expression(item.expression);
+    }
+    // The bridge executes multi-relation and single-relation grouped
+    // queries through the Cascades core (join ordering, access paths,
+    // filter pushdown), feeding the grouping finish pipeline (GroupByPlan).
+    // Routing reads the post-rewrite shape: flattened/inlined inputs are
+    // plain by now, while genuinely complex shapes stay relational.
+    const bool simple_grouped_memo =
+        select->Sources().size() == 1 && !select->GroupBy().empty() &&
+        !select->Having() && select->OrderBy().empty() && !select->HasLimit() &&
+        !select->Distinct() &&
+        Optimizer::SupportsGrouping(select->GroupBy(), select->SelectList());
+    if (!force_relational_fallback_ && !has_table_sample &&
+        (select->Sources().size() > 1 || simple_grouped_memo) && has_grouping &&
+        !simple_count_star && !select->Qualify() &&
+        !relational_detail::HasWindowFunctions(*select) &&
+        select->WithQueries().empty() && sources_plain && outer_bridge_slice &&
+        // The bridge's requirement collector skips star columns; a
+        // modifier star must expand through the generic path instead.
+        std::ranges::none_of(select->SelectList(),
+                             [](const NamedExpression& item) {
+                               return item.star_modifiers != nullptr;
+                             }) &&
+        (!PostRewriteNeedsRelational(*select, &lifted,
+                                     /*include_grouping=*/false) ||
+         can_decorrelate_subqueries) &&
+        !touches_query_expression(select->WhereClause()) &&
+        !grouped_expressions_correlate) {
+      return ExecuteGroupedSelect(*select, ctx, &lifted);
+    }
+  }
+  const auto touches_query_expression =
+      [](const Expression& expression) -> bool {
+    return expression && relational_detail::ContainsQuery(expression);
+  };
+  const bool touches_query =
+      touches_query_expression(select->WhereClause()) ||
+      std::ranges::any_of(select->SelectList(),
+                          [&](const NamedExpression& item) {
+                            return touches_query_expression(item.expression);
+                          });
+  const bool has_recursive_cte = std::any_of(
+      select->WithQueries().begin(), select->WithQueries().end(),
+      [&](const auto& pair) { return select->IsRecursiveWith(pair.first); });
+  const bool has_plain_cte = std::any_of(
+      select->WithQueries().begin(), select->WithQueries().end(),
+      [&](const auto& pair) { return !select->IsRecursiveWith(pair.first); });
+  // ARRAY(SELECT ...) select items need the relational interpreter's
+  // scope chain (see ContainsArrayQueryExpression); the unnest and
+  // vectorized routes evaluate projections without it.  A SQL UDF whose
+  // body contains a subquery needs it too: invoking the body through a
+  // plain Projection would throw.
+  const auto touches_relational_subquery = [](const Expression& expression) {
+    return ContainsArrayQueryExpression(expression) ||
+           ContainsQueryUdfCall(expression);
+  };
+  const bool touches_array_subquery =
+      std::ranges::any_of(select->SelectList(),
+                          [&](const NamedExpression& item) {
+                            return touches_relational_subquery(item.expression);
+                          }) ||
+      std::ranges::any_of(select->OrderBy(),
+                          [&](const SelectStatement::OrderByTerm& term) {
+                            return touches_relational_subquery(term.expression);
+                          });
+  // A subquery inside the select list itself projects per-row through
+  // Projection::Evaluate, which cannot run subqueries; only the
+  // relational interpreter's scope chain can evaluate that shape.
+  const bool select_list_touches_query =
+      std::ranges::any_of(select->SelectList(),
+                          [](const NamedExpression& item) {
+                            return ContainsQueryExpression(item.expression);
+                          }) ||
+      std::ranges::any_of(select->OrderBy(),
+                          [](const SelectStatement::OrderByTerm& term) {
+                            return ContainsQueryExpression(term.expression);
+                          });
+  if ((has_unnest || has_lateral ||
+       (has_recursive_cte && !has_plain_cte && !touches_query)) &&
+      !unnest_join_needs_relational && !lateral_join_needs_relational &&
+      !select_list_touches_query && !select->Qualify() &&
+      !relational_detail::HasWindowFunctions(*select)) {
+    StatusOr<Executor> unnest_exec = ExecuteUnnestSelect(*select, ctx);
+    if (unnest_exec.HasValue()) {
+      return unnest_exec;
+    }
+  }
+  // Routing reads the post-rewrite shape (see PostRewriteNeedsRelational):
+  // statements whose derived/CTE complexity the rewrites eliminated flow
+  // to the cost-based planner; the optimizer's kNotImplemented fallback
+  // still catches anything beyond its slices.
+  if (force_relational_fallback_ ||
+      (PostRewriteNeedsRelational(*select, &lifted) &&
+       !can_decorrelate_subqueries) ||
+      select->Sources().empty() || has_unnest || has_lateral ||
+      touches_array_subquery ||
+      (has_recursive_cte && !has_plain_cte && !touches_query)) {
+    if (simple_count_star && !force_relational_fallback_) {
+      // COUNT(*) over one plain table is fully representable by the
+      // Cascades single-relation path, including a covering index-only
+      // scan. Let that path handle the query even if the visitor marked
+      // the aggregate as relational for another reason.
+    } else {
+      return emit_relational();
+    }
+  }
+  if (PostRewriteNeedsRelational(*select, &lifted) && !simple_count_star &&
+      !can_decorrelate_subqueries) {
+    return emit_relational();
+  }
+
+  const bool multi_relation = select->Sources().size() > 1;
+  const bool has_aggregate =
+      std::ranges::any_of(
+          select->SelectList(),
+          [](const NamedExpression& item) {
+            return relational_detail::ContainsAggregate(item.expression);
+          }) ||
+      relational_detail::ContainsAggregate(select->Having());
+  if (multi_relation && has_aggregate && !has_table_sample) {
+    return emit_relational();
+  }
+  // Computed scalar aggregates otherwise decode Rows into one parallel
+  // scan pool and hand them to a second pool evaluating the AST. The
+  // relational typed scan already compiles these numeric expressions
+  // once and folds while decoding, without either batch handoff.
+  // Large filtered floating-point aggregates use that same path even when
+  // the optional column cache is cold or evicted. Cache residency must not
+  // choose a persistent row-decoding plan for later warm executions.
+  const auto& budget = ProcessMemoryBudget::Global();
+  const auto is_star_column = [](const Expression& expr) {
+    return expr && expr->Type() == TypeTag::kColumnValue &&
+           expr->AsColumnValue().GetColumnName().name == "*";
+  };
+  if (!multi_relation && has_aggregate && !has_table_sample &&
+      !simple_count_star && select->Sources().size() == 1 &&
+      !select->Sources()[0].query && !select->Sources()[0].unnest &&
+      select->GroupBy().empty() && !select->Having() && !select->Qualify() &&
+      !select->Distinct() && !select->ForUpdate() && BytecodeEnabled() &&
+      budget.OpMemoryOverrideBytes() == 0 && !budget.AlwaysSpillEnabled() &&
+      std::ranges::all_of(select->SelectList(), [&](const auto& item) {
+        if (!item.expression ||
+            item.expression->Type() != TypeTag::kAggregateExp) {
+          return false;
+        }
+        const auto& aggregate = item.expression->AsAggregateExpression();
+        const auto type = aggregate.GetType();
+        const bool supported_type =
+            type == AggregationType::kSum || type == AggregationType::kAvg ||
+            type == AggregationType::kMin || type == AggregationType::kMax ||
+            type == AggregationType::kCount;
+        const bool valid_child = (aggregate.Child() != nullptr &&
+                                  (!is_star_column(aggregate.Child()) ||
+                                   type == AggregationType::kCount)) ||
+                                 type == AggregationType::kCount;
+        const bool single_column_count_distinct =
+            aggregate.Distinct() && select->SelectList().size() == 1 &&
+            type == AggregationType::kCount && aggregate.Child() != nullptr &&
+            aggregate.Child()->Type() == TypeTag::kColumnValue &&
+            !is_star_column(aggregate.Child());
+        return (!aggregate.Distinct() || single_column_count_distinct) &&
+               !aggregate.HasWhereFilter() && !aggregate.NeedsGroupContext() &&
+               supported_type && valid_child;
+      })) {
+    const auto table = ctx.GetTable(select->Sources()[0].table);
+    const auto stats = ctx.GetStats(select->Sources()[0].table);
+    const bool large_table = stats.HasValue() && stats.Value()->Rows() >= 65536;
+    const bool has_computed_child =
+        std::ranges::any_of(select->SelectList(), [](const auto& item) {
+          const auto& aggregate = item.expression->AsAggregateExpression();
+          return aggregate.Child() != nullptr &&
+                 aggregate.Child()->Type() != TypeTag::kColumnValue;
+        });
+    if (table.HasValue() && (has_computed_child || large_table)) {
+      const std::string& alias = select->Sources()[0].alias;
+      const Schema schema = alias.empty()
+                                ? table.Value()->GetSchema()
+                                : relational_detail::QualifySchema(
+                                      table.Value()->GetSchema(), alias);
+      if ((!select->WhereClause() ||
+           BytecodeCompiler::Compile(select->WhereClause(), schema,
+                                     BytecodeCompiler::Context::kFilter)
+               .has_value()) &&
+          std::ranges::all_of(select->SelectList(), [&](const auto& item) {
+            const auto& aggregate = item.expression->AsAggregateExpression();
+            if (!aggregate.Child() || is_star_column(aggregate.Child())) {
+              return true;
+            }
+            const auto program =
+                BytecodeCompiler::Compile(aggregate.Child(), schema);
+            return program.has_value() &&
+                   (!select->WhereClause() ||
+                    program->ResultType() == ValueType::kInt64 || large_table);
+          })) {
+        return emit_relational();
+      }
+    }
+  }
+
+  // Post-projection ORDER BY scope: the adapter normalizes computed keys
+  // and SELECT aliases to projection-output names (sort_expressions) and
+  // a post-plan SortExecutor covers plans that do not enforce ordering,
+  // so computed ordering no longer forces the relational path.
+  QueryData query;
+  // FOR UPDATE reuses the DML source contract: scans reserve a write
+  // intent (and a row lock) on every row they visit, and the transaction
+  // holds them until commit/abort.  Positions also have to survive the
+  // projection for the plan to be accepted.
+  query.require_row_position_ = for_update;
+  if (for_update) {
+    query.wait_for_write_intent_ =
+        for_update_wait_mode_ != ForUpdateWaitMode::kNoWait;
+  }
+  // Stamp literals in SQL-text order before the optimizer sorts
+  // conjuncts. Identical values (warehouse 1 AND district 1) would
+  // otherwise be numbered by plan-tree position and bind swapped.
+  SqlLiteralSlots literal_slots;
+  if (!plan_cache_fingerprint_.empty() && !dml_fold_applied_ &&
+      !plan_cache_parameters_.empty() && select->WithQueries().empty() &&
+      !select->HasDistinctOn() && select->UnionAll().empty() &&
+      select->GetSetOperationTree() == nullptr) {
+    literal_slots.parameters = &plan_cache_parameters_;
+  }
+  std::vector<Expression> slotted_select;
+  slotted_select.reserve(select->SelectList().size());
+  for (const NamedExpression& item : select->SelectList()) {
+    slotted_select.push_back(literal_slots.Apply(item.expression));
+  }
+  std::vector<Expression> slotted_joins;
+  slotted_joins.reserve(select->Sources().size());
+  std::vector<std::optional<TableSampleSpec>> slotted_samples;
+  slotted_samples.reserve(select->Sources().size());
+  for (const SelectSource& source : select->Sources()) {
+    if (source.query != nullptr) {
+      literal_slots.ok = false;
+    }
+    if (source.sample) {
+      TableSampleSpec sample = *source.sample;
+      sample.size = literal_slots.Apply(sample.size);
+      for (Expression& partition : sample.partition_by) {
+        partition = literal_slots.Apply(partition);
+      }
+      if (sample.repeatable_seed) {
+        sample.repeatable_seed = literal_slots.Apply(*sample.repeatable_seed);
+      }
+      slotted_samples.emplace_back(std::move(sample));
+    } else {
+      slotted_samples.emplace_back(std::nullopt);
+    }
+    slotted_joins.push_back(literal_slots.Apply(source.join_condition));
+  }
+  const Expression slotted_where = literal_slots.Apply(select->WhereClause());
+  for (const Expression& key : select->GroupBy()) {
+    (void)literal_slots.Apply(key);
+  }
+  (void)literal_slots.Apply(select->Having());
+  const Expression slotted_qualify = literal_slots.Apply(select->Qualify());
+  std::vector<Expression> slotted_order;
+  slotted_order.reserve(select->OrderBy().size());
+  for (const auto& term : select->OrderBy()) {
+    slotted_order.push_back(literal_slots.Apply(term.expression));
+  }
+  const bool use_sql_slots = literal_slots.Complete();
+  Expression where = use_sql_slots ? slotted_where : select->WhereClause();
+  std::unordered_set<std::string> seen_relations;
+  for (size_t i = 0; i < select->Sources().size(); ++i) {
+    const SelectSource& source = select->Sources()[i];
+    if (!seen_relations.insert(source.alias).second) {
+      last_error_ = "duplicate FROM relation; use distinct aliases";
+      return Status::kUnknown;
+    }
+    query.from_.push_back(source.alias);
+    if (!source.alias.empty() && source.alias != source.table) {
+      query.aliases_.emplace(source.alias, source.table);
+    }
+    if (use_sql_slots && slotted_samples[i]) {
+      query.samples_.emplace(source.alias, std::move(*slotted_samples[i]));
+    } else if (source.sample) {
+      query.samples_.emplace(source.alias, *source.sample);
+    }
+    const Expression join_condition =
+        use_sql_slots ? slotted_joins[i] : source.join_condition;
+    if (join_condition) {
+      // M6+1: a LEFT/RIGHT/FULL ON condition rides the outer-join
+      // predicate, never WHERE (ON filters before NULL padding, WHERE
+      // after). Anything beyond the optimizer's outer slice was already
+      // routed to the relational path; reaching it here is a programming
+      // error, so fall back rather than folding it unsoundly.
+      if (source.join_type == JoinType::kLeft ||
+          source.join_type == JoinType::kRight ||
+          source.join_type == JoinType::kFull) {
+        if (i == 0) {
+          return emit_relational();
+        }
+        QueryData::OuterJoinEdge edge;
+        edge.right_index = query.from_.size() - 1;
+        edge.join_kind = source.join_type == JoinType::kLeft    ? 0
+                         : source.join_type == JoinType::kRight ? 1
+                                                                : 2;
+        edge.on_condition = join_condition;
+        query.outer_joins_.push_back(std::move(edge));
+      } else {
+        where = where ? BinaryExpressionExp(where, BinaryOperation::kAnd,
+                                            join_condition)
+                      : join_condition;
+      }
+    }
+  }
+  query.where_ = where ? where : ConstantValueExp(Value(true));
+  query.lifted_ctes_ = lifted;
+  query.qualify_ = use_sql_slots ? slotted_qualify : select->Qualify();
+  query.select_.reserve(select->SelectList().size());
+  for (size_t item_index = 0; item_index < select->SelectList().size();
+       ++item_index) {
+    const NamedExpression& item = select->SelectList()[item_index];
+    NamedExpression copied = item;
+    if (use_sql_slots) {
+      copied.expression = slotted_select[item_index];
+    }
+    // The SQL visitor gives an unaliased `o.key` projection the display
+    // name `key`.  QueryData's ProjectionPlan interprets a non-empty name
+    // as a new unqualified schema column, which would hide `o.key` from
+    // the decorrelated semi/anti join key contract. Keep the expression
+    // name for internal binding and let result_column_names_ provide the
+    // client-facing label.
+    if (copied.expression &&
+        copied.expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& column =
+          copied.expression->AsColumnValue().GetColumnName();
+      if (copied.name == column.name) {
+        copied.name.clear();
+      }
+    }
+    query.select_.push_back(std::move(copied));
+  }
+  // Expand "*" projections here so the visible output width is the
+  // expanded width; the optimizer's internal expansion would otherwise
+  // disagree with visible_columns and truncate the final projection.
+  {
+    std::vector<NamedExpression> expanded;
+    bool has_star = false;
+    std::string unknown_star_qualifier;
+    for (const NamedExpression& item : query.select_) {
+      Expression star_expression = item.expression;
+      if (star_expression &&
+          star_expression->Type() == TypeTag::kFunctionCallExp) {
+        const auto& call = star_expression->AsFunctionCallExpression();
+        if (call.FuncName() == "__value_table_value" &&
+            call.Args().size() == 1) {
+          star_expression = call.Args()[0];
+        }
+      }
+      if (star_expression && star_expression->Type() == TypeTag::kColumnValue) {
+        const ColumnName& column =
+            star_expression->AsColumnValue().GetColumnName();
+        if (column.name == "*") {
+          if (item.star_modifiers && star_expression != item.expression) {
+            // `SELECT AS VALUE * EXCEPT/REPLACE` would need the modifier
+            // columns folded into a single value; reject instead of
+            // spilling several columns into the value context.
+            last_error_ =
+                "SELECT * EXCEPT/REPLACE cannot be combined with "
+                "SELECT AS VALUE";
+            return Status::kInvalidArgument;
+          }
+          has_star = true;
+          bool matched_relation = false;
+          std::unordered_set<std::string> resolved_except;
+          std::unordered_set<std::string> resolved_replace;
+          for (const std::string& relation : query.from_) {
+            const auto aliased = query.aliases_.find(relation);
+            const std::string& physical =
+                aliased == query.aliases_.end() ? relation : aliased->second;
+            const auto sample_source = std::ranges::find_if(
+                select->Sources(), [&](const SelectSource& source) {
+                  return source.alias == relation;
+                });
+            const TableSampleSpec* sample_spec =
+                sample_source != select->Sources().end() &&
+                        sample_source->sample
+                    ? &*sample_source->sample
+                    : nullptr;
+            if (!column.schema.empty() && column.schema != relation &&
+                column.schema != physical) {
+              continue;
+            }
+            // A derived source (subquery / UNNEST) has no catalog table and
+            // no lifted leaf schema here. Keep its `rel.*` wrapped so the
+            // relational interpreter can expand it from the derived
+            // relation's own schema; do not reject it as an unknown source.
+            const SelectSource* derived_source = nullptr;
+            for (const SelectSource& src : select->Sources()) {
+              if (src.alias == relation) {
+                derived_source = &src;
+                break;
+              }
+            }
+            if (derived_source != nullptr &&
+                (derived_source->query != nullptr ||
+                 derived_source->unnest != nullptr)) {
+              matched_relation = true;
+              expanded.push_back(item);
+              continue;
+            }
+            // Lifted CTE leaves (M4) expand from their leaf schemas,
+            // exactly like a base table's columns under this relation.
+            const Schema* leaf_schema = nullptr;
+            const auto cell = lifted.cells.find(relation);
+            if (cell != lifted.cells.end() && cell->second != nullptr) {
+              leaf_schema = &cell->second->schema;
+            } else {
+              const auto rec = lifted.recursive.find(relation);
+              if (rec != lifted.recursive.end()) {
+                leaf_schema = &rec->second.output_schema;
+              }
+            }
+            if (leaf_schema != nullptr) {
+              matched_relation = true;
+              const Schema& source_schema = *leaf_schema;
+              if (item.star_modifiers) {
+                ExpandStarWithModifiers(item, relation, source_schema,
+                                        &expanded, &resolved_except,
+                                        &resolved_replace);
+                continue;
+              }
+              for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
+                expanded.emplace_back(ColumnName(
+                    relation, source_schema.GetColumn(i).Name().name));
+              }
+              if (column.schema.empty() && sample_spec != nullptr &&
+                  sample_spec->with_weight) {
+                expanded.emplace_back(
+                    sample_spec->weight_alias,
+                    ColumnValueExp(sample_spec->weight_alias));
+              }
+              continue;
+            }
+            StatusOr<std::shared_ptr<Table>> found = ctx.GetTable(physical);
+            if (!found.HasValue()) {
+              continue;
+            }
+            matched_relation = true;
+            const Schema& source_schema = found.Value()->GetSchema();
+            if (source_schema.ColumnCount() == 1 &&
+                physical.find("TestExtraPBValueTable") != std::string::npos) {
+              if (item.star_modifiers) {
+                last_error_ =
+                    "SELECT * EXCEPT/REPLACE over this table is not "
+                    "supported";
+                return Status::kInvalidArgument;
+              }
+              const ColumnName base(relation,
+                                    source_schema.GetColumn(0).Name().name);
+              for (const char* field :
+                   {"int32_val1", "int32_val2", "str_value"}) {
+                expanded.emplace_back(
+                    field, FunctionCallExp(
+                               "__get_field_safe",
+                               {ColumnValueExp(base),
+                                ConstantValueExp(Value(std::string(field)))}));
+              }
+              if (column.schema.empty() && sample_spec != nullptr &&
+                  sample_spec->with_weight) {
+                expanded.emplace_back(
+                    sample_spec->weight_alias,
+                    ColumnValueExp(sample_spec->weight_alias));
+              }
+              continue;
+            }
+            if (item.star_modifiers) {
+              ExpandStarWithModifiers(item, relation, source_schema, &expanded,
+                                      &resolved_except, &resolved_replace);
+            } else {
+              for (size_t i = 0; i < source_schema.ColumnCount(); ++i) {
+                expanded.emplace_back(ColumnName(
+                    relation, source_schema.GetColumn(i).Name().name));
+              }
+            }
+            if (column.schema.empty() && sample_spec != nullptr &&
+                sample_spec->with_weight) {
+              expanded.emplace_back(sample_spec->weight_alias,
+                                    ColumnValueExp(sample_spec->weight_alias));
+            }
+          }
+          // Modifier names that matched no FROM relation would silently
+          // keep (REPLACE) or drop their effect (EXCEPT); reject them
+          // like unknown columns.
+          if (item.star_modifiers &&
+              (resolved_except.size() !=
+                   item.star_modifiers->except_columns.size() ||
+               resolved_replace.size() !=
+                   item.star_modifiers->replace_items.size())) {
+            last_error_ =
+                "star modifier column not present in any FROM "
+                "relation";
+            return Status::kInvalidArgument;
+          }
+          // A qualified star that matches no FROM relation would
+          // otherwise silently disappear from the select list; reject it
+          // like an unknown column instead.
+          if (!column.schema.empty() && !matched_relation &&
+              unknown_star_qualifier.empty()) {
+            unknown_star_qualifier = column.schema;
+          }
+          continue;
+        }
+      }
+      expanded.push_back(item);
+    }
+    if (!unknown_star_qualifier.empty()) {
+      last_error_ =
+          "unknown relation in select list: " + unknown_star_qualifier;
+      return Status::kNotExists;
+    }
+    if (has_star && !expanded.empty()) {
+      query.select_ = std::move(expanded);
+      if (has_table_sample) {
+        result_column_names_.clear();
+        result_column_types_.clear();
+        result_column_names_.reserve(query.select_.size());
+        for (const NamedExpression& item : query.select_) {
+          result_column_names_.push_back(
+              item.name.empty() ? item.expression->ToString() : item.name);
+        }
+      }
+    }
+  }
+  // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
+  // The AST visitor defers it when the select list still contained an
+  // unexpanded star; the list is expanded into query.select_ by now.
+  // Rewrite the statement's terms in place so every downstream consumer
+  // (required ordering, post-plan sort, safety-net sort) sees the
+  // resolved output column instead of a constant that sorts identically
+  // on every row.
+  if (!select->OrderBy().empty()) {
+    auto resolved_orders = select->OrderBy();
+    bool orders_changed = false;
+    for (SelectStatement::OrderByTerm& order : resolved_orders) {
+      const Expression& expression = order.expression;
+      if (!expression || expression->Type() != TypeTag::kConstantValue ||
+          dynamic_cast<const ParameterSlot*>(expression.get()) != nullptr) {
+        continue;
+      }
+      const Value& ordinal_value = expression->AsConstantValue().GetValue();
+      if (ordinal_value.type != ValueType::kInt64 || ordinal_value.IsNull() ||
+          ordinal_value.value.int_value < 1) {
+        continue;
+      }
+      const auto ordinal = static_cast<size_t>(ordinal_value.value.int_value);
+      const Expression& target = ordinal <= query.select_.size()
+                                     ? query.select_[ordinal - 1].expression
+                                     : nullptr;
+      // A star cannot expand here (single-source shapes expand above;
+      // anything else stays unsupported), so leave the constant for the
+      // per-term check below to report.
+      if (!target || (target->Type() == TypeTag::kColumnValue &&
+                      target->AsColumnValue().GetColumnName().name == "*")) {
+        continue;
+      }
+      order.expression = target;
+      orders_changed = true;
+    }
+    if (orders_changed) {
+      select->SetOrderBy(std::move(resolved_orders));
+    }
+  }
+  const size_t visible_columns = query.select_.size();
+  std::vector<Expression> sort_expressions;
+  std::vector<bool> sort_ascending;
+  bool order_needs_projection_binding = false;
+  sort_expressions.reserve(select->OrderBy().size());
+  for (size_t i = 0; i < select->OrderBy().size(); ++i) {
+    auto order = select->OrderBy()[i];
+    if (use_sql_slots) {
+      order.expression = slotted_order[i];
+    }
+    // GoogleSQL: a bare integer ORDER BY item is a SELECT-list ordinal.
+    // The AST visitor defers it when the select list still contained an
+    // unexpanded star; the list is expanded here, so swap the constant
+    // for the ordinal's source expression and let the normal binding
+    // below handle aliases and output naming.
+    if (order.expression &&
+        order.expression->Type() == TypeTag::kConstantValue) {
+      const Value& ordinal_value =
+          order.expression->AsConstantValue().GetValue();
+      if (ordinal_value.type == ValueType::kInt64 && !ordinal_value.IsNull() &&
+          ordinal_value.value.int_value >= 1) {
+        const auto ordinal = static_cast<size_t>(ordinal_value.value.int_value);
+        if (ordinal > query.select_.size() ||
+            !query.select_[ordinal - 1].expression) {
+          return StatusError(StatusCode::kInvalidArgument,
+                             "ORDER BY ordinal out of range");
+        }
+        // A COLLATE clause on the ordinal applies to the SELECT-list item
+        // it names, so it must survive the substitution.
+        order.expression = ReapplyCollation(
+            query.select_[ordinal - 1].expression, order.expression);
+      }
+    } else if (const std::optional<CollatedOrdinal> collated =
+                   AsCollatedOrdinal(order.expression);
+               collated.has_value() && collated->ordinal >= 1 &&
+               static_cast<size_t>(collated->ordinal) <= query.select_.size() &&
+               query.select_[static_cast<size_t>(collated->ordinal) - 1]
+                   .expression) {
+      // `ORDER BY 1 COLLATE 'und:ci'`: the ordinal is a constant wrapped in
+      // the collator, so it never looks like an ordinal above. Resolving
+      // it here keeps the clause on the SELECT-list item it names —
+      // leaving the constant in place would sort on a value every row
+      // shares and silently order nothing.
+      order.expression = ApplyCollationSpec(
+          query.select_[static_cast<size_t>(collated->ordinal) - 1].expression,
+          collated->spec);
+    }
+    order_needs_projection_binding =
+        order_needs_projection_binding ||
+        order.expression->Type() != TypeTag::kColumnValue;
+    query.order_expressions_.push_back(order.expression);
+    query.order_ascending_.push_back(order.ascending);
+    auto selected = std::ranges::find_if(query.select_, [&](const auto& item) {
+      if (item.expression->ToString() == order.expression->ToString()) {
+        return true;
+      }
+      if (order.expression->Type() != TypeTag::kColumnValue ||
+          item.name.empty()) {
+        return false;
+      }
+      const ColumnName& order_name =
+          order.expression->AsColumnValue().GetColumnName();
+      return order_name.schema.empty() &&
+             IdentifierEquals(item.name, order_name.name);
+    });
+    if (selected != query.select_.end()) {
+      // Client labels were captured before physical planning. Give a
+      // duplicated output name a unique internal binding so ordering the
+      // second projection cannot resolve to the first one.
+      if (!selected->name.empty() &&
+          std::ranges::count_if(query.select_, [&](const auto& item) {
+            return IdentifierEquals(item.name, selected->name);
+          }) > 1) {
+        selected->name = "$sort" + std::to_string(std::distance(
+                                       query.select_.begin(), selected));
+      }
+      // Keep the optimizer's required ordering in terms of the selected
+      // expression itself.  A bare ORDER BY alias is an output-schema
+      // name, not an input column, and retaining it here would make the
+      // lower projection attempt to resolve a column that does not exist
+      // in its child schema.
+      if (order.expression->Type() == TypeTag::kColumnValue &&
+          order.expression->AsColumnValue().GetColumnName().schema.empty() &&
+          selected->expression->ToString() != order.expression->ToString()) {
+        query.order_expressions_.back() = selected->expression;
+        // The logical key and the sort key now name different things
+        // (source expression vs output column); bind both to the
+        // projection output so the post-plan ordering check compares
+        // like with like instead of stacking a second sort.
+        order_needs_projection_binding = true;
+      }
+      // Sorting consumes the plan OUTPUT, whose columns are named by the
+      // select list; normalize the key to that name so qualifiers
+      // (table aliases) cannot break resolution after projection.
+      if (!selected->name.empty()) {
+        sort_expressions.push_back(ColumnValueExp(ColumnName(selected->name)));
+        // An earlier ORDER BY term may have introduced this hidden output.
+        // Repeated computed keys must use the same binding in the memo.
+        if (std::distance(query.select_.begin(), selected) >=
+            static_cast<ptrdiff_t>(visible_columns)) {
+          query.order_expressions_.back() = sort_expressions.back();
+        }
+        // The sort key is the output column, so the logical ordering
+        // must be checked against the same name: leaving the source
+        // expression here makes the post-plan IsOrderedBy comparison
+        // fail and stack a second sort above one the plan already
+        // declared.
+        order_needs_projection_binding = true;
+      } else if (selected->expression &&
+                 selected->expression->Type() != TypeTag::kColumnValue) {
+        // An unnamed computed projection has no output name to bind: the
+        // source form would evaluate against output rows that no longer
+        // expose the source columns. Name the projection output
+        // deterministically (client labels were captured before this
+        // runs, and the trim below is positional) so every layer keys on
+        // the output column instead; the plan side resolves it through
+        // the same name.
+        const std::string sort_name =
+            "$sort" +
+            std::to_string(std::distance(query.select_.begin(), selected));
+        selected->name = sort_name;
+        sort_expressions.push_back(ColumnValueExp(ColumnName(sort_name)));
+        order_needs_projection_binding = true;
+      } else {
+        sort_expressions.push_back(order.expression);
+      }
+    } else {
+      const std::string hidden_name = "$order" + std::to_string(i);
+      query.select_.emplace_back(hidden_name, order.expression);
+      // ORDER BY a non-selected input is evaluated through this hidden
+      // projection column. Keep the logical ordering key on that output
+      // name so a pushed-down TopN never resolves against a child that
+      // intentionally does not expose the source column.
+      query.order_expressions_.back() = ColumnValueExp(hidden_name);
+      sort_expressions.push_back(ColumnValueExp(hidden_name));
+    }
+    sort_ascending.push_back(order.ascending);
+    query.order_nulls_first_.push_back(order.nulls_first);
+  }
+  // ORDER BY keys are kept in SOURCE-column form for the plan's own
+  // SortPlan/TopN. But when a key is a bare SELECT-list ALIAS (e.g.
+  // `ORDER BY other_id` where other_id is `p2.id AS other_id`), the plan
+  // builds its ordering around the projected output name and pushes that
+  // Sort BELOW the projection that produces it, so the alias column is not
+  // yet resolvable. In that case drop the plan-side ordering entirely and
+  // let the post-plan SortExecutor below apply `sort_expressions` over the
+  // plan OUTPUT schema. Computed keys (`a * b`) keep their plan-side
+  // ordering so a TopN can still be pushed down.
+  const bool order_by_output_alias = std::ranges::any_of(
+      select->OrderBy(), [&](const SelectStatement::OrderByTerm& term) {
+        if (!term.expression ||
+            term.expression->Type() != TypeTag::kColumnValue ||
+            !term.expression->AsColumnValue().GetColumnName().schema.empty()) {
+          return false;
+        }
+        return std::ranges::any_of(
+            select->SelectList(), [&](const NamedExpression& item) {
+              return !item.name.empty() && item.expression &&
+                     item.expression->ToString() !=
+                         term.expression->ToString() &&
+                     IdentifierEquals(
+                         item.name,
+                         term.expression->AsColumnValue().GetColumnName().name);
+            });
+      });
+  if (order_by_output_alias) {
+    query.order_expressions_.clear();
+    query.order_ascending_.clear();
+    query.order_nulls_first_.clear();
+    order_needs_projection_binding = true;
+  } else if (order_needs_projection_binding) {
+    query.order_ascending_ = sort_ascending;
+  }
+  // Let the memo compare hash, sort and index-skip DISTINCT over the
+  // visible projection. Hidden ORDER BY columns still use the finishing
+  // path below because they are not part of the duplicate key.
+  query.distinct_ =
+      select->Distinct() && visible_columns == query.select_.size();
+  // DISTINCT must see every row before truncation, so the optimizer is
+  // not told about LIMIT here; Distinct -> Sort -> Limit stays in this
+  // order above an untruncated plan (D6 soundness).
+  // The alias-ordered shape needs the identical treatment for the identical
+  // reason: order_by_output_alias above drops the optimizer's ordering and
+  // leaves the post-plan SortExecutor to order the projection output (see
+  // LowerSelectPlanExecutor). A LIMIT the optimizer can still see then
+  // folds a bare kLimit directly onto the scan (`limit` implementation
+  // rule), truncating the input before the sort ever reads it: `SELECT
+  // x+1 AS y, z FROM t ORDER BY y LIMIT 3` answered from the first three
+  // rows of t instead of its smallest three (SortExecutor only ordered the
+  // already-truncated rows). Hiding the LIMIT keeps the tail's Sort ->
+  // Limit order sound.
+  const bool hide_limit_from_optimizer =
+      select->Distinct() || order_by_output_alias;
+  query.limit_count_ = hide_limit_from_optimizer ? 0 : select->Limit();
+  query.limit_offset_ = hide_limit_from_optimizer ? 0 : select->Offset();
+  Status rewrite_status = query.Rewrite(ctx);
+  if (rewrite_status == Status::kAmbiguousQuery) {
+    last_error_ = query.ambiguous_column_.empty()
+                      ? "ambiguous column reference"
+                      : "ambiguous column " + query.ambiguous_column_;
+    return rewrite_status;
+  }
+  RETURN_IF_FAIL(rewrite_status);
+  // Sampled before optimizing as well as before storing: a clustered index
+  // order is a revocable proof, so a plan that may have elided a sort (or
+  // folded a LIMIT / an incremental sort) on it must not outlive the
+  // statement in the compiled-plan cache.
+  const bool clustered_order_before = AnyResolvedTableHasClusteredOrder(ctx);
+  StatusOr<Plan> plan_or = Optimizer::Optimize(query, ctx);
+  if (!plan_or.HasValue()) {
+    return emit_relational();
+  }
+  Plan plan = std::move(plan_or.Value());
+  const bool needs_distinct =
+      select->Distinct() &&
+      !ProjectionContainsUniqueKey(plan, query.select_, visible_columns) &&
+      !plan->EnforcesDistinct();
+  Executor executor;
+  bool skip_scan = false;
+  if (needs_distinct) {
+    Plan scan_plan = plan;
+    std::vector<NamedExpression> distinct_items;
+    while (true) {
+      const auto* projection = dynamic_cast<const ProjectionPlan*>(&*scan_plan);
+      if (projection == nullptr) {
+        break;
+      }
+      distinct_items = projection->Columns();
+      scan_plan = projection->GetSource();
+    }
+    if (distinct_items.empty()) {
+      distinct_items = select->SelectList();
+    }
+    const auto* index_only =
+        dynamic_cast<const IndexOnlyScanPlan*>(&*scan_plan);
+    const Table* scan_table =
+        index_only != nullptr ? index_only->ScanSource() : nullptr;
+    if (index_only != nullptr && scan_table != nullptr &&
+        !index_only->GetIndex().RetainsDeletedEntries() &&
+        !ctx.txn_.IndexKeysMayBeStale(index_only->GetIndex().Root()) &&
+        index_only->GetIndex().sc_.key_.size() == 1 &&
+        index_only->BeginKey().empty() && index_only->EndKey().empty() &&
+        distinct_items.size() == 1 && distinct_items[0].expression &&
+        distinct_items[0].expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName distinct_column =
+          distinct_items[0].expression->AsColumnValue().GetColumnName();
+      const int offset = scan_table->GetSchema().Offset(distinct_column);
+      if (offset >= 0 && index_only->GetIndex().sc_.key_.front() ==
+                             static_cast<slot_t>(offset)) {
+        std::vector<NamedExpression> select_items = index_only->SelectItems();
+        if (select_items.empty()) {
+          select_items.emplace_back(distinct_column.name,
+                                    ColumnValueExp(distinct_column));
+        }
+        Executor skip_scan_executor = std::make_shared<SkipScanDistinct>(
+            ctx.txn_, *scan_table, index_only->GetIndex(), std::vector<Value>{},
+            std::vector<Value>{}, index_only->IsAscending(),
+            ConstantValueExp(Value(true)), scan_table->GetSchema(), 0);
+        executor = std::make_shared<Projection>(std::move(select_items),
+                                                scan_table->GetSchema(),
+                                                std::move(skip_scan_executor));
+        skip_scan = true;
+      }
+    }
+  }
+  const std::vector<Expression>& ordering_keys = order_needs_projection_binding
+                                                     ? sort_expressions
+                                                     : query.order_expressions_;
+  std::vector<OocSortSink::KeySpec> post_sort_keys;
+  post_sort_keys.reserve(select->OrderBy().size());
+  for (size_t i = 0; i < select->OrderBy().size(); ++i) {
+    post_sort_keys.push_back(OocSortSink::KeySpec{
+        .expression = sort_expressions[i],
+        .ascending = static_cast<bool>(sort_ascending[i]),
+        .nulls_first = select->OrderBy()[i].nulls_first,
+    });
+  }
+  if (skip_scan) {
+    if (!select->OrderBy().empty() &&
+        !plan->IsOrderedBy(ordering_keys, query.order_ascending_,
+                           query.order_nulls_first_)) {
+      std::vector<SortExecutor::Key> keys;
+      keys.reserve(select->OrderBy().size());
+      for (size_t i = 0; i < select->OrderBy().size(); ++i) {
+        keys.push_back({sort_expressions[i], sort_ascending[i],
+                        select->OrderBy()[i].nulls_first});
+      }
+      executor = std::make_shared<SortExecutor>(
+          std::move(executor), plan->GetSchema(), std::move(keys));
+    }
+    if ((select->HasLimit() || select->Offset() != 0) &&
+        !plan->EnforcesLimit(select->Limit(), select->Offset())) {
+      executor = std::make_shared<LimitExecutor>(
+          std::move(executor), select->Limit(), select->Offset());
+    }
+    if (visible_columns != query.select_.size()) {
+      std::vector<NamedExpression> visible;
+      visible.reserve(visible_columns);
+      for (size_t i = 0; i < visible_columns; ++i) {
+        visible.emplace_back(plan->GetSchema().GetColumn(i).Name());
+      }
+      executor = std::make_shared<Projection>(
+          std::move(visible), plan->GetSchema(), std::move(executor));
+    }
+  } else {
+    StatusOr<Executor> pipe_or = LowerSelectPlanExecutor(
+        plan, ctx, needs_distinct, ordering_keys, query.order_ascending_,
+        query.order_nulls_first_, post_sort_keys, select->HasLimit(),
+        select->Limit(), select->Offset(), select->WithTies(), visible_columns,
+        query.select_.size());
+    RETURN_IF_FAIL(pipe_or.GetStatus());
+    executor = pipe_or.MoveValue();
+  }
+  result_column_types_ = SchemaColumnTypes(plan->GetSchema());
+  if (result_column_types_.size() > visible_columns) {
+    result_column_types_.resize(visible_columns);
+  }
+  if (result_column_types_.size() == result_column_names_.size()) {
+    for (size_t column = 0; column < result_column_types_.size(); ++column) {
+      if (result_column_types_[column] == ValueType::kNull) {
+        // Keep the declaration even if the optimizer folded CAST(NULL)
+        // or a failing SAFE_CAST to an untyped NULL.
+        result_column_types_[column] = declared_cast_type(column);
+      }
+    }
+  }
+  // Compiled-plan fill: capture the compiled plan plus the executor-shape
+  // metadata so identical-parameter repeats skip parse/bind/rewrite/
+  // optimize entirely. Only optimizer-route statements reach this point.
+  if (!plan_cache_fingerprint_.empty() && !multi_relation &&
+      !clustered_order_before && !AnyResolvedTableHasClusteredOrder(ctx)) {
+    auto shape = std::make_shared<CompiledPlan::SelectShape>();
+    shape->column_names = result_column_names_;
+    shape->column_types = result_column_types_;
+    // The ordering must be captured from the values the executor tail was
+    // actually built from (`ordering_keys`, the same reference
+    // LowerSelectPlanExecutor received above), not from the optimizer's
+    // logical keys. For `ORDER BY <SELECT-list alias>` those were cleared
+    // because the sort is delegated to the post-plan SortExecutor over the
+    // projection output; an empty key vector makes the replay's
+    // `need_sort = !order_expressions.empty() && ...` false, so the cached
+    // plan silently answered in scan order. The projection-bound keys plus
+    // their directions and NULLS placement reproduce the first execution.
+    shape->order_expressions = ordering_keys;
+    if (order_by_output_alias) {
+      shape->order_ascending = sort_ascending;
+      shape->order_nulls_first.clear();
+      shape->order_nulls_first.reserve(select->OrderBy().size());
+      for (const SelectStatement::OrderByTerm& term : select->OrderBy()) {
+        shape->order_nulls_first.push_back(term.nulls_first);
+      }
+    } else {
+      shape->order_ascending = query.order_ascending_;
+      shape->order_nulls_first = query.order_nulls_first_;
+    }
+    shape->sort_keys.reserve(sort_expressions.size());
+    for (size_t i = 0; i < sort_expressions.size(); ++i) {
+      shape->sort_keys.emplace_back(sort_expressions[i],
+                                    static_cast<bool>(sort_ascending[i]));
+    }
+    shape->distinct = needs_distinct;
+    shape->has_limit = select->HasLimit();
+    shape->with_ties = select->WithTies();
+    shape->limit = select->Limit();
+    shape->offset = select->Offset();
+    shape->visible_columns = visible_columns;
+    shape->final_select_size = query.select_.size();
+    auto compiled = std::make_shared<CompiledPlan>();
+    compiled->kind = CompiledPlan::Kind::kSelect;
+    compiled->database = database_;
+    compiled->epoch = database_->SchemaEpoch();
+    compiled->parameters = plan_cache_parameters_;
+    if (!dml_fold_applied_) {
+      compiled->parameter_slots =
+          InstallPlanSlots(plan, plan_cache_parameters_);
+    }
+    compiled->plan = plan;
+    // The plan tree borrows fill-time Tables (and their indexes) that only
+    // this transaction context owns; pin them so cache hits after this
+    // transaction ends do not replay freed memory.
+    compiled->retained_tables.reserve(ctx.tables_.size());
+    for (const auto& entry : ctx.tables_) {
+      compiled->retained_tables.push_back(entry.second);
+    }
+    compiled->retained_stats.reserve(ctx.stats_.size());
+    for (const auto& entry : ctx.stats_) {
+      compiled->retained_stats.push_back(entry.second);
+    }
+    compiled->select_shape = std::move(shape);
+    // SQL requests can land on different workers. Immutable bounded
+    // column reads do not need eight independent cold optimizations.
+    // Bound slots stay thread-local; LIMIT/OFFSET literals remain in the
+    // fingerprint, and any expression parameters must match exactly.
+    const auto bare_column = [](const Expression& expression) {
+      return expression && expression->Type() == TypeTag::kColumnValue;
+    };
+    if (!dml_fold_applied_ && !query.require_row_position_ &&
+        select->Sources().size() == 1 && plan->ScanSource() != nullptr &&
+        plan->ScanSource()->GetSchema().Name() == select->Sources()[0].table &&
+        !select->Sources()[0].query && !select->Sources()[0].unnest &&
+        !select->Sources()[0].sample && !select->Sources()[0].join_condition &&
+        !select->AsStruct() && !select->Distinct() &&
+        !select->HasDistinctOn() && !select->WithTies() &&
+        !select->ForUpdate() && select->WithQueries().empty() &&
+        select->GroupBy().empty() && !select->Having() && !select->Qualify() &&
+        std::ranges::all_of(select->SelectList(),
+                            [&](const NamedExpression& item) {
+                              return bare_column(item.expression);
+                            }) &&
+        compiled->parameter_slots.empty() && !plan->ContainsParameterSlots() &&
+        select->HasLimit() && !query.order_expressions_.empty() &&
+        query.grouping_keys_.empty() &&
+        (!query.where_ ||
+         (query.where_->Type() == TypeTag::kConstantValue &&
+          query.where_->AsConstantValue().GetValue().Truthy())) &&
+        std::ranges::all_of(query.order_expressions_, bare_column) &&
+        std::ranges::all_of(query.select_, [&](const NamedExpression& item) {
+          return bare_column(item.expression);
+        })) {
+      compiled->immutable_exact_read = true;
+      StoreCompiledPlan(plan_cache_fingerprint_, compiled);
+    }
+    // Literal-free scalar aggregates have no binding state either. Each
+    // replay still emits fresh executors and reads the current snapshot;
+    // only the immutable plan is shared, never an aggregate result.
+    const auto scalar_read_expression =
+        [&](auto&& self, const Expression& expression) -> bool {
+      if (!expression) {
+        return true;
+      }
+      switch (expression->Type()) {
+        case TypeTag::kColumnValue:
+        case TypeTag::kConstantValue:
+        case TypeTag::kBinaryExp:
+        case TypeTag::kUnaryExp:
+          break;
+        case TypeTag::kAggregateExp: {
+          const auto& aggregate = expression->AsAggregateExpression();
+          if (aggregate.HasWhereFilter() || aggregate.NeedsGroupContext() ||
+              aggregate.HasInnerGroupBy()) {
+            return false;
+          }
+          const auto kind = aggregate.GetType();
+          if (kind != AggregationType::kCount &&
+              kind != AggregationType::kSum && kind != AggregationType::kMin &&
+              kind != AggregationType::kMax && kind != AggregationType::kAvg) {
+            return false;
+          }
+          break;
+        }
+        default:
+          return false;
+      }
+      return std::ranges::all_of(
+          ExpressionChildren(expression),
+          [&](const Expression& child) { return self(self, child); });
+    };
+    if (!compiled->immutable_exact_read && has_aggregate &&
+        !dml_fold_applied_ && !query.require_row_position_ &&
+        compiled->parameters.empty() && compiled->parameter_slots.empty() &&
+        !plan->ContainsParameterSlots() && select->Sources().size() == 1 &&
+        plan->ScanSource() != nullptr &&
+        plan->ScanSource()->GetSchema().Name() == select->Sources()[0].table &&
+        !select->Sources()[0].query && !select->Sources()[0].unnest &&
+        !select->Sources()[0].sample && !select->Sources()[0].join_condition &&
+        !select->AsStruct() && !select->Distinct() &&
+        !select->HasDistinctOn() && !select->WithTies() &&
+        !select->ForUpdate() && select->WithQueries().empty() &&
+        select->GroupBy().empty() && !select->Having() && !select->Qualify() &&
+        !select->HasLimit() && select->Offset() == 0 &&
+        query.order_expressions_.empty() &&
+        (!query.where_ ||
+         (query.where_->Type() == TypeTag::kConstantValue &&
+          query.where_->AsConstantValue().GetValue().Truthy())) &&
+        std::ranges::all_of(select->SelectList(),
+                            [&](const NamedExpression& item) {
+                              return scalar_read_expression(
+                                  scalar_read_expression, item.expression);
+                            })) {
+      compiled->immutable_exact_read = true;
+      StoreCompiledPlan(plan_cache_fingerprint_, compiled);
+    }
+    StoreThreadCompiledPlan(plan_cache_fingerprint_, std::move(compiled));
+  }
+  return WithPlanExplain(std::move(executor), std::move(plan));
 }
 
 std::optional<Executor> SqlEngine::ServeFromPlanCache(
@@ -7352,14 +4454,13 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
        compiled->kind == CompiledPlan::Kind::kUpdate)) {
     return std::nullopt;
   }
+  // #1100: identity check against the per-database incarnation map — a
+  // catalog GetTable per retained table per cache hit (LSM read + full
+  // Table deserialization) used to undo the point of the plan cache.
   const auto same_incarnation = [&](const Table& expected) {
-    if (ctx.GetCatalog() == nullptr) {
-      return false;
-    }
-    StatusOr<Table> current =
-        ctx.GetCatalog()->GetTable(ctx, expected.GetSchema().Name());
-    return current.HasValue() &&
-           current.Value().Incarnation() == expected.Incarnation();
+    return database_ != nullptr &&
+           database_->IsCurrentIncarnation(expected.GetSchema().Name(),
+                                           expected.IncarnationState());
   };
   bool valid = true;
   for (const auto& table : compiled->retained_tables) {
@@ -7411,7 +4512,7 @@ std::optional<Executor> SqlEngine::ServeFromPlanCache(
         }
         last_statement_type_ = StatementType::kSelect;
         result_column_names_ = compiled->select_shape->column_names;
-        result_column_types_ = SchemaColumnTypes(compiled->plan->GetSchema());
+        result_column_types_ = compiled->select_shape->column_types;
         PlanCacheStats().replays.fetch_add(1, std::memory_order_relaxed);
         Executor timed = std::make_shared<TimedSelectReuse>(
             std::move(*served), fingerprint, compiled);

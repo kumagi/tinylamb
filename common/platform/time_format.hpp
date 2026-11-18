@@ -24,8 +24,8 @@
 namespace tinylamb::platform {
 
 // timegm(3)/gmtime_r(3) over the full proleptic Gregorian range, computed
-// arithmetically. macOS timegm returns -1 for any year before 1900 (and -1 is
-// also a valid result), glibc handles them; neither consults the host zone.
+// arithmetically. This handles years outside the libc timegm range on every
+// platform and never consults the host zone.
 //
 // TimeGm normalizes out-of-range fields and rewrites `tm` exactly like glibc
 // timegm (tm_wday, tm_yday, tm_isdst = 0, tm_gmtoff = 0, tm_zone = "GMT") and
@@ -51,6 +51,10 @@ void LocalTime(std::time_t seconds, struct tm* out);
 // Parses `input` per `format` into `tm`. Returns a pointer past the consumed
 // input, or nullptr on mismatch (like strptime).
 const char* ParseTime(const char* input, const char* format, struct tm* tm);
+
+// Returns the UTC offset (seconds east) recorded by ParseTime's "%z"/"%Ez"
+// conversion, or 0 when no offset was recorded (including formats with no offset specifier).
+long TmGmtoff(const struct tm* tm) noexcept;
 
 // Formats `tm` per `format` into `out` (like strftime: returns the number of
 // bytes written excluding the NUL, or 0 when it does not fit).

@@ -90,13 +90,15 @@ $$\text{cost} = N \cdot \log_2(\max(2.0, N))$$
 
 ## 関連 Rule との相互作用
 
+- `sort_external_merge`: 推定行数が `SortRowCapacity(SortMemoryPolicy)` を超える場合に排他的に発火する外部マージ版（`plan/sort_plan.hpp`, `plan/sort_shape_test.cpp`）。
+- `sort_incremental`: 接頭キーが整列済みの場合の増分整列。
 - `index_scan`: キー順序の提供者（`provided_order`）として機能し、本 Rule のバイパス判定を誘発します。
 - `topn`: ORDER BY と LIMIT が併存する場合に用いられる複合 Rule であり、全ソートを伴わない有界ヒープ処理を担います。
 - `eliminate_double_sort` / `eliminate_sort_under_unordered_consumer`: 論理最適化フェーズにおいて冗長な `kSort` ノードを事前に剪定します。
 
 ## 検証テスト
 
-`plan/plan_test.cpp` および `plan/optimizer_test.cpp` における以下のテストケースで検証されています。
+`plan/plan_test.cpp` および `plan/optimizer_test_part2.cpp` における以下のテストケースで検証されています。
 
 - `PlanTest.SortAndTopNPlansReportSortedPrefixes`:
   `SortPlan` がソートキーの前方一致に対して正しく順序成立を申告することを確認します。

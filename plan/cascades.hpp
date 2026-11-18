@@ -207,7 +207,7 @@ struct ConjunctInfo {
 
 class Memo {
  public:
-  // Default per-group expression bound (Phase 7); overriding it is meant for
+  // Default per-group expression bound; overriding it is meant for
   // tests that need to hit the cap quickly.
   static constexpr size_t kDefaultExpressionCap = 4096;
 
@@ -219,7 +219,7 @@ class Memo {
   [[nodiscard]] StatusOr<GroupId> TryBuild(
       const std::vector<std::string>& relations,
       const std::vector<ConjunctInfo>& conjuncts);
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   [[nodiscard]] GroupId Build(const std::vector<std::string>& relations) {
     return ExcShimUnwrap(TryBuild(relations), "Memo::Build");
   }
@@ -281,7 +281,7 @@ class Memo {
   [[nodiscard]] bool JoinGraphConnected() const;
   [[nodiscard]] bool HasColumnEqualityConjunct() const;
 
-  // Snapshot-proven 1:1 joins (TODO.md item 1d). The optimizer records a
+  // Snapshot-proven 1:1 joins . The optimizer records a
   // directed pair (outer, inner) when every non-NULL outer join key is
   // observed, in the planning snapshot, to be present in the inner UNIQUE
   // key: each outer row then matches exactly one inner row. Logical rules
@@ -309,7 +309,7 @@ class Memo {
       const std::vector<std::string>& relations) const;
 
   // Groups that received new expressions since the last drain; the search
-  // engine re-enqueues them (Phase 7 worklist).
+  // engine re-enqueues them.
   std::vector<GroupId> DrainTouchedGroups();
   // Expression cap exceeded: exploration degrades gracefully by keeping the
   // expressions discovered so far (documented degradation path).
@@ -357,7 +357,14 @@ class Memo {
   std::unordered_map<std::string, GroupId> groups_by_key_;
   std::unordered_map<std::string, size_t> relation_index_;
   std::vector<Expression> conjuncts_;
+  // In-graph relation endpoints only. Connectivity queries use this mask so
+  // a conjunct with an outside (root-only) reference cannot fake edges
+  // between every pair of relations.
   std::vector<uint64_t> conjunct_masks_;
+  // Parallel flag: the conjunct references something outside the join graph
+  // and must stay at the root selection. It is never pushed into a scan or
+  // join condition and never contributes to join-graph connectivity.
+  std::vector<uint8_t> conjunct_root_only_;
   std::vector<GroupId> touched_groups_;
   std::unordered_map<std::string, Schema> table_schemas_;
   std::unordered_set<std::string> proven_one_to_one_;
@@ -586,7 +593,7 @@ class Rule {
   using Transform = std::function<void(const Bindings&, Memo&, GroupId,
                                        const LogicalExpression&)>;
 
-  // `target` is an applicability hint (Phase 7): the rule never matches
+  // `target` is an applicability hint: the rule never matches
   // expressions of other operator kinds, so join rules skip Scan/Selection
   // nodes without running their patterns.
   Rule(std::string name, Pattern pattern, Transform transform,
@@ -646,8 +653,8 @@ struct RuleContext {
   const QueryData* query{nullptr};
   std::unordered_map<std::string, std::shared_ptr<Table>> tables;
   std::unordered_map<std::string, std::shared_ptr<TableStatistics>> statistics;
-  // Required columns per relation, flowing into scan implementation rules
-  // (Phase 3): the optimizer computes them once from the whole query.
+  // Required columns per relation, flowing into scan implementation rules.
+  // The optimizer computes them once from the whole query.
   std::unordered_map<std::string, std::vector<NamedExpression>>
       scan_projections;
 
@@ -655,7 +662,7 @@ struct RuleContext {
 };
 
 enum class AccessMethod : uint8_t { kAny, kPreferIndex };
-// Reserved for future distributed execution (Phase 5); never differs today
+// Reserved for future distributed execution; never differs today
 // but participates in property cache keys already.
 enum class Distribution : uint8_t { kAny, kSingleNode };
 
@@ -722,7 +729,7 @@ struct MemoryBudget {
 struct PlanAlternative {
   Plan plan;
   double local_cost{0};
-  // Estimated output rows of this alternative (Phase 6); parents combine it
+  // Estimated output rows of this alternative; parents combine it
   // into join cardinalities and sort penalties.
   double estimated_rows{0};
   std::string rule_name{};

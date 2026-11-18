@@ -94,5 +94,5 @@ $$\sigma_p(L \times R) \equiv L \bowtie_p R$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CrossToInnerWithPredicate`
+- `plan/cascades_test_part*.cpp`: `CrossToInnerWithPredicate`
   - `CrossJoin(t1, t2)` の上位に `Selection(t1.id = t2.id)` が置かれた論理プランにおいて、述語付き `kJoin` 式が Group に追加されることを検証。

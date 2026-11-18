@@ -73,11 +73,11 @@ graph TD
         // for non-inner hash joins).
 ```
 
-これにより外部結合が内部結合へと事実上変質するため、本 Rule では結合述語を物理ノードの `JoinNotes` に直接格納し、`LeftOuterJoin` 実行器がタプル走査中にインラインで述語を評価してパディングを行う契約を強制します。
+これにより外部結合が内部結合へと事実上変質するため、本 Rule では結合述語を物理ノードの残余述語として直接保持し、`LeftOuterJoin` 実行器がタプル走査中にインラインで述語を評価してパディングを行う契約を強制します。
 
 ### 2. 定数述語（ON TRUE / FALSE / NULL）の除外根拠
 - **`ON TRUE` の除外**: 内側（右辺）関係が空（0 行）の場合、左辺の全タプルに対して NULL パディング行を生成する必要があります。単なる直積（Cross Join）形状では内側関係が空でないことを静的に証明できないため、誤った交差計画への縮退を防止するために除外します。
-- **`ON FALSE / NULL` の除外**: 結合条件が常に不成立となるため、結果は「左辺全行に右辺属性の NULL を連結した射影」と完全に等価です。ネステッドループによる二次計算走査を実行する意義はなく、論理層での短絡除去（`outer_join_to_projection` 等）に委ねます。
+- **`ON FALSE / NULL` の除外**: 結合条件が常に不成立となるため、結果は「左辺全行に右辺属性の NULL を連結した射影」と完全に等価です。ネステッドループによる二次計算走査を実行する意義はなく、論理層での短絡除去に委ねます。
 
 ## 実装の詳細
 
@@ -122,7 +122,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.OuterNestedLoopPlansNonEquiLeftJoin`: `outer_hash_join` が適用できない非等値 LEFT 外部結合に対し、本 Rule が `"Left Outer Join"` 物理計画を選択することを検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.OuterJoinRuleAddsMergeJoinAlternative`: 等値条件が存在する場合にマージ結合・ハッシュ結合が優先される動作を確認。

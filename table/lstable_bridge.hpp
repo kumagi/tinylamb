@@ -24,6 +24,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 #include "common/platform/endian.hpp"
 #include "common/platform/file_io.hpp"
 #include "common/runtime_filter.hpp"
@@ -61,6 +63,8 @@ struct LSTableColumnDictionary {
   // True only after every distinct byte string has been checked against
   // Value equality. Interval-equivalent spellings otherwise remain peers.
   bool bytewise_equality{false};
+  // Strict ORDER BY proof under the uncollated string comparator.
+  bool codes_follow_string_order{false};
   bool all_single_byte{false};
   ValueType value_type{ValueType::kVarChar};
   bool all_canonical_utc_timestamps{false};
@@ -72,6 +76,12 @@ struct LSTableColumnDictionary {
   // zero padding bytes for a safe unaligned 64-bit read at the final row.
   std::vector<uint8_t> wide_codes;
   std::vector<std::string> entries;
+  // Exact physical code frequencies and encounter positions, built together
+  // with encoding. Snapshot-owned metadata, independent of SQL expressions.
+  // The final slot represents NULL. Empty vectors mean no summary was kept.
+  std::vector<int64_t> code_counts;
+  std::vector<uint64_t> code_first_row;
+  std::vector<uint32_t> encounter_codes;
   std::vector<int64_t> int_entries;
   std::vector<double> double_entries;
   std::vector<double> one_minus_double_entries;
@@ -408,6 +418,95 @@ struct LSTablePageBlock {
       std::optional<slot_t> runtime_filter_column) const noexcept;
 };
 
+// Exact row ranges over one immutable, monotonic numeric column. Gaps have
+// equal adjacent offsets. This stores physical row positions, never query
+// predicates or aggregate results, and shares the encoded store's lifetime.
+struct LSTableIntegerRuns {
+  // Exact maximum, including the final run; bounds sparse-filter output.
+  uint32_t max_run_rows{0};
+  uint32_t run_count{0};
+  slot_t column{0};
+  int64_t minimum{0};
+  std::vector<uint32_t> offsets;
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
+
+  [[nodiscard]] std::pair<uint32_t, uint32_t> Find(int64_t key) const {
+    const uint64_t off =
+        static_cast<uint64_t>(key) - static_cast<uint64_t>(minimum);
+    if (offsets.empty() || off >= offsets.size() - 1) { return {0, 0};
+}
+    return {offsets[off], offsets[off + 1]};
+  }
+};
+
+// Query-independent min/max values for each key run. Small integer domains
+// (including dates) use two 16-bit deltas from a shared signed base.
+struct LSTableIntegerRunBounds {
+  slot_t key_column{0};
+  slot_t value_column{0};
+  int64_t key_minimum{0};
+  int64_t value_minimum{0};
+  std::vector<uint32_t> packed;
+  // A budget fallback uses outward-rounded 8-bit endpoint bins. These are
+  // conservative pruning bounds; callers still evaluate each surviving row.
+  std::vector<uint16_t> coarse;
+  uint8_t coarse_shift{0};
+  int64_t value_maximum{0};
+
+  [[nodiscard]] size_t BoundsCount() const {
+    return coarse.empty() ? packed.size() : coarse.size();
+  }
+  [[nodiscard]] std::pair<int64_t, int64_t> ValueBounds(size_t offset) const {
+    if (coarse.empty()) {
+      return {value_minimum + static_cast<int64_t>(packed[offset] & 65535),
+              value_minimum + static_cast<int64_t>(packed[offset] >> 16)};
+}
+    const uint32_t bins = coarse[offset];
+    const uint64_t low = (bins & 255) << coarse_shift;
+    const uint64_t high = std::min<uint64_t>(
+        ((static_cast<uint64_t>(bins >> 8) + 1) << coarse_shift) - 1,
+        static_cast<uint64_t>(value_maximum) -
+            static_cast<uint64_t>(value_minimum));
+    return {value_minimum + static_cast<int64_t>(low),
+            value_minimum + static_cast<int64_t>(high)};
+  }
+  // Sparse key domains keep extrema only for present runs. Prefix ranks
+  // translate domain positions without a second dense per-key array.
+  std::vector<uint64_t> key_bits;
+  std::vector<uint32_t> key_prefix;
+
+  [[nodiscard]] size_t BoundsOffset(int64_t key) const {
+    const uint64_t off =
+        static_cast<uint64_t>(key) - static_cast<uint64_t>(key_minimum);
+    const size_t count = BoundsCount();
+    if (key_bits.empty()) { return off < count ? off : count;
+}
+    const uint64_t word = off >> 6;
+    if (word >= key_bits.size()) { return count;
+}
+    const uint64_t bit = uint64_t{1} << (off & 63);
+    const uint64_t bits = key_bits[word];
+    if ((bits & bit) == 0u) { return count;
+}
+    return key_prefix[word] + std::popcount(bits & (bit - 1));
+  }
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
+
+  [[nodiscard]] bool MayOverlap(int64_t key, int64_t lower,
+                                int64_t upper) const {
+    const size_t off = BoundsOffset(key);
+    if (off >= BoundsCount() || lower > upper) { return false;
+}
+    const auto [lo, hi] = ValueBounds(off);
+    return lo <= upper && hi >= lower;
+  }
+
+  [[nodiscard]] bool MayExceed(int64_t key, int64_t threshold) const {
+    const size_t off = BoundsOffset(key);
+    return off < BoundsCount() && ValueBounds(off).second > threshold;
+  }
+};
+
 struct LSTableStore {
   static constexpr uint64_t kBuildByteLimit = uint64_t{4} << 30;
   static constexpr uint32_t kInvalidBlockIndex =
@@ -451,7 +550,16 @@ struct LSTableStore {
   std::shared_ptr<const PaxChunk> pax_chunk;
   bool is_persistent_tlcs{false};
   std::shared_ptr<const platform::MemoryMap> backing_mmap;
+  std::shared_ptr<ProcessMemoryCharge> memory_charge;
   std::string_view serialized_column_stats;
+
+  // One lazily built, budgeted index per store. Replacing the store after a
+  // layout/snapshot change also replaces this index; outstanding readers
+  // retain their own shared reference to the old image.
+  [[nodiscard]] std::shared_ptr<const LSTableIntegerRuns> IntegerRuns(
+      slot_t column) const;
+  [[nodiscard]] std::shared_ptr<const LSTableIntegerRunBounds> IntegerRunBounds(
+      slot_t key_column, slot_t value_column) const;
 
   [[nodiscard]] StatusOr<ExecResult> ExecuteFragment(
       const Fragment& fragment, Runtime runtime = Runtime::kNative) const;
@@ -478,6 +586,11 @@ struct LSTableStore {
     const auto& membership = integer_membership[column];
     return !membership || !membership->Reject(value);
   }
+
+ private:
+  mutable std::mutex integer_runs_mutex_;
+  mutable std::shared_ptr<const LSTableIntegerRuns> integer_runs_;
+  mutable std::shared_ptr<const LSTableIntegerRunBounds> integer_run_bounds_;
 };
 
 [[nodiscard]] std::shared_ptr<const LSTableStore> BuildLSTableStore(

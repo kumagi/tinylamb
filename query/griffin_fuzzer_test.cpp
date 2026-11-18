@@ -117,7 +117,9 @@ TEST(GriffinFuzzer, ReplayCommittedRegressionFiles) {
   if (dir == nullptr) {
     GTEST_SKIP() << "skipped";
   }
-  for (const std::string& path : ListTestFiles(dir)) {
+  const std::vector<std::string> paths = ListTestFiles(dir);
+  EXPECT_FALSE(paths.empty()) << "no .test files in " << dir;
+  for (const std::string& path : paths) {
     std::ifstream file(path);
     std::string text((std::istreambuf_iterator<char>(file)),
                      std::istreambuf_iterator<char>());

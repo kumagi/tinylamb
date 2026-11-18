@@ -130,11 +130,13 @@ bool IsKnownTimeZone(std::string_view name) {
 
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
                                              unsigned month, unsigned day,
-                                             int hour, int minute, int second) {
+                                             int hour, int minute, int second,
+                                             bool at_utc) {
   if (name.empty()) return std::nullopt;
   CFTimeZoneRef zone = FindZone(name);
   if (zone == nullptr) return std::nullopt;
   const int64_t local = LocalSeconds(year, month, day, hour, minute, second);
+  if (at_utc) return OffsetAtUtc(zone, local);
   // UTC offsets lie within +-1 day, so the instant `local` denotes falls in
   // (local - 1d, local + 1d); the offsets at both ends bracket any single
   // transition affecting it.
@@ -165,7 +167,8 @@ bool IsKnownTimeZone(std::string_view name) {
 
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
                                              unsigned month, unsigned day,
-                                             int hour, int minute, int second) {
+                                             int hour, int minute, int second,
+                                             bool at_utc) {
   if (name.empty()) {
     return std::nullopt;
   }
@@ -174,8 +177,13 @@ std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
     if (zone == nullptr) {
       return std::nullopt;
     }
-    const std::chrono::local_seconds local{std::chrono::seconds{
-        LocalSeconds(year, month, day, hour, minute, second)}};
+    const std::chrono::seconds seconds{
+        LocalSeconds(year, month, day, hour, minute, second)};
+    if (at_utc) {
+      return static_cast<int>(
+          zone->get_info(std::chrono::sys_seconds{seconds}).offset.count());
+    }
+    const std::chrono::local_seconds local{seconds};
     return static_cast<int>(zone->get_info(local).first.offset.count());
   } catch (...) {  // NOLINT(bugprone-empty-catch) runtime_error: unknown zone
     return std::nullopt;

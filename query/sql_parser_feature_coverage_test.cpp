@@ -1,7 +1,7 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 
 // Parser/AST-visitor coverage sweep: literal forms (hex, bytes, raw and
-// escaped strings), every expression node kind the visitor lowers, nested
+// escaped strings), a representative set of expression nodes the visitor lowers, nested
 // query shapes, ordinal ORDER/GROUP BY, multi-column USING, and the
 // diagnostics for malformed input.  Expectations were pinned against the
 // engine's ground truth.
@@ -29,8 +29,10 @@ namespace tinylamb {
 namespace {
 std::vector<Row> RunSql(SqlEngine* engine, TransactionContext* ctx,
                         const std::string& sql) {
-  // One retry for empty diagnostics: a failed Execute with no LastError is
-  // the external parse child being transiently unavailable under load.
+  // One retry for empty diagnostics: a failed Execute with no LastError can
+  // mean a transient parse child, but also a misconfigured/missing executable
+  // or a permanently crashing child. An empty message after the retry is not
+  // evidence that the first failure was transient.
   StatusOr<QueryResult> result = engine->Execute(*ctx, sql);
   if (!result.HasValue()) {
     if (engine->LastError().empty()) {

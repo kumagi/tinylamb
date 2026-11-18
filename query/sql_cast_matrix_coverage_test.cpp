@@ -158,6 +158,11 @@ TEST_F(SqlCastMatrixCoverageTest, DateConversions) {
   ExpectCastError("'2026-13-40' AS DATE");
   ExpectCastError("'not-a-date' AS DATE");
   ExpectSafeCastNull("'2026-02-30' AS DATE");
+  // DATE -> BOOL has no cast signature: the BOOL target maps onto INT64 at
+  // the type layer, and the int64 conversion below used to silently return
+  // the date's day number.
+  ExpectCastError("DATE '2026-09-22' AS BOOL");
+  ExpectSafeCastNull("DATE '2026-09-22' AS BOOL");
 }
 
 TEST_F(SqlCastMatrixCoverageTest, NullPropagatesThroughEveryCast) {

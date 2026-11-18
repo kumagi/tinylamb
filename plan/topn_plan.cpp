@@ -19,7 +19,10 @@ size_t TopNPlan::EmitRowCount() const {
   // LIMIT 0 yields zero rows: TopNExecutor never emits for an empty bound,
   // so the estimate must agree (the engine reads limit==0 as a real bound
   // here, unlike the unordered-limit paths that treat 0 as "unbounded").
-  if (limit_ == 0 && !with_ties_) {
+  // WITH TIES cannot rescue an empty bound either: ties extend only the
+  // rows inside the bound, and with 0 rows there is no boundary row to tie
+  // against (TopNExecutor::Materialize returns before any tie logic).
+  if (limit_ == 0) {
     return 0;
   }
   const size_t input = child_->EmitRowCount();

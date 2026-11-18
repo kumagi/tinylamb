@@ -39,10 +39,13 @@
 
 - 待機点: `WaitForDurable(レコード終端)`。AddLog 戻り値はレコード先頭 LSN
   であり恒久化地点ではない。
-- Abort 経路は恒久化を待たない。`staged_records_` を逆順にメモリへ適用し、
-  未コミット MVCC 版を破棄して、ログを書いた transaction には `kAbort` を追記する。
-  WAL の読み戻しや `read_undo_record` の待機はない。再起動は `kCommit` のある
-  transaction だけを再生するため、揮発した Abort レコードは loser の復元を招かない。
+- Abort 経路は恒久化を待たない。`staged_records_`（既定 4 MiB 以下の通常 Tx）を逆順に
+  メモリへ適用するか、大容量トランザクションでは WAL 読み戻しモード（`ADR 0008`、
+  `IsWalRereadMode()`）で `prev_lsn` 鎖を `Logger::TryCopyBuffered` /
+  `RecoveryManager::ReadLog` により逆順に辿って適用し、未コミット MVCC 版を破棄して、
+  ログを書いた transaction には `kAbort` を追記する。Abort の耐久化待機や再起動時 undo は無い。
+  再起動は `kCommit` のある transaction だけを再生するため、揮発した Abort レコードは
+  loser の復元を招かない。
 - read-only txn: 自前のログ書込はないが、観測版があれば右端の依存 LSN 待機が発生する。
   何も観測しなければ待機しない（依存 0）。
 - チェックポイント: transaction status / prev LSN は `transaction_table_lock`

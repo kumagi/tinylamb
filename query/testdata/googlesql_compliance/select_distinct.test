@@ -278,7 +278,7 @@ ARRAY<STRUCT<INT64>>[{16}]
 ==
 
 # Distinct values counts the same even when the columns are out of order.
-[name=count_distint_16_distinct_4B]
+[name=count_distinct_16_distinct_4B]
 SELECT COUNT(*)
 from (SELECT DISTINCT distinct_16, distinct_4B from TableDistincts)
 --

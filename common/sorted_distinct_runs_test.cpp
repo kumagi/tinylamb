@@ -49,6 +49,20 @@ TEST(SortedDistinctRunsTest, FiveMillionInputsUseBoundedRuns) {
   EXPECT_EQ(expected, kDomain);
 }
 
+TEST(SortedDistinctRunsTest, FailedMergeKeepsPriorRunsUsable) {
+  SortedDistinctRuns runs;
+  ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 2>{1, 3}));
+  // The second Add at level 0 triggers a Merge with the existing run.
+  SortedDistinctRuns::SetFailNextMergeForTest(true);
+  EXPECT_FALSE(runs.Add(std::array<uint64_t, 2>{2, 4}).ok());
+  SortedDistinctRuns::SetFailNextMergeForTest(false);
+
+  // The first run must still own its file: no moved-from NULL in levels_.
+  std::vector<uint64_t> result;
+  ASSERT_SUCCESS(runs.ForEach([&](uint64_t v) { result.push_back(v); }));
+  EXPECT_EQ(result, (std::vector<uint64_t>{1, 3}));
+}
+
 TEST(SortedDistinctRunsTest, CallbackExceptionsBecomeStatus) {
   SortedDistinctRuns runs;
   ASSERT_SUCCESS(runs.Add(std::array<uint64_t, 1>{1}));

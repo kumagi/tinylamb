@@ -311,7 +311,7 @@ size_t RuntimeFilterGroup::DistinctKeys() const {
 }
 
 size_t RuntimeFilterGroup::MemoryBytes() const {
-  size_t bytes = sizeof(*this) + dense_bits_.size() * sizeof(uint64_t);
+  size_t bytes = sizeof(*this) + (dense_bits_.size() * sizeof(uint64_t));
   for (const std::unique_ptr<RuntimeFilter>& part : parts_) {
     bytes += part->MemoryBytes();
   }
@@ -368,6 +368,26 @@ void RuntimeFilterBuilder::Observe(int64_t key) {
   // The key set is only ever read (deduped, sorted) at Build() time, so
   // append here keeps Observe O(1) and avoids a hash table per join.
   keys_.push_back(key);
+}
+
+void RuntimeFilterBuilder::Observe(std::span<const int64_t> keys) {
+  if (keys.empty()) { return;
+}
+  observations_ += keys.size();
+  int64_t low = keys.front(), high = keys.front();
+  for (int64_t key : keys) {
+    low = std::min(low, key);
+    high = std::max(high, key);
+  }
+  lo_ = has_key_ ? std::min(lo_, low) : low;
+  hi_ = has_key_ ? std::max(hi_, high) : high;
+  has_key_ = true;
+  if (overflowed_ || keys.size() > kMaxTrackedKeys - keys_.size()) {
+    overflowed_ = true;
+    std::vector<int64_t>().swap(keys_);
+    return;
+  }
+  keys_.insert(keys_.end(), keys.begin(), keys.end());
 }
 
 void RuntimeFilterBuilder::ObserveNull() {

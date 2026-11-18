@@ -113,6 +113,10 @@ class WindowExecutor : public ExecutorBase {
   // these in place while computed_ stays false; the next EnsureComputed
   // resumes from here instead of appending duplicate columns.
   size_t appended_columns_{0};
+  // The buffered shape drains its child once. Kept separate from
+  // appended_columns_ because the batch evaluator appends all columns at once,
+  // so a call failure can leave appended_columns_ at 0 with rows_ still valid.
+  bool buffered_input_ready_{false};
   Options options_;
   bool spill_enabled_{false};
   bool drained_{false};

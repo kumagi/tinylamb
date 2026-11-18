@@ -105,8 +105,8 @@ SQL 標準における `UNION` は bag（多重集合）ではなく set（集�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp` / `plan/cascades_rules_coverage_test.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算が項数を検証し、子への不要な物理プロパティ伝播を行わないことを検証。
-  - `CascadesTest.UnionDistinctRewriteAddsUnionAllAndDistinctAlternative` / `CascadesTest.UnionDistinctHashSortChoice`: `UNION` に対して直接実装と `UNION ALL + DISTINCT` 展開が競合・選択される挙動を検証。
+  - `CascadesTest.UnionDistinctRewriteAddsUnionAllAndDistinctAlternative` / `CascadesRulesCoverageTest.UnionDistinctRemovesDuplicates`: `UNION` に対して直接実装と `UNION ALL + DISTINCT` 展開が競合・選択され、重複が正しく排除される挙動を検証。
 - `plan/plan_test.cpp`:
   - `PlanTest.SetOperationPlanPublishesNumericCommonSchema`: 複数入力間で共通の出力スキーマが正しく決定・公開されることを検証。

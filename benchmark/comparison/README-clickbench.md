@@ -8,7 +8,111 @@ ClickBenchの全43クエリを、同じParquetからロードしたtinylambとDu
 
 目標は、正答を確認した全43クエリでDuckDBより短時間になること。
 `--reference duckdb`の`target_achieved`は全43件の勝利を要求し、合計だけでは達成扱いにしない。
-現在は100万行・500万行の開発用部分データで改善中。標準規模の約1億行は未測定。
+100万行・500万行に加え、1000万行（標準の約1/10）を測定済み。標準規模の約1億行は未測定。
+
+## 1000万行・JIT最適化と集計経路の再構成（2026-11-13着手、最新）
+
+同じ固定バイナリ、warmup 1＋7回。8コアはCPU 0〜7、1コアはCPU 0。
+全4比較で43/43件の結果一致を確認した。値はクエリ中央値の合計。
+
+| Comparison | Cores | Tinylamb ms | Reference ms | Reference / Tinylamb | Individual wins |
+|---|---:|---:|---:|---:|---:|
+| ClickHouse | 8 | 742.468 | 1038.330 | 1.398x | 21/43 |
+| ClickHouse, reversed order | 8 | 740.689 | 1034.845 | 1.397x | 22/43 |
+| DuckDB | 8 | 735.071 | 1501.914 | 2.043x | 22/43 |
+| DuckDB | 1 | 3272.270 | 8621.261 | 2.635x | 21/43 |
+
+ClickHouseに対しては、比較順を反転した再測定でもTinylambが約1.40倍高速。
+直前の完成実装2790.978 msから約3.76倍、1→8コア加速は約4.45倍。
+全クエリ勝利と圧倒的な差は未達。クエリ別速度比の幾何平均は、
+ClickHouse 1.454倍（逆順1.455倍）、
+DuckDB 8コア1.288倍、1コア1.901倍。
+
+LLVM IRへホスト対応O3を通して個別整数カーネルをAOT相当へ改善。
+ClickBenchでは、辞書変換と部分集計のループ統合、DISTINCTの並列マージ、
+担当別TopN、派生キーの並列評価、統計カウンタのfalse sharing解消が効いた。
+さらに選択的COUNTの集計方式を切り替えて全辞書分の初期化を避け、
+整数辞書の正確な頻度情報を集計・COUNT DISTINCTに再利用した。
+Q37は約40→9.93 ms、Q39は約28.8→4.21 ms、Q16/Q36は約32→8.19/7.65 ms。
+
+初回の列ストア・辞書頻度・厳密な一意性メタデータ構築とコンパイルは計測外。
+SQL結果キャッシュは使わない。SQL全体の融合JIT/WASMは未実装であり、
+診断用の融合AOTループの8.90倍をSQL JITの成果として扱わない。
+同じCPU条件での比較で、メモリ上限は同一ではない。主測定のTinylamb最大RSSは
+50.82 GiB（列ストア等を含む）。詳しくは[計測記録](../../docs/jit_profile.md)。
+
+成果物は `build/benchmarks/clickbench-jit-20261113/`。
+`report-comparison/comparison.png` と `REPORT.md` に全43件比較、
+`report/` に変更前後・JIT診断のグラフとプロファイルの説明を保存。
+`candidate9-*/results.jsonl` は全測定値、`run.json` はバイナリhash・CPU・計時条件。
+`final-validation.json` と隣接ログが最終検証。初回の `validation.json` にある
+JIT呼び出し時のUBSan失敗は修正し、candidate9のASan/UBSanログで再検証済み。
+
+最終検証（2026-11-14 JST）: 全体ctest 3,991件で失敗0・既存skip 3、
+SQL oracle 1,024反復成功。ASan/UBSanは実行器233・関連回帰24・JIT 8・辞書走査1件、
+TSanは対象5件成功。Python 18件、layering（既存79・追加0）、diff checkも成功。
+
+## 1000万行・集約の担当分配と辞書述語の並列化（前段、2026-11-13）
+
+同じ1000万行・CPU 0〜7で1/2/4/8スレッドを測定。変更後はwarmup 1＋7回、
+全条件で全43クエリの全回答を検証した。変更前はwarmup 1＋3回の診断値。
+
+| スレッド | Tinylamb変更前 ms | Tinylamb変更後 ms | DuckDB ms | ClickHouse ms |
+|---:|---:|---:|---:|---:|
+| 1 | 11320.884 | 7618.326 | 8707.644 | 5844.481 |
+| 2 | 8200.532 | 4681.412 | 5159.884 | 2976.177 |
+| 4 | 6492.175 | 3377.006 | 2541.771 | 1648.602 |
+| 8 | 5585.338 | 2796.160 | 1521.614 | 1031.824 |
+
+ClickHouse列は独立した7回測定。8スレッドの別のpaired runでも全43件一致、
+Tinylamb 2790.978 / ClickHouse 1045.136 ms。勝利数はDuckDB 7/43、ClickHouse 11/43。
+合計では約2倍高速化したが、全クエリ勝利と圧倒的な性能差の目標は未達。
+
+`perf -e cycles:u`でQ33の直列再ハッシュを特定した。グループを先に担当分配し、
+ワーカー内で集約・TopNまで行うことで、8スレッドQ33は2132.517→120.769 ms。
+診断時の平均CPU使用は約2.7→7.0コア。複合辞書キーも直列再ハッシュを除去した。
+辞書述語の準備を並列化し、Q22は190.104→71.364 ms。
+整数等値の不在判定を狭い列キャッシュへ接続し、Q20は199.561→1.990 ms。
+Q29はコピーと割り当てを減らしても約1.1秒かかり、明確な高速化は得られていない。
+
+結果キャッシュなし。初回列構築は中央値の外。WASMはSQLエンジンに未統合。
+ビルド・テストと性能測定を分離した。計時境界とメモリ条件の差は下記と同じ。
+生のperf、全SQL・回答・測定値・バイナリ・ソース差分は
+`build/benchmarks/clickbench-parallel-20261113/` に保存。
+`report/scaling.png` / `REPORT.md` / `all-queries.csv` に変更前後を、
+`report-comparison/comparison.png` / `REPORT.md` に両エンジンとの全43件比較を示す。
+スケーリング図は同ディレクトリの `report_scaling.py` で再生成できる。
+
+検証: 全体ビルド成功、ctest 3987件で失敗0（既存skip 3）、ASan/UBSanは
+Executor 232件＋関連回帰20件、TSanは対象5件、SQL oracle 1024シード、
+Python 18件、layering lint成功。`validation-summary.json` にコマンドとログを保存。
+
+## 1000万行・TopNの遅延実体化（前段、2026-11-13）
+
+公式 `hits_0`〜`hits_9` の1000万行・105列、CPU 0–7、最大8スレッド、
+warmup 1＋7回。両比較とも全43クエリで全サンプルの回答一致を確認した。
+
+| 比較先 | Tinylamb合計 ms | 比較先合計 ms | Tinylamb勝利数 |
+|---|---:|---:|---:|
+| DuckDB 2.0.0 | 5664.964 | 1521.916 | 5/43 |
+| ClickHouse 26.10.2.103 | 5802.035 | 1042.593 | 9/43 |
+
+目標未達。TopNはキー・フィルタ列だけを準備し、勝者の行だけを復元するよう変更した。
+初回の列構築は計測外、クエリ結果キャッシュは使わない。CPU条件は共通だがメモリ上限と
+計時境界は異なり、等RSSの比較ではない。ClickHouseのサーバーTZもUTCと検証する。
+WASMスパイクはコンパイル済みコードの実行を別に測定しており、このSQLバイナリには未統合。
+
+成果物は `build/benchmarks/clickbench-tenth-20261113/` 以下。
+`final-duckdb` / `final-clickhouse` にSQL・バイナリ・全サンプルを保存し、
+`report-final/REPORT.md` / `comparison.png` / `comparison.svg` に集計した。
+グラフの再生成（出力先は未作成のディレクトリを指定）:
+
+```bash
+/var/tmp/tinylamb-comparison-venv/bin/python benchmark/comparison/clickbench_report.py \
+  --duckdb-run build/benchmarks/clickbench-tenth-20261113/final-duckdb \
+  --clickhouse-run build/benchmarks/clickbench-tenth-20261113/final-clickhouse \
+  --output build/benchmarks/clickbench-tenth-20261113/report-regenerated
+```
 
 ## 並列予算・分割処理と辞書サイズ判定（opt46、2026-11-11）
 

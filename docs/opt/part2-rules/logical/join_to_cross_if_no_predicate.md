@@ -90,8 +90,8 @@ $$L \bowtie_{\text{true}} R \equiv L \times R$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.RuleCanBeRemovedWithoutOptimizerChanges`: 結合列挙等を抑制した環境で、本 Rule によって root グループにクロス結合代替が生成されることを検証。
   - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の RuleSet に `join_to_cross_if_no_predicate` が登録されていることを検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.UnqualifiedJoinBecomesExplicitCrossJoin`: 修飾なし結合クエリが最終的に Cross Join 物理実装を選択することをエンドツーエンドで検証。

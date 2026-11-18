@@ -74,6 +74,12 @@ class RelationRenamePlan final : public PlanBase {
   }
   void Dump(std::ostream& o, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
+  [[nodiscard]] const std::string& RelationName() const noexcept {
+    return relation_;
+  }
+  [[nodiscard]] const std::string& PhysicalName() const noexcept {
+    return physical_;
+  }
 
  private:
   Plan src_;

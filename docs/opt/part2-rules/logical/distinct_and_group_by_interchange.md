@@ -103,6 +103,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.DistinctAndGroupByInterchangeBothDirections`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.DistinctAndGroupByInterchangeBothDirections`
   - 方向 1: `Distinct(Projection(scan))` から `grouping_sets` を保持する `kAggregation` 式が生成されることを検証。
   - 方向 2: 集約関数を含まない `kAggregation` から `Distinct(Projection)` 式が生成されることを検証。

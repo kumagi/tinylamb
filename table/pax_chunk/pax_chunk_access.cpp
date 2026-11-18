@@ -517,9 +517,9 @@ bool ParseModRegion(const char* r, uint32_t n, uint32_t param,
 // On-model value at absolute row `idx`; caller has validated the region and
 // idx < n. One u128 mulmod -- b*idx < 2^63 * 2^10 = 2^73 fits comfortably.
 int64_t ModValueAt(const ModRegion& p, uint32_t idx) {
-  const unsigned __int128 t = static_cast<unsigned __int128>(p.b) *
-                              static_cast<unsigned __int128>(idx) %
-                              static_cast<unsigned __int128>(p.m);
+  const platform::UInt128 t = static_cast<platform::UInt128>(p.b) *
+                              static_cast<platform::UInt128>(idx) %
+                              static_cast<platform::UInt128>(p.m);
   const uint64_t v = p.a + static_cast<uint64_t>(t);
   return static_cast<int64_t>(v >= p.m ? v - p.m : v);
 }
@@ -530,9 +530,9 @@ int64_t ModValueAt(const ModRegion& p, uint32_t idx) {
 // quantity stays under 2^82 for the region sizes this file calls it with
 // (n <= 1024, a,b < m <= 2^63), so unsigned __int128 cannot overflow.
 // (`a` is the intercept, `b` the slope.)
-unsigned __int128 ModFloorSum(unsigned __int128 n, unsigned __int128 a,
-                              unsigned __int128 b, unsigned __int128 m) {
-  unsigned __int128 ans = 0;
+platform::UInt128 ModFloorSum(platform::UInt128 n, platform::UInt128 a,
+                              platform::UInt128 b, platform::UInt128 m) {
+  platform::UInt128 ans = 0;
   while (true) {
     if (b >= m) {
       ans += (n / 2) * (n - 1) * (b / m);
@@ -543,7 +543,7 @@ unsigned __int128 ModFloorSum(unsigned __int128 n, unsigned __int128 a,
       a %= m;
     }
     // Now a < m and b < m: the largest numerator is b*(n-1) + a.
-    const unsigned __int128 y_max = (b * n) + a;
+    const platform::UInt128 y_max = (b * n) + a;
     if (y_max < m) {
       break;
     }
@@ -570,21 +570,22 @@ uint64_t ModInv(uint64_t u, uint64_t q) {
   if (q == 1) {
     return 0;
   }
-  __int128 t = 0;
-  __int128 newt = 1;
-  auto r = static_cast<__int128>(q);
-  auto newr = static_cast<__int128>(u % q);
+  platform::Int128 t = 0;
+  platform::Int128 newt = 1;
+  auto r = static_cast<platform::Int128>(q);
+  auto newr = static_cast<platform::Int128>(u % q);
   while (newr != 0) {
-    const __int128 quotient = r / newr;
-    const __int128 tmp = t - (quotient * newt);
+    const platform::Int128 quotient = r / newr;
+    const platform::Int128 tmp = t - (quotient * newt);
     t = newt;
     newt = tmp;
-    const __int128 rm = r - (quotient * newr);
+    const platform::Int128 rm = r - (quotient * newr);
     r = newr;
     newr = rm;
   }
-  const __int128 res = t % static_cast<__int128>(q);
-  return static_cast<uint64_t>(res < 0 ? res + static_cast<__int128>(q) : res);
+  const platform::Int128 res = t % static_cast<platform::Int128>(q);
+  return static_cast<uint64_t>(res < 0 ? res + static_cast<platform::Int128>(q)
+                                       : res);
 }
 
 // Canonical Int64RegionAt kMod arm, split out for the row path (lockstep
@@ -671,7 +672,7 @@ bool ParseLaneRegion(const char* r, uint32_t n, uint32_t param,
   const size_t hdr = LaneHeaderBytes(nd);
   // The header grows with nd (up to 264 bytes); the 40-byte floor above
   // only covers nd = 2. Bound it before reading the trailing fields.
-  if (static_cast<size_t>(region_end - r) < hdr) {
+  if (std::cmp_less(region_end - r, hdr)) {
     return false;
   }
   out->ischeme = static_cast<uint8_t>(r[hdr - 7]);
@@ -1486,9 +1487,9 @@ int64_t Int64RegionAt(const char* r, Scheme s, uint32_t param, uint32_t n,
       if (block_index >= parsed.block_count) {
         return 0;
       }
-      std::vector<uint64_t> decoded;
-      if (!AlpRdTansDecodeBlock(parsed, block_index, &decoded) ||
-          decoded.size() <= idx % kAlpRdTansBlockRows) {
+      std::array<uint64_t, kAlpRdTansBlockRows> decoded{};
+      if (!AlpRdTansDecodeBlock(parsed, block_index, decoded) ||
+          parsed.blocks[block_index].rows <= idx % kAlpRdTansBlockRows) {
         return 0;
       }
       return static_cast<int64_t>(decoded[idx % kAlpRdTansBlockRows]);
@@ -2703,7 +2704,7 @@ void InterpDecodeBlock(const InterpRegion& p, uint32_t b, int64_t* out) {
     uint64_t lo, hi;
   };
   std::array<Frame, kInterpMaxDepth> stack{};
-  int top = 0;
+  size_t top = 0;
   stack[top++] = {.i0 = s, .i1 = t, .lo = lo, .hi = hi};
   while (top > 0) {
     const Frame f = stack[--top];
@@ -2739,25 +2740,27 @@ void DecodeInterpAll(const InterpRegion& p, int64_t* out) {
 // extreme-bound neighbors go one past int64, mirroring the kArith arm's
 // window math). Returns false for an op outside the enum: a hostile caller
 // must fail closed like ScanMatch, not fall through to "everything".
-bool InterpWindowForValue(PaxChunk::CompareOp op, int64_t lit, __int128* plo,
-                          __int128* phi) {
-  *plo = static_cast<__int128>(INT64_MIN);
-  *phi = static_cast<__int128>(INT64_MAX);
+bool InterpWindowForValue(PaxChunk::CompareOp op, int64_t lit,
+                          platform::Int128* plo, platform::Int128* phi) {
+  *plo = static_cast<platform::Int128>(INT64_MIN);
+  *phi = static_cast<platform::Int128>(INT64_MAX);
   switch (op) {
     case PaxChunk::CompareOp::kEq:
-      *plo = *phi = static_cast<__int128>(lit);
+      *plo = *phi = static_cast<platform::Int128>(lit);
       break;
     case PaxChunk::CompareOp::kLe:
-      *phi = static_cast<__int128>(lit);
+      *phi = static_cast<platform::Int128>(lit);
       break;
     case PaxChunk::CompareOp::kLt:
-      *phi = static_cast<__int128>(lit) - 1;  // INT64_MIN -> unsatisfiable
+      *phi =
+          static_cast<platform::Int128>(lit) - 1;  // INT64_MIN -> unsatisfiable
       break;
     case PaxChunk::CompareOp::kGe:
-      *plo = static_cast<__int128>(lit);
+      *plo = static_cast<platform::Int128>(lit);
       break;
     case PaxChunk::CompareOp::kGt:
-      *plo = static_cast<__int128>(lit) + 1;  // INT64_MAX -> unsatisfiable
+      *plo =
+          static_cast<platform::Int128>(lit) + 1;  // INT64_MAX -> unsatisfiable
       break;
     default:
       return false;
@@ -2772,9 +2775,9 @@ bool InterpWindowForValue(PaxChunk::CompareOp op, int64_t lit, __int128* plo,
 // desyncing), but callers skip blocks whose checkpoint BRACKET misses the
 // window whole, so a clustered monotone column answers a range predicate by
 // walking only the boundary blocks.
-void InterpEvalBlock(const InterpRegion& p, uint32_t b, __int128 plo,
-                     __int128 phi, uint64_t* bits, bool want_sum,
-                     uint64_t* cnt_out, __int128* sum_out) {
+void InterpEvalBlock(const InterpRegion& p, uint32_t b, platform::Int128 plo,
+                     platform::Int128 phi, uint64_t* bits, bool want_sum,
+                     uint64_t* cnt_out, platform::Int128* sum_out) {
   const uint32_t s = b * kInterpBlockRows;
   const uint32_t t = std::min(p.n, (b + 1) * kInterpBlockRows);
   if (s >= t || b >= p.ncp) {
@@ -2797,10 +2800,10 @@ void InterpEvalBlock(const InterpRegion& p, uint32_t b, __int128 plo,
     uint64_t lo, hi;
   };
   std::array<Frame, kInterpMaxDepth> stack{};
-  int top = 0;
+  size_t top = 0;
   stack[top++] = {.i0 = s, .i1 = t, .lo = lo, .hi = hi};
   uint64_t cnt = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   while (top > 0) {
     const Frame f = stack[--top];
     if (f.i0 >= f.i1) {
@@ -2810,7 +2813,8 @@ void InterpEvalBlock(const InterpRegion& p, uint32_t b, __int128 plo,
     const int w = BitsNeeded(f.hi - f.lo);
     const uint64_t code = w > 0 ? br.get(w) : 0;
     const auto v = static_cast<int64_t>(f.lo + code);
-    if (static_cast<__int128>(v) >= plo && static_cast<__int128>(v) <= phi) {
+    if (static_cast<platform::Int128>(v) >= plo &&
+        static_cast<platform::Int128>(v) <= phi) {
       ++cnt;
       if (want_sum) {
         sum += v;
@@ -5054,18 +5058,26 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
       return lo < n;
     }
     case Scheme::kPBitS: {
-      if (n == 0) {
-        *pos = 0;
+      // PBitS preserves stored value order, so a binary search over the
+      // parsed region is correct (O(log n) probes instead of O(n) linear).
+      // Parse once outside the probe loop: PBitSValueAt is random-access on
+      // the parsed region.
+      PBitSRegion parsed;
+      if (n == 0 || !ParsePBitSRegion(r, n, param, region_end, &parsed)) {
+        *pos = n;
         return false;
       }
-      for (uint32_t i = 0; i < n; ++i) {
-        if (Int64RegionAt(r, s, param, n, i, region_end) >= key) {
-          *pos = i;
-          return true;
+      uint32_t lo = 0, hi = n;
+      while (lo < hi) {
+        const uint32_t mid = lo + ((hi - lo) / 2);
+        if (PBitSValueAt(parsed, mid) < key) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
         }
       }
-      *pos = n;
-      return false;
+      *pos = lo;
+      return lo < n;
     }
     case Scheme::kDeltaPfor: {
       DeltaPForRegion p;
@@ -5700,11 +5712,10 @@ bool RegionLowerBound(const char* r, Scheme s, uint32_t param, uint32_t n,
         const uint32_t cnt = kSimple8bSelCount[sel];
         const uint32_t bits = kSimple8bSelBits[sel];
         for (uint32_t j = 0; j < cnt && idx < n; ++j, ++idx) {
-          const uint64_t off =
-              bits == 0 ? 0
-                        : (word >> (bits * (cnt - 1 - j))) &
-                              ((UINT64_C(1) << bits) - 1);
-          if (static_cast<int64_t>(base_u + off) >= key) {
+          const uint64_t off = bits == 0 ? 0
+                                         : (word >> (bits * (cnt - 1 - j))) &
+                                               ((UINT64_C(1) << bits) - 1);
+          if (std::cmp_greater_equal(static_cast<int64_t>(base_u + off), key)) {
             *pos = idx;
             return true;
           }

@@ -161,7 +161,7 @@ DISTINCT の処理対象行・集合演算の中間バッファが縮みます�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part3.cpp` の
   `CascadesTest.PushFilterPastSetopRejectsUnresolvedQualifier` —
   修飾子が分岐にないときの不発。
 - `CascadesTest.PushFilterPastSetopRejectsUnqualifiedColumnMissingInBranch`

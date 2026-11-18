@@ -116,7 +116,7 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
   Its `EmitExecutor` takes `IndexOnlyScanPlan`'s stale-key gate around a read
   guard for EVERY participant, acquired in one index-root order.
 - Rule families: `ExpressionRuleSet::Default` (folds, De Morgan, comparison
-  canonicalization…) → `cascades::RuleSet::Default` (86 logical equivalences:
+  canonicalization…) → `cascades::RuleSet::Default` (95 logical equivalences:
   join commutativity/associativity/enumeration, selection merge/pushdown,
   set-op transparency…) → `implementation_rules.{hpp,cpp}`
   (`DefaultImplementationRules`: range-sliced Index/Bitmap/MinMax, Hash/Merge/
@@ -152,8 +152,13 @@ concrete `EmitExecutor` bodies live in `executor/relational_factory.cpp`
 
 ## Normative doc
 
-`docs/cascades_optimizer.md` (+ `docs/optimizer_todo.md`,
-`docs/optimizer_improvements.md`).
+`docs/cascades_optimizer.md` (+ `docs/optimizer_improvements.md`,
+`docs/optimizer_rule_audit.md`; open items tracked in `TODO.md` and `ooca-v2.md`).
+
+Execution note: by default (`TINYLAMB_EXEC_ENGINE != legacy`), `SqlEngine`
+lowers the chosen `Plan` via `executor/pipeline_lowering.hpp` (or
+`query/grouped_pipeline_lowering.hpp` for grouped routes) rather than calling
+`PlanBase::EmitExecutor` directly.
 
 Remaining allowlisted edges: `plan/* -> query/query_data.hpp` (same CMake
 target), `plan/{product_plan,implementation_rules}.cpp ->
@@ -163,7 +168,8 @@ downward plan-to-relational dependency, not an allowlisted violation.
 `JoinKind` itself lives in `common/join_kind.hpp`; `executor/join_kind.hpp`
 is a compat include.
 
-Test: `./build/plan_test`, `optimizer_test`, `cascades_test`,
+Test: `./build/plan_test`, `optimizer_test` (`optimizer_test_part*.cpp`),
+`cascades_test` (`cascades_test_part*.cpp`),
 `late_materialization_join_plan_test`, `plan_extra_test`,
 `full_scan_plan_test`, `collation_property_test`, `sort_shape_test`,
 `aggregate_shape_test`, `window_shape_test`.

@@ -8,7 +8,8 @@
 |---|---|---|---|
 | 全走査 | `O(N)` | 通常は物理走査順 | 表の大部分を読む、利用可能な索引がない |
 | 並列全走査 | `O(N/P)` に調整費用を加える | ワーカー完了順 | 大きな表、順序不要、更新ロック不要 |
-| B+Tree 範囲走査 | `O(log N + M)` | キー昇順または降順 | 等値、範囲、順序利用、高選択度 |
+| TLCS カラムナ走査 (`ColumnarTlcsScanExecutor`) | 列投影・辞書/FOR/ゾーンマップで `O(N)` を圧縮 | 既定はファイル順（Top-N あり時はソート順） | 永続 TLCS ファイル上の分析スキャン・Top-N |
+| LSM-Tree 範囲走査 (`BPlusTree` 互換別名) | `O(log N + M)` | キー昇順または降順 | 等値、範囲、順序利用、高選択度 |
 | ビットマップ・ヒープ走査 | 索引候補作成と位置順ヒープ I/O | 物理行位置順 | 複数索引条件の AND/OR、中程度の選択度 |
 | TID 走査 | 指定位置数に比例 | 指定位置を整列した順 | 物理行位置が既知 |
 | スキップ走査 | 異なるキーの数に概ね比例 | 索引キー順 | 索引上の重複を飛ばす重複除去 |
@@ -68,7 +69,7 @@
 
 ## 5. `IndexScan`：範囲索引走査
 
-`IndexScan` は B+Tree の開始キーと終了キーからカーソルを開き、昇順または降順に進める。キーは 1 列値だけでなく複合キーの値列を受け取れる。出力は索引キーだけでなく、索引項目が指す可視な表行全体である。
+`IndexScan` は `LsmIndex`（互換別名 `BPlusTree`）の開始キーと終了キーからカーソルを開き、昇順または降順に進める。キーは 1 列値だけでなく複合キーの値列を受け取れる。出力は索引キーだけでなく、索引項目が指す可視な表行全体である。
 
 `IN` 条件などでは、互いに離れた複数の範囲を一つの演算子に指定できる。一つの範囲を読み終えると次の範囲のカーソルを作り、すべての範囲を順に処理する。範囲はキー順に並ぶため、同じ区間を重複して探索せずに済む。
 
@@ -138,7 +139,7 @@
 
 ## 11. 定数、空行、および数列の入力
 
-この節の演算子が生成する値は、格納済みの行に対応しない。`ValuesExecutor`、`ConstantExecutor`、`GenerateSeriesExecutor` の行 API は、渡された `RowPosition` を書き換えない。直接呼び出す場合は、以前の有効位置が残った変数を再利用できない。既定のバッチ変換は、行ごとに新しい無効位置を作る。
+この節の演算子が生成する値は、格納済みの行に対応しない。`ValuesExecutor`、`ConstantExecutor`、`EmptyResultExecutor` の行 API は、渡された `RowPosition` を書き換えない。直接呼び出す場合は、以前の有効位置が残った変数を再利用できない。既定のバッチ変換は、行ごとに新しい無効位置を作る。
 
 ### `ValuesExecutor`
 
@@ -177,3 +178,7 @@
 `TableSampleExecutor`（`executor/table_sample.*`、`plan/sample_plan.hpp` 経由で配線）は、子演算子を包んで `TABLESAMPLE` の行を返す。方式は `BERNOULLI`（行ごとの確率判定）、`RESERVOIR`（優先度付きリザーバで指定行数を均等抽出）、`SYSTEM`（ブロック/パーティション単位の抽出）の三種で、単位は `PERCENT` または `ROWS` を取る。`WITH WEIGHT` 指定時は末尾に `DOUBLE` の重み列を追加する。
 
 `RESERVOIR` は行を `(priority, ordinal, partition)` で管理し、パーティションハッシュは `CanonicalDistinctValue` 正規化済みの行値に対する FNV-1a で計算する。サンプルは非決定的であり、同一問い合わせの再実行で行集合は変わり得る。
+
+## 16. `ColumnarTlcsScanExecutor`：永続 TLCS カラムナ直接走査
+
+`ColumnarTlcsScanExecutor`（`executor/columnar_tlcs_scan_executor.{hpp,cpp}`）は、永続 TLCS カラムナファイル（`table/tlcs_file.hpp`）上の単純走査・選択・射影・Top-N を、行オブジェクト化や一般 `ExecutorBase` 演算子木を経由せず列形式で直接処理する高速経路である。`FullScan` と同じく `NextBatch` を提供し、ディレクトリグループ単位のゾーンマップ・狭い辞書・`kFor` / `kRawDouble` / `kVarChar` 符号化を活用する（`TINYLAMB_DEBUG_TLCS` で診断トレース有効化）。

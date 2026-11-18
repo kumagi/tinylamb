@@ -1795,7 +1795,7 @@ ARRAY<STRUCT<a ARRAY<>>>[unknown order:
 ]
 ==
 
-# In this test, the arrays have no guarenteed internal order, so whether the two
+# In this test, the arrays have no guaranteed internal order, so whether the two
 # rows group  is not knowable.
 [required_features=GROUP_BY_ARRAY]
 [name=array_group_by_on_incidentally_different_ordered_arrays_nested_in_structs]
@@ -1815,7 +1815,7 @@ ARRAY<STRUCT<a ARRAY<>>>[unknown order:
 NOTE: Reference implementation reports non-determinism.
 ==
 
-# In this test, the arrays have no guarenteed internal order, so whether the two
+# In this test, the arrays have no guaranteed internal order, so whether the two
 # rows group  is not knowable.
 [required_features=GROUP_BY_ARRAY,GROUP_BY_STRUCT]
 [name=array_group_by_on_incidentally_different_ordered_arrays_embedded_in_ordered_arrays]
@@ -1841,7 +1841,7 @@ ARRAY<STRUCT<a STRUCT<INT64, f ARRAY<>>>>[unknown order:
 NOTE: Reference implementation reports non-determinism.
 ==
 
-# In this test, the arrays have no guarenteed internal order, so whether the two
+# In this test, the arrays have no guaranteed internal order, so whether the two
 # rows group  is not knowable.
 [required_features=GROUP_BY_ARRAY,GROUP_BY_STRUCT]
 [name=array_group_by_on_incidentally_different_ordered_arrays]

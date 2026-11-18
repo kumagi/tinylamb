@@ -4,9 +4,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "common/exc_shim.hpp"
+#include "executor/detail/columnar_table.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
@@ -27,7 +30,13 @@ struct ExecutionRuntime;
 struct Relation {
   Schema schema;
   std::vector<Row> rows;
+  // Structure-of-Arrays columnar batches. Producers may leave `rows` empty and
+  // populate `columnar` instead; legacy consumers materialize `rows` via
+  // EnsureRowsMaterialized() when needed, while columnar operators consume
+  // `columnar` directly with zero Row/Value boxing.
+  std::shared_ptr<const ColumnarTable> columnar;
   std::shared_ptr<SpillFile> spill;
+  std::vector<std::shared_ptr<SpillFile>> extra_spills;
   std::shared_ptr<SpillFile> spill_tail_;
   // USING join merge metadata: names whose duplicates across the joined
   // sides coalesce for bare references and star expansion.  Set by Join().
@@ -40,6 +49,10 @@ struct Relation {
   size_t join_comparisons{0};
   size_t peak_intermediate_rows{0};
   size_t spilled_rows_{0};
+  // True only when !HasSpill(), every row has schema.ColumnCount() cells,
+  // and every non-NULL cell matches its declared schema column ValueType
+  // (never kArray, never IsCaseInsensitive()).
+  bool uniform_cell_types{false};
 
   explicit Relation(ExecutionRuntime* runtime = nullptr) : runtime_(runtime) {}
   Relation(const Relation&) = delete;
@@ -48,12 +61,45 @@ struct Relation {
   Relation& operator=(Relation&& other) noexcept;
   ~Relation();
 
+  [[nodiscard]] bool HasColumnar() const noexcept {
+    return !HasSpill() && columnar != nullptr;
+  }
+
+  [[nodiscard]] bool HasColumnarOnly() const noexcept {
+    return !HasSpill() && rows.empty() && columnar != nullptr &&
+           columnar->total_rows > 0;
+  }
+
+  void SetColumnarTable(std::shared_ptr<const ColumnarTable> table,
+                        bool uniform_types);
+  [[nodiscard]] Status EnsureRowsMaterializedChecked();
+  void EnsureRowsMaterialized();
+
   void ReleaseCharge();
   [[nodiscard]] static bool HasAmpleMemoryBudget();
   void EnsureSpill();
   void AddRow(Row row);
+  void AddRowWithKnownBytes(Row row, size_t bytes, size_t flush_granularity) {
+    if (columnar == nullptr && !spill && !spill_tail_ && extra_spills.empty() &&
+        QueryMemoryBudget::Global().CanReserve(bytes + pending_charge_) &&
+        pending_charge_ + bytes < flush_granularity) [[likely]] {
+      uniform_cell_types = false;
+      charged_bytes_ += bytes;
+      pending_charge_ += bytes;
+      rows.push_back(std::move(row));
+      peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+      return;
+    }
+    AddRowSlowWithBytes(std::move(row), bytes, flush_granularity);
+  }
   void MergeInMemoryShard(Relation&& shard);
+  Status AdoptSpilledShard(Relation&& shard);
+  static Status MergeShardsInto(std::vector<Relation>& shards, Relation* out);
   Status FinishSpill();
+  Status TakeRowAndSpillBacking(
+      std::vector<Row>* out_rows,
+      std::vector<std::shared_ptr<SpillFile>>* out_spills);
+  [[nodiscard]] static size_t ChargeFlushGranularity();
   // Drop every buffered or spilled row (and its memory charge). Callers must
   // have copied the contents out beforehand (e.g. via ForEachRow); re-adding
   // rows afterwards starts a fresh spill cycle instead of appending to the
@@ -70,6 +116,19 @@ struct Relation {
   template <typename Fn>
   Status ForEachRow(Fn&& fn) {
     Status first{Status::kSuccess};
+    if (HasColumnarOnly()) {
+      Row scratch;
+      for (const ColumnarChunk& chunk : columnar->chunks) {
+        for (size_t r = 0; r < chunk.rows; ++r) {
+          chunk.MaterializeRowInto(r, &scratch);
+          fn(scratch);
+        }
+      }
+      if (spill_error_ != Status::kSuccess) {
+        first = spill_error_;
+      }
+      return first;
+    }
     for (const Row& row : rows) {
       fn(row);
     }
@@ -77,6 +136,14 @@ struct Relation {
       const Status st = spill->ForEachRow(fn);
       if (st != Status::kSuccess) {
         first = st;
+      }
+    }
+    for (const auto& extra : extra_spills) {
+      if (extra) {
+        const Status st = extra->ForEachRow(fn);
+        if (st != Status::kSuccess && first == Status::kSuccess) {
+          first = st;
+        }
       }
     }
     if (spill_tail_) {
@@ -94,6 +161,19 @@ struct Relation {
   template <typename Fn>
   Status ForEachRow(Fn&& fn) const {
     Status first{Status::kSuccess};
+    if (HasColumnarOnly()) {
+      Row scratch;
+      for (const ColumnarChunk& chunk : columnar->chunks) {
+        for (size_t r = 0; r < chunk.rows; ++r) {
+          chunk.MaterializeRowInto(r, &scratch);
+          fn(scratch);
+        }
+      }
+      if (spill_error_ != Status::kSuccess) {
+        first = spill_error_;
+      }
+      return first;
+    }
     for (const Row& row : rows) {
       fn(row);
     }
@@ -101,6 +181,14 @@ struct Relation {
       const Status st = const_cast<SpillFile*>(spill.get())->ForEachRow(fn);
       if (st != Status::kSuccess) {
         first = st;
+      }
+    }
+    for (const auto& extra : extra_spills) {
+      if (extra) {
+        const Status st = const_cast<SpillFile*>(extra.get())->ForEachRow(fn);
+        if (st != Status::kSuccess && first == Status::kSuccess) {
+          first = st;
+        }
       }
     }
     if (spill_tail_) {
@@ -120,14 +208,99 @@ struct Relation {
     return first;
   }
 
+  // Visit rows in ForEachRow() order but stop after `max_rows` rows.
+  // Spilled parts stream through independent buffered RowReaders so a
+  // sampling caller bounds the decode instead of paying a full pass.
+  template <typename Fn>
+  [[nodiscard]] Status ForEachRowBounded(size_t max_rows, Fn&& fn) const {
+    Status first{Status::kSuccess};
+    size_t seen = 0;
+    const auto drain = [&](const std::shared_ptr<SpillFile>& file) -> Status {
+      if (file == nullptr || seen >= max_rows) {
+        return Status::kSuccess;
+      }
+      ASSIGN_OR_RETURN(SpillFile::RowReader, reader, file->OpenRowReader());
+      Row row;
+      bool has_row = false;
+      while (seen < max_rows) {
+        RETURN_IF_FAIL(reader.Next(&row, &has_row));
+        if (!has_row) {
+          break;
+        }
+        ++seen;
+        fn(row);
+      }
+      return Status::kSuccess;
+    };
+    if (HasColumnarOnly()) {
+      Row scratch;
+      for (const ColumnarChunk& chunk : columnar->chunks) {
+        for (size_t r = 0; r < chunk.rows && seen < max_rows; ++r) {
+          chunk.MaterializeRowInto(r, &scratch);
+          ++seen;
+          fn(scratch);
+        }
+      }
+      if (spill_error_ != Status::kSuccess) {
+        first = spill_error_;
+      }
+      return first;
+    }
+    for (const Row& row : rows) {
+      if (seen >= max_rows) {
+        break;
+      }
+      ++seen;
+      fn(row);
+    }
+    if (const Status st = drain(spill); st != Status::kSuccess) {
+      first = st;
+    }
+    for (const auto& extra : extra_spills) {
+      if (const Status st = drain(extra);
+          st != Status::kSuccess && first == Status::kSuccess) {
+        first = st;
+      }
+    }
+    if (spill_tail_) {
+      const Status fs = const_cast<Relation*>(this)->FinishSpill();
+      if (fs != Status::kSuccess && first == Status::kSuccess) {
+        first = fs;
+      }
+      if (const Status st = drain(spill_tail_);
+          st != Status::kSuccess && first == Status::kSuccess) {
+        first = st;
+      }
+    }
+    if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
+      first = spill_error_;
+    }
+    return first;
+  }
+
   [[nodiscard]] bool HasSpill() const {
-    return spill != nullptr || spill_tail_ != nullptr;
+    return spill != nullptr || !extra_spills.empty() || spill_tail_ != nullptr;
+  }
+
+  // Bytes charged by AddRow-style paths; 0 when rows were assigned directly.
+  [[nodiscard]] size_t ChargedBytes() const noexcept { return charged_bytes_; }
+
+  [[nodiscard]] size_t EstimatedMemoryBytes() const noexcept {
+    if (HasColumnarOnly()) {
+      return columnar->EstimatedBytes();
+    }
+    return std::max(charged_bytes_, rows.size() * 64);
   }
 
   [[nodiscard]] size_t TotalRows() const {
-    size_t total = rows.size();
+    size_t total = HasColumnarOnly() ? columnar->total_rows : rows.size();
     if (spill) {
       total += spill->Count();
+    }
+    for (const auto& extra : extra_spills) {
+      if (extra) {
+        total += extra->Count();
+      }
     }
     if (spill_tail_) {
       total += spill_tail_->Count();
@@ -141,13 +314,66 @@ struct Relation {
   // separately built Relations) so the shared atomic stops being the
   // serialization point of every parallel scan/join row append.
   void FlushPendingCharge();
-  [[nodiscard]] static size_t ChargeFlushGranularity();
+  void AddRowSlowWithBytes(Row row, size_t bytes, size_t flush_granularity);
 
   ExecutionRuntime* runtime_{nullptr};
   Status spill_error_{Status::kSuccess};
   // charged_bytes_ = total estimate owned by this Relation; pending_charge_
   // is the not-yet-applied suffix of it.
   size_t pending_charge_{0};
+};
+
+struct ColumnTypeTracker {
+  bool seen_non_null{false};
+  bool mixed{false};
+  bool saw_unsafe{false};
+  ValueType type{ValueType::kNull};
+  bool is_unsigned{false};
+  bool is_interval{false};
+
+  void Observe(const Value& cell) {
+    if (cell.type == ValueType::kArray || cell.IsCaseInsensitive()) {
+      saw_unsafe = true;
+    }
+    if (cell.IsNull()) {
+      return;
+    }
+    if (!seen_non_null) {
+      seen_non_null = true;
+      type = cell.type;
+      is_unsigned = cell.IsUnsigned();
+      is_interval = cell.IsInterval();
+    } else if (type != cell.type || is_unsigned != cell.IsUnsigned() ||
+               is_interval != cell.IsInterval()) {
+      mixed = true;
+    }
+  }
+
+  void MergeFrom(const ColumnTypeTracker& other) {
+    saw_unsafe |= other.saw_unsafe;
+    if (other.mixed) {
+      mixed = true;
+      return;
+    }
+    if (!other.seen_non_null) {
+      return;
+    }
+    if (!seen_non_null) {
+      seen_non_null = true;
+      type = other.type;
+      is_unsigned = other.is_unsigned;
+      is_interval = other.is_interval;
+    } else if (type != other.type || is_unsigned != other.is_unsigned ||
+               is_interval != other.is_interval) {
+      mixed = true;
+    }
+  }
+
+  // Applies merged per-column type observations to `columns` and returns
+  // whether every column satisfies Relation::uniform_cell_types.
+  [[nodiscard]] static bool FinalizeColumns(
+      std::span<const std::vector<ColumnTypeTracker>> per_worker,
+      std::vector<Column>& columns);
 };
 
 using RelationPtr = std::shared_ptr<Relation>;

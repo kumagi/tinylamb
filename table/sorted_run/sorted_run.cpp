@@ -132,10 +132,12 @@ bool SortedRun::Entry::BuildRowInto(const std::vector<char>& blob,
   // DeserializeBounded clears *out's cells and refills them; a caller
   // feeding rows of a stable shape in a loop therefore reuses the cell
   // buffer (and its capacity) instead of allocating per row.
+  Row saved = *out;
   try {
     out->DeserializeBounded(blob.data() + row_offset_,
                             blob.size() - row_offset_, sc);
   } catch (const std::exception&) {
+    *out = std::move(saved);  // do not expose a half-decoded row
     return false;
   }
   return true;
@@ -198,12 +200,16 @@ StatusOr<Row> SortedRun::Find(std::string_view key, const Schema& sc) const {
 }
 
 std::string SortedRun::Iterator::Key() const {
-  assert(IsValid());
+  if (!IsValid()) {
+    throw std::invalid_argument("Key() on invalid SortedRun::Iterator");
+  }
   return GetEntry().BuildKey(parent_->Blob());
 }
 
 Row SortedRun::Iterator::Value() const {
-  assert(IsValid());
+  if (!IsValid()) {
+    throw std::invalid_argument("Value() on invalid SortedRun::Iterator");
+  }
   return GetEntry().BuildRow(parent_->Blob(), *schema_);
 }
 

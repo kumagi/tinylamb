@@ -168,7 +168,7 @@ Value MakeDoubleValue(ByteCursor& c) {
 }
 
 // Adversarial strings hitting the 8-byte group & continuation-flag boundaries
-// (0, 1, 7, 8, 9, 15, 16, 17, 24) and embedding NUL, 0x09, 0xFF, and ASCII
+// (0, 1, 2, 7, 8, 9, 15, 16, 17, 23, 24, 25) and embedding NUL, 0x09, 0xFF, and ASCII
 // case pairs, while avoiding spaces so VARCHAR never enters interval parsing.
 Value MakeVarCharValue(ByteCursor& c) {
   static constexpr std::array<size_t, 12> kLengths = {0,  1,  2,  7,  8,  9,

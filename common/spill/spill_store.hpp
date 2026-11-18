@@ -196,7 +196,7 @@ class SpillSegmentWriter {
   // Flushes remaining bytes and transfers ownership of the completed
   // `SpillSegmentId` to the caller (returns `kInvalidSpillSegmentId` if zero
   // bytes were written unless `EnsureOpen` was explicitly called with
-  // `keep_empty == true`).
+  // the keep-empty option).
   [[nodiscard]] StatusOr<SpillSegmentId> Finish(bool keep_empty = true);
 
   // Explicit cleanup discarding buffered data and dropping any opened segment.

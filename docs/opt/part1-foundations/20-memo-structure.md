@@ -128,15 +128,18 @@ struct LogicalExpression {
   std::shared_ptr<const SelectStatement> relational_statement{};
   Schema output_schema{};
 
-  // Extended payload fields for Window / Grouping / Marker / Assertion:
-  std::string marker_column{};
+  // Extended payload fields for Window / Grouping / Sample / RecursiveDepth:
   std::vector<Expression> partition_by{};
   std::vector<Expression> grouping_sets{};
   std::string unnest_alias{};
   std::string offset_alias{};
   std::string cte_name{};
-  double sample_rate{1.0};
-  bool is_bernoulli{false};
+  TableSampleMethod sample_method{TableSampleMethod::kBernoulli};
+  TableSampleUnit sample_unit{TableSampleUnit::kPercent};
+  Expression sample_size{};
+  std::optional<Expression> sample_seed{};
+  bool sample_with_weight{false};
+  std::string sample_weight_alias{};
   size_t depth_limit{0};
   std::optional<RecursiveDepthSpec> depth_spec{};
 
@@ -159,7 +162,7 @@ Group の実体は `Group` 構造体です（`plan/cascades.hpp`）。
 struct Group {
   GroupId id{kInvalidGroup};
   std::vector<std::string> relations{};
-  std::vector<LogicalExpression> expressions{};
+  LogicalExpressionList expressions{};
   // Single-relation conjuncts of the query predicate, applied by every scan
   // implementation of this group (D1: the group, not the expression, owns the
   // scan filter so all alternatives filter identically).
@@ -169,7 +172,14 @@ struct Group {
   // Non-empty for derived root-layer groups (Selection/Projection/
   // Aggregation/Limit chains); distinguishes groups that share a relation set.
   std::string tag{};
+  std::vector<ColumnName> dynamic_filter_keys{};
+  std::vector<ColumnName> semi_reduction_probe_keys{};
+  bool sample_barrier{false};
+  bool branch_local{false};
   LogicalProperties logical_properties{};
+  std::optional<size_t> logical_properties_expression_count{};
+  bool logical_properties_stale{true};
+  std::vector<GroupId> logical_property_dependents{};
 };
 ```
 

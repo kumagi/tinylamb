@@ -8,9 +8,23 @@ enum header `type/value_type.hpp`, allowlisted).
 
 - `status_or.hpp` — `StatusOr<T>` + 3-arg macros `ASSIGN_OR_RETURN(type,
   value, expr)`, `ASSIGN_OR_ASSERT_FAIL[_CONST]`, `ASSIGN_OR_CRASH[_CONST]`,
-  `COERCE`. **DB logic never throws**; return `Status`/`StatusOr`.
+  `COERCE`. **DB logic never throws**; return `Status`/`StatusOr` (`exc_shim.hpp`
+  and `exception_status.hpp` provide transitional test/boundary adapters only).
 - `constants.hpp` — canonical aliases: `lsn_t`/`txn_id_t`/`page_id_t` = u64,
-  `slot_t` = u16.
+  `slot_t` = u16, plus `StatusCode` (including `kMemoryLimitExceeded` and `kNoSpace`).
+- `memory_budget.{hpp,cpp}` — `ProcessMemoryBudget` global memory arbiter
+  (`kStorage`/`kColumnar`/`kQuery`/`kTx` pools, per-pool floors, RSS safety
+  threshold, `ReclaimStage` callbacks `kColumnar` -> `kCleanStorage` ->
+  `kSpillableQuery`). See ADR 0003.
+- `query_grant.{hpp,cpp}` — `QueryMemoryCoordinator`, `QueryMemoryGrant`,
+  `ActiveConsumerGuard`, `LocalBatchCache`, and `ComputeEffectiveDop`
+  (query admission control and operator budget division). See ADR 0004.
+- `spill/spill_store.{hpp,cpp}` — block-multiplexed `SpillStore` over
+  constant unlinked temp file descriptors (`OpenUnlinkedTempFile`), 64 KiB
+  blocks, free-block reuse, `TINYLAMB_TEMP_LIMIT_BYTES` cap (`kNoSpace`). See ADR 0005.
+- `incarnation.hpp`, `late_materialization.hpp`, `query_parallelism.hpp`,
+  `parallel_work.{hpp,cpp}`, `sorted_distinct_runs.{hpp,cpp}` — per-table
+  incarnation state, parallel task execution, and external sorted distinct helpers.
 - `encoder.hpp`/`decoder.hpp`, `serdes.{hpp,cpp}` — streaming `<<`/`>>` +
   primitives, big-endian fixed. Persistence base for WAL, pages, index keys.
 - `log_message.hpp` — `LOG(INFO/WARN/FATAL)` with file:line:func.
@@ -39,7 +53,8 @@ rely on libstdc++-only library features (`std::chrono::locate_zone`,
 - `endian.hpp` — `htobe64`/`be64toh` family (glibc `<endian.h>`, Apple
   `OSByteOrder`, or a portable fallback).
 - `file_io.hpp` — `DataSync` (fdatasync / `F_FULLFSYNC`), `AdviseDontNeed`,
-  `Preallocate`.
+  `Preallocate`, `OpenUnlinkedTempFile` (`O_TMPFILE` / unlinked `mkstemp`).
+- `process.{hpp,cpp}` — `CurrentProcessRssBytes` and process memory probes.
 - `socket.hpp` — `OpenSocket`/`AcceptSocket`/`OpenPipe` with atomic or
   fcntl-applied `FdFlags`, `SendNoSignal`, `InitSpawnAttributes`
   (`POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS).
@@ -60,4 +75,6 @@ kTooBigData/kDeleted/kCorrupt…`) and the macro forms above are the vocabulary
 of every layer — learn them first and the rest reads faster.
 
 Test: `./build/log_message_test`, `crc32c_test`, `serdes_test`,
-`runtime_filter_test`.
+`runtime_filter_test`, `memory_budget_test`, `query_grant_test`,
+`spill_store_test`, `ooc_scale_baseline_test` (label `scale`),
+`sorted_distinct_runs_test`, `parallel_work_test`, `status_or_test`.

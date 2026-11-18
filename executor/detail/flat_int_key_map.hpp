@@ -23,11 +23,11 @@ namespace tinylamb::relational_detail {
 //
 // Two slot layouts, chosen by T:
 //  - unsigned integral T (the group-index shape): a 16-byte {key, value}
-//    slot whose occupancy is value == kEmptyValue (uint64 max).  A 2.9M-group
+//    slot whose occupancy is value == std::numeric_limits<uint64_t>::max() (uint64 max).  A 2.9M-group
 //    fold holds ~50 MB of slots either way, but the 16-byte slot puts 4 of
 //    them per cache line instead of 2.67, which shrinks both the probe
 //    traffic and the Grow() rehash pass by a third.  Callers must never store
-//    kEmptyValue itself (group indices never do).
+//    std::numeric_limits<uint64_t>::max() itself (group indices never do).
 //  - any other T (including signed integers): the historical 24-byte
 //    {key, value, used} slot.
 //
@@ -114,6 +114,20 @@ class FlatIntKeyMap {
     if (next > Capacity()) {
       GrowTo(next);
     }
+  }
+
+  void Clear() {
+    if constexpr (kCompact) {
+      if (!slots_.empty()) {
+        std::fill(slots_.begin(), slots_.end(), EmptySlot());
+      }
+    } else {
+      for (Slot& slot : slots_) {
+        slot.used = 0;
+        slot.value = T{};
+      }
+    }
+    size_ = 0;
   }
 
  private:
@@ -209,7 +223,9 @@ class FlatIntKeyMap {
 // Duplicate keys re-probe to an occupied equal slot and are dropped.
 class FlatIntSet {
  public:
-  static constexpr uint64_t kMaxDenseSpan = 33'554'432ULL;
+  // Keep exact membership in at most 16 MiB instead of allocating a
+  // multi-gigabyte hash table for a wide but compact integer domain.
+  static constexpr uint64_t kMaxDenseSpan = 134'217'727ULL;
 
   [[nodiscard]] static size_t ReservationBytes(size_t members) {
     return sizeof(FlatIntSet) + (CapacityFor(members) * sizeof(Slot));
@@ -252,6 +268,44 @@ class FlatIntSet {
   [[nodiscard]] bool DenseOverflowed() const noexcept {
     return dense_overflow_.load(std::memory_order_relaxed);
   }
+
+  // A worker-local accumulator amortizes atomic updates for nearby keys.
+  // Writers may overlap arbitrarily; publication still waits for all writers
+  // to be destroyed, then calls FinalizeDenseBounds().
+  class DenseWriter {
+   public:
+    explicit DenseWriter(FlatIntSet& set) : set_(set) {}
+    DenseWriter(const DenseWriter&) = delete;
+    DenseWriter& operator=(const DenseWriter&) = delete;
+    ~DenseWriter() { Flush(); }
+
+    void Insert(int64_t key) noexcept {
+      if (!set_.dense_mode_ || key < set_.dense_min_ || key > set_.dense_max_) {
+        set_.dense_overflow_.store(true, std::memory_order_relaxed);
+        return;
+      }
+      const uint64_t offset =
+          static_cast<uint64_t>(key) - static_cast<uint64_t>(set_.dense_min_);
+      const auto word = static_cast<size_t>(offset >> 6);
+      if (word != word_) {
+        Flush();
+        word_ = word;
+      }
+      bits_ |= uint64_t{1} << (offset & 63);
+    }
+
+   private:
+    void Flush() noexcept {
+      if (bits_ == 0) { return;
+}
+      std::atomic_ref<uint64_t>(set_.dense_bits_[word_])
+          .fetch_or(bits_, std::memory_order_relaxed);
+      bits_ = 0;
+    }
+    FlatIntSet& set_;
+    size_t word_{0};
+    uint64_t bits_{0};
+  };
 
   void InsertDenseAtomic(int64_t key) noexcept {
     if (!dense_mode_ || key < dense_min_ || key > dense_max_) {

@@ -24,14 +24,21 @@
 #include <vector>
 
 TEST(LogMessageTest, Log_WithSurvivableSeverities_StreamsWithoutError) {
-  LOG(ERROR) << "ERROR";
-  LOG(ALERT) << "ALERT";
-  LOG(WARN) << "WARN";
-  LOG(NOTICE) << "NOTICE";
-  LOG(INFO) << "INFO";
-  LOG(USER) << "USER";
-  LOG(DEBUG) << "DEBUG";
-  LOG(TRACE) << "TRACE";
+  ::testing::internal::CaptureStderr();
+  LOG(ERROR) << "sev-ERROR";
+  LOG(ALERT) << "sev-ALERT";
+  LOG(WARN) << "sev-WARN";
+  LOG(NOTICE) << "sev-NOTICE";
+  LOG(INFO) << "sev-INFO";
+  LOG(USER) << "sev-USER";
+  LOG(DEBUG) << "sev-DEBUG";
+  LOG(TRACE) << "sev-TRACE";
+  const std::string output = ::testing::internal::GetCapturedStderr();
+  for (const char* sev :
+       {"ERROR", "ALERT", "WARN", "NOTICE", "INFO", "USER", "DEBUG", "TRACE"}) {
+    EXPECT_NE(output.find(std::string("sev-") + sev), std::string::npos)
+        << "LOG(" << sev << ") produced no stderr output";
+  }
 }
 
 TEST(LogMessageTest, Log_WithFatalSeverity_AbortsProcess) {

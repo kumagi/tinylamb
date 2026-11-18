@@ -16,6 +16,7 @@
 
 #include "table/table_statistics.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -355,6 +356,98 @@ TEST_F(TableStatisticsTest, Correlation_RoundTrip_PreservesValue) {
   EXPECT_EQ(legacy.NonNullCount(), column.NonNullCount());
   EXPECT_EQ(legacy.Distinct(), column.Distinct());
   ASSERT_SUCCESS(context.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, Correlation_UsesCanonicalNaNOrder) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  TransactionContext ctx = db_->BeginContext();
+  // ORDER BY's canonical order ranks NaN before every other value, so a
+  // mid-chain NaN is a descent while a leading NaN is fully ascending.
+  // IEEE operator< cannot see either and used to call both chains ordered.
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, mid,
+      db_->CreateTable(ctx,
+                       Schema("NaNMid", {Column("v", ValueType::kDouble)})));
+  for (double v : {1.0, nan, 2.0}) {
+    ASSERT_SUCCESS(mid.Insert(ctx.txn_, Row({Value(v)})).GetStatus());
+  }
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, head,
+      db_->CreateTable(ctx,
+                       Schema("NaNHead", {Column("v", ValueType::kDouble)})));
+  for (double v : {nan, 1.0, 2.0}) {
+    ASSERT_SUCCESS(head.Insert(ctx.txn_, Row({Value(v)})).GetStatus());
+  }
+  ASSERT_SUCCESS(ctx.PreCommit());
+  {
+    TransactionContext stat_tx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "NaNMid"));
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "NaNHead"));
+    ASSERT_SUCCESS(stat_tx.PreCommit());
+  }
+  TransactionContext stats_ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, mid_stats,
+                              db_->GetStatistics(stats_ctx, "NaNMid"));
+  EXPECT_LT(mid_stats.Column(0).Correlation(), 1.0);
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, head_stats,
+                              db_->GetStatistics(stats_ctx, "NaNHead"));
+  EXPECT_DOUBLE_EQ(head_stats.Column(0).Correlation(), 1.0);
+  ASSERT_SUCCESS(stats_ctx.PreCommit());
+}
+
+TEST_F(TableStatisticsTest, BoundaryTrackersKeepCanonicalOrderWithNaN) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  TransactionContext ctx = db_->BeginContext();
+  // NaN is canonical-min under ORDER BY's total order, so it belongs at the
+  // head of `lowest` and the tail of `highest`; an IEEE-compare insert
+  // position used to strand it mid-list and break monotonicity.
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, tbl,
+      db_->CreateTable(ctx,
+                       Schema("NaNBounds", {Column("v", ValueType::kDouble)})));
+  for (double v : {5.0, nan, 1.0, nan, 3.0, nan, 2.0}) {
+    ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(v)})).GetStatus());
+  }
+  ASSERT_SUCCESS(ctx.PreCommit());
+  {
+    TransactionContext stat_tx = db_->BeginContext();
+    ASSERT_SUCCESS(db_->RefreshStatistics(stat_tx, "NaNBounds"));
+    ASSERT_SUCCESS(stat_tx.PreCommit());
+  }
+  TransactionContext stats_ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL_CONST(TableStatistics, stats,
+                              db_->GetStatistics(stats_ctx, "NaNBounds"));
+  const ColumnStats& column = stats.Column(0);
+
+  // All three NaN samples fold into one entry under the canonical sort.
+  EXPECT_EQ(column.Distinct(), 5U);
+
+  const auto& lowest = column.LowestValues();
+  ASSERT_EQ(lowest.size(), kBoundaryValueCount);
+  EXPECT_TRUE(std::isnan(lowest[0].value.value.double_value));
+  EXPECT_EQ(lowest[0].count, 3U);
+  EXPECT_EQ(lowest[1].value, Value(1.0));
+  EXPECT_EQ(lowest[2].value, Value(2.0));
+  EXPECT_EQ(lowest[3].value, Value(3.0));
+  EXPECT_EQ(lowest[4].value, Value(5.0));
+
+  // HighestValues() reports the top-k values smallest-first, so the
+  // canonical-min NaN leads there too.
+  const auto& highest = column.HighestValues();
+  ASSERT_EQ(highest.size(), kBoundaryValueCount);
+  EXPECT_TRUE(std::isnan(highest[0].value.value.double_value));
+  EXPECT_EQ(highest[0].count, 3U);
+  EXPECT_EQ(highest[1].value, Value(1.0));
+  EXPECT_EQ(highest[4].value, Value(5.0));
+
+  // Histogram bounds stay monotonic under the same canonical order — the
+  // EstimateJoinMatches non-overlap shortcut assumes it.
+  const auto& histogram = column.Histogram();
+  ASSERT_FALSE(histogram.empty());
+  for (size_t i = 1; i < histogram.size(); ++i) {
+    EXPECT_LT(CompareForOrderBy(histogram[i - 1].upper, histogram[i].lower), 0);
+  }
+  ASSERT_SUCCESS(stats_ctx.PreCommit());
 }
 
 TEST_F(TableStatisticsTest, LayoutGeneration_TracksTheMeasuredChain) {

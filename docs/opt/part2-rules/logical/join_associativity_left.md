@@ -105,9 +105,9 @@ std::vector<std::string> UnionRelations(const std::vector<std::string>& left,
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `AssociativityRulesEnumerateJoinOrdersWithoutEnumeration`: `join_enumeration` を無効化した状態で、結合交換則と 2 方向の結合則だけから全 6 通りの結合順序が導出されることを検証。
   - `JoinEnumerationPrunesDisconnectedBipartitions`: 枝刈り効果の検証において、本 Rule を除外した環境での挙動を評価。
   - `RuleCanBeRemovedWithoutOptimizerChanges`: 冗長な Rule セットから本 Rule を単独除外してもオプティマイザの決定性に異常が生じないことを検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `JoinChainMatchesGoldenResultUnderRuleSubsets`: 順序系 Rule の構成を変更してもクエリ結果の正確性が保たれることを検証。

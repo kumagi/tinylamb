@@ -59,7 +59,9 @@ class ByteStream {
     size_t shift = 0;
     for (int i = 0; i < 10; ++i) {
       const uint8_t b = U8();
-      result |= static_cast<size_t>(b & 0x7f) << shift;
+      if (shift < sizeof(size_t) * 8) {
+        result |= static_cast<size_t>(b & 0x7f) << shift;
+      }
       if ((b & 0x80) == 0) {
         break;
       }

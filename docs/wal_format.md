@@ -24,7 +24,7 @@ logs, and recycling validates the next retained record boundary.
 `CheckpointManager::WriteCheckpoint` chooses
 `min(buffered_end_at_capture, oldest_active_first_lsn)`, waits for WAL durability,
 and persists committed row/LSM state with that replay anchor in `<db>.db`.
-The snapshot magic is `TLSMCKP1`, version 2. It has no DPT/ATT and no checkpoint
+The snapshot magic is `TLSMCKP1`, version 4. It has no DPT/ATT and no checkpoint
 WAL records or `.last_checkpoint` sidecar are emitted. Successful publication
 allows whole WAL segments below the anchor to be recycled. There is no
 full-page-image geometry requirement or full-page-image retention term.
@@ -76,11 +76,13 @@ returns zero consumed bytes and is handled by recovery's tail policy.
 current checkpoint writer does not emit them. `kCompensateUpdate` is the only
 compensation enumerator; `kFullPageImage`, allocation CLRs, B+Tree and other
 legacy compensation types no longer exist. Runtime abort reverses staged
-in-memory records and appends `kAbort`; restart replays only `kCommit` owners.
+in-memory records (or walks the transaction's `prev_lsn` WAL chain in WAL
+re-read mode above 4 MiB, ADR 0008) and appends `kAbort`; restart replays only
+`kCommit` owners.
 
 ## Damaged tails
 
-The first unparseable record ends the valid prefix. Recovery returns `kCorrupt`
+The first unparsable record ends the valid prefix. Recovery returns `kCorrupt`
 for suspect damage unless explicit force truncation is enabled; it does not
 terminate the process with `LOG(FATAL)`.
 

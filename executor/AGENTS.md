@@ -14,9 +14,18 @@ CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
 
 ## Key files
 
-- `relational_factory.cpp` + `relational.{hpp,cpp}` — **the only place that
-  implements `Plan::EmitExecutor` bodies** (V4 split). New physical operator
-  = new `Plan` node + implementation rule + factory wiring here.
+- `relational_factory.cpp` + `relational.{hpp,cpp}` — legacy
+  `Plan::EmitExecutor` factory (V4 split, still active when
+  `TINYLAMB_EXEC_ENGINE=legacy`). New physical operator = `Plan` node +
+  implementation rule + factory + `PipelineLowering` wiring.
+- `pipeline_lowering.{hpp,cpp}` — **default execution lowering** (when
+  `TINYLAMB_EXEC_ENGINE` is unset or `!= legacy`): lowers physical `Plan` trees
+  into a topological `PipelineGraph` DAG of streaming sources and OOC spillable
+  sinks (`executor/detail/pipeline/`), returning a pullable root executor.
+- `columnar_tlcs_scan_executor.{hpp,cpp}` — direct columnar TLCS scan / Top-N
+  fast path.
+- `foreign_key.{hpp,cpp}` — foreign-key constraint enforcement (including
+  OOC `ExternalSorter` verification for bulk DML).
 - Scans: `full_scan`, `parallel_scan`, `index_scan`,
   `index_only_scan`, `parallel_index_scan` (morsel-driven parallel index
   scan over partitioned key ranges, morsel-ordered handoff),
@@ -165,10 +174,13 @@ CMake target `tinylamb_executor` also covers `plan/`, `executor/detail/`, and
 4. `executor/{apply,recursive_cte,unnest}.cpp + relational.cpp ->
    query/statement.hpp` is V3' debt — read-only, do not widen.
 
-Test: `./build/executor_test`, `relational_regression_test`,
+Test: `./build/executor_test` (`executor_test_part*.cpp`),
+`executor_feature_test` (`executor_feature_test_part*.cpp`),
+`relational_regression_test` (`relational_regression_test_part*.cpp`),
 `data_chunk_test`, `distinct_test`, `merge_append_test`, `sort_collation_test`,
 `sort_shape_executor_test`, `grouped_aggregate_test`,
 `late_materialization_join_test`, `hash_semi_reduction_test`,
-`multi_index_covering_scan_test`,
-`query_memory_test`, `spill_file_test`,
-`window_spill_test`, `executor_extra_test`.
+`multi_index_covering_scan_test`, `columnar_tlcs_fast_path_test`,
+`query_memory_test`, `spill_file_test`, `window_spill_test`,
+`ooc_primitives_test`, `pipeline_p3a_test`, `pipeline_p3b_test`,
+`executor_extra_test`.

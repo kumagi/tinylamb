@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "executor/detail/flat_int_key_map.hpp"
+#include "executor/detail/grouped_output_sink.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -72,6 +73,17 @@ bool SameSingleIntegerJoinKey(const Schema& left_schema,
                               const std::vector<slot_t>& left_columns,
                               const Schema& right_schema,
                               const std::vector<slot_t>& right_columns);
+
+// Refills `out` with left+right, reusing its capacity.  Nested-loop joins
+// evaluate residuals on every candidate pair; only matching pairs need an
+// owned Row, so the scratch avoids one heap allocation per rejected pair.
+inline void ConcatRowsInto(Row* out, const Row& left, const Row& right) {
+  auto& values = out->values_;
+  values.clear();
+  values.reserve(left.values_.size() + right.values_.size());
+  values.insert(values.end(), left.values_.begin(), left.values_.end());
+  values.insert(values.end(), right.values_.begin(), right.values_.end());
+}
 
 inline Row ConcatRows(const Row& left, const Row& right) {
   std::vector<Value> values;
@@ -155,6 +167,8 @@ size_t EstimateJoinRows(const Relation& left, const Relation& right,
 struct JoinKeyFrequencyMaps {
   bool single_int{false};
   bool composite_int{false};
+  bool hashed_key{false};
+  bool hashed_fallback{false};
   std::vector<slot_t> right_columns;
   size_t build_stride{1};
   FlatIntKeyMap<size_t> single_int_frequencies;
@@ -163,6 +177,12 @@ struct JoinKeyFrequencyMaps {
       int_frequencies;
 };
 
+// The cache is keyed by candidate *address* and holds frequency maps derived
+// from that relation's rows. INVARIANT: a cached candidate Relation must not be
+// mutated or move-assigned new contents while its cache survives. The greedy
+// join planner invalidates entries whenever it reuses a Relation slot for a
+// newly built join result (see build_input.cpp); any new caller that reassigns
+// a cached Relation must do the same.
 size_t EstimateJoinRowsCached(
     const Relation& left, const Relation& candidate,
     const std::vector<Expression>& predicates,
@@ -203,6 +223,7 @@ bool IsSubset(const std::unordered_set<size_t>& values,
 // classification); eligibility that needs the joined schema (bytecode
 // compilability) is re-checked at the join step.
 struct GroupedJoinFusionSpec {
+  GroupedOutputSink* output_sink{nullptr};
   // GROUP BY expressions, evaluated against the joined schema.
   std::vector<Expression> group_keys;
   // Aggregate call sites collected from SELECT and HAVING (order matters: it
@@ -228,7 +249,6 @@ struct GroupedJoinFusionSpec {
   bool fired{false};
   // Optional post-HAVING filter over a projected SUM column.
   bool post_having_active{false};
-  slot_t post_having_select_col{0};
   slot_t post_having_agg_slot{0};
   BinaryOperation post_having_op{BinaryOperation::kGreaterThan};
   bool post_having_is_self_sum_factor{false};
@@ -241,18 +261,33 @@ struct GroupedJoinFusionSpec {
   bool rollup_count_col_first{true};
   bool rollup_distribution_applied{false};
   std::vector<std::string> rollup_select_names;
+  // Emit a ColumnarTable directly when true (and output_sink is not active).
+  bool columnar_output{false};
+  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  //   (fused_antijoin_groupby_sound)
+  // When true on a JoinType::kLeft final join, accumulate ONLY unmatched left
+  // rows (dropping matched pairs without materializing or aggregating them).
+  bool anti_unmatched_only{false};
 };
 
-StatusOr<Relation> BuildInput(TransactionContext& context,
-                              const SelectStatement& statement,
-                              const Scope* outer, const CteMap& ctes,
-                              bool* where_fully_applied,
-                              GroupedJoinFusionSpec* fusion = nullptr,
-                              bool ignore_projection_star = false);
+struct PushedScanProjection;
+
+StatusOr<Relation> BuildInput(
+    TransactionContext& context, const SelectStatement& statement,
+    const Scope* outer, const CteMap& ctes, bool* where_fully_applied,
+    GroupedJoinFusionSpec* fusion = nullptr,
+    bool ignore_projection_star = false, bool columnar_output = false,
+    const PushedScanProjection* pushed_projection = nullptr,
+    bool* pushed_projection_applied = nullptr);
 
 size_t SpillPartitionOf(const std::string& key, size_t partitions);
 
 size_t SpillPartitionOf(int64_t key, size_t partitions);
+
+size_t SpillPartitionOfSalted(const std::string& key, size_t partitions,
+                              uint64_t salt);
+
+size_t SpillPartitionOfSalted(int64_t key, size_t partitions, uint64_t salt);
 
 }  // namespace tinylamb::relational_detail
 

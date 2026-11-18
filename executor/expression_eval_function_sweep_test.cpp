@@ -212,9 +212,9 @@ std::vector<Case> SweepCases() {
        {Value(std::string("[1]")), Value(std::string("$[3]")), Value(9)},
        0},
       {"json_insert", {kJson, Value(std::string("$.q")), Value(1)}, 1},
-      {"json_insert", {kJson, Value(std::string("$.a")), Value(1)}, 0},
+      {"json_insert", {kJson, Value(std::string("$.a")), Value(1)}, 1},
       {"json_replace", {kJson, Value(std::string("$.a")), Value(2)}, 1},
-      {"json_replace", {kJson, Value(std::string("$.zz")), Value(2)}, 0},
+      {"json_replace", {kJson, Value(std::string("$.zz")), Value(2)}, 1},
       {"json_remove", {kJson, Value(std::string("$.a"))}, 1},
       {"json_array", {Value(1), kStr}, 1},
       {"json_object", {Value(std::string("k")), Value(1)}, 1},
@@ -458,6 +458,71 @@ TEST_F(RelationalFunctionSweepTest, RegexpReplacementViewsKeepConversions) {
   }
 }
 
+// SAFE_CONVERT_BYTES_TO_STRING used to re-decode `\xHH`-shaped byte runs as
+// if they were string-literal escapes, silently shrinking valid UTF-8 data
+// that merely contained that text. The payload is raw bytes — string-literal
+// escapes were already expanded by the visitor — so valid UTF-8 maps to
+// itself and only invalid sequences become U+FFFD.
+TEST_F(RelationalFunctionSweepTest, SafeConvertBytesToStringKeepsRawBytes) {
+  // "\x41\x41\x42" as data is eight ASCII characters, not "AAB".
+  const std::string escaped = R"(\x41\x41\x42)";
+  EXPECT_EQ(
+      Evaluate("safe_convert_bytes_to_string", {Value(std::string(escaped))}),
+      std::make_optional(Value(std::string(escaped))));
+  // Valid multibyte UTF-8 round-trips untouched (all seven bytes: the
+  // four-byte astral sequence plus the complete three-byte one).
+  const std::string valid = std::string("\xF0\x90\x8C\xBC\xE2\x82\xA1");
+  EXPECT_EQ(
+      Evaluate("safe_convert_bytes_to_string", {Value(std::string(valid))}),
+      std::make_optional(Value(std::string(valid))));
+  // Invalid sequences (compliance golden b'\xe2\x28\xa1') replace per byte.
+  const std::string invalid = std::string("\xE2\x28\xA1", 3);
+  const std::optional<Value> replaced =
+      Evaluate("safe_convert_bytes_to_string", {Value(std::string(invalid))});
+  ASSERT_TRUE(replaced.has_value());
+  EXPECT_EQ(replaced->AsString(), std::string("\xEF\xBF\xBD(\xEF\xBF\xBD", 7));
+}
+
+// The byte-run validator above dropped the two UPPER bounds of the canonical
+// validator (query/googlesql_ast_visitor_expr.cpp IsValidUtf8Text): a lead of
+// 0xED kept no ceiling on the second byte, so surrogate half-sequences
+// (ED A0-BF .., U+D800-DFFF) were accepted as text, and a lead of 0xF4 had no
+// ceiling either, so anything above U+10FFFF (F4 90-BF ..) passed. Both shapes
+// are what CHR() refuses; the conversion must replace them with U+FFFD.
+TEST_F(RelationalFunctionSweepTest,
+       SafeConvertBytesToStringRejectsSurrogatesAndOverrange) {
+  // Surrogate half pairs: three invalid bytes -> three replacements, one per
+  // byte (the same granularity the b'\xe2\x28\xa1' case above pins).
+  const std::string surrogate =
+      std::string("\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD", 9);
+  EXPECT_EQ(Evaluate("safe_convert_bytes_to_string",
+                     {Value(std::string("\xED\xA0\x80", 3))}),
+            std::make_optional(Value(std::string(surrogate))));
+  EXPECT_EQ(Evaluate("safe_convert_bytes_to_string",
+                     {Value(std::string("\xED\xBF\xBF", 3))}),
+            std::make_optional(Value(std::string(surrogate))));
+  // Above U+10FFFF: four bytes -> four replacements.
+  EXPECT_EQ(Evaluate("safe_convert_bytes_to_string",
+                     {Value(std::string("\xF4\x90\x80\x80", 4))}),
+            std::make_optional(Value(std::string(
+                "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD", 12))));
+  // The new ceilings must not over-reject: U+D7FF is the last code point
+  // below the surrogate range and U+10FFFF the last there is, so both still
+  // round-trip untouched.
+  const std::string last_bmp = std::string("\xED\x9F\xBF", 3);
+  EXPECT_EQ(
+      Evaluate("safe_convert_bytes_to_string", {Value(std::string(last_bmp))}),
+      std::make_optional(Value(std::string(last_bmp))));
+  const std::string last_code_point = std::string("\xF4\x8F\xBF\xBF", 4);
+  EXPECT_EQ(Evaluate("safe_convert_bytes_to_string",
+                     {Value(std::string(last_code_point))}),
+            std::make_optional(Value(std::string(last_code_point))));
+  // A truncated four-byte sequence still degrades per byte.
+  EXPECT_EQ(
+      Evaluate("safe_convert_bytes_to_string", {Value(std::string("\xF4", 1))}),
+      std::make_optional(Value(std::string("\xEF\xBF\xBD", 3))));
+}
+
 TEST_F(RelationalFunctionSweepTest, CanonicalPins) {
   struct Pin {
     const char* name;
@@ -470,6 +535,22 @@ TEST_F(RelationalFunctionSweepTest, CanonicalPins) {
        {Value(std::string("a")), Value(std::string("b"))},
        Value(std::string("ab"))},
       {"length", {Value(std::string("abcd"))}, Value(4)},
+      // LENGTH/CHAR_LENGTH/CHARACTER_LENGTH count Unicode code points;
+      // like the AST evaluator they skip orphan continuation bytes (0x80-0xBF).
+      {"length", {Value(std::string("\xC3\xA1"))}, Value(1)},
+      {"char_length", {Value(std::string("\xC3\xA1"))}, Value(1)},
+      {"character_length", {Value(std::string("\xC3\xA1"))}, Value(1)},
+      {"char_length",
+       {Value(std::string("a\x80"
+                          "b"))},
+       Value(2)},
+      // STRPOS counts code points before the byte match with the same
+      // continuation-byte-skip rule the AST evaluator uses.
+      {"strpos",
+       {Value(std::string("a\x80"
+                          "z")),
+        Value(std::string("z"))},
+       Value(2)},
       {"lower", {Value(std::string("AbC"))}, Value(std::string("abc"))},
       {"upper", {Value(std::string("AbC"))}, Value(std::string("ABC"))},
       {"reverse", {Value(std::string("abc"))}, Value(std::string("cba"))},
@@ -582,7 +663,13 @@ TEST_F(RelationalFunctionSweepTest, DeterminismAndNullPropagation) {
       "extract_year", "unix_date", "coalesce", "ifnull"};
   for (const std::string& name : null_tolerant_probe) {
     SCOPED_TRACE(name);
-    EXPECT_NO_THROW({ (void)Evaluate(name, {Value()}); });
+    std::optional<Value> result;
+    EXPECT_NO_THROW({ result = Evaluate(name, {Value()}); });
+    // Either NULL or a clean error is allowed; a fabricated non-NULL value
+    // (empty string, 0, "NULL") is the regression this pin must catch.
+    if (result.has_value()) {
+      EXPECT_TRUE(result->IsNull());
+    }
   }
 }
 
@@ -648,15 +735,15 @@ TEST_F(RelationalFunctionSweepTest, FixedCivilTimesMatchGeneralParser) {
   // +0000 retains the same UTC meaning but uses the general input parser.
   // Include century leap-year rules, both ends of the supported year range,
   // and day/week/month boundaries in positive and negative epochs.
-  for (const std::string& date :
+  for (const char* date :
        {"0001-01-01", "1582-10-15", "1900-02-28", "1969-12-31", "1970-01-01",
         "2000-02-29", "2024-02-29", "2024-12-31", "9999-12-31"}) {
-    for (const std::string& time : {"00:00:00", "12:34:56", "23:59:59"}) {
+    for (const char* time : {"00:00:00", "12:34:56", "23:59:59"}) {
       const std::string canonical =
           std::string(date).append(" ").append(time).append("+00");
-      for (const std::string& unit : {"year", "quarter", "month", "week", "day",
-                                      "hour", "minute", "second"}) {
-        for (const std::string& zone : {"UTC", "+05:30", "-03:30"}) {
+      for (const char* unit : {"year", "quarter", "month", "week", "day",
+                               "hour", "minute", "second"}) {
+        for (const char* zone : {"UTC", "+05:30", "-03:30"}) {
           SCOPED_TRACE(testing::Message()
                        << canonical << " " << unit << " " << zone);
           const auto fixed =
@@ -679,13 +766,13 @@ TEST_F(RelationalFunctionSweepTest, FixedCivilTimesMatchGeneralParser) {
       const std::string expected =
           std::string(date).append(" ").append(time, 0, 6).append("00+00");
       EXPECT_EQ(minute, std::make_optional(Value(std::string(expected))));
-      for (const std::string& unit : {"year", "month", "day"}) {
+      for (const char* unit : {"year", "month", "day"}) {
         // Bare DATE strings exercise the ten-byte form without a timestamp.
         const auto result = Evaluate(
             "datetime_trunc",
             {Value(std::string(date)), Value(std::string(unit)), Value("UTC")});
         const auto midnight = Evaluate(
-            "datetime_trunc", {Value(date + " 00:00:00"),
+            "datetime_trunc", {Value(std::string(date) + " 00:00:00"),
                                Value(std::string(unit)), Value("UTC")});
         ASSERT_TRUE(result.has_value());
         ASSERT_TRUE(midnight.has_value());
@@ -710,7 +797,7 @@ TEST_F(RelationalFunctionSweepTest, PackedUtcTruncationKeysMatchReference) {
     std::string zone;
   } restore(previous);
   SetDefaultTimeZone("UTC");
-  for (const std::string& unit : {"SECOND", "minutes", "HOUR", "day"}) {
+  for (const char* unit : {"SECOND", "minutes", "HOUR", "day"}) {
     const auto expression = FunctionCallExp(
         "timestamp_trunc", {ColumnValueExp("s"), ColumnValueExp(unit),
                             ConstantValueExp(Value("UTC"))});
@@ -724,12 +811,12 @@ TEST_F(RelationalFunctionSweepTest, PackedUtcTruncationKeysMatchReference) {
               compiled);
     int64_t last_key = 0;
     std::string last_text;
-    for (const std::string& date :
+    for (const char* date :
          {"0001-01-01", "1582-10-15", "1900-02-28", "1969-12-31", "1970-01-01",
           "2000-02-29", "2024-02-29", "9999-12-31"}) {
-      for (const std::string& time : {"00:00:00", "12:34:56", "23:59:59"}) {
-        for (const std::string& separator : {" ", "T"}) {
-          for (const std::string& suffix : {"", "+00"}) {
+      for (const char* time : {"00:00:00", "12:34:56", "23:59:59"}) {
+        for (const char* separator : {" ", "T"}) {
+          for (const char* suffix : {"", "+00"}) {
             std::string text = date;
             text += separator;
             text += time;
@@ -752,7 +839,7 @@ TEST_F(RelationalFunctionSweepTest, PackedUtcTruncationKeysMatchReference) {
         }
       }
     }
-    for (const std::string& text :
+    for (const char* text :
          {"", "2024-01-01", "2024-01-01 00:00:00+0000",
           "2024-01-01 00:00:00-01", "2024-01-01 00:00:00.1+00",
           "2024-01-01 00:00:60+00", " 2024-01-01 00:00:00+00 ",
@@ -823,12 +910,11 @@ TEST_F(RelationalFunctionSweepTest, CivilTimeFractionsLeapSecondsAndErrors) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result, std::make_optional(Value(pin.expected)));
   }
-  for (const std::string& text :
-       {"0000-01-01 00:00:00+00", "1900-02-29 00:00:00+00",
-        "2024-13-01 00:00:00+00", "2024-01-32 00:00:00+00",
-        "2024-01-01 24:00:00+00", "2024-01-01 00:60:00+00",
-        "2024-01-01 00:00:61+00", "9999-12-31 23:59:60+00",
-        "2024-x1-01 00:00:00+00", ""}) {
+  for (const char* text : {"0000-01-01 00:00:00+00", "1900-02-29 00:00:00+00",
+                           "2024-13-01 00:00:00+00", "2024-01-32 00:00:00+00",
+                           "2024-01-01 24:00:00+00", "2024-01-01 00:60:00+00",
+                           "2024-01-01 00:00:61+00", "9999-12-31 23:59:60+00",
+                           "2024-x1-01 00:00:00+00", ""}) {
     SCOPED_TRACE(text);
     EXPECT_FALSE(Evaluate("timestamp_trunc", {Value(std::string(text)),
                                               Value("minute"), Value("UTC")})
@@ -975,6 +1061,64 @@ TEST_F(RelationalFunctionSweepTest, AuditTimestampArithmeticUsesAbsoluteTime) {
       }
     }
   }
+}
+
+TEST_F(RelationalFunctionSweepTest, NamedZoneOffsetUsesHistoricalYear) {
+  // America/Los_Angeles observed Pacific War Time (UTC-7) in March 1945.
+  // The relational evaluator must look the zone up in the timestamp's own
+  // year; clamping it to 1970 would wrongly answer PST (UTC-8) and shift the
+  // rendered local time an hour earlier.
+  const std::optional<Value> as_string =
+      Evaluate("string", {Value("1945-03-15 12:00:00+00"),
+                          Value("America/Los_Angeles")});
+  ASSERT_TRUE(as_string.has_value());
+  EXPECT_EQ(*as_string, Value("1945-03-15 05:00:00-07"));
+  const std::optional<Value> formatted =
+      Evaluate("format_timestamp",
+               {Value("%Y-%m-%d %H:%M:%S"),
+                Value("1945-03-15 12:00:00+00"),
+                Value("America/Los_Angeles")});
+  ASSERT_TRUE(formatted.has_value());
+  EXPECT_EQ(*formatted, Value("1945-03-15 05:00:00"));
+}
+
+// The batch function evaluator used to run a private JSON parser that
+// disagreed with the AST evaluator on malformed input, number formatting,
+// surrogate pairs and NULL array elements. Both must now use the same
+// canonical implementation.
+TEST_F(RelationalFunctionSweepTest, AuditJsonExtractionMatchesAst) {
+  const std::vector<std::vector<Value>> cases{
+      {Value(std::string("abc")), Value(std::string("$"))},
+      {Value(std::string(R"({"a": 1})")), Value(std::string("$.a"))},
+      {Value(std::string(R"({"a": 1}})")), Value(std::string("$.a"))},
+      {Value(std::string(R"({"a": 1.50})")), Value(std::string("$.a"))},
+      {Value(std::string(R"({"e": "\ud83d\ude00"})")),
+       Value(std::string("$.e"))},
+  };
+  for (const auto& args : cases) {
+    for (const char* name :
+         {"json_extract", "json_value", "json_extract_scalar"}) {
+      const Expression call = FunctionCallExp(
+          name, {ConstantValueExp(args[0]), ConstantValueExp(args[1])});
+      const auto expected = call->TryEvaluate(Row(), Schema("t", {}));
+      const auto actual = Evaluate(name, args);
+      ASSERT_TRUE(expected.HasValue()) << name;
+      ASSERT_TRUE(actual.has_value()) << name;
+      EXPECT_EQ(*actual, expected.Value()) << name;
+    }
+  }
+
+  // NULL elements inside a JSON array must stay NULL in *_ARRAY results.
+  const std::vector<Value> arr_args{Value(std::string(R"([null, 2])")),
+                                    Value(std::string("$"))};
+  const Expression arr_call = FunctionCallExp(
+      "json_value_array",
+      {ConstantValueExp(arr_args[0]), ConstantValueExp(arr_args[1])});
+  const auto arr_expected = arr_call->TryEvaluate(Row(), Schema("t", {}));
+  const auto arr_actual = Evaluate("json_value_array", arr_args);
+  ASSERT_TRUE(arr_expected.HasValue());
+  ASSERT_TRUE(arr_actual.has_value());
+  EXPECT_EQ(*arr_actual, arr_expected.Value());
 }
 
 }  // namespace tinylamb

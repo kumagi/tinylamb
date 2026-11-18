@@ -22,6 +22,12 @@ class ZoneMap {
   void AddDouble(double value);
   void AddString(std::string_view value);
   void AddNull();
+  void AddNulls(size_t count);
+  void AddIntRange(int64_t mn, int64_t mx, size_t count);
+  void AddDateRange(int64_t mn, int64_t mx, size_t count);
+  void AddDoubleRange(double mn, double mx, bool has_bounds, bool saw_nan,
+                      size_t count);
+  void AddStringRange(std::string_view mn, std::string_view mx, size_t count);
   // Records a non-NULL value that carries no scalar ordering (arrays): it
   // bumps value_count_ so MayMatch keeps the zone instead of pruning a batch
   // that holds only array values.

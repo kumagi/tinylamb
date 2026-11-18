@@ -23,6 +23,7 @@
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -126,11 +127,15 @@ int ParallelMergeJoin::CompareKeys(const Row& left,
       continue;
     }
     // Match the SortExecutor's cross-type key order (ValueType tag order);
-    // see MergeJoin::CompareKeys.
+    // see MergeJoin::CompareKeys.  For case-insensitive VARCHAR pairs that
+    // order is the folded order (CompareUnderCollation), not the raw byte
+    // order of CompareForOrderBy (P342).
     if (!lv.IsNull() && !rv.IsNull() && lv.type != rv.type) {
       return static_cast<int>(lv.type) < static_cast<int>(rv.type) ? -1 : 1;
     }
-    return CompareForOrderBy(lv, rv) < 0 ? -1 : 1;
+    return CompareUnderCollation(lv, rv, ResolveCollation(lv, rv)) < 0
+               ? -1
+               : 1;
   }
   return 0;
 }

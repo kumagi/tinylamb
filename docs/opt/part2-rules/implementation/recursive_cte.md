@@ -121,15 +121,15 @@ graph TD
 
 - `recursive_termination_predicate_pushdown`: 再帰の停止条件述語（例: `depth < 10`）を再帰ステップ内部へ安全にプッシュダウンする論理 Rule です。
 - `union` / `union_all`: 再帰ステップにおけるアンカーと再帰段の結合に用いられる集合演算を物理実装します。
-- `kWorkTableScan`: 実行エンジンが再帰ステップに対して供給する直前の作業テーブル走査ノードです。
+- the work-table scan node: 実行エンジンが再帰ステップに対して供給する直前の作業テーブル走査ノードです。
 
 ## 検証テスト
 
-- `query/query_test.cpp`:
+- `query/query_test_part2.cpp`:
   - `QueryTest.SqlEngineRecursiveCtePlansOuterThroughCascades`: 再帰 CTE を含む外部クエリが Cascades 探索を経て正常に実行計画化されることを検証。
   - `SqlEngineRecursiveCteCountsToLimit`: 深さ上限までの反復回数の正確性を確認。
   - `SqlEngineRecursiveCteTransitiveClosureWithUnionDistinct`: `UNION` による重複排除を伴う推移閉包計算の検証。
   - `SqlEngineRecursiveCteDepthModifierBoundsIterations`: 深さ修飾子による反復停止の検証。
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.RecursiveTerminationPredicatePushdown`: 再帰停止述語の押し込み最適化を検証。
 

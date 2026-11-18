@@ -120,6 +120,6 @@ SQL の問い合わせは、求める結果を宣言する。実行エンジン�
 
 ## 演算子ではないが実行を規定する部品
 
-`DataChunk`、`ColumnVector`、`SelectionVector`、`ZoneMap`、`VectorizedExpression`、`SimdComparisonKernel`、`SpillFile`、`QueryMemoryBudget`、`PipelineBreaker` は、物理演算子ではない。これらは行の表現、述語の実行方法、メモリ超過時の動作、並列実行時の資源配分を決める。[データ表現と実行時資源](20-data-runtime.md)で個別に説明する。
+`DataChunk`、`ColumnVector`、`SelectionVector`、`ZoneMap`、`SimdComparisonKernel`、`ProcessMemoryBudget`、`QueryMemoryCoordinator` / `QueryMemoryGrant`、`SpillStore`、`ExternalSorter`、`RecursivePartitioner`、`SpillableStore`、`PipelineLowering`、`ColumnarTlcsScanExecutor`（旧経路用の `SpillFile`、`QueryMemoryBudget`、`PipelineBreaker` も残存）は、物理演算子・パイプライン低下・メモリ予算・スピル実行を支える基盤部品である。既定のパイプライン実行経路は [実行モデル](10-execution-model.md#12-パイプライン実行と-ooc-シンク現在の既定経路)、実行時資源は [データ表現と実行時資源](20-data-runtime.md) で説明する。
 
 辞書を使う型付き集約関数と `PdqSort` は要求駆動型の演算子ではなく、実行経路から利用されるカーネルである。それぞれ[集約](70-aggregation.md#9-dictionarybatchaggregation)と[整列](60-sort-distinct-set.md#6-pdqsort)で説明する。

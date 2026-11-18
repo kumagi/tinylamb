@@ -225,7 +225,7 @@ TEST_F(SqlEngineExtraTest, CteNarrowingVersusMaterialization) {
   EXPECT_EQ(run("WITH x AS (SELECT k, s FROM t) SELECT a.k, a.s FROM x a "
                 "WHERE a.k > 1 ORDER BY a.k"),
             std::vector<Row>({Row({Value(2), Value("b")}),
-                              Row({Value(3), Value("a")})}));
+                                Row({Value(3), Value("a")})}));
   cte_ctx.Abort();
 }
 
@@ -438,6 +438,49 @@ TEST_F(SqlEngineExtraTest, EngineErrorSurfaces) {
   ExpectError("SELECT k FROM t ORDER BY nope");
   ExpectError("UPDATE t SET nope = 1");
   ExpectError("DELETE FROM missing_table");
+}
+
+// `ORDER BY <SELECT-list alias>` delegates the sort to the post-plan
+// SortExecutor (the optimizer never learns the ordering), so the compiled-plan
+// shape has to capture the projection-bound keys it was built from. Capturing
+// the optimizer's cleared logical keys instead left `order_expressions` empty,
+// and an empty key vector makes the replay's `need_sort` false: every cache hit
+// silently returned scan order. Insert order deliberately differs from sort
+// order so a missing sort changes the answer.
+TEST_F(SqlEngineExtraTest, CompiledPlanCacheKeepsAliasOrderingOnReplay) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE ao (x INT64, z INT64)");
+  {
+    ASSIGN_OR_ASSERT_FAIL(Table, table, database_->GetTable(*context_, "ao"));
+    for (const int64_t v : {5, 1, 4}) {
+      ASSERT_SUCCESS(
+          table.Insert(context_->txn_, Row({Value(v), Value(v)})).GetStatus());
+    }
+  }
+  const std::string query = "SELECT x + 1 AS y, z FROM ao ORDER BY y LIMIT 3";
+  // y = 2, 5, 6 in sort order; scan order would give 6, 2, 5.
+  const std::vector<Row> expected = {Row({Value(2), Value(1)}),
+                                     Row({Value(5), Value(4)}),
+                                     Row({Value(6), Value(5)})};
+  PreparedPlanCache::Instance().Clear();
+  thread_compiled_plans.clear();
+  const uint64_t replay_before = PlanCacheStats().replays.load();
+  // First execution fills the cache; the repeats are the regression.
+  for (int n = 0; n < 4; ++n) {
+    ExpectQuery(query, expected);
+  }
+  EXPECT_GT(PlanCacheStats().replays.load(), replay_before)
+      << "no compiled-plan replay happened; the cache gate moved";
+  // Descending direction plus NULLS placement ride the same captured keys.
+  PreparedPlanCache::Instance().Clear();
+  thread_compiled_plans.clear();
+  const std::string descending =
+      "SELECT x + 1 AS y, z FROM ao ORDER BY y DESC NULLS LAST LIMIT 3";
+  const std::vector<Row> descending_expected = {Row({Value(6), Value(5)}),
+                                                Row({Value(5), Value(4)}),
+                                                Row({Value(2), Value(1)})};
+  for (int n = 0; n < 4; ++n) {
+    ExpectQuery(descending, descending_expected);
+  }
 }
 
 TEST_F(SqlEngineExtraTest, ImmutableScalarAggregatePlanSharesButNotItsResult) {

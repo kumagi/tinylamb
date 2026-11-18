@@ -945,6 +945,13 @@ void ScanMemSnapshot(const std::vector<std::pair<std::string, RowEntry>>& rows,
   for (size_t ri = 0; ri < rows.size(); ++ri) {
     const std::string& key = rows[ri].first;
     const RowEntry& entry = rows[ri].second;
+    // MVCC visibility: entries written after the read version are invisible
+    // (version 0 = unversioned = always visible).  Mirrors MemTable::
+    // SnapshotShard's version filter so future writes don't leak into the
+    // snapshot and tombstones don't hide still-visible older versions.
+    if (entry.version != 0 && entry.version > frag.read_version) {
+      continue;
+    }
     if (frag.access != AccessMode::kFilterScan) {
       int64_t key_value = 0;
       if (!MemcomparableInt64Key(key, &key_value) ||
@@ -1677,10 +1684,20 @@ CostReport Estimate(Runtime runtime, const ArtifactSet& artifacts,
         // The CPU model: one unit per row compared, scaled by the scheme's
         // expansion cost, plus a fixed per-group dispatch cost.
         double per_row = 1.0;
-        const size_t idx = static_cast<size_t>(g) * footer.column_count;
-        if (idx < footer.encodings.size()) {
-          per_row = PaxChunk::SchemeDecodeCost(
-              static_cast<PaxChunk::Scheme>(footer.encodings[idx]));
+        // Charge the decoder cost of the columns actually needed by the
+        // predicate/projection, not always column 0's scheme (as Quote above
+        // already does).
+        for (slot_t col : needed) {
+          const size_t idx =
+              (static_cast<size_t>(g) * footer.column_count) + col;
+          if (idx < footer.encodings.size()) {
+            per_row += PaxChunk::SchemeDecodeCost(
+                           static_cast<PaxChunk::Scheme>(footer.encodings[idx])) -
+                       1.0;
+          }
+        }
+        if (per_row < 1.0) {
+          per_row = 1.0;
         }
         report.cpu_units += static_cast<double>(rc) * per_row *
                             static_cast<double>(eval.size());
@@ -1914,14 +1931,24 @@ StatusOr<ExecResult> Execute(Runtime runtime, const ArtifactSet& artifacts,
     const TopKSpec& spec = *fragment.top_k;
     // The single-chunk fast path: the chunk's Top-K kernel prunes the row
     // groups whose zone-map range cannot improve the current threshold, so
-    // it reads less than the whole column.
-    if (artifacts.size() == 1 &&
+    // it reads less than the whole column.  Mirror the first Top-K fast
+    // path's gates: filter-scan access only, no aggregate/group-by, and the
+    // chunk's generation must not be newer than the fragment read version,
+    // otherwise future rows leak past the generation filter and keys outside
+    // the access range leak past the access filter.  Report kFull coverage
+    // so the executor trusts the result.
+    if (fragment.top_k.has_value() &&
+        fragment.access == AccessMode::kFilterScan &&
+        !fragment.aggregate.has_value() && fragment.group_cols.empty() &&
+        artifacts.size() == 1 &&
         artifacts[0].kind == ArtifactRef::Kind::kChunk &&
-        artifacts[0].chunk != nullptr && fragment.conjuncts.empty()) {
+        artifacts[0].chunk != nullptr && fragment.conjuncts.empty() &&
+        artifacts[0].generation <= fragment.read_version) {
       const std::vector<TopKEntry> entries = TopKColumn(
           *artifacts[0].chunk, spec.col, spec.k, spec.descending, &schema);
       result.top_k = entries;
       result.output_rows = entries.size();
+      result.coverage = Coverage::kFull;
       return result;
     }
     const RowReader reader{.flat_values = &state.values,

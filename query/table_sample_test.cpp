@@ -74,6 +74,41 @@ class TableSampleTest : public ::testing::Test {
   std::unique_ptr<SqlEngine> engine_;
 };
 
+// LIMIT is applied to the sampled OUTPUT. Pushing it into the scan truncates
+// the population the sampler draws from, changing the sample set itself.
+TEST_F(TableSampleTest, LimitDoesNotTruncateSamplePopulation) {
+  RunSql(*engine_, *context_, "CREATE TABLE samp_lim (v INT64);");
+  RunSql(*engine_, *context_,
+         "INSERT INTO samp_lim SELECT v FROM UNNEST(GENERATE_ARRAY(1, 100)) "
+         "AS v;");
+  ASSERT_EQ(context_->txn_.PreCommit(), Status::kSuccess);
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+
+  // SYSTEM samples whole storage blocks; with a single block it legitimately
+  // returns all 100 rows, so only BERNOULLI gives a sample smaller than LIMIT.
+  for (const char* method : {"BERNOULLI (50 PERCENT)"}) {
+    const std::string head =
+        std::string("SELECT v FROM samp_lim TABLESAMPLE ") + method +
+        " REPEATABLE (7)";
+    const std::vector<Row> base = RunSql(*engine_, *context_, head);
+    ASSERT_GT(base.size(), 0U) << method;
+    ASSERT_LT(base.size(), 90U) << method;
+    const std::vector<Row> limited =
+        RunSql(*engine_, *context_, head + " LIMIT 90");
+    ASSERT_EQ(limited.size(), base.size()) << method;
+    std::vector<int64_t> a, b;
+    for (const Row& r : base) {
+      a.push_back(r[0].value.int_value);
+    }
+    for (const Row& r : limited) {
+      b.push_back(r[0].value.int_value);
+    }
+    std::ranges::sort(a);
+    std::ranges::sort(b);
+    EXPECT_EQ(a, b) << method;
+  }
+}
+
 TEST_F(TableSampleTest, ReservoirRepeatableIsStable) {
   Seed();
   const std::string sql =
@@ -146,6 +181,37 @@ TEST_F(TableSampleTest, DerivedRelationUsesRelationalSamplePath) {
       "SELECT id FROM (SELECT id FROM sample_t) TABLESAMPLE RESERVOIR(2 ROWS) "
       "REPEATABLE(42)");
   ASSERT_EQ(rows.size(), 2U);
+}
+
+// A correlated EXISTS/IN whose subquery source carries a TABLESAMPLE must
+// stay on the scope-aware relational evaluator: the QueryData decorrelator
+// has no sample slot in its spec and would semi/anti join the FULL inner
+// table (the sample silently vanished).
+TEST_F(TableSampleTest, CorrelatedSubqueryKeepsInnerSample) {
+  RunSql(*engine_, *context_, "CREATE TABLE sample_outer (x INT64)");
+  RunSql(*engine_, *context_, "INSERT INTO sample_outer VALUES (1), (2), (3)");
+  RunSql(*engine_, *context_, "CREATE TABLE sample_inner (m INT64)");
+  RunSql(*engine_, *context_, "INSERT INTO sample_inner VALUES (1), (2), (3)");
+  ASSERT_EQ(context_->txn_.PreCommit(), Status::kSuccess);
+  context_ = std::make_unique<TransactionContext>(database_->BeginContext());
+
+  const std::vector<Row> exists_empty = RunSql(
+      *engine_, *context_,
+      "SELECT x FROM sample_outer t WHERE EXISTS (SELECT 1 FROM sample_inner "
+      "TABLESAMPLE SYSTEM(0 PERCENT) WHERE sample_inner.m = t.x) ORDER BY x");
+  EXPECT_TRUE(exists_empty.empty());
+  const std::vector<Row> in_empty = RunSql(
+      *engine_, *context_,
+      "SELECT x FROM sample_outer t WHERE x IN (SELECT m FROM sample_inner "
+      "TABLESAMPLE SYSTEM(0 PERCENT) WHERE sample_inner.m = t.x) ORDER BY x");
+  EXPECT_TRUE(in_empty.empty());
+  // Control: with the whole table sampled the membership answer is unchanged.
+  const std::vector<Row> full = RunSql(
+      *engine_, *context_,
+      "SELECT x FROM sample_outer t WHERE EXISTS (SELECT 1 FROM sample_inner "
+      "TABLESAMPLE SYSTEM(100 PERCENT) WHERE sample_inner.m = t.x) "
+      "ORDER BY x");
+  ASSERT_EQ(full.size(), 3U);
 }
 
 }  // namespace

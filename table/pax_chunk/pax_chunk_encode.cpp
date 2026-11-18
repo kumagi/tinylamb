@@ -196,7 +196,8 @@ EncodedCol EncRleIdxI64(const std::vector<int64_t>& vals, size_t budget) {
   const uint32_t nidx =
       (runs + kRleIdxRestartStride - 1) / kRleIdxRestartStride;
   int64_t value_base = run_vals.front();
-  uint64_t length_base = run_lens.front();
+  uint64_t length_base =
+      *std::min_element(run_lens.begin(), run_lens.end());
   uint64_t max_value_offset = 0;
   uint64_t max_length_offset = 0;
   for (uint32_t i = 0; i < runs; ++i) {
@@ -593,7 +594,7 @@ EncodedCol EncDictI64(const std::vector<int64_t>& vals, size_t budget,
 // (same header, code width, and dictionary payload) with the dictionary
 // sorted ascending and each code = the rank of its value. Value order equals
 // code order, so range predicates evaluate as a code window directly on the
-// packed code stream (OpDictRegionCount / TryFastPredicateMask) without
+// packed code stream (OpDictRegionCountSum / TryFastPredicateMask) without
 // touching the dictionary or decoding rows.
 EncodedCol EncOpDictI64(const std::vector<int64_t>& vals, size_t budget,
                         int known_distinct) {
@@ -1547,8 +1548,13 @@ EncodedCol EncPBitSI64(const std::vector<int64_t>& vals, size_t budget,
 }
 
 EncodedCol EncXorF64(const std::vector<uint64_t>& bits, size_t budget) {
-  static_cast<void>(budget);
   if (bits.empty()) {
+    return {};
+  }
+  // Minimum wire size: 8 bytes for the first value (BE64).  Nothing smaller
+  // can be emitted, so a budget below the floor retires the candidate before
+  // any thread-local scratch or bit-packing work (matches EncRleIdxI64 etc.).
+  if (budget < 8) {
     return {};
   }
   // Adaptive selection re-runs this encoder for every row group, so the xor
@@ -1714,7 +1720,7 @@ EncodedCol EncFsstStr(const std::vector<std::string_view>& sv) {
   constexpr size_t kMaxSymbols = 254;
   std::vector<Candidate> top;
   top.reserve(kMaxSymbols);
-  for (int l = 2; l <= 8; ++l) {
+  for (size_t l = 2; l <= 8; ++l) {
     freq_by_len[l - 2].ForEach([&](uint64_t key, uint64_t freq) {
       const Candidate cand{.key = key,
                            .score = freq * static_cast<uint64_t>(l - 1),
@@ -1762,7 +1768,8 @@ EncodedCol EncFsstStr(const std::vector<std::string_view>& sv) {
       std::memcpy(&raw, p + pos, maxL);
       for (int l = static_cast<int>(maxL); l >= 2; --l) {
         const uint64_t key = l == 8 ? raw : (raw & ((1ULL << (8 * l)) - 1ULL));
-        if (const uint64_t* code = code_by_len[l - 2].Find(key)) {
+        if (const uint64_t* code =
+                code_by_len[static_cast<size_t>(l) - 2].Find(key)) {
           stream.push_back(static_cast<uint8_t>(*code));
           bestL = l;
           break;
@@ -2071,14 +2078,14 @@ EncodedCol EncBp128I64(const std::vector<int64_t>& vals, size_t budget) {
       kBp128BlockRows;
   std::vector<int64_t> minima(blocks);
   std::vector<int64_t> maxima(blocks);
-  std::vector<__int128> sums(blocks, 0);
+  std::vector<platform::Int128> sums(blocks, 0);
   std::vector<uint32_t> widths(blocks, 0);
   for (uint32_t block = 0; block < blocks; ++block) {
     const size_t start = static_cast<size_t>(block) * kBp128BlockRows;
     const size_t end = std::min(vals.size(), start + kBp128BlockRows);
     int64_t minimum = vals[start];
     int64_t maximum = vals[start];
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (size_t row = start; row < end; ++row) {
       minimum = std::min(minimum, vals[row]);
       maximum = std::max(maximum, vals[row]);
@@ -2112,7 +2119,7 @@ EncodedCol EncBp128I64(const std::vector<int64_t>& vals, size_t budget) {
   for (uint32_t block = 0; block < blocks; ++block) {
     AppendBE64(encoded.buf, static_cast<uint64_t>(minima[block]));
     AppendBE64(encoded.buf, static_cast<uint64_t>(maxima[block]));
-    const auto sum_bits = static_cast<unsigned __int128>(sums[block]);
+    const auto sum_bits = static_cast<platform::UInt128>(sums[block]);
     AppendBE64(encoded.buf, static_cast<uint64_t>(sum_bits >> 64));
     AppendBE64(encoded.buf, static_cast<uint64_t>(sum_bits));
     encoded.buf.push_back(static_cast<char>(widths[block]));
@@ -3340,8 +3347,8 @@ EncodedCol EncModI64(const std::vector<int64_t>& vals, size_t budget) {
     for (uint32_t anchor = 0; anchor < 4 && anchor < n; ++anchor) {
       const uint64_t a =
           (static_cast<uint64_t>(vals[anchor]) + m -
-           static_cast<uint64_t>(static_cast<unsigned __int128>(b) * anchor %
-                                 static_cast<unsigned __int128>(m))) %
+           static_cast<uint64_t>(static_cast<platform::UInt128>(b) * anchor %
+                                 static_cast<platform::UInt128>(m))) %
           m;
       // The model trajectory is a, a+b, a+2b, ... with one conditional
       // subtract per step, so `cur` is strictly increasing until it first
@@ -3350,9 +3357,9 @@ EncodedCol EncModI64(const std::vector<int64_t>& vals, size_t budget) {
       // -- the only path into `best` -- can never fire, so this anchor's
       // walk would be discarded no matter what exception count it posted.
       // Skip the walk; `best` stays byte-identical.
-      if (static_cast<unsigned __int128>(a) +
-              (static_cast<unsigned __int128>(b) * (n - 1)) <
-          static_cast<unsigned __int128>(m)) {
+      if (static_cast<platform::UInt128>(a) +
+              (static_cast<platform::UInt128>(b) * (n - 1)) <
+          static_cast<platform::UInt128>(m)) {
         continue;
       }
       uint32_t exc = 0;
@@ -3520,33 +3527,36 @@ EncodedCol EncLaneI64(const std::vector<int64_t>& vals, size_t budget) {
       // ND == 2 keeps the scalar path: a 2x i64 block saves nothing over
       // the two scalar iterations it replaces.
       constexpr uint32_t R = ND / 4U;
-      std::array<__m256i, R> cv{};
-      std::array<__m256i, R> sv{};
+      struct alignas(32) Avx2Vec {
+        __m256i v;
+      };
+      std::array<Avx2Vec, R> cv{};
+      std::array<Avx2Vec, R> sv{};
       for (uint32_t r = 0; r < R; ++r) {
         // The register state starts at the PINNING cursor, not the row
         // origin: the scalar walk's cur[] already advanced to v[ND..2ND)
         // (tick 1) while base[] still holds tick 0, so seeding cv from base
         // would run the whole block walk one tick behind the observation.
-        cv[r] = _mm256_loadu_si256(
+        cv[r].v = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(cur.data() + (4U * r)));
-        sv[r] = _mm256_loadu_si256(
+        sv[r].v = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(step.data() + (4U * r)));
       }
       uint32_t i = 2U * ND;
       bool crossed = false;
       for (; i + ND <= n; i += ND) {
         const uint32_t before = exc;
-        std::array<__m256i, R> ex{};
+        std::array<Avx2Vec, R> ex{};
         uint32_t mism = 0;
         uint32_t b = i;
         for (uint32_t r = 0; r < R; ++r) {
           const __m256i vv =
               _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v + b));
-          ex[r] = _mm256_add_epi64(cv[r], sv[r]);
+          ex[r].v = _mm256_add_epi64(cv[r].v, sv[r].v);
           // cmpeq is 1s on match; mismatches per 4-lane reg = 4 - popcount.
           const uint32_t m4 =
               static_cast<uint32_t>(_mm256_movemask_pd(
-                  _mm256_castsi256_pd(_mm256_cmpeq_epi64(vv, ex[r])))) &
+                  _mm256_castsi256_pd(_mm256_cmpeq_epi64(vv, ex[r].v)))) &
               0xFU;
           mism += 4U - static_cast<uint32_t>(__builtin_popcount(m4));
           b += 4U;
@@ -3567,7 +3577,7 @@ EncodedCol EncLaneI64(const std::vector<int64_t>& vals, size_t budget) {
         // stops (exc == lim) and the cur bookkeeping stays identical.
         for (uint32_t r = 0; r < R; ++r) {
           _mm256_storeu_si256(reinterpret_cast<__m256i*>(cur.data() + (4U * r)),
-                              cv[r]);
+                              cv[r].v);
         }
         uint32_t l = 0;
         for (uint32_t j = i; j < n; ++j) {
@@ -3589,7 +3599,7 @@ EncodedCol EncLaneI64(const std::vector<int64_t>& vals, size_t budget) {
       }
       for (uint32_t r = 0; r < R; ++r) {
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(cur.data() + (4U * r)),
-                            cv[r]);
+                            cv[r].v);
       }
       uint32_t l = 0;
       for (; i < n; ++i) {
@@ -3846,7 +3856,6 @@ EncodedCol EncSparseI64(const std::vector<int64_t>& vals,
 //   byte cursor) immediately before decoding symbol 64k*bpv; the decoder
 //   reads the stream backwards, so pos counts bytes not yet consumed.
 EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
-  static_cast<void>(budget);
   const auto n = static_cast<uint32_t>(vals.size());
   if (n == 0) {
     return {};
@@ -3859,6 +3868,11 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   const uint64_t range = static_cast<uint64_t>(mx) - static_cast<uint64_t>(mn);
   if (range == 0) {
     return {};  // kConst owns the all-equal case
+  }
+  // Minimum wire size: base i64 (8) + bpv u8 (1) + prec u8 (1) + nsym u16 (2)
+  // = 12 bytes.  A smaller budget cannot hold even the header.
+  if (budget < 12) {
+    return {};
   }
   const auto bpv = static_cast<uint32_t>((BitsNeeded(range) + 7) / 8);
   const size_t nsym_total = static_cast<size_t>(n) * bpv;
@@ -3877,7 +3891,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   const uint32_t M = 1U << kAnsPrec;
   std::array<uint32_t, 256> f{};
   uint32_t sum = 0;
-  for (int s = 0; s < 256; ++s) {
+  for (size_t s = 0; s < 256; ++s) {
     if (cnt[s] == 0) {
       continue;
     }
@@ -3890,8 +3904,8 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   // candidate scan visits only used symbols -- one compact pass over cnt's
   // non-zero entries instead of all 256 buckets per adjustment.
   std::array<uint8_t, 256> used{};
-  int nused = 0;
-  for (int s = 0; s < 256; ++s) {
+  size_t nused = 0;
+  for (size_t s = 0; s < 256; ++s) {
     if (cnt[s] != 0) {
       used[nused++] = static_cast<uint8_t>(s);
     }
@@ -3905,8 +3919,8 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   // smallest s because the queue orders by (f, 255 - s) -- same winner as
   // the strict '>' linear scan.
   std::priority_queue<std::pair<uint32_t, uint32_t>> norm;
-  for (int i = 0; i < nused; ++i) {
-    const int s = used[i];
+  for (size_t i = 0; i < nused; ++i) {
+    const size_t s = used[i];
     norm.emplace(f[s], 255U - static_cast<uint32_t>(s));
   }
   while (sum != M) {
@@ -3918,7 +3932,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
     }
     const uint32_t pick_key = norm.top().second;
     norm.pop();
-    const int pick = static_cast<int>(255U - pick_key);
+    const size_t pick = 255U - pick_key;
     if (sum > M) {
       --f[pick];
       --sum;
@@ -3939,7 +3953,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   if (budget != kNoEncodeBudget) {
     uint64_t total_bits = 0;
     uint32_t used_syms = 0;
-    for (int s = 0; s < 256; ++s) {
+    for (size_t s = 0; s < 256; ++s) {
       if (cnt[s] == 0) {
         continue;
       }
@@ -3963,7 +3977,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   std::array<uint32_t, 256> xmax{};
   uint32_t acc = 0;
   int nsym = 0;
-  for (int s = 0; s < 256; ++s) {
+  for (size_t s = 0; s < 256; ++s) {
     cum[s] = acc;
     acc += f[s];
     // x_max = ((L >> prec) << 8) * f[s]: below it, one push keeps the state
@@ -4027,7 +4041,7 @@ EncodedCol EncAnsForI64(const std::vector<int64_t>& vals, size_t budget) {
   e.buf.push_back(static_cast<char>(bpv));
   e.buf.push_back(static_cast<char>(kAnsPrec));
   AppendBE16(e.buf, static_cast<uint16_t>(nsym));
-  for (int s = 0; s < 256; ++s) {
+  for (size_t s = 0; s < 256; ++s) {
     if (f[s] == 0) {
       continue;
     }
@@ -4473,7 +4487,7 @@ EncodedCol EncDStreamStr(const std::vector<std::string_view>& sv) {
   const uint32_t multi_budget = kDStreamMaxSymbols - nsingles;
   std::vector<Candidate> top;
   top.reserve(multi_budget);
-  for (int l = 2; std::cmp_less_equal(l, kDStreamMaxSymbolLen); ++l) {
+  for (size_t l = 2; l <= kDStreamMaxSymbolLen; ++l) {
     freq_by_len[l - 2].ForEach([&](uint64_t key, uint64_t freq) {
       const Candidate cand{.key = key,
                            .score = freq * static_cast<uint64_t>(l - 1),
@@ -4527,7 +4541,8 @@ EncodedCol EncDStreamStr(const std::vector<std::string_view>& sv) {
       std::memcpy(&raw, p + pos, maxL);
       for (int l = static_cast<int>(maxL); l >= 1; --l) {
         const uint64_t key = l == 8 ? raw : (raw & ((1ULL << (8 * l)) - 1ULL));
-        if (const uint64_t* code = code_by_len[l - 1].Find(key)) {
+        if (const uint64_t* code =
+                code_by_len[static_cast<size_t>(l) - 1].Find(key)) {
           if (clen >= 255) {
             over = true;
             break;
@@ -4628,17 +4643,17 @@ EncodedCol EncPforI64(const std::vector<int64_t>& vals, size_t budget) {
   // buckets, replacing the O(n) scan the old loop ran per width.
   std::array<uint32_t, 65> hist{};
   for (uint64_t o : offs) {
-    ++hist[BitsNeeded(o)];
+    ++hist[static_cast<size_t>(BitsNeeded(o))];
   }
   std::array<size_t, 65> suf{};
   suf[64] = 0;
-  for (int b = 64; b >= 1; --b) {
+  for (size_t b = 64; b >= 1; --b) {
     suf[b - 1] = suf[b] + hist[b];
   }
   int best_w = 64;
   size_t best_bytes = SIZE_MAX;
-  for (int w = 1; w <= 64; ++w) {
-    const size_t packed = (n * static_cast<size_t>(w) + 7) / 8;
+  for (size_t w = 1; w <= 64; ++w) {
+    const size_t packed = ((n * w) + 7) / 8;
     // Packed part alone exceeds the budget => no width can win.
     if (11 + packed > budget) {
       break;
@@ -4653,7 +4668,7 @@ EncodedCol EncPforI64(const std::vector<int64_t>& vals, size_t budget) {
     const size_t bytes = 11 + packed + (nexc * 10);
     if (bytes < best_bytes) {
       best_bytes = bytes;
-      best_w = w;
+      best_w = static_cast<int>(w);
     }
     if (nexc == 0) {
       break;  // wider w only grows the packed part
@@ -4695,7 +4710,7 @@ EncodedCol EncPforI64(const std::vector<int64_t>& vals, size_t budget) {
 // offsets that overflow 2^w as exceptions (position bitmap + full values).
 // The width sweep is kPfor's histogram-suffix-sums trick applied per block;
 // the packed lanes keep ALL rows' low bits (dense lanes are what lets the
-// bulk decode reuse kBp128Block's AVX2 kernels).
+// bulk decode reuse kBp128's AVX2 kernels).
 EncodedCol EncFastPforI64(const std::vector<int64_t>& vals, size_t budget) {
   const auto n = static_cast<uint32_t>(vals.size());
   if (n == 0) {
@@ -4726,7 +4741,7 @@ EncodedCol EncFastPforI64(const std::vector<int64_t>& vals, size_t budget) {
     const uint32_t rows = std::min(kFastPforBlockRows, n - start);
     int64_t mn = INT64_MAX;
     int64_t mx = INT64_MIN;
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (uint32_t t = 0; t < rows; ++t) {
       const int64_t v = vals[start + t];
       mn = std::min(v, mn);
@@ -4738,22 +4753,21 @@ EncodedCol EncFastPforI64(const std::vector<int64_t>& vals, size_t budget) {
     for (uint32_t t = 0; t < rows; ++t) {
       const uint64_t off = static_cast<uint64_t>(vals[start + t]) - mn_u;
       offs[start + t] = off;
-      ++hist[BitsNeeded(off)];
+      ++hist[static_cast<size_t>(BitsNeeded(off))];
     }
     std::array<size_t, 65> suf{};
     suf[64] = 0;
-    for (int bw = 64; bw >= 1; --bw) {
+    for (size_t bw = 64; bw >= 1; --bw) {
       suf[bw - 1] = suf[bw] + hist[bw];
     }
     // suf[w] counts offsets >= 2^w: the exceptions width w cannot hold.
-    int best_w = 64;
+    size_t best_w = 64;
     size_t best_bytes = SIZE_MAX;
-    for (int w = 0; w <= 64; ++w) {
+    for (size_t w = 0; w <= 64; ++w) {
       const size_t nexc = suf[w];
-      const size_t bytes =
-          kFastPforMetaBytes + ((rows + 7U) / 8U) +
-          ((static_cast<size_t>(rows) * static_cast<size_t>(w) + 7) / 8) +
-          (nexc * 8);
+      const size_t bytes = kFastPforMetaBytes + ((rows + 7U) / 8U) +
+                           (((static_cast<size_t>(rows) * w) + 7) / 8) +
+                           (nexc * 8);
       if (bytes < best_bytes) {
         best_bytes = bytes;
         best_w = w;
@@ -4765,7 +4779,7 @@ EncodedCol EncFastPforI64(const std::vector<int64_t>& vals, size_t budget) {
     FastPforPlan& bp = plan[b];
     bp.mn = mn;
     bp.mx = mx;
-    const auto sum_u = static_cast<unsigned __int128>(sum);
+    const auto sum_u = static_cast<platform::UInt128>(sum);
     bp.sum_hi = static_cast<uint64_t>(sum_u >> 64);
     bp.sum_lo = static_cast<uint64_t>(sum_u);
     bp.w = static_cast<uint32_t>(best_w);
@@ -4867,7 +4881,7 @@ bool DeltaFastPforStationaryDeltas(const std::vector<int64_t>& vals) {
 // (position bitmap + full delta values). The width sweep is kPfor's
 // histogram-suffix-sums trick applied per block over the block's deltas; the
 // packed lanes keep ALL deltas' low bits (dense lanes are what lets the bulk
-// decode reuse kBp128Block's AVX2 kernels). The replay arithmetic is
+// decode reuse kBp128's AVX2 kernels). The replay arithmetic is
 // unsigned-wrapping, so a column visiting both int64 extremes round-trips
 // bit for bit (the kS4/D2PFOR convention).
 EncodedCol EncDeltaFastPforI64(const std::vector<int64_t>& vals,
@@ -4905,7 +4919,7 @@ EncodedCol EncDeltaFastPforI64(const std::vector<int64_t>& vals,
     const uint32_t deltas_n = rows - 1;
     int64_t mn = INT64_MAX;
     int64_t mx = INT64_MIN;
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (uint32_t t = 0; t < rows; ++t) {
       const int64_t v = vals[start + t];
       mn = std::min(v, mn);
@@ -4928,22 +4942,21 @@ EncodedCol EncDeltaFastPforI64(const std::vector<int64_t>& vals,
     }
     std::array<uint32_t, 65> hist{};
     for (uint32_t t = 1; t < rows; ++t) {
-      ++hist[BitsNeeded(deltas[start + t] - dmin)];
+      ++hist[static_cast<size_t>(BitsNeeded(deltas[start + t] - dmin))];
     }
     std::array<size_t, 65> suf{};
     suf[64] = 0;
-    for (int bw = 64; bw >= 1; --bw) {
+    for (size_t bw = 64; bw >= 1; --bw) {
       suf[bw - 1] = suf[bw] + hist[bw];
     }
     // suf[w] counts (d - dmin) >= 2^w: the exceptions width w cannot hold.
-    int best_w = 64;
+    size_t best_w = 64;
     size_t best_bytes = SIZE_MAX;
-    for (int w = 0; w <= 64; ++w) {
+    for (size_t w = 0; w <= 64; ++w) {
       const size_t nexc = suf[w];
-      const size_t bytes =
-          kDeltaFastPforMetaBytes + ((deltas_n + 7U) / 8U) +
-          ((static_cast<size_t>(deltas_n) * static_cast<size_t>(w) + 7) / 8) +
-          (nexc * 8);
+      const size_t bytes = kDeltaFastPforMetaBytes + ((deltas_n + 7U) / 8U) +
+                           (((static_cast<size_t>(deltas_n) * w) + 7) / 8) +
+                           (nexc * 8);
       if (bytes < best_bytes) {
         best_bytes = bytes;
         best_w = w;
@@ -4956,7 +4969,7 @@ EncodedCol EncDeltaFastPforI64(const std::vector<int64_t>& vals,
     bp.base = vals[start];
     bp.mn = mn;
     bp.mx = mx;
-    const auto sum_u = static_cast<unsigned __int128>(sum);
+    const auto sum_u = static_cast<platform::UInt128>(sum);
     bp.sum_hi = static_cast<uint64_t>(sum_u >> 64);
     bp.sum_lo = static_cast<uint64_t>(sum_u);
     bp.dmin = dmin;
@@ -5056,17 +5069,17 @@ EncodedCol EncDeltaPForI64(const std::vector<int64_t>& values, size_t budget) {
   // for a width is the suffix sum above that width's bucket.
   std::array<uint32_t, 65> dhist{};
   for (size_t i = 1; i < n; ++i) {
-    ++dhist[BitsNeeded(deltas[i] - delta_min)];
+    ++dhist[static_cast<size_t>(BitsNeeded(deltas[i] - delta_min))];
   }
   std::array<size_t, 65> dsuf{};
   dsuf[64] = 0;
-  for (int b = 64; b >= 1; --b) {
+  for (size_t b = 64; b >= 1; --b) {
     dsuf[b - 1] = dsuf[b] + dhist[b];
   }
   int best_width = 0;
   size_t best_bytes = SIZE_MAX;
-  for (int width = 0; width <= 63; ++width) {
-    const size_t packed = ((n - 1) * static_cast<size_t>(width) + 7) / 8;
+  for (size_t width = 0; width <= 63; ++width) {
+    const size_t packed = (((n - 1) * width) + 7) / 8;
     // Bracket table + packed deltas already exceed the budget: no wider
     // width can win, so stop the O(64*n) exception count.
     if (11 + (blocks * kDeltaPForBracketBytes) + packed > budget) {
@@ -5082,11 +5095,17 @@ EncodedCol EncDeltaPForI64(const std::vector<int64_t>& values, size_t budget) {
                          (exception_count * 10);
     if (bytes < best_bytes) {
       best_bytes = bytes;
-      best_width = width;
+      best_width = static_cast<int>(width);
     }
     if (exception_count == 0) {
       break;
     }
+  }
+  // Every width was rejected by the budget before a candidate was found
+  // (best_bytes stays SIZE_MAX). Building the region anyway would be wasted
+  // work that the caller rejects on cost -- match EncPforI64's guard.
+  if (best_bytes == SIZE_MAX || best_bytes > budget) {
+    return {};
   }
 
   const uint64_t low_mask =
@@ -5114,11 +5133,11 @@ EncodedCol EncDeltaPForI64(const std::vector<int64_t>& values, size_t budget) {
   for (size_t block = 0; block < blocks; ++block) {
     const size_t start = block * kDeltaPForBlockRows;
     const size_t end = std::min(n, start + kDeltaPForBlockRows);
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (size_t i = start; i < end; ++i) {
       sum += values[i];
     }
-    const auto bits = static_cast<unsigned __int128>(sum);
+    const auto bits = static_cast<platform::UInt128>(sum);
     AppendBE64(encoded.buf, static_cast<uint64_t>(values[start]));
     AppendBE64(encoded.buf, static_cast<uint64_t>(values[end - 1]));
     AppendBE64(encoded.buf, static_cast<uint64_t>(bits >> 64));
@@ -5137,7 +5156,6 @@ EncodedCol EncDeltaPForI64(const std::vector<int64_t>& values, size_t budget) {
 //   [high bitmap: (n + (maxd>>l)) bits][low bits: n*l bits, MSB-first]
 //   param = l. decode via select() on the high bitmap.
 EncodedCol EncEliasFanoI64(const std::vector<int64_t>& vals, size_t budget) {
-  static_cast<void>(budget);
   const size_t n = vals.size();
   if (n < 2) {
     return {};
@@ -5146,6 +5164,10 @@ EncodedCol EncEliasFanoI64(const std::vector<int64_t>& vals, size_t budget) {
     if (vals[i] < vals[i - 1]) {
       return {};  // not monotonic: infeasible
     }
+  }
+  // Minimum wire size: base i64 (8) + maxd i64 (8) + l u8 (1) = 17 bytes.
+  if (budget < 17) {
+    return {};
   }
   const int64_t base = vals.front();
   uint64_t maxd =
@@ -5459,7 +5481,7 @@ EncodedCol EncDeltaCompositeI64(const std::vector<int64_t>& vals,
 
 EncodedCol EncDeltaForI64(const std::vector<int64_t>& vals, size_t budget) {
   // One scratch per call site: the delta composite's inner encoder never
-  // nests another MakeDeltas call, so the thread_local is never aliased.
+  // nests another MakeDeltasInto call, so the thread_local is never aliased.
   static thread_local std::vector<int64_t> d;
   MakeDeltasInto(vals, &d);
   return EncDeltaCompositeI64(vals, d, Scheme::kDeltaFor, EncForBA(d, budget),
@@ -6016,13 +6038,17 @@ EncodedCol EncDdRiceI64(const std::vector<int64_t>& vals, size_t budget) {
 // base value plus a byte offset. Layout: [ncp u16][checkpoints ncp*8B]
 // [byteoffs ncp*u32 BE][LEB128 zigzag deltas, deltas[0]=0]. param = 0.
 EncodedCol EncDeltaVarintI64(const std::vector<int64_t>& vals, size_t budget) {
-  static_cast<void>(budget);
   const size_t n = vals.size();
   if (n == 0) {
     return {};
   }
   const uint32_t C = kDeltaCheckpointEvery;
   const auto ncp = static_cast<uint32_t>(((n - 1) / C) + 1);
+  // Minimum wire size: ncp u16 (2) + ncp checkpoints (8*ncp) + ncp offsets (4*ncp)
+  // = 2 + 12*ncp bytes; ncp >= 1 when n >= 1.
+  if (budget < 2 + (12 * static_cast<size_t>(ncp))) {
+    return {};
+  }
   EncodedCol e;
   e.scheme = Scheme::kDeltaVarint;
   e.param = 0;
@@ -6131,6 +6157,11 @@ EncodedCol EncInterpI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   const auto ncp =
       static_cast<uint32_t>((n + kInterpBlockRows - 1) / kInterpBlockRows);
+  // Minimum wire size: ncp u16 (2) + ncp block bases (16*ncp) + ncp offsets
+  // (4*ncp) = 2 + 20*ncp bytes; ncp >= 1 when n >= 1.
+  if (budget < 2 + (20 * static_cast<size_t>(ncp))) {
+    return {};
+  }
   EncodedCol e;
   e.scheme = Scheme::kInterp;
   e.param = ncp;
@@ -6171,9 +6202,9 @@ EncodedCol EncInterpI64(const std::vector<int64_t>& vals, size_t budget) {
   return e;
 }
 
-bool QppFitsI64(__int128 value) {
-  return value >= static_cast<__int128>(INT64_MIN) &&
-         value <= static_cast<__int128>(INT64_MAX);
+bool QppFitsI64(platform::Int128 value) {
+  return value >= static_cast<platform::Int128>(INT64_MIN) &&
+         value <= static_cast<platform::Int128>(INT64_MAX);
 }
 
 bool QppAdaptiveApplicable(const std::vector<int64_t>& values) {
@@ -6189,9 +6220,10 @@ bool QppAdaptiveApplicable(const std::vector<int64_t>& values) {
   size_t neg = 0;
   size_t nonpos = 0;
   for (size_t i = 2; i < values.size(); ++i) {
-    const __int128 sd = static_cast<__int128>(values[i]) -
-                        (2 * static_cast<__int128>(values[i - 1])) +
-                        static_cast<__int128>(values[i - 2]);
+    const platform::Int128 sd =
+        static_cast<platform::Int128>(values[i]) -
+        (2 * static_cast<platform::Int128>(values[i - 1])) +
+        static_cast<platform::Int128>(values[i - 2]);
     neg += static_cast<size_t>(sd < 0);
     nonpos += static_cast<size_t>(sd <= 0);
   }
@@ -6208,6 +6240,11 @@ EncodedCol EncQppI64(const std::vector<int64_t>& vals, size_t budget) {
   }
   const auto pages =
       static_cast<uint32_t>((n + kQppPageRows - 1) / kQppPageRows);
+  // Minimum wire size: pages u16 (2) + per-page overhead (>= 6 bytes/page)
+  // = 2 + 6*pages bytes; pages >= 1 when n >= 1.
+  if (budget < 2 + (6 * static_cast<size_t>(pages))) {
+    return {};
+  }
   EncodedCol encoded;
   encoded.scheme = Scheme::kQpp;
   encoded.param = pages;
@@ -6216,19 +6253,21 @@ EncodedCol EncQppI64(const std::vector<int64_t>& vals, size_t budget) {
   for (uint32_t page_index = 0; page_index < pages; ++page_index) {
     const size_t start = static_cast<size_t>(page_index) * kQppPageRows;
     const size_t rows = std::min<size_t>(kQppPageRows, n - start);
-    __int128 a = vals[start];
-    __int128 d1 = 0;
-    __int128 d2 = 0;
+    platform::Int128 a = vals[start];
+    platform::Int128 d1 = 0;
+    platform::Int128 d2 = 0;
     if (rows == 2) {
-      d1 = static_cast<__int128>(vals[start + 1]) - a;
+      d1 = static_cast<platform::Int128>(vals[start + 1]) - a;
     }
     if (rows >= 3) {
-      std::vector<__int128> second_differences;
+      std::vector<platform::Int128> second_differences;
       second_differences.reserve(rows - 2);
       for (size_t local = 2; local < rows; ++local) {
-        const auto current = static_cast<__int128>(vals[start + local]);
-        const auto previous = static_cast<__int128>(vals[start + local - 1]);
-        const auto before = static_cast<__int128>(vals[start + local - 2]);
+        const auto current = static_cast<platform::Int128>(vals[start + local]);
+        const auto previous =
+            static_cast<platform::Int128>(vals[start + local - 1]);
+        const auto before =
+            static_cast<platform::Int128>(vals[start + local - 2]);
         second_differences.push_back(current - (2 * previous) + before);
       }
       const size_t middle = second_differences.size() / 2;
@@ -6242,36 +6281,41 @@ EncodedCol EncQppI64(const std::vector<int64_t>& vals, size_t budget) {
       }
 
       size_t best_exceptions = SIZE_MAX;
-      __int128 best_cost = 0;
+      platform::Int128 best_cost = 0;
       bool found = false;
       for (size_t anchor = 0; anchor + 1 < rows; ++anchor) {
-        const auto anchor_value = static_cast<__int128>(vals[start + anchor]);
-        const auto next_value = static_cast<__int128>(vals[start + anchor + 1]);
-        const __int128 candidate_d1 =
-            next_value - anchor_value - (static_cast<__int128>(anchor) * d2);
-        const __int128 candidate_a =
-            anchor_value - (static_cast<__int128>(anchor) * candidate_d1) -
-            ((static_cast<__int128>(anchor) *
-              (static_cast<__int128>(anchor) - 1) / 2) *
+        const auto anchor_value =
+            static_cast<platform::Int128>(vals[start + anchor]);
+        const auto next_value =
+            static_cast<platform::Int128>(vals[start + anchor + 1]);
+        const platform::Int128 candidate_d1 =
+            next_value - anchor_value -
+            (static_cast<platform::Int128>(anchor) * d2);
+        const platform::Int128 candidate_a =
+            anchor_value -
+            (static_cast<platform::Int128>(anchor) * candidate_d1) -
+            ((static_cast<platform::Int128>(anchor) *
+              (static_cast<platform::Int128>(anchor) - 1) / 2) *
              d2);
         if (!QppFitsI64(candidate_a) || !QppFitsI64(candidate_d1)) {
           continue;
         }
         size_t exception_count = 0;
-        __int128 cost = 0;
+        platform::Int128 cost = 0;
         bool fits = true;
         for (size_t local = 0; local < rows; ++local) {
-          const auto i = static_cast<__int128>(local);
-          const __int128 predicted =
+          const auto i = static_cast<platform::Int128>(local);
+          const platform::Int128 predicted =
               candidate_a + (i * candidate_d1) + ((i * (i - 1) / 2) * d2);
           if (!QppFitsI64(predicted)) {
             fits = false;
             break;
           }
-          const auto actual = static_cast<__int128>(vals[start + local]);
+          const auto actual =
+              static_cast<platform::Int128>(vals[start + local]);
           if (predicted != actual) {
             ++exception_count;
-            const __int128 delta = predicted - actual;
+            const platform::Int128 delta = predicted - actual;
             cost += delta < 0 ? -delta : delta;
           }
         }
@@ -6298,12 +6342,13 @@ EncodedCol EncQppI64(const std::vector<int64_t>& vals, size_t budget) {
     std::vector<uint8_t> bitmap;
     std::vector<std::pair<uint16_t, int64_t>> exceptions;
     for (size_t local = 0; local < rows; ++local) {
-      const auto i = static_cast<__int128>(local);
-      const __int128 predicted = a + (i * d1) + ((i * (i - 1) / 2) * d2);
+      const auto i = static_cast<platform::Int128>(local);
+      const platform::Int128 predicted =
+          a + (i * d1) + ((i * (i - 1) / 2) * d2);
       if (!QppFitsI64(predicted)) {
         return {};
       }
-      if (predicted != static_cast<__int128>(vals[start + local])) {
+      if (predicted != static_cast<platform::Int128>(vals[start + local])) {
         exceptions.emplace_back(static_cast<uint16_t>(local),
                                 vals[start + local]);
       }
@@ -6394,7 +6439,11 @@ EncodedCol EncXorForCF64(const std::vector<uint64_t>& bits, size_t budget) {
   const size_t n = bits.size();
   const uint32_t C = kDeltaCheckpointEvery;
   const auto ncp = static_cast<uint32_t>((n + C - 1) / C);
-  // Thread-local scratch: this encoder is re-run for every row group.
+  // Minimum wire size: ncp u16 (2) + ncp checkpoints (8*ncp) + w u8 (1)
+  // = 3 + 8*ncp bytes; ncp >= 1 when n >= 2.
+  if (budget < 3 + (8 * static_cast<size_t>(ncp))) {
+    return {};
+  }
   thread_local std::vector<uint64_t> xors;
   xors.clear();
   xors.reserve(n - 1);
@@ -7357,7 +7406,7 @@ void BuildCellsInto(const SortedRun::Entry& e, const std::vector<char>& blob,
     out->types[c][row_idx] = static_cast<uint8_t>(col_types[c]);
     uint64_t bits = 0;
     DeserializeU64(cursor, &bits);
-    out->payload[c][row_idx] = static_cast<int64_t>(bits);
+    out->payload[c][row_idx] = bits;
     cursor += sizeof(int64_t);
     avail -= sizeof(int64_t);
   }
@@ -7428,6 +7477,11 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
     // so the writeback stores n directly and no per-cell counter runs.
     uint64_t null_count = 0;
     int64_t sum = 0;
+    // Set once the stats-domain sum leaves int64: `sum` keeps wrapping (same
+    // recorded value as before) and P.sum_overflow marks every fold built
+    // from it untrustworthy, matching the row path's "integer overflow in
+    // SUM" refusal.
+    bool sum_overflow = false;
     int64_t mn = INT64_MAX, mx = INT64_MIN;
     int64_t emin = INT64_MAX, emax = INT64_MIN;
     int64_t cmin = INT64_MAX, cmax = INT64_MIN;
@@ -7496,8 +7550,7 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
           emax = full > emax ? full : emax;
           vals_p[i] = full;
           ubits_p[i] = static_cast<uint64_t>(full);
-          sum = static_cast<int64_t>(static_cast<uint64_t>(sum) +
-                                     static_cast<uint64_t>(full));
+          sum_overflow |= __builtin_add_overflow(sum, full, &sum);
           const int64_t smin = full < mn ? full : mn;
           const int64_t smax = full > mx ? full : mx;
           mn = smin;
@@ -7606,8 +7659,7 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
           // Stats domain: a non-int64 cell in an int64 column still throws via
           // AsInt64 exactly like the historical expression.
           const int64_t sv = cell_i64 ? full : v.AsInt64();
-          sum = static_cast<int64_t>(static_cast<uint64_t>(sum) +
-                                     static_cast<uint64_t>(sv));
+          sum_overflow |= __builtin_add_overflow(sum, sv, &sum);
           const int64_t smin = sv < mn ? sv : mn;
           const int64_t smax = sv > mx ? sv : mx;
           mn = smin;
@@ -7782,6 +7834,7 @@ void ProfileRowGroup(std::span<const Row> group_rows, const Schema& sc,
     P.count = n;
     P.null_count = null_count;
     P.sum = sum;
+    P.sum_overflow = sum_overflow;
     P.mn = mn;
     P.mx = mx;
     P.emin = emin;
@@ -8951,6 +9004,13 @@ EncodedCol EncodeColumnAdaptive(slot_t col_idx, const Schema& sc,
         }
         if (s == Scheme::kPatas) {
           return 1.30;
+        }
+        // kPBitS parses the whole region once (popcount validation +
+        // exception-order audit) before bisecting, so a point probe pays the
+        // full-region parse cost that indexed schemes (kRleIdx, kBp128)
+        // avoid.  Price at kSimple8b's 1.50 tier.
+        if (s == Scheme::kPBitS) {
+          return 1.50;
         }
         // kInterp replays a <= 128-node block tree per point probe.
         if (s == Scheme::kInterp) {

@@ -118,6 +118,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.OuterJoinAssociativity`: `(a LOJ b) LOJ c` の探索により、左子に `a`、右子に `bc_group` を持つ `LeftOuterJoin` 式が生成されることを検証。
   - `CascadesTest.OuterJoinAssociativityRejectsInvalidPredicate`: 述語 `p2` が関係 `A` の列を参照している場合に、発火が正しく拒絶されることを検証。

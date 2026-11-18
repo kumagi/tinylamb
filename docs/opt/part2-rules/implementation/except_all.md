@@ -75,6 +75,6 @@ return std::vector<PlanAlternative>{
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子数バリデーションおよび上流プロパティの伝播抑制を検証します。
   - `CascadesTest.ExceptToAntiJoinRewrite`: 反結合への書き換えが ALL なしの `kExcept` のみに限定され、`kExceptAll` が対象外であることを間接的に保証します。

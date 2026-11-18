@@ -94,5 +94,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UniqueSemiToInnerRewrite`: 右表の主キーを用いた半結合から、`kJoin` 代替式が生成されることを検証します。
-- `plan/cascades_test.cpp` の `CascadesTest.UniqueSemiToInnerDoesNotFireWithoutKeyEquality`: 述語が不等号比較などの場合に発火しない安全性を検証します。
+- `plan/cascades_test_part*.cpp` の `CascadesTest.UniqueSemiToInnerRewrite`: 右表の主キーを用いた半結合から、`kJoin` 代替式が生成されることを検証します。
+- `plan/cascades_test_part*.cpp` の `CascadesTest.UniqueSemiToInnerDoesNotFireWithoutKeyEquality`: 述語が不等号比較などの場合に発火しない安全性を検証します。

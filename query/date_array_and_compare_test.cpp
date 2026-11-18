@@ -133,6 +133,63 @@ TEST_F(DateArrayStepTest, EmptyArrayWhenDirectionsDiverge) {
             "ARRAY<DATE>[],");
 }
 
+TEST_F(DateArrayStepTest, CompositeIntervalStepsFollowTheIntervalText) {
+  // The batch evaluator used to decode a literal INTERVAL step from the
+  // expression's Amount()/Unit() pair, which truncates compound intervals
+  // to the leading field and skips the sub-field validation the AST applies.
+  // Read against a table so the call executes per-row rather than being
+  // constant-folded away.
+  const auto run = [&](const std::string& sql) {
+    StatusOr<Executor> prepared = engine_->Prepare(*context_, sql);
+    ASSERT_TRUE(prepared.HasValue()) << engine_->LastError();
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    ASSERT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+  };
+  run("CREATE TABLE gda_t (d1 DATE, d2 DATE)");
+  run("INSERT INTO gda_t VALUES "
+      "(DATE '2026-01-01', DATE '2027-06-30')");
+  // "1-2" YEAR TO MONTH is a 14-month step: the leading amount alone
+  // would walk 12 months and land on 2027-01-01 instead.
+  EXPECT_EQ(Join(RunOnBothRoutes(engine_.get(), context_.get(),
+                                 "SELECT GENERATE_DATE_ARRAY("
+                                 "d1, d2, INTERVAL '1-2' YEAR TO MONTH) "
+                                 "FROM gda_t")),
+            "ARRAY<DATE>[2026-01-01, 2027-03-01],");
+
+  // A step that mixes days with a time component has no whole-day/month
+  // reading: both routes must reject it, not silently drop the time part.
+  for (const bool relational : {false, true}) {
+    engine_->SetForceRelationalFallback(relational);
+    StatusOr<Executor> prepared = engine_->Prepare(
+        *context_,
+        "SELECT GENERATE_DATE_ARRAY(d1, d2, INTERVAL '2 3' DAY TO HOUR) "
+        "FROM gda_t");
+    bool ok = prepared.HasValue();
+    if (ok) {
+      Row row;
+      while (prepared.Value()->Next(&row, nullptr)) {
+      }
+      ok = prepared.Value()->GetStatus() == Status::kSuccess;
+    }
+    EXPECT_FALSE(ok) << (relational ? "relational" : "compiled")
+                     << " route accepted a day+hour step";
+  }
+  engine_->SetForceRelationalFallback(false);
+
+  // A pre-evaluated interval text step (make_interval call) must decode its
+  // days from the parse result instead of a shadowed zero value.
+  run("DELETE FROM gda_t");
+  run("INSERT INTO gda_t VALUES "
+      "(DATE '2026-01-01', DATE '2026-01-07')");
+  EXPECT_EQ(Join(RunOnBothRoutes(engine_.get(), context_.get(),
+                                 "SELECT GENERATE_DATE_ARRAY("
+                                 "d1, d2, MAKE_INTERVAL(3, 'DAY')) "
+                                 "FROM gda_t")),
+            "ARRAY<DATE>[2026-01-01, 2026-01-04, 2026-01-07],");
+}
+
 class ArrayCompareTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -183,6 +240,28 @@ TEST_F(ArrayCompareTest, LexicographicElementwiseComparison) {
                             "SELECT ARRAY[4, 5] > ARRAY[4, 5]")
                 .front(),
             "0");
+}
+
+// A column-vs-array-literal predicate folds into a constant comparison. The
+// scan filter must decline to compile type pairs with no comparison payload
+// (arrays here) instead of rejecting every row.
+TEST_F(ArrayCompareTest, ArrayEqualityPredicateSurvivesScanFilter) {
+  const auto run = [&](const std::string& sql) {
+    StatusOr<Executor> prepared = engine_->Prepare(*context_, sql);
+    EXPECT_TRUE(prepared.HasValue()) << engine_->LastError();
+    if (!prepared.HasValue()) {
+      return;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_EQ(prepared.Value()->GetStatus(), Status::kSuccess);
+  };
+  run("CREATE TABLE arr_scan_t (id INT64, a ARRAY<INT64>)");
+  run("INSERT INTO arr_scan_t VALUES (1, [1, 2]), (2, [3, 4])");
+  EXPECT_EQ(RunOnBothRoutes(engine_.get(), context_.get(),
+                            "SELECT id FROM arr_scan_t WHERE a = [1, 2]"),
+            (std::vector<std::string>{"1"}));
 }
 
 TEST_F(ArrayCompareTest, NullElementPropagationMatchesNullSemantics) {

@@ -669,7 +669,8 @@ TEST_F(FullScanMvccFastPathTest, TypedProjectionEndsBeforeUnneededSuffix) {
   std::vector<RowPosition> positions;
   for (int i = 0; i < 73; ++i) {
     expected.emplace_back(
-        Row({((i % 3) != 0) ? Value(i) : Value(), Value(std::string(i, 'b')),
+        Row({((i % 3) != 0) ? Value(i) : Value(),
+             Value(std::string(static_cast<size_t>(i), 'b')),
              ((i % 5) != 0) ? Value(100 + i) : Value(),
              ((i % 2) != 0) ? Value(std::string(128, 'd')) : Value(),
              Value(i + 0.5)}));
@@ -739,15 +740,17 @@ TEST_F(FullScanMvccFastPathTest,
   std::vector<Row> rows;
   std::vector<RowPosition> positions;
   for (int i = 0; i < 97; ++i) {
-    rows.emplace_back(
-        Row({Value(i), ((i % 7) != 0) ? Value(i + .5) : Value(),
-             ((i % 9) != 0) ? Value(std::string(i, 'c')) : Value(),
-             ((i % 11) != 0) ? Value(i % 13) : Value(),
-             ((i % 8) != 0) ? Value(std::string(i % 19, 'e')) : Value(),
-             ((i % 6) != 0)
-                 ? Value::Date(((i % 2) != 0) ? "1996-01-02" : "1996-01-03")
-                 : Value(),
-             ((i % 5) != 0) ? Value(i % 17) : Value()}));
+    rows.emplace_back(Row(
+        {Value(i), ((i % 7) != 0) ? Value(i + .5) : Value(),
+         ((i % 9) != 0) ? Value(std::string(static_cast<size_t>(i), 'c'))
+                        : Value(),
+         ((i % 11) != 0) ? Value(i % 13) : Value(),
+         ((i % 8) != 0) ? Value(std::string(static_cast<size_t>(i % 19), 'e'))
+                        : Value(),
+         ((i % 6) != 0)
+             ? Value::Date(((i % 2) != 0) ? "1996-01-02" : "1996-01-03")
+             : Value(),
+         ((i % 5) != 0) ? Value(i % 17) : Value()}));
     ASSIGN_OR_ASSERT_FAIL(RowPosition, position,
                           table.Insert(seed.txn_, rows.back()));
     positions.push_back(position);

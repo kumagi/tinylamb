@@ -323,6 +323,7 @@ struct CompiledPlan {
   // the fill-time bound statement so hits replay it without re-binding.
   struct SelectShape {
     std::vector<std::string> column_names;
+    std::vector<ValueType> column_types;
     std::vector<Expression> order_expressions;
     std::vector<bool> order_ascending;
     // Parallels order_expressions; absent entries mean the engine default.
@@ -330,6 +331,7 @@ struct CompiledPlan {
     std::vector<std::pair<Expression, bool>> sort_keys;
     bool distinct{false};
     bool has_limit{false};
+    bool with_ties{false};
     size_t limit{0};
     size_t offset{0};
     size_t visible_columns{0};

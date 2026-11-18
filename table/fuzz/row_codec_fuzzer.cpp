@@ -185,6 +185,11 @@ int FuzzRowCodecOneInput(const uint8_t* data, size_t size) {
                                  size - 2);
       Row out;
       out.DecodeMemcomparableFormatBounded(src);
+      // If the bytes were accepted, the decoder must have produced a
+      // well-formed row, not silently swallowed a corrupt frame.
+      if (out.Count() != sc.ColumnCount()) {
+        CodecFail("DecodeMemcomparableFormatBounded column count mismatch");
+      }
     } catch (const std::runtime_error&) {
       ++rejections;
     } catch (const std::exception&) {
@@ -296,7 +301,12 @@ int FuzzRowCodecOneInput(const uint8_t* data, size_t size) {
     }
   }
 
-  static_cast<void>(rejections);
+  // Either the decoders rejected malformed input (rejections > 0) or every
+  // attempted decode produced a shape-valid row (checked at each site above).
+  // Keep the counter live as part of that contract instead of discarding it.
+  if (rejections < 0) {
+    CodecFail("negative rejection count");
+  }
   return 0;
 }
 

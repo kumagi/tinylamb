@@ -541,7 +541,12 @@ const std::vector<std::vector<std::string>>& SeedPool() {
   return *pool;
 }
 
-bool IsSelect(const std::string& sql) { return sql.starts_with("SELECT"); }
+bool IsSelect(const std::string& sql) {
+  // WITH-based CTE queries and parenthesized set operations are SELECTs too;
+  // a leading-"SELECT" literal test silently skipped every such seed.
+  return sql.starts_with("SELECT") || sql.starts_with("WITH") ||
+         sql.starts_with("(");
+}
 
 bool IsDdl(const std::string& sql) {
   return sql.starts_with("CREATE") || sql.starts_with("DROP");
@@ -729,7 +734,7 @@ RunOutcome RunStatement(Database& db, TransactionContext& ctx,
     // "column/table X not found"-class messages are the engine's ordinary
     // rejection mechanism on some paths (cf. executor_test expectations), so
     // they count as rejections, not findings.  The transitional EXC-SHIM
-    // boundary (no-exception-rule-migration.md Phase 7) still re-raises data-
+    // boundary still re-raises data-
     // dependent runtime errors (SUM/+ overflow, struct-field access on a
     // non-struct) as C++ exceptions; those carry the same messages the
     // StatusOr channel would report, so they too are rejections.  Anything
@@ -871,6 +876,14 @@ std::string CheckEvaluationPaths(Database& db, TransactionContext& ctx,
     if (spill.threw) {
       return "[GRIFFIN-THROW-SPILL] " + sql + "\n  what: " + spill.error + "\n";
     }
+    // A variant that silently refuses to run (prepare/stream rejected, no
+    // throw) is just as much a divergence as wrong rows — the AST arm above
+    // already proves ran-equality is part of the contract.
+    if (order_indep && spill.ran != first.ran) {
+      return "[GRIFFIN-SPILL-PATH MISMATCH] " + sql +
+             "\n  default ran=" + (first.ran ? "true" : "false") +
+             " spill ran=" + (spill.ran ? "true" : "false") + "\n";
+    }
     if (order_indep && spill.ran && spill.rows != first.rows) {
       std::string report = "[GRIFFIN-SPILL MISMATCH] " + sql + "\n";
       for (const std::string& row : first.rows) {
@@ -890,6 +903,11 @@ std::string CheckEvaluationPaths(Database& db, TransactionContext& ctx,
       return "[GRIFFIN-THROW-RELATIONAL] " + sql + "\n  what: " + rel.error +
              "\n";
     }
+    if (rel.ran != first.ran) {
+      return "[GRIFFIN-RELATIONAL-PATH MISMATCH] " + sql +
+             "\n  default ran=" + (first.ran ? "true" : "false") +
+             " relational ran=" + (rel.ran ? "true" : "false") + "\n";
+    }
     if (rel.ran && rel.rows != first.rows) {
       std::string report = "[GRIFFIN-RELATIONAL MISMATCH] " + sql + "\n";
       for (const std::string& row : first.rows) {
@@ -906,6 +924,11 @@ std::string CheckEvaluationPaths(Database& db, TransactionContext& ctx,
     if (cas.threw) {
       return "[GRIFFIN-THROW-CASCADES] " + sql + "\n  what: " + cas.error +
              "\n";
+    }
+    if (cas.ran != first.ran) {
+      return "[GRIFFIN-CASCADES-PATH MISMATCH] " + sql +
+             "\n  default ran=" + (first.ran ? "true" : "false") +
+             " cascades ran=" + (cas.ran ? "true" : "false") + "\n";
     }
     if (cas.ran && cas.rows != first.rows) {
       std::string report = "[GRIFFIN-CASCADES MISMATCH] " + sql + "\n";

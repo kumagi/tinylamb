@@ -234,7 +234,7 @@ SELECT FloatReflexiveEquals(rand());
 ARRAY<STRUCT<BOOL>>[{true}]
 ==
 
-[name=call_function_with_coorelated_argument_ref]
+[name=call_function_with_correlated_argument_ref]
 SELECT StringIdentityCorrelated('a')
 UNION ALL
 SELECT StringIdentityCorrelated('b');

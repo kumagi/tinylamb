@@ -72,7 +72,7 @@ Plan RemoveIdentityProjection(Plan child,
                               .estimated_rows = children[0].estimated_rows}};
 ```
 
-- **物理計画ノード**: `RemoveIdentityProjection` が返却した `ProjectionPlan` または子最良プランを採用します。実行時は `executor/relational_factory.cpp` において `ProjectionExecutor` が生成されます。
+- **物理計画ノード**: `RemoveIdentityProjection` が返却した `ProjectionPlan` または子最良プランを採用します。実行時は `executor/relational_factory.cpp` において the projection executor が生成されます。
 - **局所コスト計算**:
   ```cpp
   local_cost = children[0].estimated_rows;
@@ -99,6 +99,6 @@ Plan RemoveIdentityProjection(Plan child,
 - `plan/plan_test.cpp`:
   - `PlanTest.ProjectionEmitExecutorProjectsValues`: 物理射影実行器による属性抽出と式評価の正確性を検証。
   - `PlanTest.ProjectionPlanIsOrderedByDelegatesToChild`: 射影ノードが子ノードのソート順序判定をそのまま透過することを検証。
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.ProjectionIsPushedThroughInnerJoinWithRequiredColumns`: 射影のプッシュダウンと要求属性セットの伝播動作を検証。
 

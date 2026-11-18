@@ -72,4 +72,4 @@ const auto rows = static_cast<double>(sample->EmitRowCount());
 
 - `query/table_sample_test.cpp`: `SYSTEM TABLESAMPLE` の文法・再現性・行数上限。
 - `query/analytical_features_test.cpp`: `TABLESAMPLE` × `GROUP BY` 等の分析機能との組合せ。
-- `query/query_test.cpp`: `TABLESAMPLE` を含む end-to-end 結果検証。
+- `query/query_test_part*.cpp`: `TABLESAMPLE` を含む end-to-end 結果検証。

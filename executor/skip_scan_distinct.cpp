@@ -30,9 +30,9 @@ namespace {
 std::string EncodeParts(const std::vector<Value>& parts) {
   std::string encoded;
   for (const Value& value : parts) {
-    if (value.IsNull()) {
-      break;
-    }
+    // NULL has a valid memcomparable encoding (the smallest marker). Breaking
+    // at the first NULL truncates a composite prefix and makes the subsequent
+    // seek skip whole DISTINCT groups.
     encoded += value.EncodeMemcomparableFormat();
   }
   return encoded;
@@ -107,6 +107,33 @@ void SkipScanDistinct::ResolveCurrentRow() const {
     current_row_resolved_ = true;
     return;
   }
+  if (ref.Value()->body.row_page.IsColumnarStub()) {
+    ref.Value().PageUnlock();
+    std::string stub_image;
+    const Status ds = table_.ReadEncodedFromStub(current_pos_, &stub_image);
+    if (ds != Status::kSuccess) {
+      if (ds != Status::kNotExists) {
+        status_ = ds;
+      }
+      current_row_.Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    const StatusOr<std::string_view> visible =
+        txn_.ReadVersion(current_pos_, std::string_view(stub_image));
+    if (!visible.HasValue()) {
+      if (visible.GetStatus() != Status::kNotExists) {
+        status_ = visible.GetStatus();
+      }
+      current_row_.Clear();
+      current_row_resolved_ = true;
+      return;
+    }
+    const std::string encoded_row(visible.Value());
+    current_row_.Deserialize(encoded_row.data(), table_.GetSchema());
+    current_row_resolved_ = true;
+    return;
+  }
   StatusOr<std::string_view> row = ref.Value()->Read(txn_, current_pos_.slot);
   if (!row.HasValue()) {
     // Stale index entries may legitimately name a row invisible to this
@@ -118,7 +145,6 @@ void SkipScanDistinct::ResolveCurrentRow() const {
     current_row_resolved_ = true;
     return;
   }
-  txn_.AddReadSet(current_pos_);
   const std::string encoded_row(row.Value());
   current_row_.Deserialize(encoded_row.data(), table_.GetSchema());
   current_row_resolved_ = true;

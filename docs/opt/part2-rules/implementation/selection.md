@@ -85,7 +85,7 @@ SQL 標準において、`WHERE` 句等の選択述語は真（TRUE）と評価�
         c::LogicalOperator::kSelection));
 ```
 
-- **物理計画ノード**: `SelectionPlan`（`plan/selection_plan.hpp`）を生成します。実行時は `SelectionExecutor` が各タプルに対して述語を評価します。
+- **物理計画ノード**: `SelectionPlan`（`plan/selection_plan.hpp`）を生成します。実行時は the selection executor が各タプルに対して述語を評価します。
 - **局所コスト計算**:
   ```cpp
   local_cost = input; // children[0].estimated_rows
@@ -110,6 +110,6 @@ SQL 標準において、`WHERE` 句等の選択述語は真（TRUE）と評価�
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.ConstantFalseSelectionBecomesEmptyPlan`: 定数 0 の述語が `EmptyPlan`（実行時 `EmptyResult`）となり、テーブル走査が実行されないことを検証。
   - `OptimizerTest.ContradictoryConjunctsBecomeEmptyResult`: `c1 = 10 AND c1 = 11` などの矛盾連言が 0 行短絡されることを確認。

@@ -138,7 +138,7 @@ from enum_bytes
 ARRAY<STRUCT<e BOOL>>[{true}]
 ==
 [name=fetch_unknown_fields_many_times]
-# Engines algebretize and use different codepaths for fetches with multiple
+# Engines algebraize and use different codepaths for fetches with multiple
 # fields, so repeat some tests for more complex output.
 with t as (
   select cast(unknown_test_enum_7_unknown_repeated_test_enum_7 as

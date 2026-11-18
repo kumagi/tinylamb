@@ -32,8 +32,8 @@ ARRAY<STRUCT<id INT64, d FLOAT64, fd FLOAT64>>[
 [name=floating_identity_constants_neutralized]
 SELECT id, a + 0.0 AS x, a * 1.0 AS y FROM arithmetic_input ORDER BY id
 --
-ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
-  {1, 10, 10}, {2, 0, 0}, {3, NULL, NULL}
+ARRAY<STRUCT<id INT64, x FLOAT64, y FLOAT64>>[
+  {1, 10.0, 10.0}, {2, 0.0, 0.0}, {3, NULL, NULL}
 ]
 ==
 
@@ -229,8 +229,8 @@ ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
 SELECT id, SAFE_DIVIDE(a, 0) AS x, SAFE_DIVIDE(a, 2) AS y
 FROM arithmetic_input ORDER BY id
 --
-ARRAY<STRUCT<id INT64, x INT64, y INT64>>[
-  {1, NULL, 5}, {2, NULL, 0}, {3, NULL, NULL}
+ARRAY<STRUCT<id INT64, x FLOAT64, y FLOAT64>>[
+  {1, NULL, 5.0}, {2, NULL, 0.0}, {3, NULL, NULL}
 ]
 ==
 

@@ -71,6 +71,8 @@ class FullScan : public ExecutorBase {
   bool AttachRuntimeFilter(
       const std::shared_ptr<const RuntimeFilterGroup>& group, slot_t column,
       ValueType type) override;
+  [[nodiscard]] std::optional<uint64_t> TryExactUnfilteredRowCount()
+      const override;
 
   [[nodiscard]] const std::optional<ColumnName>& ClusteredOrder() const {
     return clustered_order_;
@@ -82,6 +84,7 @@ class FullScan : public ExecutorBase {
   const Table* table_;
   Iterator iter_;
   size_t max_rows_;
+  bool lock_rows_{false};
   size_t emitted_{0};
   // Set by the first Next/NextBatch: past that point the iterator has already
   // consumed rows, and installing a filter could only prune them retroactively.

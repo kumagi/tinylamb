@@ -50,13 +50,14 @@ TEST(Crc32CTest, Crc32C_MatchesSoftwareLoop_AcrossSizesAndSeeds) {
     byte = static_cast<uint8_t>(rng());
   }
 
-  // Boundary lengths around the 256-byte lane threshold and every tail shape.
+  // Boundary lengths around the multi-lane threshold and every tail shape.
   for (size_t length :
-       {size_t{0},   size_t{1},   size_t{2},    size_t{3},    size_t{4},
-        size_t{7},   size_t{8},   size_t{9},    size_t{15},   size_t{16},
-        size_t{17},  size_t{63},  size_t{64},   size_t{65},   size_t{127},
-        size_t{128}, size_t{255}, size_t{256},  size_t{257},  size_t{264},
-        size_t{511}, size_t{512}, size_t{1024}, size_t{4096}, size_t{8192}}) {
+       {size_t{0},    size_t{1},    size_t{2},    size_t{3},    size_t{4},
+        size_t{7},    size_t{8},    size_t{9},    size_t{15},   size_t{16},
+        size_t{17},   size_t{63},   size_t{64},   size_t{65},   size_t{127},
+        size_t{128},  size_t{255},  size_t{256},  size_t{257},  size_t{264},
+        size_t{511},  size_t{512},  size_t{1024}, size_t{2047}, size_t{2048},
+        size_t{2049}, size_t{2056}, size_t{4096}, size_t{8192}}) {
     for (size_t offset = 0; offset < 16; ++offset) {
       ASSERT_LE(length + offset, buf.size());
       const auto raw = static_cast<uint32_t>(rng());

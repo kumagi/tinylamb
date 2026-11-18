@@ -526,7 +526,7 @@ TEST_F(SqlClusteredOrderTest, ClaimedScanStaysOrderedAfterAConcurrentWrite) {
 // The SQL COUNT(*) index-only path serves its entries from the visibility
 // map once the committed rows' version chains are gone: the answer is
 // unchanged and the heap fetch is skipped.  (The plan shape itself is
-// pinned by OptimizerTest.CountStarUsesUnboundedIndexOnlyScan.)
+// pinned by the plan-shape assertions.)
 TEST_F(SqlClusteredOrderTest, CountStarIndexOnlyScanServesVisibilityMap) {
   WaitForChainFreePages();
   TransactionContext ctx = database_->BeginReadOnlyContext();

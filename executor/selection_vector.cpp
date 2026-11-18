@@ -138,6 +138,11 @@ SelectionVector::SelectionVector(std::vector<uint32_t> indices)
     : indices_(std::move(indices)) {}
 
 void SelectionVector::Initialize(size_t count) {
+  // Indices are uint32_t; a larger batch cannot be represented.
+  if (count > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1) {
+    indices_.clear();
+    return;
+  }
   indices_.resize(count);
   std::iota(indices_.begin(), indices_.end(), 0U);
 }

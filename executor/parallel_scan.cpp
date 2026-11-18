@@ -15,16 +15,19 @@
 
 #include "common/constants.hpp"
 #include "common/exception_status.hpp"
+#include "common/literal_like_pattern.hpp"
 #include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/scan_filter.hpp"
+#include "executor/query_memory.hpp"
 #include "page/row_position.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "table/iterator.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
+#include "table/tlcs_file.hpp"
 #include "transaction/transaction.hpp"
 #include "type/value_type.hpp"
 
@@ -45,6 +48,19 @@ void ParallelScan::SetRowFilter(
   row_filter_programs_ =
       std::make_unique<relational_detail::WorkerScanFilterPrograms>(
           std::move(programs));
+  // A wide scan may have declined a full column cache before its filter was
+  // attached. Prepare the predicate columns so immutable membership synopses
+  // can reject an impossible equality without visiting every heap row.
+  // If a value may exist, Start still restores the full-row fallback.
+  if (!projection_ && !lstable_store_ &&
+      std::ranges::any_of(peek_compares_, [](const auto& compare) {
+        return compare.op == BinaryOperation::kEquals;
+      })) {
+    const auto prepared = PrepareLSTableColumns({});
+    if (!prepared.HasValue()) {
+      FailWith(prepared.GetStatus());
+    }
+  }
 }
 
 ParallelScan::ParallelScan(Transaction& txn, const Table& table,
@@ -107,7 +123,13 @@ ParallelScan::ParallelScan(Transaction& txn, const Table& table,
       morsels_.push_back(std::move(morsel));
     }
   } else {
-    morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel);
+    Status morsel_status = Status::kSuccess;
+    morsels_ = table_->BuildScanMorsels(*txn_, pages_per_morsel, &morsel_status);
+    if (morsel_status != Status::kSuccess) {
+      // Surface the planning failure through the normal worker-status path
+      // instead of streaming an empty (= "no rows") result.
+      worker_status_ = morsel_status;
+    }
   }
   morsels_done_.assign(morsels_.size(), false);
   worker_count_ = std::min(QueryParallelWorkerLimit(worker_count),
@@ -279,11 +301,173 @@ StatusOr<bool> ParallelScan::TryFoldLSTableStore(
   return true;
 }
 
+StatusOr<std::optional<int64_t>> ParallelScan::TryCountDictionaryMatches() try {
+  if (started_ || projection_ || txn_->HasAnyPageVersionChains() ||
+      !peek_compares_.empty() || !row_filter_ ||
+      row_filter_->compile_decided_reject ||
+      !row_filter_->disjunctive_branches.empty() ||
+      !row_filter_->prefix_in.empty() ||
+      !row_filter_->prebuilt_membership.empty() ||
+      !row_filter_->prebuilt_scalar_compare.empty() ||
+      !row_filter_->residual.empty() || row_filter_->simple.empty()) {
+    return std::optional<int64_t>{};
+  }
+  if (worker_status_ != Status::kSuccess) {
+    return worker_status_;
+  }
+  const auto slot = row_filter_->simple.front().column;
+  if (slot >= table_->GetSchema().ColumnCount() ||
+      table_->GetSchema().GetColumn(slot).Type() != ValueType::kVarChar ||
+      table_->GetSchema().GetColumn(slot).IsInterval()) {
+    return std::optional<int64_t>{};
+  }
+  auto predicates = row_filter_->simple;
+  for (auto& predicate : predicates) {
+    if (predicate.column != slot || predicate.column_payload ||
+        predicate.constant.type != ValueType::kVarChar ||
+        predicate.constant.IsCaseInsensitive() ||
+        (!predicate.plain_string_payload &&
+         predicate.op != BinaryOperation::kLike &&
+         predicate.op != BinaryOperation::kNotLike)) {
+      return std::optional<int64_t>{};
+    }
+    predicate.column = 0;
+  }
+  ASSIGN_OR_RETURN(bool, prepared,
+                   PrepareLSTableColumns({static_cast<slot_t>(slot)}));
+  if (!prepared) {
+    return std::optional<int64_t>{};
+  }
+  const auto& dictionary = lstable_store_->dictionaries[slot];
+  const size_t domain = dictionary.entries.size();
+  if (dictionary.code_counts.size() != domain + 1 ||
+      lstable_store_->total_rows > static_cast<uint64_t>(INT64_MAX)) {
+    return std::optional<int64_t>{};
+  }
+  // Every row must be accounted for by a dictionary code (including the
+  // NULL sentinel at index `domain`). Otherwise selected_count would under-
+  // count and typed_folded_ would suppress the row-level fallback.
+  uint64_t coded_rows = 0;
+  for (const uint64_t count : dictionary.code_counts) {
+    coded_rows += count;
+  }
+  if (coded_rows != lstable_store_->total_rows) {
+    return std::optional<int64_t>{};
+  }
+  const size_t workers = std::min(
+      worker_count_, ParallelWorkerCount(std::max<size_t>(1, domain / 8192)));
+  std::vector<std::optional<LiteralLikePattern>> patterns(predicates.size());
+  for (size_t i = 0; i < predicates.size(); ++i) {
+    if (predicates[i].op == BinaryOperation::kLike ||
+        predicates[i].op == BinaryOperation::kNotLike) {
+      patterns[i] =
+          LiteralLikePattern::Compile(predicates[i].constant.AsStringView());
+    }
+  }
+  std::vector<int64_t> counts(workers, 0);
+  RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
+    int64_t selected_count = 0;
+    Row row(std::vector<Value>(1));
+    row.values_[0].type = ValueType::kVarChar;
+    for (size_t code = domain * worker / workers;
+         code < domain * (worker + 1) / workers; ++code) {
+      row.values_[0].value.varchar_value = dictionary.entries[code];
+      if (std::ranges::all_of(predicates, [&](const auto& predicate) {
+            const auto& pattern =
+                patterns[static_cast<size_t>(&predicate - predicates.data())];
+            if (pattern)
+              return pattern->Matches(row.values_[0].AsStringView()) ==
+                     (predicate.op == BinaryOperation::kLike);
+            return relational_detail::MatchSimpleCompare(row, predicate);
+          }))
+        selected_count += dictionary.code_counts[code];
+    }
+    counts[worker] = selected_count;
+  }));
+  int64_t count = 0;
+  for (const auto partial : counts) {
+    count += partial;
+  }
+  started_ = true;
+  typed_folded_ = true;
+  return std::optional<int64_t>(count);
+} catch (const std::bad_alloc&) {
+  return Status::kNoSpace;
+} catch (...) {
+  return Status::kRuntimeError;
+}
+
+StatusOr<bool> ParallelScan::PrepareLSTableColumns(
+    const std::vector<slot_t>& required_columns) try {
+  if (worker_status_ != Status::kSuccess) {
+    return worker_status_;
+  }
+  if (started_ || txn_->HasAnyPageVersionChains() ||
+      (!txn_->IsReadOnly() && !txn_->WriteSetEmpty()) ||
+      table_->RowsRewrittenInPlace()) {
+    return false;
+  }
+  std::vector<slot_t> needed = required_columns;
+  for (const auto& pred : peek_compares_) {
+    needed.push_back(pred.column);
+  }
+  if (row_filter_) {
+    for (const auto& pred : row_filter_->simple) {
+      if (pred.column >= table_->GetSchema().ColumnCount()) {
+        return false;
+      }
+      needed.push_back(static_cast<slot_t>(pred.column));
+    }
+  }
+  const auto contains = [&](const auto& store) {
+    return store && store->uncommitted_owner_txn == 0 &&
+           store->layout_generation == table_->LayoutGeneration() &&
+           store->first_pid == table_->FirstPageId() &&
+           std::ranges::all_of(needed, [&](slot_t c) {
+             return c < table_->GetSchema().ColumnCount() &&
+                    store->HasColumn(c);
+           });
+  };
+  if (contains(lstable_store_)) {
+    return true;
+  }
+  auto store = GetOrBuildLSTableStore(*txn_, *table_, true, &needed);
+  if (!contains(store) || txn_->HasAnyPageVersionChains()) {
+    return false;
+  }
+  lstable_store_ = std::move(store);
+  return true;
+} catch (const std::bad_alloc&) {
+  FailWith(Status::kNoSpace);
+  return Status::kNoSpace;
+} catch (...) {
+  FailWith(Status::kRuntimeError);
+  return Status::kRuntimeError;
+}
+
+StatusOr<Row> ParallelScan::ReadFoldedRow(RowPosition position) const try {
+  ASSIGN_OR_RETURN(Row, row, table_->Read(*txn_, position));
+  if (!projection_) {
+    return row;
+  }
+  std::vector<Value> values;
+  values.reserve(projection_->size());
+  for (slot_t slot : *projection_) {
+    values.push_back(row[slot]);
+  }
+  return Row(std::move(values));
+} catch (const std::bad_alloc&) {
+  return Status::kNoSpace;
+} catch (...) {
+  return Status::kRuntimeError;
+}
+
 StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
     size_t worker_count,
     const std::function<Status(size_t, const LSTablePageBlock&, const uint32_t*,
                                size_t)>& consume,
-    const std::vector<slot_t>* required_columns) try {
+    const std::vector<slot_t>* required_columns,
+    const std::function<bool(size_t, const LSTablePageBlock&)>& may_match) try {
   if (started_ || txn_->HasAnyPageVersionChains()) {
     return false;
   }
@@ -334,23 +518,13 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
       }
     }
   }
-  if (!lstable_store_ && required_columns != nullptr &&
-      (txn_->IsReadOnly() || txn_->WriteSetEmpty())) {
-    std::vector<slot_t> needed = *required_columns;
-    for (const auto& pred : peek_compares_) {
-      needed.push_back(pred.column);
+  if (required_columns != nullptr) {
+    auto prepared = PrepareLSTableColumns(*required_columns);
+    if (!prepared.HasValue()) {
+      return prepared.GetStatus();
     }
-    if (row_filter_) {
-      for (const auto& pred : row_filter_->simple) {
-        needed.push_back(static_cast<slot_t>(pred.column));
-      }
-    }
-    auto store = GetOrBuildLSTableStore(*txn_, *table_, true, &needed);
-    if (store && store->uncommitted_owner_txn == 0 &&
-        store->layout_generation == table_->LayoutGeneration() &&
-        store->first_pid == table_->FirstPageId() &&
-        !txn_->HasAnyPageVersionChains()) {
-      lstable_store_ = std::move(store);
+    if (!prepared.Value()) {
+      return false;
     }
   }
   if (!lstable_store_) {
@@ -369,6 +543,42 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
   const size_t fold_workers =
       std::min({std::max<size_t>(1, worker_count), worker_count_,
                 ParallelWorkerCount(total_blocks)});
+  QueryMemoryCharge predicate_charge;
+  std::vector<std::optional<LiteralLikePattern>> literal_patterns(
+      can_inline_simple ? row_filter_->simple.size() : 0);
+  std::vector<std::vector<uint8_t>> dictionary_matches(literal_patterns.size());
+  for (size_t p = 0; p < literal_patterns.size(); ++p) {
+    const auto& predicate = row_filter_->simple[p];
+    if (predicate.op != BinaryOperation::kLike &&
+        predicate.op != BinaryOperation::kNotLike) {
+      continue;
+    }
+    literal_patterns[p] =
+        LiteralLikePattern::Compile(predicate.constant.AsStringView());
+    const auto& dictionary = lstable_store_->dictionaries[predicate.column];
+    const size_t domain = dictionary.entries.size();
+    if ((!dictionary.active && dictionary.wide_code_bytes == 0) ||
+        domain == 0 ||
+        dictionary.DictionaryCodeCount() != lstable_store_->total_rows ||
+        domain > lstable_store_->total_rows / 2 ||
+        !QueryMemoryBudget::Global().CanReserve(domain)) {
+      continue;
+    }
+    predicate_charge.Add(domain);
+    auto& matches = dictionary_matches[p];
+    matches.resize(domain);
+    RETURN_IF_FAIL(RunParallelTasks(fold_workers, [&](size_t worker) {
+      for (size_t code = domain * worker / fold_workers;
+           code < domain * (worker + 1) / fold_workers; ++code) {
+        const auto text = dictionary.StringEntryAt(code);
+        const bool match = literal_patterns[p]
+                               ? literal_patterns[p]->Matches(text)
+                               : relational_detail::FastLikeMatch(
+                                     text, predicate.constant.AsStringView());
+        matches[code] = match == (predicate.op == BinaryOperation::kLike);
+      }
+    }));
+  }
   const std::vector<IntegerPeekCompare>* peek_ptr =
       peek_compares_.empty() ? nullptr : &peek_compares_;
   std::atomic<bool> failed{false};
@@ -392,7 +602,7 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
           return;
         }
         const LSTablePageBlock& blk = lstable_store_->blocks[b];
-        if (blk.row_count == 0) {
+        if (blk.row_count == 0 || (may_match && !may_match(w, blk))) {
           continue;
         }
         if (!blk.MatchesZoneMaps(peek_ptr, nullptr, std::nullopt)) {
@@ -661,6 +871,15 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                 break;
               }
               if (col.type == ValueType::kVarChar) {
+                const auto p =
+                    static_cast<size_t>(&pred - row_filter_->simple.data());
+                if (!dictionary_matches[p].empty()) {
+                  if (!dictionary_matches[p][col.DictionaryCodeAt(r)]) {
+                    simple_ok = false;
+                    break;
+                  }
+                  continue;
+                }
                 const std::string_view value = col.VarcharAt(r);
                 const std::string_view constant =
                     pred.constant.value.varchar_value;
@@ -686,7 +905,10 @@ StatusOr<bool> ParallelScan::TryFoldLSTableBlocks(
                     break;
                   case BinaryOperation::kLike:
                   case BinaryOperation::kNotLike:
-                    ok = relational_detail::FastLikeMatch(value, constant) ==
+                    ok = (literal_patterns[p]
+                              ? literal_patterns[p]->Matches(value)
+                              : relational_detail::FastLikeMatch(value,
+                                                                 constant)) ==
                          (pred.op == BinaryOperation::kLike);
                     break;
                   default:
@@ -810,6 +1032,16 @@ void ParallelScan::Start(size_t batch_size) {
   }
   if (morsels_.empty()) {
     return;
+  }
+  // A fold may prepare just its keys and then decline (predicate, budget,
+  // or snapshot eligibility). The normal scan still owes its full payload.
+  if (lstable_store_) {
+    for (size_t c = 0; c < OutputColumnCount(); ++c) {
+      if (!lstable_store_->HasColumn(TableColumnSlot(c))) {
+        lstable_store_.reset();
+        break;
+      }
+    }
   }
   workers_.reserve(worker_count_);
   size_t launched = 0;
@@ -1165,9 +1397,7 @@ void ParallelScan::RunWorker(size_t batch_size, size_t worker_index) {
                   break;
               }
             }
-            const RowPosition position(pid, r < blk->slots.size()
-                                                ? blk->slots[r]
-                                                : static_cast<slot_t>(r));
+            const RowPosition position(pid, blk->SlotAt(r));
             if (row_filter_ != nullptr && !skip_worker_filter) {
               const int decision = relational_detail::MatchScanFilterWorker(
                   row_scratch, table_->GetSchema(), *row_filter_,
@@ -1481,6 +1711,22 @@ size_t ParallelScan::DrainDeferred(DataChunk* destination, size_t max_rows) {
     deferred_drained_ = true;
   }
   return destination->Size();
+}
+
+std::optional<uint64_t> ParallelScan::TryExactUnfilteredRowCount() const {
+  if (started_ || row_filter_ != nullptr || !peek_compares_.empty() ||
+      txn_ == nullptr || table_ == nullptr || txn_->IsFailed() ||
+      !(txn_->IsReadOnly() || txn_->WriteSetEmpty()) ||
+      txn_->HasAnyPageVersionChains() || table_->RowsRewrittenInPlace()) {
+    return std::nullopt;
+  }
+  if (const auto tlcs = table_->GetBackingTLCSStore();
+      tlcs != nullptr &&
+      tlcs->LayoutGeneration() == table_->LayoutGeneration() &&
+      tlcs->FirstPageId() == table_->FirstPageId()) {
+    return tlcs->TotalRows();
+  }
+  return std::nullopt;
 }
 
 void ParallelScan::Dump(std::ostream& out, int /*indent*/) const {

@@ -1,0 +1,15 @@
+-- tinylamb-griffin-test v1
+-- seed: 16740944519751780439
+-- stmt: SELECT a.id, b.id FROM tree a CROSS JOIN tree b WHERE a.id = b.id;
+-- stmt: CREATE TABLE tree (id INT64, parent INT64, w DOUBLE);
+-- stmt: SELECT parent, COUNT(*) FROM tree GROUP BY parent HAVING COUNT(*) > 1;
+-- stmt: SELECT a * 3 + 1 FROM t1 WHERE a > 0;
+-- stmt: INSERT INTO tree VALUES (1, NULL, 1.0), (2, 1, 2.5), (3, 1, 2.5), (4, 2, NULL), (5, 5, 0.0);
+-- stmt: CREATE TABLE t1 (a INT64, b STRING, c DOUBLE);
+-- stmt: SELECT b, COUNT(*) FROM t1 GROUP BY b;
+-- stmt: SELECT t.id FROM tree t LEFT JOIN t1 k ON t.parent = k.id WHERE k.id IS NULL;
+-- stmt: SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.a = t2.d ORDER BY t1.a;
+-- stmt: INSERT INTO t1 (a, b, c) VALUES (1, 'x', 1.5), (2, 'y', NULL), (NULL, 'z', 3.25);
+-- stmt: SELECT c.id, p.parent FROM tree c JOIN tree p ON w.parent = p.id ORDER BY c.id;
+-- ran_select: true
+-- failure: evaluation-path mismatch

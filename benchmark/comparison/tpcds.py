@@ -258,8 +258,14 @@ def report(out):
     records = [json.loads(line) for line in (out / 'results.jsonl').read_text().splitlines()]
     records.sort(key=lambda record: record['query'])
     good = [r for r in records if r['status'] == 'ok']
-    fig, axes = plt.subplots(3, 1, figsize=(20, 12), constrained_layout=True)
-    for ax, start in zip(axes, (1, 34, 67)):
+    meta = json.loads((out / 'environment.json').read_text())
+    suite = meta['args'].get('suite', 'tpcds')
+    label = 'TPC-H' if suite == 'tpch' else 'TPC-DS'
+    panels = (meta['dataset']['queries'] + 32) // 33
+    fig, grid = plt.subplots(panels, 1, figsize=(20, 4 * panels),
+                            constrained_layout=True, squeeze=False)
+    axes = grid[:, 0]
+    for ax, start in zip(axes, range(1, panels * 33 + 1, 33)):
         subset = [r for r in records if start <= r['query'] < start + 33]
         for j, r in enumerate(subset):
             if r['status'] != 'ok':
@@ -277,7 +283,7 @@ def report(out):
     from matplotlib.patches import Patch
     axes[0].legend(handles=[Patch(color='#2678b2', label='tinylamb'), Patch(color='#ec9b24', label='DuckDB')])
     meta = json.loads((out / 'environment.json').read_text())
-    fig.suptitle(f'TPC-DS derived / dsdgen SF={meta["dataset"]["scale_factor"]} / binary64 / '
+    fig.suptitle(f'{label} derived / SF={meta["dataset"]["scale_factor"]} / binary64 / '
                  f'{len(good)}/{len(records)} answers matched\nMedian with min/max; warm embedded APIs; not a certified TPC score')
     fig.savefig(out / 'latency.png', dpi=170)
     fig.savefig(out / 'latency.svg')
@@ -294,6 +300,8 @@ def report(out):
                'geomean_tinylamb_over_duckdb': math.exp(statistics.mean(map(math.log, ratios))) if ratios else None,
                'sum_median_ms': {e: sum(statistics.median(r[e]['samples_ms']) for r in good) for e in ('tinylamb', 'duckdb')},
                'failures': [{'query': r['query'], 'status': r['status'], 'detail': r.get('detail')} for r in records if r['status'] != 'ok']}
+    summary['performance_failures'] = [r['query'] for r in records if not r.get('performance_pass', True)]
+    summary['unattempted_queries'] = [q for q in meta['args']['queries'] if q not in {r['query'] for r in records}]
     dump(out / 'summary.json', summary)
     fig, ax = plt.subplots(figsize=(19, 5), constrained_layout=True)
     speedups = [1 / ratio for ratio in ratios]
@@ -304,10 +312,10 @@ def report(out):
     if speedups:
         ax.set_ylim(min(speedups) * .7, max(speedups) * 1.3)
     ax.set_xticks(range(len(good)), [str(r['query']) for r in good], fontsize=6)
-    ax.set_xlabel('TPC-DS query')
+    ax.set_xlabel(f'{label} query')
     ax.set_ylabel('DuckDB / tinylamb median time (log)')
     ax.grid(axis='y', alpha=.2)
-    ax.set_title(f'TPC-DS derived / SF={meta["dataset"]["scale_factor"]} / {meta["args"]["threads"]} threads / '
+    ax.set_title(f'{label} derived / SF={meta["dataset"]["scale_factor"]} / {meta["args"]["threads"]} threads / '
                  f'tinylamb faster on {summary["tinylamb_wins"]}/{len(records)} queries\n'
                  'Above 1: tinylamb faster; below 1: DuckDB faster. Binary64; not a certified TPC score.')
     fig.savefig(out / 'speedup.png', dpi=180)
@@ -316,8 +324,43 @@ def report(out):
     print(json.dumps(summary, indent=2))
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
+def query_records(workers, queries, warmup, repeats, max_ratio=None):
+    """Run in requested order, stopping before the next query on a gate failure."""
+    for q in queries:
+        record = {'query': q, 'status': 'ok', 'load_average_before': os.getloadavg()}
+        for e in (('tinylamb', 'duckdb') if q % 2 else ('duckdb', 'tinylamb')):
+            samples, answers, prepares = [], [], []
+            for i in range(warmup + repeats):
+                response = workers[e].query(f'q{q}.sql')
+                if 'error' in response:
+                    record['status'] = 'error'; record['detail'] = e + ': ' + response['error']; break
+                answers.append(response['rows'])
+                if i >= warmup:
+                    samples.append(response['ms'])
+                    prepares.append(response.get('prepare_ms'))
+            record[e] = {'samples_ms': samples, 'prepare_ms': prepares, 'rows': answers[-1] if answers else None}
+            if answers and any(compare(answers[0], rows) for rows in answers[1:]):
+                record['status'] = 'unstable'; record['detail'] = e + ': answers changed between runs'
+                record[e]['unstable_answers'] = answers
+        if record['status'] == 'ok':
+            mismatch = compare(record['tinylamb']['rows'], record['duckdb']['rows'])
+            if mismatch:
+                record['status'] = 'mismatch'; record['detail'] = mismatch
+        record['load_average_after'] = os.getloadavg()
+        if record['status'] == 'ok' and max_ratio is not None:
+            tiny = statistics.median(record['tinylamb']['samples_ms'])
+            duck = statistics.median(record['duckdb']['samples_ms'])
+            record['time_ratio'] = tiny / duck if duck > 0 else None
+            record['performance_pass'] = tiny <= max_ratio * duck
+        yield record
+        if max_ratio is not None and (record['status'] != 'ok' or
+                                      not record.get('performance_pass', False)):
+            return
+
+
+def main(suite="tpcds"):
+    p = argparse.ArgumentParser(description=(__doc__ if suite == 'tpcds' else
+        'TPC-H 22-query embedded comparison using an existing DBGEN dataset.'))
     p.add_argument('--output', type=Path)
     p.add_argument('--dataset', type=Path, help='reuse a generated dataset')
     p.add_argument('--fixture', type=Path, help='reuse a loaded native DB (no other process may open it)')
@@ -328,20 +371,27 @@ def main():
     p.add_argument('--threads', type=int, default=2)
     p.add_argument('--cpus', help='comma-separated logical CPUs (default: first --threads allowed CPUs)')
     p.add_argument('--timeout', type=float, default=60)
-    p.add_argument('--queries', nargs='+', type=int, default=list(range(1, 100)))
+    query_count = 22 if suite == 'tpch' else 99
+    p.add_argument('--queries', nargs='+', type=int, default=list(range(1, query_count + 1)))
+    p.add_argument('--max-ratio', type=float, help='stop at first error, mismatch, or median tinylamb/DuckDB ratio above this limit')
     p.add_argument('--prepare-only', action='store_true')
     p.add_argument('--profile', action='store_true', help='native plan timing and EXPLAIN dump; diagnostic run')
     p.add_argument('--report', type=Path)
     p.add_argument('--duck-worker', nargs=3, metavar=('DB', 'QUERIES', 'THREADS'))
     a = p.parse_args()
+    a.suite = suite
     if a.duck_worker:
         duck_worker(a.duck_worker[0], a.duck_worker[1], int(a.duck_worker[2])); return
     if a.report:
         report(a.report); return
     if not a.output or a.scale <= 0 or a.repeats < 1 or a.warmup < 0 or a.threads < 1:
         p.error('output, positive scale/repeats/threads and nonnegative warmup required')
-    if len(set(a.queries)) != len(a.queries) or any(q < 1 or q > 99 for q in a.queries):
-        p.error('queries must be distinct numbers 1..99')
+    if suite == 'tpch' and not a.dataset:
+        p.error('TPC-H requires an existing --dataset generated with DBGEN')
+    if len(set(a.queries)) != len(a.queries) or any(q < 1 or q > query_count for q in a.queries):
+        p.error(f'queries must be distinct numbers 1..{query_count}')
+    if a.max_ratio is not None and (not math.isfinite(a.max_ratio) or a.max_ratio <= 0):
+        p.error('max-ratio must be finite and positive')
     cpus = list(map(int, a.cpus.split(','))) if a.cpus else sorted(os.sched_getaffinity(0))[:a.threads]
     os.sched_setaffinity(0, cpus)
     out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
@@ -349,6 +399,8 @@ def main():
     if not a.dataset:
         prepare(dataset, a.scale, a.threads)
     metadata = json.loads((dataset / 'dataset.json').read_text())
+    if metadata['queries'] != query_count:
+        p.error(f'{suite} requires {query_count} queries in dataset metadata')
     if sha(dataset / 'manifest.tsv') != metadata['manifest_sha256']:
         raise ValueError('dataset manifest changed')
     for table, info in metadata['tables'].items():
@@ -366,6 +418,9 @@ def main():
                      'benchmark/comparison/tpcds_test.py', 'benchmark/comparison/requirements-tpcds.txt',
                      'benchmark/comparison/README-tpcds.md'):
         shutil.copy2(ROOT / relative, sources / Path(relative).name)
+    if suite == 'tpch':
+        shutil.copy2(ROOT / 'benchmark/comparison/tpch.py', sources / 'tpch.py')
+        shutil.copy2(ROOT / 'benchmark/comparison/README-tpch.md', sources / 'README-tpch.md')
     cache_text = (a.binary.parent / 'CMakeCache.txt').read_text()
     (out / 'CMakeCache.txt').write_text(cache_text)
     build_inputs = freeze_build_inputs(a.binary, cache_text, out)
@@ -417,33 +472,18 @@ def main():
                        [sys.executable, str(Path(__file__).resolve()), '--duck-worker', str(dataset / 'reference.duckdb'), str(dataset / e), str(a.threads)])
             workers[e] = Worker(command, log, a.timeout)
         with (out / 'results.jsonl').open('w') as results:
-            for q in a.queries:
-                record = {'query': q, 'status': 'ok', 'load_average_before': os.getloadavg()}
-                for e in (('tinylamb', 'duckdb') if q % 2 else ('duckdb', 'tinylamb')):
-                    samples, answers, prepares = [], [], []
-                    for i in range(a.warmup + a.repeats):
-                        response = workers[e].query(f'q{q}.sql')
-                        if 'error' in response:
-                            record['status'] = 'error'; record['detail'] = e + ': ' + response['error']; break
-                        answers.append(response['rows'])
-                        if i >= a.warmup:
-                            samples.append(response['ms'])
-                            prepares.append(response.get('prepare_ms'))
-                    record[e] = {'samples_ms': samples, 'prepare_ms': prepares, 'rows': answers[-1] if answers else None}
-                    if answers and any(compare(answers[0], rows) for rows in answers[1:]):
-                        record['status'] = 'unstable'; record['detail'] = e + ': answers changed between runs'
-                if record['status'] == 'ok':
-                    mismatch = compare(record['tinylamb']['rows'], record['duckdb']['rows'])
-                    if mismatch:
-                        record['status'] = 'mismatch'; record['detail'] = mismatch
-                record['load_average_after'] = os.getloadavg()
+            for record in query_records(workers, a.queries, a.warmup, a.repeats,
+                                        a.max_ratio):
                 results.write(json.dumps(record, allow_nan=False) + '\n'); results.flush()
-                print(q, record['status'], record.get('detail', ''), flush=True)
+                print(record['query'], record['status'], record.get('detail', ''),
+                      f"ratio={record['time_ratio']:.3f}" if record.get('time_ratio') is not None else '',
+                      flush=True)
     finally:
         for worker in workers.values(): worker.close()
         for log in logs: log.close()
     report(out)
-    if any(json.loads(line)['status'] != 'ok' for line in (out / 'results.jsonl').read_text().splitlines()):
+    if any(r['status'] != 'ok' or not r.get('performance_pass', True)
+           for r in map(json.loads, (out / 'results.jsonl').read_text().splitlines())):
         raise SystemExit(1)
 
 

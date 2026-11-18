@@ -367,7 +367,7 @@ std::string RunMode(Database& db, TransactionContext& ctx,
   *dump = SortedDump(*rows);
   static constexpr std::array<const char*, 3> kNames = {"default", "relational",
                                                         "grouped"};
-  return kNames[mode];
+  return kNames[static_cast<size_t>(mode)];
 }
 
 std::string CheckDqp(Database& db, TransactionContext& ctx,
@@ -399,10 +399,16 @@ std::string CheckDqp(Database& db, TransactionContext& ctx,
   return {};
 }
 
-std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats) {
+std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats,
+                       bool* skipped) {
   ScopedDb plain("diff_oracle_radar_plain");
   ScopedDb indexed("diff_oracle_radar_indexed");
   if (!plain || !indexed) {
+    // No database: nothing ran. Report the skip through `skipped` so the
+    // caller does not bulk-count the iteration's queries as agreed.
+    if (skipped != nullptr) {
+      *skipped = true;
+    }
     return {};
   }
   TransactionContext plain_ctx = plain->BeginContext();
@@ -454,15 +460,20 @@ std::string CheckRadar(const DiffOracleTrace& trace, DiffOracleStats* stats) {
 
 }  // namespace
 
-std::string ReplayDiffOracleTrace(const DiffOracleTrace& trace, bool verbose) {
+std::string ReplayDiffOracleTrace(const DiffOracleTrace& trace, bool verbose,
+                                  bool* skipped) {
   if (trace.kind == "radar") {
-    return CheckRadar(trace, nullptr);
+    return CheckRadar(trace, nullptr, skipped);
   }
   if (trace.setup.empty() || !trace.setup[0].starts_with("CREATE TABLE")) {
     return "malformed diff-oracle trace";
   }
   ScopedDb db("diff_oracle");
   if (!db) {
+    // Resource pressure (quota): no query ran, not "all arms agreed".
+    if (skipped != nullptr) {
+      *skipped = true;
+    }
     return {};
   }
   TransactionContext ctx = db->BeginContext();
@@ -551,7 +562,13 @@ std::string RunTqsIteration(std::mt19937& rng, bool /*verbose*/,
               JoinSorted(std::move(semi)), JoinSorted(std::move(anti))};
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
-  const std::string report = ReplayDiffOracleTrace(t, false);
+  bool skipped = false;
+  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  if (skipped) {
+    // No database: nothing ran, so no query may be counted as agreed.
+    ++out->skipped;
+    return {};
+  }
   if (report.empty()) {
     out->tqs_queries += static_cast<int>(t.queries.size());
   }
@@ -576,7 +593,7 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
     const std::string b = g.Chance(15) ? "NULL" : std::to_string(g.Pick(-2, 2));
     const char* flag =
         g.Chance(40) ? "TRUE" : (g.Chance(50) ? "FALSE" : "NULL");
-    const char* s = kStr[g.Pick(0, 3)];
+    const char* s = kStr[static_cast<size_t>(g.Pick(0, 3))];
     std::string insert = "INSERT INTO ";
     insert.append(tab).append(" VALUES (").append(std::to_string(i));
     insert.append(", ").append(a).append(", ").append(b);
@@ -607,7 +624,15 @@ std::string RunSubsetIteration(std::mt19937& rng, bool /*verbose*/,
                           " AND " + other + ";" + std::string(kSep) +
                           "SELECT COUNT(*) FROM " + tab + " WHERE " + pred +
                           ";");
-  const std::string report = ReplayDiffOracleTrace(t, false);
+  bool skipped = false;
+  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  if (skipped) {
+    // No database: no subset relation was evaluated on either side.
+    if (stats != nullptr) {
+      ++stats->skipped;
+    }
+    return {};
+  }
   if (stats != nullptr && report.empty()) {
     stats->subset_checks += static_cast<int>(
         t.subset_and.size() + t.subset_or.size() + t.subset_dis.size() +
@@ -649,7 +674,14 @@ std::string RunDqpIteration(std::mt19937& rng, bool /*verbose*/,
   };
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
-  const std::string report = ReplayDiffOracleTrace(t, false);
+  bool skipped = false;
+  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  if (skipped) {
+    // No database: nothing ran, so neither the report nor the re-count pass
+    // below may claim the query set executed.
+    ++out->skipped;
+    return {};
+  }
   if (report.empty()) {
     // Replay does not count. Re-count by a cheap second pass only when the
     // caller asked, using the same checker against the trace's own database
@@ -702,7 +734,13 @@ std::string RunRadarIteration(std::mt19937& rng, bool /*verbose*/,
   };
   DiffOracleStats local_stats;
   DiffOracleStats* out = stats != nullptr ? stats : &local_stats;
-  const std::string report = ReplayDiffOracleTrace(t, false);
+  bool skipped = false;
+  const std::string report = ReplayDiffOracleTrace(t, false, &skipped);
+  if (skipped) {
+    // The radar arm needs two databases; without them neither side ran.
+    ++out->skipped;
+    return {};
+  }
   if (report.empty()) {
     out->radar_queries += static_cast<int>(t.queries.size());
   }

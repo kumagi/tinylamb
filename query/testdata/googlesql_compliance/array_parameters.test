@@ -600,7 +600,7 @@ ARRAY<STRUCT<elem STRING, offset INT64>>[known order:
   {"σ", 0}
 ]
 ==
-[name=select_string_array_parameter_unnest_with_offset_alaised_sorted]
+[name=select_string_array_parameter_unnest_with_offset_aliased_sorted]
 [parameters=ARRAY<STRING>['σ', 'π', '⨝', NULL] string_arr]
 SELECT elem, off
 FROM UNNEST(@string_arr) elem WITH OFFSET off

@@ -277,4 +277,34 @@ TEST(SpillFileTest, ReadAllRows_WhenFileDeleted_ThrowsRuntimeError) {
   EXPECT_FALSE(spill.ReadAllRows().HasValue());
 }
 
+TEST(SpillFileTest, RowReaderStreamsRowsAndTracksFileBytes) {
+  SpillFile spill;
+  constexpr int64_t kRows = 2500;
+  for (int64_t i = 0; i < kRows; ++i) {
+    ASSERT_SUCCESS(
+        spill.Append(Row({Value(i), Value("val_" + std::to_string(i))})));
+  }
+  ASSERT_SUCCESS(spill.FinishWriting());
+  EXPECT_GT(spill.FileBytes(), 0ULL);
+
+  ASSIGN_OR_ASSERT_FAIL(SpillFile::RowReader, reader, spill.OpenRowReader());
+  EXPECT_TRUE(reader.IsOpen());
+  EXPECT_EQ(reader.Remaining(), static_cast<uint64_t>(kRows));
+  int64_t expected = 0;
+  Row row;
+  bool has_row = false;
+  while (true) {
+    ASSERT_SUCCESS(reader.Next(&row, &has_row));
+    if (!has_row) {
+      break;
+    }
+    EXPECT_EQ(row[0].value.int_value, expected);
+    EXPECT_EQ(row[1].value.varchar_value, "val_" + std::to_string(expected));
+    ++expected;
+  }
+  EXPECT_EQ(expected, kRows);
+  EXPECT_FALSE(reader.IsOpen());
+  EXPECT_EQ(reader.Remaining(), 0ULL);
+}
+
 }  // namespace tinylamb

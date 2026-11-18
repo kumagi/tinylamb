@@ -143,7 +143,7 @@ OracleのARCHIVELOGが残った最初の探索試行は不採用。キャッシ�
 
 - OracleのTPC-Cは未対応。PG専用クライアントをOracleの測定済みとして扱わない。
 - 追加索引なし、SF=1、bind／prepared、長時間の同期writeとtail、実運用サイズの評価は追加課題。
-- 進行中のPG比1.5倍改善は[既存計画](postgresql_1_5_plan_2026-10-30.md)に保持。この2コア枠を8／16コアの達成判定へ混ぜない。
+- 進行中のPG比1.5倍改善は既存の設計ノートに保持。この2コア枠を8／16コアの達成判定へ混ぜない。
 
 公式資料: [配布イメージ](https://container-registry.oracle.com/ords/ocr/ba/database/free)、
 [リソース制限](https://docs.oracle.com/en/database/oracle/oracle-database/26/xeinl/licensing-restrictions.html)、

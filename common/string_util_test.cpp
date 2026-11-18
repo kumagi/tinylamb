@@ -1,13 +1,101 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "common/string_util.hpp"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "common/literal_like_pattern.hpp"
 #include "gtest/gtest.h"
+
+namespace {
+
+// #1056 performance pins use a global operator new replacement; only the
+// measuring thread counts, so sanitizer background allocations cannot flip
+// the assertion (same idiom as common/decoder_test.cpp).
+std::atomic<uint64_t> g_alloc_count{0};
+std::atomic<bool> g_counting{false};
+std::thread::id g_measuring_thread;
+
+inline void CountAllocationIfActive() {
+  if (g_counting.load(std::memory_order_relaxed) &&
+      std::this_thread::get_id() == g_measuring_thread) {
+    g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+}  // namespace
+
+void* operator new(std::size_t n) {
+  CountAllocationIfActive();
+  void* p = std::malloc(n == 0 ? 1 : n);
+  if (p == nullptr) {
+    throw std::bad_alloc();
+  }
+  return p;
+}
+void* operator new[](std::size_t n) { return operator new(n); }
+void* operator new(std::size_t n, std::align_val_t a) {
+  CountAllocationIfActive();
+  const auto align = static_cast<std::size_t>(a);
+  std::size_t size = n == 0 ? 1 : n;
+  size = (size + align - 1) & ~(align - 1);
+  void* p = std::aligned_alloc(align, size);
+  if (p == nullptr) {
+    throw std::bad_alloc();
+  }
+  return p;
+}
+void* operator new[](std::size_t n, std::align_val_t a) {
+  return operator new(n, a);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  std::free(p);
+}
+void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
+  std::free(p);
+}
 
 namespace tinylamb {
 namespace {
+
+TEST(StringUtilTest,
+     LiteralLikePatternHandlesEdgesAndDeclinesGeneralWildcards) {
+  for (const auto* const pattern :
+       {"", "%", "%%", "abc", "abc%", "%abc", "%abc%"}) {
+    const auto compiled = LiteralLikePattern::Compile(pattern);
+    if (!compiled.has_value()) {
+      ADD_FAILURE() << "Expected pattern to compile: " << pattern;
+      continue;
+    }
+    for (const auto* const value :
+         {"", "abc", "xabc", "abcx", "xabcx", "ABC"}) {
+      const std::string_view p(pattern), v(value);
+      const bool expected =
+          p == "%" || p == "%%" || (p.empty() && v.empty()) ||
+          (p == "abc" && v == "abc") || (p == "abc%" && v.starts_with("abc")) ||
+          (p == "%abc" && v.ends_with("abc")) ||
+          (p == "%abc%" && v.find("abc") != std::string_view::npos);
+      EXPECT_EQ(compiled->Matches(value), expected)
+          << pattern << " / " << value;
+    }
+  }
+  for (const auto* const pattern : {"a_c", "a%b", "%a%b%", "%%%"}) {
+    EXPECT_FALSE(LiteralLikePattern::Compile(pattern));
+  }
+}
 
 TEST(StringUtilTest, AsciiCaseConversion) {
   EXPECT_EQ(AsciiToLower('A'), 'a');
@@ -49,6 +137,67 @@ TEST(StringUtilTest, TrimAsciiWhitespace) {
   EXPECT_EQ(TrimAsciiWhitespace("no_spaces"), "no_spaces");
   EXPECT_EQ(TrimAsciiWhitespace("   \t\n\r"), "");
   EXPECT_EQ(TrimAsciiWhitespace(""), "");
+}
+
+// #1056 pins for the bitmap/inline-set rewrite of TrimCodePoints: membership
+// structure changed, semantics must not.
+TEST(StringUtilTest, TrimCodePointsAsciiCutset) {
+  EXPECT_EQ(TrimCodePoints(" \t x \n", " \t\n\r\f\v", true, true), "x");
+  EXPECT_EQ(TrimCodePoints("  ab  ", " ", true, true), "ab");
+  EXPECT_EQ(TrimCodePoints("", " ", true, true), "");
+  EXPECT_EQ(TrimCodePoints("ab", "", true, true), "ab");
+  EXPECT_EQ(TrimCodePoints("  ab  ", " ", false, true), "  ab");
+  EXPECT_EQ(TrimCodePoints("  ab  ", " ", true, false), "ab  ");
+}
+
+TEST(StringUtilTest, TrimCodePointsMultiByteCutset) {
+  // 'Á' is one code point (C3 81); it must never cut the lead byte of an
+  // unrelated character sharing that lead byte.
+  EXPECT_EQ(TrimCodePoints("\xC3\x81x\xC3\x81", "\xC3\x81", true, true), "x");
+  EXPECT_EQ(TrimCodePoints("\xC3\x83x", "\xC3\x81", true, true),
+            "\xC3\x83x");  // 'Ã' != 'Á'
+  // A lone continuation byte from a BYTES cutset keeps byte semantics.
+  EXPECT_EQ(TrimCodePoints("\xACx", "\xAC", true, true), "x");
+  // Leading byte of a well-formed sequence stripped by a one-byte (invalid
+  // lead) cutset point.
+  EXPECT_EQ(TrimCodePoints("\xC3\xA9x", "\xC3", true, true), "\xA9x");
+  // More multi-byte points than the inline array (8) exercises the overflow
+  // bucket.
+  std::string big_cutset;
+  std::string big_text;
+  for (int i = 0; i < 10; ++i) {
+    big_cutset.append("\xC3", 1);
+    big_cutset.push_back(static_cast<char>(0x81 + i));
+    big_text.append("\xC3", 1);
+    big_text.push_back(static_cast<char>(0x81 + i));
+  }
+  big_text += "x";
+  big_text += big_cutset;
+  EXPECT_EQ(TrimCodePoints(big_text, big_cutset, true, true), "x");
+}
+
+TEST(StringUtilTest, TrimCodePointsDoesNotAllocateForTypicalCutsets) {
+  const std::string text = "  hello world, this string has some padding   ";
+  const std::string_view ascii_cutset = " \t\n\r\f\v";
+  // Warm up any lazy static init outside the window.
+  EXPECT_EQ(TrimCodePoints(text, ascii_cutset, true, true),
+            "hello world, this string has some padding");
+  std::atomic<uint64_t> sink{0};
+  const auto measure = [&](std::string_view cutset) {
+    g_alloc_count.store(0, std::memory_order_relaxed);
+    g_measuring_thread = std::this_thread::get_id();
+    g_counting.store(true, std::memory_order_seq_cst);
+    for (int i = 0; i < 100; ++i) {
+      sink.fetch_add(TrimCodePoints(text, cutset, true, true).size(),
+                     std::memory_order_relaxed);
+    }
+    g_counting.store(false, std::memory_order_seq_cst);
+    return g_alloc_count.load(std::memory_order_relaxed);
+  };
+  // The old body allocated the per-call vector<string_view> on every row.
+  EXPECT_EQ(measure(ascii_cutset), 0U);
+  const std::string multi = "\xC3\x81\xC3\x82\xC3\x83";  // 3 inline points
+  EXPECT_EQ(measure(multi), 0U);
 }
 
 }  // namespace

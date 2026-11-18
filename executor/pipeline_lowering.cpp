@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <ranges>
 #include <sstream>
@@ -429,7 +430,13 @@ Status PipelineLowering::LowerNode(const Plan& plan, TransactionContext& ctx,
           enforced = idx_scan->EnforcesIntegerPredicate(sel->Predicate());
         } else if (auto* pscan =
                        dynamic_cast<ParallelScan*>(ses->Underlying().get())) {
-          if (!relational_detail::ContainsQuery(sel->Predicate()) &&
+          // Same gate as SelectionPlan::EmitExecutor: an ordered scan relies
+          // on morsel-ordered handoff and a projected scan re-materializes
+          // parked rows under the unprojected table schema, so neither may
+          // take a row filter. Share the A/B hatch too.
+          if (pscan->CanTakeRowFilter() &&
+              std::getenv("TINYLAMB_DISABLE_WORKER_SCAN_FILTER") == nullptr &&
+              !relational_detail::ContainsQuery(sel->Predicate()) &&
               BytecodeEnabled()) {
             std::vector<Expression> conjuncts =
                 SplitConjuncts(sel->Predicate());

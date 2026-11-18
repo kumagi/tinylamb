@@ -16,7 +16,11 @@
 
 #include "table/full_scan_iterator.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -39,6 +43,7 @@
 #include "page/row_page.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
+#include "table/tlcs_file.hpp"
 #include "transaction/transaction.hpp"
 
 namespace tinylamb {
@@ -122,6 +127,14 @@ bool PhysicalReadEligible(const Transaction& txn, const Page& page) {
 }
 
 }  // namespace
+
+struct FullScanIterator::StubBlockCache {
+  TlcsFile::DecodedBlock block;
+  std::vector<slot_t> col_chunk_idx;
+  std::vector<uint8_t> io_scratch;
+};
+
+FullScanIterator::~FullScanIterator() = default;
 
 FullScanIterator::FullScanIterator(
     const Table* table, Transaction* txn,
@@ -209,9 +222,32 @@ IteratorBase& FullScanIterator::operator++() {
   if (!pos_.IsValid()) {
     return *this;
   }
+  if ((++advance_steps_ & 255U) == 0 && txn_ != nullptr &&
+      txn_->HasStatementTimeout()) {
+    const Status ts = txn_->CheckStatementTimeout();
+    if (ts != Status::kSuccess) {
+      status_ = ts;
+      pos_.page_id = ~0ULL;
+      current_row_.Clear();
+      return *this;
+    }
+  }
   if (lstable_store_ != nullptr) {
     ++lstable_row_cursor_;
     SeekLSTableRow();
+    return *this;
+  }
+  if (!lock_rows_ && stub_block_idx_ != LSTableStore::kInvalidBlockIndex) {
+    ++pos_.slot;
+    if (pos_.slot >= stub_block_row_count_) {
+      if (!AdvanceFromStubPage()) {
+        pos_.page_id = ~0ULL;
+        current_row_.Clear();
+        stub_row_materialized_ = true;
+        return *this;
+      }
+    }
+    SeekVisibleRow();
     return *this;
   }
   ++pos_.slot;
@@ -276,9 +312,7 @@ FullScanIterator::PeekOutcome FullScanIterator::PeekIntegerPlanned(
     if (status != Status::kSuccess) [[unlikely]] {
       // Same corrupt-image failure channel as Row::TryPeekInteger: a Status,
       // not a C++ exception across the caller's StatusOr boundary.
-      return {.kind = PeekOutcome::Kind::kError,
-              .value = 0,
-              .status = status};
+      return {.kind = PeekOutcome::Kind::kError, .value = 0, .status = status};
     }
     payload += consumed + skip.fixed_after;
   }
@@ -298,7 +332,8 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
     peek_plan_built_ = true;
   }
   std::optional<slot_t> cached_column;
-  std::optional<int64_t> cached_value;
+  bool has_cached_value = false;
+  int64_t cached_value = 0;
   // The cache holds only the immediately preceding column: it pays off when
   // consecutive predicates target the same column.
   for (size_t k = 0; k < peek_compares_->size(); ++k) {
@@ -312,10 +347,11 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
             row.data());  // NOLINT(bugprone-suspicious-stringview-data-usage)
         switch (outcome.kind) {
           case PeekOutcome::Kind::kValue:
+            has_cached_value = true;
             cached_value = outcome.value;
             break;
           case PeekOutcome::Kind::kNull:
-            cached_value = std::nullopt;
+            has_cached_value = false;
             break;
           case PeekOutcome::Kind::kFallback: {
             ASSIGN_OR_RETURN(
@@ -323,7 +359,8 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
                 Row::TryPeekInteger(
                     row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                     table_->GetSchema(), pred.column));
-            cached_value = peeked;
+            has_cached_value = peeked.has_value();
+            cached_value = peeked.value_or(0);
           } break;
           case PeekOutcome::Kind::kError:
             return outcome.status;
@@ -335,12 +372,13 @@ StatusOr<bool> FullScanIterator::PassesPeekFilters(std::string_view row) const {
               Row::TryPeekInteger(
                   row.data(),  // NOLINT(bugprone-suspicious-stringview-data-usage)
                   table_->GetSchema(), pred.column));
-          cached_value = peeked;
+          has_cached_value = peeked.has_value();
+          cached_value = peeked.value_or(0);
         }
       }
     }
-    if (!cached_value ||
-        !MatchIntegerCompare(*cached_value, pred.op, pred.constant)) {
+    if (!has_cached_value ||
+        !MatchIntegerCompare(cached_value, pred.op, pred.constant)) {
       return false;
     }
   }
@@ -355,6 +393,43 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
     // version chain meanwhile, but cannot change these bytes before we drop
     // the latch. Re-pinning invalidates this verdict before any newer image
     // is read. A cached false verdict only keeps the ordinary MVCC resolver.
+    bool is_stub = (*page_)->body.row_page.IsColumnarStub();
+    if (is_stub && lock_rows_) {
+      const page_id_t pid = pos_.page_id;
+      page_.reset();
+      const Status h = table_->EnsurePageHydratedIfStub(*txn_, pid);
+      if (h != Status::kSuccess) {
+        status_ = h;
+        txn_->MarkFailed();
+        pos_.page_id = ~0ULL;
+        return std::nullopt;
+      }
+      if (!PinPage(pid)) {
+        return std::nullopt;
+      }
+      is_stub = (*page_)->body.row_page.IsColumnarStub();
+      physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
+    }
+    if (is_stub && stub_decoded_pid_ != pos_.page_id) {
+      std::shared_ptr<const TlcsFile> tlcs = table_->GetBackingTLCSStore();
+      if (tlcs == nullptr) {
+        status_ = StatusError(StatusCode::kNotExists,
+                              "stub page missing backing tlcs store");
+        pos_.page_id = ~0ULL;
+        return std::nullopt;
+      }
+      // #1111: pin the block's shared cached encoded images; the decode and
+      // Row -> Serialize round trip now happen at most once per block.
+      auto rows =
+          tlcs->GetCachedEncodedBlockByPid(pos_.page_id, table_->GetSchema());
+      if (!rows.HasValue()) {
+        status_ = rows.GetStatus();
+        pos_.page_id = ~0ULL;
+        return std::nullopt;
+      }
+      stub_decoded_rows_ = rows.MoveValue();
+      stub_decoded_pid_ = pos_.page_id;
+    }
     if (!physical_read_eligible_.has_value()) {
       physical_read_eligible_ = PhysicalReadEligible(*txn_, **page_);
     }
@@ -364,7 +439,12 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
     while (pos_.slot < (*page_)->body.row_page.RowMax()) {
       std::optional<std::string_view> row;
       const bool already_reserved = lock_rows_ && txn_->HasWriteSet(pos_);
-      if (lock_rows_) {
+      if (is_stub) {
+        if (pos_.slot < stub_decoded_rows_->size() &&
+            !(*stub_decoded_rows_)[pos_.slot].empty()) {
+          row = std::string_view((*stub_decoded_rows_)[pos_.slot]);
+        }
+      } else if (lock_rows_) {
         // DML source scan: pin the position's head version with a write
         // intent BEFORE resolving the row, so the image handed to the
         // predicate is the newest committed version -- the same contract
@@ -387,7 +467,7 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
             txn_->ReleaseWriteIntent(held);
           }
           scan_acquired_.clear();
-          status_ = Status::kConflicts;
+          status_ = txn_->LastWriteSetFailureStatus();
           pos_.page_id = ~0ULL;
           return std::nullopt;
         }
@@ -535,6 +615,63 @@ std::optional<std::string_view> FullScanIterator::NextVisibleImage() {
 }
 
 void FullScanIterator::SeekVisibleRow() {
+  while (pos_.IsValid()) {
+    if (!lock_rows_ && stub_block_idx_ == LSTableStore::kInvalidBlockIndex &&
+        page_ != nullptr && (*page_)->body.row_page.IsColumnarStub()) {
+      if (!TryEnterStubPage()) {
+        if (!pos_.IsValid()) {
+          current_row_.Clear();
+          stub_row_materialized_ = true;
+          return;
+        }
+        break;
+      }
+    }
+    if (lock_rows_ || stub_block_idx_ == LSTableStore::kInvalidBlockIndex) {
+      break;
+    }
+    if (!backing_tlcs_->BlockMatchesZoneMaps(stub_block_idx_, peek_compares_,
+                                             runtime_filter_, key_column_) ||
+        pos_.slot >= stub_block_row_count_) {
+      if (!AdvanceFromStubPage()) {
+        pos_.page_id = ~0ULL;
+        current_row_.Clear();
+        stub_row_materialized_ = true;
+        return;
+      }
+      continue;
+    }
+    if (StubBlockAllRowsMatch(*backing_tlcs_, stub_block_idx_)) {
+      stub_row_materialized_ = false;
+      return;
+    }
+    std::vector<slot_t> filter_cols;
+    GatherStubFilterCols(/*include_keep_cols=*/false, &filter_cols);
+    if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id, filter_cols)) {
+      pos_.page_id = ~0ULL;
+      current_row_.Clear();
+      stub_row_materialized_ = true;
+      return;
+    }
+    while (pos_.slot < stub_block_row_count_ && !StubRowMatches(pos_.slot)) {
+      ++pos_.slot;
+    }
+    if (pos_.slot < stub_block_row_count_) {
+      stub_row_materialized_ = false;
+      return;
+    }
+    if (!AdvanceFromStubPage()) {
+      pos_.page_id = ~0ULL;
+      current_row_.Clear();
+      stub_row_materialized_ = true;
+      return;
+    }
+  }
+  if (!pos_.IsValid()) {
+    current_row_.Clear();
+    page_.reset();
+    return;
+  }
   std::optional<std::string_view> row = NextVisibleImage();
   if (!row.has_value()) {
     current_row_.Clear();
@@ -572,6 +709,11 @@ bool FullScanIterator::AdvancePage() {
         break;
       }
       page_.reset();
+      if (txn_->GetPageManager()->TailPageInvisibleToSnapshot(
+              *txn_, table_->first_pid_, next_page)) {
+        // Another transaction's uncommitted growth: the visible chain ends.
+        return false;
+      }
       const Status waited = txn_->GetPageManager()->WaitForTableTailPage(
           *txn_, table_->first_pid_, next_page);
       if (waited != Status::kSuccess) {
@@ -667,7 +809,7 @@ const RowDecodePlan* FullScanIterator::RowPlan() {
   }
   plan.all_fixed = all_fixed;
   plan.kept_count = kept.size();
-  plan.slot_unsigned.assign(kept.size(), 0);
+  plan.slot_unsigned.resize(kept.size());
   bool has_unsigned = false;
   for (size_t k = 0; k < kept.size(); ++k) {
     plan.stored_slot[kept[k]] = k;
@@ -815,8 +957,23 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
   const Schema& schema = table_->schema_;
   size_t count = 0;
   while (count < max_rows) {
+    if (!pos_.IsValid()) {
+      break;
+    }
+    if (!lock_rows_ && stub_block_idx_ != LSTableStore::kInvalidBlockIndex) {
+      count += DecodeStubBlockBatch(batch, count, max_rows - count);
+      continue;
+    }
     if (page_ == nullptr && pos_.IsValid() && !PinPage(pos_.page_id)) {
       pos_.page_id = ~0ULL;
+      break;
+    }
+    if (!lock_rows_ && page_ != nullptr &&
+        (*page_)->body.row_page.IsColumnarStub() && TryEnterStubPage()) {
+      count += DecodeStubBlockBatch(batch, count, max_rows - count);
+      continue;
+    }
+    if (!pos_.IsValid()) {
       break;
     }
     std::optional<std::string_view> row = NextVisibleImage();
@@ -981,6 +1138,11 @@ size_t FullScanIterator::DecodeNextTypedBatch(TypedCellBatch* batch,
       page_.reset();
     }
   }
+  if (pos_.IsValid() && !lock_rows_ &&
+      (stub_block_idx_ != LSTableStore::kInvalidBlockIndex ||
+       (page_ != nullptr && (*page_)->body.row_page.IsColumnarStub()))) {
+    SeekVisibleRow();
+  }
   batch->rows = count;
   return count;
 }
@@ -1044,6 +1206,10 @@ void FullScanIterator::SetRuntimeFilter(const RuntimeFilterGroup* group,
   }
   if (lstable_store_ != nullptr) {
     SeekLSTableRow();
+    return;
+  }
+  if (!lock_rows_ && stub_block_idx_ != LSTableStore::kInvalidBlockIndex) {
+    SeekVisibleRow();
     return;
   }
   // The constructor already seeked to the first visible row, which is exactly
@@ -1246,7 +1412,7 @@ void FullScanIterator::SeekLSTableRow() {
     }
     for (; lstable_row_cursor_ < blk->row_count; ++lstable_row_cursor_) {
       if (LSTableRowMatches(*blk, lstable_row_cursor_)) {
-        pos_ = RowPosition(blk->page_id, blk->slots[lstable_row_cursor_]);
+        pos_ = RowPosition(blk->page_id, blk->SlotAt(lstable_row_cursor_));
         lstable_row_materialized_ = false;
         return;
       }
@@ -1495,7 +1661,7 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
         }
       }
       if (batch->capture_positions) {
-        batch->positions.emplace_back(blk->page_id, blk->slots[r]);
+        batch->positions.emplace_back(blk->page_id, blk->SlotAt(r));
       }
       ++count;
     }
@@ -1509,14 +1675,527 @@ size_t FullScanIterator::DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
   return count;
 }
 
+const std::shared_ptr<const TlcsFile>& FullScanIterator::EnsureBackingTlcs()
+    const {
+  if (!backing_tlcs_checked_) {
+    backing_tlcs_ = table_->GetBackingTLCSStore();
+    backing_tlcs_checked_ = true;
+  }
+  return backing_tlcs_;
+}
+
+void FullScanIterator::ClearStubBlockState() {
+  stub_block_idx_ = LSTableStore::kInvalidBlockIndex;
+  stub_current_pid_ = 0;
+  stub_next_page_id_ = 0;
+  stub_block_row_count_ = 0;
+  stub_row_materialized_ = true;
+}
+
+bool FullScanIterator::TryEnterStubPage() {
+  if (lock_rows_ || page_ == nullptr ||
+      !(*page_)->body.row_page.IsColumnarStub()) {
+    return false;
+  }
+  if (projection_.has_value() && RowPlan() == nullptr) {
+    return false;
+  }
+  const Schema& schema = table_->GetSchema();
+  for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+    const ValueType type = schema.GetColumn(i).Type();
+    if (schema.GetColumn(i).IsInterval() ||
+        (type != ValueType::kInt64 && type != ValueType::kDate &&
+         type != ValueType::kDouble && type != ValueType::kVarChar)) {
+      return false;
+    }
+  }
+  const auto& tlcs = EnsureBackingTlcs();
+  if (tlcs == nullptr) {
+    status_ = StatusError(StatusCode::kNotExists,
+                          "stub page missing backing tlcs store");
+    pos_.page_id = ~0ULL;
+    FullScanIterator::DropPageLatch();
+    ClearStubBlockState();
+    return false;
+  }
+  const page_id_t pid = pos_.page_id;
+  const page_id_t next_pid = (*page_)->body.row_page.next_page_id_;
+  FullScanIterator::DropPageLatch();
+  const uint32_t bidx = tlcs->FindBlockIndex(pid);
+  if (bidx == LSTableStore::kInvalidBlockIndex) {
+    status_ = StatusError(StatusCode::kCorrupt,
+                          "stub page missing from backing tlcs directory");
+    pos_.page_id = ~0ULL;
+    ClearStubBlockState();
+    return false;
+  }
+  StatusOr<uint32_t> rc = tlcs->BlockRowCount(bidx);
+  if (!rc.HasValue()) {
+    status_ = rc.GetStatus();
+    pos_.page_id = ~0ULL;
+    ClearStubBlockState();
+    return false;
+  }
+  stub_block_idx_ = bidx;
+  stub_current_pid_ = pid;
+  stub_next_page_id_ = next_pid;
+  stub_block_row_count_ = rc.Value();
+  stub_row_materialized_ = false;
+  return true;
+}
+
+bool FullScanIterator::AdvanceFromStubPage() {
+  const page_id_t predecessor = stub_current_pid_;
+  const page_id_t saved_next = stub_next_page_id_;
+  ClearStubBlockState();
+  if (pages_) {
+    ++page_index_;
+    if (page_index_ < pages_->size()) {
+      pos_ = RowPosition((*pages_)[page_index_], 0);
+      return PinPage(pos_.page_id);
+    }
+    return false;
+  }
+  page_id_t next_page = saved_next;
+  for (;;) {
+    if (next_page == 0) {
+      return false;
+    }
+    const Status visible = txn_->GetPageManager()->CheckTableTailPage(
+        txn_->ID(), table_->first_pid_, next_page);
+    if (visible == Status::kSuccess) {
+      pos_ = RowPosition(next_page, 0);
+      return PinPage(next_page);
+    }
+    if (txn_->GetPageManager()->TailPageInvisibleToSnapshot(
+            *txn_, table_->first_pid_, next_page)) {
+      return false;
+    }
+    const Status waited = txn_->GetPageManager()->WaitForTableTailPage(
+        *txn_, table_->first_pid_, next_page);
+    if (waited != Status::kSuccess) {
+      status_ = waited;
+      return false;
+    }
+    if (!PinPage(predecessor)) {
+      return false;
+    }
+    next_page = (*page_)->body.row_page.next_page_id_;
+    FullScanIterator::DropPageLatch();
+  }
+}
+
+bool FullScanIterator::StubBlockAllRowsMatch(
+    const TlcsFile& tlcs, uint32_t block_idx) const noexcept {
+  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+      key_column_.has_value()) {
+    return false;
+  }
+  if (peek_compares_ == nullptr || peek_compares_->empty()) {
+    return true;
+  }
+  return tlcs.BlockAllRowsMatchPeek(block_idx, *peek_compares_);
+}
+
+void FullScanIterator::GatherStubFilterCols(bool include_keep_cols,
+                                            std::vector<slot_t>* out) const {
+  out->clear();
+  const Schema& schema = table_->GetSchema();
+  const slot_t ncols = schema.ColumnCount();
+  if (include_keep_cols) {
+    out->insert(out->end(), typed_keep_slots_.begin(), typed_keep_slots_.end());
+  }
+  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+      key_column_.has_value() && *key_column_ < ncols) {
+    out->push_back(*key_column_);
+  }
+  if (peek_compares_ != nullptr) {
+    for (const IntegerPeekCompare& pred : *peek_compares_) {
+      if (pred.column < ncols) {
+        out->push_back(pred.column);
+      }
+    }
+  }
+  std::sort(out->begin(), out->end());
+  out->erase(std::unique(out->begin(), out->end()), out->end());
+}
+
+bool FullScanIterator::EnsureStubBlockColumns(
+    uint32_t block_idx, page_id_t pid, std::span<const slot_t> columns) const {
+  const auto& tlcs = EnsureBackingTlcs();
+  if (tlcs == nullptr) {
+    status_ = StatusError(StatusCode::kNotExists,
+                          "stub page missing backing tlcs store");
+    return false;
+  }
+  const slot_t ncols = table_->GetSchema().ColumnCount();
+  constexpr slot_t kNoChunk = std::numeric_limits<slot_t>::max();
+  if (stub_cache_ == nullptr) {
+    stub_cache_ = std::make_unique<StubBlockCache>();
+  }
+  if (stub_cache_->col_chunk_idx.size() != ncols) {
+    stub_cache_->col_chunk_idx.assign(ncols, kNoChunk);
+    stub_cache_->block.pid = 0;
+    stub_cache_->block.block_index = LSTableStore::kInvalidBlockIndex;
+  }
+  if (stub_cache_->block.pid != pid ||
+      stub_cache_->block.block_index != block_idx) {
+    StatusOr<uint32_t> rc = tlcs->BlockRowCount(block_idx);
+    if (!rc.HasValue()) {
+      status_ = rc.GetStatus();
+      return false;
+    }
+    stub_cache_->block.block_index = block_idx;
+    stub_cache_->block.pid = pid;
+    stub_cache_->block.row_count = rc.Value();
+    stub_cache_->block.column_ids.clear();
+    stub_cache_->block.columns.clear();
+    std::fill(stub_cache_->col_chunk_idx.begin(),
+              stub_cache_->col_chunk_idx.end(), kNoChunk);
+  }
+  std::vector<slot_t> missing;
+  missing.reserve(columns.size());
+  for (const slot_t c : columns) {
+    if (c < ncols && stub_cache_->col_chunk_idx[c] == kNoChunk) {
+      missing.push_back(c);
+    }
+  }
+  if (missing.empty()) {
+    return true;
+  }
+  std::sort(missing.begin(), missing.end());
+  missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
+  TlcsFile::DecodedBlock delta;
+  const Status ds = tlcs->DecodeBlockColumns(
+      block_idx, missing, table_->GetSchema(), &delta,
+      /*materialize_dict_ints=*/true, &stub_cache_->io_scratch);
+  if (!ds.ok()) {
+    status_ = ds;
+    return false;
+  }
+  stub_cache_->block.row_count = delta.row_count;
+  for (size_t i = 0; i < delta.column_ids.size(); ++i) {
+    const slot_t cid = delta.column_ids[i];
+    const auto idx = static_cast<slot_t>(stub_cache_->block.columns.size());
+    stub_cache_->block.column_ids.push_back(cid);
+    stub_cache_->block.columns.push_back(std::move(delta.columns[i]));
+    if (cid < stub_cache_->col_chunk_idx.size()) {
+      stub_cache_->col_chunk_idx[cid] = idx;
+    }
+  }
+  return true;
+}
+
+bool FullScanIterator::StubRowMatches(uint32_t row) const noexcept {
+  if (stub_cache_ == nullptr) {
+    return false;
+  }
+  if ((runtime_filter_ != nullptr || key_filter_ != nullptr) &&
+      key_column_.has_value()) {
+    const slot_t col_idx = *key_column_;
+    if (col_idx >= stub_cache_->col_chunk_idx.size()) {
+      return false;
+    }
+    const slot_t chunk_idx = stub_cache_->col_chunk_idx[col_idx];
+    if (chunk_idx >= stub_cache_->block.columns.size()) {
+      return false;
+    }
+    const TlcsFile::DecodedColumnChunk& col =
+        stub_cache_->block.columns[chunk_idx];
+    if (col.IsNull(row) ||
+        (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
+      return false;
+    }
+    const int64_t key = col.int_cells[row];
+    const bool rejected = runtime_filter_ != nullptr
+                              ? runtime_filter_->Reject(key)
+                              : !key_filter_->contains(key);
+    if (rejected) {
+      return false;
+    }
+  }
+  if (peek_compares_ != nullptr && !peek_compares_->empty()) {
+    for (const IntegerPeekCompare& pred : *peek_compares_) {
+      if (pred.column >= stub_cache_->col_chunk_idx.size()) {
+        return false;
+      }
+      const slot_t chunk_idx = stub_cache_->col_chunk_idx[pred.column];
+      if (chunk_idx >= stub_cache_->block.columns.size()) {
+        return false;
+      }
+      const TlcsFile::DecodedColumnChunk& col =
+          stub_cache_->block.columns[chunk_idx];
+      if (col.IsNull(row) ||
+          (col.type != ValueType::kInt64 && col.type != ValueType::kDate)) {
+        return false;
+      }
+      if (!MatchIntegerCompare(col.int_cells[row], pred.op, pred.constant)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void FullScanIterator::EnsureStubRowMaterialized() const {
+  if (stub_row_materialized_ ||
+      stub_block_idx_ == LSTableStore::kInvalidBlockIndex) {
+    return;
+  }
+  if (!pos_.IsValid() || pos_.slot >= stub_block_row_count_) {
+    current_row_.Clear();
+    stub_row_materialized_ = true;
+    return;
+  }
+  const Schema& schema = table_->GetSchema();
+  std::vector<slot_t> cols;
+  if (projection_.has_value()) {
+    cols = *projection_;
+  } else {
+    cols.resize(schema.ColumnCount());
+    for (slot_t c = 0; c < schema.ColumnCount(); ++c) {
+      cols[c] = c;
+    }
+  }
+  if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id, cols)) {
+    current_row_.Clear();
+    stub_row_materialized_ = true;
+    return;
+  }
+  const uint32_t r = pos_.slot;
+  current_row_.values_.resize(cols.size());
+  for (size_t k = 0; k < cols.size(); ++k) {
+    const slot_t col_idx = cols[k];
+    const slot_t chunk_idx = stub_cache_->col_chunk_idx[col_idx];
+    const TlcsFile::DecodedColumnChunk& col =
+        stub_cache_->block.columns[chunk_idx];
+    if (col.IsNull(r)) {
+      current_row_.values_[k] = Value();
+      continue;
+    }
+    switch (col.type) {
+      case ValueType::kInt64:
+        current_row_.values_[k] = Value(col.int_cells[r]);
+        if (col.is_unsigned) {
+          current_row_.values_[k].SetUnsigned();
+        }
+        break;
+      case ValueType::kDate:
+        current_row_.values_[k] = Value::DateFromDays(col.int_cells[r]);
+        break;
+      case ValueType::kDouble: {
+        double d = 0.0;
+        std::memcpy(&d, &col.int_cells[r], sizeof(d));
+        current_row_.values_[k] = Value(d);
+        break;
+      }
+      case ValueType::kVarChar:
+        current_row_.values_[k] = Value(std::string(col.VarcharAt(r)));
+        break;
+      default:
+        current_row_.values_[k] = Value();
+        break;
+    }
+  }
+  stub_row_materialized_ = true;
+}
+
+size_t FullScanIterator::DecodeStubBlockBatch(TypedCellBatch* batch,
+                                              size_t count_offset,
+                                              size_t max_rows) {
+  if (stub_block_idx_ == LSTableStore::kInvalidBlockIndex || max_rows == 0) {
+    return 0;
+  }
+  const auto& tlcs = EnsureBackingTlcs();
+  if (tlcs == nullptr) {
+    status_ = StatusError(StatusCode::kNotExists,
+                          "stub page missing backing tlcs store");
+    pos_.page_id = ~0ULL;
+    ClearStubBlockState();
+    return 0;
+  }
+  if (!tlcs->BlockMatchesZoneMaps(stub_block_idx_, peek_compares_,
+                                  runtime_filter_, key_column_) ||
+      pos_.slot >= stub_block_row_count_) {
+    if (!AdvanceFromStubPage()) {
+      pos_.page_id = ~0ULL;
+    }
+    return 0;
+  }
+  const bool all_match = StubBlockAllRowsMatch(*tlcs, stub_block_idx_);
+  std::vector<slot_t> needed;
+  if (all_match) {
+    needed = typed_keep_slots_;
+  } else {
+    GatherStubFilterCols(/*include_keep_cols=*/true, &needed);
+  }
+  if (!EnsureStubBlockColumns(stub_block_idx_, pos_.page_id, needed)) {
+    pos_.page_id = ~0ULL;
+    ClearStubBlockState();
+    return 0;
+  }
+  const size_t stride = batch->stride;
+  const size_t kept_count = typed_keep_slots_.size();
+  bool kept_has_null = false;
+  for (size_t k = 0; k < kept_count; ++k) {
+    const slot_t col_idx = typed_keep_slots_[k];
+    const TlcsFile::DecodedColumnChunk& chunk =
+        stub_cache_->block.columns[stub_cache_->col_chunk_idx[col_idx]];
+    if (chunk.has_null) {
+      kept_has_null = true;
+      break;
+    }
+  }
+  size_t emitted = 0;
+  if (!kept_has_null && !batch->capture_positions && all_match) {
+    const uint32_t r0 = pos_.slot;
+    const size_t take = std::min<size_t>(stub_block_row_count_ - r0, max_rows);
+    std::memset(batch->nulls.data() + (count_offset * stride), 0,
+                take * stride);
+    for (size_t k = 0; k < kept_count; ++k) {
+      const slot_t col_idx = typed_keep_slots_[k];
+      const TlcsFile::DecodedColumnChunk& col =
+          stub_cache_->block.columns[stub_cache_->col_chunk_idx[col_idx]];
+      const size_t vslot = typed_varchar_slot_[k];
+      if (vslot == SIZE_MAX) {
+        const int64_t* __restrict src = col.int_cells.data() + r0;
+        if (stride == 1) {
+          std::memcpy(batch->cells.data() + count_offset, src,
+                      take * sizeof(int64_t));
+        } else {
+          int64_t* __restrict dst =
+              batch->cells.data() + (count_offset * stride) + k;
+          for (size_t r = 0; r < take; ++r) {
+            dst[r * stride] = src[r];
+          }
+        }
+      } else if (!col.dict_encoded && col.varchar_ends.size() >= r0 + take) {
+        auto& dst_bytes = batch->varchar_bytes[vslot];
+        auto& dst_ends = batch->varchar_ends[vslot];
+        const uint32_t src_byte_begin = r0 == 0 ? 0U : col.varchar_ends[r0 - 1];
+        const uint32_t src_byte_end = col.varchar_ends[r0 + take - 1];
+        const auto dst_base = static_cast<uint32_t>(dst_bytes.size());
+        if (src_byte_end > src_byte_begin) {
+          dst_bytes.insert(dst_bytes.end(),
+                           col.varchar_bytes.data() + src_byte_begin,
+                           col.varchar_bytes.data() + src_byte_end);
+        }
+        const uint32_t offset_delta = dst_base - src_byte_begin;
+        const uint32_t* __restrict src_ends = col.varchar_ends.data() + r0;
+        const size_t old_ends = dst_ends.size();
+        dst_ends.resize(old_ends + take);
+        uint32_t* __restrict out_ends = dst_ends.data() + old_ends;
+        for (size_t r = 0; r < take; ++r) {
+          out_ends[r] = src_ends[r] + offset_delta;
+        }
+      } else {
+        auto& dst_bytes = batch->varchar_bytes[vslot];
+        auto& dst_ends = batch->varchar_ends[vslot];
+        for (size_t r = 0; r < take; ++r) {
+          const std::string_view sv = col.VarcharAt(r0 + r);
+          dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+          dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
+        }
+      }
+    }
+    emitted = take;
+    pos_.slot = static_cast<slot_t>(r0 + take);
+  } else if (!kept_has_null && !batch->capture_positions) {
+    std::array<uint32_t, 2048> match_rows{};
+    const size_t max_take = std::min<size_t>(max_rows, 2048);
+    size_t n_match = 0;
+    uint32_t cur = pos_.slot;
+    for (; cur < stub_block_row_count_ && n_match < max_take; ++cur) {
+      if (StubRowMatches(cur)) {
+        match_rows[n_match++] = cur;
+      }
+    }
+    pos_.slot = static_cast<slot_t>(cur);
+    if (n_match > 0) {
+      std::memset(batch->nulls.data() + (count_offset * stride), 0,
+                  n_match * stride);
+      for (size_t k = 0; k < kept_count; ++k) {
+        const slot_t col_idx = typed_keep_slots_[k];
+        const TlcsFile::DecodedColumnChunk& col =
+            stub_cache_->block.columns[stub_cache_->col_chunk_idx[col_idx]];
+        const size_t vslot = typed_varchar_slot_[k];
+        if (vslot == SIZE_MAX) {
+          const int64_t* __restrict src = col.int_cells.data();
+          int64_t* __restrict dst =
+              batch->cells.data() + (count_offset * stride) + k;
+          for (size_t i = 0; i < n_match; ++i) {
+            dst[i * stride] = src[match_rows[i]];
+          }
+        } else {
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          auto& dst_ends = batch->varchar_ends[vslot];
+          for (size_t i = 0; i < n_match; ++i) {
+            const std::string_view sv = col.VarcharAt(match_rows[i]);
+            dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+            dst_ends.push_back(static_cast<uint32_t>(dst_bytes.size()));
+          }
+        }
+      }
+      emitted = n_match;
+    }
+  } else {
+    uint32_t r = pos_.slot;
+    for (; r < stub_block_row_count_ && emitted < max_rows; ++r) {
+      if (!all_match && !StubRowMatches(r)) {
+        continue;
+      }
+      const size_t base = (count_offset + emitted) * stride;
+      std::memset(batch->nulls.data() + base, 0, stride);
+      for (size_t k = 0; k < kept_count; ++k) {
+        const slot_t col_idx = typed_keep_slots_[k];
+        const TlcsFile::DecodedColumnChunk& col =
+            stub_cache_->block.columns[stub_cache_->col_chunk_idx[col_idx]];
+        const size_t vslot = typed_varchar_slot_[k];
+        if (col.IsNull(r)) {
+          batch->nulls[base + k] = 1;
+          if (vslot != SIZE_MAX) {
+            batch->varchar_ends[vslot].push_back(
+                static_cast<uint32_t>(batch->varchar_bytes[vslot].size()));
+          } else {
+            batch->cells[base + k] = 0;
+          }
+          continue;
+        }
+        if (vslot == SIZE_MAX) {
+          batch->cells[base + k] = col.int_cells[r];
+        } else {
+          const std::string_view sv = col.VarcharAt(r);
+          auto& dst_bytes = batch->varchar_bytes[vslot];
+          dst_bytes.insert(dst_bytes.end(), sv.data(), sv.data() + sv.size());
+          batch->varchar_ends[vslot].push_back(
+              static_cast<uint32_t>(dst_bytes.size()));
+        }
+      }
+      if (batch->capture_positions) {
+        batch->positions.emplace_back(pos_.page_id, static_cast<slot_t>(r));
+      }
+      ++emitted;
+    }
+    pos_.slot = static_cast<slot_t>(r);
+  }
+  if (pos_.slot >= stub_block_row_count_) {
+    if (!AdvanceFromStubPage()) {
+      pos_.page_id = ~0ULL;
+    }
+  }
+  return emitted;
+}
+
 bool FullScanIterator::IsValid() const { return pos_.IsValid(); }
 
 const Row& FullScanIterator::operator*() const {
   EnsureLSTableRowMaterialized();
+  EnsureStubRowMaterialized();
   return current_row_;
 }
 Row& FullScanIterator::operator*() {
   EnsureLSTableRowMaterialized();
+  EnsureStubRowMaterialized();
   return current_row_;
 }
 

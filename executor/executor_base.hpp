@@ -19,6 +19,7 @@
 
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "common/constants.hpp"
@@ -48,8 +49,8 @@ class ExecutorBase {
     return o;
   }
 
-  // Dynamic ("runtime") join filter pushdown (Phase 2 "Dynamic Filter Join /
-  // SIP / Bloom").  A hash join materializes its build side first, publishes a
+  // Dynamic ("runtime") join filter pushdown. A hash join materializes its
+  // build side first, publishes a
   // sound filter over the build keys here, and only then pulls rows from the
   // probe side: `column` on this executor holds a join key whose value has no
   // counterpart on the build side, so the row cannot produce a match.
@@ -65,6 +66,13 @@ class ExecutorBase {
     (void)column;
     (void)type;
     return false;
+  }
+
+  // Returns exact visible row count in O(1) without scanning when this executor
+  // is an unfiltered clean full-table scan with an intact snapshot store.
+  [[nodiscard]] virtual std::optional<uint64_t> TryExactUnfilteredRowCount()
+      const {
+    return std::nullopt;
   }
 
   // Sticky execution error. Next()/NextBatch() return false/0 both at EOF

@@ -36,7 +36,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.TopNPushThroughProvenOneToOneJoinWithForeignKey`
   - `CascadesTest.TopNPushThroughProvenOneToOneJoinRejectsNullableForeignKey`
   - `CascadesTest.TopNPushThroughProvenOneToOneJoinRejectsFilteredOtherSide`

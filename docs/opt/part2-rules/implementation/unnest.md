@@ -81,7 +81,7 @@ UNNEST ノードの上流に結合や集約が配置される場合、入力行�
 
 ## 検証テスト
 
-- `query/query_test.cpp`:
+- `query/query_test_part2.cpp`:
   - `QueryTest.CascadesOptimizesUnnestPlans`: UNNEST 構文を含むクエリが Cascades オプティマイザを通じて物理実行計画へと正常に最適化・実行されることを検証。
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.UnnestFilterPushdown`: フィルタ述語の押し込み後においても `kUnnest` 式が安定して保持されることを検証。

@@ -101,7 +101,9 @@ class SqlFrontendCoverageTest : public ::testing::Test {
 // ------------------------------------------------------------- set ops -----
 
 TEST_F(SqlFrontendCoverageTest, LimitZeroStillResolvesSelectList) {
+  // LIMIT 0 must not turn an otherwise-invalid projection into a success.
   ExpectError("SELECT bogus_col FROM t LIMIT 0");
+  // A valid LIMIT 0 still yields no rows.
   const auto rows = RunSql(engine_.get(), context_.get(),
                            "SELECT k FROM t LIMIT 0");
   EXPECT_TRUE(rows.empty());

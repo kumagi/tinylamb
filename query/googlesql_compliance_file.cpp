@@ -171,7 +171,7 @@ std::vector<std::string> SplitCases(std::string_view contents) {
 // of the upstream option vocabulary, so they are consumed (and ignored); a
 // leading "default " (the file-default spelling) is stripped before matching.
 // Anything outside this set and the handled keys above is not an option line.
-constexpr std::string_view kIgnoredOptionKeys[] = {
+constexpr auto kIgnoredOptionKeys = std::to_array<std::string_view>({
     "labels",
     "extract_labels",
     "global_labels",
@@ -185,8 +185,7 @@ constexpr std::string_view kIgnoredOptionKeys[] = {
     "use_test_database_copy",
     "reserve_match_recognize",
     "reserve_graph_table",
-    "unknown_order",
-};
+});
 
 bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
                        std::vector<std::string>* file_default_features,
@@ -298,14 +297,19 @@ bool ConsumeOptionLine(std::string_view line, GoogleSqlComplianceCase* out,
   if (bare_key.starts_with("default ")) {
     bare_key.remove_prefix(std::string_view("default ").size());
   }
-  for (const std::string_view ignored : kIgnoredOptionKeys) {
-    if (bare_key == ignored) {
-      return true;
-    }
+  if (bare_key == "unknown_order") {
+    // The order-unspecified declaration must flip the comparison flag; the
+    // upstream vocabulary spells it bare (`[unknown_order]` = true) or with
+    // an explicit value. Absorbing it into kIgnoredOptionKeys left the
+    // harness comparing strict row order against `-- unknown order` output.
+    const std::string lower_value = ToLower(Trim(value));
+    out->unknown_order =
+        value.empty() || lower_value == "true" || lower_value == "1";
+    return true;
   }
-  // Not an option line: the caller falls through to SQL so an unknown or
-  // misspelled key fails loudly instead of being silently swallowed.
-  return false;
+  return std::ranges::any_of(
+      kIgnoredOptionKeys,
+      [&](const std::string_view ignored) { return bare_key == ignored; });
 }
 
 bool ParseStructRow(std::string_view text, size_t* offset,
@@ -388,7 +392,11 @@ bool ParseStructRow(std::string_view text, size_t* offset,
 
 void ParseExpectedRows(std::string_view result, GoogleSqlComplianceCase* out) {
   const std::string lower = ToLower(std::string(result));
-  out->unknown_order = lower.find("unknown order") != std::string::npos;
+  // An `[unknown_order]` option line may already have set the flag; the
+  // `unknown order:` phrase in the expectation is the other spelling and
+  // must not clear it.
+  out->unknown_order =
+      out->unknown_order || lower.find("unknown order") != std::string::npos;
   const size_t array_open = result.find('[');
   if (array_open == std::string_view::npos) {
     return;
@@ -1619,10 +1627,18 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
             normalize_ws(strip_order_annotations(want))) {
       return true;
     }
-    if (normalize_ws(actual_str) == normalize_ws(unquoted) ||
-        normalize_ws(actual_str) == normalize_ws(want) ||
-        normalize_ws("{" + actual_str + "}") == normalize_ws(want) ||
-        normalize_ws("{" + actual_str + "}") == normalize_ws(unquoted)) {
+    // The plain whitespace-normalized comparison is a catch-all that would
+    // accept any two strings differing only in spacing. Restrict it to
+    // proto-text-shaped goldens (brace-wrapped payloads), where formatting is
+    // genuinely insignificant.
+    const bool proto_shaped = want.find('{') != std::string::npos ||
+                              unquoted.find('{') != std::string::npos ||
+                              actual_str.find('{') != std::string::npos;
+    if (proto_shaped &&
+        (normalize_ws(actual_str) == normalize_ws(unquoted) ||
+         normalize_ws(actual_str) == normalize_ws(want) ||
+         normalize_ws("{" + actual_str + "}") == normalize_ws(want) ||
+         normalize_ws("{" + actual_str + "}") == normalize_ws(unquoted))) {
       return true;
     }
     const std::string norm_actual = Unquote(actual_str);
@@ -1752,7 +1768,8 @@ bool ComplianceValueMatches(const Value& actual, std::string_view expected) {
     }
     // Match timestamps where reference output includes timezone suffix like
     // -08, +00, etc.
-    if (unquoted.size() > 3 &&
+    if (actual_str.size() >= 19 && actual_str[4] == '-' &&
+        actual_str[7] == '-' && unquoted.size() > 3 &&
         (unquoted[unquoted.size() - 3] == '-' ||
          unquoted[unquoted.size() - 3] == '+') &&
         (std::isdigit(

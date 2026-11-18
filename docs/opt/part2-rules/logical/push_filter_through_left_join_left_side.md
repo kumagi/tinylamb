@@ -164,8 +164,8 @@ while the join alternative below carries the push)")。押し込んだ述語は
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.PushFilterThroughLeftJoinLeftSide`
+- `plan/cascades_test_part2.cpp` の `CascadesTest.PushFilterThroughLeftJoinLeftSide`
   — LEFT 型(join_type = 0)の OuterJoin 上の Selection `a.x = 1` に対し、
   左入力側に同じ述語の Selection を持つ OuterJoin 代替が作られることを
-  検証します。RIGHT/FULL を拒む側面の反例テストは `plan/cascades_test.cpp`
+  検証します。RIGHT/FULL を拒む側面の反例テストは `plan/cascades_test_part2.cpp`
   では確認できませんでした。

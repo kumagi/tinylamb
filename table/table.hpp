@@ -45,11 +45,12 @@ class Encoder;
 struct Row;
 struct RowPosition;
 struct LSTableStore;
+class TlcsFile;
 
 class Table {
  public:
   using ScanMorsel = std::vector<page_id_t>;
-  // IndexValueType moved to index/index_schema.hpp (improvement3 S5).  The
+  // IndexValueType moved to index/index_schema.hpp.  The
   // using-declaration is a compatibility bridge for TUs that still spell
   // Table::IndexValueType (table.cpp, index_scan_iterator.cpp); it adds no
   // second definition and the disk encoding is unchanged.
@@ -133,8 +134,12 @@ class Table {
       const std::vector<IntegerPeekCompare>* peek_compares = nullptr,
       const RuntimeFilterGroup* runtime_filter = nullptr,
       ValueType runtime_filter_type = ValueType::kNull) const;
+  // Empty + txn.MarkFailed() on failure when `status_out == nullptr`;
+  // when `status_out != nullptr`, records the cause in `*status_out` without
+  // poisoning a live transaction on a read-only scan failure.
   [[nodiscard]] std::vector<ScanMorsel> BuildScanMorsels(
-      Transaction& txn, size_t pages_per_morsel = 8) const;
+      Transaction& txn, size_t pages_per_morsel = 8,
+      Status* status_out = nullptr) const;
   struct IntegerKeyCounts {
     std::vector<uint64_t> counts;
     uint64_t rows{0};
@@ -167,6 +172,10 @@ class Table {
       const;
   void SetProjectedLSTableStore(
       std::shared_ptr<const LSTableStore> store) const;
+  [[nodiscard]] std::shared_ptr<const TlcsFile> GetBackingTLCSStore() const;
+  void SetBackingTLCSStore(std::shared_ptr<const TlcsFile> store) const;
+  [[nodiscard]] uint64_t BackingColumnarRowCount() const;
+  Status EnsurePageHydratedIfStub(Transaction& txn, page_id_t pid) const;
   [[nodiscard]] bool LSTableCapacityRejected(uint64_t generation) const {
     return incarnation_state_ != nullptr &&
            incarnation_state_->LSTableCapacityRejectedGeneration() ==
@@ -184,6 +193,12 @@ class Table {
   [[nodiscard]] page_id_t FirstPageId() const { return first_pid_; }
   [[nodiscard]] page_id_t LastPageId() const { return last_pid_; }
   [[nodiscard]] uint64_t Incarnation() const { return incarnation_; }
+  // The per-database identity object this handle was bound to at lookup
+  // time (see Database::IsCurrentIncarnation for the reuse check).
+  [[nodiscard]] const std::shared_ptr<TableIncarnation>& IncarnationState()
+      const {
+    return incarnation_state_;
+  }
 
   // Physical row-layout bookkeeping behind the clustered-order proof in
   // table/table_statistics.hpp. Both read the shared TableIncarnation, so every
@@ -206,12 +221,14 @@ class Table {
   [[nodiscard]] const Index& GetIndex(size_t offset) const {
     return indexes_[offset];
   }
+  [[nodiscard]] Status ReadEncodedFromStub(RowPosition pos,
+                                           std::string* out) const;
 
  private:
   [[nodiscard]] std::shared_ptr<const IntegerKeyCounts> ReadIntegerKeyCounts(
       Transaction& txn, const std::vector<ScanMorsel>& morsels, slot_t column,
       int64_t minimum, size_t span, bool cached_pages_only) const;
-  // |hint_leaf| threads a BPlusTree landing-leaf cursor so consecutive index
+  // |hint_leaf| threads an LSM page-id hint so consecutive index
   // operations on the same tree (e.g. the delete+insert pair of one UPDATE)
   // skip the root-to-leaf walk when the remembered leaf still covers the
   // key. nullptr keeps the plain always-descend behavior.
@@ -220,6 +237,7 @@ class Table {
                                PageRef& successor) const;
   [[nodiscard]] StatusOr<Row> ReadLatest(Transaction& txn,
                                          RowPosition pos) const;
+  [[nodiscard]] StatusOr<Row> ReadFromStub(RowPosition pos) const;
   Status IndexInsert(Transaction& txn, const Index& idx, const Row& new_row,
                      const RowPosition& pos,
                      page_id_t* hint_leaf = nullptr) const;

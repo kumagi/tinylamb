@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -99,23 +100,445 @@ class FullScanIteratorTest : public ::testing::Test {
 
 TEST_F(FullScanIteratorTest, Construct_Default_Succeeds) {}
 
+// A non-empty columnar store built before a committed row mutation is stale,
+// not a reason to keep declining rebuilds: columnar acceleration must come
+// back on the next read transaction.
+TEST_F(FullScanIteratorTest, StaleNonEmptyLSTableStoreIsRebuilt) {
+  {
+    auto ctx = db_->BeginContext();
+    auto tbl = db_->GetTable(ctx, "SampleTable").MoveValue();
+    for (int64_t i = 0; i < 10; ++i) {
+      ASSERT_SUCCESS(tbl.Insert(ctx.txn_, Row({Value(i), Value("x"),
+                                               Value(static_cast<double>(i))}))
+                         .GetStatus());
+    }
+    ASSERT_SUCCESS(ctx.txn_.PreCommit());
+  }
+  std::shared_ptr<const LSTableStore> first;
+  {
+    auto reader = db_->BeginReadOnlyContext();
+    auto tbl = db_->GetTable(reader, "SampleTable").MoveValue();
+    first = GetOrBuildLSTableStore(reader.txn_, tbl, true);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->total_rows, 10U);
+    ASSERT_SUCCESS(reader.txn_.PreCommit());
+  }
+  {
+    auto writer = db_->BeginContext();
+    auto tbl = db_->GetTable(writer, "SampleTable").MoveValue();
+    ASSERT_SUCCESS(
+        tbl.Insert(writer.txn_, Row({Value(10), Value("y"), Value(2.0)}))
+            .GetStatus());
+    ASSERT_SUCCESS(writer.txn_.PreCommit());
+  }
+  auto fresh = db_->BeginReadOnlyContext();
+  auto fresh_table = db_->GetTable(fresh, "SampleTable").MoveValue();
+  // Install the stale non-empty image to exercise the exact gate that used to
+  // permanently disable lazy rebuilds.
+  fresh_table.SetLSTableStore(first);
+  const auto rebuilt = GetOrBuildLSTableStore(fresh.txn_, fresh_table, true);
+  ASSERT_NE(rebuilt, nullptr);
+  EXPECT_EQ(rebuilt->total_rows, 11U);
+  EXPECT_NE(rebuilt, first);
+  ASSERT_SUCCESS(fresh.txn_.PreCommit());
+}
+
+TEST(LSTableIntegerRunsTest, ExactGapsConcurrentReuseAndBudgetedLifetime) {
+  auto& budget = ProcessMemoryBudget::Global();
+  const auto before = budget.ColumnarUsed();
+  std::shared_ptr<const LSTableIntegerRuns> retained;
+  {
+    LSTableStore store;
+    store.total_rows = 8;
+    store.integer_columns = {{-3, -3, 0, 0, 0, 4, 4, 4}};
+    store.column_has_null = {0};
+    store.column_is_monotonic = {1};
+    std::vector<std::future<std::shared_ptr<const LSTableIntegerRuns>>> readers;
+    readers.reserve(4);
+for (int i = 0; i < 4; ++i) {
+      readers.push_back(
+          std::async(std::launch::async, [&] { return store.IntegerRuns(0); }));
+    }
+    retained = readers[0].get();
+    ASSERT_NE(retained, nullptr);
+    EXPECT_EQ(retained->max_run_rows, 3);
+    for (size_t i = 1; i < readers.size(); ++i) {
+      EXPECT_EQ(readers[i].get(), retained);
+}
+    for (int64_t key = -5; key <= 6; ++key) {
+      const auto [begin, end] = retained->Find(key);
+      const auto& values = store.integer_columns[0];
+      const auto first = std::lower_bound(values.begin(), values.end(), key);
+      const auto last = std::upper_bound(values.begin(), values.end(), key);
+      EXPECT_EQ(end - begin, static_cast<size_t>(last - first));
+      if (begin != end) {
+        EXPECT_EQ(begin, static_cast<size_t>(first - values.begin()));
+}
+    }
+    EXPECT_GT(budget.ColumnarUsed(), before);
+  }
+  EXPECT_GT(budget.ColumnarUsed(), before);
+  retained.reset();
+  EXPECT_EQ(budget.ColumnarUsed(), before);
+}
+
+TEST(LSTableIntegerRunsTest, MaximumRunBoundsIncludeSkewAndEndpoints) {
+  for (const auto& keys : std::vector<std::vector<int64_t>>{
+           {1},
+           {1, 1, 1, 1},
+           {1, 1, 1, 1, 2},
+           {1, 2, 2, 2, 2},
+           {std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::min() + 2},
+           {std::numeric_limits<int64_t>::max() - 2,
+            std::numeric_limits<int64_t>::max(),
+            std::numeric_limits<int64_t>::max()}}) {
+    LSTableStore store;
+    store.total_rows = keys.size();
+    store.integer_columns = {keys};
+    store.column_has_null = {0};
+    store.column_is_monotonic = {1};
+    const auto index = store.IntegerRuns(0);
+    ASSERT_NE(index, nullptr);
+    uint32_t expected = 0;
+    for (int64_t key : keys) {
+      expected = std::max(expected, static_cast<uint32_t>(std::count(
+                                        keys.begin(), keys.end(), key)));
+}
+    EXPECT_EQ(index->max_run_rows, expected);
+    uint32_t runs = 1;
+    for (size_t i = 1; i < keys.size(); ++i) { runs += static_cast<uint32_t>(keys[i] != keys[i - 1]);
+}
+    EXPECT_EQ(index->run_count, runs);
+  }
+}
+
+TEST(LSTableIntegerRunsTest, RefusesUnprovenSparseAndUnbudgetedInputs) {
+  LSTableStore store;
+  store.total_rows = 3;
+  store.integer_columns = {{0, 0, 1}};
+  store.column_has_null = {1};
+  store.column_is_monotonic = {1};
+  EXPECT_EQ(store.IntegerRuns(0), nullptr);
+  store.column_has_null[0] = 0;
+  store.column_is_monotonic[0] = 0;
+  EXPECT_EQ(store.IntegerRuns(0), nullptr);
+  store.column_is_monotonic[0] = 1;
+  store.integer_columns[0] = {0, 2, 1};
+  EXPECT_EQ(store.IntegerRuns(0), nullptr);
+  store.integer_columns[0] = {INT64_MIN, 0, INT64_MAX};
+  EXPECT_EQ(store.IntegerRuns(0), nullptr);
+  store.integer_columns[0] = {0, 0, 1};
+  auto& budget = ProcessMemoryBudget::Global();
+  struct RestoreLimit {
+    size_t old = ProcessMemoryBudget::Global().ColumnarPoolLimit();
+    ~RestoreLimit() {
+      ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(old);
+    }
+  } restore;
+  budget.SetColumnarPoolLimitForTest(1);
+  EXPECT_EQ(store.IntegerRuns(0), nullptr);
+  budget.SetColumnarPoolLimitForTest(restore.old);
+  EXPECT_NE(store.IntegerRuns(0), nullptr);
+}
+
+TEST(LSTableIntegerRunsTest, RunBoundsKeepExactExtremaAndBudgetedLifetime) {
+  auto& budget = ProcessMemoryBudget::Global();
+  for (int64_t base : {INT64_MIN, int64_t{-32768}, INT64_MAX - 65535}) {
+    const auto before = budget.ColumnarUsed();
+    std::shared_ptr<const LSTableIntegerRunBounds> retained;
+    {
+      LSTableStore store;
+      store.total_rows = 8;
+      store.integer_columns = {{-3, -3, 0, 0, 0, 4, 4, 4},
+                               {base, base + 10, base + 65535, base + 7,
+                                base + 20, base + 1, base + 11, base + 100}};
+      store.column_min_int = {-3, base};
+      store.column_max_int = {4, base + 65535};
+      store.column_has_null = {0, 0};
+      store.column_is_monotonic = {1, 0};
+      std::vector<std::future<std::shared_ptr<const LSTableIntegerRunBounds>>>
+          readers;
+      readers.reserve(4);
+for (int i = 0; i < 4; ++i) {
+        readers.push_back(std::async(
+            std::launch::async, [&] { return store.IntegerRunBounds(0, 1); }));
+}
+      retained = readers[0].get();
+      ASSERT_NE(retained, nullptr);
+      for (size_t i = 1; i < readers.size(); ++i) {
+        EXPECT_EQ(readers[i].get(), retained);
+}
+      for (int64_t key : {-3, 0, 4}) {
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (size_t r = 0; r < store.total_rows; ++r) {
+          if (store.integer_columns[0][r] != key) { continue;
+}
+          lo = std::min(lo, store.integer_columns[1][r]);
+          hi = std::max(hi, store.integer_columns[1][r]);
+        }
+        const uint32_t packed = retained->packed[key + 3];
+        EXPECT_EQ(retained->value_minimum + (packed & 65535), lo);
+        EXPECT_EQ(retained->value_minimum + (packed >> 16), hi);
+        EXPECT_TRUE(retained->MayOverlap(key, lo, hi));
+        EXPECT_TRUE(retained->MayOverlap(key, lo, lo));
+        EXPECT_TRUE(retained->MayOverlap(key, hi, hi));
+        EXPECT_TRUE(retained->MayOverlap(key, INT64_MIN, INT64_MAX));
+        EXPECT_FALSE(retained->MayOverlap(key, hi, lo - (lo != INT64_MIN)));
+        if (lo != INT64_MIN) {
+          EXPECT_FALSE(retained->MayOverlap(key, INT64_MIN, lo - 1));
+}
+        if (hi != INT64_MAX) {
+          EXPECT_FALSE(retained->MayOverlap(key, hi + 1, INT64_MAX));
+}
+        EXPECT_FALSE(retained->MayExceed(key, hi));
+        EXPECT_TRUE(retained->MayExceed(key, hi - 1));
+      }
+      EXPECT_FALSE(retained->MayExceed(-4, INT64_MIN));
+      EXPECT_FALSE(retained->MayExceed(5, INT64_MIN));
+    }
+    EXPECT_GT(budget.ColumnarUsed(), before);
+    retained.reset();
+    EXPECT_EQ(budget.ColumnarUsed(), before);
+  }
+}
+
+TEST(LSTableIntegerRunsTest, SparseRunBoundsKeepHolesRanksAndEndpoints) {
+  for (int64_t base : {INT64_MIN, int64_t{-4096}, INT64_MAX - 5000}) {
+    LSTableStore store;
+    store.integer_columns.resize(2);
+    for (int64_t i = 0; i <= 1100; ++i) {
+      const int64_t key = base + (i * 4);
+      for (int64_t v : {i % 17, (i % 17) + 3}) {
+        store.integer_columns[0].push_back(key);
+        store.integer_columns[1].push_back(v);
+      }
+    }
+    store.total_rows = store.integer_columns[0].size();
+    store.column_has_null = {0, 0};
+    store.column_is_monotonic = {1, 0};
+    const auto bounds = store.IntegerRunBounds(0, 1);
+    ASSERT_NE(bounds, nullptr);
+    ASSERT_FALSE(bounds->key_bits.empty());
+    EXPECT_EQ(bounds->packed.size(), 1101);
+    for (int64_t offset = 0; offset <= 4400; ++offset) {
+      const int64_t key = base + offset;
+      if (offset % 4 != 0) {
+        EXPECT_FALSE(bounds->MayOverlap(key, INT64_MIN, INT64_MAX));
+        continue;
+      }
+      const int64_t lo = (offset / 4) % 17, hi = lo + 3;
+      EXPECT_TRUE(bounds->MayOverlap(key, lo, lo));
+      EXPECT_TRUE(bounds->MayOverlap(key, hi, hi));
+      EXPECT_FALSE(bounds->MayOverlap(key, hi + 1, INT64_MAX));
+      EXPECT_TRUE(bounds->MayExceed(key, hi - 1));
+      EXPECT_FALSE(bounds->MayExceed(key, hi));
+    }
+    EXPECT_FALSE(bounds->MayOverlap(base + 4401, INT64_MIN, INT64_MAX));
+    if (base != INT64_MIN) {
+      EXPECT_FALSE(bounds->MayOverlap(base - 1, INT64_MIN, INT64_MAX));
+}
+  }
+}
+
+TEST(LSTableIntegerRunsTest, CoarseRunBoundsNeverRejectMatchingRows) {
+  for (int64_t base : {INT64_MIN, int64_t{-32768}, INT64_MAX - 65535}) {
+    LSTableStore store;
+    store.integer_columns.resize(2);
+    for (int64_t i = 0; i <= 1100; ++i) {
+      for (int64_t delta : {(i % 256) * 257, (i % 256) * 257 / 2}) {
+        store.integer_columns[0].push_back(i * 4);
+        store.integer_columns[1].push_back(base + delta);
+      }
+    }
+    store.total_rows = store.integer_columns[0].size();
+    store.column_has_null = {0, 0};
+    store.column_is_monotonic = {1, 0};
+    ASSERT_NE(store.IntegerRuns(0), nullptr);
+    auto& budget = ProcessMemoryBudget::Global();
+    struct RestoreLimit {
+      size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
+      ~RestoreLimit() {
+        ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
+      }
+    } restore;
+    const size_t before = budget.ColumnarUsed();
+    budget.SetColumnarPoolLimitForTest(before +
+                                       sizeof(LSTableIntegerRunBounds) + 3500);
+    const auto bounds = store.IntegerRunBounds(0, 1);
+    ASSERT_NE(bounds, nullptr);
+    ASSERT_FALSE(bounds->coarse.empty());
+    EXPECT_TRUE(bounds->packed.empty());
+    EXPECT_EQ(bounds->BoundsCount(), 1101);
+    EXPECT_LE(budget.ColumnarUsed() - before,
+              sizeof(LSTableIntegerRunBounds) + 3500);
+    for (size_t row = 0; row < store.total_rows; ++row) {
+      const int64_t key = store.integer_columns[0][row];
+      const int64_t value = store.integer_columns[1][row];
+      EXPECT_TRUE(bounds->MayOverlap(key, value, value));
+      if (value != INT64_MIN) { EXPECT_TRUE(bounds->MayExceed(key, value - 1));
+}
+      const auto [lo, hi] = bounds->ValueBounds(bounds->BoundsOffset(key));
+      EXPECT_LE(lo, value);
+      EXPECT_GE(hi, value);
+      EXPECT_GE(lo, base);
+      EXPECT_LE(hi, base + 65535);
+      if (lo != INT64_MIN) {
+        EXPECT_FALSE(bounds->MayOverlap(key, INT64_MIN, lo - 1));
+}
+      if (hi != INT64_MAX) {
+        EXPECT_FALSE(bounds->MayOverlap(key, hi + 1, INT64_MAX));
+}
+      EXPECT_FALSE(bounds->MayOverlap(key, 1, 0));
+      EXPECT_FALSE(bounds->MayOverlap(key + 1, INT64_MIN, INT64_MAX));
+    }
+  }
+}
+
+TEST(LSTableIntegerRunsTest, RunBoundsRefuseNullWideAndUnbudgetedColumns) {
+  for (int mode : {0, 1, 2}) {
+    LSTableStore store;
+    store.total_rows = 3;
+    store.integer_columns = {
+        {0, 0, 1},
+        {INT64_MIN, mode == 1 ? INT64_MAX : INT64_MIN + 3, INT64_MIN + 1}};
+    store.column_has_null = {0, static_cast<uint8_t>(mode == 0)};
+    store.column_is_monotonic = {1, 0};
+    ASSERT_NE(store.IntegerRuns(0), nullptr);
+    if (mode < 2) {
+      EXPECT_EQ(store.IntegerRunBounds(0, 1), nullptr);
+      continue;
+    }
+    struct RestoreLimit {
+      size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
+      ~RestoreLimit() {
+        ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
+      }
+    } restore;
+    ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(1);
+    size_t reclaims = 0;
+    auto& budget = ProcessMemoryBudget::Global();
+    const uint64_t hook =
+        budget.RegisterReclaimHook(ReclaimStage::kColumnar, [&](size_t) {
+          ++reclaims;
+          return size_t{0};
+        });
+    EXPECT_EQ(store.IntegerRunBounds(0, 1), nullptr);
+    budget.UnregisterReclaimHook(hook);
+    EXPECT_EQ(reclaims, 0);
+    ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(restore.saved);
+    EXPECT_NE(store.IntegerRunBounds(0, 1), nullptr);
+  }
+}
+
+TEST_F(FullScanIteratorTest,
+       ProjectionReplacementReleasesIdleImageBeforeBuild) {
+  auto load = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(
+          load, Schema("ReplaceProjection", {Column("a", ValueType::kInt64),
+                                             Column("b", ValueType::kInt64)})));
+  for (int64_t i = 0; i < 9000; ++i) {
+    ASSERT_SUCCESS(
+        table.Insert(load.txn_, Row({Value(i), Value(-i)})).GetStatus());
+}
+  ASSERT_SUCCESS(load.PreCommit());
+  auto reader = db_->BeginReadOnlyContext();
+  table.RejectLSTableCapacity(table.LayoutGeneration());
+  const std::vector<slot_t> first{0}, second{1};
+  auto original = GetOrBuildLSTableStore(reader.txn_, table, true, &first);
+  ASSERT_NE(original, nullptr);
+  auto& budget = ProcessMemoryBudget::Global();
+  constexpr size_t cap = 2 * 1024 * 1024;
+  ASSERT_LT(budget.ColumnarUsed(), cap - 65536);
+  // Model a large old image without putting MiB of row payload in a unit test.
+  ASSERT_TRUE(
+      original->memory_charge->TryAdd(cap - 65536 - budget.ColumnarUsed()));
+  std::weak_ptr<const LSTableStore> old_image = original;
+  original.reset();
+  struct RestoreLimit {
+    size_t saved = ProcessMemoryBudget::Global().ColumnarPoolLimit();
+    ~RestoreLimit() {
+      ProcessMemoryBudget::Global().SetColumnarPoolLimitForTest(saved);
+    }
+  } restore;
+  budget.SetColumnarPoolLimitForTest(cap);
+  const auto before = budget.TelemetrySnapshot().reclaim_calls;
+  const auto replacement =
+      GetOrBuildLSTableStore(reader.txn_, table, true, &second);
+  ASSERT_NE(replacement, nullptr);
+  EXPECT_TRUE(old_image.expired());
+  EXPECT_EQ(budget.TelemetrySnapshot().reclaim_calls, before);
+  EXPECT_TRUE(replacement->HasColumn(1));
+  EXPECT_FALSE(replacement->HasColumn(0));
+  EXPECT_EQ(replacement->integer_columns[1].front(), 0);
+  EXPECT_EQ(replacement->integer_columns[1].back(), -8999);
+  ASSERT_SUCCESS(reader.PreCommit());
+}
+
+TEST_F(FullScanIteratorTest, IntegerRunIndexStaysWithItsLayoutImage) {
+  auto ctx = db_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(
+      Table, table,
+      db_->CreateTable(ctx, Schema("Runs", {Column("k", ValueType::kInt64)})));
+  for (int64_t k : {-3, -3, 0, 4, 4}) {
+    ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value(k)})).GetStatus());
+}
+  const auto original = BuildLSTableStore(ctx.txn_, table);
+  ASSERT_NE(original, nullptr);
+  const auto old_index = original->IntegerRuns(0);
+  ASSERT_NE(old_index, nullptr);
+  const auto old_bounds = original->IntegerRunBounds(0, 0);
+  ASSERT_NE(old_bounds, nullptr);
+  ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value(7)})).GetStatus());
+  // The ordinary cache lookup refuses the stale image while a write is
+  // pending. An explicit transaction-local rebuild has a separate index.
+  EXPECT_EQ(GetOrBuildLSTableStore(ctx.txn_, table, true), nullptr);
+  const auto changed = BuildLSTableStore(ctx.txn_, table);
+  ASSERT_NE(changed, nullptr);
+  EXPECT_NE(changed, original);
+  const auto new_index = changed->IntegerRuns(0);
+  ASSERT_NE(new_index, nullptr);
+  const auto new_bounds = changed->IntegerRunBounds(0, 0);
+  ASSERT_NE(new_bounds, nullptr);
+  EXPECT_FALSE(old_bounds->MayExceed(7, 6));
+  EXPECT_TRUE(new_bounds->MayExceed(7, 6));
+  EXPECT_EQ(old_index->Find(7), std::make_pair(0U, 0U));
+  EXPECT_EQ(new_index->Find(7), std::make_pair(5U, 6U));
+  ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value()})).GetStatus());
+  EXPECT_EQ(GetOrBuildLSTableStore(ctx.txn_, table, true), nullptr);
+  const auto nullable = BuildLSTableStore(ctx.txn_, table);
+  ASSERT_NE(nullable, nullptr);
+  EXPECT_EQ(nullable->IntegerRuns(0), nullptr);
+  EXPECT_EQ(nullable->IntegerRunBounds(0, 0), nullptr);
+  EXPECT_TRUE(new_bounds->MayExceed(7, 6));
+  EXPECT_EQ(new_index->Find(7), std::make_pair(5U, 6U));
+  ctx.Abort();
+}
+
 TEST_F(FullScanIteratorTest,
        ExactUniquenessSurvivesRejectedDictionaryEncoding) {
   auto context = db_->BeginContext();
   ASSIGN_OR_ASSERT_FAIL(
       Table, table,
-      db_->CreateTable(
-          context,
-          Schema("UniqueProof", {Column("k", ValueType::kInt64),
-                                 Column("duplicate", ValueType::kInt64),
-                                 Column("nullable", ValueType::kInt64)})));
+      db_->CreateTable(context,
+                       Schema("UniqueProof",
+                              {Column("k", ValueType::kInt64),
+                               Column("duplicate", ValueType::kInt64),
+                               Column("nullable", ValueType::kInt64),
+                               Column("unique_later", ValueType::kInt64),
+                               Column("late_duplicate", ValueType::kInt64)})));
   for (int64_t i = 0; i < 8192; ++i) {
     // Exceed the separate first-column dense-domain uniqueness bitmap.
     const int64_t k = ((i * 4093) % 8192) * 100003;
-    ASSERT_SUCCESS(table
-                       .Insert(context.txn_, Row({Value(k), Value(i % 4096),
-                                                  i < 2 ? Value() : Value(k)}))
-                       .GetStatus());
+    ASSERT_SUCCESS(
+        table
+            .Insert(context.txn_,
+                    Row({Value(k), Value(i % 4096), i < 2 ? Value() : Value(k),
+                         Value(k), Value(i == 8191 ? 0 : k)}))
+            .GetStatus());
   }
   const auto store = BuildLSTableStore(context.txn_, table);
   ASSERT_NE(store, nullptr);
@@ -124,6 +547,16 @@ TEST_F(FullScanIteratorTest,
   EXPECT_EQ(store->column_is_unique_nonnull[0], 1);
   EXPECT_EQ(store->column_is_unique_nonnull[1], 0);
   EXPECT_EQ(store->column_is_unique_nonnull[2], 0);
+  EXPECT_EQ(store->column_is_unique_nonnull[3], 1);
+  EXPECT_EQ(store->column_is_unique_nonnull[4], 0);
+  ASSERT_SUCCESS(table
+                     .Insert(context.txn_, Row({Value(0), Value(0), Value(0),
+                                                Value(0), Value(0)}))
+                     .GetStatus());
+  const auto changed = BuildLSTableStore(context.txn_, table);
+  ASSERT_NE(changed, nullptr);
+  EXPECT_EQ(changed->column_is_unique_nonnull[3], 0);
+  EXPECT_EQ(store->column_is_unique_nonnull[3], 1);
   ASSERT_SUCCESS(context.PreCommit());
 }
 
@@ -196,9 +629,9 @@ TEST_F(FullScanIteratorTest, NumericStreamsOwnPageSlicesAndPreserveBits) {
                                        : -row;
     return Row({row % 11 == 0 ? Value() : Value(integer),
                 row % 13 == 0 ? Value() : Value::DateFromDays(row - 2000),
-                row % 17 == 0
-                    ? Value()
-                    : Value(std::bit_cast<double>(kDoubleBits[row % 6])),
+                row % 17 == 0 ? Value()
+                              : Value(std::bit_cast<double>(
+                                    kDoubleBits[static_cast<size_t>(row) % 6])),
                 Value(), Value(std::string(80, 'p'))});
   };
   {
@@ -383,6 +816,13 @@ TEST_F(FullScanIteratorTest, PackedIntegerDictionaryKeepsNullsAndBoundaries) {
               7);
       EXPECT_LT(dictionary.wide_codes.size(),
                 static_cast<size_t>(rows) * dictionary.wide_code_bytes);
+      const size_t domain = dictionary.int_entries.size();
+      if (domain <= 300) {
+        ASSERT_EQ(dictionary.code_counts.size(), domain + 1);
+      }
+      std::vector<int64_t> expected_counts(domain + 1);
+      std::vector<uint64_t> expected_first(domain + 1, UINT64_MAX);
+      std::vector<uint32_t> expected_encounter;
       size_t base = 0;
       for (const auto& block : store->blocks) {
         const auto& column = block.columns[c];
@@ -394,6 +834,11 @@ TEST_F(FullScanIteratorTest, PackedIntegerDictionaryKeepsNullsAndBoundaries) {
                                               : Value::DateFromDays(n % 31);
           const uint32_t code = dictionary.DictionaryCodeAt(base + row);
           EXPECT_EQ(code, column.DictionaryCodeAt(row));
+          ASSERT_LE(code, domain);
+          if (expected_counts[code]++ == 0) {
+            expected_first[code] = base + row;
+            expected_encounter.push_back(code);
+          }
           if (expected.IsNull()) {
             EXPECT_EQ(code, dictionary.int_entries.size());
           } else {
@@ -406,6 +851,11 @@ TEST_F(FullScanIteratorTest, PackedIntegerDictionaryKeepsNullsAndBoundaries) {
       EXPECT_EQ(base, dictionary.DictionaryCodeCount());
       EXPECT_EQ(dictionary.DictionaryCodeAt(base), UINT32_MAX);
       EXPECT_EQ(dictionary.DictionaryCodeAt(SIZE_MAX), UINT32_MAX);
+      if (!dictionary.code_counts.empty()) {
+        EXPECT_EQ(dictionary.code_counts, expected_counts);
+        EXPECT_EQ(dictionary.code_first_row, expected_first);
+        EXPECT_EQ(dictionary.encounter_codes, expected_encounter);
+      }
     }
     ASSERT_SUCCESS(reader.PreCommit());
   }
@@ -855,19 +1305,28 @@ TEST_F(FullScanIteratorTest, StringDictionaryKeepsModestEstimatedSavings) {
 
 TEST_F(FullScanIteratorTest, IntegerDictionaryCrossesFormerCardinalityLimit) {
   constexpr int64_t cardinality = (int64_t{1} << 20) + 17;
-  constexpr int64_t rows = cardinality * 3;
+  constexpr int64_t rows = (cardinality * 9) / 4;
+  constexpr int64_t kCommitBatch = 262144;
   {
     auto setup = db_->BeginContext();
     const Schema schema("LargeDictionary", {Column("k", ValueType::kInt64)});
     ASSERT_SUCCESS(db_->CreateTable(setup, schema).GetStatus());
-    ASSIGN_OR_ASSERT_FAIL(Table, table,
-                          db_->GetTable(setup, "LargeDictionary"));
-    for (int64_t i = 0; i < rows; ++i) {
-      ASSERT_SUCCESS(
-          table.Insert(setup.txn_, Row({Value(i % cardinality)})).GetStatus());
-    }
-    ASSERT_SUCCESS(table.Insert(setup.txn_, Row({Value()})).GetStatus());
     ASSERT_SUCCESS(setup.PreCommit());
+  }
+  Row insert_row({Value(int64_t{0})});
+  for (int64_t base = 0; base < rows; base += kCommitBatch) {
+    auto batch = db_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(Table, table,
+                          db_->GetTable(batch, "LargeDictionary"));
+    const int64_t end = std::min(rows, base + kCommitBatch);
+    for (int64_t i = base; i < end; ++i) {
+      insert_row[0].value.int_value = i % cardinality;
+      ASSERT_SUCCESS(table.Insert(batch.txn_, insert_row).GetStatus());
+    }
+    if (end == rows) {
+      ASSERT_SUCCESS(table.Insert(batch.txn_, Row({Value()})).GetStatus());
+    }
+    ASSERT_SUCCESS(batch.PreCommit());
   }
   auto reader = db_->BeginReadOnlyContext();
   ASSIGN_OR_ASSERT_FAIL(Table, table, db_->GetTable(reader, "LargeDictionary"));

@@ -2,7 +2,7 @@
 # such as UDFs, UDAs, and TVFs.
 #
 # We have a separate test file for these cases because some of the test drivers
-# cannot handle the mix yet and we didn't want to unnessarily break the other
+# cannot handle the mix yet and we didn't want to unnecessarily break the other
 # test files for some drivers.
 
 [prepare_database]

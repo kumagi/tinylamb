@@ -189,7 +189,7 @@ TEST(DataChunkTest, Append_MovedRowPreservesValuesAndZoneMaps) {
   const ZoneMap& integers = chunk.ZoneMapAt(0);
   const ZoneMap& strings = chunk.ZoneMapAt(1);
   ASSERT_TRUE(integers.Minimum().has_value());
-  ASSERT_TRUE(integers.Minimum().has_value());
+  ASSERT_TRUE(integers.Maximum().has_value());
   ASSERT_TRUE(integers.Maximum().has_value());
   ASSERT_TRUE(strings.Minimum().has_value());
   ASSERT_TRUE(strings.Maximum().has_value());

@@ -59,7 +59,7 @@ CREATE TEMP AGGREGATE FUNCTION PipeConcat(a STRING, b STRING) AS (
   # CREATE AGGREGATE FUNCTION body expressions. This usefully tests the
   # WITH expression inside these functions which seems like a potential source
   # of trouble given that in this case it creates an otherwise unreachable
-  # ResolvedAST shape. (You can't trivally convert this to a subquery.)
+  # ResolvedAST shape. (You can't trivially convert this to a subquery.)
   WITH (arr AS ARRAY_AGG(STRUCT(a, b)),
         ARRAY_TO_STRING(ARRAY(
           SELECT CONCAT(e.a, ',', e.b)

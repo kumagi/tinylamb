@@ -3,8 +3,12 @@
 #define TINYLAMB_EXECUTOR_DETAIL_SUBQUERY_RUNTIME_HPP
 
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -13,6 +17,7 @@
 #include "common/runtime_filter.hpp"
 #include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/relation.hpp"
+#include "executor/query_memory.hpp"
 #include "query/statement.hpp"
 #include "type/column_name.hpp"
 #include "type/value.hpp"
@@ -60,6 +65,254 @@ struct Scope {
 
 using CteMap = std::unordered_map<std::string, RelationPtr>;
 
+struct TransparentStringHash {
+  using is_transparent = void;
+  [[nodiscard]] size_t operator()(std::string_view sv) const noexcept {
+    return std::hash<std::string_view>{}(sv);
+  }
+};
+
+struct TransparentStringEqual {
+  using is_transparent = void;
+  [[nodiscard]] bool operator()(std::string_view lhs,
+                                std::string_view rhs) const noexcept {
+    return lhs == rhs;
+  }
+};
+
+struct SharedBaseRelationCache {
+  struct DensePkEntry {
+    uint32_t nb{std::numeric_limits<uint32_t>::max()};
+    uint32_t rin{0};
+    uint32_t subgid{0};
+  };
+  struct CachedPkDict {
+    std::shared_ptr<const void> store_owner;
+    bool has_dense{false};
+    int64_t min_k{0};
+    int64_t max_k{0};
+    uint64_t span{0};
+    uint32_t subgid_count{0};
+    std::vector<DensePkEntry> remapped_dense;
+    std::vector<uint32_t> subgid;
+    std::vector<std::pair<uint32_t, uint32_t>> subgid_rep_loc;
+  };
+  struct CachedSplitRightDict {
+    uint32_t subgid_count{0};
+    std::vector<uint32_t> subgid;
+    std::vector<uint32_t> rep_idx;
+  };
+
+  bool AcquireSplitRightDictSlot(
+      const std::string& key,
+      std::shared_ptr<const CachedSplitRightDict>* out_hit) {
+    return AcquireCachedSlot(split_right_dict_entries_,
+                             split_right_dict_in_flight_, key, out_hit);
+  }
+
+  void PublishSplitRightDict(const std::string& key,
+                             std::shared_ptr<const CachedSplitRightDict> dict) {
+    PublishCachedSlot(split_right_dict_entries_, split_right_dict_in_flight_,
+                      key, std::move(dict));
+  }
+
+  void AbandonSplitRightDict(const std::string& key) {
+    AbandonCachedSlot(split_right_dict_in_flight_, key);
+  }
+
+  bool AcquireBaseSlot(const std::string& key, RelationPtr* out_hit) {
+    auto& active = ActiveThreadKeys();
+    const std::string tag = ThreadTag(this, key);
+    if (active.contains(tag)) {
+      return false;
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+      if (auto it = base_entries_.find(key); it != base_entries_.end()) {
+        *out_hit = it->second;
+        return false;
+      }
+      if (!base_in_flight_.contains(key)) {
+        base_in_flight_.insert(key);
+        active.insert(tag);
+        return true;
+      }
+      cv_.wait(lock);
+    }
+  }
+
+  void PublishBase(const std::string& key, RelationPtr rel) {
+    ActiveThreadKeys().erase(ThreadTag(this, key));
+    {
+      std::scoped_lock lock(mu_);
+      const size_t max_cache_bytes = std::min<size_t>(
+          size_t{256} << 20, QueryMemoryBudget::Global().Limit() / 8);
+      if (rel != nullptr && !rel->HasSpill()) {
+        const size_t est = rel->EstimatedMemoryBytes();
+        if (est <= max_cache_bytes &&
+            total_base_bytes_ + est <= max_cache_bytes) {
+          total_base_bytes_ += est;
+          base_entries_.emplace(key, std::move(rel));
+        }
+      }
+      base_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  void AbandonBase(const std::string& key) {
+    ActiveThreadKeys().erase(ThreadTag(this, key));
+    {
+      std::scoped_lock lock(mu_);
+      base_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  bool AcquirePkDenseSlot(
+      const std::string& key,
+      std::shared_ptr<const std::vector<DensePkEntry>>* out_hit) {
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+      if (auto it = pk_dense_entries_.find(key);
+          it != pk_dense_entries_.end()) {
+        *out_hit = it->second;
+        return false;
+      }
+      if (!pk_dense_in_flight_.contains(key)) {
+        pk_dense_in_flight_.insert(key);
+        return true;
+      }
+      cv_.wait(lock);
+    }
+  }
+
+  void PublishPkDense(const std::string& key,
+                      std::shared_ptr<const std::vector<DensePkEntry>> dense) {
+    {
+      std::scoped_lock lock(mu_);
+      if (dense != nullptr) {
+        pk_dense_entries_.emplace(key, std::move(dense));
+      }
+      pk_dense_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  void AbandonPkDense(const std::string& key) {
+    {
+      std::scoped_lock lock(mu_);
+      pk_dense_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  bool AcquirePkDictSlot(const std::string& key,
+                         std::shared_ptr<const CachedPkDict>* out_hit) {
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+      if (auto it = pk_dict_entries_.find(key); it != pk_dict_entries_.end()) {
+        *out_hit = it->second;
+        return false;
+      }
+      if (!pk_dict_in_flight_.contains(key)) {
+        pk_dict_in_flight_.insert(key);
+        return true;
+      }
+      cv_.wait(lock);
+    }
+  }
+
+  void PublishPkDict(const std::string& key,
+                     std::shared_ptr<const CachedPkDict> dict) {
+    {
+      std::scoped_lock lock(mu_);
+      if (dict != nullptr) {
+        pk_dict_entries_.emplace(key, std::move(dict));
+      }
+      pk_dict_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  void AbandonPkDict(const std::string& key) {
+    {
+      std::scoped_lock lock(mu_);
+      pk_dict_in_flight_.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  static std::unordered_set<std::string>& ActiveThreadKeys() {
+    thread_local std::unordered_set<std::string> keys;
+    return keys;
+  }
+  static std::string ThreadTag(const void* self, const std::string& key) {
+    return std::to_string(reinterpret_cast<uintptr_t>(self)) + ":" + key;
+  }
+
+  template <typename EntryT>
+  bool AcquireCachedSlot(
+      const std::unordered_map<std::string, std::shared_ptr<const EntryT>>&
+          entries,
+      std::unordered_set<std::string>& in_flight, const std::string& key,
+      std::shared_ptr<const EntryT>* out_hit) {
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+      if (auto it = entries.find(key); it != entries.end()) {
+        *out_hit = it->second;
+        return false;
+      }
+      if (!in_flight.contains(key)) {
+        in_flight.insert(key);
+        return true;
+      }
+      cv_.wait(lock);
+    }
+  }
+
+  template <typename EntryT>
+  void PublishCachedSlot(
+      std::unordered_map<std::string, std::shared_ptr<const EntryT>>& entries,
+      std::unordered_set<std::string>& in_flight, const std::string& key,
+      std::shared_ptr<const EntryT> entry) {
+    {
+      std::scoped_lock lock(mu_);
+      if (entry != nullptr) {
+        entries.emplace(key, std::move(entry));
+      }
+      in_flight.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  void AbandonCachedSlot(std::unordered_set<std::string>& in_flight,
+                         const std::string& key) {
+    {
+      std::scoped_lock lock(mu_);
+      in_flight.erase(key);
+    }
+    cv_.notify_all();
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::unordered_map<std::string, RelationPtr> base_entries_;
+  size_t total_base_bytes_{0};
+  std::unordered_set<std::string> base_in_flight_;
+  std::unordered_map<std::string,
+                     std::shared_ptr<const std::vector<DensePkEntry>>>
+      pk_dense_entries_;
+  std::unordered_set<std::string> pk_dense_in_flight_;
+  std::unordered_map<std::string, std::shared_ptr<const CachedPkDict>>
+      pk_dict_entries_;
+  std::unordered_set<std::string> pk_dict_in_flight_;
+  std::unordered_map<std::string, std::shared_ptr<const CachedSplitRightDict>>
+      split_right_dict_entries_;
+  std::unordered_set<std::string> split_right_dict_in_flight_;
+};
+
 struct CorrelatedIndex {
   Schema schema;
   // A materialized CTE may be rebound by an enclosing/recursive scope.
@@ -79,10 +332,19 @@ struct CorrelatedIndex {
   bool null_parameter_seen{false};
   bool preaggregated{false};
   bool has_preagg_int_scalars{false};
+  bool has_preagg_str_scalars{false};
   bool preagg_two_int_key{false};
   bool preagg_empty_has_row{false};
+  // Keys whose group existed but was rejected by HAVING. They must answer
+  // NULL/false, not the empty-input aggregate used for genuinely absent keys.
+  std::unordered_set<int64_t> preagg_rejected_int_keys;
   FlatIntKeyMap<Value> preagg_int_scalars{};
   FlatIntKeyMap<uint8_t> preagg_seen_keys{};
+  std::unordered_map<std::string, Value, TransparentStringHash,
+                     TransparentStringEqual>
+      preagg_str_scalars{};
+  std::unordered_set<std::string, TransparentStringHash, TransparentStringEqual>
+      preagg_seen_str_keys{};
   size_t preagg_distinct_keys{0};
   Value preagg_empty_scalar{};
   // EXISTS-only fast path: when the subquery result is consumed purely as
@@ -127,9 +389,10 @@ struct CorrelatedIndex {
 // never filtered by it.  `column` is a full-schema slot; consumers remap it
 // into their own projection.
 // `ExecutionRuntime::table_key_filters` is keyed by the source's in-statement
-// name (alias, else table name), never the bare base table: a self-join names
+// name (alias when present, otherwise the table name): a self-join names
 // the same table twice, and a key domain derived for one alias (from that
-// alias's join predicate) must never prune another alias's scan.
+// alias's join predicate) must never prune another alias's scan. Without
+// an alias, the bare table name is used as the key.
 inline std::string TableKeyFilterKey(const SelectSource& source) {
   return source.alias.empty() ? source.table : source.alias;
 }
@@ -154,8 +417,10 @@ struct TableKeyFilter {
     // A sibling UNION/ROLLUP branch must not inherit an earlier key domain.
     return owner == &statement && owner_runtime_id == statement.RuntimeId();
   }
-  const ExpressionBase* source_expr{nullptr};
   bool exact_in{false};
+  // Expression this filter was built from, used to recognise the direct
+  // base-scan path during bytecode lowering.
+  const ExpressionBase* source_expr{nullptr};
 
   [[nodiscard]] bool empty() const {
     return filter == nullptr || filter->empty();
@@ -175,7 +440,11 @@ struct BaseRelationArena {
   std::vector<std::vector<uint64_t>> null_bits;
   struct VarcharRun {
     std::vector<uint8_t> bytes;
-    std::vector<uint32_t> ends;  // rows entries, cumulative byte offsets
+    std::vector<size_t> ends;  // rows entries, cumulative byte offsets
+
+    void AppendEnd(size_t prefix_bytes, size_t relative_end) {
+      ends.push_back(prefix_bytes + relative_end);
+    }
   };
   std::vector<VarcharRun> varchars;
   size_t rows{0};
@@ -204,7 +473,10 @@ struct BaseRelationArena {
   // the view.
   [[nodiscard]] std::string_view Varchar(size_t row, size_t column) const {
     const VarcharRun& run = varchars[VarcharOrdinal(column)];
-    const uint32_t begin = row == 0 ? 0U : run.ends[row - 1];
+    const size_t begin = row == 0 ? 0 : run.ends[row - 1];
+    if (run.ends[row] == begin) {
+      return {};
+    }
     return {reinterpret_cast<const char*>(run.bytes.data()) + begin,
             run.ends[row] - begin};
   }
@@ -253,11 +525,11 @@ struct BaseRelationArena {
     for (size_t v = 0; v < varchars.size(); ++v) {
       VarcharRun& dst = varchars[v];
       const VarcharRun& src = run.varchars[v];
-      const auto dst_bytes = static_cast<uint32_t>(dst.bytes.size());
+      const size_t dst_bytes = dst.bytes.size();
       dst.bytes.insert(dst.bytes.end(), src.bytes.begin(), src.bytes.end());
       dst.ends.reserve(dst.ends.size() + src.ends.size());
-      for (const uint32_t end : src.ends) {
-        dst.ends.push_back(dst_bytes + end);
+      for (const size_t end : src.ends) {
+        dst.AppendEnd(dst_bytes, end);
       }
     }
     rows += run.rows;
@@ -378,7 +650,8 @@ struct ExecutionRuntime {
   double sort_ms{0};
   // Wall time of the top-level ExecuteQuery, including result materialization.
   // Operator timers above overlap each other and omit some phases; subtract
-  // them from execute_ms only as a clue, never as a partition of the wall clock.
+  // them from execute_ms only as a clue, never as a partition of the wall
+  // clock.
   double execute_ms{0};
   double boundary_ms{0};
   // Sum of nested BuildInput calls, so it can exceed execute_ms.
@@ -399,11 +672,22 @@ struct ExecutionRuntime {
   double planning_ms{0};
   double join_estimate_ms{0};
   size_t partitioned_aggregate_merges{0};
+  size_t partitioned_numeric_aggregations{0};
+  // Physical dictionary kernels, distinct from logical scan_rows. A summary
+  // fold consumes dictionary frequencies without visiting row code streams.
+  size_t dictionary_aggregations{0};
+  size_t dictionary_summary_aggregations{0};
+  size_t dictionary_aggregate_rows{0};
+  size_t partitioned_dictionary_aggregations{0};
   size_t typed_parallel_aggregations{0};
-  size_t typed_parallel_agg_fallbacks{0};
   // Statements whose final join step fused with their GROUP BY (the joined
   // relation was never materialized).
   size_t grouped_join_fusions{0};
+  size_t pushed_group_rows{0};
+  size_t pushed_group_joins{0};
+  size_t transfer_seed_rows{0};
+  size_t transfer_scan_tested{0};
+  size_t transfer_scan_rejected{0};
   // Probe table scanned directly into groups without a materialized input.
   size_t streamed_grouped_joins{0};
   size_t selective_index_scans{0};
@@ -428,7 +712,7 @@ struct ExecutionRuntime {
   size_t key_filter_keys{0};
   size_t key_filter_rejected{0};
   size_t key_filter_null_rejected{0};
-  // Dynamic filter composition (Phase 2 "Dynamic Filter Join / SIP / Bloom"):
+  // Dynamic filter composition:
   // how many stashed filters carried a range enclosure / a Bloom part, and
   // their combined resident footprint. EXPLAIN renders these so a plan that
   // only prunes through the exact set is distinguishable from one that also
@@ -457,6 +741,7 @@ struct ExecutionRuntime {
     size_t limit{0};
   };
   std::optional<GroupingRankLimit> grouping_rank_limit;
+  std::shared_ptr<SharedBaseRelationCache> shared_base_cache;
 };
 
 double ElapsedMs(std::chrono::steady_clock::time_point begin);
@@ -475,8 +760,9 @@ void MaterializeCacheRowsIfNeeded(const std::string& cache_key,
 
 // Parallel variant for multi-million-row caches: boxes disjoint row ranges
 // across worker threads, then marks the arena rows_boxed.
-[[nodiscard]] Status MaterializeCacheRowsParallel(
-    const std::string& cache_key, Relation* cached, ExecutionRuntime* runtime);
+[[nodiscard]] Status MaterializeCacheRowsParallel(const std::string& cache_key,
+                                                  Relation* cached,
+                                                  ExecutionRuntime* runtime);
 
 // Cache key shared by scalar/EXISTS result caching and IN membership caching.
 // The inherited CTE identities are part of the key because the same query
@@ -528,7 +814,8 @@ std::shared_ptr<SelectStatement> PushGroupedCteJoinDomains(
 // If every CTE consumer observes membership only, retain the referenced
 // columns and group duplicate join outputs before materializing the cell.
 std::shared_ptr<SelectStatement> GroupPresenceOnlyCte(
-    const SelectStatement& consumer, const std::string& name);
+    const SelectStatement& consumer, const std::string& name,
+    TransactionContext* context = nullptr);
 
 // Restrict a singly consumed CTE using necessary integer equalities of its
 // consumer. Outer-join equalities propagate only toward the nullable side.
@@ -570,10 +857,13 @@ std::optional<ScanRuntimeFilter> CorrelationDomainFilter(
     const ColumnName& outer_column, const std::vector<slot_t>& projection,
     const ExecutionRuntime& runtime);
 
+struct GroupedOutputSink;
 StatusOr<Relation> ExecuteQuery(TransactionContext& context,
                                 const SelectStatement& statement,
                                 const Scope* outer,
-                                const CteMap& inherited_ctes);
+                                const CteMap& inherited_ctes,
+                                GroupedOutputSink* output_sink = nullptr,
+                                bool columnar_output = false);
 
 StatusOr<Relation> ExecuteRecursiveCte(
     TransactionContext& context, const std::string& name,
@@ -618,7 +908,8 @@ Status ValidateCteDependencies(const SelectStatement& statement);
 // executor repeatedly calls this until it reaches a fixed point; EXPLAIN uses
 // the same helper so its displayed shape matches the executable query shape.
 std::shared_ptr<SelectStatement> OptimizeDerivedBoundaries(
-    const SelectStatement& statement, const CteMap& inherited_ctes);
+    const SelectStatement& statement, const CteMap& inherited_ctes,
+    TransactionContext* context = nullptr);
 
 StatusOr<Relation> FinishQuery(TransactionContext& context,
                                const SelectStatement& statement, Relation input,

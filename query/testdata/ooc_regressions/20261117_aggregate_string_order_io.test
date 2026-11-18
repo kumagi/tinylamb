@@ -1,0 +1,9 @@
+-- sql_ooc_fuzzer regression
+-- seed: 241
+-- profile: pool=32768 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: sweep io / budget-invariance mismatch [groupby+stringagg+orderby] (same query, different memory knobs) :: op 4 `sweep io 32 :: q ord=0 heavy=1 take=-1 nv=2 vs=155175830 ex=1 snap=0 :: SELECT pad AS c1, COUNT(*) AS c2, LENGTH(STRING_AGG(t, ',' ORDER BY k)) AS c3, MAX(LENGT...(212B)`: sweep io `q ord=0 heavy=1 take=-1 nv=2 vs=155175830 ex=1 snap=0 :: SELECT pad AS c1, COUNT(*) AS c2, LENGTH(STRING_AGG(t, ',' ORDE...(197B)` with failure #3: budget-invariance mismatch [groupby+stringagg+orderby] (same query, different memory knobs): SELECT pad AS c1, COUNT(*) AS c2, LENGTH(STRING_AGG(t, ',' ORDER 
+create t0 2 8274 1 3 1000000 1
+ins_bulk t0 303 479 74
+create t3 1 59 1914 2 11 0
+ins_copy t3 t0 405 593 189
+sweep io 32 :: q ord=0 heavy=1 take=-1 nv=2 vs=155175830 ex=1 snap=0 :: SELECT pad AS c1, COUNT(*) AS c2, LENGTH(STRING_AGG(t, ',' ORDER BY k)) AS c3, MAX(LENGTH(pad)) AS c4 FROM t3 GROUP BY 1 HAVING COUNT(*) > 1

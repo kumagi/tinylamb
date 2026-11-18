@@ -987,7 +987,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
   }
 
   // On multi-super-block (`large`, 9,000-row) rounds, probe the 3 selectivity
-  // patterns of `TryStreamGroupedJoin` across 4,096-row LSTable super-blocks:
+  // patterns of the streaming grouped-join paths across 4,096-row LSTable super-blocks:
   //   0: Pattern A (<5% sparse gather across block 0 & block 1 boundary)
   //   1: Pattern C (100% block 0) + Pattern B (~22% block 1) + 0% block 2
   //   2: Pattern B (>92% high-selectivity block 0) + Pattern C (100% block 1/2)
@@ -1289,7 +1289,7 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
         int64_t sum_a{0};
         bool any_a{false};
       };
-      std::map<int, BigAgg> big_groups;
+      std::map<int64_t, BigAgg> big_groups;
       for (const FactRow& f : facts) {
         if (f.k == kNullRepr) {
           continue;
@@ -1306,7 +1306,8 @@ std::string RunJoinIteration(std::mt19937& rng, bool verbose, JoinStats* stats,
       }
       std::vector<std::string> big_expected;
       for (const auto& [tag, ag] : big_groups) {
-        const int64_t big_sum = ag.cnt * 9007199254740993LL;
+        const int64_t big_sum =
+            static_cast<int64_t>(ag.cnt) * 9007199254740993LL;
         if (big_sum > 9007199254740992LL) {
           big_expected.push_back(FmtStr(tag) + "," +
                                  (ag.any_a ? Fmt(ag.sum_a) : "NULL") + "," +

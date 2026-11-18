@@ -693,7 +693,7 @@ ERROR: generic::out_of_range: Cannot INSERT a NULL value into a primary key colu
 # duplicate keys.
 #
 # The query is designed so that first insert corresponds to the middle row from
-# a table with three (determistically ordered) rows. An engine that ignores the
+# a table with three (deterministically ordered) rows. An engine that ignores the
 # ORDER BY is unlikely to accidentally insert that row first.
 [name=insert_ignore_with_query]
 [primary_key_mode=first_column_is_primary_key]
@@ -888,7 +888,7 @@ ERROR: generic::out_of_range: Cannot INSERT a NULL value into a primary key colu
 # duplicate keys.
 #
 # The query is designed so that the last insert corresponds to the middle row
-# from a table with three (determistically ordered) rows. An engine that ignores
+# from a table with three (deterministically ordered) rows. An engine that ignores
 # the ORDER BY is unlikely to accidentally insert that row last.
 [name=insert_replace_with_query]
 [primary_key_mode=first_column_is_primary_key]
@@ -1100,7 +1100,7 @@ ERROR: generic::out_of_range: Cannot INSERT a NULL value into a primary key colu
 # duplicate keys.
 #
 # The query is designed so that the last insert corresponds to the middle row
-# from a table with three (determistically ordered) rows. An engine that ignores
+# from a table with three (deterministically ordered) rows. An engine that ignores
 # the ORDER BY is unlikely to accidentally insert that row last.
 [name=insert_update_with_query]
 [primary_key_mode=first_column_is_primary_key]

@@ -24,7 +24,7 @@ class Index;
 class Table;
 class Transaction;
 
-// Morsel-driven parallel index scan (RangePartitionedScan consumer): the
+// Morsel-driven parallel index scan (ParallelIndexScan consumer): the
 // requested key range is partitioned at B+Tree leaf boundaries
 // (BPlusTree::ScanPartitionBoundaries) and workers scan one key sub-range
 // each, so the random heap I/O of a large index range scan overlaps across

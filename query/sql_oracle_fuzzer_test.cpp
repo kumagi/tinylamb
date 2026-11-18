@@ -51,22 +51,14 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
 // query and its oracle-equivalent forms: a logic bug in the optimizer or the
 // executor.  Skips (unsupported generated syntax) are allowed but counted so
 // a silently-all-skipping harness fails this test.
-TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
-  int iterations = 64;
-  if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
-    char* end = nullptr;
-    errno = 0;
-    const long parsed = std::strtol(env, &end, 10);
-    if (errno == 0 && end != env && *end == '\0' && parsed > 0 &&
-        std::in_range<int>(parsed)) {
-      iterations = static_cast<int>(parsed);
-    }
-  }
+namespace {
+
+void RunSeededOracleRange(uint32_t begin_seed, uint32_t end_seed) {
   int tlp_ran = 0;
   int tlp_agg_ran = 0;
-  [[maybe_unused]] int unionall_ran = 0;
-  [[maybe_unused]] int or_partition_ran = 0;
-  [[maybe_unused]] int subq_ran = 0;
+  int unionall_ran = 0;
+  int or_partition_ran = 0;
+  int subq_ran = 0;
   int norec_ran = 0;
   int pqs_ran = 0;
   int idx_ran = 0;
@@ -79,8 +71,8 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
   int ordinal_setop_ran = 0;
   int dqe_ran = 0;
   int troc_ran = 0;
-  const int kIterations = iterations;
-  for (uint32_t seed = 0; std::cmp_less(seed, kIterations); ++seed) {
+  const int count = static_cast<int>(end_seed - begin_seed);
+  for (uint32_t seed = begin_seed; seed < end_seed; ++seed) {
     std::mt19937 rng(seed);
     OracleIterationStats stats;
     OracleTrace trace;
@@ -116,30 +108,28 @@ TEST(SqlOracleFuzzer, SeededIterationsHoldOracles) {
     dqe_ran += stats.dqe_ran ? 1 : 0;
     troc_ran += stats.troc_ran ? 1 : 0;
   }
-  EXPECT_GT(tlp_ran, kIterations / 2);
-  EXPECT_GT(tlp_agg_ran, kIterations / 2);
-  EXPECT_GT(unionall_ran, kIterations / 2);
-  EXPECT_GT(or_partition_ran, kIterations / 2);
-  EXPECT_GE(subq_ran, kIterations / 4);
-  EXPECT_GT(norec_ran, kIterations / 2);
-  EXPECT_GT(pqs_ran, kIterations / 2);
-  EXPECT_GT(idx_ran, kIterations / 2);
-  EXPECT_GT(skip_ran, kIterations / 2);
-  EXPECT_GT(window_ran, kIterations / 2);
-  EXPECT_GT(topties_ran, kIterations / 2);
-  EXPECT_GT(ordinal_order_ran, kIterations / 2);
+  EXPECT_GT(tlp_ran, count / 2);
+  EXPECT_GT(tlp_agg_ran, count / 2);
+  EXPECT_GT(unionall_ran, count / 2);
+  EXPECT_GT(or_partition_ran, count / 2);
+  EXPECT_GE(subq_ran, count / 4);
+  EXPECT_GT(norec_ran, count / 2);
+  EXPECT_GT(pqs_ran, count / 2);
+  EXPECT_GT(idx_ran, count / 2);
+  EXPECT_GT(skip_ran, count / 2);
+  EXPECT_GT(window_ran, count / 2);
+  EXPECT_GT(topties_ran, count / 2);
+  EXPECT_GT(ordinal_order_ran, count / 2);
   EXPECT_GT(ordinal_derived_ran, 0);
   EXPECT_GT(ordinal_cte_ran, 0);
   EXPECT_GT(ordinal_setop_ran, 0);
-  EXPECT_GT(dqe_ran, kIterations / 2);
-  EXPECT_GT(troc_ran, kIterations / 2);
+  EXPECT_GT(dqe_ran, count / 2);
+  EXPECT_GT(troc_ran, count / 2);
 }
 
-// Plan feedback: across a run the bandit must observe several distinct plan
-// shapes from EXPLAIN.
-TEST(SqlOracleFuzzer, PlanFeedbackObservesPlans) {
+void RunPlanFeedbackRange(uint32_t begin_seed, uint32_t end_seed) {
   OracleSession session;
-  for (uint32_t seed = 0; seed < 48; ++seed) {
+  for (uint32_t seed = begin_seed; seed < end_seed; ++seed) {
     std::mt19937 rng(seed + 1000);
     std::string report =
         RunOracleIteration(rng, false, nullptr, nullptr, &session);
@@ -148,14 +138,90 @@ TEST(SqlOracleFuzzer, PlanFeedbackObservesPlans) {
   EXPECT_GT(session.PlansSeen(), 1U);
 }
 
+}  // namespace
+
+TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard0) {
+  uint32_t end_seed = 16;
+  if (const char* env = std::getenv("TINYLAMB_ORACLE_ITERS")) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0 &&
+        std::in_range<uint32_t>(parsed)) {
+      end_seed = static_cast<uint32_t>(parsed);
+    }
+  }
+  RunSeededOracleRange(0, end_seed);
+}
+
+TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard1) {
+  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+    return;
+  }
+  RunSeededOracleRange(16, 32);
+}
+
+TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard2) {
+  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+    return;
+  }
+  RunSeededOracleRange(32, 48);
+}
+
+TEST(SqlOracleFuzzer, SeededIterationsHoldOraclesShard3) {
+  if (std::getenv("TINYLAMB_ORACLE_ITERS") != nullptr) {
+    return;
+  }
+  RunSeededOracleRange(48, 64);
+}
+
+// Plan feedback: across a run the bandit must observe several distinct plan
+// shapes from EXPLAIN.
+TEST(SqlOracleFuzzer, PlanFeedbackObservesPlansShard0) {
+  RunPlanFeedbackRange(0, 16);
+}
+
+TEST(SqlOracleFuzzer, PlanFeedbackObservesPlansShard1) {
+  RunPlanFeedbackRange(16, 32);
+}
+
+TEST(SqlOracleFuzzer, PlanFeedbackObservesPlansShard2) {
+  RunPlanFeedbackRange(32, 48);
+}
+
 // AMOEBA: equivalent predicates over a 2000-row table must not diverge
 // beyond the conservative thresholds.
 TEST(SqlOracleFuzzer, AmoebaEquivalenceHolds) {
   for (uint32_t seed = 0; seed < 8; ++seed) {
     std::mt19937 rng(seed);
     std::string report = RunAmoebaIteration(rng, false);
-    ASSERT_EQ(report, "") << (seed != 0U) << report;
+    ASSERT_EQ(report, "") << "seed=" << seed << " " << report;
   }
+}
+
+// Resource pressure (no throwaway database) ran no query at all.  The report
+// is "" there, so the iteration must say it was skipped instead of reporting
+// every generated family as "ran" -- a run that executed nothing would
+// otherwise look like full coverage.
+TEST(SqlOracleFuzzer, ResourcePressureCountsAsSkippedNotRan) {
+  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
+  OracleIterationStats stats;
+  OracleTrace trace;
+  EXPECT_EQ(RunOracleIteration(rng, false, &stats, &trace), "") << "seed 0";
+  EXPECT_TRUE(stats.skipped);
+  for (const bool ran :
+       {stats.tlp_ran, stats.unionall_ran, stats.subq_ran, stats.norec_ran,
+        stats.pqs_ran, stats.skip_ran, stats.window_ran, stats.recursive_ran,
+        stats.cte_ran}) {
+    EXPECT_FALSE(ran) << "family reported as ran with no database";
+  }
+  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+  // The hatch is off again: the next iteration must run and count normally.
+  OracleIterationStats again;
+  EXPECT_EQ(RunOracleIteration(rng, false, &again, nullptr), "");
+  EXPECT_FALSE(again.skipped);
+  EXPECT_TRUE(again.tlp_ran || again.unionall_ran || again.subq_ran);
 }
 
 namespace {
@@ -423,10 +489,8 @@ TEST(SqlOracleFuzzer, OrPartitionPreservesDuplicateRows) {
   EXPECT_EQ(ReplayOracleTrace(trace, false), "");
 }
 
-// The window/ties oracles must catch a wrong model: a clean trace replays
-// empty, and perturbing one frame offset flips the model comparison into a
-// report (proves probes run, values are compared, and the new .test tags
-// survive serialization).
+// The window oracle must catch a wrong model: perturb the EXCLUDE CURRENT ROW
+// flag on the second window probe so the replayed model no longer matches.
 TEST(SqlOracleFuzzer, WindowOracleDetectsWrongModel) {
   OracleTrace trace;
   trace.table = "t9";
@@ -458,6 +522,26 @@ TEST(SqlOracleFuzzer, WindowOracleDetectsWrongModel) {
       "10|1|0|0|0|1|0|SELECT u, SUM(b) OVER (PARTITION BY a ORDER BY u ROWS "
       "BETWEEN 1 PRECEDING AND 0 FOLLOWING) FROM t9 ORDER BY u;";
   EXPECT_NE(ReplayOracleTrace(wrong, false), "");
+}
+
+// A committed file whose recorded arms all fail to execute must not pass
+// vacuously: the Check* "oracle skipped" bool used to be discarded, so a
+// truncated or tampered trace replayed clean with an empty report. Every
+// skip is now surfaced as a report of its own.
+TEST(SqlOracleFuzzer, ReplayReportsAllArmsSkipped) {
+  OracleTrace trace;
+  trace.setup = {"CREATE TABLE t9 (a INT64, b INT64);",
+                 "INSERT INTO t9 VALUES (1, 2), (3, 4);"};
+  trace.tlp = {"SELECT * FROM missing_table;", "SELECT * FROM missing_table;",
+               "SELECT * FROM missing_table;", "SELECT * FROM missing_table;"};
+  trace.subq = {"SELECT * FROM missing_table;", "SELECT * FROM missing_table;",
+                "SELECT * FROM missing_table;"};
+  trace.norec = {"SELECT * FROM missing_table;",
+                 "SELECT * FROM missing_table;"};
+  const std::string report = ReplayOracleTrace(trace, false);
+  EXPECT_NE(report.find("skipped recorded oracle arm"), std::string::npos)
+      << report;
+  EXPECT_NE(report.find("TLP"), std::string::npos) << report;
 }
 
 // Any committed sql_oracle_fuzz-*.test file replays as a permanent

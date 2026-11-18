@@ -400,7 +400,7 @@ ARRAY<STRUCT<double_val DOUBLE, int64_val INT64>>[unknown order:
   {-2, -2}
 ]
 ==
-# Implict coercion of int64 to double
+# Implicit coercion of int64 to double
 [name=unionall_implicit_coercion_int64]
 SELECT int64_val as double_val FROM TableDataTypes
 UNION ALL
@@ -408,7 +408,7 @@ SELECT double_val FROM Table1
 --
 ARRAY<STRUCT<double_val DOUBLE>>[unknown order:{-1}, {-2}, {0.2}, {0.1}]
 ==
-# Implict coercion of uint32; uint32 -> uint64, uint32 -> int64 and uint32 -> double
+# Implicit coercion of uint32; uint32 -> uint64, uint32 -> int64 and uint32 -> double
 [name=unionall_implicit_coercion_uint32]
 SELECT uint32_val as uint64_val,
        uint32_val as int64_val,

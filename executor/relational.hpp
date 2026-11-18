@@ -3,10 +3,13 @@
 #define TINYLAMB_RELATIONAL_EXECUTOR_HPP
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "executor/executor_base.hpp"
+#include "executor/spill_file.hpp"
 #include "type/row.hpp"
+#include "type/schema.hpp"
 
 namespace tinylamb {
 
@@ -15,6 +18,7 @@ class TransactionContext;
 class PlanBase;
 
 namespace relational_detail {
+struct ColumnarTable;
 struct ExecutionRuntime;
 }  // namespace relational_detail
 
@@ -48,7 +52,15 @@ class RelationalExecutor : public ExecutorBase {
   std::shared_ptr<const SelectStatement> statement_;
   std::unique_ptr<relational_detail::ExecutionRuntime> runtime_keep_;
   std::vector<Row> rows_;
+  std::shared_ptr<const relational_detail::ColumnarTable> columnar_;
+  std::vector<std::shared_ptr<SpillFile>> spill_files_;
+  size_t spill_file_idx_{0};
+  std::optional<SpillFile::RowReader> spill_reader_;
+  Schema output_schema_;
+  size_t columnar_chunk_idx_{0};
+  size_t columnar_row_in_chunk_{0};
   size_t offset_{0};
+  size_t total_row_count_{0};
   bool initialized_{false};
   size_t hash_joins_{0};
   size_t hybrid_hash_joins_{0};
@@ -69,6 +81,11 @@ class RelationalExecutor : public ExecutorBase {
   size_t uncorrelated_hash_builds_{0};
   size_t uncorrelated_hash_probes_{0};
   size_t grouped_join_fusions_{0};
+  size_t pushed_group_rows_{0};
+  size_t pushed_group_joins_{0};
+  size_t transfer_seed_rows_{0};
+  size_t transfer_scan_tested_{0};
+  size_t transfer_scan_rejected_{0};
   size_t streamed_grouped_joins_{0};
   size_t selective_index_scans_{0};
   size_t selective_index_rows_{0};

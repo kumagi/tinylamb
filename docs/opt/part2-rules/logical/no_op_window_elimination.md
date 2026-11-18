@@ -127,5 +127,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.NoOpWindowElimination`: 上位の射影で参照されていない `Window` ノードが正しくバイパスされ、直結した代替プランが生成されることを検証。

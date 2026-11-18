@@ -67,7 +67,7 @@ Memo 上では、`filter-before-distinct:` タグの派生グループに
   こと」だけを見る演算子で、述語 `p` も行の値だけを見ます。ある行が `p`
   を通るかは独立に決まり、「重複の代表として残るか」の判定には影響しない
   ため、先に弾いてから重複排除しても残る行集合は同じです。
-- **循環防止条件の理由**: 派生グループのタグは述語の文字列で指纹化されて
+- **循環防止条件の理由**: 派生グループのタグは述語の文字列で指紋化されて
   いるものの、`filtered == group`(自分自身を子にする)や
   `filtered == distinct.children[0]`(DISTINCT が既にその形を持つのに
   同じ子を束ね直す)は、Rule の無限再適用や自己参照式を生むため禁止です。
@@ -126,6 +126,6 @@ Memo 上では、`filter-before-distinct:` タグの派生グループに
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.FilterIsPushedBelowDistinct` —
+- `plan/cascades_test_part1.cpp` の `CascadesTest.FilterIsPushedBelowDistinct` —
   Selection が DISTINCT の下へ移動した代替がメモに追加されることを
   検証します。

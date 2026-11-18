@@ -100,5 +100,5 @@ if (reflexive) {
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.ComparisonSelfPredicatesFold`: 自己比較を持つ Selection から正規化された代替述語が生成されることの検証。
-- `plan/cascades_test.cpp` の `CascadesTest.ComparisonSelfPredicatesSkipFloats`: 浮動小数点列に対して反射律の破れを防ぐため変換が正しく抑止されることの検証。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.ComparisonSelfPredicatesFold`: 自己比較を持つ Selection から正規化された代替述語が生成されることの検証。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.ComparisonSelfPredicatesSkipFloats`: 浮動小数点列に対して反射律の破れを防ぐため変換が正しく抑止されることの検証。

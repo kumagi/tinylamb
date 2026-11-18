@@ -117,5 +117,5 @@ $$(x = k) \land (x \le b) \equiv (x = k)$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.FunctionalDependencyFilterReduction`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.FunctionalDependencyFilterReduction`
   - `age = 10 AND age <= 20` を含む Selection 式から、冗長な `<=` 比較が除去され `age = 10` のみを持つ等価式が Memo に追加されることを検証。

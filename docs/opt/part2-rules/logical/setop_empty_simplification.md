@@ -60,22 +60,29 @@ graph TD
 `plan/cascades.cpp` における変換処理は以下の通りです。
 
 ```cpp
-          const bool empty_branch =
-              std::ranges::any_of(expression.children, [&](GroupId child) {
-                return std::ranges::any_of(
-                    memo.Get(child).expressions,
-                    [](const LogicalExpression& candidate) {
-                      return candidate.operation == LogicalOperator::kEmpty;
-                    });
-              });
-          const bool empty_left =
-              except &&
-              std::ranges::any_of(
-                  memo.Get(expression.children.front()).expressions,
-                  [](const LogicalExpression& candidate) {
-                    return candidate.operation == LogicalOperator::kEmpty;
-                  });
-          if (!empty_branch && !empty_left) {
+          // INTERSECT empties when ANY branch is empty; EXCEPT only when
+          // its LEFT branch is empty (A EXCEPT empty(B) is just A -- adding
+          // an Empty alternative there would collapse a non-empty result).
+          const bool empties =
+              intersect
+                  ? std::ranges::any_of(
+                        expression.children,
+                        [&](GroupId child) {
+                          return std::ranges::any_of(
+                              memo.Get(child).expressions,
+                              [](const LogicalExpression& candidate) {
+                                return candidate.operation ==
+                                       LogicalOperator::kEmpty;
+                              });
+                        })
+                  : except &&
+                        std::ranges::any_of(
+                            memo.Get(expression.children.front()).expressions,
+                            [](const LogicalExpression& candidate) {
+                              return candidate.operation ==
+                                     LogicalOperator::kEmpty;
+                            });
+          if (!empties) {
             return;
           }
           const GroupId base = memo.EnsureGroup(memo.Get(group).relations);
@@ -103,4 +110,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `IntersectWithEmptyBranchBecomesEmpty`: 右分岐に空式を持つ INTERSECT 論理式を探索した際、ルートグループに `kEmpty` 代替式が生成されることを検証します。
+- `plan/cascades_test_part*.cpp` の `IntersectWithEmptyBranchBecomesEmpty`: 右分岐に空式を持つ INTERSECT 論理式を探索した際、ルートグループに `kEmpty` 代替式が生成されることを検証します。

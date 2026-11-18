@@ -46,4 +46,4 @@ Window が計算する行数と partition 状態を縮小できます。入力�
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` の `LimitPrefixThroughUnorderedWindowFires`、`DefaultFrameWindowKeepsLimitAbove`、`CumeDistWindowKeepsLimitAbove`、`NestedWindowLayerRefusesLimitPrefix`、`UnorderedRuleRefusesOrderedWindow` を参照します。
+`plan/cascades_test_part*.cpp` の `LimitPrefixThroughUnorderedWindowFires`、`DefaultFrameWindowKeepsLimitAbove`、`CumeDistWindowKeepsLimitAbove`、`NestedWindowLayerRefusesLimitPrefix`、`UnorderedRuleRefusesOrderedWindow` を参照します。

@@ -43,7 +43,7 @@ graph TD
 
 ## 実装の詳細
 
-`TryEvaluate` が失敗した場合は変換を返さず、元の実行時評価を保持します。各要素を一行へコピーし、必要なら要素番号を付けた `constant_rows` を `kValues` 候補へ設定します。閾値は Memo に巨大なリテラル表を抱え込ませないための上限です。
+`TryEvaluate` が失敗した場合は変換を返さず、元の実行時評価を保持します。各要素を一行へコピーし、必要なら要素番号を付けた the constant rows を `kValues` 候補へ設定します。閾値は Memo に巨大なリテラル表を抱え込ませないための上限です。
 
 ## 最適化効果
 
@@ -55,4 +55,4 @@ graph TD
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` の `ConstantUnnestArrayFoldsToValues` と `ConstantUnnestKeepsRuntimeWhenNotFoldable` が、要素配置と拒否条件を検査します。
+`plan/cascades_test_part*.cpp` の `ConstantUnnestArrayFoldsToValues` と `ConstantUnnestKeepsRuntimeWhenNotFoldable` が、要素配置と拒否条件を検査します。

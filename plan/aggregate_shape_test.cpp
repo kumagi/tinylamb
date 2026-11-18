@@ -55,6 +55,7 @@
 #include "plan/parallel_thresholds.hpp"
 #include "plan/plan.hpp"
 #include "plan/sort_plan.hpp"
+#include "plan/topn_plan.hpp"
 #include "query/sql_engine.hpp"
 #include "table/table.hpp"
 #include "table/table_statistics.hpp"
@@ -1490,6 +1491,27 @@ TEST_F(AggregateShapeTest, AKeylessShapeKeepsTheHistoricalScalarOperators) {
               nullptr)
         << plan->ToString();
   }
+}
+
+// #1014: TopNPlan::EmitRowCount must agree with TopNExecutor on an empty
+// bound. The executor returns before any tie logic for limit==0, so WITH
+// TIES cannot lift an empty bound -- the old `limit_ == 0 && !with_ties_`
+// early-return let the estimate report the full input row count.
+TEST(TopNEmitRowCountTest, ZeroLimitWithTiesEstimatesZero) {
+  const Plan input = LeafWith(std::vector<Row>(10));
+  const Expression key = ColumnValueExp(ColumnName("k"));
+  const std::vector<TopNKey> keys{{key, true, std::nullopt}};
+  EXPECT_EQ(TopNPlan(input, keys, /*limit=*/0, /*offset=*/0,
+                     /*with_ties=*/true)
+                .EmitRowCount(),
+            0U);
+  EXPECT_EQ(TopNPlan(input, keys, 0, 0, false).EmitRowCount(), 0U);
+  // Controls: a non-empty WITH TIES bound still estimates the remainder
+  // (ties can extend to every input row), and the plain bound stays
+  // min(remaining, limit).
+  EXPECT_EQ(TopNPlan(input, keys, 3, 0, true).EmitRowCount(), 10U);
+  EXPECT_EQ(TopNPlan(input, keys, 3, 0, false).EmitRowCount(), 3U);
+  EXPECT_EQ(TopNPlan(input, keys, 0, 4, true).EmitRowCount(), 0U);
 }
 
 }  // namespace tinylamb

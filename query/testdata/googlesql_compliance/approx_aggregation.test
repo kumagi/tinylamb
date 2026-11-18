@@ -73,7 +73,7 @@ FROM UNNEST([1,2,3,3,2,1]) x
 ARRAY<STRUCT<BOOL>>[{true}]
 
 ==
-[name=approx_count_distinct_is_reasonale]
+[name=approx_count_distinct_is_reasonable]
 SELECT approx_dc BETWEEN exact_dc / 2 AND exact_dc * 2 FROM (
 SELECT COUNT(DISTINCT x) exact_dc, APPROX_COUNT_DISTINCT(x) approx_dc
 FROM UNNEST([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]) x)

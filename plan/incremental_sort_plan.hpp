@@ -51,6 +51,13 @@ class IncrementalSortPlan final : public PlanBase {
     return child_->EnforcesDistinct();
   }
   [[nodiscard]] Collation OrderCollation() const override;
+  [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] const std::vector<SortKey>& PrefixKeys() const {
+    return prefix_keys_;
+  }
+  [[nodiscard]] const std::vector<SortKey>& SuffixKeys() const {
+    return suffix_keys_;
+  }
   void Dump(std::ostream& output, int indent) const override;
   [[nodiscard]] std::string ToString() const override;
 

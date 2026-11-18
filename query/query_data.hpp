@@ -174,7 +174,7 @@ struct QueryData {
   std::vector<std::optional<bool>> order_nulls_first_;
   std::unordered_map<std::string, TableSampleSpec> samples_;
   bool distinct_{false};
-  // LIMIT/OFFSET made visible to the optimizer (Phase 5 Top-K). The plan may
+  // LIMIT/OFFSET made visible to the optimizer. The plan may
   // fold them into a LimitPlan; the engine skips its own wrapper when the
   // plan reports EnforcesLimit (D6).
   size_t limit_count_{0};

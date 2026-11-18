@@ -7,12 +7,43 @@
 #include <memory>
 #include <utility>
 
+#include "common/parallel_work.hpp"
+#include "common/query_parallelism.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb::relational_detail {
+namespace {
+// Large intermediates are built by workers, but their destruction used to
+// return every row allocation from the coordinator. Reclaim disjoint ranges
+// while the query admission scope is alive. Outside a query (including static
+// teardown), and during exception unwinding, retain ordinary serial cleanup.
+void ClearRelationRows(std::vector<Row>& rows) noexcept {
+  if (rows.size() >= 16384 && query_parallelism_budget.outstanding != nullptr &&
+      query_parallelism_budget.cpu_slots > 1 &&
+      std::uncaught_exceptions() == 0) {
+    try {
+      const size_t workers = ParallelWorkerCount(rows.size() / 4096);
+      if (workers > 1) {
+        (void)RunParallelTasks(workers, [&](size_t w) {
+          const size_t begin = rows.size() * w / workers;
+          const size_t end = rows.size() * (w + 1) / workers;
+          for (size_t r = begin; r < end; ++r) {
+            // swap is noexcept and leaves an empty, valid row. The ordinary
+            // clear below also handles any work not started on a failure.
+            std::vector<Value>().swap(rows[r].values_);
+          }
+        });
+      }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+      // Destruction must remain noexcept even if scheduling cannot allocate.
+    }
+  }
+  rows.clear();
+}
+}  // namespace
 
 std::shared_ptr<QueryMemoryCharge> TryReserveQueryMemory(size_t bytes) {
   if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
@@ -24,7 +55,9 @@ std::shared_ptr<QueryMemoryCharge> TryReserveQueryMemory(size_t bytes) {
 Relation::Relation(Relation&& other) noexcept
     : schema(std::move(other.schema)),
       rows(std::move(other.rows)),
+      columnar(std::move(other.columnar)),
       spill(std::move(other.spill)),
+      extra_spills(std::move(other.extra_spills)),
       spill_tail_(std::move(other.spill_tail_)),
       using_columns(std::move(other.using_columns)),
       charged_bytes_(other.charged_bytes_),
@@ -35,6 +68,7 @@ Relation::Relation(Relation&& other) noexcept
       join_comparisons(other.join_comparisons),
       peak_intermediate_rows(other.peak_intermediate_rows),
       spilled_rows_(other.spilled_rows_),
+      uniform_cell_types(other.uniform_cell_types),
       runtime_(other.runtime_),
       spill_error_(std::move(other.spill_error_)),
       pending_charge_(other.pending_charge_) {
@@ -47,14 +81,19 @@ Relation::Relation(Relation&& other) noexcept
   other.join_comparisons = 0;
   other.peak_intermediate_rows = 0;
   other.spilled_rows_ = 0;
+  other.uniform_cell_types = false;
 }
 
 Relation& Relation::operator=(Relation&& other) noexcept {
   if (this != &other) {
+    ClearRelationRows(rows);
+    columnar.reset();
     ReleaseCharge();
     schema = std::move(other.schema);
     rows = std::move(other.rows);
+    columnar = std::move(other.columnar);
     spill = std::move(other.spill);
+    extra_spills = std::move(other.extra_spills);
     spill_tail_ = std::move(other.spill_tail_);
     using_columns = std::move(other.using_columns);
     charged_bytes_ = other.charged_bytes_;
@@ -68,6 +107,7 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     join_comparisons = other.join_comparisons;
     peak_intermediate_rows = other.peak_intermediate_rows;
     spilled_rows_ = other.spilled_rows_;
+    uniform_cell_types = other.uniform_cell_types;
     spill_error_ = std::move(other.spill_error_);
     runtime_ = other.runtime_;
     other.hash_joins = 0;
@@ -77,11 +117,62 @@ Relation& Relation::operator=(Relation&& other) noexcept {
     other.join_comparisons = 0;
     other.peak_intermediate_rows = 0;
     other.spilled_rows_ = 0;
+    other.uniform_cell_types = false;
   }
   return *this;
 }
 
-Relation::~Relation() { ReleaseCharge(); }
+Relation::~Relation() {
+  ClearRelationRows(rows);
+  columnar.reset();
+  ReleaseCharge();
+}
+
+void Relation::SetColumnarTable(std::shared_ptr<const ColumnarTable> table,
+                                bool uniform_types) {
+  ClearRelationRows(rows);
+  columnar.reset();
+  ReleaseCharge();
+  columnar = std::move(table);
+  uniform_cell_types = uniform_types;
+  if (columnar != nullptr) {
+    peak_intermediate_rows =
+        std::max(peak_intermediate_rows, columnar->total_rows);
+    if (columnar->memory_charge == nullptr) {
+      const size_t bytes = columnar->EstimatedBytes();
+      charged_bytes_ = bytes;
+      pending_charge_ = bytes;
+      if (pending_charge_ >= ChargeFlushGranularity()) {
+        FlushPendingCharge();
+      }
+    }
+  }
+}
+
+Status Relation::EnsureRowsMaterializedChecked() {
+  if (!HasColumnarOnly()) {
+    return spill_error_;
+  }
+  bool uniform_ok = false;
+  const Status st =
+      MaterializeColumnarTableToRows(*columnar, schema, &rows, &uniform_ok);
+  if (st != Status::kSuccess) {
+    if (spill_error_ == Status::kSuccess) {
+      spill_error_ = st;
+    }
+    uniform_cell_types = false;
+    ClearRelationRows(rows);
+    return st;
+  }
+  uniform_cell_types = uniform_ok;
+  peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+  columnar.reset();
+  return Status::kSuccess;
+}
+
+void Relation::EnsureRowsMaterialized() {
+  (void)EnsureRowsMaterializedChecked();
+}
 
 size_t Relation::ChargeFlushGranularity() {
   // Scale the batching window to the budget so tiny test budgets keep
@@ -118,25 +209,77 @@ void Relation::ReleaseCharge() {
 }
 
 void Relation::EnsureSpill() {
-  if (spill) {
+  if (columnar != nullptr) {
+    if (EnsureRowsMaterializedChecked() != Status::kSuccess) {
+      return;
+    }
+    columnar.reset();
+  }
+  if ((spill || !extra_spills.empty()) && !rows.empty()) {
+    NoteRelationSpill(runtime_);
+    auto front = std::make_shared<SpillFile>();
+    Status st = Status::kSuccess;
+    for (const Row& row : rows) {
+      st = front->Append(row);
+      if (st != Status::kSuccess) {
+        break;
+      }
+    }
+    if (st == Status::kSuccess) {
+      st = front->FinishWriting();
+    }
+    if (st != Status::kSuccess) {
+      if (spill_error_ == Status::kSuccess) {
+        spill_error_ = st;
+      }
+    } else {
+      // `rows` are a NEW spill generation: they were kept in memory after the
+      // earlier generations had already gone to `spill` / `extra_spills`
+      // (e.g. the in-memory fallback when a spill write failed). ForEachRow()
+      // reads `spill -> extra_spills -> spill_tail_`, oldest first, so the new
+      // generation must be appended after the existing ones. Promoting it to
+      // the head (and demoting the old head into extra_spills.begin()) reverses
+      // the order on every repeated spill.
+      spilled_rows_ += rows.size();
+      extra_spills.push_back(std::move(front));
+      ClearRelationRows(rows);
+      rows.shrink_to_fit();
+      ReleaseCharge();
+    }
+  }
+  if (spill && spill_tail_) {
+    return;
+  }
+  if (spill || !extra_spills.empty()) {
+    if (!spill_tail_) {
+      spill_tail_ = std::make_shared<SpillFile>();
+    }
     return;
   }
   NoteRelationSpill(runtime_);
   spill = std::make_shared<SpillFile>();
   for (const Row& row : rows) {
     // Spill failure (e.g. disk quota exceeded) keeps the rows in memory
-    // rather than crashing; the soft memory budget may be exceeded but the
-    // query can still produce a result.
-    if (spill->Append(row) != Status::kSuccess) {
+    // rather than crashing; record the sticky error and fall back cleanly.
+    const Status st = spill->Append(row);
+    if (st != Status::kSuccess) {
+      if (spill_error_ == Status::kSuccess) {
+        spill_error_ = st;
+      }
       spill.reset();
       return;
     }
   }
-  if (spill->FinishWriting() != Status::kSuccess) {
+  const Status finish_st = spill->FinishWriting();
+  if (finish_st != Status::kSuccess) {
+    if (spill_error_ == Status::kSuccess) {
+      spill_error_ = finish_st;
+    }
     spill.reset();
     return;
   }
-  rows.clear();
+  spilled_rows_ += rows.size();
+  ClearRelationRows(rows);
   rows.shrink_to_fit();
   ReleaseCharge();
   spill_tail_ = std::make_shared<SpillFile>();
@@ -144,9 +287,19 @@ void Relation::EnsureSpill() {
 
 void Relation::AddRow(Row row) {
   const size_t bytes = EstimateRowBytes(row);
+  AddRowWithKnownBytes(std::move(row), bytes, ChargeFlushGranularity());
+}
+
+void Relation::AddRowSlowWithBytes(Row row, size_t bytes,
+                                   size_t flush_granularity) {
+  if (columnar != nullptr) {
+    EnsureRowsMaterialized();
+    columnar.reset();
+  }
+  uniform_cell_types = false;
   // The pending (not yet applied) charge joins the soft-limit check so spill
   // decisions see the same total usage the immediate-charge version tracked.
-  if (spill_tail_ ||
+  if (spill || spill_tail_ || !extra_spills.empty() ||
       !QueryMemoryBudget::Global().CanReserve(bytes + pending_charge_)) {
     FlushPendingCharge();
     if (!spill_tail_) {
@@ -182,11 +335,266 @@ void Relation::AddRow(Row row) {
   }
   charged_bytes_ += bytes;
   pending_charge_ += bytes;
-  if (pending_charge_ >= ChargeFlushGranularity()) {
+  if (pending_charge_ >= flush_granularity) {
     FlushPendingCharge();
   }
   rows.push_back(std::move(row));
   peak_intermediate_rows = std::max(peak_intermediate_rows, rows.size());
+}
+
+Status Relation::MergeShardsInto(std::vector<Relation>& shards, Relation* out) {
+  Status first_error{Status::kSuccess};
+  size_t total_in_memory = 0;
+  size_t total_pending_charge = 0;
+  bool any_spilled = out->HasSpill();
+  for (Relation& shard : shards) {
+    const Status fs = shard.FinishSpill();
+    if (first_error.ok() && fs != Status::kSuccess) {
+      first_error = fs;
+    }
+    const Status gs = shard.GetStatus();
+    if (first_error.ok() && gs != Status::kSuccess) {
+      first_error = gs;
+    }
+    if (shard.spill_error_ != Status::kSuccess &&
+        out->spill_error_ == Status::kSuccess) {
+      out->spill_error_ = shard.spill_error_;
+    }
+    if (shard.HasSpill()) {
+      any_spilled = true;
+    } else {
+      total_in_memory += shard.rows.size();
+      total_pending_charge += shard.pending_charge_;
+    }
+  }
+  if (!any_spilled && total_in_memory == 0 && out->rows.empty()) {
+    bool any_columnar = out->HasColumnarOnly();
+    for (const Relation& shard : shards) {
+      if (shard.HasColumnarOnly()) {
+        any_columnar = true;
+      }
+    }
+    if (any_columnar) {
+      auto merged = std::make_shared<ColumnarTable>();
+      if (out->columnar != nullptr) {
+        for (const auto& owner : out->columnar->keepalives) {
+          merged->AppendKeepalive(owner);
+        }
+        for (const ColumnarChunk& chunk : out->columnar->chunks) {
+          merged->total_rows += chunk.rows;
+          merged->chunks.push_back(chunk);
+        }
+      }
+      bool keep_uniform = (out->columnar == nullptr || out->uniform_cell_types);
+      for (Relation& shard : shards) {
+        if (shard.columnar != nullptr) {
+          if (!shard.uniform_cell_types) {
+            keep_uniform = false;
+          }
+          for (const auto& owner : shard.columnar->keepalives) {
+            merged->AppendKeepalive(owner);
+          }
+          for (const ColumnarChunk& chunk : shard.columnar->chunks) {
+            merged->total_rows += chunk.rows;
+            merged->chunks.push_back(chunk);
+          }
+        }
+        shard.ResetContents();
+      }
+      out->SetColumnarTable(std::move(merged), keep_uniform);
+      return first_error;
+    }
+  }
+  if (out->HasColumnarOnly()) {
+    const Status ms = out->EnsureRowsMaterializedChecked();
+    if (first_error.ok() && ms != Status::kSuccess) {
+      first_error = ms;
+    }
+    out->columnar.reset();
+  }
+  for (Relation& shard : shards) {
+    if (shard.HasColumnarOnly()) {
+      const Status ms = shard.EnsureRowsMaterializedChecked();
+      if (first_error.ok() && ms != Status::kSuccess) {
+        first_error = ms;
+      }
+      total_in_memory += shard.rows.size();
+      shard.columnar.reset();
+    }
+  }
+  if (!any_spilled && total_in_memory > 0 &&
+      QueryMemoryBudget::Global().CanReserve(total_pending_charge +
+                                             out->pending_charge_)) {
+    const bool initial_empty = out->rows.empty();
+    bool all_shards_uniform = true;
+    for (const Relation& shard : shards) {
+      if (!shard.rows.empty() && !shard.uniform_cell_types) {
+        all_shards_uniform = false;
+        break;
+      }
+    }
+    const bool keep_uniform =
+        (initial_empty || out->uniform_cell_types) && all_shards_uniform;
+    for (Relation& shard : shards) {
+      out->charged_bytes_ += shard.charged_bytes_;
+      out->pending_charge_ += shard.pending_charge_;
+      shard.charged_bytes_ = 0;
+      shard.pending_charge_ = 0;
+    }
+    if (out->pending_charge_ >= ChargeFlushGranularity()) {
+      out->FlushPendingCharge();
+    }
+    const size_t base = out->rows.size();
+    std::vector<size_t> shard_offsets(shards.size(), base);
+    size_t cursor = base;
+    for (size_t w = 0; w < shards.size(); ++w) {
+      shard_offsets[w] = cursor;
+      cursor += shards[w].rows.size();
+    }
+    out->rows.resize(cursor);
+    const size_t merge_workers =
+        total_in_memory >= 16384
+            ? std::min(ParallelWorkerCount(total_in_memory / 8192),
+                       shards.size())
+            : 1;
+    if (merge_workers > 1) {
+      const Status merge_status =
+          RunParallelTasks(merge_workers, [&](size_t worker) {
+            for (size_t w = worker; w < shards.size(); w += merge_workers) {
+              auto& src = shards[w].rows;
+              if (!src.empty()) {
+                std::move(src.begin(), src.end(),
+                          out->rows.begin() +
+                              static_cast<std::ptrdiff_t>(shard_offsets[w]));
+                std::vector<Row>().swap(src);
+              }
+            }
+          });
+      if (first_error.ok() && merge_status != Status::kSuccess) {
+        first_error = merge_status;
+      }
+    } else {
+      for (size_t w = 0; w < shards.size(); ++w) {
+        auto& src = shards[w].rows;
+        if (!src.empty()) {
+          std::move(src.begin(), src.end(),
+                    out->rows.begin() +
+                        static_cast<std::ptrdiff_t>(shard_offsets[w]));
+          std::vector<Row>().swap(src);
+        }
+      }
+    }
+    out->uniform_cell_types = keep_uniform;
+    out->peak_intermediate_rows =
+        std::max(out->peak_intermediate_rows, out->rows.size());
+    for (Relation& shard : shards) {
+      shard.ResetContents();
+    }
+    return first_error;
+  }
+  if (!any_spilled && !out->HasSpill() && total_in_memory > 0) {
+    out->rows.reserve(out->rows.size() + total_in_memory);
+  }
+  for (Relation& shard : shards) {
+    if (shard.HasSpill()) {
+      const Status it = out->AdoptSpilledShard(std::move(shard));
+      if (first_error.ok() && it != Status::kSuccess) {
+        first_error = it;
+      }
+    } else {
+      out->MergeInMemoryShard(std::move(shard));
+      shard.ResetContents();  // NOLINT(bugprone-use-after-move)
+    }
+  }
+  return first_error;
+}
+
+Status Relation::AdoptSpilledShard(Relation&& shard) {
+  Status first{Status::kSuccess};
+  if (shard.spill_error_ != Status::kSuccess) {
+    if (spill_error_ == Status::kSuccess) {
+      spill_error_ = shard.spill_error_;
+    }
+    first = shard.spill_error_;
+  }
+  const Status fs = shard.FinishSpill();
+  if (fs != Status::kSuccess) {
+    if (spill_error_ == Status::kSuccess) {
+      spill_error_ = fs;
+    }
+    if (first == Status::kSuccess) {
+      first = fs;
+    }
+  }
+  if (HasColumnarOnly()) {
+    const Status ms = EnsureRowsMaterializedChecked();
+    if (first == Status::kSuccess && ms != Status::kSuccess) {
+      first = ms;
+    }
+    columnar.reset();
+  }
+  if (!shard.HasSpill()) {
+    MergeInMemoryShard(std::move(shard));
+    if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
+      first = spill_error_;
+    }
+    return first;
+  }
+  uniform_cell_types = false;
+  if (!HasSpill() && !rows.empty() && !HasAmpleMemoryBudget()) {
+    EnsureSpill();
+  }
+  auto flush_active_tail = [&]() {
+    if (!spill_tail_) {
+      return;
+    }
+    const Status tail_status = spill_tail_->FinishWriting();
+    if (tail_status != Status::kSuccess) {
+      if (spill_error_ == Status::kSuccess) {
+        spill_error_ = tail_status;
+      }
+      if (first == Status::kSuccess) {
+        first = tail_status;
+      }
+    }
+    if (spill_tail_->Count() > 0) {
+      if (!spill) {
+        spill = std::move(spill_tail_);
+      } else {
+        extra_spills.push_back(std::move(spill_tail_));
+      }
+    } else {
+      spill_tail_.reset();
+    }
+  };
+  flush_active_tail();
+  for (Row& row : shard.rows) {
+    AddRow(std::move(row));
+  }
+  shard.rows.clear();
+  flush_active_tail();
+  auto adopt_file = [&](std::shared_ptr<SpillFile> f) {
+    if (!f || f->Count() == 0) {
+      return;
+    }
+    spilled_rows_ += f->Count();
+    if (!spill) {
+      spill = std::move(f);
+    } else {
+      extra_spills.push_back(std::move(f));
+    }
+  };
+  adopt_file(std::move(shard.spill));
+  for (auto& extra : shard.extra_spills) {
+    adopt_file(std::move(extra));
+  }
+  adopt_file(std::move(shard.spill_tail_));
+  peak_intermediate_rows = std::max(peak_intermediate_rows, TotalRows());
+  shard.ResetContents();
+  if (first == Status::kSuccess && spill_error_ != Status::kSuccess) {
+    first = spill_error_;
+  }
+  return first;
 }
 
 void Relation::MergeInMemoryShard(Relation&& shard) {
@@ -198,9 +606,15 @@ void Relation::MergeInMemoryShard(Relation&& shard) {
     shard.ReleaseCharge();
     return;
   }
-  if (!HasSpill() && !shard.HasSpill() &&
-      QueryMemoryBudget::Global().CanReserve(shard.pending_charge_ +
-                                             pending_charge_)) {
+  if (shard.HasSpill()) {
+    (void)AdoptSpilledShard(std::move(shard));
+    return;
+  }
+  if (HasSpill() || !shard.uniform_cell_types) {
+    uniform_cell_types = false;
+  }
+  if (!HasSpill() && QueryMemoryBudget::Global().CanReserve(
+                         shard.pending_charge_ + pending_charge_)) {
     charged_bytes_ += shard.charged_bytes_;
     pending_charge_ += shard.pending_charge_;
     shard.charged_bytes_ = 0;
@@ -222,12 +636,6 @@ void Relation::MergeInMemoryShard(Relation&& shard) {
     AddRow(std::move(row));
   }
   shard.rows.clear();
-  if (shard.HasSpill()) {
-    const Status st = shard.ForEachRow([this](const Row& row) { AddRow(row); });
-    if (st != Status::kSuccess && spill_error_ == Status::kSuccess) {
-      spill_error_ = st;
-    }
-  }
   shard.ReleaseCharge();
 }
 
@@ -242,10 +650,40 @@ Status Relation::FinishSpill() {
   return spill_error_;
 }
 
-void Relation::ResetContents() {
-  rows.clear();
+Status Relation::TakeRowAndSpillBacking(
+    std::vector<Row>* out_rows,
+    std::vector<std::shared_ptr<SpillFile>>* out_spills) {
+  RETURN_IF_FAIL(FinishSpill());
+  out_rows->swap(rows);
+  ClearRelationRows(rows);
   rows.shrink_to_fit();
+  out_spills->clear();
+  auto append_spill = [&](std::shared_ptr<SpillFile>& f) {
+    if (f && f->Count() > 0) {
+      out_spills->push_back(std::move(f));
+    } else {
+      f.reset();
+    }
+  };
+  append_spill(spill);
+  for (auto& extra : extra_spills) {
+    append_spill(extra);
+  }
+  extra_spills.clear();
+  append_spill(spill_tail_);
+  spilled_rows_ = 0;
+  uniform_cell_types = false;
+  ReleaseCharge();
+  return Status::kSuccess;
+}
+
+void Relation::ResetContents() {
+  uniform_cell_types = false;
+  ClearRelationRows(rows);
+  rows.shrink_to_fit();
+  columnar.reset();
   spill.reset();
+  extra_spills.clear();
   spill_tail_.reset();
   spilled_rows_ = 0;
   ReleaseCharge();
@@ -261,7 +699,55 @@ StatusOr<Relation> MaterializeRelation(const Relation& source) {
   Relation out(source.runtime());
   out.schema = source.schema;
   out.using_columns = source.using_columns;
-  Status copied = source.ForEachRow([&](const Row& row) { out.AddRow(row); });
+  Status copied = source.GetStatus();
+  if (copied == Status::kSuccess && source.HasColumnarOnly()) {
+    out.SetColumnarTable(source.columnar, source.uniform_cell_types);
+  } else if (copied == Status::kSuccess && !source.HasSpill() &&
+             !source.rows.empty()) {
+    const size_t workers = ParallelWorkerCount(source.rows.size() / 4096);
+    if (workers > 1) {
+      std::vector<ExecutionRuntime> runtimes(workers);
+      std::vector<Relation> shards(workers);
+      for (size_t w = 0; w < workers; ++w) {
+        shards[w].set_runtime(&runtimes[w]);
+      }
+      copied = RunParallelTasks(workers, [&](size_t w) {
+        const size_t begin = source.rows.size() * w / workers;
+        const size_t end = source.rows.size() * (w + 1) / workers;
+        shards[w].rows.reserve(end - begin);
+        for (size_t r = begin; r < end; ++r) {
+          shards[w].AddRow(source.rows[r]);
+        }
+        if (source.uniform_cell_types && !shards[w].HasSpill()) {
+          shards[w].uniform_cell_types = true;
+        }
+      });
+      if (copied == Status::kSuccess) {
+        for (size_t w = 0; w < workers; ++w) {
+          if (out.runtime() != nullptr) {
+            out.runtime()->relation_spills += runtimes[w].relation_spills;
+          }
+        }
+        const Status merged = Relation::MergeShardsInto(shards, &out);
+        if (copied == Status::kSuccess) {
+          copied = merged;
+        }
+        if (source.uniform_cell_types && !out.HasSpill()) {
+          out.uniform_cell_types = true;
+        }
+      }
+    } else {
+      out.rows.reserve(source.rows.size());
+      for (const Row& row : source.rows) {
+        out.AddRow(row);
+      }
+      if (source.uniform_cell_types && !out.HasSpill()) {
+        out.uniform_cell_types = true;
+      }
+    }
+  } else if (copied == Status::kSuccess) {
+    copied = source.ForEachRow([&](const Row& row) { out.AddRow(row); });
+  }
   if (copied == Status::kSuccess) {
     copied = source.GetStatus();
   }
@@ -286,6 +772,36 @@ void CopyExecutionStats(Relation* destination, const Relation& source) {
   destination->join_comparisons = source.join_comparisons;
   destination->peak_intermediate_rows = source.peak_intermediate_rows;
   destination->using_columns = source.using_columns;
+}
+
+bool ColumnTypeTracker::FinalizeColumns(
+    std::span<const std::vector<ColumnTypeTracker>> per_worker,
+    std::vector<Column>& columns) {
+  bool all_uniform = !columns.empty();
+  for (size_t i = 0; i < columns.size(); ++i) {
+    ColumnTypeTracker merged;
+    for (const auto& worker : per_worker) {
+      if (i < worker.size()) {
+        merged.MergeFrom(worker[i]);
+      }
+    }
+    if (merged.mixed) {
+      columns[i] = Column(columns[i].Name(), ValueType::kNull);
+      all_uniform = false;
+    } else if (merged.seen_non_null) {
+      columns[i].SetType(merged.type);
+      columns[i].SetInterval(merged.is_interval);
+      columns[i].SetUnsigned(merged.is_unsigned);
+      if (merged.saw_unsafe || merged.type == ValueType::kNull ||
+          merged.type == ValueType::kArray) {
+        all_uniform = false;
+      }
+    } else if (merged.saw_unsafe || columns[i].Type() == ValueType::kNull ||
+               columns[i].Type() == ValueType::kArray) {
+      all_uniform = false;
+    }
+  }
+  return all_uniform;
 }
 
 }  // namespace tinylamb::relational_detail

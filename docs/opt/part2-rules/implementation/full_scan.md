@@ -45,7 +45,7 @@ graph TD
 
 ```cpp
   // The group filter carries the single-relation conjuncts of the WHERE
-  // clause (Phase 2 pushdown); it must be applied in full because the root
+  // clause; it must be applied in full because the root
   // SelectionPlan wrap no longer exists. Conjuncts speak relation identities
   // while scan machinery speaks physical table names, so translate down.
   Expression filter = QualifyDown(memo.Get(group).filter, relation, physical);
@@ -116,7 +116,7 @@ graph TD
 
 ## 検証テスト
 
-`plan/optimizer_test.cpp` における以下のテストケースで検証されています。
+`plan/optimizer_test_part1.cpp` における以下のテストケースで検証されています。
 
 - `OptimizerTest.UnorderedLimitPushesRowCapIntoFullScan`:
   順序なし LIMIT がスキャンの最大読み取り上限（`scan_limit`）へ正しく反映されることを確認します。

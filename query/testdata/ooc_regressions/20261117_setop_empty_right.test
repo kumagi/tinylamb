@@ -1,0 +1,9 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1040
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: crash / SIGSEGV / in relational_detail::TryColumnarSetOperation(relational_detail::Relation&, relational_detail :: faulting frame: relational_detail::TryColumnarSetOperation(relational_detail::Relation&, relational_detail | process died (SIGSEGV) while running:  | 
+create t1 2 199 868 1 2 0
+ins_bulk t1 1 417 674
+create t3 28 44 2391 1000 3 0
+sweep io 65 :: del t3 range 4 1236 1 0
+check setop t1 t3 0

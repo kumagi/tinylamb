@@ -38,6 +38,15 @@ class ColumnVector {
   // filter's output): all rows land in the int64 payload storage with an
   // empty null bitmap region, skipping one Value construction per row.
   void AppendBoolBatch(const uint8_t* bits, size_t count);
+  void AppendNullBatch(size_t count, ZoneMap* zone_map = nullptr);
+  void AppendIntBatch(ValueType type, bool is_unsigned, const int64_t* values,
+                      const uint8_t* nulls, size_t count,
+                      ZoneMap* zone_map = nullptr);
+  void AppendDoubleBatch(const double* values, const uint8_t* nulls,
+                         size_t count, ZoneMap* zone_map = nullptr);
+  void AppendStringViewBatch(const std::string_view* values,
+                             const uint8_t* nulls, size_t count,
+                             ZoneMap* zone_map = nullptr);
   void Reset();
   void Reserve(size_t capacity);
 
@@ -76,6 +85,9 @@ class ColumnVector {
   // default (binary) rather than folding some rows and not others.
   [[nodiscard]] Collation ColumnCollation() const {
     return mixed_collation_ ? Collation::kNone : collation_;
+  }
+  [[nodiscard]] bool HasMixedCollation() const noexcept {
+    return mixed_collation_;
   }
 
   [[nodiscard]] Value AggregateLogicalAnd(
@@ -149,6 +161,10 @@ class DataChunk {
     assert(row_index < size_ && "DataChunk::PositionAt out of range");
     return positions_[row_index];
   }
+  void SetPositionAt(size_t row_index, RowPosition pos) {
+    assert(row_index < size_ && "DataChunk::SetPositionAt out of range");
+    positions_[row_index] = pos;
+  }
   [[nodiscard]] size_t Size() const { return size_; }
   [[nodiscard]] bool Empty() const { return size_ == 0; }
   [[nodiscard]] size_t ColumnCount() const { return columns_.size(); }
@@ -165,6 +181,12 @@ class DataChunk {
     assert(index < zone_maps_.size() && "DataChunk::ZoneMapAt out of range");
     return zone_maps_[index];
   }
+  [[nodiscard]] ZoneMap* MutableZoneMapAt(size_t index) {
+    assert(index < zone_maps_.size() &&
+           "DataChunk::MutableZoneMapAt out of range");
+    return &zone_maps_[index];
+  }
+  void CommitBatchAppend(size_t appended_rows);
 
   [[nodiscard]] Value AggregateLogicalAnd(
       size_t col_idx, const SelectionVector* sel = nullptr) const;

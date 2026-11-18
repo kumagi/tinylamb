@@ -102,4 +102,4 @@ UNNEST は要素数に応じてタプル数を増やす演算子です。展開�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UnnestFilterPushdown`: `unnest_alias = "elem"` を持つ Unnest ノード上のフィルタ `t1.id > 10` が、Unnest の下位の Selection として正常に押し込まれることを検証します。
+- `plan/cascades_test_part2.cpp` の `CascadesTest.UnnestFilterPushdown`: `unnest_alias = "elem"` を持つ Unnest ノード上のフィルタ `t1.id > 10` が、Unnest の下位の Selection として正常に押し込まれることを検証します。

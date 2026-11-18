@@ -87,4 +87,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.ValuesFoldIntoUnionAll`: 同一スキーマの単一行 VALUES を 2 分岐に持つ `kUnionAll` を探索した際、要素数 2 のタプルリストを持つ単一の `kValues` 代替式が生成されることを検証します。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.ValuesFoldIntoUnionAll`: 同一スキーマの単一行 VALUES を 2 分岐に持つ `kUnionAll` を探索した際、要素数 2 のタプルリストを持つ単一の `kValues` 代替式が生成されることを検証します。

@@ -105,7 +105,7 @@ B+Tree 探索キーの境界決定において、等号プレフィックスを�
       EqualityPrefixRows(statistics, index, equality_prefix_values));
   ```
 - **制約なし索引フルスキャン**:
-  フィルターが存在せず、かつ出力順序要求や集約を満たすための走査です。Index-Only Scan の場合はヒープアクセスを伴わないため、テーブル行数 $\times 0.5$ の優遇コストが与えられます。
+  フィルタが存在せず、かつ出力順序要求や集約を満たすための走査です。Index-Only Scan の場合はヒープアクセスを伴わないため、テーブル行数 $\times 0.5$ の優遇コストが与えられます。
 - **ビットマップスキャン（Bitmap AND/OR）**:
   複数索引の条件に一致するタプル ID（TID）をインメモリビットマップ上で論理積・論理和合成し、単一回のヒープアクセス（`BitmapHeapScan`）を実行します。
 
@@ -124,13 +124,13 @@ B+Tree 探索キーの境界決定において、等号プレフィックスを�
 
 ## 検証テスト
 
-`plan/optimizer_test.cpp` における以下のテストケースで検証されています。
+- `plan/optimizer_test_part1.cpp` / `plan/optimizer_test_part2.cpp` における以下のテストケースで検証されています。
 
 - `OptimizerTest.IndexScan` / `OptimizerTest.IndexOnlyScan`:
   インデックススキャンおよびインデックスオンリースキャンの基本生成動作を確認します。
 - `OptimizerTest.CompositeIndexUsesEqualityPrefix`:
   複合索引における等号プレフィックスの認識と行数見積もりの正当性を検証します。
-- `OptimizerTest.ResidualPredicateWrapsIndexScanInSelection`:
+- `OptimizerTest.ResidualPredicateSurvivesIndexAccessChoice` / `OptimizerTest.LikePrefixUsesIndexRangeAndRetainsResidualPredicate`:
   範囲条件でカバーしきれない残余述語が `SelectionPlan` で保護されることを確認します。
 - `OptimizerTest.InListDrivesPointUnionIndexAccess` / `IndependentIndexPredicatesUseBitmapAnd`:
   IN リスト展開およびビットマップ結合アクセスの生成を確認します。

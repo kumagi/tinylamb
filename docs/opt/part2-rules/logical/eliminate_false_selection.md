@@ -84,8 +84,8 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `FalseSelectionAddsEmptyLogicalAlternative`: 定数偽の Selection を探索した際、Group に `kEmpty` 式が追加されることを検証。
   - `DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の Rule セットに本 Rule が登録されていることを検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `ConstantFalseSelectionBecomesEmptyPlan`: `WHERE false` を含むクエリの物理プランが `EmptyResult` となり、行スキャンが実行されないことを検証。

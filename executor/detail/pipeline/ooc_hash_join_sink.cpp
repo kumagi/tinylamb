@@ -650,7 +650,6 @@ StatusOr<std::shared_ptr<PipelineSource>> OocSemiProbeIntakeSink::Finalize(
   RETURN_IF_FAIL(join_ctx_->reduced_probe_store->Seal());
   RETURN_IF_FAIL(join_ctx_->reduced_probe_store->ResetCursor());
 
-  join_ctx_->semi_domain_capped = domain_capped_;
   if (domain_capped_) {
     join_ctx_->semi_probe_domain.reset();
     join_ctx_->semi_kept_ordinals.clear();

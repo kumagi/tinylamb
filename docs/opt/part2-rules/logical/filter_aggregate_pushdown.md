@@ -49,7 +49,7 @@ graph TD
 
 - **三値論理と例外消去**: 述語 $p$ の評価において UNKNOWN または FALSE と判定されたタプルは集約から除外されます。これは元の Selection 演算子の三値論理セマンティクスと完全に合致し、集約関数内部でのゼロ除算や型エラーを等価に防護します。
 - **GROUP BY における空グループの生成挙動**:
-  標準 SQL において、入力行全体に対してフィルタを適用した後に GROUP BY を行う場合、述語を満たす行が 1 件も存在しないグループキー値は出力されません。一方、FILTER 句付き集約を全入力に対して実行する場合、グループ化自体は全行を対象に行われ、述語に合致しないグループに対しても「空の集約値（例: `COUNT` なら 0、`SUM` なら NULL）」を持つ行が出力され得るセマンティクス差が存在します。現行の tinylamb 実装では、このグループ生存性の差分に関するガードは設けられておらず、スカラ集約または同一グループ空間を前提とした変換として動作します。
+  標準 SQL において、入力行全体に対してフィルタを適用した後に GROUP BY を行う場合、述語を満たす行が 1 件も存在しないグループキー値は出力されません。一方、FILTER 句付き集約を全入力に対して実行する場合、グループ化自体は全行を対象に行われ、述語に合致しないグループに対しても「空の集約値（例: `COUNT` なら 0、`SUM` なら NULL）」を持つ行が出力され得るセマンティクス差が存在します。現行の tinylamb 実装では、このグループ生存性の差分を防ぐため、グループ化を伴う集約（`GROUP BY` が非空）への適用を明示的に拒否するガード（`if (!expression.grouping_sets.empty()) { continue; }`）が設けられています。すなわちスカラ集約に対してのみ FILTER 句押し下げが行われます。
 
 ## 実装の詳細
 
@@ -80,5 +80,5 @@ Selection 演算子ノードの実行コスト、および Selection と Aggrega
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.FilterAggregatePushdown`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.FilterAggregatePushdown`
   - `Selection` を下位に持つ `SUM(v)` 集約に対して本 Rule が適用され、Selection をバイパスしてスキャン Group を直接参照し、集約式に `WhereFilter` が設定された `kAggregation` 等価式が生成されることを検証。

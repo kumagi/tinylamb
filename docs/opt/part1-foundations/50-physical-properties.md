@@ -67,10 +67,16 @@ struct PhysicalProperties {
     }
     if (all_columns) {
       properties.ordering = std::move(ordering);
+      properties.sort_ascending = query.order_ascending_;
+      properties.sort_nulls_first = query.order_nulls_first_;
     }
   }
   if (query.limit_count_ != 0 || query.limit_offset_ != 0) {
-    properties.limit_hint = query.limit_offset_ + query.limit_count_;
+    properties.limit_hint =
+        query.limit_offset_ >
+                std::numeric_limits<size_t>::max() - query.limit_count_
+            ? std::numeric_limits<size_t>::max()
+            : query.limit_offset_ + query.limit_count_;
   }
 ```
 

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "common/memory_budget.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
@@ -152,6 +154,39 @@ TEST_F(SqlWindowAggCoverageTest, Smoke) {
   const auto rows = RunSql(engine_.get(), context_.get(), "SELECT 1");
   ASSERT_EQ(rows.size(), 1U);
   EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+}
+
+// The OOC invertible sliding SUM must remove the leaving row before adding
+// the entering one. Add-first briefly holds both rows and raises a spurious
+// INT64 overflow even though every real frame is in range.
+TEST_F(SqlWindowAggCoverageTest, SlidingSumIgnoresTransientFrameOverflow) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE win_ov (k INT64, v INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO win_ov VALUES "
+         "(1, 9223372036854775807), (2, -1), (3, 9223372036854775807);");
+
+  auto& budget = ProcessMemoryBudget::Global();
+  struct ResetGuard {
+    ResetGuard() = default;
+    ResetGuard(const ResetGuard&) = delete;
+    ResetGuard& operator=(const ResetGuard&) = delete;
+    ~ResetGuard() {
+      ProcessMemoryBudget::Global().ResetTestKnobs();
+      ProcessMemoryBudget::Global().SetTestOpMemoryBytes(0);
+    }
+  } guard;
+  budget.SetTestOpMemoryBytes(64ULL << 10);
+  budget.SetTestAlwaysSpill(true);
+
+  const auto rows =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND "
+             "CURRENT ROW) FROM win_ov");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{9223372036854775807LL}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{9223372036854775806LL}));
+  EXPECT_EQ(rows[2][0], Value(int64_t{9223372036854775806LL}));
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +494,18 @@ TEST_F(WindowSqlCov, RangeIntervalFramesOnDateKeys) {
                 "RANGE INTERVAL offset requires a DATE order key"),
             std::string::npos)
       << int_key.GetStatus().GetMessage();
+
+  // A negative interval offset must be rejected like a negative numeric one;
+  // otherwise PRECEDING's key-minus-negative lands after the current row and
+  // the bounded scan silently returns the wrong frame.
+  const auto negative = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL -1 DAY PRECEDING "
+      "AND CURRENT ROW) FROM wx WHERE g = 1");
+  ASSERT_FALSE(negative.HasValue());
+  EXPECT_NE(negative.GetStatus().GetMessage().find("non-negative"),
+            std::string::npos)
+      << negative.GetStatus().GetMessage();
 }
 
 TEST_F(WindowSqlCov, RowsFrameCornerBounds) {
@@ -726,6 +773,200 @@ TEST_F(WindowSqlCov, ArrayAndSketchWindowAggregates) {
             std::string::npos);
 }
 
+TEST_F(WindowSqlCov, InnerLimitAppliesAfterDistinctAndNullFilter) {
+  // LIMIT counts emitted elements, not raw inputs: DISTINCT / IGNORE NULLS
+  // removal happens before the cut (GoogleSQL aggregation input pipeline).
+  const auto distinct =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT ARRAY_AGG(DISTINCT v ORDER BY v LIMIT 2) "
+                "FROM UNNEST([1, 1, 2, 3]) AS v");
+  ASSERT_TRUE(distinct.HasValue()) << distinct.GetStatus().GetMessage();
+  ASSERT_EQ(distinct.Value().size(), 1U);
+  EXPECT_EQ(distinct.Value()[0][0].ArrayElements(),
+            (std::vector<Value>({Value(1), Value(2)})));
+
+  const auto ignore_nulls =
+      TryRunSql(engine_.get(), context_.get(),
+                "SELECT ARRAY_AGG(v IGNORE NULLS ORDER BY v LIMIT 2) "
+                "FROM UNNEST([1, CAST(NULL AS INT64), 2, 3]) AS v");
+  ASSERT_TRUE(ignore_nulls.HasValue()) << ignore_nulls.GetStatus().GetMessage();
+  ASSERT_EQ(ignore_nulls.Value().size(), 1U);
+  EXPECT_EQ(ignore_nulls.Value()[0][0].ArrayElements(),
+            (std::vector<Value>({Value(1), Value(2)})));
+}
+
+TEST_F(WindowSqlCov, WindowAggregatesApplyInnerOrderByBeforeLimit) {
+  // BUG-029/P148: inner ORDER BY must sort the aggregated inputs before the
+  // LIMIT cut; ties keep frame order and NULL keys use the default placement.
+  const auto rows = TryRunSql(
+      engine_.get(), context_.get(),
+      "SELECT ARRAY_AGG(v ORDER BY v DESC LIMIT 2) OVER (PARTITION BY g), "
+      "ARRAY_AGG(v ORDER BY k) OVER (PARTITION BY g), "
+      "STRING_AGG(s ORDER BY s DESC) OVER (PARTITION BY g) "
+      "FROM wx ORDER BY g, v");
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 6U);
+  for (size_t i = 0; i < 5; ++i) {
+    const Row& row = rows.Value()[i];
+    ASSERT_TRUE(row[0].IsArray());
+    // LIMIT 2 picks the two largest v, not the first two frame rows.
+    EXPECT_EQ(row[0].ArrayElements(),
+              (std::vector<Value>({Value(50), Value(40)})));
+    ASSERT_TRUE(row[1].IsArray());
+    // NULL k sorts first (ASC default); the k=1 tie keeps frame order 10, 20.
+    EXPECT_EQ(row[1].ArrayElements(),
+              (std::vector<Value>(
+                  {Value(40), Value(10), Value(20), Value(30), Value(50)})));
+    EXPECT_EQ(row[2], Value("date,banana,Egg,Cherry,Apple"));
+  }
+  const Row& last = rows.Value()[5];
+  ASSERT_TRUE(last[0].IsArray());
+  EXPECT_EQ(last[0].ArrayElements(), (std::vector<Value>({Value(60)})));
+  ASSERT_TRUE(last[1].IsArray());
+  EXPECT_EQ(last[1].ArrayElements(), (std::vector<Value>({Value(60)})));
+  EXPECT_EQ(last[2], Value("Fig"));
+}
+
+// P669: GROUP BY + window used to run the statement's LIMIT/OFFSET twice —
+// FinishQuery applies LimitedRows at its tail and ExecuteWindowOverAggregate
+// sliced again with the same statement — so OFFSET rows silently vanished
+// (LIMIT 10 OFFSET 5 returned 5 rows).  The window must additionally see the
+// full grouped input even though ORDER BY + LIMIT lets the sort pre-truncate.
+TEST_F(WindowSqlCov, GroupByWindowLimitOffsetAppliesExactlyOnce) {
+  ASSERT_TRUE(
+      TryRunSql(engine_.get(), context_.get(), "CREATE TABLE wg (g INT64);")
+          .HasValue());
+  std::string insert = "INSERT INTO wg VALUES ";
+  for (int64_t g = 1; g <= 22; ++g) {
+    if (g > 1) {
+      insert += ", ";
+    }
+    insert += "(" + std::to_string(g) + ")";
+  }
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(), insert).HasValue());
+
+  for (const char* mode : {static_cast<const char*>("legacy"), "pipeline"}) {
+    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", mode, 1), 0);
+    const auto rows = TryRunSql(
+        engine_.get(), context_.get(),
+        "SELECT g, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY g) AS rn, "
+        "SUM(COUNT(*)) OVER () AS total "
+        "FROM wg GROUP BY g ORDER BY g LIMIT 10 OFFSET 5;");
+    unsetenv("TINYLAMB_EXEC_ENGINE");
+    ASSERT_TRUE(rows.HasValue())
+        << mode << ": " << rows.GetStatus().GetMessage();
+    ASSERT_EQ(rows.Value().size(), 10U) << "engine " << mode;
+    for (size_t i = 0; i < 10; ++i) {
+      const Row& row = rows.Value()[i];
+      const int64_t g = 6 + static_cast<int64_t>(i);
+      EXPECT_EQ(row[0], Value(g)) << "engine " << mode << " row " << i;
+      EXPECT_EQ(row[1], Value(1)) << "engine " << mode << " row " << i;
+      EXPECT_EQ(row[2], Value(g)) << "engine " << mode << " row " << i;
+      EXPECT_EQ(row[3], Value(22)) << "engine " << mode << " row " << i;
+    }
+  }
+}
+
+TEST_F(WindowSqlCov, SpilledOocRangeFramesWithNullAndNaNKeysFollowAst) {
+  // Bug 726: the OOC RangeFrameScanner resolves offset bounds with
+  // sequential readers and the deque consumer retires rows at a monotone
+  // floor.  NULL / NaN order keys collapse their offset frames to their own
+  // peer group, which sorts at the far end of the partition, so those frames
+  // restart below positions that earlier finite or empty frames had already
+  // retired -- the spill lane used to answer NULL for them.  The AST
+  // (legacy engine) is the ground truth.
+  ASSERT_TRUE(TryRunSql(engine_.get(), context_.get(),
+                        "CREATE TABLE wn (g INT64, k FLOAT64, v INT64);")
+                  .HasValue());
+  ASSERT_TRUE(
+      TryRunSql(
+          engine_.get(), context_.get(),
+          "INSERT INTO wn VALUES "
+          "(1, CAST('NaN' AS FLOAT64), 1), (1, CAST('NaN' AS FLOAT64), 2), "
+          "(1, 10.0, 10), (1, 20.0, 20), (1, 30.0, 30), "
+          "(2, NULL, 1), (2, NULL, 2), (2, 10.0, 10), (2, 20.0, 20), "
+          "(2, 30.0, 30);")
+          .HasValue());
+
+  struct {
+    const char* sql;
+    std::vector<Row> expected;
+  } cases[] = {
+      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 FOLLOWING "
+       "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k DESC;",
+       .expected={{Value(30), Value(10)},
+        {Value(20), Value()},
+        {Value(10), Value()},
+        {Value(1), Value(3)},
+        {Value(2), Value(3)}}},
+      {.sql="SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN 15 FOLLOWING "
+       "AND 25 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
+       .expected={{Value(1), Value(3)},
+        {Value(2), Value(3)},
+        {Value(10), Value(30)},
+        {Value(20), Value()},
+        {Value(30), Value()}}},
+      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
+       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected={{Value(30), Value()},
+        {Value(20), Value()},
+        {Value(10), Value()},
+        {Value(1), Value(3)},
+        {Value(2), Value(3)}}},
+      {.sql="SELECT v, MIN(v) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
+       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected={{Value(30), Value()},
+        {Value(20), Value()},
+        {Value(10), Value()},
+        {Value(1), Value(1)},
+        {Value(2), Value(1)}}},
+      {.sql="SELECT v, COUNT(*) OVER (ORDER BY k DESC RANGE BETWEEN 100 FOLLOWING "
+       "AND 200 FOLLOWING) FROM wn WHERE g = 2 ORDER BY k DESC;",
+       .expected={{Value(30), Value(0)},
+        {Value(20), Value(0)},
+        {Value(10), Value(0)},
+        {Value(1), Value(2)},
+        {Value(2), Value(2)}}},
+      {.sql="SELECT v, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 15 PRECEDING "
+       "AND 15 PRECEDING) FROM wn WHERE g = 1 ORDER BY k DESC;",
+       .expected={{Value(30), Value()},
+        {Value(20), Value()},
+        {Value(10), Value()},
+        {Value(1), Value()},
+        {Value(2), Value()}}},
+      {.sql="SELECT v, SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING "
+       "AND 15 FOLLOWING) FROM wn WHERE g = 1 ORDER BY k;",
+       .expected={{Value(1), Value(3)},
+        {Value(2), Value(3)},
+        {Value(10), Value(33)},
+        {Value(20), Value(63)},
+        {Value(30), Value(63)}}},
+  };
+
+  for (const auto& c : cases) {
+    // The AST ground truth itself.
+    ASSERT_EQ(setenv("TINYLAMB_EXEC_ENGINE", "legacy", 1), 0);
+    const auto legacy = TryRunSql(engine_.get(), context_.get(), c.sql);
+    unsetenv("TINYLAMB_EXEC_ENGINE");
+    ASSERT_TRUE(legacy.HasValue()) << legacy.GetStatus().GetMessage();
+    EXPECT_EQ(legacy.Value(), c.expected) << c.sql;
+
+    // In-memory pipeline lane.
+    const auto normal = TryRunSql(engine_.get(), context_.get(), c.sql);
+    ASSERT_TRUE(normal.HasValue()) << normal.GetStatus().GetMessage();
+    EXPECT_EQ(normal.Value(), c.expected) << c.sql;
+
+    // Forced-spill (OOC RangeFrameScanner) lane.
+    ProcessMemoryBudget::Global().SetTestAlwaysSpill(true);
+    ProcessMemoryBudget::Global().SetTestOpMemoryBytes(4096);
+    const auto spilled = TryRunSql(engine_.get(), context_.get(), c.sql);
+    ProcessMemoryBudget::Global().SetTestAlwaysSpill(false);
+    ProcessMemoryBudget::Global().SetTestOpMemoryBytes(0);
+    ASSERT_TRUE(spilled.HasValue()) << spilled.GetStatus().GetMessage();
+    EXPECT_EQ(spilled.Value(), c.expected) << "spill lane: " << c.sql;
+  }
+}
+
 TEST_F(WindowSqlCov, ElementwiseWindowAggregatesOverArrays) {
   const auto rows = TryRunSql(
       engine_.get(), context_.get(),
@@ -806,10 +1047,15 @@ TEST_F(WindowSqlCov, PercentileWindowVariants) {
   EXPECT_EQ(r[2], Value(10));
   EXPECT_TRUE(r[3].IsNull());
 
-  // Out-of-range percentile raises.
+  // Out-of-range percentile raises, including NaN (an IEEE comparison with
+  // the [0,1] bounds would let it through to an out-of-range index).
   EXPECT_FALSE(TryRunSql(engine_.get(), context_.get(),
                          "SELECT PERCENTILE_CONT(v, 1.5) OVER () "
                          "FROM UNNEST([10, 20]) AS v")
+                   .HasValue());
+  EXPECT_FALSE(TryRunSql(engine_.get(), context_.get(),
+                         "SELECT PERCENTILE_CONT(v, CAST('nan' AS FLOAT64)) "
+                         "OVER () FROM UNNEST([10, 20]) AS v")
                    .HasValue());
 }
 
@@ -1046,7 +1292,9 @@ TEST_F(DirectWinCov, GroupsFramesWithEveryBoundKind) {
       {.name = "following..unbounded",
        .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
        .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
-       .expected = {Value(50), Value(50), Value(30), Value(30)}},
+       // The last peer group's 1-FOLLOWING start is past the partition
+       // end: empty frame (NULL), not a clamp onto the last group.
+       .expected = {Value(50), Value(50), Value(30), Value()}},
       {.name = "unbounded..unbounded",
        .start = Bound(WindowFrameBoundType::kUnboundedFollowing),
        .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
@@ -1055,11 +1303,12 @@ TEST_F(DirectWinCov, GroupsFramesWithEveryBoundKind) {
        .start = Bound(WindowFrameBoundType::kUnboundedPreceding),
        .end = Bound(WindowFrameBoundType::kUnboundedPreceding),
        .expected = {Value(10), Value(10), Value(10), Value(10)}},
-      // A following-start clamped past the last group pins to it.
-      {.name = "following-clamped..unbounded",
+      // A following-start past the last group empties the frame for every
+      // row (PostgreSQL/DuckDB return NULL), matching ROWS/RANGE.
+      {.name = "following-past-end..unbounded",
        .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 5),
        .end = Bound(WindowFrameBoundType::kUnboundedFollowing),
-       .expected = {Value(30), Value(30), Value(30), Value(30)}},
+       .expected = {Value(), Value(), Value(), Value()}},
       // Preceding-end below a following-start empties the frame.
       {.name = "following..preceding",
        .start = OffsetBound(WindowFrameBoundType::kOffsetFollowing, 1),
@@ -1248,6 +1497,18 @@ TEST_F(DirectWinCov, PercentileRespectNullsAndInterpolation) {
   rows = Apply(*context_, percentile, {Value(), Value(10)});
   ASSERT_TRUE(rows.HasValue());
   EXPECT_DOUBLE_EQ(rows.Value()[0].value.double_value, 10.0);
+
+  // PERCENTILE_DISC at p=1 with RESPECT NULLS must still see the non-NULL
+  // value (the frame is {NULL, 10}); a moved-from `values` would return NULL.
+  auto disc = MakeWindow("PERCENTILE_DISC",
+                         {ColumnValueExp("v"), ConstantValueExp(Value(1.0))});
+  disc->order_by = {TermOnV(true)};
+  disc->respect_nulls = true;
+  rows = Apply(*context_, disc, {Value(), Value(10)});
+  ASSERT_TRUE(rows.HasValue()) << rows.GetStatus().GetMessage();
+  ASSERT_EQ(rows.Value().size(), 2U);
+  EXPECT_EQ(rows.Value()[0], Value(10));
+  EXPECT_EQ(rows.Value()[1], Value(10));
 }
 
 TEST_F(DirectWinCov, PercentileOverNumericStringsSortsNumerically) {

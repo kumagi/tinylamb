@@ -102,7 +102,7 @@ SQL 意味論において、外部結合の結合述語（ON 節 $p$）は NULL 
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` における以下のテストケースで検証されています。
+`plan/cascades_test_part3.cpp` における以下のテストケースで検証されています。
 
 - `CascadesTest.OuterToInnerJoinOnNullRejectingFilter`:
   `t2.val > 10` 等の不等号述語により内部結合への降格が発生することを確認します。

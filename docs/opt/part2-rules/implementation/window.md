@@ -56,7 +56,7 @@ graph TD
 
 ## 実装の詳細
 
-`plan/implementation_rules.cpp` の実装コードは以下のとおりです。
+`plan/implementation_rules.cpp` は `WindowPlan` のメモリ形状を `WindowPolicyForRows(rows)`（`plan/window_plan.hpp`）で選択します。推定行数が既定 64 MiB 予算内に収まる場合は buffered 形、超える場合（かつ全ウィンドウ呼び出しが共通の `PARTITION BY` キーを持つ場合）はパーティション分割スピル形（`WindowExecutor::Options` または既定パイプライン実行時は `OocWindowSink`）を用います。
 
 ```cpp
           Plan window = std::make_shared<WindowPlan>(children[0].plan,
@@ -72,7 +72,7 @@ graph TD
 - **推定出力行数（`estimated_rows`）**: 入力行数 `children[0].estimated_rows` をそのまま引き継ぎます。
 - **局所コスト（`local_cost`）**: パーティション内ソートを前提とし、外部ソート相当の $N \log_2 N$（`rows * std::log2(std::max(2.0, rows))`）を見積もります。`std::max(2.0, rows)` は極小行数におけるゼロ除算や負数コストを防止する下限ガードです。
 
-順序プロパティについて、`WindowPlan::IsOrderedBy` は子の判定結果をそのまま返します。ウィンドウ計算は列を追加するだけで、入力行の順序を変えないためです。
+順序プロパティについて、buffered 形の `WindowPlan::IsOrderedBy` は子の判定結果をそのまま返します。パーティション分割スピル形はパーティションごとに出力順が変わるため `IsOrderedBy` は `false` を返します。
 
 ## 最適化効果
 
@@ -88,10 +88,9 @@ graph TD
 
 ## 検証テスト
 
-- `query/query_test.cpp`:
+- `query/query_test_part2.cpp` / `query/query_test_part1.cpp`:
   - `QueryTest.SqlEngineWindowRankingPlansThroughCascades`: RANK 等の順位付けウィンドウ関数が Cascades を経由して正常に `WindowPlan` として計画されることを検証。
   - `QueryTest.SqlEngineWindowFunctionsPartitionRankAndCumulativeSum`: パーティション順位および累積和の正確な実行意味論を検証。
-- `executor/executor_test.cpp`:
+- `executor/executor_test_part3.cpp` / `executor/window_spill_test.cpp`:
   - `ExecutorTest.RelationalWindowFunctionKeepsSpilledRows`: 一時領域へのスピルが発生する大規模データセットにおけるウィンドウ実行の頑健性を検証。
-- `plan/cascades_test.cpp`:
-  - `CascadesTest.WindowAndSpoolAreUnaryLogicalOperators`: `kWindow` が単項論理演算子として Memo 内で適切に管理されることを検証。
+- `plan/window_shape_test.cpp`: `WindowPlan` の buffered / spill 形選択と順序・共有分割判定を検証。

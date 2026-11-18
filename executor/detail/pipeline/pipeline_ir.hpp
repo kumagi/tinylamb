@@ -221,7 +221,7 @@ class DeferredPipelineSource final : public PipelineSource {
   std::shared_ptr<PipelineSource> bound_;
 };
 
-// Wraps an genuinely O(1)-streaming leaf ExecutorBase (FullScan, IndexScan,
+// Wraps a genuinely O(1)-streaming leaf ExecutorBase (FullScan, IndexScan,
 // IndexOnlyScan, Values, Empty). Does not record `legacy_source_ms`.
 class StreamingExecutorSource final : public PipelineSource {
  public:

@@ -16,6 +16,7 @@
 #include "common/constants.hpp"
 #include "common/memory_budget.hpp"
 #include "common/platform/extended_float.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "common/spill/spill_store.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
@@ -121,6 +122,19 @@ double NumericValueOf(const Value& value) noexcept {
                               : static_cast<double>(value.value.int_value);
   }
   return std::numeric_limits<double>::quiet_NaN();
+}
+
+// Widen an INT64/UINT64 key without going through `double`, so 2^63-ish
+// values keep their exact magnitude and ordering. Mirrors window_eval's
+// FrameNumericOf (the canonical RANGE frame arithmetic).
+platform::ExtendedFloat FrameNumericOf(const Value& value) noexcept {
+  if (value.type == ValueType::kInt64) {
+    return value.IsUnsigned()
+               ? static_cast<platform::ExtendedFloat>(
+                     static_cast<uint64_t>(value.value.int_value))
+               : static_cast<platform::ExtendedFloat>(value.value.int_value);
+  }
+  return static_cast<platform::ExtendedFloat>(NumericValueOf(value));
 }
 
 std::string WindowOrderTermsKey(const std::vector<Expression>& partition_by,
@@ -263,20 +277,24 @@ class SegmentIndexedReader {
     cached_rows_.clear();
     cached_block_idx_ = std::numeric_limits<size_t>::max();
     uint64_t next_row = 0;
-    std::vector<Row> rows;
-    std::string scratch;
+    // Build the block directory from row-block headers only. Decoding every
+    // row here made dynamic LAG/LEAD and NTH_VALUE read and rebuild the whole
+    // spilled partition before producing the first result. The framed layout
+    // is [uint32 row_count][uint32 payload_bytes][payload...], so we can read
+    // the two header words and seek past the payload without touching a row.
+    std::array<uint32_t, 2> header{0, 0};
     while (!reader_.Eof()) {
       const uint64_t off = reader_.Offset();
-      rows.clear();
-      ASSIGN_OR_RETURN(bool, got_block,
-                       ReadRowBlock(&reader_, &rows, &scratch));
-      if (!got_block) {
-        break;
+      RETURN_IF_FAIL(reader_.ReadExact(header.data(), sizeof(header)));
+      const uint32_t row_count = header[0];
+      const uint32_t payload_bytes = header[1];
+      if (payload_bytes > reader_.Remaining()) {
+        return StatusError(StatusCode::kCorrupt, "truncated row block payload");
       }
-      const uint64_t cnt = rows.size();
-      blocks_.push_back(
-          BlockEntry{.offset = off, .first_row = next_row, .row_count = cnt});
-      next_row += cnt;
+      blocks_.push_back(BlockEntry{
+          .offset = off, .first_row = next_row, .row_count = row_count});
+      next_row += row_count;
+      RETURN_IF_FAIL(reader_.Seek(off + sizeof(header) + payload_bytes));
     }
     total_rows_ = next_row;
     return Status::kSuccess;
@@ -314,7 +332,7 @@ class SegmentIndexedReader {
                          "SegmentIndexedReader failed to read indexed block");
     }
     cached_block_idx_ = bidx;
-    const size_t local_idx = static_cast<size_t>(row_idx - it->first_row);
+    const auto local_idx = static_cast<size_t>(row_idx - it->first_row);
     if (local_idx >= cached_rows_.size()) {
       cached_block_idx_ = std::numeric_limits<size_t>::max();
       return StatusError(StatusCode::kCorrupt,
@@ -430,37 +448,48 @@ bool IsDynamicNthCall(const WindowFunctionCallExpression& call) {
 
 bool RangeDistanceWithin(const Value& key, const Value& candidate, double off,
                          bool inclusive_le) {
-  const double dk = NumericValueOf(key);
-  const double dc = NumericValueOf(candidate);
-  return inclusive_le ? dk - dc <= off + 1e-9 : dk - dc >= off - 1e-9;
+  // Mirror window_eval.cpp's DistanceWithin: keep INT64 exact (including the
+  // unsigned domain) and subtract in ExtendedFloat. Converting to double
+  // first collapses differences near 2^63 and wrongly opens RANGE bounds.
+  const auto numeric = [](const Value& v) -> platform::ExtendedFloat {
+    if (v.type == ValueType::kInt64) {
+      return v.IsUnsigned()
+                 ? static_cast<platform::ExtendedFloat>(
+                       static_cast<uint64_t>(v.value.int_value))
+                 : static_cast<platform::ExtendedFloat>(v.value.int_value);
+    }
+    return static_cast<platform::ExtendedFloat>(NumericValueOf(v));
+  };
+  const platform::ExtendedFloat diff = numeric(key) - numeric(candidate);
+  const auto bound =
+      static_cast<platform::ExtendedFloat>(off);
+  return inclusive_le ? diff <= bound : diff >= bound;
 }
 
 bool RangeCandidateAtMostKeyPlusOffset(const Value& candidate, const Value& key,
                                        double off) {
-  const bool key_int = key.type == ValueType::kInt64;
   const platform::ExtendedFloat limit =
-      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) +
-                    static_cast<platform::ExtendedFloat>(off)
-              : static_cast<platform::ExtendedFloat>(NumericValueOf(key) + off);
-  const platform::ExtendedFloat cand =
-      candidate.type == ValueType::kInt64
-          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
-          : static_cast<platform::ExtendedFloat>(NumericValueOf(candidate));
+      FrameNumericOf(key) + static_cast<platform::ExtendedFloat>(off);
+  const platform::ExtendedFloat cand = FrameNumericOf(candidate);
   return cand <= limit;
 }
 
 bool RangeCandidateAtLeastKeyMinusOffset(const Value& candidate,
                                          const Value& key, double off) {
-  const bool key_int = key.type == ValueType::kInt64;
   const platform::ExtendedFloat limit =
-      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) -
-                    static_cast<platform::ExtendedFloat>(off)
-              : static_cast<platform::ExtendedFloat>(NumericValueOf(key) - off);
-  const platform::ExtendedFloat cand =
-      candidate.type == ValueType::kInt64
-          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
-          : static_cast<platform::ExtendedFloat>(NumericValueOf(candidate));
+      FrameNumericOf(key) - static_cast<platform::ExtendedFloat>(off);
+  const platform::ExtendedFloat cand = FrameNumericOf(candidate);
   return cand >= limit;
+}
+
+// True for a DOUBLE NaN.  NaN sorts before (ASC) / after (DESC) the finite
+// run yet never satisfies a bound comparison, so it breaks the ordered
+// scan's early-stop assumption: window_eval has no early stop (it scans
+// every candidate), so a NaN candidate must be skipped, not treated as the
+// end of the matching run.
+bool IsNaNOrderKey(const Value& value) {
+  return value.type == ValueType::kDouble &&
+         std::isnan(value.value.double_value);
 }
 
 struct RangeBoundSpec {
@@ -570,22 +599,80 @@ class RangeFrameScanner {
   RangeFrameScanner(const SpillStore* store, SpillSegmentId seg_id,
                     uint64_t total_rows, size_t order_key_start,
                     size_t order_key_count, bool ascending,
-                    RangeBoundSpec start_bound, RangeBoundSpec end_bound)
+                    RangeBoundSpec start_bound, RangeBoundSpec end_bound,
+                    size_t buffer_bytes)
       : total_rows_(total_rows),
         order_key_start_(order_key_start),
         order_key_count_(order_key_count),
         ascending_(ascending),
         start_bound_(start_bound),
         end_bound_(end_bound),
-        peer_reader_(store, seg_id, SpillStore::kBlockSize),
-        lo_reader_(store, seg_id, SpillStore::kBlockSize),
-        hi_reader_(store, seg_id, SpillStore::kBlockSize) {}
+        store_(store),
+        seg_id_(seg_id),
+        buffer_bytes_(buffer_bytes),
+        peer_reader_(store, seg_id, buffer_bytes),
+        lo_reader_(store, seg_id, buffer_bytes),
+        hi_reader_(store, seg_id, buffer_bytes) {}
 
   Status Open() {
     RETURN_IF_FAIL(peer_reader_.Open());
     RETURN_IF_FAIL(lo_reader_.Open());
     RETURN_IF_FAIL(hi_reader_.Open());
+    // NULL and NaN keys collapse offset bounds to their own peer group (see
+    // ResolveForRow), and both sort runs sit at one end of the partition.
+    // That lets a frame's lower bound restart at a LOWER position after
+    // finite rows -- and empty frames -- have already pushed it past it (DESC
+    // puts NULL/NaN last, so `15 FOLLOWING` frames of the finite run end
+    // below the NULL/NaN runs while those rows' own collapsed frames sit on
+    // top of them).  Consumers retire deque rows at a monotone floor, so
+    // record where each collapse run starts; RestartFloor() tells them the
+    // lowest position a later frame can still read.  One sequential key pass
+    // over the segment, O(1) extra memory.
+    if (order_key_count_ == 1 &&
+        (start_bound_.type == WindowFrameBoundType::kOffsetPreceding ||
+         start_bound_.type == WindowFrameBoundType::kOffsetFollowing ||
+         end_bound_.type == WindowFrameBoundType::kOffsetPreceding ||
+         end_bound_.type == WindowFrameBoundType::kOffsetFollowing)) {
+      SegmentRowReader scan(store_, seg_id_, buffer_bytes_);
+      RETURN_IF_FAIL(scan.Open());
+      uint64_t idx = 0;
+      bool in_run = false;
+      uint64_t run_start = 0;
+      while (true) {
+        Row r;
+        ASSIGN_OR_RETURN(bool, got, scan.Next(&r));
+        if (!got) {
+          break;
+        }
+        const Value key = ExtractSlice(r, order_key_start_, 1)[0];
+        if (key.IsNull() || IsNaNOrderKey(key)) {
+          if (!in_run) {
+            in_run = true;
+            run_start = idx;
+          }
+        } else if (in_run) {
+          in_run = false;
+          peer_collapse_runs_.emplace_back(run_start, idx - 1);
+        }
+        ++idx;
+      }
+      if (in_run) {
+        peer_collapse_runs_.emplace_back(run_start, idx - 1);
+      }
+    }
     return Status::kSuccess;
+  }
+
+  // Lowest frame lower bound any row at index >= k can resolve to, or
+  // nullopt when no NULL/NaN peer-collapse run can restart the scan from
+  // below.
+  [[nodiscard]] std::optional<uint64_t> RestartFloor(uint64_t k) const {
+    for (const auto& g : peer_collapse_runs_) {
+      if (g.second >= k) {
+        return g.first;
+      }
+    }
+    return std::nullopt;
   }
 
   Status ResolveForRow(uint64_t k, const Row& cur_row, bool* empty_out,
@@ -653,6 +740,12 @@ class RangeFrameScanner {
                      : peer_end_);
       if (lo > hi) {
         *empty_out = true;
+        // Publish the bounds even when the frame is empty: the deque-based
+        // window modes use `lo` as the row-retirement floor, and an empty
+        // frame whose bounds are dropped silently forces the floor to k_,
+        // which retires rows a later (non-empty) frame still reads.
+        *lo_out = lo;
+        *hi_out = hi;
       } else {
         *empty_out = false;
         *lo_out = lo;
@@ -674,6 +767,14 @@ class RangeFrameScanner {
         lo_idx = peer_start_;
         break;
       case WindowFrameBoundType::kOffsetPreceding: {
+        if (IsNaNOrderKey(key)) {
+          // NaNs form one peer group and every NaN comparison is false, so
+          // no candidate can ever satisfy the bound: window_eval collapses
+          // the start bound to the peer-group head.  Without this the scan
+          // consumes rows it can never return and misplaces the frame start.
+          lo_idx = peer_start_;
+          break;
+        }
         std::optional<int64_t> boundary;
         if (start_bound_.is_interval) {
           ASSIGN_OR_RETURN(int64_t, b,
@@ -723,6 +824,15 @@ class RangeFrameScanner {
         break;
       }
       case WindowFrameBoundType::kOffsetFollowing: {
+        if (IsNaNOrderKey(key)) {
+          // Same NaN collapse as the PRECEDING arm (window_eval: the offset
+          // bound cannot distinguish NaNs, so it opens at the peer-group
+          // head).  Critically, the scan must not run: it would drain the
+          // shared sequential lo_reader_ to EOF for a bound that can never
+          // be satisfied, leaving every later row's frame empty.
+          lo_idx = peer_start_;
+          break;
+        }
         std::optional<int64_t> boundary;
         if (start_bound_.is_interval) {
           ASSIGN_OR_RETURN(int64_t, b,
@@ -783,6 +893,13 @@ class RangeFrameScanner {
                                                      end_bound_.interval));
           boundary = b;
         }
+        if (!boundary.has_value() && IsNaNOrderKey(key)) {
+          // NaN key: no candidate compares, so window_eval's end bound is
+          // `reached.value_or(peer_end)` = peer_end.  Skip the scan and any
+          // stale hi_last_reached_ carry-over.
+          hi_idx = peer_end_;
+          break;
+        }
         while (true) {
           if (!hi_ahead_valid_) {
             Row r;
@@ -815,6 +932,13 @@ class RangeFrameScanner {
             hi_ahead_valid_ = false;
             continue;
           }
+          if (IsNaNOrderKey(hi_ahead_key_)) {
+            // NaN candidate: never satisfies the comparison, but window_eval
+            // scans past it (no early stop), so do not treat it as the end
+            // of the matching run.
+            hi_ahead_valid_ = false;
+            continue;
+          }
           break;
         }
         if (hi_last_reached_.has_value()) {
@@ -839,6 +963,12 @@ class RangeFrameScanner {
                            RangeIntervalBoundaryDays(key, ascending_ ? -1 : 1,
                                                      end_bound_.interval));
           boundary = b;
+        }
+        if (!boundary.has_value() && IsNaNOrderKey(key)) {
+          // NaN key: no candidate compares, so window_eval's end bound is
+          // nullopt (empty frame).  Skip the scan and any stale
+          // hi_last_reached_ carry-over.
+          break;
         }
         while (true) {
           if (!hi_ahead_valid_) {
@@ -894,6 +1024,12 @@ class RangeFrameScanner {
             hi_ahead_valid_ = false;
             continue;
           }
+          if (IsNaNOrderKey(hi_ahead_key_)) {
+            // NaN candidate: never satisfies the comparison; window_eval
+            // keeps scanning (no early stop), so do not end the run here.
+            hi_ahead_valid_ = false;
+            continue;
+          }
           break;
         }
         if (hi_last_reached_.has_value()) {
@@ -905,6 +1041,11 @@ class RangeFrameScanner {
 
     if (!lo_idx.has_value() || !hi_idx.has_value() || *lo_idx > *hi_idx) {
       *empty_out = true;
+      // Same contract as the peer-scan branch above: publish the bound the
+      // caller may retire the deque to. A bound the scan could not find sits
+      // at (or past) the last row, so retiring everything is safe there.
+      *lo_out = lo_idx.value_or(total_rows_);
+      *hi_out = hi_idx.value_or(total_rows_ > 0 ? total_rows_ - 1 : 0);
     } else {
       *empty_out = false;
       *lo_out = *lo_idx;
@@ -920,6 +1061,14 @@ class RangeFrameScanner {
   bool ascending_{true};
   RangeBoundSpec start_bound_;
   RangeBoundSpec end_bound_;
+
+  const SpillStore* store_;
+  SpillSegmentId seg_id_;
+  size_t buffer_bytes_;
+
+  // Sorted, disjoint [first,last] index runs of NULL / NaN order keys,
+  // whose offset frames peer-collapse (see Open()).
+  std::vector<std::pair<uint64_t, uint64_t>> peer_collapse_runs_;
 
   SegmentRowReader peer_reader_;
   bool has_peer_{false};
@@ -977,16 +1126,20 @@ class StreamingWindowAggState {
       return false;
     }
     const std::string& fn = window.function;
-    // NOTE: Double SUM/AVG is not strictly bit-exact under subtraction across
-    // cancellations; we only claim O(1) invertible subtraction for COUNT,
-    // COUNTIF, integer/no-double SUM/AVG (checking double at runtime), and
-    // BIT_XOR. IGNORE NULLS is a no-op for every listed function because they
-    // all skip NULL arguments natively. BIT_AND/BIT_OR subtract through 64
-    // per-bit counters and LOGICAL_AND/OR through true/false counts, so those
-    // are O(1) removable too.
+    // NOTE: SUM/AVG are excluded entirely. DOUBLE SUM/AVG is not invertible
+    // under subtraction (cancellation loses bits later frames need), and a
+    // sticky `any_double_` would keep a double lane even for int-only frames;
+    // these functions use the generic frame-recompute path instead. IGNORE
+    // NULLS is a no-op for the listed functions (all skip NULLs natively).
+    // BIT_AND/BIT_OR subtract through 64 per-bit counters and LOGICAL_AND/OR
+    // through true/false counts, so those are O(1) removable too.
+    // SUM/AVG are excluded: DOUBLE addition is not invertible under
+    // subtraction (cancellation loses bits that later frames would need), so
+    // suffix/sliding frames with these functions must use the generic
+    // frame-recompute path instead of blind `double_sum_ -= value`.
     return fn == "COUNT" || fn == "COUNTIF" || fn == "BIT_XOR" ||
            fn == "BIT_AND" || fn == "BIT_OR" || fn == "LOGICAL_AND" ||
-           fn == "LOGICAL_OR" || fn == "SUM" || fn == "AVG";
+           fn == "LOGICAL_OR";
   }
 
   Status InitNthConstant() {
@@ -1029,6 +1182,8 @@ class StreamingWindowAggState {
     non_null_count_ = 0;
     trues_ = 0;
     int_sum_ = 0;
+    uint_sum_ = 0;
+    sum_is_uint64_ = false;
     double_sum_ = 0.0;
     bit_acc_ = 0;
     nth_seen_ = 0;
@@ -1130,9 +1285,44 @@ class StreamingWindowAggState {
       if (v.type == ValueType::kDouble) {
         if (!any_double_) {
           double_sum_ = static_cast<double>(int_sum_);
+          int_sum_ = 0;
           any_double_ = true;
         }
         double_sum_ += v.value.double_value;
+      } else if (fn_ == "AVG") {
+        // AVG sums through a double intermediate (AggregateAccumulator
+        // ground truth): per-value tag-respecting cast, never an overflow
+        // error. The exact int/uint totals stay untouched for the SUM arm.
+        if (!any_double_) {
+          double_sum_ = static_cast<double>(int_sum_);
+          int_sum_ = 0;
+          any_double_ = true;
+        }
+        double_sum_ +=
+            v.IsUnsigned()
+                ? static_cast<double>(static_cast<uint64_t>(v.value.int_value))
+                : static_cast<double>(v.value.int_value);
+      } else if (sum_is_uint64_ || v.IsUnsigned()) {
+        // Mirror AggregateAccumulator's SUM: any UINT64 input switches the
+        // total to an exact Int128 accumulation bounded to the uint64 range
+        // and the result carries the UINT64 tag; a plain signed wrap would
+        // make the streamed window disagree with the grouped SUM.
+        const platform::Int128 prior =
+            sum_is_uint64_ ? static_cast<platform::Int128>(uint_sum_)
+                           : static_cast<platform::Int128>(int_sum_);
+        const platform::Int128 input =
+            v.IsUnsigned() ? static_cast<platform::Int128>(
+                                 static_cast<uint64_t>(v.value.int_value))
+                           : static_cast<platform::Int128>(v.value.int_value);
+        const platform::Int128 next = prior + input;
+        constexpr platform::Int128 max_uint64 =
+            std::numeric_limits<uint64_t>::max();
+        if (next < 0 || next > max_uint64) {
+          return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
+        }
+        sum_is_uint64_ = true;
+        uint_sum_ = static_cast<uint64_t>(next);
+        int_sum_ = 0;
       } else if (any_double_) {
         double_sum_ += static_cast<double>(v.value.int_value);
       } else {
@@ -1173,7 +1363,7 @@ class StreamingWindowAggState {
       // Per-bit population counters make the aggregate O(1) removable: bit b
       // of BIT_AND is set iff every non-null argument has it, i.e.
       // bit_ones_[b] == non_null_count_; BIT_OR iff bit_ones_[b] > 0.
-      const uint64_t bits = static_cast<uint64_t>(v.value.int_value);
+      const auto bits = static_cast<uint64_t>(v.value.int_value);
       for (size_t b = 0; b < bit_ones_.size(); ++b) {
         bit_ones_[b] += static_cast<int32_t>((bits >> b) & 1U);
       }
@@ -1243,13 +1433,30 @@ class StreamingWindowAggState {
         return StatusError(StatusCode::kInvalidArgument,
                            fn_ + " requires an integer argument");
       }
-      const uint64_t bits = static_cast<uint64_t>(v.value.int_value);
+      const auto bits = static_cast<uint64_t>(v.value.int_value);
       for (size_t b = 0; b < bit_ones_.size(); ++b) {
         bit_ones_[b] -= static_cast<int32_t>((bits >> b) & 1U);
       }
       return Status::kSuccess;
     }
     if (fn_ == "SUM" || fn_ == "AVG") {
+      if (fn_ == "SUM" && v.type == ValueType::kInt64 &&
+          (sum_is_uint64_ || v.IsUnsigned())) {
+        // Invert the exact uint64-domain SUM accumulation.
+        const platform::Int128 input =
+            v.IsUnsigned() ? static_cast<platform::Int128>(
+                                 static_cast<uint64_t>(v.value.int_value))
+                           : static_cast<platform::Int128>(v.value.int_value);
+        const platform::Int128 next =
+            static_cast<platform::Int128>(uint_sum_) - input;
+        constexpr platform::Int128 max_uint64 =
+            std::numeric_limits<uint64_t>::max();
+        if (next < 0 || next > max_uint64) {
+          return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
+        }
+        uint_sum_ = static_cast<uint64_t>(next);
+        return Status::kSuccess;
+      }
       if (v.type == ValueType::kDouble || any_double_) {
         double_sum_ -= NumericValueOf(v);
       } else {
@@ -1290,7 +1497,16 @@ class StreamingWindowAggState {
       return Value(static_cast<int64_t>(logical_trues_ > 0 ? 1 : 0));
     }
     if (fn_ == "SUM") {
-      return any_double_ ? Value(double_sum_) : Value(int_sum_);
+      if (sum_is_uint64_ && !any_double_) {
+        return Value(static_cast<int64_t>(uint_sum_)).WithUnsigned();
+      }
+      if (any_double_) {
+        // Doubles kept their own running total; the exact integer part
+        // (signed or uint64) folds in once, as in AggregateAccumulator.
+        return Value(double_sum_ +
+                     (sum_is_uint64_ ? static_cast<double>(uint_sum_) : 0.0));
+      }
+      return Value(int_sum_);
     }
     if (fn_ == "AVG") {
       const double sum =
@@ -1341,6 +1557,8 @@ class StreamingWindowAggState {
   int64_t non_null_count_{0};
   int64_t trues_{0};
   int64_t int_sum_{0};
+  uint64_t uint_sum_{0};
+  bool sum_is_uint64_{false};
   double double_sum_{0.0};
   int64_t bit_acc_{0};
   size_t nth_target_{1};
@@ -1394,7 +1612,7 @@ class SlidingMinMax {
       return Status::kSuccess;
     }
     if (v.type == ValueType::kDouble && std::isnan(v.value.double_value)) {
-      nans_.push_back(Entry{pos, std::move(v)});
+      nans_.push_back(Entry{.pos=pos, .v=std::move(v)});
       return Status::kSuccess;
     }
     while (!q_.empty()) {
@@ -1406,7 +1624,7 @@ class SlidingMinMax {
       }
       q_.pop_back();
     }
-    q_.push_back(Entry{pos, std::move(v)});
+    q_.push_back(Entry{.pos=pos, .v=std::move(v)});
     return Status::kSuccess;
   }
 
@@ -1463,7 +1681,8 @@ class SkewCallStream {
         txn_(txn),
         budget_bytes_(std::max<size_t>(kMinWindowMemBudget, budget_bytes)),
         grant_(grant),
-        cur_reader_(store_, seg_id_, SpillStore::kBlockSize) {}
+        cur_reader_(store_, seg_id_,
+                    std::max<size_t>(4096, budget_bytes_ / 4)) {}
 
   Status Init() {
     RETURN_IF_FAIL(cur_reader_.Open());
@@ -1503,8 +1722,8 @@ class SkewCallStream {
         return Status::kSuccess;
       }
       mode_ = Mode::kCumeDist;
-      peer_reader_ = std::make_unique<SegmentRowReader>(store_, seg_id_,
-                                                        SpillStore::kBlockSize);
+      peer_reader_ = std::make_unique<SegmentRowReader>(
+          store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       return peer_reader_->Open();
     }
     if (fn == "NTILE") {
@@ -1551,7 +1770,7 @@ class SkewCallStream {
       if (call_.args.size() > 1 && !IsStaticScalarExpr(call_.args[1])) {
         lag_lead_dynamic_ = true;
         indexed_reader_ = std::make_unique<SegmentIndexedReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(indexed_reader_->Open());
         mode_ = (fn == "LAG") ? Mode::kLag : Mode::kLead;
         return Status::kSuccess;
@@ -1578,14 +1797,14 @@ class SkewCallStream {
         mode_ = Mode::kLag;
         if (lag_lead_offset_ > 0 && lag_lead_offset_ < total_rows_) {
           peer_reader_ = std::make_unique<SegmentRowReader>(
-              store_, seg_id_, SpillStore::kBlockSize);
+              store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
           RETURN_IF_FAIL(peer_reader_->Open());
         }
       } else {
         mode_ = Mode::kLead;
         if (lag_lead_offset_ < total_rows_) {
           peer_reader_ = std::make_unique<SegmentRowReader>(
-              store_, seg_id_, SpillStore::kBlockSize);
+              store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
           RETURN_IF_FAIL(peer_reader_->Open());
           Row discard;
           for (uint64_t i = 0; i < lag_lead_offset_; ++i) {
@@ -1613,7 +1832,8 @@ class SkewCallStream {
         !dynamic_nth) {
       StreamingWindowAggState agg(call_, input_schema_, txn_);
       RETURN_IF_FAIL(agg.InitNthConstant());
-      SegmentRowReader scan(store_, seg_id_, SpillStore::kBlockSize);
+      SegmentRowReader scan(store_, seg_id_,
+                            std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(scan.Open());
       Row r;
       while (true) {
@@ -1650,7 +1870,8 @@ class SkewCallStream {
            call_.frame_end.type == WindowFrameBoundType::kCurrentRow)) {
         if (order_key_count_ == 0) {
           // Every row in the partition is a peer -> same as whole partition.
-          SegmentRowReader scan(store_, seg_id_, SpillStore::kBlockSize);
+          SegmentRowReader scan(store_, seg_id_,
+                                std::max<size_t>(4096, budget_bytes_ / 4));
           RETURN_IF_FAIL(scan.Open());
           Row r;
           while (true) {
@@ -1665,7 +1886,7 @@ class SkewCallStream {
           return Status::kSuccess;
         }
         peer_reader_ = std::make_unique<SegmentRowReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(peer_reader_->Open());
         mode_ = Mode::kPrefixRangePeer;
         return Status::kSuccess;
@@ -1687,7 +1908,7 @@ class SkewCallStream {
                                      "FOLLOWING must be non-negative"));
           lag_lead_offset_ = static_cast<uint64_t>(off);
           peer_reader_ = std::make_unique<SegmentRowReader>(
-              store_, seg_id_, SpillStore::kBlockSize);
+              store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
           RETURN_IF_FAIL(peer_reader_->Open());
           mode_ = Mode::kPrefixRowsPreceding;
           return Status::kSuccess;
@@ -1703,7 +1924,7 @@ class SkewCallStream {
                                      "FOLLOWING must be non-negative"));
           lag_lead_offset_ = static_cast<uint64_t>(off);
           peer_reader_ = std::make_unique<SegmentRowReader>(
-              store_, seg_id_, SpillStore::kBlockSize);
+              store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
           RETURN_IF_FAIL(peer_reader_->Open());
           // Pre-advance `off` rows into prefix_agg_ (rows 0..min(total_rows_-1,
           // off)).
@@ -1756,7 +1977,8 @@ class SkewCallStream {
       }
       prefix_agg_ =
           std::make_unique<StreamingWindowAggState>(call_, input_schema_, txn_);
-      SegmentRowReader scan(store_, seg_id_, SpillStore::kBlockSize);
+      SegmentRowReader scan(store_, seg_id_,
+                            std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(scan.Open());
       Row r;
       while (true) {
@@ -1766,8 +1988,8 @@ class SkewCallStream {
         }
         RETURN_IF_FAIL(prefix_agg_->AddRow(r));
       }
-      peer_reader_ = std::make_unique<SegmentRowReader>(store_, seg_id_,
-                                                        SpillStore::kBlockSize);
+      peer_reader_ = std::make_unique<SegmentRowReader>(
+          store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(peer_reader_->Open());
       if (clamped_empty_on_huge && start_delta > 0) {
         // Defer first removal until k=0 -> start_delta handled cleanly in
@@ -1834,7 +2056,7 @@ class SkewCallStream {
         sliding_end_delta_ = ed;
       }
       indexed_reader_ = std::make_unique<SegmentIndexedReader>(
-          store_, seg_id_, SpillStore::kBlockSize);
+          store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(indexed_reader_->Open());
       dynamic_nth_use_range_ = false;
       mode_ = Mode::kDynamicNthRange;
@@ -1858,10 +2080,10 @@ class SkewCallStream {
         prefix_agg_ = std::make_unique<StreamingWindowAggState>(
             call_, input_schema_, txn_);
         peer_reader_ = std::make_unique<SegmentRowReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(peer_reader_->Open());
-        lo_reader_ = std::make_unique<SegmentRowReader>(store_, seg_id_,
-                                                        SpillStore::kBlockSize);
+        lo_reader_ = std::make_unique<SegmentRowReader>(
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(lo_reader_->Open());
         hi_pos_ = 0;
         lo_pos_ = 0;
@@ -1869,9 +2091,9 @@ class SkewCallStream {
         return Status::kSuccess;
       }
 
-      // Bounded deque sliding window capped strictly at `budget_bytes_ / 2`:
-      peer_reader_ = std::make_unique<SegmentRowReader>(store_, seg_id_,
-                                                        SpillStore::kBlockSize);
+      // Bounded deque sliding window capped at max(16 KiB, `budget_bytes_ / 2`):
+      peer_reader_ = std::make_unique<SegmentRowReader>(
+          store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(peer_reader_->Open());
       deque_lo_ = 0;
       deque_hi_loaded_ = 0;
@@ -1916,12 +2138,12 @@ class SkewCallStream {
           call_.order_by.empty() ? true : call_.order_by[0].ascending;
       range_scanner_ = std::make_unique<RangeFrameScanner>(
           store_, seg_id_, total_rows_, order_key_start_, order_key_count_, asc,
-          sspec, espec);
+          sspec, espec, std::max<size_t>(4096, budget_bytes_ / 4));
       RETURN_IF_FAIL(range_scanner_->Open());
 
       if (dynamic_nth) {
         indexed_reader_ = std::make_unique<SegmentIndexedReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(indexed_reader_->Open());
         dynamic_nth_use_range_ = true;
         mode_ = Mode::kDynamicNthRange;
@@ -1933,10 +2155,10 @@ class SkewCallStream {
         prefix_agg_ = std::make_unique<StreamingWindowAggState>(
             call_, input_schema_, txn_);
         peer_reader_ = std::make_unique<SegmentRowReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(peer_reader_->Open());
-        lo_reader_ = std::make_unique<SegmentRowReader>(store_, seg_id_,
-                                                        SpillStore::kBlockSize);
+        lo_reader_ = std::make_unique<SegmentRowReader>(
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(lo_reader_->Open());
         hi_pos_ = 0;
         lo_pos_ = 0;
@@ -1948,7 +2170,7 @@ class SkewCallStream {
           call_.frame_start.type != WindowFrameBoundType::kUnboundedPreceding ||
           call_.frame_end.type != WindowFrameBoundType::kUnboundedFollowing) {
         peer_reader_ = std::make_unique<SegmentRowReader>(
-            store_, seg_id_, SpillStore::kBlockSize);
+            store_, seg_id_, std::max<size_t>(4096, budget_bytes_ / 4));
         RETURN_IF_FAIL(peer_reader_->Open());
         deque_lo_ = 0;
         deque_hi_loaded_ = 0;
@@ -2422,9 +2644,18 @@ class SkewCallStream {
           minmax_.emplace(call_, input_schema_, txn_);
         }
 
+        // target_lo doubles as the deque-retirement floor, so it must never
+        // jump ahead of what a LATER frame can still ask for. raw_lo = k_ +
+        // sliding_start_delta_ is non-decreasing in k_, so max(0, raw_lo) is a
+        // monotone floor: an empty frame (ROWS BETWEEN 3 PRECEDING AND 1
+        // PRECEDING is empty for k_ = 0..2 and then reads rows 0..2) used to
+        // park the floor at k_, retiring rows the first non-empty frame still
+        // needs. Once the window runs off the end (raw_lo >= total_rows_)
+        // every later frame is empty too, and retiring everything is safe
+        // there. target_hi keeps the empty-frame clamp because raw_hi can be
+        // negative and would otherwise wrap.
         const uint64_t target_lo =
-            empty_frame ? k_
-                        : static_cast<uint64_t>(std::max<int64_t>(0, raw_lo));
+            static_cast<uint64_t>(std::max<int64_t>(0, raw_lo));
         const uint64_t target_hi =
             empty_frame ? k_
                         : std::min<uint64_t>(static_cast<uint64_t>(raw_hi),
@@ -2636,7 +2867,27 @@ class SkewCallStream {
             (call_.function == "MIN" || call_.function == "MAX")) {
           minmax_.emplace(call_, input_schema_, txn_);
         }
-        const uint64_t eff_lo = empty_frame ? k_ : target_lo;
+        // Same monotone-floor rule as the ROWS mode: an empty RANGE frame must
+        // not retire deque rows below what a later frame reads. ResolveForRow
+        // now publishes lo/hi for empty frames too, so target_lo is that
+        // frame's own lower bound (non-decreasing in k_) rather than the
+        // caller's placeholder zero -- the floor stays tight enough to keep the
+        // deque bounded. eff_hi keeps the k_ clamp so an empty frame does not
+        // try to load rows the resolver never resolved.
+        //
+        // One bound kind still breaks monotonicity: NULL and NaN order keys
+        // collapse their offset bounds to their own peer group, which sorts
+        // at the far end of the partition (last under DESC). A finite row's
+        // frame -- or its empty-frame placeholder -- can therefore sit past
+        // the NULL/NaN run that the trailing rows' frames restart at. Clamp
+        // the retirement floor to the next collapse run's start while such a
+        // run can still be read, so the deque keeps the rows those frames
+        // need.
+        uint64_t eff_lo = target_lo;
+        if (auto floor = range_scanner_->RestartFloor(k_);
+            floor.has_value() && *floor < eff_lo) {
+          eff_lo = *floor;
+        }
         const uint64_t eff_hi = empty_frame ? k_ : target_hi;
         const uint64_t keep_lo =
             direct_streaming ? eff_lo : std::min(k_, eff_lo);
@@ -3429,7 +3680,8 @@ class OocWindowStreamSource final : public PipelineSource {
            ProcessMemoryBudget::Global().AlwaysSpillEnabled() ||
            (part_grant_cache_.has_value() && !part_rows.empty() &&
             !part_grant_cache_->Reserve(rb)))) {
-        // Partition exceeds B_op / 2 -> transition this single partition to a
+        // Partition exceeds its budget (max(B_op / 2, 16 KiB)) -> transition
+        // this single partition to a
         // spill segment in exact sorted order (`ExternalSorter` output order).
         runtime_spilled_->store(true, std::memory_order_relaxed);
         skew_store_ = &ctx->spill_store;

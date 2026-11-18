@@ -90,7 +90,7 @@ OR 木の中に異なる列の参照（例: `x = 1 OR y = 2`）や、非等値�
 
 定数値の個数が数十〜数百件に及ぶクエリにおいて、タプルごとに多数の比較木をトラバースする CPU オーバーヘッドを解消します。
 
-ビルド側の `Values` はクエリ開始時に 1 回だけインメモリハッシュテーブル（`SemiJoinPlan`）に格納されるため、プローブ側の各タプルは 1 回のハッシュルックアップで高速にフィルタリングされます。
+ビルド側の `Values` はクエリ開始時に 1 回だけインメモリハッシュテーブル（ソート/ハッシュ結合のビルド側）に格納されるため、プローブ側の各タプルは 1 回のハッシュルックアップで高速にフィルタリングされます。
 
 ## 関連 Rule との相互作用
 
@@ -100,11 +100,11 @@ OR 木の中に異なる列の参照（例: `x = 1 OR y = 2`）や、非等値�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.InListToSemiJoin`
+- `plan/cascades_test_part*.cpp`: `CascadesTest.InListToSemiJoin`
   - `x = 1 OR x = 2 OR x = 3` に対し、定数テーブルとの `SemiJoin` 式が生成されることを検証。
-- `plan/cascades_test.cpp`: `CascadesTest.InListToSemiJoinRejectsMixedColumnOr`
+- `plan/cascades_test_part*.cpp`: `CascadesTest.InListToSemiJoinRejectsMixedColumnOr`
   - 列が混在する OR 述語（`x = 1 OR y = 2`）に対して本 Rule が発火を拒絶することを検証。
-- `plan/cascades_test.cpp`: `CascadesTest.InListToSemiJoinRejectsUncollectableBranch`
+- `plan/cascades_test_part*.cpp`: `CascadesTest.InListToSemiJoinRejectsUncollectableBranch`
   - 等値以外の範囲述語が混ざった OR 述語に対して発火を拒絶することを検証。
-- `plan/cascades_test.cpp`: `CascadesTest.DerivedGroupFingerprintSeparatesDifferentInLists`
+- `plan/cascades_test_part*.cpp`: `CascadesTest.DerivedGroupFingerprintSeparatesDifferentInLists`
   - 異なる定数リストが別々の派生 Group として隔離されることを検証。

@@ -129,7 +129,6 @@ inline size_t DeserializeStringView(const char* pos, std::string_view* out) {
 // untouched) when the stored length would run past `end`.
 size_t DeserializeStringView(const char* pos, const char* end,
                              std::string_view* out);
-size_t DeserializeString(std::istream& in, std::string* out);
 inline size_t DeserializeSlot(const char* pos, slot_t* out) {
   return DeserializeU16(pos, out);
 }

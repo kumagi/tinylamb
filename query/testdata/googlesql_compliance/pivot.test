@@ -24,7 +24,7 @@ CREATE CONSTANT ITEM2 = STRUCT(200 AS value, 300 AS value2);
 ==
 
 [prepare_database]
-CREATE CONSTANT C10 = cAST(10 AS INT64);
+CREATE CONSTANT C10 = CAST(10 AS INT64);
 ==
 
 [prepare_database]
@@ -394,7 +394,7 @@ NOTE: Reference implementation reports non-determinism.
 
 # Non-deterministic input columns should produce the same result in all PIVOT
 # columns, even if a pivot value is repeated.
-[name=pivot_nondeterminstic_input_column]
+[name=pivot_nondeterministic_input_column]
 SELECT
   min_x_1 = min_x_2,
   max_x_1 = max_x_2

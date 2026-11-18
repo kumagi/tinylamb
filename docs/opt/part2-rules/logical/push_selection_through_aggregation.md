@@ -130,7 +130,7 @@ HAVING(集約条件)は上に残ります。SQL フロントエンドが
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part*.cpp` の
   `CascadesTest.PushSelectionThroughAggregationFiltersGroupingKeys` —
   出力名 `k` を参照する述語が、下の列 `a.x` を参照する述語に張り替えられ、
   集約の入力側の Selection として現れることを検証します。

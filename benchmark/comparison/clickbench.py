@@ -257,6 +257,7 @@ def init_clickhouse(args):
     config = f"""<clickhouse>
 <logger><level>warning</level><log>{escape(str(root / 'server.log'))}</log>
 <errorlog>{escape(str(root / 'error.log'))}</errorlog></logger>
+<timezone>UTC</timezone>
 <listen_host>127.0.0.1</listen_host><http_port>{args.http_port}</http_port>
 <tcp_port>{args.native_port}</tcp_port><path>{escape(str(root / 'data'))}/</path>
 <tmp_path>{escape(str(root / 'tmp'))}/</tmp_path>
@@ -491,6 +492,15 @@ def check_native_utc(native, directory):
     return {'timezone': 'UTC', 'probe': probe.name, 'rows': result['rows']}
 
 
+def check_clickhouse_utc(client):
+    # Bare DateTime columns inherit the server timezone. A session setting
+    # alone does not prove that existing table values are serialized in UTC.
+    result = client.query("SELECT timezone(), toString(toDateTime(946782245))")
+    if result.get('rows') != [['UTC', '2000-01-02 03:04:05']]:
+        raise ValueError('ClickHouse server must use UTC: ' + repr(result))
+    return {'timezone': 'UTC', 'rows': result['rows']}
+
+
 def run(args):
     dataset, out = args.dataset.resolve(), args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -518,6 +528,7 @@ def run(args):
     count = client.query('SELECT count(*) FROM hits')
     if count.get('rows') != [[metadata['rows']]]:
         raise ValueError(reference + ' row count differs from manifest: ' + repr(count))
+    reference_session = check_clickhouse_utc(client) if reference == 'clickhouse' else {'timezone': 'UTC'}
     version = client.query('SELECT version()')
     binary = args.binary.resolve()
     manifest = {'dataset': metadata, 'binary_sha256': sha(binary),
@@ -526,6 +537,7 @@ def run(args):
                 reference + '_version': version.get('rows'), 'reference': reference, 'reverse': args.reverse,
                 'timer': ('native Execute+Collect; DuckDB execute+fetchall; both include planning' if reference == 'duckdb' else
                           'native Execute+Collect; ClickHouse statistics.elapsed; both include planning'),
+                'reference_session': reference_session,
                 'query_result_cache': False, 'validation': 'untimed bag/rank/membership checks',
                 'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -585,10 +597,9 @@ def run(args):
         native = Worker([str(binary), str(args.native_db.resolve()), '--serve',
                          str(dataset / 'tinylamb'), str(args.threads)], log, args.timeout)
         try:
-            if reference == 'duckdb':
-                manifest['native_session'] = check_native_utc(native, out / 'queries')
-                manifest['reference_session_timezone'] = 'UTC'
-                dump(out / 'run.json', manifest)
+            manifest['native_session'] = check_native_utc(native, out / 'queries')
+            manifest['reference_session_timezone'] = 'UTC'
+            dump(out / 'run.json', manifest)
             for q in range(1, 44):
                 sql = (dataset / 'clickhouse' / f'q{q}.sql').read_text()
                 if reference == 'duckdb':

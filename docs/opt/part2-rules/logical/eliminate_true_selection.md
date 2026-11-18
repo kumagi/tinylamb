@@ -92,6 +92,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `EliminateTrueSelectionCopiesChildScan`: 定数真の Selection を探索した際、入力 Group の `kScan` 式が親 Group へ直接複製されることを検証。
   - `DefaultRulesIncludePredicateAndProjectionTransforms`: 既定 Rule セットに本 Rule が登録されていることを検証。

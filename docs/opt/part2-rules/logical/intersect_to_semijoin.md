@@ -110,5 +110,5 @@ INTERSECT 演算は、集合論的に両入力の共通部分を抽出します�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.IntersectToSemiJoinRewrite`: `kIntersect` 式に対して探索を実行した際、同一の子グループを持つ `kSemiJoin` 代替がグループ内に追加されることを検証。

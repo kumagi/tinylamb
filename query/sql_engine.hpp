@@ -28,6 +28,19 @@ namespace tinylamb {
 class Database;
 class Statement;
 class SelectStatement;
+class CreateTableStatement;
+class DropTableStatement;
+class CreateMaterializedViewStatement;
+class DropMaterializedViewStatement;
+class CreateViewStatement;
+class DropViewStatement;
+class CreateIndexStatement;
+class AlterTableStatement;
+class InsertStatement;
+class UpdateStatement;
+class DeleteStatement;
+class MergeStatement;
+struct ExplainRequest;
 class TransactionContext;
 enum class StatementType : uint8_t;
 
@@ -85,7 +98,7 @@ class SqlEngine {
   StatusOr<QueryResult> Execute(TransactionContext& ctx, std::string_view sql);
   StatusOr<Executor> Prepare(TransactionContext& ctx, std::string_view sql);
   // Per-worker ingress count used by benchmark integrity gates.  It advances
-  // before parsing/preparing, so exceptions cannot make an SQL invocation
+  // before parsing/preparing, so exceptions cannot make a SQL invocation
   // disappear from the measurement.
   [[nodiscard]] static uint64_t ThreadExecutionCount();
   static void SetThreadRuntimeProfiling(bool enabled);
@@ -158,6 +171,45 @@ class SqlEngine {
  private:
   StatusOr<Executor> PrepareStatement(TransactionContext& ctx,
                                       std::unique_ptr<Statement> statement);
+
+  // DDL statement execution methods (implemented in
+  // query/sql_engine_statements.cpp)
+  StatusOr<Executor> ExecuteCreateTable(TransactionContext& ctx,
+                                        const CreateTableStatement& create);
+  StatusOr<Executor> ExecuteDropTable(TransactionContext& ctx,
+                                      const DropTableStatement& drop);
+  StatusOr<Executor> ExecuteCreateMaterializedView(
+      TransactionContext& ctx, const CreateMaterializedViewStatement& create);
+  StatusOr<Executor> ExecuteDropMaterializedView(
+      TransactionContext& ctx, const DropMaterializedViewStatement& drop);
+  StatusOr<Executor> ExecuteCreateView(TransactionContext& ctx,
+                                       const CreateViewStatement& create);
+  StatusOr<Executor> ExecuteDropView(TransactionContext& ctx,
+                                     const DropViewStatement& drop);
+  StatusOr<Executor> ExecuteCreateIndex(TransactionContext& ctx,
+                                        const CreateIndexStatement& create);
+  StatusOr<Executor> ExecuteAlterTable(TransactionContext& ctx,
+                                       const AlterTableStatement& alter);
+
+  // DML statement execution methods (implemented in
+  // query/sql_engine_statements.cpp)
+  StatusOr<Executor> ExecuteInsert(TransactionContext& ctx,
+                                   const InsertStatement& insert);
+  StatusOr<Executor> ExecuteUpdate(TransactionContext& ctx,
+                                   const UpdateStatement& update);
+  StatusOr<Executor> ExecuteDelete(TransactionContext& ctx,
+                                   const DeleteStatement& remove);
+
+  // Utility statement execution methods (implemented in
+  // query/sql_engine_statements.cpp)
+  StatusOr<Executor> ExecuteExplain(TransactionContext& ctx,
+                                    std::string_view sql,
+                                    const ExplainRequest& explain,
+                                    std::unique_ptr<Statement> statement);
+
+  // Query planning orchestration for SELECT queries (in query/sql_engine.cpp)
+  StatusOr<Executor> ExecuteSelect(TransactionContext& ctx,
+                                   std::unique_ptr<SelectStatement> select);
 
   // Folds non-correlated `x IN (SELECT ...)` (and its negation) inside a
   // DML WHERE into a constant IN list by running the subquery once now.
@@ -284,6 +336,48 @@ class SqlEngine {
   ForUpdateWaitMode for_update_wait_mode_{ForUpdateWaitMode::kWait};
   std::vector<SharedGroupingCore> shared_grouping_cores_;
   uint64_t views_registered_epoch_{~uint64_t{0}};
+
+  // DML subquery folding prepares the inner SELECT recursively. That nested
+  // prepare would otherwise leave `last_statement_type_` and the result
+  // column metadata describing the inner SELECT, so the server would stream
+  // an UPDATE/DELETE/INSERT as a SELECT. Restore the whole per-statement
+  // metadata bundle on scope exit.
+  struct NestedPrepareState {
+   private:
+    SqlEngine& engine_;
+    std::optional<StatementType> statement_type_;
+    bool query_is_literal_constant_;
+    std::string dml_table_;
+    std::vector<std::string> column_names_;
+    std::vector<ValueType> column_types_;
+    std::string error_;
+    std::string fingerprint_;
+    std::vector<Value> parameters_;
+
+   public:
+    explicit NestedPrepareState(SqlEngine& engine)
+        : engine_(engine),
+          statement_type_(engine.last_statement_type_),
+          query_is_literal_constant_(engine.last_query_is_literal_constant_),
+          dml_table_(engine.last_dml_table_),
+          column_names_(engine.result_column_names_),
+          column_types_(engine.result_column_types_),
+          error_(engine.last_error_),
+          fingerprint_(engine.plan_cache_fingerprint_),
+          parameters_(engine.plan_cache_parameters_) {}
+    NestedPrepareState(const NestedPrepareState&) = delete;
+    NestedPrepareState& operator=(const NestedPrepareState&) = delete;
+    ~NestedPrepareState() {
+      engine_.last_statement_type_ = std::move(statement_type_);
+      engine_.last_query_is_literal_constant_ = query_is_literal_constant_;
+      engine_.last_dml_table_ = std::move(dml_table_);
+      engine_.result_column_names_ = std::move(column_names_);
+      engine_.result_column_types_ = std::move(column_types_);
+      engine_.last_error_ = std::move(error_);
+      engine_.plan_cache_fingerprint_ = std::move(fingerprint_);
+      engine_.plan_cache_parameters_ = std::move(parameters_);
+    }
+  };
 };
 
 }  // namespace tinylamb

@@ -722,7 +722,7 @@ ARRAY<STRUCT<INT64>>[{6}]
 ==
 
 [name=string_agg_distinct_with_collation_ci]
-# It is indeterministic that which string within an equivalence group
+# It is indeterminate which string within an equivalence group
 # (e.g.'abc' and 'ABc') will be picked.
 with string_agg_res as (
   select string_agg(distinct collate(elem, 'und:ci')) output_string from
@@ -737,7 +737,7 @@ NOTE: Reference implementation reports non-determinism.
 ==
 
 [name=string_agg_distinct_with_collation_binary]
-# It is indeterministic that which string within an equivalence group
+# It is indeterminate which string within an equivalence group
 # (e.g.'abc' and 'ABc') will be picked.
 with string_agg_res as (
   select string_agg(distinct collate(elem, 'binary')) output_string from

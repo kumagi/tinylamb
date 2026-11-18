@@ -154,7 +154,7 @@ struct AdvanceByteTable {
 }
 
 [[nodiscard]] inline const AdvanceByteTable& AdvanceByteTableFor(size_t bytes) {
-  // 16 slots: an 8-lane page CRC probes 8 distinct distances per call, so a
+  // 16 slots: an 8-lane page CRC reuses one distance across 8 lanes, so a
   // 4-slot cache would thrash on every invocation.
   static thread_local std::array<AdvanceByteTable, 16> slots{};
   static thread_local size_t next = 0;
@@ -203,8 +203,7 @@ struct AdvanceByteTable {
   const uint8_t* p5 = p4 + lane;
   const uint8_t* p6 = p5 + lane;
   const uint8_t* p7 = p6 + lane;
-  const size_t last = n - (7 * lane);  // 8th slice is the longer one
-  uint32_t r0 = 0;
+  uint32_t r0 = crc;
   uint32_t r1 = 0;
   uint32_t r2 = 0;
   uint32_t r3 = 0;
@@ -212,8 +211,7 @@ struct AdvanceByteTable {
   uint32_t r5 = 0;
   uint32_t r6 = 0;
   uint32_t r7 = 0;
-  size_t i = 0;
-  for (; i + 8 <= lane; i += 8) {
+  for (size_t i = 0; i < lane; i += 8) {
     uint64_t v0 = 0;
     uint64_t v1 = 0;
     uint64_t v2 = 0;
@@ -239,28 +237,19 @@ struct AdvanceByteTable {
     r6 = static_cast<uint32_t>(_mm_crc32_u64(r6, v6));
     r7 = static_cast<uint32_t>(_mm_crc32_u64(r7, v7));
   }
-  for (; i < lane; ++i) {
-    r0 = _mm_crc32_u8(r0, p0[i]);
-    r1 = _mm_crc32_u8(r1, p1[i]);
-    r2 = _mm_crc32_u8(r2, p2[i]);
-    r3 = _mm_crc32_u8(r3, p3[i]);
-    r4 = _mm_crc32_u8(r4, p4[i]);
-    r5 = _mm_crc32_u8(r5, p5[i]);
-    r6 = _mm_crc32_u8(r6, p6[i]);
-    r7 = _mm_crc32_u8(r7, p7[i]);
-  }
-  (void)0;
-  const size_t tail = last - lane;  // bytes of slice 8 past the loop
-  uint32_t out = Crc32CRawHardwareChained(r7, p7 + lane, tail);
-  out ^= AdvanceRegisterBy(r0, n - lane);
-  out ^= AdvanceRegisterBy(r1, n - (2 * lane));
-  out ^= AdvanceRegisterBy(r2, n - (3 * lane));
-  out ^= AdvanceRegisterBy(r3, n - (4 * lane));
-  out ^= AdvanceRegisterBy(r4, n - (5 * lane));
-  out ^= AdvanceRegisterBy(r5, n - (6 * lane));
-  out ^= AdvanceRegisterBy(r6, last);
-  out ^= AdvanceRegisterBy(crc, n);
-  return out;
+  // Fold all 8 equal-length lanes sequentially using one advance table for
+  // `lane` bytes, so 64 consecutive sizes share a single cache entry instead of
+  // thrashing 8 slots per distinct buffer length.
+  const AdvanceByteTable& adv = AdvanceByteTableFor(lane);
+  uint32_t out = ApplyByteAdvance(adv, r0) ^ r1;
+  out = ApplyByteAdvance(adv, out) ^ r2;
+  out = ApplyByteAdvance(adv, out) ^ r3;
+  out = ApplyByteAdvance(adv, out) ^ r4;
+  out = ApplyByteAdvance(adv, out) ^ r5;
+  out = ApplyByteAdvance(adv, out) ^ r6;
+  out = ApplyByteAdvance(adv, out) ^ r7;
+  const size_t covered = 8 * lane;
+  return Crc32CRawHardwareChained(out, p + covered, n - covered);
 }
 
 // Castagnoli CRC-32C (reflected poly 0x82F63B78) via the SSE4.2 crc32
@@ -275,7 +264,9 @@ struct AdvanceByteTable {
   // A/B hatch: TINYLAMB_DISABLE_CRC_LANES=1 restores the plain chained loop.
   static const bool lanes_disabled =
       std::getenv("TINYLAMB_DISABLE_CRC_LANES") != nullptr;
-  if (data.size() >= 256 && !lanes_disabled) {
+  // Below 2 KiB, direct chained _mm_crc32_u64 avoids table-build thrashing on
+  // diverse row/WAL record sizes while remaining sub-microsecond.
+  if (data.size() >= 2048 && !lanes_disabled) {
     return Crc32CRawHardwareLanes(crc, data.data(), data.size());
   }
   const uint8_t* p = data.data();

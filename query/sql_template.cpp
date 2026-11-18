@@ -157,10 +157,14 @@ StatusOr<Expression> BindExpression(
       // The extractor reads `date '...'` from the SQL text as a bare string and
       // would otherwise degrade the typed DATE constant into a VARCHAR.  Keep
       // the cached tree type-correct so later binds (and the interpreter) see a
-      // DATE, not a string.
+      // DATE, not a string.  TryDate keeps the parse failure inside StatusOr:
+      // this binder sits on Prepare's Status boundary, where the EXC-SHIM
+      // Value::Date would otherwise leak a std::runtime_error.
       if (current.type == ValueType::kDate &&
           parameter.type == ValueType::kVarChar) {
-        parameter = Value::Date(parameter.value.varchar_value);
+        ASSIGN_OR_RETURN(Value, parsed_date,
+                         (Value::TryDate(parameter.value.varchar_value)));
+        parameter = std::move(parsed_date);
       }
       // The fingerprint collapses date literals and plain strings into the
       // same '?' slot. The forward direction is repaired above; the reverse
@@ -352,7 +356,11 @@ StatusOr<Expression> BindExpression(
     }
     case TypeTag::kIntervalExp: {
       const auto& interval = expression->AsIntervalExpression();
-      return IntervalExpressionExp(interval.Amount(), interval.Unit());
+      // Keep the quoted amount text: Amount() is the folded integer and a
+      // quoted fractional value (INTERVAL '1.5' HOUR) would otherwise be
+      // reinterpreted as 1 on a template replay.
+      return IntervalExpressionExp(interval.Amount(), interval.Unit(),
+                                   interval.RawAmount());
     }
     case TypeTag::kCastExp: {
       const auto& cast = expression->AsCastExpression();
@@ -375,7 +383,7 @@ StatusOr<Expression> BindExpression(
 // FROM/JOIN conditions -> WHERE -> GROUP BY -> HAVING -> QUALIFY -> ORDER BY
 // -> UNION ALL branches.  Binding clauses in any other order silently swaps
 // parameters between clauses of same-fingerprint statements
-// (improvements2.md §7.1).
+//.
 bool ContainsBindableConstant(const Expression& expression);
 
 bool SelectHasBindableConstant(
@@ -892,8 +900,8 @@ void AppendQuotedIdentifier(std::string_view sql, size_t& i,
 // The scanner is a quote/comment aware state machine mirroring
 // SplitSqlStatements: string literals, quoted identifiers, dollar-quoted
 // strings and comments are consumed atomically so that quote characters
-// inside them are never mistaken for literal delimiters (improvements2.md
-// §7.5).
+// inside them are never mistaken for literal delimiters (
+// the original design).
 SqlTemplate ExtractSqlTemplate(std::string_view sql) {
   SqlTemplate result;
   result.fingerprint.reserve(sql.size());

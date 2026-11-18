@@ -1,6 +1,6 @@
 # 単項変換と実行制御
 
-単項演算子は、一つの子から行を受け取る。`Selection` は条件に合う行だけを残し、`Projection` は列を組み替え、`Limit` は返す行数を制限し、`Materialize` は入力を保存する。いずれも入力は一つだが、ストリーミングの可否やメモリ使用量が異なる。
+単項演算子は、一つの子から行を受け取る。`Selection` は条件に合う行だけを残し、`Projection` は列を組み替え、`Limit` は返す行数を制限する。いずれも入力は一つだが、ストリーミングの可否やメモリ使用量が異なる（かつて存在した `MaterializeExecutor` と `Max1RowExecutor` は撤去済み）。
 
 ## 1. `Selection`
 
@@ -99,9 +99,9 @@ JIT を使えるのは、符号付き `INT64` で `NULL` がなく、列の配�
 
 この種のラッパーによる処理時間の増加は小さい。ただし、子の状態を転送しなければ、子の失敗と正常な末尾を区別できない。`GetStatus` を子へ転送するか、停止時に子の状態を明示的にコピーする必要がある。
 
-## 7. `CardinalityProbe`
+## 7. Cardinality probing
 
-`CardinalityProbe` は現行コードに存在しない。実行計測は `executor/executor_base.hpp` の計測境界を参照する。
+行数プローブは `executor/detail/` の実行時状態に記録され、`executor/executor_base.hpp` には計測 API は無い。
 
 ## 8. `ScheduledExecutor`
 

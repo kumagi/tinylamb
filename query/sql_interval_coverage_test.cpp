@@ -2,8 +2,9 @@
 
 // Coverage tests for the INTERVAL literal grammar in type/interval.cpp:
 // single-unit forms, YEAR TO MONTH / DAY TO SECOND / HOUR TO MINUTE compound
-// forms, fractional seconds, multi-component strings, arithmetic, overflow
-// clamping, and the lenient fallback for malformed components.
+// forms, fractional seconds, multi-component strings, arithmetic,
+// preservation of very large values without clamping, and the lenient
+// fallback for malformed components.
 
 #include <gtest/gtest.h>
 
@@ -111,8 +112,8 @@ TEST_F(SqlIntervalCoverageTest, IntervalArithmetic) {
                Value("1-5 0 0:0:0").WithInterval());
   ExpectScalar("SELECT INTERVAL '1' SECOND + INTERVAL '0.5' SECOND",
                Value("0-0 0 0:0:1.5").WithInterval());
-  // Extra arguments stay lenient, but the unit attribute must be a real one.
-  ExpectScalar("SELECT make_interval(1, 'DAY', 3, 4)",
+  // make_interval is exactly (value, unit); extra arguments are rejected.
+  ExpectScalar("SELECT make_interval(1, 'DAY')",
                Value("0-0 1 0:0:0").WithInterval());
 }
 

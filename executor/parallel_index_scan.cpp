@@ -45,7 +45,7 @@ ParallelIndexScan::ParallelIndexScan(
   }
   table_lease_ = lease.MoveValue();
   key_slots_.assign(index.sc_.key_.begin(), index.sc_.key_.end());
-  // RangePartitionedScan: leaf-aligned boundaries turn the key range into
+  // ParallelIndexScan: key-range boundaries turn the key range into
   // half-open morsels [b_i, b_{i+1}); the first morsel starts at the scan's
   // own begin and the last ends at its own end.  A navigation failure falls
   // back to a single morsel (the serial shape); the worker's own scan

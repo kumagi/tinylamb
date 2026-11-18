@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "executor/data_chunk.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/flat_int_key_map.hpp"
@@ -49,6 +50,7 @@
 #include "expression/named_expression.hpp"
 #include "page/row_position.hpp"
 #include "table/lstable_bridge.hpp"
+#include "transaction/transaction.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
@@ -159,6 +161,10 @@ bool AggregationExecutor::Execute(Row* dst) {
     int64_t total = 0;
     bool any = false;
     while (child_->NextBatch(&input_batch_) != 0) {
+      if (const Status ts = Transaction::CheckThreadStatementTimeout();
+          ts != Status::kSuccess) {
+        return FailWith(ts);
+      }
       rows_seen_ += input_batch_.Size();
       if (!jit_attempted_ && rows_seen_ >= jit_threshold_rows_) {
         jit_attempted_ = true;
@@ -166,22 +172,60 @@ bool AggregationExecutor::Execute(Row* dst) {
         // exactly like the serial path; never fall back to the wrapping
         // kernel for correctness.
         jit_sum_ = JitInt64Kernels::CompileSumChecked();
+        // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
+        //   (zonemap_prefix_sum_masked_sound)
+        // When ZoneMap bounds prove that NO intermediate prefix sum from the
+        // current `total` can overflow INT64, the unchecked / null-masked SIMD
+        // kernels are 100% exact across ALL batches (not just batch 0!).
+        jit_unchecked_sum_ = JitInt64Kernels::CompileSum();
+        jit_masked_sum_ = JitInt64Kernels::CompileMaskedSum();
       }
       const ColumnVector& column = input_batch_.ColumnAt(jit_sum_column_);
+      const ZoneMap& sum_zone = input_batch_.ZoneMapAt(jit_sum_column_);
+      const bool valid_int_layout =
+          input_batch_.HasLayout(input_schema_) &&
+          column.Type() == ValueType::kInt64 && !column.IsUnsigned() &&
+          !column.IsHeterogeneous() && sum_zone.Initialized();
+      if (valid_int_layout && sum_zone.ValueCount() == 0) {
+        continue;
+      }
+      const bool envelope_safe =
+          valid_int_layout && sum_zone.ValueCount() > 0 &&
+          sum_zone.Minimum().has_value() && sum_zone.Maximum().has_value() &&
+          sum_zone.Minimum()->type == ValueType::kInt64 &&
+          sum_zone.Maximum()->type == ValueType::kInt64 &&
+          !sum_zone.Minimum()->IsUnsigned() &&
+          !sum_zone.Maximum()->IsUnsigned() &&
+          JitInt64Kernels::CanUseUncheckedSum(
+              total, sum_zone.Minimum()->value.int_value,
+              sum_zone.Maximum()->value.int_value, column.Size());
+      if (envelope_safe && sum_zone.NullCount() == 0 && jit_unchecked_sum_) {
+        total +=
+            jit_unchecked_sum_->Sum(column.IntegerData().data(), column.Size());
+        any = any || column.Size() != 0;
+        ++jit_batches_;
+        continue;
+      }
+      if (envelope_safe && sum_zone.NullCount() > 0 && jit_masked_sum_) {
+        jit_null_bytes_.resize(column.Size());
+        UnpackNullBitmapToBytes(column.NullBitmap(), column.Size(),
+                                jit_null_bytes_.data());
+        total += jit_masked_sum_->MaskedSum(
+            column.IntegerData().data(), jit_null_bytes_.data(), column.Size());
+        any = true;
+        ++jit_batches_;
+        continue;
+      }
       // The checked kernel folds a batch from 0 and only checks the final
       // merge. That matches row order only while no prior rows have been
       // accumulated: with a running total, e.g. [MAX] then [5,-5], the
       // second batch's partial 0 hides the overflowing MAX+5 the canonical
       // accumulator raises on. Once any row has contributed, use the exact
       // row-by-row path below.
-      if (jit_sum_ && !any &&
-          input_batch_.ZoneMapAt(jit_sum_column_).NullCount() == 0) {
-        // The JIT kernel reads raw int64 storage; verify the child batch
-        // really has the declared layout before trusting it.
-        if (!input_batch_.HasLayout(input_schema_) ||
-            column.Type() != ValueType::kInt64) {
-          CHECK_MSG(false, "aggregation input layout mismatch");
-        }
+      if (jit_sum_ && !any && valid_int_layout && sum_zone.NullCount() == 0) {
+        // The JIT kernel reads raw signed-int64 storage; the guard above
+        // verifies the runtime batch really has that layout before trusting
+        // it (same contract as executor/projection.cpp).
         bool batch_overflow = false;
         const int64_t partial = jit_sum_->SumChecked(
             column.IntegerData().data(), column.Size(), &batch_overflow);
@@ -341,7 +385,7 @@ StatusOr<bool> AggregationExecutor::TryFoldAffineSums(Row* dst) {
     }
   }
   struct alignas(64) Partial {
-    __int128 sum{0};
+    platform::Int128 sum{0};
     uint64_t count{0};
   };
   const size_t workers = scan->WorkerCount();
@@ -383,8 +427,9 @@ StatusOr<bool> AggregationExecutor::TryFoldAffineSums(Row* dst) {
       output.emplace_back();
       continue;
     }
-    const __int128 sum =
-        total.sum + (static_cast<__int128>((*inputs)[i].addend) * total.count);
+    const platform::Int128 sum =
+        total.sum +
+        (static_cast<platform::Int128>((*inputs)[i].addend) * total.count);
     if (sum < std::numeric_limits<int64_t>::min() ||
         sum > std::numeric_limits<int64_t>::max()) {
       return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
@@ -414,8 +459,12 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
     return false;
   }
   const auto type = input_schema_.GetColumn(static_cast<size_t>(offset)).Type();
-  if (type != ValueType::kVarChar && type != ValueType::kInt64 &&
-      type != ValueType::kDate) {
+  // VARCHAR values may carry case-insensitive or interval collation tags under
+  // which distinct code/byte entries can be collation-equal (e.g. 'A'/'a').
+  // The fold path has no collation awareness, so reject VARCHAR and let the
+  // regular aggregation path handle it (AggregateAccumulator::Add uses
+  // CanonicalDistinctValue for correct collation semantics).
+  if (type != ValueType::kInt64 && type != ValueType::kDate) {
     return false;
   }
   const auto& store = *scan->GetLSTableStore();
@@ -427,6 +476,26 @@ StatusOr<bool> AggregationExecutor::TryFoldDistinctColumn(Row* dst) {
   const bool coded = dictionary.wide_code_bytes != 0 && domain != 0;
   const bool code_equality =
       coded && (type != ValueType::kVarChar || dictionary.bytewise_equality);
+  if (code_equality &&
+      !input_schema_.GetColumn(static_cast<size_t>(offset)).IsInterval() &&
+      dictionary.code_counts.size() == domain + 1 &&
+      domain <= static_cast<uint64_t>(INT64_MAX)) {
+    int64_t distinct = 0;
+    ASSIGN_OR_RETURN(bool, summarized,
+                     scan->TryFoldLSTableStore([&](const LSTableStore&) {
+                       // Physical frequencies belong to this validated
+                       // snapshot. The final NULL slot never contributes to
+                       // COUNT DISTINCT.
+                       for (size_t code = 0; code < domain; ++code) {
+                         distinct += dictionary.code_counts[code] != 0;
+                       }
+                       return Status::kSuccess;
+                     }));
+    if (summarized) {
+      *dst = Row({Value(distinct)});
+      return true;
+    }
+  }
   size_t bytes = 0;
   if (__builtin_mul_overflow(
           code_equality ? domain : static_cast<size_t>(store.total_rows),
@@ -630,6 +699,12 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
     if (counted) {
       return true;
     }
+    ASSIGN_OR_RETURN(std::optional<int64_t>, selected,
+                     scan->TryCountDictionaryMatches());
+    if (selected) {
+      *dst = Row(std::vector<Value>(inputs_.size(), Value(*selected)));
+      return true;
+    }
   }
   if (scan && aggregates_.size() == 1) {
     const auto& agg = aggregates_[0].expression->AsAggregateExpression();
@@ -692,9 +767,9 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
                 return true;
               }
             } else if (valid_bounds && global_max >= global_min) {
-              const __int128_t span128 = static_cast<__int128_t>(global_max) -
-                                         static_cast<__int128_t>(global_min) +
-                                         1;
+              const platform::Int128 span128 =
+                  static_cast<platform::Int128>(global_max) -
+                  static_cast<platform::Int128>(global_min) + 1;
               if (span128 > 0 && span128 <= 1048576) {
                 const auto span = static_cast<size_t>(span128);
                 const size_t workers = std::min<size_t>(8, scan->WorkerCount());
@@ -794,9 +869,9 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
   // Merge morsels in physical order. Prefix extrema preserve checked SUM's
   // *intermediate* overflow, including cancellation across morsel boundaries.
   struct alignas(64) Partial {
-    __int128_t sum{0};
-    __int128_t low{0};
-    __int128_t high{0};
+    platform::Int128 sum{0};
+    platform::Int128 low{0};
+    platform::Int128 high{0};
     uint64_t count{0};
     int64_t min{std::numeric_limits<int64_t>::max()};
     int64_t max{std::numeric_limits<int64_t>::min()};
@@ -969,7 +1044,7 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
   for (size_t i = 0; i < width; ++i) {
     const auto type =
         aggregates_[i].expression->AsAggregateExpression().GetType();
-    __int128_t total = 0;
+    platform::Int128 total = 0;
     uint64_t count = 0;
     int64_t min = std::numeric_limits<int64_t>::max();
     int64_t max = std::numeric_limits<int64_t>::min();
@@ -1017,15 +1092,18 @@ StatusOr<int64_t> CheckedAdd(int64_t lhs, int64_t rhs) {
 StatusOr<double> CheckedDoubleAdd(double lhs, double rhs) {
   const double result = lhs + rhs;
   if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
-    return StatusError(StatusCode::kIsInfinity, "SUM overflow: result is infinite");
+    return StatusError(StatusCode::kIsInfinity,
+                       "SUM overflow: result is infinite");
   }
   return result;
 }
 
-// The typed fast path only understands COUNT/SUM/AVG; every other kind
-// (MIN/MAX with NaN poisoning, STRING_AGG, COUNTIF, ARRAY_AGG,
-// LOGICAL_AND/OR, statistical and sketch aggregates) routes through the
+// The typed fast path handles COUNT/SUM/AVG plus MIN/MAX, BIT_* and
+// LOGICAL_* (see the case list below). Everything else — STRING_AGG,
+// COUNTIF, ARRAY_AGG, statistical and sketch aggregates — routes through the
 // general accumulator, which owns NULL/DISTINCT/HAVING/ORDER-BY semantics.
+// Keep this list in sync with the switch: adding a kind here requires its
+// NaN/collation/three-valued semantics to be handled in the typed kernel too.
 bool IsTypedAggregate(AggregationType type) {
   switch (type) {
     case AggregationType::kCount:
@@ -1135,8 +1213,8 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
                 // (no CheckedDoubleAdd, matching the generic path).
                 (*results)[i] = Value(c);
               } else {
-                StatusOr<double> next = CheckedDoubleAdd(
-                    (*results)[i].value.double_value, c);
+                StatusOr<double> next =
+                    CheckedDoubleAdd((*results)[i].value.double_value, c);
                 if (!next.HasValue()) {
                   return FailWith(next.GetStatus());
                 }
@@ -1484,6 +1562,10 @@ bool AggregationExecutor::NextGeneric(Row* dst) {
     }
   }
   while (child_->NextBatch(&input_batch_) != 0) {
+    if (const Status ts = Transaction::CheckThreadStatementTimeout();
+        ts != Status::kSuccess) {
+      return FailWith(ts);
+    }
     if (AccumulateTypedBatch(&results, &counts, input_batch_)) {
       continue;
     }

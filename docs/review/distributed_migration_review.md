@@ -2,7 +2,7 @@
 
 ## サマリー
 
-本書に対応する実装(epoch モード・制御プレーン・shipper/receiver・router・admin)はリポジトリに一切存在しない。M1 の前提となる Phase 0 相当バイナリ（StreamLogger/EpochManager/PreCommit 分割 API/async commit）もフラグ（--wal-streams/--epochs/--distributed/--control-peers）も見当たらず、親文書 distributed.md:22 が「ネットワーク関連のコードは現在ワイヤサーバのみ」と認めている。既存コードへの参照(page_storage.cpp:52、recovery_manager.cpp:74)は正確で、WAL 無限増大や torn page→SinglePageRecovery の主張も現状と整合する。ただし **base backup の安全性根拠が置く「解析失敗=末尾」規約は現行 RecoverFrom の throw 挙動と矛盾**しており、これは M3 の中核手順の根拠に関わる最重要指摘である。さらに quorum パラメータの数値不整合、フェーズ対応表の欠落、簡体字混入等がある。
+本書に対応する実装(epoch モード・制御プレーン・shipper/receiver・router・admin)はリポジトリに一切存在しない。M1 の前提となる Phase 0 相当バイナリ（StreamLogger/EpochManager/PreCommit 分割 API/async commit）もフラグ（--wal-streams/--epochs/--distributed/--control-peers）も見当たらず、親文書 distributed.md:22 が「ネットワーク関連のコードは現在ワイヤサーバのみ」と認めている。既存コードへの参照(page_storage.cpp:52、recovery_manager.cpp:74)は正確で、WAL 無限増大や torn page→SinglePageRecovery の主張も現状と整合する。なお G-2（base backup 安全性根拠への指摘）は無効として撤回した：現行 RecoverFrom は解析失敗で例外を送出せず、torn tail を刈って Status を返すため、親文書の「解析失敗=末尾」規約の記述は実装と整合している。quorum パラメータの数値不整合、フェーズ対応表の欠落、簡体字混入等がある。
 
 ## 指摘一覧
 
@@ -13,12 +13,11 @@
 - 根拠: find/grep で distributed/ なし。postgres_server_main.cpp は --host/--port/--read-workers のみ解析。common/constants.hpp に nodeid_t/epoch_t 等なし。distributed.md §11 Phase 0(WP-0a〜0e)の受入基準を満たす痕跡がない(improvement.md §19 に該当作業なし)。
 - 提案: 冒頭に「本書は未着手の設計段階の運用計画。Phase 0〜4 がすべて未実装であることを前提に読む」注記を追加。
 
-### G-2: base backup 安全性根拠の「解析失敗=末尾規約で刈られる」が現行 RecoverFrom の挙動と矛盾する
-- 区分: 実態との乖離
+### G-2: [撤回 — 指摘は無効] base backup 安全性根拠の「解析失敗=末尾規約で刈られる」は実装と整合している
+- 区分: 撤回（実態との乖離なし）
 - 対象: docs/distributed_migration.md:139-140
-- 問題: 「末尾の不完全レコードは『解析失敗=末尾』規約で刈られる」と書くが、n2/n3 起動時の RecoverFrom は解析失敗時に例外を送出して起動に失敗する(recovery_manager.cpp:397-399 throw std::runtime_error)。SinglePageRecovery のみ break で末尾扱い(:356-361)であり、本体リカバリでは成立しない。torn tail を含む WAL を base backup でコピーした場合、n2 は起動時に例外で停止し得る。
-- 根拠: recovery/recovery_manager.cpp:392-396(RecoverFrom の `if (!success) { throw ... }`)、:404(`case LogType::kUnknown: throw ...`)、:356-361(SPR の `break` のみ)。ReadLog(:512-521) はデコード失敗後の stream 状態を検査せず true を返すため、torn レコードが garbage 値としてデコードされる可能性もある。
-- 提案: §5 の安全性根拠に「現状 RecoverFrom は解析失敗で例外を送出するため、tail 刈りの実装(Phase 7 で追加予定)または M3 手順に『コピー完了時の WAL 長を記録し、それを超える末尾を truncate してから起動』の回避手順を追加」と書き換える。または Phase 0 で tail 切り詰めを実装する WP を追加する。
+- 訂正: 初版は「n2/n3 起動時の RecoverFrom は解析失敗時に例外を送出して起動に失敗する(recovery_manager.cpp:397-399 throw std::runtime_error)」と書いたが、これは誤り。recovery/ 配下に throw は存在せず（logger.cpp:863 のコメントのみ）、:397-399 は ReadLogDetailed のシグネチャと kMinHeader 定義である。実際の RecoverFrom は ValidLogEndStatus(scan_start) で有効末尾を求め（recovery_manager.cpp:601）、torn tail を LOG して logger_->TruncateTo(valid_end) で刈り（:611-614）、2 パス目の読み直し失敗時のみ StatusError(kCorrupt) を返す（:688-690）。すなわち親文書の「末尾の不完全レコードは『解析失敗=末尾』規約で刈られる」は現行実装と整合しており、§5 の書き換えや tail 刈り WP の追加は不要である。
+- 根拠: recovery/recovery_manager.cpp:601（ValidLogEndStatus）、:604-615（"Truncating torn WAL tail" + TruncateTo）、:688-690（StatusError 返却）。grep -rn 'throw' recovery/*.cpp で実行文 0 件。
 
 ### G-3: 「未知の LogType に遭遇した旧バイナリは解析停止(=ログ末尾扱い)」の主張が現行デコーダと矛盾
 - 区分: 実態との乖離

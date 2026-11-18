@@ -91,6 +91,39 @@ class MaterializedViewTest : public ::testing::Test {
 // answers queries like any base relation, persists the defining text, and
 // cleans up on DROP.  Staleness is manual: rows only change through an
 // explicit recreate (or base-table writes followed by a recreate).
+TEST_F(MaterializedViewTest, DropTableClearsMaterializedViewDefinition) {
+  Run("CREATE TABLE mat_src (k INT64);");
+  Run("INSERT INTO mat_src VALUES (1), (2);");
+  Run("CREATE MATERIALIZED VIEW m AS SELECT k FROM mat_src;");
+  // DROP TABLE on the backing table must remove the definition too.
+  Run("DROP TABLE m;");
+  EXPECT_FALSE(Fails("CREATE MATERIALIZED VIEW m AS SELECT k FROM mat_src;"))
+      << last_error_;
+  EXPECT_FALSE(Fails("DROP MATERIALIZED VIEW m;")) << last_error_;
+}
+
+TEST_F(MaterializedViewTest, ViewAndTablesShareOneCaseInsensitiveNamespace) {
+  Run("CREATE VIEW occupied_name AS SELECT 17 AS id");
+  EXPECT_TRUE(Fails("CREATE TABLE OCCUPIED_NAME (id INT64)"));
+  EXPECT_TRUE(Fails("CREATE TABLE occupied_name AS SELECT 30 AS id"));
+  EXPECT_TRUE(
+      Fails("CREATE MATERIALIZED VIEW occupied_name AS SELECT 30 AS id"));
+  EXPECT_EQ(Run("SELECT id FROM occupied_name"),
+            std::vector<Row>({Row({Value(17)})}));
+  Run("DROP VIEW occupied_name");
+  Run("CREATE TABLE occupied_name (id INT64)");
+  EXPECT_TRUE(Fails("CREATE OR REPLACE VIEW OCCUPIED_NAME AS SELECT 30 AS id"));
+  Run("INSERT INTO occupied_name VALUES (42)");
+  EXPECT_EQ(Run("SELECT id FROM occupied_name"),
+            std::vector<Row>({Row({Value(42)})}));
+  // The same shared namespace applies to RENAME TO and materialized views.
+  Run("CREATE VIEW rename_view_target AS SELECT 9 AS id");
+  Run("CREATE TABLE rename_source (id INT64)");
+  EXPECT_TRUE(Fails("ALTER TABLE rename_source RENAME TO rename_view_target"));
+  Run("CREATE MATERIALIZED VIEW rename_mv_target AS SELECT 1 AS id");
+  EXPECT_TRUE(Fails("ALTER TABLE rename_source RENAME TO rename_mv_target"));
+}
+
 TEST_F(MaterializedViewTest, CreateQueryDropRoundTrip) {
   Run("CREATE TABLE base_t (k INT64, v STRING);");
   Run("INSERT INTO base_t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
@@ -193,6 +226,25 @@ TEST_F(MaterializedViewTest, RefreshByRecreateSeesBaseWrites) {
   const std::vector<Row> refreshed = Run("SELECT c FROM mv_r;");
   ASSERT_EQ(refreshed.size(), 1U);
   EXPECT_EQ(refreshed[0][0].value.int_value, 2);
+}
+
+TEST_F(MaterializedViewTest, RenamingBackingTableMovesViewDefinition) {
+  Run("CREATE TABLE mv_rename_src (k INT64);");
+  Run("INSERT INTO mv_rename_src VALUES (7);");
+  Run("CREATE MATERIALIZED VIEW mv_rename AS SELECT k FROM mv_rename_src;");
+  Run("ALTER TABLE mv_rename RENAME TO mv_renamed;");
+  // The old name is free for a new table; DROP MATERIALIZED VIEW must target
+  // the renamed view, not the unrelated new table.
+  Run("CREATE TABLE mv_rename (v INT64);");
+  Run("INSERT INTO mv_rename VALUES (777);");
+  // The old name no longer names a materialized view; DROP MV on it must fail
+  // and must NOT drop the unrelated table that now uses that name.
+  EXPECT_TRUE(Fails("DROP MATERIALIZED VIEW mv_rename;"));
+  const auto survived = Run("SELECT v FROM mv_rename;");
+  ASSERT_EQ(survived.size(), 1U);
+  EXPECT_EQ(survived[0][0], Value(int64_t{777}));
+  // The renamed view still has its definition and can be dropped normally.
+  EXPECT_FALSE(Fails("DROP MATERIALIZED VIEW mv_renamed;")) << last_error_;
 }
 
 }  // namespace tinylamb

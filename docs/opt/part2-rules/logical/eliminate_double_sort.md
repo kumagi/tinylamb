@@ -136,9 +136,9 @@ SQL におけるソート順序の契約（Ordering Contract）は、「要求�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CompatibleNestedSortsCollapseToOneOrder`
+- `plan/cascades_test_part*.cpp`: `CompatibleNestedSortsCollapseToOneOrder`
   - プレフィックス一致（外側 1 キー / 内側 2 キー）において発火し、内側のソート式が外側 Group に複製されることを検証。
-- `plan/cascades_test.cpp`: `EliminateDoubleSortRequiresSameKeyExpressions`
+- `plan/cascades_test_part*.cpp`: `EliminateDoubleSortRequiresSameKeyExpressions`
   - キー式が異なる場合、方向が一致していても発火しない D5 ガードレールを検証。
-- `plan/cascades_test.cpp`: `EliminateDoubleSortRequiresSameNullsFirst`
+- `plan/cascades_test_part*.cpp`: `EliminateDoubleSortRequiresSameNullsFirst`
   - NULLS FIRST/LAST の指定が一致しない場合に発火を阻止する挙動を検証。

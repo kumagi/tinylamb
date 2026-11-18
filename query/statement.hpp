@@ -31,11 +31,13 @@
 #include <vector>
 
 #include "common/set_operation.hpp"
+#include "expression/aggregate_expression.hpp"
 #include "expression/expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/query_expression.hpp"
 #include "expression/rewrite.hpp"
 #include "expression/table_sample_spec.hpp"
+#include "expression/window_function_expression.hpp"
 #include "type/column.hpp"
 #include "type/schema.hpp"
 
@@ -254,23 +256,32 @@ class CreateIndexStatement : public Statement {
 
 class CreateTableStatement : public Statement {
  public:
-  CreateTableStatement(std::string table_name, std::vector<Column> columns)
-      : Statement(StatementType::kCreateTable),
-        table_name_(std::move(table_name)),
-        columns_(std::move(columns)) {}
-
   CreateTableStatement(std::string table_name, std::vector<Column> columns,
-                       std::vector<ForeignKeyDef> foreign_keys)
+                       bool if_not_exists = false, bool or_replace = false)
       : Statement(StatementType::kCreateTable),
         table_name_(std::move(table_name)),
         columns_(std::move(columns)),
-        foreign_keys_(std::move(foreign_keys)) {}
+        if_not_exists_(if_not_exists),
+        or_replace_(or_replace) {}
 
-  CreateTableStatement(std::string table_name,
-                       std::shared_ptr<SelectStatement> as_query)
+  CreateTableStatement(std::string table_name, std::vector<Column> columns,
+                       std::vector<ForeignKeyDef> foreign_keys,
+                       bool if_not_exists = false, bool or_replace = false)
       : Statement(StatementType::kCreateTable),
         table_name_(std::move(table_name)),
-        as_query_(std::move(as_query)) {}
+        columns_(std::move(columns)),
+        foreign_keys_(std::move(foreign_keys)),
+        if_not_exists_(if_not_exists),
+        or_replace_(or_replace) {}
+
+  CreateTableStatement(std::string table_name,
+                       std::shared_ptr<SelectStatement> as_query,
+                       bool if_not_exists = false, bool or_replace = false)
+      : Statement(StatementType::kCreateTable),
+        table_name_(std::move(table_name)),
+        as_query_(std::move(as_query)),
+        if_not_exists_(if_not_exists),
+        or_replace_(or_replace) {}
 
   [[nodiscard]] const std::string& TableName() const { return table_name_; }
   [[nodiscard]] const std::vector<Column>& Columns() const { return columns_; }
@@ -281,9 +292,17 @@ class CreateTableStatement : public Statement {
     return as_query_;
   }
   [[nodiscard]] bool IsAsSelect() const { return as_query_ != nullptr; }
+  [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
+  [[nodiscard]] bool OrReplace() const { return or_replace_; }
 
   void Dump(std::ostream& o) const override {
     o << "table=" << table_name_;
+    if (if_not_exists_) {
+      o << " if_not_exists";
+    }
+    if (or_replace_) {
+      o << " or_replace";
+    }
     if (as_query_) {
       o << " AS SELECT";
     } else {
@@ -320,6 +339,8 @@ class CreateTableStatement : public Statement {
   std::vector<Column> columns_;
   std::vector<ForeignKeyDef> foreign_keys_;
   std::shared_ptr<SelectStatement> as_query_;
+  bool if_not_exists_ = false;
+  bool or_replace_ = false;
 };
 
 // CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS <query>.  The result is
@@ -365,14 +386,16 @@ class CreateMaterializedViewStatement : public Statement {
 class CreateViewStatement : public Statement {
  public:
   CreateViewStatement(std::string view_name, bool or_replace,
-                      std::string query_text)
+                      std::string query_text, bool if_not_exists = false)
       : Statement(StatementType::kCreateView),
         view_name_(std::move(view_name)),
         or_replace_(or_replace),
-        query_text_(std::move(query_text)) {}
+        query_text_(std::move(query_text)),
+        if_not_exists_(if_not_exists) {}
 
   [[nodiscard]] const std::string& ViewName() const { return view_name_; }
   [[nodiscard]] bool OrReplace() const { return or_replace_; }
+  [[nodiscard]] bool IfNotExists() const { return if_not_exists_; }
   [[nodiscard]] const std::string& QueryText() const { return query_text_; }
   void Dump(std::ostream& o) const override {
     o << "view=" << view_name_ << (or_replace_ ? " or_replace" : "") << " AS "
@@ -383,6 +406,7 @@ class CreateViewStatement : public Statement {
   std::string view_name_;
   bool or_replace_;
   std::string query_text_;
+  bool if_not_exists_{false};
 };
 
 class DropViewStatement : public Statement {
@@ -484,7 +508,7 @@ class SelectStatement : public Statement {
   const std::vector<OrderByTerm>& OrderBy() const { return order_by_; }
   size_t Limit() const { return limit_; }
   // True only when the SQL carried an explicit LIMIT clause; LIMIT 0 must be
-  // distinguishable from an absent LIMIT (§6.3).
+  // distinguishable from an absent LIMIT.
   bool HasLimit() const { return has_limit_; }
   void SetLimit(std::optional<size_t> limit) {
     has_limit_ = limit.has_value();
@@ -697,9 +721,9 @@ class SelectStatement : public Statement {
   }
   // Recomputed because shared child statements and expressions can mutate
   // independently of this node. Return an owned value so concurrent const
-  // readers do not write a shared cache buffer. Pointer components distinguish
-  // opaque aggregate/window/set-operation nodes within this process; this key
-  // is not a stable serialization or a cross-process cache identifier.
+  // readers do not write a shared cache buffer. Aggregate/window/set-operation
+  // nodes are folded structurally into this key; it is not a stable
+  // serialization or a cross-process cache identifier.
   std::string Fingerprint() const {
     std::ostringstream stream;
     auto append_string = [&](std::string_view text) {
@@ -747,9 +771,40 @@ class SelectStatement : public Statement {
         } else {
           stream << "<null>;";
         }
-      } else if (expression->Type() == TypeTag::kAggregateExp ||
-                 expression->Type() == TypeTag::kWindowFunctionExp) {
-        stream << static_cast<const void*>(expression.get());
+      } else if (expression->Type() == TypeTag::kAggregateExp) {
+        const auto& agg = expression->AsAggregateExpression();
+        append_string(expression->ToString());
+        append_string(agg.ArrayElementSqlType());
+        stream << agg.InnerGroupBy().size() << ';';
+        for (const Expression& item : agg.InnerGroupBy()) {
+          self(self, item);
+        }
+        stream << agg.InnerOrderBy().size() << ';';
+        for (const auto& term : agg.InnerOrderBy()) {
+          self(self, term.expression);
+          stream << term.ascending << ':'
+                 << (term.nulls_first.has_value()
+                         ? (*term.nulls_first ? '1' : '0')
+                         : 'n')
+                 << ';';
+        }
+        walk_nested_special(walk_nested_special, agg.Child());
+        walk_nested_special(walk_nested_special, agg.SecondaryArg());
+        for (const Expression& arg : agg.TrailingArgs()) {
+          walk_nested_special(walk_nested_special, arg);
+        }
+        walk_nested_special(walk_nested_special, agg.WhereFilter());
+        walk_nested_special(walk_nested_special, agg.HavingCondition());
+      } else if (expression->Type() == TypeTag::kWindowFunctionExp) {
+        const auto& win = expression->AsWindowFunctionCallExpression();
+        append_string(expression->ToString());
+        stream << win.respect_nulls << ':' << win.ignore_nulls << ';';
+        self(self, win.where_filter);
+        for (const Expression& child : ExpressionChildren(expression)) {
+          if (child) {
+            walk_nested_special(walk_nested_special, child);
+          }
+        }
       } else {
         stream << expression->ToString();
         for (const Expression& child : ExpressionChildren(expression)) {
@@ -796,7 +851,9 @@ class SelectStatement : public Statement {
     stream << "order;";
     for (const OrderByTerm& term : order_by_) {
       append_expression(append_expression, term.expression);
-      stream << term.ascending << ':' << term.nulls_first.value_or(false)
+      stream << term.ascending << ':'
+             << (term.nulls_first.has_value() ? (*term.nulls_first ? '1' : '0')
+                                              : 'n')
              << ';';
     }
     stream << "limit;" << has_limit_ << ':' << limit_ << ':' << offset_
@@ -964,6 +1021,7 @@ struct SetOperationTree {
   std::vector<std::shared_ptr<SelectStatement>> branches;
   std::vector<SetOperationKind> kinds;
   bool grouped{false};
+  bool disjoint_ordered_by_head{false};
 };
 
 enum class InsertMode : uint8_t { kDefault, kIgnore, kUpdate, kReplace };

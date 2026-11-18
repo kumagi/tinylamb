@@ -178,7 +178,7 @@ SELECT n FROM (
 ) u
 LIMIT 2
 --
-ARRAY<STRUCT<n INT64>>[{1}, {2}]
+ARRAY<STRUCT<n INT64>>[unknown order:{1}, {2}]
 ==
 
 [mode=explain]

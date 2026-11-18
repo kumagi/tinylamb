@@ -19,8 +19,12 @@
 #include <fcntl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <limits>
+#include <string>
+#include <system_error>
 
 #include "common/platform/os.hpp"
 
@@ -141,6 +145,66 @@ int CloseFile(int fd) {
   return ::_close(fd);
 #else
   return ::close(fd);
+#endif
+}
+
+int OpenUnlinkedTempFile(const std::filesystem::path& dir) {
+  std::filesystem::path target_dir = dir;
+  if (target_dir.empty()) {
+    std::error_code ec;
+    target_dir = std::filesystem::temp_directory_path(ec);
+    if (ec || target_dir.empty()) {
+      target_dir = ".";
+    }
+  }
+#ifdef TINYLAMB_OS_WINDOWS
+  static std::atomic<uint64_t> counter{0};
+  const DWORD pid = ::GetCurrentProcessId();
+  const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+  const std::filesystem::path tmp_path =
+      target_dir / ("tinylamb_tmp_" + std::to_string(pid) + "_" +
+                    std::to_string(seq) + ".tmp");
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = FALSE;
+  HANDLE h = ::CreateFileW(
+      tmp_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_NEW,
+      FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    errno = MapWin32ErrorToErrno(::GetLastError());
+    return -1;
+  }
+  const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(h),
+                                   _O_BINARY | _O_NOINHERIT);
+  if (fd < 0) {
+    ::CloseHandle(h);
+    errno = EMFILE;
+    return -1;
+  }
+  return fd;
+#else
+#if defined(__linux__) && defined(O_TMPFILE)
+  const int tmp_fd =
+      ::open(target_dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  if (tmp_fd >= 0) {
+    return tmp_fd;
+  }
+#endif
+  std::string tmpl = (target_dir / "tinylamb_tmp_XXXXXX").string();
+  const int fd = ::mkstemp(tmpl.data());
+  if (fd < 0) {
+    return -1;
+  }
+  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  if (::unlink(tmpl.c_str()) != 0) {
+    const int saved = errno;
+    (void)::close(fd);
+    errno = saved != 0 ? saved : EIO;
+    return -1;
+  }
+  return fd;
 #endif
 }
 

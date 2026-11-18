@@ -1,0 +1,12 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1794937460021
+-- profile: pool=16384 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: post-reopen count(t#) mismatch :: op 7 `reopen`: post-reopen count(t0) mismatch: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t0 |   expected 1 rows, engine returned 1 |   row 0: expected [161|13041|74007|146|1194596] got [160|12939|73182|145|1187481]
+create t0 58 6970 880
+create t1 2 7488 3923
+ins_bulk t0 1 161 499
+ins_bulk t1 1 50 970
+inject io 40
+commit
+checkpoint
+reopen

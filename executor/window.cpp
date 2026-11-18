@@ -101,31 +101,45 @@ const std::vector<Expression>* WindowExecutor::SharedPartitionKey() const {
 bool WindowExecutor::ComputeColumns() {
   const Schema input_schema = InputSchema();
   const relational_detail::CteMap empty_ctes;
-  for (size_t call_index = appended_columns_; call_index < outputs_.size();
-       ++call_index) {
-    const NamedExpression& item = outputs_[call_index];
+  const size_t begin = appended_columns_;
+  if (begin >= outputs_.size()) {
+    return true;
+  }
+  std::vector<const WindowFunctionCallExpression*> calls;
+  calls.reserve(outputs_.size() - begin);
+  for (size_t i = begin; i < outputs_.size(); ++i) {
+    const NamedExpression& item = outputs_[i];
     if (item.expression == nullptr ||
         item.expression->Type() != TypeTag::kWindowFunctionExp) {
       return FailWith(
           Status(StatusCode::kUnknown, "window output is not a window call"));
     }
-    const WindowFunctionCallExpression& call =
-        item.expression->AsWindowFunctionCallExpression();
-    std::vector<Value> computed;
-    Status status = relational_detail::ComputeOneWindow(
-        context_, call, rows_, input_schema, nullptr, empty_ctes, &computed);
-    if (status != Status::kSuccess) {
-      return FailWith(status);
-    }
-    if (computed.size() != rows_.size()) {
+    calls.push_back(&item.expression->AsWindowFunctionCallExpression());
+  }
+  // One batch pass shares the partition/order layout among calls with the
+  // same shape instead of regrouping and re-sorting rows once per call.
+  std::vector<std::vector<Value>> computed;
+  const Status status = relational_detail::ComputeWindowColumns(
+      context_, calls, rows_, input_schema, nullptr, empty_ctes, &computed);
+  if (status != Status::kSuccess) {
+    return FailWith(status);
+  }
+  if (computed.size() != calls.size()) {
+    return FailWith(
+        Status(StatusCode::kUnknown, "window output width mismatch"));
+  }
+  for (std::vector<Value>& column : computed) {
+    if (column.size() != rows_.size()) {
       return FailWith(
           Status(StatusCode::kUnknown, "window output width mismatch"));
     }
-    for (size_t i = 0; i < rows_.size(); ++i) {
-      rows_[i].values_.push_back(std::move(computed[i]));
-    }
-    ++appended_columns_;
   }
+  for (std::vector<Value>& column : computed) {
+    for (size_t i = 0; i < rows_.size(); ++i) {
+      rows_[i].values_.push_back(std::move(column[i]));
+    }
+  }
+  appended_columns_ = outputs_.size();
   return true;
 }
 
@@ -141,7 +155,7 @@ bool WindowExecutor::EnsureComputed() {
   // cannot stream. A child that fails mid-drain leaves nothing behind. A
   // retry after a window-call failure skips the drain: the child is already
   // exhausted and rows_ holds the partially extended input.
-  if (appended_columns_ == 0) {
+  if (!buffered_input_ready_) {
     std::vector<Row> input;
     DataChunk batch;
     while (child_->NextBatch(&batch) != 0) {
@@ -157,6 +171,7 @@ bool WindowExecutor::EnsureComputed() {
     for (Row& input_row : input) {
       rows_.push_back(std::move(input_row));
     }
+    buffered_input_ready_ = true;
   }
   if (!ComputeColumns()) {
     return false;

@@ -178,10 +178,7 @@ bool BuildDatabase(const std::vector<std::string>& setup, ScopedDb* out) {
   // A failed commit (e.g. WAL write error under disk pressure) leaves the
   // tables empty; reporting mirror mismatches against that state would be a
   // false positive, so skip the iteration instead.
-  if (ctx.txn_.PreCommit() != Status::kSuccess) {
-    return false;
-  }
-  return true;
+  return ctx.txn_.PreCommit() == Status::kSuccess;
 }
 
 std::vector<std::vector<Value>> ExecuteAll(
@@ -331,7 +328,7 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
     if (verbose) {
       std::cerr << "[plancache_fuzz][skip-setup]\n";
     }
-    return "";
+    return "[PLANCACHE FUZZ SETUP ERROR] db_a";
   }
   bool ok = false;
   const std::vector<std::vector<Value>> r1 = ExecuteAll(*db_a, t.queries, &ok);
@@ -339,11 +336,11 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
     if (verbose) {
       std::cerr << "[plancache_fuzz][skip-query]\n";
     }
-    return "";
+    return "[PLANCACHE FUZZ QUERY ERROR] phase1";
   }
   const std::vector<std::vector<Value>> r2 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
-    return "";
+    return "[PLANCACHE FUZZ QUERY ERROR] phase2";
   }
 
   // ---- Mutate (cache stays warm). ----
@@ -355,12 +352,12 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
       }
     }
     if (ctx.txn_.PreCommit() != Status::kSuccess) {
-      return "";
+      return "[PLANCACHE FUZZ SETUP ERROR] mutation PreCommit";
     }
   }
   const std::vector<std::vector<Value>> r3 = ExecuteAll(*db_a, t.queries, &ok);
   if (!ok) {
-    return "";
+    return "[PLANCACHE FUZZ QUERY ERROR] phase3";
   }
 
   // ---- Phase 4: fresh database, replayed script (all misses). ----
@@ -368,11 +365,11 @@ std::string RunPlanCacheIteration(std::mt19937& rng, bool verbose,
   setup_b.insert(setup_b.end(), t.mutations.begin(), t.mutations.end());
   ScopedDb db_b("sql_plancache_fuzz");
   if (!BuildDatabase(setup_b, &db_b)) {
-    return "";
+    return "[PLANCACHE FUZZ SETUP ERROR] db_b";
   }
   const std::vector<std::vector<Value>> r4 = ExecuteAll(*db_b, t.queries, &ok);
   if (!ok) {
-    return "";
+    return "[PLANCACHE FUZZ QUERY ERROR] phase4";
   }
 
   const std::vector<std::string> m1 = FormatRows(r1);
@@ -439,6 +436,9 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
   }
   const std::vector<std::vector<Value>> r2 =
       ExecuteAll(*db_a, trace.queries, &ok);
+  if (!ok) {
+    return "replay query failed (hit phase)";
+  }
   {
     TransactionContext ctx = db_a->BeginContext();
     for (const std::string& m : trace.mutations) {
@@ -452,6 +452,9 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
   }
   const std::vector<std::vector<Value>> r3 =
       ExecuteAll(*db_a, trace.queries, &ok);
+  if (!ok) {
+    return "replay query failed (drift phase)";
+  }
   std::vector<std::string> setup_b = trace.setup;
   setup_b.insert(setup_b.end(), trace.mutations.begin(), trace.mutations.end());
   ScopedDb db_b("sql_plancache_replay");
@@ -460,6 +463,9 @@ std::string ReplayPlanCacheTrace(const PlanCacheTrace& trace, bool verbose) {
   }
   const std::vector<std::vector<Value>> r4 =
       ExecuteAll(*db_b, trace.queries, &ok);
+  if (!ok) {
+    return "replay query failed (fresh phase)";
+  }
 
   const std::vector<std::string> m1 = FormatRows(r1);
   const std::vector<std::string> m2 = FormatRows(r2);
@@ -561,7 +567,10 @@ bool ParsePlanCacheTest(std::string_view text, uint64_t* seed,
       return false;
     }
   }
-  return saw_header && !trace->setup.empty();
+  // An empty query/expect pair would make replay compare zero rows and call
+  // a corrupted regression file "fixed". Require a real test body.
+  return saw_header && !trace->setup.empty() && !trace->queries.empty() &&
+         !trace->expected.empty();
 }
 
 void PlanCacheFuzzTry(const uint8_t* data, size_t size, bool verbose) {

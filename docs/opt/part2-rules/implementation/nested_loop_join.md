@@ -95,7 +95,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part2.cpp`:
   - `OptimizerTest.BatchNestedLoopExecutesNonEquiInnerJoin`: `nested_loop_join` を無効化した際にブロック化版へ正常に切り替わることを検証。
   - `OptimizerTest.BatchNestedLoopGateKeepsEquiJoins`: 等値結合において他の全結合 Rule が無効化された場合の挙動を検証。
   - `OptimizerTest.CrossTableResidualPredicateIsAppliedByTheJoin`: 表間にまたがる述語が結合オペレータによって確実に評価されることを検証。

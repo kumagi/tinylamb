@@ -27,6 +27,9 @@ class MinMaxIndexPlan final : public PlanBase {
   [[nodiscard]] const Schema& GetSchema() const override { return schema_; }
   [[nodiscard]] size_t AccessRowCount() const override { return 1; }
   [[nodiscard]] size_t EmitRowCount() const override { return 1; }
+  [[nodiscard]] const Plan& Child() const { return child_; }
+  [[nodiscard]] const NamedExpression& Aggregate() const { return aggregate_; }
+  [[nodiscard]] bool Reverse() const { return reverse_; }
   [[nodiscard]] size_t ValueSlot() const { return value_slot_; }
   [[nodiscard]] bool EnforcesDistinct() const override { return true; }
   void Dump(std::ostream& output, int indent) const override;

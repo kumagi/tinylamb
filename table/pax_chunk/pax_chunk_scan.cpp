@@ -33,8 +33,8 @@ bool QppRegionCountSum(const char* region, uint32_t n, uint32_t param,
   if (!ParseQppRegion(region, n, param, region_end, &parsed)) {
     return false;
   }
-  __int128 low = INT64_MIN;
-  __int128 high = INT64_MAX;
+  platform::Int128 low = INT64_MIN;
+  platform::Int128 high = INT64_MAX;
   switch (op) {
     case PaxChunk::CompareOp::kEq:
       low = high = literal;
@@ -43,19 +43,19 @@ bool QppRegionCountSum(const char* region, uint32_t n, uint32_t param,
       high = literal;
       break;
     case PaxChunk::CompareOp::kLt:
-      high = static_cast<__int128>(literal) - 1;
+      high = static_cast<platform::Int128>(literal) - 1;
       break;
     case PaxChunk::CompareOp::kGe:
       low = literal;
       break;
     case PaxChunk::CompareOp::kGt:
-      low = static_cast<__int128>(literal) + 1;
+      low = static_cast<platform::Int128>(literal) + 1;
       break;
     default:
       return false;
   }
   int64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t p = 0; p < parsed.pages; ++p) {
     const QppPage& page = parsed.page[p];
     std::array<QppRange, 2> ranges{};
@@ -277,7 +277,7 @@ int64_t PaxChunk::ByteSliceFilteredSum(const char* region, uint32_t n,
       m[stride - 1] &= static_cast<uint8_t>(0xFFU << (8 - (n & 7U)));
     }
   }
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t b = 0; b < w; ++b) {
     const unsigned char* sl = r + 1 + (static_cast<size_t>(b) * stride);
     uint64_t cnt = 0;
@@ -287,7 +287,8 @@ int64_t PaxChunk::ByteSliceFilteredSum(const char* region, uint32_t n,
     }
     // Unsigned weight: for w == 64 the sign bit weighs +2^63 mod 2^64,
     // which equals -2^63 under the final truncation (two's complement).
-    sum += static_cast<__int128>(cnt) * (static_cast<__int128>(1) << b);
+    sum += static_cast<platform::Int128>(cnt) *
+           (static_cast<platform::Int128>(1) << b);
   }
   return static_cast<int64_t>(sum);
 }
@@ -413,12 +414,13 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
               (static_cast<unsigned>(plane[i >> 3]) >> (7U - (i & 7U))) & 1U);
     }
   }
-  const __int128 base_extended =
+  const platform::Int128 base_extended =
       (p.base & (1ULL << 63)) != 0
-          ? static_cast<__int128>(p.base & ~(1ULL << 63)) +
-                (static_cast<__int128>(1) << 63)
-          : static_cast<__int128>(p.base);
-  __int128 ordered_sum = base_extended * static_cast<__int128>(normal_count);
+          ? static_cast<platform::Int128>(p.base & ~(1ULL << 63)) +
+                (static_cast<platform::Int128>(1) << 63)
+          : static_cast<platform::Int128>(p.base);
+  platform::Int128 ordered_sum =
+      base_extended * static_cast<platform::Int128>(normal_count);
   for (uint32_t b = 0; b < p.width; ++b) {
     const unsigned char* plane = p.planes + (static_cast<size_t>(b) * p.stride);
     uint64_t count = 0;
@@ -426,10 +428,11 @@ int64_t PaxChunk::PBitSFilteredSum(const char* region, uint32_t param,
       count += static_cast<uint64_t>(
           __builtin_popcount(static_cast<unsigned int>(plane[i] & active[i])));
     }
-    ordered_sum += static_cast<__int128>(count) *
-                   (static_cast<__int128>(1) << (p.width - 1 - b));
+    ordered_sum += static_cast<platform::Int128>(count) *
+                   (static_cast<platform::Int128>(1) << (p.width - 1 - b));
   }
-  __int128 sum = ordered_sum - (static_cast<__int128>(normal_count) << 63);
+  platform::Int128 sum =
+      ordered_sum - (static_cast<platform::Int128>(normal_count) << 63);
   for (uint32_t k = 0; k < p.exceptions; ++k) {
     const char* entry = p.exception_values + (static_cast<size_t>(k) * 10);
     const uint32_t pos = ReadBE16(entry);
@@ -553,16 +556,26 @@ bool DictColumnSum(const char* region, uint32_t n, uint32_t param,
   const int cw = BitsNeeded(ncodes - 1);
   const char* dict =
       region + 2 + ((static_cast<size_t>(n) * static_cast<size_t>(cw) + 7) / 8);
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint16_t d = 0; d < ncodes; ++d) {
     if (freq[d] == 0) {
       continue;
     }
-    sum += static_cast<__int128>(static_cast<int64_t>(
+    sum += static_cast<platform::Int128>(static_cast<int64_t>(
                ReadBE64(dict + (static_cast<size_t>(d) * 8)))) *
-           static_cast<__int128>(freq[d]);
+           static_cast<platform::Int128>(freq[d]);
   }
   // Clamped codes decode to raw 0: no contribution.
+  // A dictionary-sum that leaves int64 is refused rather than narrowed: the
+  // caller falls back to the exact decode path, matching the row-level SUM
+  // path's "integer overflow in SUM" contract instead of publishing a
+  // wrapped value.
+  if (sum <
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::min()) ||
+      sum >
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::max())) {
+    return false;
+  }
   *sum_out = static_cast<int64_t>(sum);
   return true;
 }
@@ -644,10 +657,12 @@ void OpDictWindowForValue(const char* region, uint32_t n, uint32_t param,
   }
   *lo = wlo;
   *span = whi - wlo;
-  // Clamp codes decode as raw 0: they hit iff the rank 0 would take falls
-  // inside the window (also false when the window is empty).
-  const uint64_t zero_rank = lower_bound(0);
-  *clamp_pass = zero_rank >= *lo && zero_rank < *lo + *span;
+  // Clamp codes (>= ncodes) decode as the raw value 0, so their verdict is
+  // the predicate applied to 0 itself -- not the rank 0 would take in the
+  // dictionary, which answers a different question whenever 0 is not an
+  // entry (dict [5,10] with `kGt 3` must count no clamp row, dict [5,10]
+  // with `kLt 1` must count every one of them).
+  *clamp_pass = RleDictMatch(op, static_cast<int64_t>(0), lit);
 }
 
 bool OpDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
@@ -953,8 +968,9 @@ void TileDictWindowForValue(const TileDictCursor& c, PaxChunk::CompareOp op,
   }
   *lo = wlo;
   *span = whi - wlo;
-  const uint64_t zero_rank = lower_bound(0);
-  *clamp_pass = zero_rank >= wlo && zero_rank < whi;
+  // Same contract as OpDictWindowForValue: a clamp code decodes as raw 0, so
+  // its verdict is `0 OP lit`, not the window position of dictionary rank 0.
+  *clamp_pass = RleDictMatch(op, static_cast<int64_t>(0), lit);
 }
 
 // kTileDict compressed-domain fold. Each tile's bracket [dict[0],
@@ -1080,7 +1096,7 @@ bool Bp128RegionCountSumParsed(const Bp128Region& parsed,
     return false;
   }
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t block_index = 0; block_index < parsed.block_count;
        ++block_index) {
     const Bp128Block& block = parsed.blocks[block_index];
@@ -1157,7 +1173,7 @@ bool FastPforRegionCountSumParsed(const FastPforRegion& parsed,
     return false;
   }
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t b = 0; b < parsed.block_count; ++b) {
     const FastPforBlock& blk = parsed.blocks[b];
     if (op == PaxChunk::CompareOp::kEq && blk.minimum == blk.maximum) {
@@ -1233,7 +1249,7 @@ bool DeltaFastPforRegionCountSumParsed(const DeltaFastPforRegion& parsed,
     return false;
   }
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t b = 0; b < parsed.block_count; ++b) {
     const DeltaFastPforBlock& blk = parsed.blocks[b];
     if (op == PaxChunk::CompareOp::kEq && blk.minimum == blk.maximum) {
@@ -1337,7 +1353,7 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
   }
   pass[d] = RleDictMatch(op, static_cast<int64_t>(0), lit) ? 1 : 0;
   uint64_t cnt = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   uint64_t acc = 0;
   const char* q = runs_hdr + 4;
   for (uint32_t i = 0; i < runs && acc < n; ++i) {
@@ -1355,9 +1371,9 @@ bool RleDictRegionCountSum(const char* region, uint32_t n, uint32_t param,
       if (ok != 0) {
         cnt += end - acc;
         if (sum_out != nullptr && code < d) {
-          sum += static_cast<__int128>(static_cast<int64_t>(
+          sum += static_cast<platform::Int128>(static_cast<int64_t>(
                      ReadBE64(dict + (static_cast<size_t>(code) * 8)))) *
-                 static_cast<__int128>(end - acc);
+                 static_cast<platform::Int128>(end - acc);
         }
       }
     }
@@ -1387,7 +1403,7 @@ bool RleBpRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t run = 0; run < p.runs; ++run) {
     const uint32_t length = RleBpLengthAt(p, run);
     const int64_t value = RleBpValueAt(p, run);
@@ -1396,7 +1412,7 @@ bool RleBpRegionCountSum(const char* region, uint32_t n, uint32_t param,
     }
     count += length;
     if (sum_out != nullptr) {
-      sum += static_cast<__int128>(value) * length;
+      sum += static_cast<platform::Int128>(value) * length;
     }
   }
   *count_out = count;
@@ -1508,7 +1524,7 @@ bool RleDeltaRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t run = 0; run < parsed.run_count; ++run) {
     const RleDeltaRun& item = parsed.runs[run];
     if (!RleDictMatch(op, item.value, lit)) {
@@ -1516,7 +1532,7 @@ bool RleDeltaRegionCountSum(const char* region, uint32_t n, uint32_t param,
     }
     count += item.length;
     if (sum_out != nullptr) {
-      sum += static_cast<__int128>(item.value) * item.length;
+      sum += static_cast<platform::Int128>(item.value) * item.length;
     }
   }
   *count_out = count;
@@ -1611,7 +1627,7 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
   // Codes >= d decode as raw 0 and participate exactly when 0 passes.
   const bool zero_pass = RleDictMatch(op, static_cast<int64_t>(0), lit);
   uint64_t cnt = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   uint64_t acc = 0;
   const char* q = runs_hdr + 4;
   for (uint32_t i = 0; i < runs && acc < n; ++i) {
@@ -1627,8 +1643,9 @@ bool OpRleRegionCountSum(const char* region, uint32_t n, uint32_t param,
       if (hit) {
         cnt += end - acc;
         if (sum_out != nullptr && code < d) {
-          sum += static_cast<__int128>(dict_at(static_cast<uint32_t>(code))) *
-                 static_cast<__int128>(end - acc);
+          sum += static_cast<platform::Int128>(
+                     dict_at(static_cast<uint32_t>(code))) *
+                 static_cast<platform::Int128>(end - acc);
         }
       }
     }
@@ -1652,7 +1669,7 @@ bool InterpRegionCountSum(const char* region, uint32_t n, uint32_t param,
   if (count_out == nullptr || region == nullptr || region_end == nullptr) {
     return false;
   }
-  __int128 plo = 0, phi = 0;
+  platform::Int128 plo = 0, phi = 0;
   if (!InterpWindowForValue(op, lit, &plo, &phi)) {
     return false;
   }
@@ -1661,15 +1678,15 @@ bool InterpRegionCountSum(const char* region, uint32_t n, uint32_t param,
     return false;
   }
   uint64_t cnt = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t b = 0; b < p.ncp; ++b) {
     const char* ck = p.ckpts + (static_cast<size_t>(b) * 16);
     // SIGNED bracket domain: a sign-crossing block's u64 words sort
     // backwards (see ParseInterpRegion).
     const auto first =
-        static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck)));
+        static_cast<platform::Int128>(static_cast<int64_t>(ReadBE64(ck)));
     const auto last =
-        static_cast<__int128>(static_cast<int64_t>(ReadBE64(ck + 8)));
+        static_cast<platform::Int128>(static_cast<int64_t>(ReadBE64(ck + 8)));
     // The decoded values of block b provably lie inside [first, last] (the
     // tree bounds close on them), so the bracket alone decides "cannot
     // match" and -- when no sum is requested -- "all match" too.
@@ -1691,11 +1708,11 @@ bool InterpRegionCountSum(const char* region, uint32_t n, uint32_t param,
   return true;
 }
 
-__int128 DeltaPForBracketSum(const char* bracket) {
-  const __int128 high = static_cast<int64_t>(ReadBE64(bracket + 16));
+platform::Int128 DeltaPForBracketSum(const char* bracket) {
+  const platform::Int128 high = static_cast<int64_t>(ReadBE64(bracket + 16));
   const uint64_t low_bits = ReadBE64(bracket + 24);
-  return (high * (static_cast<__int128>(1) << 64)) +
-         static_cast<__int128>(low_bits);
+  return (high * (static_cast<platform::Int128>(1) << 64)) +
+         static_cast<platform::Int128>(low_bits);
 }
 
 bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
@@ -1705,8 +1722,8 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
   if (count_out == nullptr) {
     return false;
   }
-  __int128 low_value = 0;
-  __int128 high_value = 0;
+  platform::Int128 low_value = 0;
+  platform::Int128 high_value = 0;
   if (!InterpWindowForValue(op, lit, &low_value, &high_value)) {
     return false;
   }
@@ -1716,21 +1733,21 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
   }
 
   uint64_t count = 0;
-  __int128 sum = 0;
+  platform::Int128 sum = 0;
   for (uint32_t block = 0; block < parsed.blocks; ++block) {
     const char* bracket =
         parsed.brackets + (static_cast<size_t>(block) * kDeltaPForBracketBytes);
     const auto first = static_cast<int64_t>(ReadBE64(bracket));
     const auto last = static_cast<int64_t>(ReadBE64(bracket + 8));
-    if (static_cast<__int128>(last) < low_value ||
-        static_cast<__int128>(first) > high_value) {
+    if (static_cast<platform::Int128>(last) < low_value ||
+        static_cast<platform::Int128>(first) > high_value) {
       continue;
     }
     const uint32_t start = block * kDeltaPForBlockRows;
     const uint32_t rows =
         std::min<uint32_t>(kDeltaPForBlockRows, parsed.n - start);
-    if (static_cast<__int128>(first) >= low_value &&
-        static_cast<__int128>(last) <= high_value) {
+    if (static_cast<platform::Int128>(first) >= low_value &&
+        static_cast<platform::Int128>(last) <= high_value) {
       count += rows;
       if (sum_out != nullptr) {
         sum += DeltaPForBracketSum(bracket);
@@ -1740,7 +1757,7 @@ bool DeltaPForRegionCountSum(const char* region, uint32_t n, uint32_t param,
     std::array<int64_t, kDeltaPForBlockRows> decoded{};
     DecodeDeltaPForBlock(parsed, block, decoded.data());
     for (uint32_t i = 0; i < rows; ++i) {
-      const __int128 value = decoded[i];
+      const platform::Int128 value = decoded[i];
       if (value < low_value || value > high_value) {
         continue;
       }
@@ -1876,7 +1893,7 @@ uint32_t PaxChunk::ByteSliceNullAwareCount(const char* region, Scheme s,
   // form over the lists the predicate passes -- zero bitstream reads, zero
   // row decode, any row order. A null bitmap is corrected analytically: the
   // closed form folds the RAW-value histogram (nulls are raw 0 by the
-  // ComputeReference convention), and the null-aware count excludes null
+  // the reference-computation convention), and the null-aware count excludes null
   // rows, so the null rows are subtracted exactly when raw 0 matches the
   // literal. (The generic loop below cannot serve this scheme with a null
   // region_end: the Rice stream has no self-described length.)
@@ -2086,7 +2103,7 @@ StatusOr<std::vector<char>> PaxChunk::DecompressRegionExact(
     std::string_view in, size_t uncompressed_size) {
   // Allocation bound first: callers inflate pre-validation footer bytes, so a
   // hostile length must not become an unbounded reservation. Real footers are
-  // O(rows) indexes over chunks of at most kHardMaxRows rows per pack record
+  // O(rows) indexes over chunks of at most the pack-record row cap rows per pack record
   // (hash dominates at ~48B/row); 1 GiB covers even multi-million-row
   // standalone chunks with wide margin.
   constexpr size_t kMaxExactOutput = 1ULL * 1024 * 1024 * 1024;
@@ -2573,15 +2590,25 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
         for (slot_t c = 0; c < footer.column_count; ++c) {
           const RgColumnProfile& P = prof[c];
           const bool is_i64 = P.is_i64;
-          footer.col_sum_valid[c] = is_i64 ? 1 : 0;
           footer.col_counts[c] += P.count;
           if (is_i64) {
             footer.col_nulls[c] += P.null_count;
           }
           if (is_i64) {
-            footer.col_sums[c] =
-                static_cast<int64_t>(static_cast<uint64_t>(footer.col_sums[c]) +
-                                     static_cast<uint64_t>(P.sum));
+            int64_t folded = 0;
+            const bool folded_wrapped =
+                __builtin_add_overflow(footer.col_sums[c], P.sum, &folded);
+            footer.col_sums[c] = folded;
+            // The footer sums are only trustworthy while every row-group
+            // contribution (P.sum_overflow) AND the cross-group fold stayed
+            // inside int64; once either wraps, the column's stored sums are
+            // wrapped values, so mark them invalid for good and let readers
+            // fall back to exact accumulation.
+            footer.col_sum_valid[c] = static_cast<uint8_t>(
+                !P.sum_overflow && !folded_wrapped &&
+                (g_idx == 0 || footer.col_sum_valid[c] != 0U));
+          } else {
+            footer.col_sum_valid[c] = 0;
           }
           if (is_i64) {
             footer.col_mins[c] = std::min(P.cmin, footer.col_mins[c]);
@@ -2621,7 +2648,7 @@ StatusOr<PaxChunk> PaxChunk::BuildFromSortedRun(const SortedRun& run,
           }
           uint8_t* regs =
               &footer.hll_sketches[hll_base + (static_cast<size_t>(c) * 64)];
-          for (int r = 0; r < 64; ++r) {
+          for (size_t r = 0; r < 64; ++r) {
             regs[r] = std::max(prof[c].hll[r], regs[r]);
           }
         }
@@ -4622,7 +4649,7 @@ StatusOr<Value> PaxChunk::ReadColumnValue(size_t global_row_index,
   // Decoded-int fast path for the single-group shape (the dominant stored
   // layout): a fully cached cell reads as one load plus the null test,
   // mirroring ReadRowIntoImpl's cached arm. Like the legacy paths, a NULL
-  // cell reports null (callers such as LsmView's key refresh and the merge
+  // cell reports null (callers such as the LSM reader's key refresh and the merge
   // join's null-key skip depend on that verdict); the cache itself stores
   // the raw-0 clamped value, so the bitmap gate decides which of the two is
   // served. Partial spans fall through to the region decoders below:
@@ -5068,9 +5095,10 @@ Status PaxChunk::ColumnStats(slot_t col_idx, const Schema& sc,
     out->mode_value = footer_.col_modes[col_idx];
     out->mode_count = footer_.col_mode_counts[col_idx];
     for (int b = 0; b < B; ++b) {
-      out->hist_counts[b] = footer_.col_hists[(static_cast<size_t>(col_idx) *
-                                               static_cast<size_t>(B)) +
-                                              static_cast<size_t>(b)];
+      out->hist_counts[static_cast<size_t>(b)] =
+          footer_.col_hists[(static_cast<size_t>(col_idx) *
+                             static_cast<size_t>(B)) +
+                            static_cast<size_t>(b)];
     }
   }
   return Status::kSuccess;
@@ -5261,23 +5289,25 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
       return false;
     }
     // Whole chunk in range: SUM and COUNT are exact from per-chunk stats.
-    // Unsigned accumulate: per-group sums can each be near INT64_MAX on
-    // adversarial data; a signed += here is UB (the cross-chunk fold below
-    // already uses the same wrapping-u64 rule).
-    uint64_t s = 0;
+    // Wide accumulate: per-group sums can each be near INT64_MAX on
+    // adversarial data; their fold can leave int64 even when every stored
+    // contribution is exact (col_sum_valid marks columns whose own serial
+    // sum already wrapped while encoding).
+    platform::Int128 s = 0;
     const bool col_in_range = static_cast<size_t>(col) < f.column_count &&
                               static_cast<size_t>(col) < f.col_sum_valid.size();
     if (is_i64_col && col_in_range && f.col_stats_present &&
         (f.col_sum_valid[col] != 0U) &&
         static_cast<size_t>(col) < f.col_sums.size()) {
-      s = static_cast<uint64_t>(f.col_sums[col]);
-    } else if (is_i64_col && col_in_range && f.rg_sums_present) {
+      s = static_cast<platform::Int128>(f.col_sums[col]);
+    } else if (is_i64_col && col_in_range && f.rg_sums_present &&
+               (f.col_sum_valid[col] != 0U)) {
       for (size_t g = 0; g < f.row_group_count; ++g) {
         const size_t zi = (g * f.column_count) + col;
         if (zi >= f.rg_sums.size()) {
           return false;
         }
-        s += static_cast<uint64_t>(f.rg_sums[zi]);
+        s += static_cast<platform::Int128>(f.rg_sums[zi]);
       }
     } else {
       return false;  // no per-chunk sum available for this column
@@ -5302,6 +5332,12 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
     for (uint16_t rc : f.row_counts) {
       cnt += rc;
     }
+    if (s < static_cast<platform::Int128>(
+                std::numeric_limits<int64_t>::min()) ||
+        s > static_cast<platform::Int128>(
+                std::numeric_limits<int64_t>::max())) {
+      return false;  // per-chunk SUM left int64: fall back to exact rows
+    }
     contribs.push_back({c_lo, c_hi, static_cast<int64_t>(s), cnt});
   }
   if (contribs.empty()) {
@@ -5317,13 +5353,20 @@ bool MetadataRangeAggregate(const std::vector<const PaxChunk*>& chunks,
       return false;  // overlap
     }
   }
-  // Unsigned accumulate: per-chunk sums can each be near INT64_MAX; a
-  // signed += across chunks is UB on adversarial data.
-  uint64_t total_sum = 0;
+  // Wide accumulate: per-chunk sums can each be near INT64_MAX; a folded
+  // total outside int64 is refused so the caller falls back to exact
+  // accumulation (the row path raises "integer overflow in SUM").
+  platform::Int128 total_sum = 0;
   uint64_t total_cnt = 0;
   for (const Contrib& cc : contribs) {
-    total_sum += static_cast<uint64_t>(cc.sum);
+    total_sum += static_cast<platform::Int128>(cc.sum);
     total_cnt += cc.count;
+  }
+  if (total_sum <
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::min()) ||
+      total_sum >
+          static_cast<platform::Int128>(std::numeric_limits<int64_t>::max())) {
+    return false;
   }
   *sum_out = static_cast<int64_t>(total_sum);
   *count_out = total_cnt;
@@ -5658,9 +5701,9 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     auto rc_of = [&](uint64_t g) -> uint64_t {
       return rd(footer_off + 30 + (static_cast<size_t>(g) * 2), 2);
     };
-    // Minimum byte extent of a whitelisted leaf-scheme inner region holding
+    // Minimum byte extent of a allowlisted leaf-scheme inner region holding
     // `cnt` entries at absolute offset `ioff` (`avail` = bytes remaining in
-    // the cell). Returns UINT64_MAX on any structural violation: whitelist
+    // the cell). Returns UINT64_MAX on any structural violation: allowlist
     // miss, bad param, or a header that disagrees with the stored inner
     // param. Lockstep with WASM inner_extent.
     auto inner_extent = [&](uint64_t ioff, uint64_t avail, uint64_t ischeme,
@@ -5972,7 +6015,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             trace(158, fsum);
             return w;
           }
-          // Inner whitelist + extent (kFreq's arm, minus the bitmap).
+          // Inner allowlist + extent (kFreq's arm, minus the bitmap).
           const uint64_t ischeme = rd(off + 154, 1);
           const uint64_t iprm = rd(off + 155, 4);
           if (nexc > 0) {
@@ -7797,6 +7840,46 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             }
             prev_pos = ps;
           }
+          {
+            // Full replay consistency: the bulk arm's truth is a single
+            // forward walk from ckpt[0], while the point arm trusts each
+            // ckpt[k] verbatim. Replay every 64-row block from its
+            // checkpoint and demand it lands exactly on the next recorded
+            // (state, pos), pinning every checkpoint to that walk (same
+            // replay budget as case 35's INTERP blocks; ~n steps total).
+            AnsForRegion parsed;
+            const char* base = b.data() + off;
+            if (!AnsForParse(base, base + have, static_cast<uint32_t>(n),
+                             static_cast<uint32_t>(prm), &parsed)) {
+              trace(107, have);
+              return w;
+            }
+            for (uint32_t k = 0; k + 1 < parsed.ncp; ++k) {
+              uint32_t cx =
+                  ReadBE32(parsed.ckpt + (static_cast<size_t>(k) * 8));
+              uint32_t cpos =
+                  ReadBE32(parsed.ckpt + (static_cast<size_t>(k) * 8) + 4);
+              // One block covers 64 rows of bpv offset symbols each: the
+              // encoder records the state at the start of each block's
+              // first symbol.
+              const uint32_t steps = kAnsCkptRows * parsed.bpv;
+              for (uint32_t s = 0; s < steps; ++s) {
+                uint8_t sym = 0;
+                if (!AnsForStep(parsed, &cx, &cpos, &sym)) {
+                  trace(107, cx);
+                  return w;
+                }
+              }
+              const uint32_t want_x =
+                  ReadBE32(parsed.ckpt + (static_cast<size_t>(k + 1) * 8));
+              const uint32_t want_pos =
+                  ReadBE32(parsed.ckpt + (static_cast<size_t>(k + 1) * 8) + 4);
+              if (cx != want_x || cpos != want_pos) {
+                trace(107, cx);
+                return w;
+              }
+            }
+          }
           region_need = hdr + (ncp * 8) + 4 + slen;
           break;
         }
@@ -8134,11 +8217,11 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
             const uint32_t start = block * kDeltaPForBlockRows;
             const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(
                 n, static_cast<uint64_t>(start) + kDeltaPForBlockRows));
-            __int128 sum = 0;
+            platform::Int128 sum = 0;
             for (uint32_t i = start; i < end; ++i) {
               sum += decoded[i];
             }
-            const auto bits = static_cast<unsigned __int128>(sum);
+            const auto bits = static_cast<platform::UInt128>(sum);
             if (ReadBE64(bracket) != static_cast<uint64_t>(decoded[start]) ||
                 ReadBE64(bracket + 8) !=
                     static_cast<uint64_t>(decoded[end - 1]) ||
@@ -8451,6 +8534,13 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
           uint64_t covered = 0;
           int64_t previous_value = 0;
           for (uint64_t k = 0; k < prm; ++k) {
+            // Every 16th run boundary is a restart-table entry: it must equal
+            // the cumulative rows covered so far, otherwise seek paths anchor
+            // on a wrong row and return values from the wrong run.
+            if (k % 16 == 0 && rd(roff + ((k / 16) * 4), 4) != covered) {
+              trace(151, covered);
+              return w;
+            }
             uint64_t voff = 0;
             for (uint64_t vb = 0; vb < vbpv; ++vb) {
               voff |= rd8(off + 8 + 9 + (k * vbpv) + vb) << (vb * 8);
@@ -8761,7 +8851,7 @@ WalkResult ValidateWalk(const std::vector<char>& b) {
     trace(999, 3131);
     return w;
   }  // blooms
-  // Writer emits rg_sums BETWEEN blooms and HLL (SerializeFooter order).
+  // Writer emits rg_sums BETWEEN blooms and HLL (the footer field order).
   if (!section(8, rg * cc, "rgsums")) {
     trace(999, 3264);
     return w;

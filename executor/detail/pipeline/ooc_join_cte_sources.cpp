@@ -1,5 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -140,16 +141,47 @@ bool JoinValueUnmatchable(const Value& value) {
          std::isnan(value.value.double_value);
 }
 
+bool IdenticalValue(const Value& a, const Value& b);
+
+
+
 bool EqualRowsExact(const Row& a, const Row& b) {
   if (a.Count() != b.Count()) {
     return false;
   }
   for (size_t i = 0; i < a.Count(); ++i) {
-    if (!EqualUnderCollation(a[i], b[i])) {
+    if (!IdenticalValue(a[i], b[i])) {
       return false;
     }
   }
   return true;
+}
+
+// True bit-exact value equality for LRU cache keys: type, collation tag
+// (unsigned / CI / interval) and payload must all agree.  Unlike
+// Value::operator== this does not fold -0.0/+0.0 or NaN payloads, and unlike
+// EqualUnderCollation it does not fold case-insensitive varchar pairs.
+bool IdenticalValue(const Value& a, const Value& b) {
+  if (a.type != b.type || a.Collation() != b.Collation()) {
+    return false;
+  }
+  if (a.IsNull() || b.IsNull()) {
+    return a.IsNull() && b.IsNull();
+  }
+  switch (a.type) {
+    case ValueType::kInt64:
+      return a.value.int_value == b.value.int_value;
+    case ValueType::kDate:
+      return a.value.int_value == b.value.int_value;
+    case ValueType::kDouble:
+      // Compare raw bits so -0.0 != +0.0 and distinct NaN payloads differ.
+      return std::bit_cast<uint64_t>(a.value.double_value) ==
+             std::bit_cast<uint64_t>(b.value.double_value);
+    case ValueType::kVarChar:
+      return a.value.varchar_value == b.value.varchar_value;
+    default:
+      return false;
+  }
 }
 
 Row NullRow(size_t cols) { return Row(std::vector<Value>(cols)); }
@@ -1896,6 +1928,7 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
       has_outer_row_ = true;
       matched_any_ = false;
       active_inner_rows_.clear();
+      active_inner_view_.reset();
       active_inner_idx_ = 0;
       active_inner_spill_.reset();
       reading_inner_spill_ = false;
@@ -1905,10 +1938,15 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
       if (inner_query_ != nullptr) {
         ++cache_probes_;
         bool cache_hit = false;
+        const size_t probe_hash =
+            relational_detail::GroupKeyTransparentHash{}(cur_outer_row_);
         for (size_t i = lru_cache_.size(); i > 0; --i) {
+          if (lru_cache_[i - 1].key_hash != probe_hash) {
+            continue;
+          }
           if (EqualRowsExact(lru_cache_[i - 1].key, cur_outer_row_)) {
             ++cache_hits_;
-            active_inner_rows_ = lru_cache_[i - 1].rows;
+            active_inner_view_ = lru_cache_[i - 1].rows;
             if (i != lru_cache_.size()) {
               LruEntry moved = std::move(lru_cache_[i - 1]);
               lru_cache_.erase(lru_cache_.begin() +
@@ -1954,8 +1992,9 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
               if (active_inner_spill_ != nullptr) {
                 return active_inner_spill_->AppendRow(r);
               }
-              if (!active_inner_rows_.empty() &&
-                  res_bytes + rb > cache_budget_bytes_) {
+              if (res_bytes + rb > cache_budget_bytes_) {
+                // A single row larger than the cache budget must spill too;
+                // keeping it resident silently drops it from the budget.
                 SpillableStore::Options sopts;
                 sopts.spill_store = &ctx->spill_store;
                 sopts.memory_budget_bytes = cache_budget_bytes_;
@@ -1988,11 +2027,18 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
               lru_bytes_ -= lru_cache_.front().bytes;
               lru_cache_.erase(lru_cache_.begin());
             }
+            // Move the freshly built rows into one immutable shared view:
+            // both the LRU entry and the active reader own this same buffer.
+            auto shared_rows = std::make_shared<const std::vector<Row>>(
+                std::move(active_inner_rows_));
+            active_inner_view_ = shared_rows;
             if (entry_bytes <= cache_budget_bytes_) {
               lru_bytes_ += entry_bytes;
-              lru_cache_.push_back(LruEntry{.key = cur_outer_row_,
-                                            .rows = active_inner_rows_,
-                                            .bytes = entry_bytes});
+              lru_cache_.push_back(LruEntry{
+                  .key = cur_outer_row_,
+                  .rows = std::move(shared_rows),
+                  .bytes = entry_bytes,
+                  .key_hash = probe_hash});
             }
           }
         }
@@ -2049,9 +2095,9 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
       }
     } else {
       bool stop_outer = false;
-      while (out->Size() < max_rows &&
-             active_inner_idx_ < active_inner_rows_.size()) {
-        const Row& ir = active_inner_rows_[active_inner_idx_++];
+      while (out->Size() < max_rows && active_inner_view_ != nullptr &&
+             active_inner_idx_ < active_inner_view_->size()) {
+        const Row& ir = (*active_inner_view_)[active_inner_idx_++];
         ASSIGN_OR_RETURN(bool, handled, consume_inner_row(ir));
         if (handled) {
           stop_outer = true;
@@ -2064,7 +2110,9 @@ StatusOr<bool> OocApplySource::NextBatch(PipelineContext* ctx, DataChunk* out,
     }
 
     const bool finished_inner =
-        !reading_inner_spill_ && active_inner_idx_ >= active_inner_rows_.size();
+        !reading_inner_spill_ &&
+        (active_inner_view_ == nullptr ||
+         active_inner_idx_ >= active_inner_view_->size());
     if (has_outer_row_ && finished_inner) {
       has_outer_row_ = false;
       if (!matched_any_) {

@@ -42,13 +42,17 @@ BitmapIndexScan::BitmapIndexScan(
       end_key_(end_key),
       index_read_guard_(index_read_guard) {}
 
-std::vector<RowPosition> BitmapIndexScan::ScanPositions() const {
+StatusOr<std::vector<RowPosition>> BitmapIndexScan::ScanPositions() const {
   std::vector<RowPosition> positions;
-  for (IndexScanIterator it(*table_, *index_, *txn_, begin_key_, end_key_, true,
-                            false, index_read_guard_);
-       it.IsValid(); ++it) {
+  IndexScanIterator it(*table_, *index_, *txn_, begin_key_, end_key_, true,
+                       false, index_read_guard_);
+  for (; it.IsValid(); ++it) {
     positions.push_back(it.Position());
   }
+  // A sticky page/IO error makes IsValid() false just like a clean exhaustion.
+  // This route materializes the whole position set before the heap is read,
+  // so a truncated set would silently return fewer rows. Fail closed.
+  RETURN_IF_FAIL(it.GetStatus());
   std::sort(positions.begin(), positions.end(), RowPositionComparator{});
   positions.erase(std::unique(positions.begin(), positions.end()),
                   positions.end());
@@ -76,6 +80,12 @@ size_t BitmapHeapScan::NextBatch(DataChunk* destination, size_t max_rows) {
   while (destination->Size() < max_rows && offset_ < positions_.size()) {
     const RowPosition pos = positions_[offset_++];
     StatusOr<Row> row_or = table_->Read(*txn_, pos);
+    if (row_or.GetStatus() == Status::kNotExists) {
+      // The row is invisible to this snapshot (e.g. a newer committed
+      // insert whose key reached this bitmap); drop it silently, matching
+      // IndexScanIterator::ResolveRow and the OocBitmapScanSource path.
+      continue;
+    }
     if (row_or.GetStatus() != Status::kSuccess) {
       FailWith(row_or.GetStatus());
       return destination->Size();

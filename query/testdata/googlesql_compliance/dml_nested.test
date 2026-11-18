@@ -29,7 +29,7 @@ ARRAY<STRUCT<primary_key INT64, int64_value INT64, array_value ARRAY<>>>[
 # Use a new table in case some engines don't support array-valued primary keys.
 #
 # We must annotate this [prepare_database] statement with
-# [required_features=GROUP_BY_ARRAY] in order to pass the compliace test
+# [required_features=GROUP_BY_ARRAY] in order to pass the compliance test
 # framework's validation that the first column can be thought of as a primary
 # key. As a result, the table will only be created for drivers that support
 # GROUP_BY_ARRAY, and it will only be visible to tests that require

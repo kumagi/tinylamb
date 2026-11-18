@@ -22,8 +22,8 @@ TEST(PlanMemoOracle, SeededIterationsPreserveMemoEquivalence) {
   for (uint32_t seed = 0; seed < kIterations; ++seed) {
     std::mt19937 rng(seed);
     const GeneratedJoinGraph graph = GenerateJoinGraph(rng);
-    EXPECT_TRUE(CheckExploreEquivalence(graph).empty())
-        << (seed != 0U) << CheckExploreEquivalence(graph);
+    const auto report = CheckExploreEquivalence(graph);
+    EXPECT_TRUE(report.empty()) << "seed=" << seed << " " << report;
     ++ran;
   }
   EXPECT_EQ(ran, kIterations);

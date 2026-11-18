@@ -126,12 +126,12 @@ for (const LookupRangeCandidate& range : ranges) {
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `OptimizerTest.IndexScanJoin`: 内部結合がインデックス結合として計画され、正常に実行されることを検証します。
   - `OptimizerTest.AliasedSelfJoinCanUseIndexNestedLoop`: 同一テーブルに対する別名自己結合において、関係キーの逆引きと `declared_output` のリネームが機能し、インデックス結合が成立することを検証します。
   - `OptimizerTest.IndexJoinRulePushesOneRangeBoundIntoTheProbe`: 等値 prefix の次の索引キー列に範囲 bound 1 個が probe に入り（`probe:{..., ProbeLeft.y > ProbeRight.b}`）、実行結果が鏡像と一致することを検証します。メモ経路ではなく規則を直接適用するのは、`l.x = r.a` に式書き換えの NULL 安全推論（`x = y → x = y AND x IS NOT NULL AND y IS NOT NULL`）が付き、その inferred conjunct が走査グループに push されて本規則が抑止されるためです。
   - `OptimizerTest.IndexJoinRuleAdoptsBothIntervalBoundsIntoTheProbe`: 下限と上限が揃ったとき probe が区間になり（`probe:{IntervalRight.a, IntervalLeft.lo < IntervalRight.b < IntervalLeft.hi}`）、両 conjunct が残差から消え、実行結果が鏡像と一致することを検証します。
   - `OptimizerTest.IndexJoinRuleKeepsUnprobedPredicatesResidual`: whitelist 外の型（FLOAT64）の範囲と索引非キー列の等値が probe に入らず残差 `Selection` になることと、行が鏡像と一致することを検証します。
 - `plan/plan_test.cpp`: `PlanTest.LookupProbeDerivesPrefixInIndexKeyOrder` / `PlanTest.LookupRangeAcceptsOnlyInt64AndDate`（片側の採用、反対側の 2 個目の採用と区間表記、同側の 2 個目・3 個目・位置違いの拒否）/ `PlanTest.LookupRangeRejectsNonWhitelistedKeyColumnType` / `PlanTest.LookupSeekIsAbsentWithoutALeadingKeyJoinColumn`（probe 導出と `SetLookupRange` の受入・拒否条件）。
-- `executor/executor_test.cpp`: `ExecutorTest.LookupJoin*`（等値 prefix＋範囲、区間（両側境界の順序交換・開閉端・NULL 上端）、重複キー、NULL/NaN bound、unique 短絡、空入力、非キー列等値、whitelist 拒否）。
-- `query/query_test.cpp`: `QueryTest.CompositeIndexLookupJoinRangeAndResidualSemantics` / `QueryTest.CompositeIndexLookupJoinIntervalProbe`（SQL 経路の回帰。鏡像 C++ と突き合わせる）。
+- `executor/executor_test_part1.cpp`: `ExecutorTest.LookupJoin*`（等値 prefix＋範囲、区間（両側境界の順序交換・開閉端・NULL 上端）、重複キー、NULL/NaN bound、unique 短絡、空入力、非キー列等値、whitelist 拒否）。
+- `query/query_test_part3.cpp`: `QueryTest.CompositeIndexLookupJoinRangeAndResidualSemantics` / `QueryTest.CompositeIndexLookupJoinIntervalProbe`（SQL 経路の回帰。鏡像 C++ と突き合わせる）。

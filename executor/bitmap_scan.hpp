@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
 #include "expression/expression.hpp"
 #include "index/index.hpp"
@@ -58,7 +59,7 @@ class BitmapIndexScan {
       const std::vector<Value>& begin_key, const std::vector<Value>& end_key,
       TransactionManager::IndexReadGuard* index_read_guard = nullptr);
 
-  [[nodiscard]] std::vector<RowPosition> ScanPositions() const;
+  [[nodiscard]] StatusOr<std::vector<RowPosition>> ScanPositions() const;
 
  private:
   Transaction* txn_;

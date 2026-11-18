@@ -76,8 +76,7 @@ class SqlAstFunctionSweepTest : public ::testing::Test {
     database_.reset();
   }
 
-  // Runs the statement on a private engine wrapper; pass nullptr as the
-  // engine to use one.
+  // Runs the statement on a fresh private engine.
   std::vector<Row> RunLocal(const std::string& sql) {
     SqlEngine local(*database_);
     return RunSql(&local, context_.get(), sql);

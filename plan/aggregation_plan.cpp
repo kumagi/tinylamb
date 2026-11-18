@@ -220,7 +220,15 @@ Schema AggregationPlan::GenerateSchema() const {
   std::vector<Column> columns;
   columns.reserve(group_keys_.size() + aggregates_.size());
   for (const auto& key : group_keys_) {
-    columns.emplace_back(key.name,
+    ColumnName col_name("", key.name);
+    if (key.expression && key.expression->Type() == TypeTag::kColumnValue) {
+      const ColumnName& expr_col =
+          key.expression->AsColumnValue().GetColumnName();
+      if (!expr_col.schema.empty() && key.name == expr_col.name) {
+        col_name = expr_col;
+      }
+    }
+    columns.emplace_back(col_name,
                          KeyValueType(key.expression, child_->GetSchema()));
   }
   for (const auto& agg : aggregates_) {

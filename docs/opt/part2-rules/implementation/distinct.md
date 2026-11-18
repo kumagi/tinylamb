@@ -84,4 +84,4 @@ return std::vector<PlanAlternative>{
 ## 検証テスト
 
 - `plan/plan_test.cpp` の `PlanTest.DistinctPlanUsesHashExecutorAndPreservesOrderingMetadata`: `DistinctPlan` が `HashDistinct` として表示され、推定行数および順序メタデータを正しく子から継承することを検証。
-- `plan/cascades_test.cpp` の `CascadesTest.FilterIsPushedBelowDistinct`: フィルタプッシュダウンと DISTINCT 演算の組み合わせが正しく機能することを検証。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.FilterIsPushedBelowDistinct`: フィルタプッシュダウンと DISTINCT 演算の組み合わせが正しく機能することを検証。

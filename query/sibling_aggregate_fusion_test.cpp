@@ -195,6 +195,44 @@ TEST_F(SiblingAggregateFusionTest, HavingLiftsToTheOuterScope) {
   ExpectSameMultiset(fused, expected);
 }
 
+TEST_F(SiblingAggregateFusionTest, MemberOrderByStaysUnfused) {
+  // A member's ORDER BY refers to its own output names, which the fusion
+  // renames to __fa*; the representative body would keep a now-unresolvable
+  // (or wrong ordinal) sort key. Such a member must be left unfused.
+  const auto unfused =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT a.g, a.n, b.total FROM "
+             "(SELECT g, COUNT(*) AS n FROM events GROUP BY g "
+             " ORDER BY n DESC) a "
+             "JOIN (SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+             "ON a.g = b.g;");
+  EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 0U);
+  const std::vector<Row> expected = {{Value(1), Value(2), Value(4)},
+                                     {Value(2), Value(3), Value(30)},
+                                     {Value(3), Value(1), Value(1)},
+                                     {Value(4), Value(1), Value(99)}};
+  ExpectSameMultiset(unfused, expected);
+}
+
+TEST_F(SiblingAggregateFusionTest, BaseQualifiedHavingStaysUnfused) {
+  // `HAVING events.g > 1` is legal in the member's own scope, but lifting it
+  // to the outer query would leave `events` unbound (the member source is
+  // replaced by __faggN). The rewrite must refuse rather than emit a dangling
+  // reference, and the plain join must still return the right rows.
+  const auto unfused =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT a.g, a.n, b.total FROM "
+             "(SELECT g, COUNT(*) AS n FROM events GROUP BY g "
+             " HAVING events.g > 1) a "
+             "JOIN (SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+             "ON a.g = b.g;");
+  EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 0U);
+  const std::vector<Row> expected = {{Value(2), Value(3), Value(30)},
+                                     {Value(3), Value(1), Value(1)},
+                                     {Value(4), Value(1), Value(99)}};
+  ExpectSameMultiset(unfused, expected);
+}
+
 TEST_F(SiblingAggregateFusionTest, DifferentGroupKeysStayUnfused) {
   RunSql(engine_.get(), context_.get(), "CREATE TABLE dim (h INT64, w INT64);");
   RunSql(engine_.get(), context_.get(),
@@ -256,6 +294,40 @@ TEST_F(SiblingAggregateFusionTest, ThreeSiblingsFuseAndKeepEveryAggregate) {
                      RunSql(engine_.get(), context_.get(),
                             "SELECT g, COUNT(*), SUM(v), MIN(v) FROM events "
                             "GROUP BY g;"));
+}
+
+TEST_F(SiblingAggregateFusionTest, CrossJoinMembersAreNotFused) {
+  // An unconditional CROSS JOIN of two grouped subqueries is not key-bound;
+  // fusion would collapse the cross product into one row per group.
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT a.g, a.n, b.total FROM "
+                           "(SELECT g, COUNT(*) AS n FROM events GROUP BY g) a, "
+                           "(SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+                           "ORDER BY a.g, b.total;");
+  EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 0U);
+  // Ground truth: the unfused cross product.
+  ExpectSameMultiset(
+      rows, RunSql(engine_.get(), context_.get(),
+                   "SELECT a.g, a.n, b.total FROM "
+                   "(SELECT g, COUNT(*) AS n FROM events GROUP BY g) a CROSS JOIN "
+                   "(SELECT g, SUM(v) AS total FROM events GROUP BY g) b;"));
+}
+
+TEST_F(SiblingAggregateFusionTest, NonKeyJoinMembersAreNotFused) {
+  // ON a.n = b.total equates aggregate outputs, not GROUP BY keys; fusion
+  // would rebind them to the same fused row and change the matched pairs.
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT a.g, a.n, b.g, b.total FROM "
+                           "(SELECT g, COUNT(*) AS n FROM events GROUP BY g) a "
+                           "JOIN (SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+                           "ON a.n = b.total;");
+  EXPECT_EQ(engine_->LastFusedSiblingAggregates(), 0U);
+  ExpectSameMultiset(
+      rows, RunSql(engine_.get(), context_.get(),
+                   "SELECT a.g, a.n, b.g, b.total FROM "
+                   "(SELECT g, COUNT(*) AS n FROM events GROUP BY g) a "
+                   "JOIN (SELECT g, SUM(v) AS total FROM events GROUP BY g) b "
+                   "ON a.n = b.total;"));
 }
 
 }  // namespace tinylamb

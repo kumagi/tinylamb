@@ -118,11 +118,8 @@ TEST(MergeAppendExecutorTest, MergesTwoSortedStreams) {
 
 TEST(MergeAppendExecutorTest, PreservesUnionAllMultiplicity) {
   auto out = RunMerge({{1, 1, 2}, {1, 3}});
-  // 5 rows total, non-decreasing (the static merge is stable per source).
-  ASSERT_EQ(out.size(), 5U);
-  for (size_t i = 1; i < out.size(); ++i) {
-    EXPECT_LE(out[i - 1], out[i]);
-  }
+  // 5 rows total, exact multiset: both sources' 1s must survive.
+  EXPECT_EQ(out, std::vector<int64_t>({1, 1, 1, 2, 3}));
 }
 
 TEST(MergeAppendExecutorTest, SingleSourcePassesThrough) {

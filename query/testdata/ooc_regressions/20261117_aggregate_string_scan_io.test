@@ -1,0 +1,7 @@
+-- sql_ooc_fuzzer regression
+-- seed: 130
+-- profile: pool=16384 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: sweep io / check strag(t#) mismatch :: op 2 `sweep io 61 :: check strag t1`: sweep io `check strag t1` with failure #3: check strag(t1) mismatch: SELECT g, LENGTH(STRING_AGG(t, ',' ORDER BY k DESC)), SUBSTR(STRING_AGG(t, ',' ORDER BY k DESC), 1, 24), COUNT(t) FROM t1 GROUP BY g ORDER BY g |   expected 25 rows, engine returned 0 |   row 0: expected [0|NULL|NULL|0] got [<none>] |   row 1: expected [1|79|dddd,dddd,dddd,dddd,dddd|16] got [<none>] |   row 2: expected [2|67|ccc,ccc,ccc,ccc,ccc,ccc,|17] got [<none>] |   row 3: expected [3|47|bb,bb,bb,bb,bb,bb,bb,bb,|16] got [<none>] |   row 4: expect
+create t1 25 156 1463 1000 1000000 0
+ins_bulk t1 1 402 570
+sweep io 61 :: check strag t1

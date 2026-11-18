@@ -45,6 +45,7 @@
 #include "table/iterator.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
+#include "table/tlcs_file.hpp"
 #include "transaction/transaction.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -83,7 +84,11 @@ void CompactFrequencies(std::vector<ValueFrequency>* frequencies) {
 
 struct ValueLess {
   bool operator()(const Value& left, const Value& right) const {
-    return left < right;
+    // The canonical ORDER BY total order: NaN has a fixed position and every
+    // comparison is defined, unlike IEEE `Value::operator<` where NaN is
+    // unordered — a non-strict-weak-order comparator would scatter NaN
+    // samples through `sorted` and break the sorted-list invariants below.
+    return CompareForOrderBy(left, right) < 0;
   }
 };
 
@@ -191,7 +196,7 @@ class ColumnCollector {
       if (left.count != right.count) {
         return left.count > right.count;
       }
-      return left.value < right.value;
+      return CompareForOrderBy(left.value, right.value) < 0;
     });
     if (result.most_common.size() > kMostCommonValueCount) {
       result.most_common.resize(kMostCommonValueCount);
@@ -274,7 +279,13 @@ class ColumnCollector {
   void TrackOrder(const Value& value) {
     if (has_prev_) {
       ++total_pairs_;
-      if (!(value < prev_)) {
+      // Correlation must certify the same total order ORDER BY elides a sort
+      // on: CompareForOrderBy ranks NaN before every other value, while the
+      // raw IEEE operator< makes every NaN-adjacent pair "ordered", so a
+      // chain with a mid-scan NaN would still report correlation 1.0 and the
+      // clustered-order proof would emit a wrong order (and a wrong row set
+      // under LIMIT).
+      if (CompareForOrderBy(prev_, value) <= 0) {
         ++ordered_pairs_;
       }
     }
@@ -288,7 +299,8 @@ class ColumnCollector {
     // one (equality follows the same order).  Interval-shaped varchars can
     // compare unequal byte-wise yet be equal as intervals, so they keep the
     // linear scan.
-    if (lowest_.size() == kBoundaryValueCount && lowest_.back().value < value &&
+    if (lowest_.size() == kBoundaryValueCount &&
+        CompareForOrderBy(lowest_.back().value, value) < 0 &&
         (value.type == ValueType::kInt64 || value.type == ValueType::kDouble ||
          value.type == ValueType::kDate)) {
       return;
@@ -298,7 +310,7 @@ class ColumnCollector {
         ++lowest_[i].count;
         return;
       }
-      if (value < lowest_[i].value) {
+      if (CompareForOrderBy(value, lowest_[i].value) < 0) {
         lowest_.insert(lowest_.begin() + static_cast<std::ptrdiff_t>(i),
                        ValueFrequency{.value = value, .count = 1});
         if (lowest_.size() > kBoundaryValueCount) {
@@ -314,7 +326,7 @@ class ColumnCollector {
 
   void TrackHighest(const Value& value) {
     if (highest_.size() == kBoundaryValueCount &&
-        value < highest_.back().value &&
+        CompareForOrderBy(value, highest_.back().value) < 0 &&
         (value.type == ValueType::kInt64 || value.type == ValueType::kDouble ||
          value.type == ValueType::kDate)) {
       return;
@@ -324,7 +336,7 @@ class ColumnCollector {
         ++highest_[i].count;
         return;
       }
-      if (highest_[i].value < value) {
+      if (CompareForOrderBy(highest_[i].value, value) < 0) {
         highest_.insert(highest_.begin() + static_cast<std::ptrdiff_t>(i),
                         ValueFrequency{.value = value, .count = 1});
         if (highest_.size() > kBoundaryValueCount) {
@@ -1173,13 +1185,12 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
   // away from `generation`, and a row that committed after the scan's snapshot
   // would be visible to a later reader without having been measured here.
   const uint64_t generation = target.LayoutGeneration();
-  if (std::shared_ptr<const LSTableStore> tlcs = target.GetLSTableStore();
-      tlcs != nullptr && tlcs->is_persistent_tlcs && generation != 0 &&
-      tlcs->layout_generation == generation &&
-      tlcs->first_pid == target.FirstPageId() &&
-      !target.RowsRewrittenInPlace() &&
-      !tlcs->serialized_column_stats.empty()) {
-    std::string stats_buf(tlcs->serialized_column_stats);
+  auto try_load_tlcs_stats = [&](std::string_view encoded,
+                                 uint64_t total_rows) -> bool {
+    if (encoded.empty() || generation == 0 || target.RowsRewrittenInPlace()) {
+      return false;
+    }
+    std::string stats_buf(encoded);
     std::stringstream ss(stats_buf);
     Decoder dec(ss);
     std::vector<ColumnStats> decoded;
@@ -1187,11 +1198,26 @@ Status TableStatistics::Update(Transaction& txn, const Table& target) {
     if (!dec.Failed() && dec.AtEnd() &&
         decoded.size() == schema.ColumnCount() &&
         target.LayoutGeneration() == generation) {
-      row_count_ = static_cast<size_t>(tlcs->total_rows);
+      row_count_ = static_cast<size_t>(total_rows);
       stats_ = std::move(decoded);
       layout_generation_ = generation;
-      return Status::kSuccess;
+      return true;
     }
+    return false;
+  };
+  if (std::shared_ptr<const LSTableStore> tlcs = target.GetLSTableStore();
+      tlcs != nullptr && tlcs->is_persistent_tlcs &&
+      tlcs->layout_generation == generation &&
+      tlcs->first_pid == target.FirstPageId() &&
+      try_load_tlcs_stats(tlcs->serialized_column_stats, tlcs->total_rows)) {
+    return Status::kSuccess;
+  }
+  if (std::shared_ptr<const TlcsFile> tlcs_file = target.GetBackingTLCSStore();
+      tlcs_file != nullptr && tlcs_file->LayoutGeneration() == generation &&
+      tlcs_file->FirstPageId() == target.FirstPageId() &&
+      try_load_tlcs_stats(tlcs_file->SerializedColumnStats(),
+                          tlcs_file->TotalRows())) {
+    return Status::kSuccess;
   }
   std::vector<ColumnCollector> collectors;
   collectors.reserve(schema.ColumnCount());
@@ -1619,6 +1645,60 @@ std::ostream& operator<<(std::ostream& out, const TableStatistics& stats) {
     out << column << "\n";
   }
   return out;
+}
+
+struct StreamingStatsCollector::Impl {
+  explicit Impl(const Schema& schema) {
+    types.reserve(schema.ColumnCount());
+    collectors.reserve(schema.ColumnCount());
+    for (slot_t i = 0; i < schema.ColumnCount(); ++i) {
+      const ValueType t = schema.GetColumn(i).Type();
+      types.push_back(t);
+      collectors.emplace_back(t);
+    }
+  }
+  std::vector<ValueType> types;
+  std::vector<ColumnCollector> collectors;
+  uint64_t row_count{0};
+};
+
+StreamingStatsCollector::StreamingStatsCollector(const Schema& schema)
+    : impl_(std::make_unique<Impl>(schema)) {}
+
+StreamingStatsCollector::~StreamingStatsCollector() = default;
+StreamingStatsCollector::StreamingStatsCollector(
+    StreamingStatsCollector&&) noexcept = default;
+StreamingStatsCollector& StreamingStatsCollector::operator=(
+    StreamingStatsCollector&&) noexcept = default;
+
+void StreamingStatsCollector::AddRow(const Row& row) {
+  ++impl_->row_count;
+  const size_t n = std::min(row.Count(), impl_->collectors.size());
+  for (size_t i = 0; i < n; ++i) {
+    impl_->collectors[i].Add(row[i]);
+  }
+}
+
+uint64_t StreamingStatsCollector::RowCount() const noexcept {
+  return impl_->row_count;
+}
+
+std::vector<ColumnStats> StreamingStatsCollector::FinishStats() const {
+  std::vector<ColumnStats> out;
+  out.reserve(impl_->collectors.size());
+  for (size_t i = 0; i < impl_->collectors.size(); ++i) {
+    CollectedColumn collected = impl_->collectors[i].Finish();
+    out.push_back(ColumnStats::FromRawParts(
+        impl_->types[i], collected.non_null_count, collected.null_count,
+        collected.distinct_count, std::move(collected.histogram),
+        std::move(collected.lowest), std::move(collected.highest),
+        std::move(collected.most_common), collected.correlation));
+  }
+  return out;
+}
+
+std::string StreamingStatsCollector::FinishEncoded() const {
+  return Encode(FinishStats());
 }
 
 }  // namespace tinylamb

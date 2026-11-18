@@ -331,6 +331,29 @@ bool LookupJoin::NextRow(Row* dst) {
     }
     const Row& left_key = left_key_result.Value();
     Row right_row = **right_it_;
+    if (!right_it_->IsValid()) {
+      if (right_it_->GetStatus() != Status::kSuccess) {
+        return FailWith(right_it_->GetStatus());
+      }
+      hold_left_.Clear();
+      if (!Load()) {
+        return false;
+      }
+      continue;
+    }
+    if (!right_row.IsValid()) {
+      ++*right_it_;
+      if (!right_it_->IsValid()) {
+        if (right_it_->GetStatus() != Status::kSuccess) {
+          return FailWith(right_it_->GetStatus());
+        }
+        hold_left_.Clear();
+        if (!Load()) {
+          return false;
+        }
+      }
+      continue;
+    }
     const auto right_key_result = right_row.TryExtract(right_cols_);
     if (!right_key_result.HasValue()) {
       FailWith(right_key_result.GetStatus());

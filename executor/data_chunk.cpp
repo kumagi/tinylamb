@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -383,6 +385,308 @@ void ColumnVector::AppendBoolBatch(const uint8_t* bits, size_t count) {
   int64_t* out = integers_.data() + old_size;
   for (size_t i = 0; i < count; ++i) {
     out[i] = bits[i] != 0 ? 1 : 0;
+  }
+}
+
+void ColumnVector::AppendNullBatch(size_t count, ZoneMap* zone_map) {
+  if (count == 0) {
+    return;
+  }
+  const size_t old_size = size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  if (old_size == 0 && (count % 64) == 0) {
+    std::fill(null_bitmap_.begin(), null_bitmap_.end(), ~uint64_t{0});
+  } else {
+    for (size_t i = 0; i < count; ++i) {
+      null_bitmap_[(old_size + i) / 64] |= uint64_t{1} << ((old_size + i) % 64);
+    }
+  }
+  if (heterogeneous_) {
+    nested_.resize(size_);
+  } else {
+    switch (type_) {
+      case ValueType::kInt64:
+      case ValueType::kDate:
+        integers_.resize(size_, 0);
+        break;
+      case ValueType::kDouble:
+        doubles_.resize(size_, 0.0);
+        break;
+      case ValueType::kVarChar:
+        strings_.resize(size_);
+        break;
+      case ValueType::kArray:
+        nested_.resize(size_);
+        break;
+      case ValueType::kNull:
+        break;
+    }
+  }
+  if (zone_map != nullptr) {
+    zone_map->AddNulls(count);
+  }
+}
+
+void ColumnVector::AppendIntBatch(ValueType type, bool is_unsigned,
+                                  const int64_t* values, const uint8_t* nulls,
+                                  size_t count, ZoneMap* zone_map) {
+  if (count == 0) {
+    return;
+  }
+  if (!heterogeneous_ && type_ == ValueType::kNull) {
+    type_ = type;
+    unsigned_ = is_unsigned;
+    MaterializeInferredStorage();
+  }
+  if (heterogeneous_ || type_ != type || unsigned_ != is_unsigned) {
+    for (size_t i = 0; i < count; ++i) {
+      Value v;
+      if (nulls == nullptr || nulls[i] == 0) {
+        if (type == ValueType::kDate) {
+          v = Value::DateFromDays(values[i]);
+        } else {
+          v = Value(values[i]);
+          if (is_unsigned) {
+            v.SetUnsigned();
+          }
+        }
+      }
+      if (zone_map != nullptr) {
+        zone_map->Add(v);
+      }
+      Append(std::move(v));
+    }
+    return;
+  }
+  const size_t old_size = size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  integers_.resize(size_);
+  std::memcpy(integers_.data() + old_size, values, count * sizeof(int64_t));
+  if (nulls == nullptr) {
+    if (zone_map != nullptr) {
+      if (is_unsigned) {
+        for (size_t i = 0; i < count; ++i) {
+          Value v(values[i]);
+          v.SetUnsigned();
+          zone_map->Add(v);
+        }
+      } else {
+        int64_t mn = values[0];
+        int64_t mx = values[0];
+        for (size_t i = 1; i < count; ++i) {
+          mn = std::min(mn, values[i]);
+          mx = std::max(mx, values[i]);
+        }
+        if (type == ValueType::kDate) {
+          zone_map->AddDateRange(mn, mx, count);
+        } else {
+          zone_map->AddIntRange(mn, mx, count);
+        }
+      }
+    }
+    return;
+  }
+  size_t null_cnt = 0;
+  size_t non_null = 0;
+  int64_t mn = 0;
+  int64_t mx = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (nulls[i] != 0) {
+      null_bitmap_[(old_size + i) / 64] |= uint64_t{1} << ((old_size + i) % 64);
+      ++null_cnt;
+    } else if (zone_map != nullptr) {
+      if (is_unsigned) {
+        Value v(values[i]);
+        v.SetUnsigned();
+        zone_map->Add(v);
+      } else {
+        if (non_null == 0) {
+          mn = mx = values[i];
+        } else {
+          mn = std::min(mn, values[i]);
+          mx = std::max(mx, values[i]);
+        }
+        ++non_null;
+      }
+    }
+  }
+  if (zone_map != nullptr) {
+    if (null_cnt > 0) {
+      zone_map->AddNulls(null_cnt);
+    }
+    if (!is_unsigned && non_null > 0) {
+      if (type == ValueType::kDate) {
+        zone_map->AddDateRange(mn, mx, non_null);
+      } else {
+        zone_map->AddIntRange(mn, mx, non_null);
+      }
+    }
+  }
+}
+
+void ColumnVector::AppendDoubleBatch(const double* values, const uint8_t* nulls,
+                                     size_t count, ZoneMap* zone_map) {
+  if (count == 0) {
+    return;
+  }
+  if (!heterogeneous_ && type_ == ValueType::kNull) {
+    type_ = ValueType::kDouble;
+    unsigned_ = false;
+    MaterializeInferredStorage();
+  }
+  if (heterogeneous_ || type_ != ValueType::kDouble || unsigned_) {
+    for (size_t i = 0; i < count; ++i) {
+      Value v =
+          (nulls != nullptr && nulls[i] != 0) ? Value() : Value(values[i]);
+      if (zone_map != nullptr) {
+        zone_map->Add(v);
+      }
+      Append(std::move(v));
+    }
+    return;
+  }
+  const size_t old_size = size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  doubles_.resize(size_);
+  std::memcpy(doubles_.data() + old_size, values, count * sizeof(double));
+  size_t null_cnt = 0;
+  size_t non_null = 0;
+  bool has_bounds = false;
+  bool saw_nan = false;
+  double mn = 0.0;
+  double mx = 0.0;
+  if (nulls == nullptr) {
+    non_null = count;
+    if (zone_map != nullptr) {
+      for (size_t i = 0; i < count; ++i) {
+        const double d = values[i];
+        if (std::isnan(d)) {
+          saw_nan = true;
+        } else if (!has_bounds) {
+          has_bounds = true;
+          mn = mx = d;
+        } else {
+          mn = std::min(mn, d);
+          mx = std::max(mx, d);
+        }
+      }
+    }
+  } else {
+    for (size_t i = 0; i < count; ++i) {
+      if (nulls[i] != 0) {
+        null_bitmap_[(old_size + i) / 64] |= uint64_t{1}
+                                             << ((old_size + i) % 64);
+        ++null_cnt;
+      } else {
+        ++non_null;
+        if (zone_map != nullptr) {
+          const double d = values[i];
+          if (std::isnan(d)) {
+            saw_nan = true;
+          } else if (!has_bounds) {
+            has_bounds = true;
+            mn = mx = d;
+          } else {
+            mn = std::min(mn, d);
+            mx = std::max(mx, d);
+          }
+        }
+      }
+    }
+  }
+  if (zone_map != nullptr) {
+    if (null_cnt > 0) {
+      zone_map->AddNulls(null_cnt);
+    }
+    if (non_null > 0) {
+      zone_map->AddDoubleRange(mn, mx, has_bounds, saw_nan, non_null);
+    }
+  }
+}
+
+void ColumnVector::AppendStringViewBatch(const std::string_view* values,
+                                         const uint8_t* nulls, size_t count,
+                                         ZoneMap* zone_map) {
+  if (count == 0) {
+    return;
+  }
+  if (!heterogeneous_ && type_ == ValueType::kNull) {
+    type_ = ValueType::kVarChar;
+    unsigned_ = false;
+    MaterializeInferredStorage();
+  }
+  if (heterogeneous_ || type_ != ValueType::kVarChar) {
+    for (size_t i = 0; i < count; ++i) {
+      Value v = (nulls != nullptr && nulls[i] != 0)
+                    ? Value()
+                    : Value(std::string(values[i]));
+      if (zone_map != nullptr) {
+        zone_map->Add(v);
+      }
+      Append(std::move(v));
+    }
+    return;
+  }
+  const size_t old_size = size_;
+  size_ = old_size + count;
+  null_bitmap_.resize((size_ + 63) / 64, 0);
+  strings_.reserve(size_);
+  size_t null_cnt = 0;
+  size_t non_null = 0;
+  std::string_view mn;
+  std::string_view mx;
+  if (nulls == nullptr) {
+    for (size_t i = 0; i < count; ++i) {
+      strings_.emplace_back(values[i]);
+      if (zone_map != nullptr) {
+        if (i == 0) {
+          mn = mx = values[0];
+        } else {
+          if (values[i] < mn) {
+            mn = values[i];
+          }
+          if (mx < values[i]) {
+            mx = values[i];
+          }
+        }
+      }
+    }
+    non_null = count;
+  } else {
+    for (size_t i = 0; i < count; ++i) {
+      if (nulls[i] != 0) {
+        null_bitmap_[(old_size + i) / 64] |= uint64_t{1}
+                                             << ((old_size + i) % 64);
+        strings_.emplace_back();
+        ++null_cnt;
+      } else {
+        strings_.emplace_back(values[i]);
+        if (zone_map != nullptr) {
+          if (non_null == 0) {
+            mn = mx = values[i];
+          } else {
+            if (values[i] < mn) {
+              mn = values[i];
+            }
+            if (mx < values[i]) {
+              mx = values[i];
+            }
+          }
+        }
+        ++non_null;
+      }
+    }
+  }
+  if (zone_map != nullptr) {
+    if (null_cnt > 0) {
+      zone_map->AddNulls(null_cnt);
+    }
+    if (non_null > 0) {
+      zone_map->AddStringRange(mn, mx, non_null);
+    }
   }
 }
 
@@ -833,6 +1137,15 @@ void DataChunk::AppendGather(const DataChunk& source, const uint32_t* selection,
     positions_[old_size + i] = source.PositionAt(selection[i]);
   }
   size_ += count;
+}
+
+void DataChunk::CommitBatchAppend(size_t appended_rows) {
+  if (appended_rows == 0) {
+    return;
+  }
+  rebind_on_first_row_ = false;
+  positions_.resize(size_ + appended_rows);
+  size_ += appended_rows;
 }
 
 Row DataChunk::RowAt(size_t row_index) const {

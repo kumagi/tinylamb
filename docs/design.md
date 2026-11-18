@@ -1,7 +1,6 @@
 # tinylamb 設計判断記録
 
-本書は、2026-08 の全コード精査
-([docs/bug_audit_2026-08.md](bug_audit_2026-08.md)) で特定した、正しさ・耐久性・
+本書は、2026-08 の全コード精査（旧 `docs/bug_audit_2026-08.md`、アーカイブ削除済み）で特定した、正しさ・耐久性・
 再起動互換性に関わる設計判断を記録する。2026-09-02 に以下の方針をベースライン
 として承認した。以後の実装、コードレビュー、テスト、性能評価は本書を参照する。
 
@@ -50,9 +49,9 @@
 - D1: `LoggerTest.D1NoRecordsInterleavedAcrossProducers` / `D1RejectsRecordOverMaxSize`
 - D2/D3/D10: `RecoveryManagerTest.ReplaysCommittedAndIgnoresUncommittedLosers`、`PageManagerTest.UnboundedRowBlockInsertUpdateDeleteAndFuzzyCheckpoint`、`CheckpointManagerTest.FuzzyCheckpointWithInFlightAndPostCheckpointTxns`、`CatalogTest.DropTableCrashRecoveryReclaimsPages`
 - D4: `docs/commit_durability.md` と `LoggerTest.WaitForDurableObservesFsync`
-- D5: `plan/cascades_test.cpp` と `executor/relational_regression_test.cpp`
+- D5: `plan/cascades_test_part*.cpp` (`cascades_test`) と `executor/relational_regression_test_part*.cpp` (`relational_regression_test`)
 - D6/D7: `expression/rewrite_test.cpp` / `bytecode_test.cpp` / `differential_test.cpp`
-- D8: `executor/relational_regression_test.cpp`
+- D8: `executor/relational_regression_test_part*.cpp` (`relational_regression_test`)
 - D9: `LogRecordTest.RoundTripSerialization` と `recovery/logger_test.cpp`。旧形式互換・旧 B+Tree の削除済みテストを現行の検証根拠に数えない。
 - D11: 旧 B+Tree の構造変更に関する記録。現行 `LsmIndex` の検証は `index/lsm_index_test.cpp` を参照。
 
@@ -419,7 +418,7 @@ join実行基盤、D5〜D7は最適化経路の意味論、D9〜D11は形式・�
   確認してから回収する。
 - 理由: foster chainを壊してsubtreeを孤児化する誤ったliftを防ぎ、既存の削除・挿入・
   前後走査の構造を維持する。
-- 実装範囲: `index/b_plus_tree.cpp`、`page/branch_page.cpp`、root縮退・ページ回収、
+- 実装範囲: LSM 索引 (`index/lsm_index.*`) のルート縮退・ページ回収、
   `SanityCheckForTest`を用いた回帰・fuzzテスト。
 
 ### 守る不変条件

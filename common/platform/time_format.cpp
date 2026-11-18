@@ -133,6 +133,8 @@ size_t FormatTime(char* out, size_t size, const char* format,
 #endif
 }
 
+long TmGmtoff(const struct tm* tm) noexcept { return tm->tm_gmtoff; }
+
 #else
 
 namespace {
@@ -158,6 +160,12 @@ long GetTmGmtoff(const struct tm* tm) {
 #endif
 }
 
+}  // namespace
+
+long TmGmtoff(const struct tm* tm) noexcept { return GetTmGmtoff(tm); }
+
+namespace {
+
 const char* GetTmZone(const struct tm* tm) {
 #if !defined(_WIN32)
   return tm->tm_zone;
@@ -181,7 +189,7 @@ const char* ParseOffset(const char* rp, struct tm* tm) {
   while (digits < 4 && IsDigit(*rp)) {
     value = value * 10 + (*rp++ - '0');
     ++digits;
-    if (*rp == ':' && digits == 2 && IsDigit(rp[1])) ++rp;
+    if (*rp == ':' && digits >= 1 && IsDigit(rp[1])) ++rp;
   }
   if (digits == 2) {
     value *= 100;
@@ -292,7 +300,8 @@ const char* PortableStrptime(const char* rp, const char* fmt, struct tm* tm) {
         int y = 0;
         rp = ParseIntField(rp, 2, 0, 99, &y);
         if (rp == nullptr) return nullptr;
-        tm->tm_year = (y >= 69 ? y : y + 100);
+        // GoogleSQL interprets a two-digit year as 2000 + yy.
+        tm->tm_year = y + 100;
         break;
       }
       case 'C': {

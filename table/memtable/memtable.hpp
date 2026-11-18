@@ -206,8 +206,8 @@ class MemTable final {
   static std::vector<std::pair<std::string, RowEntry>> SnapshotShard(
       const Shard& s, uint64_t max_visible_version);
 
-  // Stored by VALUE (same contract as FullScanIterator / LsmView): callers
-  // routinely pass a temporary or a Schema resolved from a SchemaRegistry
+  // Stored by VALUE (same contract as FullScanIterator / IndexScanIterator): callers
+  // routinely pass a temporary or a Schema resolved from the catalog
   // that is only valid for a scope; a reference member would dangle
   // silently on the first Put(). Schema is cheap to copy.
   const Schema schema_;

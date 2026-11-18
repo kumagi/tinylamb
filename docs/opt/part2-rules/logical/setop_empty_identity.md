@@ -106,4 +106,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `EmptySetOperationBranchesUseIdentityAlternatives`: UNION ALL、EXCEPT ALL、UNION、EXCEPT の各演算子に空分岐を配置し、生き残り分岐（`kScan`）または `kDistinct` の代替式が適切に生成されることを一括検証します。
+- `plan/cascades_test_part*.cpp` の `EmptySetOperationBranchesUseIdentityAlternatives`: UNION ALL、EXCEPT ALL、UNION、EXCEPT の各演算子に空分岐を配置し、生き残り分岐（`kScan`）または `kDistinct` の代替式が適切に生成されることを一括検証します。

@@ -377,7 +377,7 @@ ARRAY<STRUCT<primary_key INT64, col STRING>>[known order:
 ]
 ==
 
-# In german language 'ss' is equal to 'ß'.
+# In German language 'ss' is equal to 'ß'.
 [name=orderby_collate_german]
 select primary_key, col
 from (select 1 primary_key, "ßd" col UNION ALL
@@ -534,5 +534,5 @@ FROM (
 ARRAY<STRUCT<INT64>>[{3}]
 ==
 
-# TODO: Add more non-english language cases.
+# TODO: Add more non-English language cases.
 

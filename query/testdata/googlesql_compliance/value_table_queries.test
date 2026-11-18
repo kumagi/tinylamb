@@ -257,7 +257,7 @@ ARRAY<PROTO<googlesql_test.KitchenSinkPB>>[
   }
 ]
 ==
-# Select and filter objects from a value table, outputing a value table.
+# Select and filter objects from a value table, outputting a value table.
 [name=value_table_in_out_filter_proto]
 select AS VALUE v
 FROM KitchenSinkValueTable v

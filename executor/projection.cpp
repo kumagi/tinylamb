@@ -248,6 +248,9 @@ Projection::Projection(std::vector<NamedExpression> expressions,
     state.eligible = BytecodeEnabled() &&
                      Affine(expressions_[index].expression, input_schema_,
                             &state.column, &state.multiplier, &state.addend);
+    state.branchless_eligible =
+        BytecodeEnabled() && bytecodes_[index].has_value() &&
+        bytecodes_[index]->ResultType() == ValueType::kInt64;
   }
 }
 
@@ -290,17 +293,102 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
     }
     expression_input = &cse_input_batch_;
   }
+  const Schema& active_schema =
+      cse_bytecodes_.empty() ? input_schema_ : augmented_schema_;
   std::vector<std::optional<ColumnVector>> evaluated(expressions_.size());
   for (size_t index = 0; index < bytecodes_.size(); ++index) {
     JitProjectionState& jit = jit_states_[index];
     jit.rows_seen += expression_input->Size();
-    if (jit.eligible && !jit.attempted && cse_bytecodes_.empty() &&
+    if ((jit.eligible || jit.branchless_eligible) && !jit.attempted &&
         jit.rows_seen >= jit_threshold_rows_) {
       jit.attempted = true;
-      jit.kernel = JitInt64Kernels::CompileProjectionChecked();
-      if (!jit.kernel) {
-        jit.kernel = JitInt64Kernels::CompileProjection();
+      if (jit.eligible && cse_bytecodes_.empty()) {
+        jit.kernel = JitInt64Kernels::CompileProjectionChecked();
+        if (!jit.kernel) {
+          jit.kernel = JitInt64Kernels::CompileProjection();
+        }
       }
+      // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
+      //   (if_conversion_sound_and_complete,
+      //   zonemap_interval_mul_4corners_sound)
+      if (jit.branchless_eligible && bytecodes_[index].has_value()) {
+        jit.branchless =
+            JitBranchlessProgram::Compile(*bytecodes_[index], active_schema);
+      }
+    }
+    bool handled_by_branchless = false;
+    if (jit.branchless && expression_input->HasLayout(active_schema)) {
+      const auto& ref_cols = jit.branchless->ReferencedColumns();
+      bool layout_ok = true;
+      for (uint16_t col_idx : ref_cols) {
+        const ColumnVector& col = expression_input->ColumnAt(col_idx);
+        if (col.Type() != ValueType::kInt64 || col.IsUnsigned() ||
+            col.IsHeterogeneous()) {
+          layout_ok = false;
+          break;
+        }
+      }
+      if (layout_ok) {
+        const size_t n_rows = expression_input->Size();
+        if (jit_null_scratch_.size() < ref_cols.size()) {
+          jit_null_scratch_.resize(ref_cols.size());
+        }
+        jit_col_inputs_.resize(ref_cols.size());
+        bool any_col_nulls = false;
+        for (size_t u = 0; u < ref_cols.size(); ++u) {
+          const uint16_t col_idx = ref_cols[u];
+          const ColumnVector& col = expression_input->ColumnAt(col_idx);
+          const ZoneMap& zone = expression_input->ZoneMapAt(col_idx);
+          const bool has_nulls = !zone.Initialized() || zone.NullCount() > 0;
+          any_col_nulls = any_col_nulls || has_nulls;
+          const uint8_t* null_ptr = nullptr;
+          if (has_nulls) {
+            jit_null_scratch_[u].resize(n_rows);
+            UnpackNullBitmapToBytes(col.NullBitmap(), n_rows,
+                                    jit_null_scratch_[u].data());
+            null_ptr = jit_null_scratch_[u].data();
+          }
+          const bool has_bounds =
+              zone.Initialized() && zone.ValueCount() > 0 &&
+              zone.Minimum().has_value() && zone.Maximum().has_value() &&
+              zone.Minimum()->type == ValueType::kInt64 &&
+              zone.Maximum()->type == ValueType::kInt64 &&
+              !zone.Minimum()->IsUnsigned() && !zone.Maximum()->IsUnsigned();
+          jit_col_inputs_[u] = {
+              .values = col.IntegerData().data(),
+              .nulls = null_ptr,
+              .has_nulls = has_nulls,
+              .has_bounds = has_bounds,
+              .min_value = has_bounds ? zone.Minimum()->value.int_value : 0,
+              .max_value = has_bounds ? zone.Maximum()->value.int_value : 0};
+        }
+        // Prefer `jit.branchless` when the expression goes beyond 1-col
+        // non-null affine, when NULLs are present, or when ZoneMap proves the
+        // batch overflow-free (unlocking pure `nsw` AVX2 SIMD + memcpy output).
+        const bool use_branchless =
+            !jit.kernel.has_value() || any_col_nulls ||
+            jit.branchless->ProveOverflowFree(jit_col_inputs_);
+        if (use_branchless) {
+          jit_out_values_.resize(n_rows);
+          jit_out_nulls_.resize(n_rows);
+          bool has_any_null = false;
+          if (jit.branchless->Evaluate(jit_col_inputs_, n_rows,
+                                       jit_out_values_.data(),
+                                       jit_out_nulls_.data(), &has_any_null)) {
+            ColumnVector& evaluated_column =
+                evaluated[index].emplace(ValueType::kInt64, n_rows);
+            evaluated_column.AppendIntBatch(
+                ValueType::kInt64, /*is_unsigned=*/false,
+                jit_out_values_.data(),
+                has_any_null ? jit_out_nulls_.data() : nullptr, n_rows);
+            ++jit_batches_;
+            handled_by_branchless = true;
+          }
+        }
+      }
+    }
+    if (handled_by_branchless) {
+      continue;
     }
     // The JIT kernel reads raw signed-int64 storage.  Fire only when the
     // runtime batch really has that layout (signed INT64, no NULLs);
@@ -430,7 +518,8 @@ size_t Projection::NextBatch(DataChunk* destination, size_t max_rows) {
   return destination->Size();
 }
 
-void Projection::Dump(std::ostream& o, int indent) const {
+void Projection::DumpHeader(std::ostream& o, int indent,
+                            bool leading_indent) const {
   std::unordered_map<std::string, size_t> dump_cse_counts;
   std::unordered_map<std::string, Expression> dump_cse_samples;
   size_t case_count = 0;
@@ -445,9 +534,20 @@ void Projection::Dump(std::ostream& o, int indent) const {
       repeated_key = key;
     }
   }
+  const std::string pad = Indent(static_cast<size_t>(std::max(0, indent)));
+  auto write_pad = [&](bool first) {
+    if (!first || leading_indent) {
+      o << pad;
+    }
+  };
+  bool first_line = true;
   if (case_count >= 2) {
+    write_pad(first_line);
+    first_line = false;
     o << "ComputeScalar CASE uses=2\n";
   } else if (!repeated_key.empty()) {
+    write_pad(first_line);
+    first_line = false;
     const TypeTag type = dump_cse_samples.at(repeated_key)->Type();
     if (type == TypeTag::kCaseExp) {
       o << "ComputeScalar CASE uses=" << dump_cse_counts.at(repeated_key)
@@ -457,8 +557,7 @@ void Projection::Dump(std::ostream& o, int indent) const {
         << "\n";
     }
   }
-  std::ostringstream child_dump;
-  src_->Dump(child_dump, indent + 2);
+  write_pad(first_line);
   o << "Projection: [";
   for (size_t i = 0; i < expressions_.size(); ++i) {
     if (0 < i) {
@@ -466,7 +565,14 @@ void Projection::Dump(std::ostream& o, int indent) const {
     }
     o << expressions_[i];
   }
-  o << "]\n" << Indent(static_cast<size_t>(indent) + 2) << child_dump.str();
+  o << "]";
+}
+
+void Projection::Dump(std::ostream& o, int indent) const {
+  std::ostringstream child_dump;
+  src_->Dump(child_dump, indent + 2);
+  DumpHeader(o, indent, /*leading_indent=*/false);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2) << child_dump.str();
 }
 
 }  // namespace tinylamb

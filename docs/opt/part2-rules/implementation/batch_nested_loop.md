@@ -110,5 +110,5 @@ return {PlanAlternative{.plan = std::move(join),
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopExecutesNonEquiInnerJoin`: タプル版を無効化した際に `BatchNestedLoopJoin` が正しく選択され、同一の結合結果を出力することの確認。
-- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopGateKeepsEquiJoins`: 等値結合に対してはゲートが働き、ブロック化入れ子ループが誤って適用されないことの検証。
+- `plan/optimizer_test_part2.cpp` の `OptimizerTest.BatchNestedLoopExecutesNonEquiInnerJoin`: タプル版を無効化した際に `BatchNestedLoopJoin` が正しく選択され、同一の結合結果を出力することの確認。
+- `plan/optimizer_test_part2.cpp` の `OptimizerTest.BatchNestedLoopGateKeepsEquiJoins`: 等値結合に対してはゲートが働き、ブロック化入れ子ループが誤って適用されないことの検証。

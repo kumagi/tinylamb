@@ -50,6 +50,10 @@ struct DiffOracleStats {
   int subset_checks{0};
   int dqp_queries{0};
   int radar_queries{0};
+  // Iterations that ran no query at all because the harness database could
+  // not be created (ScopedDb quota exhaustion). Kept separate so a skipped
+  // iteration is never bulk-counted as "all arms agreed".
+  int skipped{0};
 };
 
 std::string RunTqsIteration(std::mt19937& rng, bool verbose,
@@ -65,8 +69,13 @@ std::string RunRadarIteration(std::mt19937& rng, bool verbose,
                               DiffOracleStats* stats = nullptr,
                               DiffOracleTrace* trace = nullptr);
 
+// Replays the trace and returns the mismatch report ("" when every executed
+// arm agreed). `skipped`, when non-null, is set when no query ran because a
+// database could not be created: the report is still "" there, so callers
+// that bulk-add per-iteration query counts must consult it first.
 std::string ReplayDiffOracleTrace(const DiffOracleTrace& trace,
-                                  bool verbose = false);
+                                  bool verbose = false,
+                                  bool* skipped = nullptr);
 
 std::string SerializeDiffOracleTest(uint64_t seed, const DiffOracleTrace& trace,
                                     const std::string& failure_summary);

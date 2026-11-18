@@ -62,7 +62,7 @@ struct LookupSeek {
 // bounds (`right < bound` / `right <= bound`).
 [[nodiscard]] bool IsLowerLookupRange(BinaryOperation operation);
 
-// Range-probe whitelist for the index nested-loop join. The seek range is only
+// Range-probe allowlist for the index nested-loop join. The seek range is only
 // an enclosure (the executor re-checks the comparison per candidate), so a
 // bound is admissible exactly when its memcomparable encoding orders the way
 // Value::operator< does for the same type. INT64 and DATE are the signed
@@ -223,6 +223,8 @@ class ProductPlan final : public PlanBase {
   [[nodiscard]] const std::optional<LookupSeek>& Lookup() const {
     return lookup_seek_;
   }
+  [[nodiscard]] const Table* RightTable() const { return right_tbl_; }
+  [[nodiscard]] const Index* RightIndex() const { return right_idx_; }
   // Extends the derived equality prefix with a range bound on the first
   // unpinned index key column. Returns false (and leaves the plan unchanged)
   // when the range cannot be probed safely -- the caller then keeps the
@@ -272,7 +274,7 @@ class ProductPlan final : public PlanBase {
     JoinKind kind, size_t left_rows, size_t right_rows,
     std::optional<size_t> match_rows = std::nullopt);
 
-// ---- Hash semi reduction (Phase 2 "Hash Semi Reduction") --------------------
+// ---- Hash semi reduction ----------------------------------------------------
 // An existence-only (semi / anti / null-aware anti) join emits just the probe
 // side, so its hash build is a pure membership test over the join key. The
 // helpers below estimate how many build rows the probe side's key domain can

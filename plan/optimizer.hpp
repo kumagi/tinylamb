@@ -39,9 +39,9 @@ struct OptimizerOptions {
   ExpressionRuleSet expression_rules;
   std::vector<cascades::ImplementationRule> extra_implementation_rules;
   std::unordered_set<std::string> disabled_implementation_rules;
-  // Phase 5 access-path hint applied to the root physical properties.
+  // Access-path hint applied to the root physical properties.
   cascades::AccessMethod access_method{cascades::AccessMethod::kAny};
-  // Phase 9 diagnostics: log the explored memo and the chosen plan.
+  // Diagnostics: log the explored memo and the chosen plan.
   bool dump_memo{false};
   // Exploration budget: maximum logical rule applications during Explore
   // (0 = unlimited, still guarded by the worklist step cap). Exhaustion

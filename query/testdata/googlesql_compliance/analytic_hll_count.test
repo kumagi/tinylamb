@@ -246,7 +246,7 @@ ARRAY<STRUCT<row_id INT64, BYTES>>[known order:
 ]
 ==
 
-[name=analytic_hll_count_merge_partial_over_range_unbounded_and_proceding]
+[name=analytic_hll_count_merge_partial_over_range_unbounded_and_proceeding]
 SELECT row_id, HLL_COUNT.MERGE_PARTIAL(sketch) OVER (ORDER BY row_id RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
 FROM (
   SELECT cast(1 as int64) as row_id,

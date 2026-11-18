@@ -3,19 +3,28 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "common/random_string.hpp"
+#include "common/status_or.hpp"
+#include "database/database.hpp"
+#include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
+#include "executor/detail/typed_stream_aggregate_internal.hpp"
 #include "expression/aggregate_expression.hpp"
 #include "expression/binary_expression.hpp"
 #include "expression/case_expression.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
 #include "expression/expression.hpp"
+#include "query/googlesql_frontend.hpp"
+#include "query/sql_engine.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -51,6 +60,46 @@ Schema MakeScanSchema() {
                     Column(ColumnName("l_tax"), ValueType::kDouble),
                     Column(ColumnName("l_shipmode"), ValueType::kVarChar),
                 });
+}
+
+TEST(TypedStreamAggregateTest, VarcharRunEndOffsetsCrossFourGiB) {
+  if (sizeof(size_t) <= sizeof(uint32_t)) {
+    GTEST_SKIP() << "The backing vector cannot exceed 4 GiB on this platform";
+  }
+  relational_detail::BaseRelationArena::VarcharRun run;
+  const auto four_gib = static_cast<size_t>(uint64_t{1} << 32);
+  // Exercise the rebase used by both append paths without reserving 4 GiB.
+  run.AppendEnd(four_gib - 3, 1);
+  run.AppendEnd(four_gib - 3, 5);
+  run.AppendEnd(four_gib + 2, 7);
+  EXPECT_EQ(run.ends,
+            (std::vector<size_t>{four_gib - 2, four_gib + 2, four_gib + 9}));
+}
+
+TEST(TypedStreamAggregateTest, VarcharRunsKeepSlicedBatchBoundariesAfterMerge) {
+  const auto make_arena = [] {
+    relational_detail::BaseRelationArena arena;
+    arena.stride = 1;
+    arena.slot_types = {ValueType::kVarChar};
+    arena.null_bits.resize(1);
+    arena.varchars.resize(1);
+    return arena;
+  };
+  TypedCellBatch batch;
+  batch.Configure(1, {ValueType::kVarChar}, {false});
+  batch.cells = {0, 0, 0};
+  batch.nulls = {0, 0, 0};
+  batch.varchar_bytes[0] = {'a', 'b', 'c'};
+  batch.varchar_ends[0] = {1, 1, 3};
+  batch.rows = 3;
+  auto combined = make_arena();
+  relational_detail::AppendBatchToArena(batch, 0, 1, &combined);
+  auto second = make_arena();
+  relational_detail::AppendBatchToArena(batch, 1, 2, &second);
+  combined.AppendTyped(second);
+  EXPECT_EQ(combined.Varchar(0, 0), "a");
+  EXPECT_EQ(combined.Varchar(1, 0), "");
+  EXPECT_EQ(combined.Varchar(2, 0), "bc");
 }
 
 TEST(TypedStreamAggregateTest, MatchTypedStringInListExactAndPrefix) {
@@ -437,6 +486,49 @@ TEST(TypedStreamAggregateTest, AggregateAccumulatorStreamingAndMerge) {
   EXPECT_EQ(distinct_acc.DistinctIntCount(), 12U);
 }
 
+// The precomputed-Shape merge overload used by OOC sinks must be equivalent
+// to the one that analyzes the expression on every call.
+TEST(TypedStreamAggregateTest,
+     MergeSerializedPartialStateWithPrecomputedShape) {
+  const std::vector<AggregationType> kinds = {
+      AggregationType::kSum, AggregationType::kAvg, AggregationType::kMin,
+      AggregationType::kMax};
+  for (const AggregationType kind : kinds) {
+    const Expression expr = std::make_shared<AggregateExpression>(
+        kind, ColumnValueExp(ColumnName("x")));
+    const auto* agg = &expr->AsAggregateExpression();
+    const AggregateAccumulator::Shape shape =
+        AggregateAccumulator::AnalyzeShape(agg, nullptr);
+
+    AggregateAccumulator lhs_with_shape(agg, shape);
+    AggregateAccumulator lhs_without_shape(agg);
+    AggregateAccumulator partial(agg);
+    ASSERT_EQ(lhs_with_shape.Add(Value(int64_t{11})), Status::kSuccess);
+    ASSERT_EQ(lhs_without_shape.Add(Value(int64_t{11})), Status::kSuccess);
+    ASSERT_EQ(partial.Add(Value(int64_t{27})), Status::kSuccess);
+    ASSERT_EQ(partial.Add(Value(int64_t{3})), Status::kSuccess);
+
+    std::string blob;
+    ASSERT_EQ(partial.SerializePartialState(&blob), Status::kSuccess);
+    std::string_view with_shape_view = blob;
+    std::string_view without_shape_view = blob;
+    ASSERT_EQ(
+        lhs_with_shape.MergeSerializedPartialState(&with_shape_view, shape),
+        Status::kSuccess);
+    ASSERT_EQ(
+        lhs_without_shape.MergeSerializedPartialState(&without_shape_view),
+        Status::kSuccess);
+    EXPECT_TRUE(with_shape_view.empty());
+    EXPECT_TRUE(without_shape_view.empty());
+
+    auto a = lhs_with_shape.TryFinish();
+    auto b = lhs_without_shape.TryFinish();
+    ASSERT_TRUE(a.HasValue());
+    ASSERT_TRUE(b.HasValue());
+    EXPECT_EQ(a.Value(), b.Value());
+  }
+}
+
 TEST(TypedStreamAggregateTest, HavingReferencesOnlyKeysAndAggregatesAndCells) {
   const Schema schema = MakeScanSchema();
   const std::vector<slot_t> key_offsets = {0};  // l_orderkey
@@ -463,6 +555,191 @@ TEST(TypedStreamAggregateTest, HavingReferencesOnlyKeysAndAggregatesAndCells) {
   EXPECT_TRUE(relational_detail::TryPackShortVarcharSpan("AB", &packed));
   EXPECT_NE(packed, 0U);
   EXPECT_FALSE(relational_detail::TryPackShortVarcharSpan("ABCD", &packed));
+}
+
+// AccumulatorChunks commits backing store in kSegmentSlots-sized segments,
+// so a small group count must not commit the full 512-slot (~440KB) slab.
+TEST(TypedStreamAggregateTest, AccumulatorChunksCommitsStorageInSegments) {
+  const Expression sum_expr = std::make_shared<AggregateExpression>(
+      AggregationType::kSum, ColumnValueExp(ColumnName("x")));
+  const AggregateExpression* aggregate = &sum_expr->AsAggregateExpression();
+  const std::vector<const AggregateExpression*> aggregates = {aggregate};
+
+  relational_detail::AccumulatorChunks chunks;
+  chunks.Configure(1);
+
+  // Ten groups x one aggregate = ten slots: only the first segment of the
+  // first chunk may be committed, not the whole 512-slot slab.
+  for (size_t i = 0; i < 10; ++i) {
+    chunks.AppendGroup(aggregates, nullptr);
+  }
+  EXPECT_EQ(chunks.CommittedBytes(),
+            relational_detail::AccumulatorChunks::kSegmentBytes);
+  EXPECT_EQ(chunks.CommittedBytes(),
+            relational_detail::AccumulatorChunks::kSegmentSlots *
+                sizeof(AggregateAccumulator));
+
+  // The accumulators are still live and writable through the same indexing.
+  chunks.State(0, 0).Add(Value(int64_t{7}));
+  chunks.State(9, 0).Add(Value(int64_t{9}));
+
+  // Fill past the first segment and past the first chunk: commitment must
+  // track usage, then cap at the whole slab per chunk.
+  for (size_t i = 10; i < 70; ++i) {
+    chunks.AppendGroup(aggregates, nullptr);
+  }
+  EXPECT_EQ(chunks.CommittedBytes(),
+            2 * relational_detail::AccumulatorChunks::kSegmentBytes);
+  for (size_t i = 70; i < 512 + 10; ++i) {
+    chunks.AppendGroup(aggregates, nullptr);
+  }
+  EXPECT_EQ(chunks.CommittedBytes(),
+            relational_detail::AccumulatorChunks::kSlotsPerChunk *
+                    sizeof(AggregateAccumulator) +
+                relational_detail::AccumulatorChunks::kSegmentBytes);
+  chunks.State(511, 0).Add(Value(int64_t{5}));
+  chunks.State(520, 0).Add(Value(int64_t{6}));
+  EXPECT_EQ(chunks.State(0, 0).TryFinish().Value(), Value(int64_t{7}));
+  EXPECT_EQ(chunks.State(9, 0).TryFinish().Value(), Value(int64_t{9}));
+  EXPECT_EQ(chunks.State(511, 0).TryFinish().Value(), Value(int64_t{5}));
+  EXPECT_EQ(chunks.State(520, 0).TryFinish().Value(), Value(int64_t{6}));
+}
+
+// Builds a TLCS-compacted k/v table so the GROUP BY over it runs the
+// columnar typed-stream compact aggregation kernel.
+struct TypedStreamColumnarKvFixture {
+  static void Build(Database* db, const std::string& name,
+                    const std::vector<int64_t>& ks,
+                    const std::vector<int64_t>& vs);
+};
+
+// static
+void TypedStreamColumnarKvFixture::Build(Database* db, const std::string& name,
+                                         const std::vector<int64_t>& ks,
+                                         const std::vector<int64_t>& vs) {
+  TransactionContext ctx = db->BeginContext();
+  Schema schema(name, {Column("k", ValueType::kInt64),
+                       Column("v", ValueType::kInt64)});
+  ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
+  Table tbl = db->GetTable(ctx, name).MoveValue();
+  for (size_t i = 0; i < vs.size(); ++i) {
+    ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(ks[i]), Value(vs[i])}))
+                    .HasValue());
+  }
+  ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  TransactionContext compact_ctx = db->BeginContext();
+  ASSERT_EQ(db->CompactTableToTlcs(compact_ctx, name), Status::kSuccess);
+  ASSERT_EQ(compact_ctx.txn_.PreCommit(), Status::kSuccess);
+}
+
+// Runs `sql` and reports executor completion status (kSuccess on a clean
+// drain). Prepare failures surface through *status too.
+std::vector<Row> RunGroupedQuery(SqlEngine* engine, TransactionContext* ctx,
+                                 const std::string& sql, Status* status) {
+  StatusOr<Executor> prepared = engine->Prepare(*ctx, sql);
+  if (!prepared.HasValue()) {
+    *status = prepared.GetStatus();
+    return {};
+  }
+  std::vector<Row> rows;
+  Row row;
+  while (prepared.Value()->Next(&row, nullptr)) {
+    rows.push_back(std::move(row));
+    row = Row();
+  }
+  *status = prepared.Value()->GetStatus();
+  return rows;
+}
+
+// Bug #543: the partitioned columnar aggregation folded a group's rows in
+// worker-major order over per-shard buffers, so whether SUM(INT64) overflowed
+// (and with what value) depended on how blocks were handed to workers. These
+// patterns put the overflow (a) exactly across a TLCS block boundary the fold
+// must still report, and (b) inside a group where the canonical row-order sum
+// is legal even though M + M wraps locally. The checked SUM keeps the kernel
+// on a single worker, so every run must reproduce the canonical answer; the
+// query repeats below catch a regression that only some block hand-offs
+// expose.
+TEST(TypedStreamAggregateTest, SkewedGroupedSumInt64KeepsCanonicalOverflow) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  // 3 TLCS blocks (40,000 rows each in the fixture's compaction); markers sit
+  // across the 40,000-row block boundary so a worker-boundary recombination
+  // cannot hide or fabricate the overflow.
+  constexpr int64_t kRows = 120003;
+  const int64_t kMax = std::numeric_limits<int64_t>::max();
+  const int64_t kMin = std::numeric_limits<int64_t>::min();
+
+  const std::string prefix = "tsagg_skew_" + RandomString();
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+
+  // Case A: rows 0 and 40000 are INT64_MAX, row 40001 is INT64_MIN. The
+  // canonical row-order sum overflows at row 40000 (M + M), and the
+  // block-boundary fold must still report it.
+  std::vector<int64_t> ks_a(kRows, 1);
+  std::vector<int64_t> vs_a(kRows, 0);
+  vs_a[0] = kMax;
+  vs_a[40000] = kMax;
+  vs_a[40001] = kMin;
+  TypedStreamColumnarKvFixture::Build(db.get(), "ta", ks_a, vs_a);
+
+  // Case B: rows 0 and 40002 are INT64_MIN, rows 40000 and 40001 are
+  // INT64_MAX. The canonical running sums (−2^63, ..., M, M−1, −2) never
+  // leave int64 — even though a fold that sees rows 40000/40001 without the
+  // leading INT64_MIN wraps — and the final group-1 sum is exactly −2. The
+  // last row joins group 7 (sum 5) so a second group is exercised too.
+  std::vector<int64_t> ks_b(kRows, 1);
+  std::vector<int64_t> vs_b(kRows, 0);
+  vs_b[0] = kMin;
+  vs_b[40000] = kMax;
+  vs_b[40001] = kMax;
+  vs_b[40002] = kMin;
+  ks_b[kRows - 1] = 7;
+  vs_b[kRows - 1] = 5;
+  TypedStreamColumnarKvFixture::Build(db.get(), "tb", ks_b, vs_b);
+
+  TransactionContext ctx = db->BeginReadOnlyContext();
+  SqlEngine engine(*db);
+  Status status = Status::kSuccess;
+  const std::string sql_b = "SELECT k, SUM(v) FROM tb GROUP BY k";
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    auto rows_a = RunGroupedQuery(&engine, &ctx,
+                                  "SELECT k, SUM(v) FROM ta GROUP BY k",
+                                  &status);
+    EXPECT_EQ(status, Status::kIsInfinity)
+        << "attempt " << attempt << ": block-boundary fold must report the "
+        << "canonical SUM overflow";
+
+    auto rows_b = RunGroupedQuery(&engine, &ctx, sql_b, &status);
+    EXPECT_EQ(status, Status::kSuccess) << "attempt " << attempt;
+    EXPECT_EQ(rows_b.size(), 2U);
+    std::sort(rows_b.begin(), rows_b.end(), [](const Row& x, const Row& y) {
+      return x[0].AsInt64() < y[0].AsInt64();
+    });
+    ASSERT_EQ(rows_b.size(), 2U);
+    EXPECT_EQ(rows_b[0][0].AsInt64(), 1);
+    EXPECT_EQ(rows_b[0][1].AsInt64(), -2);
+    EXPECT_EQ(rows_b[1][0].AsInt64(), 7);
+    EXPECT_EQ(rows_b[1][1].AsInt64(), 5);
+  }
+
+  // The canonical (typed-aggregation disabled) path must agree exactly.
+  ASSERT_EQ(::setenv("TINYLAMB_DISABLE_TYPED_AGG", "1", 1), 0);
+  auto canonical = RunGroupedQuery(&engine, &ctx, sql_b, &status);
+  ::unsetenv("TINYLAMB_DISABLE_TYPED_AGG");
+  EXPECT_EQ(status, Status::kSuccess);
+  ASSERT_EQ(canonical.size(), 2U);
+  std::sort(canonical.begin(), canonical.end(), [](const Row& x, const Row& y) {
+    return x[0].AsInt64() < y[0].AsInt64();
+  });
+  EXPECT_EQ(canonical[0][0].AsInt64(), 1);
+  EXPECT_EQ(canonical[0][1].AsInt64(), -2);
+  EXPECT_EQ(canonical[1][0].AsInt64(), 7);
+  EXPECT_EQ(canonical[1][1].AsInt64(), 5);
+
+  db->DeleteAll();
 }
 
 }  // namespace

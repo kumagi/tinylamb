@@ -158,7 +158,8 @@ TEST(ColumnarTableTest, GatheredSliceChecksChunksLengthMatch) {
   auto malformed_gi = std::make_shared<ChunkGatherIndex>();
   malformed_gi->source_table = base;
   malformed_gi->src_rows = {0, 1};
-  // Intentionally shorter than src_rows to test the defensive length guard.
+  // src_chunks is intentionally shorter than src_rows; the slice taken by
+  // this test only touches the first row, so the length guard is not reached.
   malformed_gi->src_chunks = {0};
 
   ColumnarTable tbl;
@@ -216,7 +217,8 @@ TEST(ColumnarTableTest, EstimatedBytesDeduplicatesMoreThanFourGatherIndices) {
   twelve_distinct_gi_chunk.rows = 64;
   twelve_distinct_gi_chunk.columns.resize(12);
   std::vector<std::shared_ptr<ChunkGatherIndex>> gis;
-  for (size_t c = 0; c < 6; ++c) {
+  gis.reserve(6);
+for (size_t c = 0; c < 6; ++c) {
     gis.push_back(make_gi());
   }
   for (size_t c = 0; c < 12; ++c) {

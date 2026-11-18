@@ -106,8 +106,8 @@ tinylamb は、次のパイプラインでクエリを実行します。アー�
 flowchart LR
   sql["SQL 文(テキスト)"] --> fe["フロントエンド query/<br>GoogleSQL を解釈し QueryData へ"]
   fe --> opt["Optimizer::Optimize<br>(plan/optimizer.cpp)"]
-  opt --> fact["executor/relational_factory.cpp<br>Plan → Executor 木を生成"]
-  fact --> run["実行(morsel 駆動)<br>結果行を呼び出し元へ"]
+  opt --> fact["executor/pipeline_lowering.cpp (既定)<br>または relational_factory.cpp (legacy)"]
+  fact --> run["実行(パイプライン/OOC または morsel 駆動)<br>結果行を呼び出し元へ"]
 ```
 
 本書が対象とするのは中央の `Optimizer::Optimize` です。ヘッダ `plan/optimizer.hpp` における宣言は次のとおりです。

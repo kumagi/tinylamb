@@ -112,6 +112,10 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
       {"SELECT FORMAT('%10s|', 'ab')", R"sql("        ab|")sql"},
       {"SELECT FORMAT('%-10s|', 'ab')", R"sql("ab        |")sql"},
       {"SELECT FORMAT('%05d', 42)", R"sql("00042")sql"},
+      {"SELECT FORMAT('%04d', -5)", R"sql("-005")sql"},
+      {"SELECT FORMAT('%+.4d', -5)", R"sql("-0005")sql"},
+      {"SELECT FORMAT('%+04d', 5)", R"sql("+005")sql"},
+      {"SELECT FORMAT('%#06x', 255)", R"sql("0x00ff")sql"},
       {"SELECT FORMAT('%+d', 42)", R"sql("+42")sql"},
       {"SELECT FORMAT('% d', 42)", R"sql(" 42")sql"},
       {R"sql(SELECT FORMAT('%''d', 12345678))sql", R"sql("12,345,678")sql"},
@@ -386,11 +390,19 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
        R"sql("2026-01-02 03:04:05+0000")sql"},
       {"SELECT FORMAT_TIMESTAMP('%Ez', TIMESTAMP '2026-01-02 03:04:05+00')",
        R"sql("+0000")sql"},
+      // America/Los_Angeles kept Pacific War Time (UTC-7) through 1945; the
+      // lookup must use the timestamp's own year, not a post-epoch clamp.
+      {"SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', TIMESTAMP "
+       "'1945-03-15 12:00:00+00', 'America/Los_Angeles')",
+       R"sql("1945-03-15 05:00:00")sql"},
+      {"SELECT STRING(TIMESTAMP '1945-03-15 12:00:00+00', "
+       "'America/Los_Angeles')",
+       R"sql("1945-03-15 05:00:00-07")sql"},
       {"SELECT PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', '2026-01-02 03:04:05')",
        R"sql("2026-01-02 03:04:05+00")sql"},
       {"SELECT PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S %z', '2026-01-02 03:04:05 "
        "+0530')",
-       R"sql("2026-01-02 03:04:05+00")sql"},
+       R"sql("2026-01-01 21:34:05+00")sql"},
       {"SELECT PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S %Z', '2026-01-02 03:04:05 "
        "UTC')",
        R"sql("2026-01-02 03:04:05+00")sql"},
@@ -466,6 +478,62 @@ TEST_F(SqlFunctionEdgeTest, PinnedScalarTable) {
   }
 }
 
+TEST_F(SqlFunctionEdgeTest, BatchOnlyBuiltinsInInsertValues) {
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE batch_only_g0 (s STRING);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO batch_only_g0 VALUES (TO_BASE64('abc'));");
+  const auto rows =
+      RunSql(engine_.get(), context_.get(), "SELECT s FROM batch_only_g0");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value("YWJj"));
+}
+
+TEST_F(SqlFunctionEdgeTest, LastDayRawDatePartTokenFromColumnArg) {
+  // The second operand is a bare date-part token, not a row reference; with a
+  // column first argument the whole-row fallback used to feed a STRUCT into
+  // LAST_DAY and fail every engine.
+  const auto rows =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT LAST_DAY(d, MONTH) FROM UNNEST([DATE '2020-02-29', "
+             "DATE '2024-02-05']) AS d");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0].AsString(), "2020-02-29");
+  EXPECT_EQ(rows[1][0].AsString(), "2024-02-29");
+}
+
+TEST_F(SqlFunctionEdgeTest, WeekWithWeekdayDatePartSpelling) {
+  // WEEK(<weekday>) is the date_part spelling with an explicit week-start
+  // day, not the one-argument week-number function: the bare weekday is a
+  // keyword, and the date-part alias rewrite used to resolve it as a column.
+  // The corpus's gated last_day_date case pins the LAST_DAY values.
+  const auto last_day =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT LAST_DAY(DATE '2020-07-24', WEEK(MONDAY)), "
+             "LAST_DAY(DATE '2020-07-24', WEEK(SUNDAY))");
+  ASSERT_EQ(last_day.size(), 1U);
+  EXPECT_EQ(last_day[0][0].AsString(), "2020-07-26");
+  EXPECT_EQ(last_day[0][1].AsString(), "2020-07-25");
+
+  // The bare spelling evaluates to the part token itself.
+  const auto token =
+      RunSql(engine_.get(), context_.get(), "SELECT WEEK(SUNDAY)");
+  ASSERT_EQ(token.size(), 1U);
+  EXPECT_EQ(token[0][0], Value("week(sunday)"));
+
+  // EXTRACT with the weekday-qualified part counts weeks from that start;
+  // the first partial week of the year is week 0 (as for plain WEEK).
+  const auto extract =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT EXTRACT(WEEK(SUNDAY) FROM DATE '2020-07-24'), "
+             "EXTRACT(WEEK(MONDAY) FROM DATE '2020-07-24'), "
+             "EXTRACT(WEEK FROM DATE '2020-07-24')");
+  ASSERT_EQ(extract.size(), 1U);
+  EXPECT_EQ(extract[0][0], Value(int64_t{29}));
+  EXPECT_EQ(extract[0][1], Value(int64_t{29}));
+  EXPECT_EQ(extract[0][2], Value(int64_t{29}));
+}
+
 TEST_F(SqlFunctionEdgeTest, UnicodeCaseAndFloatingPrecision) {
   const auto scalar_rows =
       RunSql(engine_.get(), context_.get(),
@@ -535,6 +603,7 @@ TEST_F(SqlFunctionEdgeTest, ErrorTable) {
       "SELECT BOOL_VAL(1)",
       "SELECT STR_VALUE('x')",
       "SELECT MAKE_INTERVAL(day => 4)",
+      "SELECT MAKE_INTERVAL(1, 'DAY', 3)",
       "SELECT GENERATE_ARRAY(1, 5, 0)",
       "SELECT PARSE_DATE('%Y-%m-%d', 'bad')",
       "SELECT PARSE_DATETIME('%Y-%m-%dT%H:%M:%S', '2026-01-02T03:04:05')",
@@ -560,7 +629,6 @@ TEST_F(SqlFunctionEdgeTest, DeviationSweep) {
   const std::vector<std::string> cases = {
       "SELECT CHR(0)",
       "SELECT SUBSTR('abcdef', 0, 3)",
-      "SELECT MAKE_INTERVAL(1, 'DAY', 3)",
       "SELECT '2026-01-02' + INTERVAL 5 DAY",
       "SELECT 'x' + INTERVAL 5 DAY",
       // A non-numeric interval amount parses to a zero interval today

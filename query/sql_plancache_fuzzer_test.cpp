@@ -49,6 +49,14 @@ TEST(SqlPlanCacheFuzzer, TestFileRoundTrip) {
   EXPECT_EQ(seed, 7U);
   EXPECT_EQ(parsed, trace);
   EXPECT_EQ(ReplayPlanCacheTrace(parsed), "") << "honest trace mismatched";
+
+  // A broken expectation must be detected, otherwise the replay oracle is
+  // self-satisfying and cannot guard committed .test regressions.
+  PlanCacheTrace tampered = parsed;
+  ASSERT_FALSE(tampered.expected.empty());
+  tampered.expected[0] = "|99999|,";
+  EXPECT_NE(ReplayPlanCacheTrace(tampered), "")
+      << "tampered expectation was not detected";
 }
 
 }  // namespace tinylamb

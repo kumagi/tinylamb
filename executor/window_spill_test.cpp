@@ -163,6 +163,39 @@ TEST_F(WindowSpillTest, IntegerPartitionsKeepNullsAndCompositeOrderPeers) {
   EXPECT_EQ(result, std::vector<Value>(rows.size(), Value(1)));
 }
 
+// Heterogeneous order keys used to collapse into one comparator equivalence
+// class: ValueLess swallowed operator<'s type-mismatch throw as "not less",
+// so stable_sort kept physical order across the type boundary and the window
+// order contradicted ORDER BY's cross-type ranking. The fallback now uses
+// the ORDER BY total order (CompareForOrderBy): INT64 keys rank before
+// VARCHAR keys, each class ordered by value.
+TEST_F(WindowSpillTest, MixedTypeOrderKeysFollowOrderByRanking) {
+  const Schema schema("mixed", {Column("k", ValueType::kInt64),
+                                Column("s", ValueType::kVarChar)});
+  // CASE WHEN k < 10 THEN k ELSE s END: INT64 keys for one group, VARCHAR
+  // keys for the other, physically interleaved.
+  std::vector<Row> rows{
+      Row({Value(1), Value("z")}),  Row({Value(50), Value("a")}),
+      Row({Value(2), Value("y")}),  Row({Value(51), Value("b")}),
+      Row({Value(3), Value("x")}),  Row({Value(52), Value("c")})};
+  WindowFunctionCallExpression rank;
+  rank.function = "ROW_NUMBER";
+  rank.order_by = {
+      {.expression =
+           CaseExpressionExp(
+               {{BinaryExpressionExp(ColumnValueExp("k"),
+                                     BinaryOperation::kLessThan,
+                                     ConstantValueExp(Value(int64_t{10}))),
+                 ColumnValueExp("k")}},
+               ColumnValueExp("s"))}};
+  std::vector<Value> result;
+  ASSERT_EQ(relational_detail::ComputeOneWindow(*context_, rank, rows, schema,
+                                                nullptr, {}, &result),
+            Status::kSuccess);
+  EXPECT_EQ(result, (std::vector<Value>{Value(1), Value(4), Value(2), Value(5),
+                                        Value(3), Value(6)}));
+}
+
 TEST_F(WindowSpillTest, LongPeerRunsKeepRankAndCumulativeRange) {
   const Schema schema("peers", {Column("k", ValueType::kInt64)});
   std::vector<Row> rows;

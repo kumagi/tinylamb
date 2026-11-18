@@ -1,8 +1,10 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include "executor/spill_file.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <ios>
 #include <random>
@@ -15,6 +17,7 @@
 
 #include "common/decoder.hpp"
 #include "common/encoder.hpp"
+#include "common/memory_budget.hpp"
 #include "page/row_position.hpp"
 #include "type/row.hpp"
 
@@ -30,13 +33,10 @@ std::string RandomSuffix() {
 }  // namespace
 
 std::filesystem::path SpillFile::TempDirectory() {
-  if (const char* env = std::getenv("TINYLAMB_TEMP");
-      env != nullptr && env[0] != '\0') {
-    std::filesystem::path dir(env);
-    std::filesystem::create_directories(dir);
-    return dir;
-  }
-  return std::filesystem::temp_directory_path();
+  std::filesystem::path dir = ProcessMemoryBudget::ResolveTempDirectory();
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return dir;
 }
 
 SpillFile::SpillFile() {
@@ -47,12 +47,14 @@ SpillFile::SpillFile(SpillFile&& other) noexcept
     : path_(std::move(other.path_)),
       stream_(std::move(other.stream_)),
       count_(other.count_),
+      file_bytes_(other.file_bytes_),
       writing_(other.writing_),
       finished_(other.finished_),
       has_positions_(other.has_positions_) {
   // Clear the moved-from state so this object exclusively owns the file:
   // otherwise destroying `other` would delete the file still in use here.
   other.count_ = 0;
+  other.file_bytes_ = 0;
   other.path_.clear();
   other.writing_ = false;
   other.finished_ = false;
@@ -61,17 +63,26 @@ SpillFile::SpillFile(SpillFile&& other) noexcept
 
 SpillFile& SpillFile::operator=(SpillFile&& other) noexcept {
   if (this != &other) {
-    if (!path_.empty() && std::filesystem::exists(path_)) {
+    if (stream_.is_open()) {
+      stream_.close();
+    }
+    // Same non-throwing cleanup as ~SpillFile: the error_code overload of
+    // remove() treats "not found" as a normal result, so the throwing
+    // exists() probe is unnecessary — and it could not throw inside this
+    // noexcept function anyway without calling std::terminate.
+    if (!path_.empty()) {
       std::error_code ec;
       std::filesystem::remove(path_, ec);
     }
     path_ = std::move(other.path_);
     stream_ = std::move(other.stream_);
     count_ = other.count_;
+    file_bytes_ = other.file_bytes_;
     writing_ = other.writing_;
     finished_ = other.finished_;
     has_positions_ = other.has_positions_;
     other.count_ = 0;
+    other.file_bytes_ = 0;
     other.path_.clear();
     other.writing_ = false;
     other.finished_ = false;
@@ -157,18 +168,103 @@ Status SpillFile::FinishWriting() {
     finished_ = true;
     return Status::kSuccess;
   }
+  stream_.flush();
+  if (!stream_) {
+    // ostream failures set badbit/failbit; errno is not necessarily meaningful
+    // here and may hold an unrelated stale value.
+    return StatusError(StatusCode::kIOError,
+                       "failed to flush spill file: " + path_.string());
+  }
   stream_.seekp(0);
+  if (!stream_) {
+    return StatusError(StatusCode::kIOError,
+                       "failed to seek spill file: " + path_.string());
+  }
   stream_.write(reinterpret_cast<const char*>(&count_), sizeof(count_));
   stream_.flush();
   if (!stream_) {
-    // Leave the stream open so the destructor still cleans up the file; the
-    // failed query must not pretend the spill succeeded.
     return StatusError(StatusCode::kIOError,
                        "failed to finalize spill file: " + path_.string());
   }
   stream_.close();
+  if (!stream_) {
+    return StatusError(StatusCode::kIOError,
+                       "failed to close spill file: " + path_.string());
+  }
   writing_ = false;
   finished_ = true;
+  if (count_ > 0 && !path_.empty()) {
+    std::error_code ec;
+    const uint64_t sz = std::filesystem::file_size(path_, ec);
+    if (ec) {
+      return StatusError(StatusCode::kIOError,
+                         "failed to size spill file: " + path_.string() +
+                             " (" + ec.message() + ")");
+    }
+    file_bytes_ = sz;
+  }
+  return Status::kSuccess;
+}
+
+StatusOr<SpillFile::RowReader> SpillFile::OpenRowReader() {
+  if (!finished_) {
+    RETURN_IF_FAIL(FinishWriting());
+  }
+  if (has_positions_) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "OpenRowReader on positioned spill");
+  }
+  if (count_ == 0) {
+    return RowReader{};
+  }
+  RowReader reader;
+  reader.path_ = path_;
+  reader.io_buffer_.assign(RowReader::kReadBufferBytes, '\0');
+  reader.stream_ = std::make_unique<std::ifstream>();
+  reader.stream_->rdbuf()->pubsetbuf(
+      reader.io_buffer_.data(),
+      static_cast<std::streamsize>(RowReader::kReadBufferBytes));
+  reader.stream_->open(path_, std::ios::binary | std::ios::in);
+  if (!*reader.stream_) {
+    return StatusError(StatusCode::kIOError,
+                       "failed to open spill file: " + path_.string());
+  }
+  uint64_t stored = 0;
+  reader.stream_->read(reinterpret_cast<char*>(&stored), sizeof(stored));
+  if (reader.stream_->gcount() !=
+      static_cast<std::streamsize>(sizeof(stored))) {
+    return StatusError(StatusCode::kCorrupt,
+                       "truncated spill file header: " + path_.string());
+  }
+  if (stored != count_) {
+    return StatusError(StatusCode::kCorrupt,
+                       "spill file header mismatch: " + path_.string());
+  }
+  reader.remaining_ = stored;
+  return reader;
+}
+
+Status SpillFile::RowReader::Next(Row* out, bool* has_row) {
+  if (!stream_ || remaining_ == 0) {
+    *has_row = false;
+    stream_.reset();
+    io_buffer_.clear();
+    io_buffer_.shrink_to_fit();
+    return Status::kSuccess;
+  }
+  Decoder dec(*stream_);
+  dec >> *out;
+  if (!*stream_) {
+    return StatusError(StatusCode::kCorrupt,
+                       "truncated spill file: " + path_.string());
+  }
+  --remaining_;
+  if (remaining_ == 0) {
+    stream_.reset();
+    io_buffer_.clear();
+    io_buffer_.shrink_to_fit();
+  }
+  *has_row = true;
   return Status::kSuccess;
 }
 

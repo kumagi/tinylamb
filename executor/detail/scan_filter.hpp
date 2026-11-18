@@ -16,7 +16,6 @@
 #include "executor/detail/subquery_runtime.hpp"
 #include "expression/bytecode.hpp"
 #include "expression/expression.hpp"
-#include "query/statement.hpp"
 #include "table/full_scan_iterator.hpp"
 #include "type/column_name.hpp"
 #include "type/schema.hpp"
@@ -25,9 +24,13 @@
 namespace tinylamb {
 class TransactionContext;
 class Table;
+struct SelectSource;
 }  // namespace tinylamb
 
 namespace tinylamb::relational_detail {
+
+struct PushedScanProjection;
+struct ScanTupleFilter;
 
 struct SimpleComparePredicate {
   slot_t column{0};
@@ -128,6 +131,9 @@ struct FilterCompileEnv {
   // FinishQuery historically compiled without a context. Enable only the
   // selective EXISTS peel there, preserving its other execution strategies.
   bool prebuild_only_exists{false};
+  // Optional in-memory outer relation being filtered (enables Lean-proven
+  // outer-domain semi-restriction in TryCompilePrebuiltExists).
+  const Relation* input_relation{nullptr};
 };
 
 struct CompiledScanFilter {
@@ -152,6 +158,7 @@ struct CompiledScanFilter {
   struct DisjunctiveBranch {
     std::vector<SimpleComparePredicate> simple;
     std::vector<PrefixInPredicate> prefix_in;
+    std::vector<PrebuiltMembershipPredicate> prebuilt_membership;
     std::vector<Expression> residual;
   };
   std::vector<DisjunctiveBranch> disjunctive_branches;
@@ -165,7 +172,14 @@ struct CompiledScanFilter {
 
 bool FastLikeMatch(std::string_view value, std::string_view pattern);
 
-bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred);
+// Returns true/false for a clean match/reject. When the exact evaluator
+// raises (an off-schema runtime value surprises a compile-time-predicated
+// comparison), the verdict is false and `error` — when supplied — receives
+// the failure so MatchScanFilter can apply the tolerant-WHERE rule: a sibling
+// conjunct that cleanly rejects still suppresses the error, otherwise the
+// query fails instead of silently returning an empty result.
+bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred,
+                        Status* error = nullptr);
 
 bool MatchPrefixIn(const Row& row, const PrefixInPredicate& pred);
 
@@ -186,7 +200,8 @@ bool MatchPrebuiltMembership(const Row& row,
 // a missing key, or a NULL group value means the original comparison is
 // UNKNOWN and the row is rejected.
 bool MatchPrebuiltScalarCompare(const Row& row,
-                                const PrebuiltScalarComparePredicate& pred);
+                                const PrebuiltScalarComparePredicate& pred,
+                                Status* error = nullptr);
 
 bool IsNonThrowingScanComparison(const Expression& predicate,
                                  const Schema& schema);
@@ -244,16 +259,17 @@ std::vector<IntegerPeekCompare> BuildIntegerPeeks(
 // build side published for `key_column`; the scan rejects non-members before
 // row decode, both in the serial iterator and inside parallel workers (the
 // group is immutable once built, so sharing it across workers is safe).
-bool TryParallelTableScan(TransactionContext& context, Table& table,
-                          const std::vector<slot_t>* projection,
-                          const RuntimeFilterGroup* runtime_filter,
-                          ValueType runtime_filter_type,
-                          std::optional<slot_t> full_key_column,
-                          bool filter_during_scan,
-                          const CompiledScanFilter* scan_filter,
-                          const Schema& result_schema, const Scope* outer,
-                          const CteMap& ctes, Relation* result,
-                          Status* error = nullptr);
+bool TryParallelTableScan(
+    TransactionContext& context, Table& table,
+    const std::vector<slot_t>* projection,
+    const RuntimeFilterGroup* runtime_filter, ValueType runtime_filter_type,
+    std::optional<slot_t> full_key_column, bool filter_during_scan,
+    const CompiledScanFilter* scan_filter, const Schema& result_schema,
+    const Scope* outer, const CteMap& ctes, Relation* result,
+    Status* error = nullptr, const ScanTupleFilter* tuple_filter = nullptr,
+    bool columnar_output = false,
+    const PushedScanProjection* pushed_projection = nullptr,
+    bool* pushed_projection_applied = nullptr);
 
 // Bytecode programs covering every non-simple component of a
 // CompiledScanFilter, so a scan worker can decide a row without touching the
@@ -312,7 +328,10 @@ StatusOr<Relation> LoadSource(
     TransactionContext& context, const SelectSource& source, const Scope* outer,
     const CteMap& ctes, const std::vector<slot_t>* projection = nullptr,
     const std::vector<Expression>* scan_predicates = nullptr,
-    const ScanRuntimeFilter* runtime_filter = nullptr);
+    const ScanRuntimeFilter* runtime_filter = nullptr,
+    const ScanTupleFilter* tuple_filter = nullptr, bool columnar_output = false,
+    const PushedScanProjection* pushed_projection = nullptr,
+    bool* pushed_projection_applied = nullptr);
 
 // Materializes one UNNEST'd array value into a single-column relation named
 // after the source alias (struct elements expand into per-field columns,
@@ -332,9 +351,6 @@ bool ContainsQuery(const Expression& expression);
 std::vector<Expression> FoldRowIndependentSubqueries(
     TransactionContext& context, const std::vector<Expression>& predicates,
     const Scope* outer, const CteMap& ctes);
-
-std::optional<size_t> LocalColumnOffset(const Schema& schema,
-                                        const ColumnName& name);
 
 Status FilterRelation(TransactionContext& context, Relation* relation,
                       const std::vector<Expression>& predicates,

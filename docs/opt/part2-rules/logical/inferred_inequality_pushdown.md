@@ -111,5 +111,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.InferredInequalityPushdown`: `t1.x > 10` と `t1.x = t2.y` から、`t2` グループの filter に `t2.y > 10` が推論・登録されることを検証。

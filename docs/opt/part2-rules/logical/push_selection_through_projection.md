@@ -154,7 +154,7 @@ std::optional<Expression> RewriteThroughOutputs(
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part*.cpp` の
   `CascadesTest.PushSelectionThroughProjectionRewritesPredicate` —
   出力別名を参照する述語が、下の列を参照する述語に張り替えられた
   Selection を子に持つ代替が作られることを検証します。

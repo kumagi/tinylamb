@@ -109,5 +109,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.DynamicFilterPushdownJoin`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.DynamicFilterPushdownJoin`
   - 等値結合 `t1.id = t2.id` の論理最適化において、プローブ側 Group のタグに `bloom_probe:` を含む派生 Group が結合右枝として生成されることを検証。

@@ -81,6 +81,22 @@ bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
   return true;
 }
 
+bool CanBindFieldPathBase(
+    std::string_view column,
+    const std::unordered_set<std::string>& ambiguous_column_name,
+    const std::unordered_map<std::string, ValueType>& col_types) {
+  const std::string lower = ToLowerCopy(std::string(column));
+  if (ambiguous_column_name.contains(lower)) {
+    return false;
+  }
+  const auto type_it = col_types.find(lower);
+  if (type_it == col_types.end()) {
+    return false;
+  }
+  return type_it->second == ValueType::kVarChar ||
+         type_it->second == ValueType::kNull;
+}
+
 // Dotted references whose qualifier names a COLUMN (not a FROM relation)
 // address encoded fields of proto / struct payloads: "value.int32_val",
 // "t.value.nested_value.nested_int64".  Rewrite them into chained
@@ -88,6 +104,8 @@ bool CaseInsensitiveEquals(std::string_view left, std::string_view right) {
 Expression BindColumnQualifiedFieldReads(
     const Expression& expr,
     const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& ambiguous_column_name,
+    const std::unordered_map<std::string, ValueType>& col_types,
     const std::unordered_set<std::string>& relations,
     const std::unordered_map<std::string, size_t>& relation_column_counts) {
   if (!expr) {
@@ -140,11 +158,14 @@ Expression BindColumnQualifiedFieldReads(
       return expr;
     }
     // The qualifier may itself be dotted ("t.value"); the first segment must
-    // name a column of the driving table for this to be a field read.
+    // name an unambiguous STRUCT/PROTO column of a driving table.
     const size_t first_dot = name.schema.find('.');
     const std::string head = first_dot == std::string::npos
                                  ? name.schema
                                  : name.schema.substr(0, first_dot);
+    if (!CanBindFieldPathBase(head, ambiguous_column_name, col_types)) {
+      return expr;
+    }
     const auto it = col_table_map.find(ToLowerCopy(head));
     if (it == col_table_map.end()) {
       return expr;
@@ -170,7 +191,8 @@ Expression BindColumnQualifiedFieldReads(
   bool changed = false;
   for (Expression& child : children) {
     Expression mapped = BindColumnQualifiedFieldReads(
-        child, col_table_map, relations, relation_column_counts);
+        child, col_table_map, ambiguous_column_name, col_types, relations,
+        relation_column_counts);
     changed |= child->ToString() != mapped->ToString();
     child = std::move(mapped);
   }
@@ -178,12 +200,15 @@ Expression BindColumnQualifiedFieldReads(
 }
 
 // Rewrites STRUCT/PROTO field paths (`value.empty_message`, where `value`
-// names a column rather than a FROM relation) into safe field-extraction
-// calls over the base column, so the flat-column plan executor can evaluate
-// them.  Returns nullptr when the expression is untouched.
+// names an unambiguous STRUCT/PROTO column rather than a FROM relation) into
+// safe field-extraction calls over the base column, so the flat-column plan
+// executor can evaluate them.  Returns nullptr when the expression is
+// untouched.
 Expression BindFieldPaths(
     const Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
+    const std::unordered_set<std::string>& ambiguous_column_name,
+    const std::unordered_map<std::string, ValueType>& col_types,
     const std::unordered_set<std::string>& relations) {
   if (!exp) {
     return nullptr;
@@ -191,7 +216,9 @@ Expression BindFieldPaths(
   if (exp->Type() == TypeTag::kColumnValue) {
     const ColumnName& col_name = exp->AsColumnValue().GetColumnName();
     if (col_name.schema.empty() || col_name.name.empty() ||
-        col_name.name == "*" || relations.contains(col_name.schema)) {
+        col_name.name == "*" || relations.contains(col_name.schema) ||
+        !CanBindFieldPathBase(col_name.schema, ambiguous_column_name,
+                              col_types)) {
       return nullptr;
     }
     const auto base_it = col_table_map.find(ToLowerCopy(col_name.schema));
@@ -218,7 +245,8 @@ Expression BindFieldPaths(
   std::vector<Expression> children = ExpressionChildren(exp);
   bool changed = false;
   for (Expression& child : children) {
-    Expression mapped = BindFieldPaths(child, col_table_map, relations);
+    Expression mapped = BindFieldPaths(
+        child, col_table_map, ambiguous_column_name, col_types, relations);
     changed |= static_cast<bool>(mapped);
     if (mapped) {
       child = std::move(mapped);
@@ -271,7 +299,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
                     // resolution by design; trees are parser-bounded in depth.
     Expression& exp,
     const std::unordered_map<std::string, std::string>& col_table_map,
-    const std::unordered_set<std::string>& ambiguous_colum_name,
+    const std::unordered_set<std::string>& ambiguous_column_name,
     const std::unordered_set<std::string>& relations,
     const std::vector<ColumnName>& all_cols, bool expand_proto_value_table,
     std::string* ambiguous_column) {
@@ -314,7 +342,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
       }
       return Status::kSuccess;
     }
-    if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
+    if (ambiguous_column_name.contains(ToLowerCopy(col_name.name))) {
       if (ambiguous_column != nullptr && ambiguous_column->empty()) {
         *ambiguous_column = col_name.name;
       }
@@ -377,14 +405,14 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
         return Status::kSuccess;
       }
       RETURN_IF_FAIL(ResolveExpression(
-          child, col_table_map, ambiguous_colum_name, relations, all_cols,
+          child, col_table_map, ambiguous_column_name, relations, all_cols,
           expand_proto_value_table, ambiguous_column));
       exp = WithExpressionChildren(exp, {std::move(child)});
       return Status::kSuccess;
     }
     default:
-      // Other node kinds (CAST/ARRAY literals, subquery tests, ...) carry no
-      // bare-column references this pass is responsible for.
+      // Other node kinds carry no bare-column references this pass
+      // resolves; CAST/ARRAY/subquery tests are handled in their cases above.
       return Status::kSuccess;
   }
   std::vector<Expression> children = ExpressionChildren(exp);
@@ -392,7 +420,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
   for (Expression& child : children) {
     const Expression before = child;
     RETURN_IF_FAIL(ResolveExpression(
-        child, col_table_map, ambiguous_colum_name, relations, all_cols,
+        child, col_table_map, ambiguous_column_name, relations, all_cols,
         expand_proto_value_table, ambiguous_column));
     changed |= before != child;
   }
@@ -405,7 +433,7 @@ ResolveExpression(  // NOLINT(misc-no-recursion) // Recursive expression-tree
 Status ResolveSelect(
     std::vector<NamedExpression>& select,
     const std::unordered_map<std::string, std::string>& col_table_map,
-    const std::unordered_set<std::string>& ambiguous_colum_name,
+    const std::unordered_set<std::string>& ambiguous_column_name,
     const std::vector<ColumnName>& all_cols,
     const std::unordered_set<std::string>& relations,
     bool expand_proto_value_table, std::string* ambiguous_column) {
@@ -474,7 +502,7 @@ Status ResolveSelect(
           continue;
         }
         for (const auto& cols : all_cols) {
-          if (ambiguous_colum_name.contains(ToLowerCopy(cols.name))) {
+          if (ambiguous_column_name.contains(ToLowerCopy(cols.name))) {
             it = select.insert(it, NamedExpression(cols));
           } else {
             it = select.insert(it, NamedExpression(cols.name, cols));
@@ -486,7 +514,7 @@ Status ResolveSelect(
       if (!col_name.schema.empty()) {
         Expression expression = it->expression;
         RETURN_IF_FAIL(ResolveExpression(
-            expression, col_table_map, ambiguous_colum_name, relations,
+            expression, col_table_map, ambiguous_column_name, relations,
             all_cols, expand_proto_value_table, ambiguous_column));
         // ResolveExpression may replace the node (whole-row/proto rewrites);
         // the rebuilt tree must be written back to the select item.
@@ -494,7 +522,7 @@ Status ResolveSelect(
         ++it;
         continue;
       }
-      if (ambiguous_colum_name.contains(ToLowerCopy(col_name.name))) {
+      if (ambiguous_column_name.contains(ToLowerCopy(col_name.name))) {
         if (ambiguous_column != nullptr && ambiguous_column->empty()) {
           *ambiguous_column = col_name.name;
         }
@@ -550,7 +578,7 @@ Status ResolveSelect(
     } else {
       Expression expression = it->expression;
       RETURN_IF_FAIL(ResolveExpression(
-          expression, col_table_map, ambiguous_colum_name, relations, all_cols,
+          expression, col_table_map, ambiguous_column_name, relations, all_cols,
           expand_proto_value_table, ambiguous_column));
       // See the qualified branch above: write back replaced subtrees.
       it->expression = std::move(expression);
@@ -584,23 +612,42 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   // relation identity so every downstream lookup resolves uniformly.
   const std::unordered_set<std::string> relations(from_.begin(), from_.end());
   std::unordered_map<std::string, std::string> col_table_map;
-  std::unordered_set<std::string> ambiguous_colum_name;
+  std::unordered_map<std::string, ValueType> col_types;
+  std::unordered_set<std::string> ambiguous_column_name;
   std::vector<ColumnName> all_cols;
   std::unordered_map<std::string, size_t> relation_column_counts;
+  const auto record_column = [&](const std::string& relation,
+                                 const std::string& name, ValueType type) {
+    all_cols.emplace_back(relation, name);
+    const std::string lower_name = ToLowerCopy(name);
+    if (!col_table_map.contains(lower_name)) {
+      col_table_map.emplace(lower_name, relation);
+      col_types.emplace(lower_name, type);
+    } else {
+      ambiguous_column_name.emplace(lower_name);
+    }
+  };
   const auto add_sample_weight = [&](const std::string& relation) {
     const auto sample = samples_.find(relation);
     if (sample == samples_.end() || !sample->second.with_weight) {
       return;
     }
-    const std::string& name = sample->second.weight_alias;
-    all_cols.emplace_back(relation, name);
     ++relation_column_counts[relation];
-    const std::string lower_name = ToLowerCopy(name);
-    if (!col_table_map.contains(lower_name)) {
-      col_table_map.emplace(lower_name, relation);
-    } else {
-      ambiguous_colum_name.emplace(lower_name);
+    record_column(relation, sample->second.weight_alias, ValueType::kDouble);
+  };
+  const auto record_relation_schema = [&](const std::string& relation,
+                                          const Schema& sc) {
+    relation_column_counts[relation] =
+        (sc.ColumnCount() == 1 &&
+         sc.GetColumn(0).Type() != ValueType::kVarChar &&
+         sc.GetColumn(0).Type() != ValueType::kNull)
+            ? 2
+            : sc.ColumnCount();
+    for (size_t i = 0; i < sc.ColumnCount(); ++i) {
+      const Column& col = sc.GetColumn(i);
+      record_column(relation, col.Name().name, col.Type());
     }
+    add_sample_weight(relation);
   };
 
   for (const auto& relation : from_) {
@@ -620,24 +667,7 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
       }
     }
     if (leaf_schema != nullptr) {
-      const Schema& sc = *leaf_schema;
-      relation_column_counts[relation] =
-          (sc.ColumnCount() == 1 &&
-           sc.GetColumn(0).Type() != ValueType::kVarChar &&
-           sc.GetColumn(0).Type() != ValueType::kNull)
-              ? 2
-              : sc.ColumnCount();
-      for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-        const ColumnName& col_name = sc.GetColumn(i).Name();
-        all_cols.emplace_back(relation, col_name.name);
-        const std::string lower_name = ToLowerCopy(col_name.name);
-        if (!col_table_map.contains(lower_name)) {
-          col_table_map.emplace(lower_name, relation);
-        } else {
-          ambiguous_colum_name.emplace(lower_name);
-        }
-      }
-      add_sample_weight(relation);
+      record_relation_schema(relation, *leaf_schema);
       continue;
     }
     const auto aliased = aliases_.find(relation);
@@ -645,44 +675,30 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
         aliased == aliases_.end() ? relation : aliased->second;
     ASSIGN_OR_RETURN(std::shared_ptr<Table>, from_table,
                      ctx.GetTable(physical));
-    const Schema& sc = from_table->GetSchema();
-    relation_column_counts[relation] =
-        (sc.ColumnCount() == 1 &&
-         sc.GetColumn(0).Type() != ValueType::kVarChar &&
-         sc.GetColumn(0).Type() != ValueType::kNull)
-            ? 2
-            : sc.ColumnCount();
-    for (size_t i = 0; i < sc.ColumnCount(); ++i) {
-      const ColumnName& col_name = sc.GetColumn(i).Name();
-      all_cols.emplace_back(relation, col_name.name);
-      const std::string lower_name = ToLowerCopy(col_name.name);
-      if (!col_table_map.contains(lower_name)) {
-        col_table_map.emplace(lower_name, relation);
-      } else {
-        ambiguous_colum_name.emplace(lower_name);
-      }
-    }
-    add_sample_weight(relation);
+    record_relation_schema(relation, from_table->GetSchema());
   }
 
   // STRUCT/PROTO field paths become explicit extraction calls before
   // resolution so only plain column references remain to bind.
   for (auto& item : select_) {
     Expression mapped =
-        BindFieldPaths(item.expression, col_table_map, relations);
+        BindFieldPaths(item.expression, col_table_map, ambiguous_column_name,
+                       col_types, relations);
     if (mapped) {
       item.expression = std::move(mapped);
     }
   }
   {
-    Expression mapped = BindFieldPaths(where_, col_table_map, relations);
+    Expression mapped = BindFieldPaths(
+        where_, col_table_map, ambiguous_column_name, col_types, relations);
     if (mapped) {
       where_ = std::move(mapped);
     }
   }
   for (OuterJoinEdge& edge : outer_joins_) {
     Expression mapped =
-        BindFieldPaths(edge.on_condition, col_table_map, relations);
+        BindFieldPaths(edge.on_condition, col_table_map, ambiguous_column_name,
+                       col_types, relations);
     if (mapped) {
       edge.on_condition = std::move(mapped);
     }
@@ -690,7 +706,8 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& [relation, sample] : samples_) {
     (void)relation;
     for (Expression& partition : sample.partition_by) {
-      Expression mapped = BindFieldPaths(partition, col_table_map, relations);
+      Expression mapped = BindFieldPaths(
+          partition, col_table_map, ambiguous_column_name, col_types, relations);
       if (mapped) {
         partition = std::move(mapped);
       }
@@ -701,21 +718,23 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
   for (auto& named : select_) {
     if (named.expression) {
       named.expression = BindColumnQualifiedFieldReads(
-          named.expression, col_table_map, relations, relation_column_counts);
+          named.expression, col_table_map, ambiguous_column_name, col_types,
+          relations, relation_column_counts);
     }
   }
-  where_ = where_
-               ? BindColumnQualifiedFieldReads(where_, col_table_map, relations,
-                                               relation_column_counts)
-               : where_;
-  qualify_ =
-      qualify_ ? BindColumnQualifiedFieldReads(
-                     qualify_, col_table_map, relations, relation_column_counts)
-               : qualify_;
+  where_ = where_ ? BindColumnQualifiedFieldReads(
+                        where_, col_table_map, ambiguous_column_name, col_types,
+                        relations, relation_column_counts)
+                  : where_;
+  qualify_ = qualify_ ? BindColumnQualifiedFieldReads(
+                            qualify_, col_table_map, ambiguous_column_name,
+                            col_types, relations, relation_column_counts)
+                      : qualify_;
   for (OuterJoinEdge& edge : outer_joins_) {
     edge.on_condition =
         edge.on_condition
             ? BindColumnQualifiedFieldReads(edge.on_condition, col_table_map,
+                                            ambiguous_column_name, col_types,
                                             relations, relation_column_counts)
             : edge.on_condition;
   }
@@ -759,25 +778,25 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
       }
     }
     const Status order_status = ResolveExpression(
-        order, col_table_map, ambiguous_colum_name, relations, all_cols,
+        order, col_table_map, ambiguous_column_name, relations, all_cols,
         expand_proto_value_table, &ambiguous_column_);
     if (order_status != Status::kSuccess) {
-      return RecordAmbiguousColumn(order_status, ambiguous_colum_name);
+      return RecordAmbiguousColumn(order_status, ambiguous_column_name);
     }
   }
   const Status select_status =
-      ResolveSelect(select_, col_table_map, ambiguous_colum_name, all_cols,
+      ResolveSelect(select_, col_table_map, ambiguous_column_name, all_cols,
                     relations, expand_proto_value_table, &ambiguous_column_);
   if (select_status != Status::kSuccess) {
-    return RecordAmbiguousColumn(select_status, ambiguous_colum_name);
+    return RecordAmbiguousColumn(select_status, ambiguous_column_name);
   }
 
   // Rewrite WHERE clause.
   Status where_status =
-      ResolveExpression(where_, col_table_map, ambiguous_colum_name, relations,
+      ResolveExpression(where_, col_table_map, ambiguous_column_name, relations,
                         all_cols, expand_proto_value_table, &ambiguous_column_);
   if (where_status != Status::kSuccess) {
-    return RecordAmbiguousColumn(where_status, ambiguous_colum_name);
+    return RecordAmbiguousColumn(where_status, ambiguous_column_name);
   }
   // Rewrite QUALIFY clause. Like ORDER BY it runs after projection, so bare
   // identifiers may name SELECT-list aliases; inline them (any depth) with
@@ -793,29 +812,29 @@ Status QueryData::Rewrite(TransactionContext& ctx) {
     qualify_ = InlineSelectAliases(qualify_, aliases, col_table_map);
   }
   Status qualify_status = ResolveExpression(
-      qualify_, col_table_map, ambiguous_colum_name, relations, all_cols,
+      qualify_, col_table_map, ambiguous_column_name, relations, all_cols,
       expand_proto_value_table, &ambiguous_column_);
   if (qualify_status != Status::kSuccess) {
-    return RecordAmbiguousColumn(qualify_status, ambiguous_colum_name);
+    return RecordAmbiguousColumn(qualify_status, ambiguous_column_name);
   }
   // Rewrite each outer-join ON condition in the same scope: bare names in ON
   // resolve against the combined FROM clause, exactly like WHERE.
   for (OuterJoinEdge& edge : outer_joins_) {
     Status on_status = ResolveExpression(
-        edge.on_condition, col_table_map, ambiguous_colum_name, relations,
+        edge.on_condition, col_table_map, ambiguous_column_name, relations,
         all_cols, expand_proto_value_table, &ambiguous_column_);
     if (on_status != Status::kSuccess) {
-      return RecordAmbiguousColumn(on_status, ambiguous_colum_name);
+      return RecordAmbiguousColumn(on_status, ambiguous_column_name);
     }
   }
   for (auto& [relation, sample] : samples_) {
     (void)relation;
     for (Expression& partition : sample.partition_by) {
       Status partition_status = ResolveExpression(
-          partition, col_table_map, ambiguous_colum_name, relations, all_cols,
+          partition, col_table_map, ambiguous_column_name, relations, all_cols,
           expand_proto_value_table, &ambiguous_column_);
       if (partition_status != Status::kSuccess) {
-        return RecordAmbiguousColumn(partition_status, ambiguous_colum_name);
+        return RecordAmbiguousColumn(partition_status, ambiguous_column_name);
       }
     }
   }

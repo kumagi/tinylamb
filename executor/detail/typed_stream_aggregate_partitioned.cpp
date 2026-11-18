@@ -90,6 +90,19 @@ inline bool IsDistinctAggKind(ColAggKind kind) noexcept {
          kind == ColAggKind::kCountDistinctVarChar;
 }
 
+// A checked SUM(INT64) is order-sensitive: whether the running sum wraps
+// depends on the sequence a group's rows reach the accumulator in, and the
+// partitioned kernels fold in row order only when Pass 1 runs a single worker
+// (with the dynamic block hand-off, the worker-major merge of the per-shard
+// buffers is an arbitrary row order otherwise). Keep plans with a checked SUM
+// on one worker; COUNT/MIN/MAX plans stay parallel. Same contract as the
+// typed-stream aggregate gate and the non-partitioned TLCS grouped gate.
+inline bool HasCheckedIntSum(const std::vector<ColAggSpec>& agg_specs) {
+  return std::any_of(
+      agg_specs.begin(), agg_specs.end(),
+      [](const ColAggSpec& s) { return s.kind == ColAggKind::kSumInt64; });
+}
+
 inline bool IsFixedNumericAggKind(ColAggKind kind) noexcept {
   return kind == ColAggKind::kCountStar || kind == ColAggKind::kCountCol ||
          kind == ColAggKind::kCountByteLen || kind == ColAggKind::kSumInt64 ||
@@ -99,114 +112,6 @@ inline bool IsFixedNumericAggKind(ColAggKind kind) noexcept {
          kind == ColAggKind::kMinDouble || kind == ColAggKind::kMinByteLen ||
          kind == ColAggKind::kMaxInt64 || kind == ColAggKind::kMaxDate ||
          kind == ColAggKind::kMaxDouble || kind == ColAggKind::kMaxByteLen;
-}
-
-// Reconstructs full key specifications (minus redundant functionally dependent
-// `kColInt64Delta` or `kConstInt64` keys when collapsed) -> physical keys.
-struct KeyProjectionMap {
-  std::vector<ColGroupKeySpec> phys_specs;
-  // Maps full key index i -> physical index, or -1 if derived.
-  std::vector<int32_t> full_to_phys;
-  // If full_to_phys[i] < 0 and key_specs[i].kind == kColInt64Delta, base phys
-  // slot whose int value + key_specs[i].const_int yields full key i.
-  std::vector<int32_t> delta_base_phys;
-
-  void ReconstructFull(const std::vector<ColGroupKeySpec>& full_specs,
-                       const RuntimeKeyCell* phys_cells,
-                       RuntimeKeyCell* out_full) const noexcept {
-    for (size_t i = 0; i < full_specs.size(); ++i) {
-      const int32_t p = full_to_phys[i];
-      if (p >= 0) {
-        out_full[i] = phys_cells[p];
-      } else if (full_specs[i].kind == ColKeyKind::kConstInt64) {
-        out_full[i] = RuntimeKeyCell{.int_val = full_specs[i].const_int};
-      } else {
-        const RuntimeKeyCell& base = phys_cells[delta_base_phys[i]];
-        if (base.is_null) {
-          out_full[i] = RuntimeKeyCell{.is_null = true};
-        } else {
-          out_full[i] =
-              RuntimeKeyCell{.int_val = base.int_val + full_specs[i].const_int};
-        }
-      }
-    }
-  }
-};
-
-StatusOr<KeyProjectionMap> BuildKeyProjectionMap(
-    const TlcsFile& tlcs, const std::vector<uint32_t>& candidate_blocks,
-    const std::vector<ColGroupKeySpec>& key_specs) {
-  KeyProjectionMap km;
-  km.full_to_phys.assign(key_specs.size(), -1);
-  km.delta_base_phys.assign(key_specs.size(), -1);
-
-  bool any_delta = false;
-  for (const auto& ks : key_specs) {
-    if (ks.kind == ColKeyKind::kColInt64Delta) {
-      any_delta = true;
-      break;
-    }
-  }
-  bool delta_safe = false;
-  if (any_delta) {
-    ASSIGN_OR_RETURN(
-        bool, ok,
-        ValidateDeltaKeysNoOverflow(tlcs, candidate_blocks, key_specs));
-    delta_safe = ok;
-  }
-
-  // Record base kColInt64 column indices so overflow-safe delta keys reuse
-  // them.
-  std::vector<std::pair<slot_t, int32_t>> int64_bases;
-  for (size_t i = 0; i < key_specs.size(); ++i) {
-    const auto& ks = key_specs[i];
-    if (ks.kind == ColKeyKind::kConstInt64) {
-      continue;
-    }
-    if (ks.kind == ColKeyKind::kColInt64) {
-      const auto p = static_cast<int32_t>(km.phys_specs.size());
-      km.phys_specs.push_back(ks);
-      km.full_to_phys[i] = p;
-      int64_bases.emplace_back(ks.full_col, p);
-    }
-  }
-  // Rebuild preserving original order when no deltas collapsed, or keeping
-  // stable physical mapping.
-  if (int64_bases.empty() || !delta_safe) {
-    km.phys_specs.clear();
-    std::fill(km.full_to_phys.begin(), km.full_to_phys.end(), -1);
-    for (size_t i = 0; i < key_specs.size(); ++i) {
-      if (key_specs[i].kind == ColKeyKind::kConstInt64) {
-        continue;
-      }
-      km.full_to_phys[i] = static_cast<int32_t>(km.phys_specs.size());
-      km.phys_specs.push_back(key_specs[i]);
-    }
-    return km;
-  }
-
-  for (size_t i = 0; i < key_specs.size(); ++i) {
-    const auto& ks = key_specs[i];
-    if (ks.kind == ColKeyKind::kConstInt64 || km.full_to_phys[i] >= 0) {
-      continue;
-    }
-    if (ks.kind == ColKeyKind::kColInt64Delta) {
-      int32_t base_p = -1;
-      for (const auto& [col, p] : int64_bases) {
-        if (col == ks.full_col) {
-          base_p = p;
-          break;
-        }
-      }
-      if (base_p >= 0) {
-        km.delta_base_phys[i] = base_p;
-        continue;
-      }
-    }
-    km.full_to_phys[i] = static_cast<int32_t>(km.phys_specs.size());
-    km.phys_specs.push_back(ks);
-  }
-  return km;
 }
 
 // Single-owner append chunk stream for one `(worker, shard)` bucket. Chunks
@@ -415,14 +320,15 @@ class SlabChunkReader {
 };
 
 // Shared fast single-column ORDER BY classification + final Relation emission
-// helper for materialized `FinalMaterializedRow` survivors.
+// helper for materialized materialized row survivors.
 enum class PartOrderKind : uint8_t { kNone, kInt, kDouble };
 
 PartOrderKind ClassifyPartOrderKind(
     const std::vector<ColumnarOrderBinding>& order_bindings,
     const std::vector<ColGroupKeySpec>& key_specs,
     const std::vector<ColAggSpec>& agg_specs) noexcept {
-  if (order_bindings.size() != 1) {
+  if (order_bindings.size() != 1 ||
+      order_bindings[0].order.KeyCollation() == Collation::kCaseInsensitive) {
     return PartOrderKind::kNone;
   }
   const OutputSlotBinding& b0 = order_bindings[0].binding;
@@ -461,6 +367,7 @@ PartOrderKind ClassifyPartOrderKind(
       case ColKeyKind::kColInt64Delta:
       case ColKeyKind::kColDate:
       case ColKeyKind::kUtcTimestampExtract:
+      case ColKeyKind::kUtcTimestampTrunc:
         return PartOrderKind::kInt;
       case ColKeyKind::kColDouble:
         return PartOrderKind::kDouble;
@@ -593,10 +500,15 @@ Status EvaluateNumericOrderValue(const OutputSlotBinding& b,
                           : (st.double_val / static_cast<double>(st.count));
         return Status::kSuccess;
       case ColAggKind::kSumDouble:
+        *out_is_null = !st.has_value;
+        *out_double = st.double_val;
+        return Status::kSuccess;
       case ColAggKind::kMinDouble:
       case ColAggKind::kMaxDouble:
         *out_is_null = !st.has_value;
-        *out_double = st.double_val;
+        // GoogleSQL: any NaN in the group makes MIN/MAX NaN.
+        *out_double = st.saw_nan ? std::numeric_limits<double>::quiet_NaN()
+                                 : st.double_val;
         return Status::kSuccess;
       default:
         *out_is_null = false;
@@ -903,6 +815,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
     std::vector<RuntimeKeyCell> probe_keys(n_phys);
     std::string regex_scratch;
     TimestampPrefixCache ts_cache;
+    RegexReplaceCache regex_cache;
     uint64_t dummy_scanned = 0;
 
     for (size_t bi = 0; bi < sample_blocks; ++bi) {
@@ -919,7 +832,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
         for (size_t k = 0; k < n_phys; ++k) {
           if (!ExtractSingleKeyCell(km.phys_specs[k], col_ptrs, r,
                                     &probe_keys[k], &regex_scratch, &ts_cache,
-                                    &kst)) {
+                                    &kst, &regex_cache)) {
             if (kst == StatusCode::kInvalidArgument) {
               return std::optional<Relation>{};
             }
@@ -950,10 +863,13 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
   const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
       req.table_schema, req.preds, req.key_specs, req.agg_specs);
   const size_t ncols = req.table_schema.ColumnCount();
-  const size_t workers = std::max<size_t>(
-      1, std::min<size_t>(
-             {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-              req.candidate_blocks.size(), size_t{16}}));
+  const size_t workers =
+      HasCheckedIntSum(req.agg_specs)
+          ? size_t{1}
+          : std::max<size_t>(
+                1, std::min<size_t>({QueryParallelWorkerLimit(
+                                         std::thread::hardware_concurrency()),
+                                     req.candidate_blocks.size(), size_t{16}}));
 
   if (use_pair_sharded) {
     // Pass 1 collects non-distinct aggs into compact per-worker
@@ -1910,12 +1826,18 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
                     st.double_val += d;
                     st.has_value = true;
                   } else if (ex.kind == ColAggKind::kMinDouble) {
+                    if (std::isnan(d)) {
+                      st.saw_nan = true;
+                    }
                     if (!st.has_value ||
                         CompareForOrderBy(Value(d), Value(st.double_val)) < 0) {
                       st.double_val = d;
                       st.has_value = true;
                     }
                   } else {
+                    if (std::isnan(d)) {
+                      st.saw_nan = true;
+                    }
                     if (!st.has_value ||
                         CompareForOrderBy(Value(d), Value(st.double_val)) > 0) {
                       st.double_val = d;
@@ -2112,6 +2034,8 @@ StatusOr<std::optional<Relation>> ExecutePartitionedDistinct(
 struct NumericAggCell {
   int64_t val_bits{0};
   int64_t cnt{0};
+  // GoogleSQL MIN/MAX NaN poisoning (see RuntimeAggState::saw_nan).
+  bool saw_nan{false};
 };
 
 inline Status MergeNumericRawValue(const ColAggSpec& spec, bool val_is_null,
@@ -2167,6 +2091,9 @@ inline Status MergeNumericRawValue(const ColAggSpec& spec, bool val_is_null,
       st.cnt += multiplicity;
       break;
     case ColAggKind::kMinDouble: {
+      if (std::isnan(val_d)) {
+        st.saw_nan = true;
+      }
       const auto cur = std::bit_cast<double>(st.val_bits);
       if (st.cnt == 0 || CompareForOrderBy(Value(val_d), Value(cur)) < 0) {
         st.val_bits = std::bit_cast<int64_t>(val_d);
@@ -2175,6 +2102,9 @@ inline Status MergeNumericRawValue(const ColAggSpec& spec, bool val_is_null,
       break;
     }
     case ColAggKind::kMaxDouble: {
+      if (std::isnan(val_d)) {
+        st.saw_nan = true;
+      }
       const auto cur = std::bit_cast<double>(st.val_bits);
       if (st.cnt == 0 || CompareForOrderBy(Value(val_d), Value(cur)) > 0) {
         st.val_bits = std::bit_cast<int64_t>(val_d);
@@ -2193,6 +2123,7 @@ inline RuntimeAggState ToRuntimeAggState(const ColAggSpec& spec,
   RuntimeAggState st;
   st.count = nc.cnt;
   st.has_value = (nc.cnt > 0);
+  st.saw_nan = nc.saw_nan;
   if (spec.kind == ColAggKind::kSumDouble ||
       spec.kind == ColAggKind::kAvgDouble ||
       spec.kind == ColAggKind::kAvgByteLen ||
@@ -2230,10 +2161,13 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
   const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
       req.table_schema, req.preds, km.phys_specs, req.agg_specs);
   const size_t ncols = req.table_schema.ColumnCount();
-  const size_t workers = std::max<size_t>(
-      1, std::min<size_t>(
-             {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-              req.candidate_blocks.size(), size_t{16}}));
+  const size_t workers =
+      HasCheckedIntSum(req.agg_specs)
+          ? size_t{1}
+          : std::max<size_t>(
+                1, std::min<size_t>({QueryParallelWorkerLimit(
+                                         std::thread::hardware_concurrency()),
+                                     req.candidate_blocks.size(), size_t{16}}));
 
   const bool only_count_star =
       (naggs == 1 && req.agg_specs[0].kind == ColAggKind::kCountStar);
@@ -2288,7 +2222,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
     }
 
     // Compact self-tuning L1 combiner for single-key COUNT(*) (`Q16, Q36`)
-    // that auto-disables on low hit rates (`< 8%`) so unique WatchIDs bypass
+    // that auto-disables on low hit rates (`< 6.25%`) so unique WatchIDs bypass
     // it.
     struct L1SingleIntCount {
       int64_t key{0};
@@ -2386,7 +2320,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
           } else {
             Status kst = Status::kSuccess;
             if (!ExtractSingleKeyCell(km.phys_specs[0], col_ptrs, r,
-                                      &probe_keys[0], &regex_scratch, &ts_cache,
+                                      probe_keys.data(), &regex_scratch, &ts_cache,
                                       &kst)) {
               p1_status[tid] = std::move(kst);
               return;
@@ -3025,7 +2959,11 @@ StatusOr<std::optional<Relation>> ExecutePartitionedFixedKeys(
                     break;
                   default:
                     w.is_null = (nc.cnt == 0);
-                    w.dv = std::bit_cast<double>(nc.val_bits);
+                    w.dv =
+                        nc.saw_nan && (oagg->kind == ColAggKind::kMinDouble ||
+                                       oagg->kind == ColAggKind::kMaxDouble)
+                            ? std::numeric_limits<double>::quiet_NaN()
+                            : std::bit_cast<double>(nc.val_bits);
                     break;
                 }
               } else {
@@ -3249,10 +3187,13 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
   const ColumnarStageSchedule sched = BuildColumnarStageSchedule(
       req.table_schema, req.preds, km.phys_specs, req.agg_specs);
   const size_t ncols = req.table_schema.ColumnCount();
-  const size_t workers = std::max<size_t>(
-      1, std::min<size_t>(
-             {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-              req.candidate_blocks.size(), size_t{16}}));
+  const size_t workers =
+      HasCheckedIntSum(req.agg_specs)
+          ? size_t{1}
+          : std::max<size_t>(
+                1, std::min<size_t>({QueryParallelWorkerLimit(
+                                         std::thread::hardware_concurrency()),
+                                     req.candidate_blocks.size(), size_t{16}}));
   const size_t num_shards =
       req.candidate_blocks.size() <= 16
           ? 16
@@ -3419,6 +3360,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
     std::vector<RuntimeKeyCell> probe_keys(n_phys);
     std::string regex_scratch;
     TimestampPrefixCache ts_cache;
+    RegexReplaceCache regex_cache;
     uint64_t local_scanned = 0;
     uint64_t local_matching = 0;
     std::array<int64_t, 8> agg_words{};
@@ -3448,7 +3390,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
         for (size_t k = 0; k < n_phys; ++k) {
           if (!ExtractSingleKeyCell(km.phys_specs[k], col_ptrs, r,
                                     &probe_keys[k], &regex_scratch, &ts_cache,
-                                    &kst)) {
+                                    &kst, &regex_cache)) {
             p1_status[tid] = std::move(kst);
             return;
           }
@@ -3633,7 +3575,7 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
           // The mixed-path record layout mirrors emit_group_record: an 8-byte
           // hash, a 1-byte key NULL mask, 9 bytes for the count payload, then
           // 4+len for each VARCHAR key and 8 for each fixed-width key. The old
-          // /24 guess overpresized the table by ~3x for several 10-char
+          // /24 guess oversized the table by ~3x for several 10-char
           // VARCHAR keys, wasting memory charged to the query budget.
           constexpr size_t kAssumedVarcharKeyBytes = 12;
           size_t mixed_rec_bytes = 8 + (only_count_star ? 9 : 2);
@@ -4085,6 +4027,9 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
                       }
                     } else if (spec.kind == ColAggKind::kMinDouble) {
                       const auto d = std::bit_cast<double>(vi);
+                      if (std::isnan(d)) {
+                        st.saw_nan = true;
+                      }
                       if (!st.has_value ||
                           CompareForOrderBy(Value(d), Value(st.double_val)) <
                               0) {
@@ -4093,6 +4038,9 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
                       }
                     } else if (spec.kind == ColAggKind::kMaxDouble) {
                       const auto d = std::bit_cast<double>(vi);
+                      if (std::isnan(d)) {
+                        st.saw_nan = true;
+                      }
                       if (!st.has_value ||
                           CompareForOrderBy(Value(d), Value(st.double_val)) >
                               0) {
@@ -4241,6 +4189,439 @@ StatusOr<std::optional<Relation>> ExecutePartitionedMixedKeysInternal(
       &shard_survivor_charges);
 }
 
+// Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+// (unordered_group_by_key_fiber_subset_sound,
+// unordered_group_by_nonkey_filter_corrupts_count_bug)
+// CB-2: Key-fiber subset aggregation for unordered `GROUP BY ... LIMIT K`
+// (ClickBench Q18: `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY
+// UserID, SearchPhrase LIMIT 10`). Filtering input rows by a predicate `P(k1)`
+// on an integer/date prefix key `k1` alone preserves 100% exact full-table
+// aggregates for every surviving group while skipping decompression of heavy
+// VARCHAR keys (`SearchPhrase`) on >99% of blocks!
+StatusOr<std::optional<Relation>> TryRunKeyFiberUnorderedLimitAggregate(
+    const PartitionedColumnarAggRequest& req, const KeyProjectionMap& km) {
+  if (!req.order_bindings.empty() || !req.stmt.HasLimit() ||
+      req.stmt.Limit() == 0 || req.any_scalar_distinct ||
+      req.candidate_blocks.size() <= 8 || HasCheckedIntSum(req.agg_specs)) {
+    return std::optional<Relation>{};
+  }
+  if (req.stmt.Offset() >
+      std::numeric_limits<size_t>::max() - req.stmt.Limit()) {
+    return std::optional<Relation>{};
+  }
+  const size_t topk_cap = req.stmt.Offset() + req.stmt.Limit();
+  if (topk_cap == 0 || topk_cap > 512) {
+    return std::optional<Relation>{};
+  }
+
+  // Every physical key must be infallible so skipping non-fiber rows can never
+  // mask a runtime expression error.
+  size_t fiber_phys_idx = SIZE_MAX;
+  for (size_t p = 0; p < km.phys_specs.size(); ++p) {
+    const ColKeyKind kind = km.phys_specs[p].kind;
+    if (kind != ColKeyKind::kColInt64 && kind != ColKeyKind::kColDate &&
+        kind != ColKeyKind::kColDouble && kind != ColKeyKind::kColVarChar &&
+        kind != ColKeyKind::kCaseWhenVarChar) {
+      return std::optional<Relation>{};
+    }
+    if (fiber_phys_idx == SIZE_MAX &&
+        (kind == ColKeyKind::kColInt64 || kind == ColKeyKind::kColDate)) {
+      fiber_phys_idx = p;
+    }
+  }
+  if (fiber_phys_idx == SIZE_MAX) {
+    return std::optional<Relation>{};
+  }
+  for (const ColAggSpec& as : req.agg_specs) {
+    if (IsDistinctAggKind(as.kind)) {
+      return std::optional<Relation>{};
+    }
+  }
+
+  // Step 1: Seed up to `target_fiber_keys` distinct values of `fiber_col` from
+  // the leading candidate blocks (decoding ONLY `preds` + `fiber_col`!).
+  const size_t target_fiber_keys =
+      std::min<size_t>(64, std::max<size_t>(16, topk_cap * 2));
+  const ColGroupKeySpec& fiber_spec = km.phys_specs[fiber_phys_idx];
+  const ColumnarStageSchedule seed_sched =
+      BuildColumnarStageSchedule(req.table_schema, req.preds, {fiber_spec}, {});
+  const size_t ncols = req.table_schema.ColumnCount();
+
+  static constexpr size_t kFiberSlots = 256;
+  static constexpr size_t kFiberMask = kFiberSlots - 1;
+  struct FiberSlot {
+    uint64_t hash{0};
+    int64_t key{0};
+    bool occupied{false};
+  };
+  std::array<FiberSlot, kFiberSlots> fiber_ht{};
+  size_t fiber_count = 0;
+  bool fiber_has_null = false;
+  int64_t fiber_min = std::numeric_limits<int64_t>::max();
+  int64_t fiber_max = std::numeric_limits<int64_t>::min();
+  bool exhausted_all_blocks = true;
+
+  auto fiber_contains_nonnull = [&](int64_t v) noexcept -> bool {
+    if (v < fiber_min || v > fiber_max) {
+      return false;
+    }
+    const uint64_t h = MixHash64(static_cast<uint64_t>(v));
+    size_t pos = static_cast<size_t>(h) & kFiberMask;
+    while (fiber_ht[pos].occupied) {
+      if (fiber_ht[pos].hash == h && fiber_ht[pos].key == v) {
+        return true;
+      }
+      pos = (pos + 1) & kFiberMask;
+    }
+    return false;
+  };
+
+  auto fiber_insert_nonnull = [&](int64_t v) noexcept -> bool {
+    const uint64_t h = MixHash64(static_cast<uint64_t>(v));
+    size_t pos = static_cast<size_t>(h) & kFiberMask;
+    while (fiber_ht[pos].occupied) {
+      if (fiber_ht[pos].hash == h && fiber_ht[pos].key == v) {
+        return false;
+      }
+      pos = (pos + 1) & kFiberMask;
+    }
+    fiber_ht[pos] = {.hash = h, .key = v, .occupied = true};
+    fiber_min = std::min(fiber_min, v);
+    fiber_max = std::max(fiber_max, v);
+    ++fiber_count;
+    return true;
+  };
+
+  {
+    BlockDecodeScratch seed_scratch;
+    std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
+    std::vector<uint32_t> cand_rows;
+    uint64_t dummy_scanned = 0;
+    const size_t max_seed_blocks =
+        std::min<size_t>(8, req.candidate_blocks.size());
+    size_t bi = 0;
+    for (; bi < max_seed_blocks; ++bi) {
+      ASSIGN_OR_RETURN(
+          bool, any_rows,
+          DecodeAndFilterBlock(*req.tlcs, req.candidate_blocks[bi],
+                               req.table_schema, req.preds, seed_sched,
+                               &seed_scratch, &col_ptrs, &cand_rows,
+                               &dummy_scanned));
+      if (!any_rows) {
+        continue;
+      }
+      const auto* fch = col_ptrs[fiber_spec.full_col];
+      const bool no_null = !fch->has_null;
+      for (const uint32_t r : cand_rows) {
+        if (!no_null && fch->IsNull(r)) {
+          if (!fiber_has_null) {
+            fiber_has_null = true;
+            ++fiber_count;
+          }
+        } else {
+          (void)fiber_insert_nonnull(fch->int_cells[r]);
+        }
+        if (fiber_count >= target_fiber_keys) {
+          exhausted_all_blocks = false;
+          break;
+        }
+      }
+      if (fiber_count >= target_fiber_keys) {
+        break;
+      }
+    }
+    if (bi < req.candidate_blocks.size() && fiber_count < target_fiber_keys) {
+      exhausted_all_blocks = false;
+    }
+  }
+
+  if (fiber_count == 0) {
+    return std::optional<Relation>{};
+  }
+  if (!exhausted_all_blocks && fiber_count < std::min<size_t>(4, topk_cap)) {
+    return std::optional<Relation>{};
+  }
+
+  // Step 2: Zone-map prune `candidate_blocks` on `fiber_col`!
+  std::vector<uint32_t> fiber_blocks;
+  if (!fiber_has_null && fiber_min <= fiber_max) {
+    const uint32_t dg_count = req.tlcs->DirGroupCount();
+    const uint32_t dg_size = req.tlcs->DirGroupSize();
+    std::vector<std::shared_ptr<const TlcsFile::DirGroup>> dir_groups(dg_count);
+    for (uint32_t g = 0; g < dg_count; ++g) {
+      ASSIGN_OR_RETURN(std::shared_ptr<const TlcsFile::DirGroup>, grp,
+                       req.tlcs->GetDirGroup(g));
+      dir_groups[g] = std::move(grp);
+    }
+    const slot_t fcol = fiber_spec.full_col;
+    fiber_blocks.reserve(req.candidate_blocks.size());
+    for (const uint32_t bidx : req.candidate_blocks) {
+      const auto& blk = dir_groups[bidx / dg_size]->blocks[bidx % dg_size];
+      const auto& m = blk.columns[fcol];
+      if (m.encoding == TlcsColumnEncoding::kConstNull) {
+        continue;
+      }
+      if (m.has_min_max && (m.max_int < fiber_min || m.min_int > fiber_max)) {
+        continue;
+      }
+      fiber_blocks.push_back(bidx);
+    }
+  } else {
+    fiber_blocks = req.candidate_blocks;
+  }
+
+  // Determine remaining payload columns (`SearchPhrase`, `agg_specs`, etc.)
+  // decoded ONLY on blocks where `fiber_rows` is non-empty!
+  std::vector<uint8_t> in_seed(ncols, 0);
+  for (const slot_t c : seed_sched.stage1a_cols) {
+    in_seed[c] = 1;
+  }
+  for (const slot_t c : seed_sched.stage1b_cols) {
+    in_seed[c] = 1;
+  }
+  for (const slot_t c : seed_sched.stage2_cols) {
+    in_seed[c] = 1;
+  }
+  for (const slot_t c : seed_sched.cond_cols) {
+    in_seed[c] = 1;
+  }
+  std::vector<uint8_t> extra_need(ncols, 0);
+  std::vector<uint8_t> extra_bytes(ncols, 0);
+  for (const auto & ks : km.phys_specs) {
+    if (ks.kind == ColKeyKind::kConstInt64) {
+      continue;
+    }
+    extra_need[ks.full_col] = 1;
+    if (req.table_schema.GetColumn(ks.full_col).Type() == ValueType::kVarChar) {
+      extra_bytes[ks.full_col] = 1;
+    }
+    for (const auto& cc : ks.case_conditions) {
+      extra_need[cc.left] = 1;
+      if (!cc.constant_payload) {
+        extra_need[cc.right] = 1;
+      }
+    }
+  }
+  for (const ColAggSpec& as : req.agg_specs) {
+    if (as.kind == ColAggKind::kCountStar) {
+      continue;
+    }
+    extra_need[as.full_col] = 1;
+    if (as.needs_bytes) {
+      extra_bytes[as.full_col] = 1;
+    }
+  }
+  ColumnarStageSchedule scan_sched = seed_sched;
+  for (size_t i = 0; i < scan_sched.stage1b_cols.size(); ++i) {
+    if (extra_bytes[scan_sched.stage1b_cols[i]] != 0U) {
+      scan_sched.stage1b_len_only[i] = 0;
+    }
+  }
+  for (size_t i = 0; i < scan_sched.stage2_cols.size(); ++i) {
+    if (extra_bytes[scan_sched.stage2_cols[i]] != 0U) {
+      scan_sched.stage2_len_only[i] = 0;
+    }
+  }
+  std::vector<slot_t> extra_cols;
+  std::vector<uint8_t> extra_len_only;
+  for (size_t c = 0; c < ncols; ++c) {
+    if (extra_need[c] != 0U && in_seed[c] == 0U) {
+      extra_cols.push_back(static_cast<slot_t>(c));
+      extra_len_only.push_back(extra_bytes[c] != 0U ? 0 : 1);
+    }
+  }
+
+  const size_t workers = std::max<size_t>(
+      1, std::min<size_t>(
+             {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+              std::max<size_t>(1, fiber_blocks.size()), size_t{16}}));
+  std::vector<QueryMemoryCharge> w_charges(workers);
+  std::vector<std::unique_ptr<WorkerGroupTable>> w_tables;
+  w_tables.reserve(workers);
+  for (size_t w = 0; w < workers; ++w) {
+    w_tables.push_back(std::make_unique<WorkerGroupTable>(
+        &km.phys_specs, &req.agg_specs, &w_charges[w]));
+  }
+  std::vector<Status> w_status(workers, Status::kSuccess);
+  std::atomic<size_t> next_b{0};
+  std::atomic<uint64_t> total_scanned{0};
+  std::atomic<uint64_t> total_matching{0};
+  const size_t n_phys = km.phys_specs.size();
+
+  RunParallelTasks(workers, [&](size_t tid) {
+    BlockDecodeScratch scratch;
+    TlcsFile::DecodedBlock blk_extra;
+    std::vector<uint8_t> io_extra;
+    std::vector<const TlcsFile::DecodedColumnChunk*> col_ptrs(ncols, nullptr);
+    std::vector<uint32_t> cand_rows;
+    std::vector<uint32_t> fiber_rows;
+    std::vector<RuntimeKeyCell> probe_keys(n_phys);
+    std::string regex_scratch;
+    TimestampPrefixCache ts_cache;
+    RegexReplaceCache regex_cache;
+    uint64_t local_scanned = 0;
+    uint64_t local_matching = 0;
+    WorkerGroupTable& wt = *w_tables[tid];
+
+    while (true) {
+      const size_t bi = next_b.fetch_add(1, std::memory_order_relaxed);
+      if (bi >= fiber_blocks.size()) {
+        break;
+      }
+      const uint32_t bidx = fiber_blocks[bi];
+      auto dec_or = DecodeAndFilterBlock(*req.tlcs, bidx, req.table_schema,
+                                         req.preds, scan_sched, &scratch,
+                                         &col_ptrs, &cand_rows, &local_scanned);
+      if (!dec_or.HasValue()) {
+        w_status[tid] = dec_or.GetStatus();
+        return;
+      }
+      if (!dec_or.Value()) {
+        continue;
+      }
+      local_matching += cand_rows.size();
+
+      const auto* fch = col_ptrs[fiber_spec.full_col];
+      const bool no_null = !fch->has_null;
+      fiber_rows.clear();
+      for (const uint32_t r : cand_rows) {
+        if (!no_null && fch->IsNull(r)) {
+          if (fiber_has_null) {
+            fiber_rows.push_back(r);
+          }
+        } else if (fiber_contains_nonnull(fch->int_cells[r])) {
+          fiber_rows.push_back(r);
+        }
+      }
+      if (fiber_rows.empty()) {
+        continue;
+      }
+
+      if (!extra_cols.empty()) {
+        Status est = req.tlcs->DecodeBlockColumnsWithOptions(
+            bidx, extra_cols, req.table_schema, &blk_extra, true, &io_extra,
+            extra_len_only);
+        if (est != Status::kSuccess) {
+          w_status[tid] = std::move(est);
+          return;
+        }
+        for (size_t i = 0; i < extra_cols.size(); ++i) {
+          col_ptrs[extra_cols[i]] = &blk_extra.columns[i];
+        }
+      }
+
+      for (const uint32_t r : fiber_rows) {
+        Status kst = Status::kSuccess;
+        for (size_t k = 0; k < n_phys; ++k) {
+          if (!ExtractSingleKeyCell(km.phys_specs[k], col_ptrs, r,
+                                    &probe_keys[k], &regex_scratch, &ts_cache,
+                                    &kst, &regex_cache)) {
+            w_status[tid] = std::move(kst);
+            return;
+          }
+        }
+        const uint64_t kh =
+            GroupKeySliceHasher::HashTyped(probe_keys.data(), km.phys_specs);
+        auto gid_or = wt.FindOrInsert(probe_keys.data(), kh);
+        if (!gid_or.HasValue()) {
+          w_status[tid] = gid_or.GetStatus();
+          return;
+        }
+        RuntimeAggState* ast = wt.AggsAt(gid_or.Value());
+        for (size_t a = 0; a < req.agg_specs.size(); ++a) {
+          Status fst = FoldRowIntoAggState(req.agg_specs[a], col_ptrs, r,
+                                           ast[a], wt.Arena());
+          if (fst != Status::kSuccess) {
+            w_status[tid] = std::move(fst);
+            return;
+          }
+        }
+      }
+    }
+    total_scanned.fetch_add(local_scanned, std::memory_order_relaxed);
+    total_matching.fetch_add(local_matching, std::memory_order_relaxed);
+  });
+
+  for (const Status& st : w_status) {
+    if (st == StatusCode::kInvalidArgument ||
+        st == StatusCode::kMemoryLimitExceeded) {
+      return std::optional<Relation>{};
+    }
+    RETURN_IF_FAIL(st);
+  }
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  QueryMemoryCharge merge_charge;
+  WorkerGroupTable merged(&km.phys_specs, &req.agg_specs, &merge_charge);
+  size_t est_total = 0;
+  for (const auto& wt : w_tables) {
+    est_total += wt->NumGroups();
+  }
+  Status rst = merged.Reserve(std::max<size_t>(16, est_total));
+  if (rst == StatusCode::kMemoryLimitExceeded) {
+    return std::optional<Relation>{};
+  }
+  RETURN_IF_FAIL(rst);
+  for (size_t w = 0; w < workers; ++w) {
+    WorkerGroupTable& src = *w_tables[w];
+    for (size_t g = 0; g < src.NumGroups(); ++g) {
+      Status mst =
+          merged.MergeFromGroup(src.KeysAt(g), src.HashAt(g), src.AggsAt(g),
+                                /*borrow_strings=*/true);
+      if (mst == StatusCode::kMemoryLimitExceeded) {
+        return std::optional<Relation>{};
+      }
+      RETURN_IF_FAIL(mst);
+    }
+  }
+
+  std::vector<std::vector<SurvivorGroupRow>> single_surv(1);
+  std::vector<std::unique_ptr<QueryMemoryCharge>> survivor_charges(1);
+  QueryMemoryCharge& survivor_charge = SurvivorChargeFor(survivor_charges, 0);
+  auto& out_vec = single_surv[0];
+  std::vector<RuntimeKeyCell> full_keys(req.key_specs.size());
+  std::vector<Value> finished_aggs(req.agg_specs.size());
+  std::vector<Value> cached_keys(req.key_specs.size());
+  std::vector<Value> having_scratch(req.agg_specs.size());
+
+  const size_t ng = merged.NumGroups();
+  for (size_t g = 0; g < ng; ++g) {
+    const RuntimeAggState* ast = merged.AggsAt(g);
+    ASSIGN_OR_RETURN(
+        bool, passes,
+        EvalPositionalHavingOnStates(req.positional_having, req.agg_specs, ast,
+                                     &having_scratch));
+    if (!passes) {
+      continue;
+    }
+    km.ReconstructFull(req.key_specs, merged.KeysAt(g), full_keys.data());
+    for (size_t a = 0; a < req.agg_specs.size(); ++a) {
+      finished_aggs[a] = FinishAggState(req.agg_specs[a], ast[a]);
+    }
+    std::fill(cached_keys.begin(), cached_keys.end(), Value());
+    SurvivorGroupRow row;
+    row.emit_vals.reserve(req.emit_bindings.size());
+    for (const auto& eb : req.emit_bindings) {
+      ASSIGN_OR_RETURN(Value, ev,
+                       EvaluateBindingValue(eb, req.key_specs, full_keys.data(),
+                                            finished_aggs, &cached_keys));
+      row.emit_vals.push_back(std::move(ev));
+    }
+    PushChargedSurvivor(&out_vec, &survivor_charge, std::move(row));
+    if (out_vec.size() >= topk_cap) {
+      break;
+    }
+  }
+
+  if (out_vec.size() < topk_cap && !exhausted_all_blocks) {
+    return std::optional<Relation>{};
+  }
+
+  return FinalizePartitionedRelation(req, single_surv, ng, total_scanned.load(),
+                                     total_matching.load(), merge_begin,
+                                     "key-fiber-limit", &survivor_charges);
+}
+
 }  // namespace
 
 StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
@@ -4255,6 +4636,17 @@ StatusOr<std::optional<Relation>> TryRunPartitionedColumnarTlcsAggregate(
     // Only constant keys (`GROUP BY 1`), handled cleanly by non-partitioned
     // small path.
     return std::optional<Relation>{};
+  }
+
+  // CB-2: Unordered `GROUP BY ... LIMIT K` key-fiber prefix exact subset
+  // (`ClickBench Q18`). Runs before allocating multi-shard SpillStore slabs!
+  if (req.order_bindings.empty() && req.stmt.HasLimit() &&
+      !req.any_scalar_distinct && req.candidate_blocks.size() > 8) {
+    ASSIGN_OR_RETURN(std::optional<Relation>, fiber_res,
+                     TryRunKeyFiberUnorderedLimitAggregate(req, km));
+    if (fiber_res.has_value()) {
+      return fiber_res;
+    }
   }
 
   // One lazily-opened unlinked backing file shared by every Pass-1 shard

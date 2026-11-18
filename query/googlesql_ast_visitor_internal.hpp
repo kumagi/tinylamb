@@ -5,14 +5,19 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "common/status_or.hpp"
 #include "expression/expression.hpp"
+#include "expression/window_function_expression.hpp"
 #include "query/googlesql_ast.hpp"
 #include "query/statement.hpp"
 
@@ -38,10 +43,106 @@ inline std::string Lower(std::string value) {
   return value;
 }
 
+inline std::string UpperCopy(std::string text) {
+  std::ranges::transform(text, text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::toupper(c));
+  });
+  return text;
+}
+
+// UDF types and registries
+struct SqlUdf {
+  std::string name;
+  std::vector<std::pair<std::string, bool>>
+      parameters;  // (lower name, NOT AGGREGATE)
+  std::vector<std::shared_ptr<GoogleSqlAstNode>> default_values;
+  bool is_aggregate{false};
+  std::shared_ptr<GoogleSqlAstNode> root;  // owns the AST copy
+  const GoogleSqlAstNode* body{nullptr};
+  // Body analysis: how often each parameter occurs, and whether the body is
+  // too complex (subqueries, aggregates) for argument-once binding.
+  std::vector<size_t> parameter_counts;
+  bool simple_body{true};
+  // Connection that created the definition (see SetUdfSessionScope). 0 is the
+  // unscoped CLI/test harness.
+  uint64_t owner_session{0};
+};
+
+// CREATE [TEMP] FUNCTION definitions live in a thread-local registry. Each
+// server connection scopes lookups to its own id so a function never resolves
+// in another session that happens to share the event-loop thread; 0 is the
+// unscoped default used by the CLI and the single-connection test harness.
+void SetUdfSessionScope(uint64_t session_id);
+uint64_t UdfSessionScope();
+// Registers `udf` (lowered name) for the current scope, replacing only that
+// scope's definition of the name.
+void RegisterUdf(SqlUdf udf);
+// Definition visible to the current scope, or nullptr.
+SqlUdf* FindUdf(const std::string& name);
+// Drops every definition owned by `session_id` (server disconnect).
+void PurgeUdfSessionDefinitions(uint64_t session_id);
+
+std::unordered_map<std::string, Expression>& SessionConstantExpressions();
+
+struct UdfExpansionFrame {
+  const SqlUdf* udf;
+  const std::vector<Expression>* arguments;
+  size_t mask_depth;
+};
+
+extern thread_local std::vector<UdfExpansionFrame> t_udf_frames;
+extern thread_local std::vector<std::unordered_set<std::string>>
+    t_udf_bound_masks;
+
+// Named windows
+struct NamedWindowParts {
+  std::vector<Expression> partition_by;
+  std::vector<WindowOrderTerm> order_by;
+  WindowFrameUnit frame_unit{WindowFrameUnit::kDefault};
+  WindowFrameBound frame_start;
+  WindowFrameBound frame_end;
+  bool has_frame{false};
+};
+
+extern thread_local std::unordered_map<std::string, NamedWindowParts>
+    t_named_windows;
+StatusOr<NamedWindowParts> ParseWindowSpecification(
+    const GoogleSqlAstNode& spec);
+void CollectFromBoundNames(const GoogleSqlAstNode& node,
+                           std::unordered_set<std::string>* names);
+
+extern thread_local const std::string* t_visit_source;
+void SkipSqlTrivia(std::string_view text, size_t* position);
+inline bool IsLateralIdentifierChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+inline bool IsAstTrivia(std::string_view kind) { return kind == "Location"; }
+
+// Source slicing
+std::string SliceSource(const GoogleSqlAstNode* node);
+
+// Literal and type helpers
 StatusOr<int64_t> ParseIntLiteral(const GoogleSqlAstNode& node);
+StatusOr<uint64_t> ParseUnsignedLiteral(const GoogleSqlAstNode& node);
+StatusOr<std::string> DecodeSingleComponent(std::string_view value_view);
+
+StatusOr<std::string> SqlTypeFromAst(const GoogleSqlAstNode& node);
 StatusOr<std::string> Identifier(const GoogleSqlAstNode& node);
 StatusOr<std::string> Path(const GoogleSqlAstNode& path);
 StatusOr<std::string> Alias(const GoogleSqlAstNode& node);
+StatusOr<Expression> BuildNewConstructor(const GoogleSqlAstNode& node);
+
+// Ordering terms
+StatusOr<WindowOrderTerm> ParseOrderingTerm(const GoogleSqlAstNode* term);
+StatusOr<std::vector<WindowOrderTerm>> ParseOrderingList(
+    const GoogleSqlAstNode* list);
+
+// Struct helpers
+std::optional<std::vector<std::string>> StructProjectionFields(
+    const Expression& expression, size_t depth = 0);
+
+// Core visitors
 StatusOr<Expression> VisitExpression(const GoogleSqlAstNode& node);
 StatusOr<std::shared_ptr<SelectStatement>> VisitQuery(
     const GoogleSqlAstNode& query);

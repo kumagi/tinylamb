@@ -19,5 +19,12 @@ not fetched for normal builds).
   `tinylamb_expression_jit_benchmark` (**`EXCLUDE_FROM_ALL`**): scalar-vs-JIT
   on INT64 filters, reports compile ms + break-even row count (LLVM
   availability probe).
+- `ooc_baseline_measure.cpp` →
+  `tinylamb_ooc_baseline_measure` (**`EXCLUDE_FROM_ALL`**): measures pooled
+  tracked memory (`ProcessMemoryBudget`) and unaccounted RSS across load and
+  self-join execution.
+- `tpcds_benchmark.cpp`, `tpcds_compare.cpp`, `tpcc_tcp_benchmark.cpp`,
+  `spsc_aggregation_benchmark.cpp`, `wasm_spike/` — TPC-DS, external-client
+  TPC-C, SPSC aggregation, and WASM execution spike runners/benchmarks.
 
 Gate: `scripts/bench_gate.py` compares against `BenchmarkHistory.md`.

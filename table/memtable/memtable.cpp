@@ -538,8 +538,15 @@ Status MemTable::Sync(std::vector<char>* blob_out,
   // flush_mutex_ is held, so this read is ordered against
   // SetDurabilityCallback's store; (fn, ctx) are always a matched pair.
   if (durability_fn_ != nullptr) {
-    durability_fn_(reinterpret_cast<const char*>(blob_out->data()),
-                   blob_out->size(), durability_ctx_);
+    try {
+      durability_fn_(reinterpret_cast<const char*>(blob_out->data()),
+                     blob_out->size(), durability_ctx_);
+    } catch (const std::exception& e) {
+      return StatusError(StatusCode::kIOError,
+                         std::string("WAL durability hook failed: ") + e.what());
+    } catch (...) {
+      return StatusError(StatusCode::kIOError, "WAL durability hook failed");
+    }
   }
   return Status::kSuccess;
 }

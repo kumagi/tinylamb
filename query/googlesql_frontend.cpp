@@ -218,7 +218,8 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   });
 
   std::string output;
-  std::thread reader([stdout_read, &output]() {
+  bool output_truncated = false;
+  std::thread reader([stdout_read, &output, &output_truncated]() {
     std::array<char, 4096> buffer{};
     for (;;) {
       DWORD n = 0;
@@ -229,6 +230,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
       }
       output.append(buffer.data(), n);
       if (output.size() > kMaxChildOutputBytes) {
+        output_truncated = true;
         break;
       }
     }
@@ -256,6 +258,16 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
 
   if (timed_out) {
     return {.ok = false, .ast = {}, .error = "GoogleSQL parser timed out"};
+  }
+  if (output_truncated) {
+    return {.ok = false,
+            .ast = {},
+            .error = "GoogleSQL parser output exceeds the size limit"};
+  }
+  if (output_truncated) {
+    return {.ok = false,
+            .ast = {},
+            .error = "GoogleSQL parser output exceeds the size limit"};
   }
   if (exit_code != 0 || output.starts_with("ERROR:")) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
@@ -408,6 +420,11 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
                 .error = "cannot start GoogleSQL: " + reason};
       }
     } else {
+      // Resolve in the parent: a fork()ed child of a multi-threaded process
+      // may only run async-signal-safe code. std::getenv / std::filesystem /
+      // readlink / std::string allocation can deadlock on a lock some other
+      // thread held at fork time (see common/platform/process.cpp).
+      const std::string resolved = ResolveGoogleSqlExecutable().string();
       child = fork();
       if (child < 0) {
         const std::string reason(std::strerror(errno));
@@ -418,7 +435,6 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
                 .error = "cannot start GoogleSQL: " + reason};
       }
       if (child == 0) {
-        const std::string resolved = ResolveGoogleSqlExecutable().string();
         dup2(input_pipe[0], STDIN_FILENO);
         dup2(output_pipe[1], STDOUT_FILENO);
         dup2(output_pipe[1], STDERR_FILENO);
@@ -442,6 +458,7 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   bool output_open = true;
   size_t written = 0;
   std::string output;
+  bool output_truncated = false;
   // Interleave writes and reads via poll: the child emits its AST while
   // still consuming the query, so a large result cannot deadlock a parent
   // that is stuck in write() (§7.2). One syscall per readiness event keeps
@@ -500,6 +517,9 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
         if (count > 0) {
           output.append(buffer.data(), static_cast<size_t>(count));
           if (output.size() > kMaxChildOutputBytes) {
+            // A partial dump must never be reported as a successful parse
+            // (nor cached): the AST reader would accept a truncated token.
+            output_truncated = true;
             close(output_pipe[0]);
             output_pipe[0] = -1;
             output_open = false;
@@ -580,6 +600,12 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
       timed_out.error = "GoogleSQL parser timed out";
       return timed_out;
     }
+    if (output_truncated) {
+      GoogleSqlParseResult truncated;
+      truncated.ok = false;
+      truncated.error = "GoogleSQL parser output exceeds the size limit";
+      return truncated;
+    }
     if (exit_code != 0 || output.starts_with("ERROR:")) {
       return {.ok = false, .ast = {}, .error = std::move(output)};
     }
@@ -615,6 +641,12 @@ GoogleSqlParseResult ParseRawSubprocess(std::string_view sql) {
   if (!WIFEXITED(status) ||        // NOLINT(misc-include-cleaner) glibc macro
       WEXITSTATUS(status) != 0) {  // NOLINT(misc-include-cleaner) glibc macro
     return {.ok = false, .ast = {}, .error = std::move(output)};
+  }
+  if (output_truncated) {
+    GoogleSqlParseResult truncated;
+    truncated.ok = false;
+    truncated.error = "GoogleSQL parser output exceeds the size limit";
+    return truncated;
   }
   if (output.starts_with("ERROR:")) {
     return {.ok = false, .ast = {}, .error = std::move(output)};
@@ -705,11 +737,6 @@ std::string MaskLiteralsAndComments(std::string_view sql) {
           i += 2;
           continue;
         }
-        // A doubled quote is an escaped quote, not the terminator.
-        if (sql[i] == quote && i + 1 < sql.size() && sql[i + 1] == quote) {
-          i += 2;
-          continue;
-        }
         ++i;
       }
       i = std::min(sql.size(), i + 1);
@@ -772,24 +799,27 @@ bool ExtractDistinctOn(std::string_view sql, size_t* out_start, size_t* out_end,
       pos = found + 8;
       continue;
     }
+    // Scan tokens on the masked copy: a comment between DISTINCT and ON (or
+    // ON and '(') is replaced by spaces there, while raw `lower` still has
+    // '/' and '*' and would make the rewrite silently no-op.
     size_t after_dist = found + 8;
-    while (after_dist < lower.size() &&
-           (std::isspace(static_cast<unsigned char>(lower[after_dist])) != 0)) {
+    while (after_dist < mask.size() &&
+           (std::isspace(static_cast<unsigned char>(mask[after_dist])) != 0)) {
       ++after_dist;
     }
-    if (lower.compare(after_dist, 2, "on") == 0) {
+    if (mask.compare(after_dist, 2, "on") == 0) {
       size_t after_on = after_dist + 2;
-      if (after_on < lower.size() &&
-          ((std::isalnum(static_cast<unsigned char>(lower[after_on])) != 0) ||
-           lower[after_on] == '_')) {
+      if (after_on < mask.size() &&
+          ((std::isalnum(static_cast<unsigned char>(mask[after_on])) != 0) ||
+           mask[after_on] == '_')) {
         pos = after_on;
         continue;
       }
-      while (after_on < lower.size() &&
-             (std::isspace(static_cast<unsigned char>(lower[after_on])) != 0)) {
+      while (after_on < mask.size() &&
+             (std::isspace(static_cast<unsigned char>(mask[after_on])) != 0)) {
         ++after_on;
       }
-      if (after_on < lower.size() && lower[after_on] == '(') {
+      if (after_on < mask.size() && mask[after_on] == '(') {
         // Depth-count on the literal-masked copy: mask and sql share
         // positions 1:1, and counting on raw text would let an unbalanced
         // parenthesis inside a string literal (e.g. ON ('a)')) corrupt the
@@ -856,6 +886,25 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
   // ties" / "fetch first" inside a string literal or comment is ignored.
   const std::string mask = ToLowerCopy(MaskLiteralsAndComments(sql));
   std::string lower = ToLowerCopy(sql);
+  // The numeric argument scan below runs over the original text; skip block
+  // and line comments together with whitespace so a comment between the
+  // keyword and the number does not collapse LIMIT to its "1" fallback.
+  const auto skip_space_and_comments = [&](size_t cur, size_t end) {
+    while (cur < end) {
+      if (std::isspace(static_cast<unsigned char>(lower[cur])) != 0) {
+        ++cur;
+      } else if (lower.compare(cur, 2, "/*") == 0) {
+        const size_t close = lower.find("*/", cur + 2);
+        cur = close == std::string::npos ? end : close + 2;
+      } else if (lower.compare(cur, 2, "--") == 0) {
+        const size_t eol = lower.find('\n', cur + 2);
+        cur = eol == std::string::npos ? end : eol + 1;
+      } else {
+        break;
+      }
+    }
+    return cur;
+  };
   *out_with_ties = false;
   const size_t limit_pos = FindOuterKeyword(mask, "limit");
   size_t fetch_pos = FindOuterKeyword(mask, "fetch first");
@@ -877,11 +926,7 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
     size_t offset_pos = FindOuterKeyword(mask, "offset");
     std::string offset_val;
     if (offset_pos != std::string::npos && offset_pos < fetch_pos) {
-      size_t cur = offset_pos + 6;
-      while (cur < fetch_pos &&
-             (std::isspace(static_cast<unsigned char>(lower[cur])) != 0)) {
-        ++cur;
-      }
+      size_t cur = skip_space_and_comments(offset_pos + 6, fetch_pos);
       while (cur < fetch_pos &&
              (std::isdigit(static_cast<unsigned char>(lower[cur])) != 0)) {
         offset_val.push_back(lower[cur]);
@@ -889,12 +934,7 @@ bool ExtractFetchWithTies(std::string_view sql, std::string* out_rewritten,
       }
     }
 
-    size_t count_start = fetch_pos + 11;
-    while (
-        count_start < lower.size() &&
-        (std::isspace(static_cast<unsigned char>(lower[count_start])) != 0)) {
-      ++count_start;
-    }
+    size_t count_start = skip_space_and_comments(fetch_pos + 11, lower.size());
     std::string count_val;
     size_t count_cur = count_start;
     while (count_cur < lower.size() &&
@@ -1553,7 +1593,7 @@ GoogleSqlParseResult ParseViaSubprocess(std::string_view sql) {
       return res;
     }
     if (with_ties) {
-      size_t limit_pos = res.ast.find("LimitOffset");
+      size_t limit_pos = res.ast.rfind("LimitOffset");
       if (limit_pos != std::string::npos) {
         size_t line_start = res.ast.rfind('\n', limit_pos);
         line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
@@ -1731,10 +1771,12 @@ GoogleSqlParseResult GoogleSqlFrontend::Parse(std::string_view sql) {
     shard.cache.emplace(cache_key, parsed.ast);
     shard.negative_cache.erase(cache_key);
   } else {
-    // A failure with no diagnostic is a transient child-process death, not
-    // a syntax error.  Caching it would defeat the caller's immediate retry
-    // (main.cpp re-executes once when LastError is empty).
-    if (!parsed.error.empty()) {
+    // Only deterministic parser verdicts ("ERROR: ...") belong in the
+    // negative cache. Spawn/pipe failures, timeouts and oversized-output
+    // errors are transient resource problems: caching them would turn a
+    // retryable failure into a sticky "(recently cached)" syntax error for
+    // the whole TTL.
+    if (parsed.error.starts_with("ERROR:")) {
       if (shard.negative_cache.size() >= max_per_shard) {
         shard.negative_cache.erase(shard.negative_cache.begin());
       }

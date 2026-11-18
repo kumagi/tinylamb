@@ -899,7 +899,7 @@ TEST_F(CascadesRulesCoverageTest, ContradictoryConjunctsProduceEmptyPlan) {
 }
 
 TEST_F(CascadesRulesCoverageTest, TransitiveEqualityInferredAcrossJoin) {
-  // sc1.c1 = sc2.d1 AND sc1.c1 < 5 infers sc2.d1 < 5 for the right scan.
+  // sc1.c1 = sc2.d1 AND sc1.c1 < 2 infers sc2.d1 < 2 for the right scan.
   const auto rows = Run(
       "SELECT sc2.d3 FROM sc1 JOIN sc2 ON sc1.c1 = sc2.d1 WHERE sc1.c1 < 2");
   EXPECT_EQ(rows.size(), 2U);

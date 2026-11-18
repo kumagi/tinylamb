@@ -360,6 +360,12 @@ TEST_F(SqlFunctionCoverageTest, InstrStartsEndsWithBranches) {
   ExpectRow("SELECT INSTR(NULL, 'a'), STARTS_WITH(NULL, 'a')",
             Row({Value(), Value()}));
   ExpectError("SELECT INSTR('a')");
+  ExpectError("SELECT INSTR('banana', 'an', 0)");
+  ExpectError("SELECT INSTR('banana', 'an', 1, 0)");
+  EXPECT_EQ(RunSql(engine_.get(), context_.get(),
+                   "SELECT INSTR('abc', '', 1, 3)")
+                .front()[0],
+            Value(int64_t{0}));
 }
 
 TEST_F(SqlFunctionCoverageTest, LpadRpadBranches) {
@@ -668,6 +674,15 @@ TEST_F(SqlFunctionCoverageTest, CastHexBranches) {
   ExpectError("SELECT CAST('-0x81' AS INT8)");
 }
 
+TEST_F(SqlFunctionCoverageTest, DecimalIntegerCastAcceptsOneLeadingPlus) {
+  ExpectScalar("SELECT CAST(' +42 ' AS INT64)", Value(42));
+  ExpectScalar("SELECT CAST('+18446744073709551615' AS UINT64)",
+               Value(int64_t{-1}).WithUnsigned());
+  ExpectError("SELECT CAST('+-5' AS INT64)");
+  ExpectError("SELECT CAST('+' AS INT64)");
+  ExpectError("SELECT CAST('+9223372036854775808' AS INT64)");
+}
+
 TEST_F(SqlFunctionCoverageTest, CastDoubleBranches) {
   ExpectRow("SELECT CAST('2.5' AS FLOAT64), CAST(3 AS FLOAT64)",
             Row({Value(2.5), Value(3.0)}));
@@ -761,6 +776,37 @@ TEST_F(SqlFunctionCoverageTest, CastTimestampBranches) {
   ExpectScalar("SELECT CAST('2020-03-14 10:11:12 UTC' AS TIMESTAMP)",
                Value("2020-03-14 10:11:12+00"));
   ExpectError("SELECT CAST('garbage' AS TIMESTAMP)");
+}
+
+TEST_F(SqlFunctionCoverageTest, CivilCastsApplySourceZoneBeforeTakingFields) {
+  ExpectRow(
+      "SELECT CAST('2026-01-02 03:04:05+05' AS DATETIME), "
+      "CAST('2026-01-02 20:00:00-08' AS TIME), "
+      "CAST('2026-01-02 20:00:00-08:00' AS DATE), "
+      "CAST('2026-01-02T01:00:00.25+0530' AS DATETIME)",
+      Row({Value("2026-01-01 22:04:05"), Value("04:00:00"),
+           Value::Date("2026-01-03"), Value("2026-01-01 19:30:00.250")}));
+  ExpectScalar("SELECT CAST('2026-01-02 00:30:00 UTC+02' AS DATE)",
+               Value::Date("2026-01-01"));
+}
+
+TEST_F(SqlFunctionCoverageTest, CivilCastsRejectUnparsedSuffixes) {
+  ExpectError("SELECT CAST('2026-01-02 03:04:05junk' AS DATETIME)");
+  ExpectError("SELECT CAST('2026-01-02 03:04:05.abc' AS DATETIME)");
+  ExpectError("SELECT CAST('2026-01-02 03:04:05+05junk' AS TIMESTAMP)");
+  ExpectError("SELECT CAST('2026-01-02 03:04:05. Z' AS TIMESTAMP)");
+  ExpectError("SELECT CAST('2026-01-02 garbage' AS DATE)");
+  ExpectNullScalar(
+      "SELECT SAFE_CAST('2026-01-02 03:04:05+05junk' AS TIMESTAMP)");
+}
+
+TEST_F(SqlFunctionCoverageTest, YearOneCastsUseTheSessionZone) {
+  ExpectScalar("SELECT CAST('0001-01-01 00:00:00' AS TIMESTAMP)",
+               Value("0001-01-01 00:00:00+00"));
+  ExpectScalar("SELECT CAST('0001-01-01 07:52:58+00' AS DATETIME)",
+               Value("0001-01-01 07:52:58"));
+  ExpectScalar("SELECT CAST('0001-01-01 00:00:01.5' AS TIMESTAMP)",
+               Value("0001-01-01 00:00:01.500+00"));
 }
 
 TEST_F(SqlFunctionCoverageTest, SafeCastNullsOnError) {
@@ -1030,6 +1076,20 @@ TEST_F(SqlFunctionCoverageTest, FormatSpecifierMatrix) {
 // ---------------------------------------------------------------------------
 // Date / time function family (explicit UTC keeps expectations deterministic).
 // ---------------------------------------------------------------------------
+
+TEST_F(SqlFunctionCoverageTest, UnixDateTimestampStringAppliesTimezoneInBatchPath) {
+  // The batch fast path used to truncate a TIMESTAMP literal to its first 10
+  // characters and read the wall-clock date, ignoring the +05:00 offset.
+  // UTC is the previous day (2020-06-14) => 18427.
+  ExpectScalar("SELECT UNIX_DATE('2020-06-15 01:00:00+05:00')",
+               Value(int64_t{18427}));
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE unix_date_tz(d INT64)");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO unix_date_tz VALUES "
+         "(UNIX_DATE('2020-06-15 01:00:00+05:00'))");
+  ExpectScalar("SELECT d FROM unix_date_tz", Value(int64_t{18427}));
+}
 
 TEST_F(SqlFunctionCoverageTest, DateTimeFunctionFamily) {
   ExpectRow(

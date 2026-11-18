@@ -1115,19 +1115,19 @@ ARRAY<STRUCT<
         arr_not_includes_all BOOL
       >>[{true, false}]
 ==
-[name=euclidian_distance_shuffled_input]
+[name=euclidean_distance_shuffled_input]
 SELECT EUCLIDEAN_DISTANCE(ARRAY<FLOAT64>[1, 2], ARRAY(SELECT e FROM UNNEST(ARRAY<FLOAT64>[1, 2]) AS e));
 --
 ARRAY<STRUCT<DOUBLE>>[{0}]
 
 NOTE: Reference implementation reports non-determinism.
 ==
-[name=euclidian_distance_shuffled_input_strkey]
+[name=euclidean_distance_shuffled_input_strkey]
 SELECT EUCLIDEAN_DISTANCE(ARRAY[('a', 10.0), ('b', 30.0), ('d', 40.0)], ARRAY(SELECT e FROM UNNEST(ARRAY[('a', 10.0), ('b', 30.0), ('d', 40.0)]) AS e));
 --
 ARRAY<STRUCT<DOUBLE>>[{0}]
 ==
-[name=euclidian_distance_shuffled_input_intkey]
+[name=euclidean_distance_shuffled_input_intkey]
 SELECT EUCLIDEAN_DISTANCE(ARRAY[(1, 10.0), (2, 30.0), (3, 40.0)], ARRAY(SELECT e FROM UNNEST(ARRAY[(1, 10.0), (2, 30.0), (3, 40.0)]) AS e));
 
 --

@@ -102,5 +102,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.JoinOnFalseToEmptyPreservesRelationSet`: 述語定数 `0`（偽）を持つ2 表結合を探索した際、親グループに関係集合を保持した `kEmpty` 式が正しく追加されることを検証。

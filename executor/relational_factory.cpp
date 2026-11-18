@@ -1,6 +1,6 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 //
-// Relational factory (improvement3.md A5 second stage / V4): every
+// Relational factory (the relational factory split): every
 // PlanBase::EmitExecutor implementation lives here so the plan layer carries
 // logical information only and never includes executor headers. Plans expose
 // an opaque Executor handle (plan/plan.hpp forward declares ExecutorBase);
@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/set_operation.hpp"
 #include "database/transaction_context.hpp"
@@ -116,6 +117,23 @@
 #include "type/schema.hpp"
 
 namespace tinylamb {
+namespace {
+// EmitExecutor returns an opaque Executor, not StatusOr: carry a preparation
+// failure as a sticky executor status so the caller sees it after exhaustion.
+class FailedScanExecutor final : public ExecutorBase {
+ public:
+  explicit FailedScanExecutor(Status status) : status_(std::move(status)) {}
+  size_t NextBatch(DataChunk* /*destination*/, size_t /*max_rows*/) override { return 0; }
+  void Dump(std::ostream& o, int indent) const override {
+    o << std::string(static_cast<size_t>(std::max(0, indent)), ' ')
+      << "BitmapScan(failed)";
+  }
+  Status GetStatus() const override { return status_; }
+
+ private:
+  Status status_;
+};
+}  // namespace
 
 Executor RelationalPlan::EmitExecutor(TransactionContext& context) const {
   return std::make_shared<RelationalExecutor>(context, statement_);
@@ -538,8 +556,9 @@ Executor EmitScalarAggregation(const AggregationPlan& plan,
                 g_max = std::max(g_max, c.max_int);
               }
               if (g_max >= g_min) {
-                const __int128_t span128 = static_cast<__int128_t>(g_max) -
-                                           static_cast<__int128_t>(g_min) + 1;
+                const platform::Int128 span128 =
+                    static_cast<platform::Int128>(g_max) -
+                    static_cast<platform::Int128>(g_min) + 1;
                 if (span128 <= 0 || span128 > 1048576) {
                   return false;
                 }
@@ -1145,7 +1164,7 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
                                        lock_rows_, wait_for_write_intent_,
                                        std::move(index_read_guard), prefetch);
   }
-  // RangePartitionedScan / ParallelIndexScan: a large ascending single-range
+  // ParallelIndexScan / ParallelIndexScan: a large ascending single-range
   // scan partitions at B+Tree leaf boundaries and scans the partitions in
   // parallel.  The morsel-ordered handoff keeps the key order, so the plan's
   // ordering claims stay valid; the residual predicate rides a Selection
@@ -1212,10 +1231,14 @@ Executor BitmapScanPlan::EmitExecutor(TransactionContext& context) const {
       return stale_fallback();
     }
     index_read_guards.emplace_back(std::move(index_read_guard));
-    std::vector<RowPosition> next =
+    StatusOr<std::vector<RowPosition>> next_or =
         BitmapIndexScan(context.txn_, table_, *range.index, range.begin_key,
                         range.end_key, &index_read_guards.back())
             .ScanPositions();
+    if (!next_or.HasValue()) {
+      return std::make_shared<FailedScanExecutor>(next_or.GetStatus());
+    }
+    std::vector<RowPosition> next = std::move(next_or.Value());
     if (first) {
       positions = std::move(next);
       first = false;
@@ -1439,7 +1462,7 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
   Schema residual_schema =
       Residual() ? Left()->GetSchema() + Right()->GetSchema() : Schema();
   // Inner equi merge joins without residuals go parallel past the
-  // threshold (TODO.md item 5b): the steering partitioner needs enough rows
+  // threshold : the steering partitioner needs enough rows
   // to amortize thread startup. Outer/semi/anti and residual shapes keep
   // the proven sequential executor.
   if (Kind() == JoinKind::kInner && !Residual() &&
@@ -1741,8 +1764,7 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
     constexpr size_t kBytesPerCell = 24;
     const auto side = [&](const Plan& src) {
       const size_t rows = src->EmitRowCount();
-      const size_t width =
-          std::max<size_t>(1, src->GetSchema().ColumnCount());
+      const size_t width = std::max<size_t>(1, src->GetSchema().ColumnCount());
       return rows > SIZE_MAX / (width * kBytesPerCell)
                  ? SIZE_MAX
                  : rows * width * kBytesPerCell;
@@ -1752,8 +1774,8 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
     return l > SIZE_MAX - r ? SIZE_MAX : l + r;
   };
   const QueryMemoryBudget& budget = QueryMemoryBudget::Global();
-  const bool fits_budget = budget.Unlimited() ||
-                           estimated_input_bytes() <= budget.Remaining();
+  const bool fits_budget =
+      budget.Unlimited() || estimated_input_bytes() <= budget.Remaining();
   if (!dynamic_filter && !any_null_safe && fits_budget &&
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {

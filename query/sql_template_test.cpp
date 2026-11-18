@@ -334,7 +334,7 @@ std::shared_ptr<SelectStatement> WhereOrderByTree() {
 }
 
 TEST(SqlTemplateTest, BindsWhereBeforeOrderByInTextOrder) {
-  // Regression (improvements2.md §7.1): BindSelect used to bind ORDER BY
+  // Regression: BindSelect used to bind ORDER BY
   // before WHERE, so re-binding the cached "...WHERE a=1 ORDER BY b+2" tree
   // with parameters [7, 9] extracted from "...WHERE a=7 ORDER BY b+9"
   // executed "WHERE a=9 ORDER BY b+7".  Parameters are extracted in text
@@ -488,7 +488,7 @@ TEST(SqlTemplateTest, BindsWithQueriesBeforeMainSelect) {
 }
 
 TEST(SqlTemplateTest, FingerprintIgnoresQuoteInsideQuotedIdentifier) {
-  // Regression (improvements2.md §7.5): the apostrophe inside the quoted
+  // Regression: the apostrophe inside the quoted
   // identifier used to start a bogus string literal, polluting both the
   // fingerprint and the parameter list.
   const SqlTemplate extracted =

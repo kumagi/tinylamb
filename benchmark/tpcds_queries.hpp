@@ -2424,7 +2424,7 @@ LIMIT 100)sql";
 // (cdemo keys are never NULL), so the port pins the 0.9 * avg reference to
 // the top demo key like the other single-population adaptations.
 inline constexpr std::string_view kQ44Sql = R"sql(SELECT
-  asceding.rnk,
+  ascending.rnk,
   i1.i_product_name best_performing,
   i2.i_product_name worst_performing
 FROM (SELECT * FROM
@@ -2438,7 +2438,7 @@ FROM (SELECT * FROM
                       FROM store_sales
                       WHERE ss_store_sk = 4 AND ss_cdemo_sk = 200
                       GROUP BY ss_store_sk)) V1) V11
-       WHERE rnk < 11) asceding,
+       WHERE rnk < 11) ascending,
      (SELECT * FROM
        (SELECT item_sk, RANK() OVER (ORDER BY rank_col DESC) rnk
         FROM (SELECT ss_item_sk item_sk, AVG(ss_net_profit) rank_col
@@ -2453,10 +2453,10 @@ FROM (SELECT * FROM
        WHERE rnk < 11) descending,
      item i1,
      item i2
-WHERE asceding.rnk = descending.rnk
-  AND i1.i_item_sk = asceding.item_sk
+WHERE ascending.rnk = descending.rnk
+  AND i1.i_item_sk = ascending.item_sk
   AND i2.i_item_sk = descending.item_sk
-ORDER BY asceding.rnk
+ORDER BY ascending.rnk
 LIMIT 100)sql";
 
 // q45: disjunctive predicate over zip prefix / item id IN-subquery, kept

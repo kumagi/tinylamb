@@ -2022,7 +2022,21 @@ std::string RunAggregateIteration(std::mt19937& rng, bool verbose,
       std::string error;
       auto got = RunQuery(db, ctx, qe.sql, &error);
       if (!got.has_value()) {
-        continue;
+        // The first evaluation succeeded for this query, so a failure in a
+        // re-verification pass (INDEXED/CASCADES/SPILL) is a real divergence,
+        // not an expected rejection. Report it like any other mismatch.
+        static constexpr std::array<const char*, 4> kPassTags = {
+            "[AGGREGATE-INDEXED MISMATCH] ", "[AGGREGATE-CASCADES MISMATCH] ",
+            "[AGGREGATE-SPILL MISMATCH] ",
+            "[AGGREGATE-CASCADES-SPILL MISMATCH] "};
+        report = std::string(kPassTags[static_cast<size_t>(pass)]) + qe.sql +
+                 "\n  re-verification query failed: " + error + "\n";
+        if (prev_route != nullptr) {
+          platform::SetEnv("TINYLAMB_GROUPED_ROUTE", saved_route.c_str());
+        } else {
+          platform::UnsetEnv("TINYLAMB_GROUPED_ROUTE");
+        }
+        return report;
       }
       const std::vector<std::string> actual = FormatRows(*got);
       std::vector<std::string> expected = qe.expected;

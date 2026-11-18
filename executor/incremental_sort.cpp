@@ -126,10 +126,10 @@ bool IncrementalSortExecutor::ArePrefixEqual(const Row& a, const Row& b) {
       }
       return false;
     }
-    // Peers must collapse the way the ordering groups them, so a
-    // case-insensitive prefix key starts a new run at 'a' vs 'A' instead of
-    // treating the already-sorted run as a single group. A binary prefix key
-    // keeps Value's equality.
+    // Peers must collapse exactly the way the ordering groups them, so a
+    // case-insensitive prefix key treats 'a' and 'A' as the same run instead
+    // of splitting the boundary row. A binary prefix key keeps Value's
+    // equality (NaN, -0.0 and interval equivalence).
     return EqualUnderCollation(va_or.Value(), vb_or.Value());
   });
 }

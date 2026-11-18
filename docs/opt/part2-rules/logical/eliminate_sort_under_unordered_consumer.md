@@ -97,5 +97,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `EliminateSortUnderUnorderedAggregation`
+- `plan/cascades_test_part*.cpp`: `EliminateSortUnderUnorderedAggregation`
   - `Aggregation(Sort(Scan))` の論理木に対して本 Rule が発火し、Sort を介さずに Scan を直結した `kAggregation` 等価式が Group に追加されることを検証。

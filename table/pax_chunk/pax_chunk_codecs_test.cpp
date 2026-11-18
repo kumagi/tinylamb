@@ -63,7 +63,7 @@ TEST(PaxChunkCodecsTest, AuditBuilderRejectsCorruptRowsAndUnsortedKeys) {
         auto entries = original;
         auto blob = run.Blob();
         if (corruption == 0) {
-          entries[1].row_offset_ = blob.size();
+          entries[1].row_offset_ = static_cast<uint32_t>(blob.size());
         }
         if (corruption == 1) {
           blob.resize(entries[1].row_offset_ + 1);
@@ -97,7 +97,7 @@ TEST(PaxChunkCodecsTest, AuditNonIntegerZoneMapsCannotPruneIntegerRanges) {
                                                     schema, compressed)
                            .MoveValue();
     EXPECT_FALSE(chunk.RGOverlapsCol(0, 0, 40, 100));
-    for (size_t column : {1U, 2U}) {
+    for (const slot_t column : {slot_t{1}, slot_t{2}}) {
       EXPECT_TRUE(chunk.RGOverlapsCol(0, column, 40, 100));
       EXPECT_TRUE(chunk.RGOverlapsCol(0, column, -100, -40));
     }
@@ -127,8 +127,9 @@ TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
     if (!encoded.has_value()) {
       continue;
     }
-    auto chunk = AuditSingleColumnChunk(scheme, values.size(), encoded->bytes,
-                                        encoded->param);
+    auto chunk =
+        AuditSingleColumnChunk(scheme, static_cast<slot_t>(values.size()),
+                               encoded->bytes, encoded->param);
     ReducePlan plan;
     plan.op = AggOp::kSum;
     plan.col = 0;
@@ -137,8 +138,33 @@ TEST(PaxChunkCodecsTest, AuditReduceRejectsScaledOverflowAcrossSchemes) {
     plan.coeff = 1;
     const auto result = ReduceColumn(chunk, plan);
     EXPECT_TRUE(result.valid);
-    EXPECT_TRUE(result.sum == static_cast<__int128>(INT64_MAX) * values.size());
+    EXPECT_TRUE(result.sum ==
+                static_cast<platform::Int128>(INT64_MAX) * values.size());
   }
+}
+
+// With kLane, row l + nd*t belongs to lane l. A predicate whose window is
+// empty for one real lane must not leave `all_full` set: otherwise the
+// full-select shortcut admits that lane's rows too.
+TEST(PaxChunkCodecsTest, AuditLanePredicateWithEmptyLaneKeepsOtherLaneOnly) {
+  constexpr uint32_t kRows = 64;
+  std::vector<int64_t> values(kRows);
+  for (uint32_t i = 0; i < kRows; ++i) {
+    values[i] = (i % 2 == 0) ? 1 : 50;  // lane 0: constant 1, lane 1: 50
+  }
+  auto encoded = codec_benchmark::EncodeInt64Block(Scheme::kLane, values);
+  ASSERT_TRUE(encoded.has_value());
+  ASSERT_EQ(encoded->scheme, Scheme::kLane);
+  auto chunk = AuditSingleColumnChunk(Scheme::kLane, kRows, encoded->bytes,
+                                      encoded->param);
+
+  ReducePlan plan;
+  plan.op = AggOp::kCount;
+  plan.col = 0;
+  plan.preds.push_back(Predicate{.col=0, .op=ScanOp::kEq, .lit=50});
+  const auto result = ReduceColumn(chunk, plan);
+  ASSERT_TRUE(result.valid);
+  EXPECT_EQ(result.count, kRows / 2);
 }
 
 TEST(PaxChunkCodecsTest, AuditPartialZoneMapsCannotProveWholeColumnBounds) {
@@ -189,15 +215,15 @@ TEST(PaxChunkCodecsTest, AuditCodecBenchmarkRejectsOversizedBlock) {
   EXPECT_TRUE(codec_benchmark::EncodeVarcharBlock(Scheme::kPlain, strings));
 }
 
-TEST(PaxChunkCodecsTest, AuditGroupSumReportsCorruptGroupAndWrapsExplicitly) {
+TEST(PaxChunkCodecsTest, AuditGroupSumReportsCorruptGroupAndOverflows) {
   std::vector<char> data;
   AppendBE64(data, static_cast<uint64_t>(INT64_MAX));
   auto chunk = AuditSingleColumnChunk(Scheme::kConst, 2, std::move(data));
-  auto result = GroupBySumColumns(chunk, {0}, 0);
-  ASSERT_TRUE(result.HasValue());
-  ASSERT_EQ(result.Value().size(), 1U);
-  EXPECT_EQ(result.Value()[0].sum, -2);
-  EXPECT_EQ(result.Value()[0].count, 2U);
+  // INT64_MAX * 2 rows overflows int64: both group-by kernels surface the
+  // ground-truth "integer overflow in SUM" error instead of a wrapped
+  // subtotal.
+  EXPECT_EQ(GroupBySumColumns(chunk, {0}, 0).GetStatus(), Status::kIsInfinity);
+  EXPECT_EQ(GroupBySumColumn(chunk, 0, 0).GetStatus(), Status::kIsInfinity);
   auto footer = chunk.GetFooter();
   footer.column_offsets[0] = UINT32_MAX;
   PaxChunk corrupt(chunk.Data(), std::move(footer));
@@ -205,6 +231,118 @@ TEST(PaxChunkCodecsTest, AuditGroupSumReportsCorruptGroupAndWrapsExplicitly) {
             Status::kCorruption);
   EXPECT_EQ(GroupBySumColumns(chunk, {1}, 0).GetStatus(),
             Status::kInvalidArgument);
+}
+
+TEST(PaxChunkCodecsTest, AuditFooterSumsRefuseWrappedColumnStats) {
+  const Schema sc("audit", {Column("k", ValueType::kInt64),
+                            Column("v", ValueType::kInt64)});
+  // A serial sum that leaves int64 inside one row group wraps the recorded
+  // P.sum; the column must be marked invalid so metadata-only sums refuse.
+  std::vector<Row> wrapped{Row({Value(1), Value(INT64_MAX)}),
+                           Row({Value(2), Value(1)})};
+  // Each row group's own sum stays inside int64 but their fold does not:
+  // 1024 zeros of slack in group 0 keep its subtotal exactly INT64_MAX.
+  std::vector<Row> fold_wrapped{Row({Value(1), Value(INT64_MAX)})};
+  for (uint32_t i = 0; i < 1023; ++i) {
+    fold_wrapped.push_back(Row({Value(static_cast<int64_t>(i + 2)), Value(0)}));
+  }
+  fold_wrapped.push_back(Row({Value(1025), Value(1)}));
+  // Control: the same shape whose total stays inside int64 must still
+  // answer from metadata.
+  const std::vector<Row> exact{Row({Value(1), Value(INT64_MAX)}),
+                               Row({Value(2), Value(-1)})};
+  for (bool compressed : {false, true}) {
+    for (const auto* rows : {&wrapped, &fold_wrapped}) {
+      const auto built = PaxChunk::BuildFromSortedRun(fuzz::MakeRun(*rows, sc),
+                                                      sc, compressed);
+      ASSERT_TRUE(built.HasValue()) << compressed;
+      const PaxChunk& chunk = built.Value();
+      const PaxChunk::Footer& f = chunk.GetFooter();
+      ASSERT_TRUE(f.col_stats_present);
+      ASSERT_GT(f.col_sum_valid.size(), 1U);
+      EXPECT_EQ(f.col_sum_valid[1], 0U) << compressed;
+      int64_t sum = 7;
+      uint64_t count = 7;
+      EXPECT_FALSE(FastColumnSum(chunk, 1, &sum, &count)) << compressed;
+      EXPECT_EQ(sum, 7);
+      EXPECT_EQ(count, 7U);
+    }
+    const auto built =
+        PaxChunk::BuildFromSortedRun(fuzz::MakeRun(exact, sc), sc, compressed);
+    ASSERT_TRUE(built.HasValue()) << compressed;
+    int64_t sum = 0;
+    uint64_t count = 0;
+    ASSERT_TRUE(FastColumnSum(built.Value(), 1, &sum, &count)) << compressed;
+    EXPECT_EQ(sum, INT64_MAX - 1);
+    EXPECT_EQ(count, 2U);
+  }
+}
+
+TEST(PaxChunkCodecsTest, GroupBySumSkipsNullSummandsButKeepsTheirGroups) {
+  // Storage schema: id(pk, int64), qty(int64, nullable), name(varchar,
+  // not null), score(double), flag(int64). Group on flag, sum on qty.
+  const Schema sc = fuzz::MakeStorageSchema();
+  // flag 1: one non-null summand; flag 2: only NULL summands (the group
+  // must still appear, with count == 0 == "SUM is NULL"); flag 3: mixed.
+  const std::vector<Row> rows{
+      Row({Value(0), Value(10), Value("a"), Value(0.5), Value(1)}),
+      Row({Value(1), Value(), Value("b"), Value(0.5), Value(2)}),
+      Row({Value(2), Value(), Value("c"), Value(0.5), Value(2)}),
+      Row({Value(3), Value(), Value("d"), Value(0.5), Value(3)}),
+      Row({Value(4), Value(20), Value("e"), Value(0.5), Value(3)})};
+  for (bool compressed : {false, true}) {
+    const auto built =
+        PaxChunk::BuildFromSortedRun(fuzz::MakeRun(rows, sc), sc, compressed);
+    ASSERT_TRUE(built.HasValue()) << compressed;
+    const PaxChunk& chunk = built.Value();
+    {
+      const auto by_flag = GroupBySumColumn(chunk, 4, 1, &sc);
+      ASSERT_TRUE(by_flag.HasValue()) << compressed;
+      ASSERT_EQ(by_flag.Value().size(), 3U) << compressed;
+      for (const GroupByEntry& e : by_flag.Value()) {
+        switch (e.key) {
+          case 1:
+            EXPECT_EQ(e.sum, 10);
+            EXPECT_EQ(e.count, 1U);
+            break;
+          case 2:
+            EXPECT_EQ(e.sum, 0);
+            EXPECT_EQ(e.count, 0U);  // all summands NULL => SUM is NULL
+            break;
+          case 3:
+            EXPECT_EQ(e.sum, 20);
+            EXPECT_EQ(e.count, 1U);  // the NULL row did not count
+            break;
+          default:
+            FAIL() << "unexpected group key " << e.key;
+        }
+      }
+    }
+    {
+      const auto by_flag = GroupBySumColumns(chunk, {4}, 1, &sc);
+      ASSERT_TRUE(by_flag.HasValue()) << compressed;
+      ASSERT_EQ(by_flag.Value().size(), 3U) << compressed;
+      for (const GroupByEntryN& e : by_flag.Value()) {
+        ASSERT_EQ(e.key.size(), 1U);
+        switch (e.key[0]) {
+          case 1:
+            EXPECT_EQ(e.sum, 10);
+            EXPECT_EQ(e.count, 1U);
+            break;
+          case 2:
+            EXPECT_EQ(e.sum, 0);
+            EXPECT_EQ(e.count, 0U);
+            break;
+          case 3:
+            EXPECT_EQ(e.sum, 20);
+            EXPECT_EQ(e.count, 1U);
+            break;
+          default:
+            FAIL() << "unexpected group key " << e.key[0];
+        }
+      }
+    }
+  }
 }
 
 TEST(PaxChunkCodecsTest, AuditDoubleAggregatesRejectOversizedFallback) {
@@ -234,7 +372,7 @@ TEST(PaxChunkCodecsTest, AuditOpDictClampComparesDecodedEmptyString) {
   for (StrScanOp op :
        {StrScanOp::kEq, StrScanOp::kNe, StrScanOp::kLt, StrScanOp::kLe,
         StrScanOp::kGt, StrScanOp::kGe, StrScanOp::kPrefix}) {
-    for (const std::string& needle : {"", "abc", "a", "def", "zzz"}) {
+    for (const std::string_view needle : {"", "abc", "a", "def", "zzz"}) {
       EXPECT_EQ(VarcharFilterCount(chunk, 0, op, needle),
                 VarcharFilterSelection(chunk, 0, op, needle).count);
     }
@@ -259,23 +397,25 @@ TEST(PaxChunkCodecsTest, AuditBp128FullWidthRoundTrip) {
   }
   const EncodedCol encoded = EncBp128I64(values);
   Bp128Region region{};
-  ASSERT_TRUE(ParseBp128Region(encoded.buf.data(), values.size(), encoded.param,
-                               encoded.buf.data() + encoded.buf.size(),
-                               &region));
+  ASSERT_TRUE(ParseBp128Region(
+      encoded.buf.data(), static_cast<uint32_t>(values.size()), encoded.param,
+      encoded.buf.data() + encoded.buf.size(), &region));
   std::vector<int64_t> decoded(values.size());
   DecodeBp128All(region, decoded.data());
   EXPECT_EQ(decoded, values);
 }
 
 TEST(PaxChunkCodecsTest, ScaledSumChecksProductAndAdditionBounds) {
-  constexpr __int128 kMin = std::numeric_limits<__int128>::min();
-  constexpr __int128 kMax = std::numeric_limits<__int128>::max();
+  constexpr platform::Int128 kMin =
+      std::numeric_limits<platform::Int128>::min();
+  constexpr platform::Int128 kMax =
+      std::numeric_limits<platform::Int128>::max();
   struct Case {
     int64_t coefficient;
-    __int128 subtotal;
-    __int128 initial;
+    platform::Int128 subtotal;
+    platform::Int128 initial;
     bool fits;
-    __int128 expected;
+    platform::Int128 expected;
   };
   const auto cases = std::to_array<Case>({
       {.coefficient = 0,
@@ -364,12 +504,12 @@ TEST(PaxChunkCodecsTest, ScaledSumChecksProductAndAdditionBounds) {
        .fits = false,
        .expected = 0},
       {.coefficient = INT64_MIN,
-       .subtotal = static_cast<__int128>(1) << 64,
+       .subtotal = static_cast<platform::Int128>(1) << 64,
        .initial = 0,
        .fits = true,
        .expected = kMin},
       {.coefficient = INT64_MIN,
-       .subtotal = (static_cast<__int128>(1) << 64) + 1,
+       .subtotal = (static_cast<platform::Int128>(1) << 64) + 1,
        .initial = 0,
        .fits = false,
        .expected = 0},
@@ -402,7 +542,7 @@ TEST(PaxChunkCodecsTest, ScaledSumChecksProductAndAdditionBounds) {
   for (size_t i = 0; i < cases.size(); ++i) {
     SCOPED_TRACE(i);
     const Case& test = cases[i];
-    __int128 total = test.initial;
+    platform::Int128 total = test.initial;
     EXPECT_EQ(TryAccumulateScaledSum(test.coefficient, test.subtotal, &total),
               test.fits);
     EXPECT_EQ(total, test.expected);

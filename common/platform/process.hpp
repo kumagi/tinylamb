@@ -66,6 +66,25 @@ inline constexpr int kWriteFailingErrno = ENOSPC;
 inline constexpr int kWriteFailingErrno = EBADF;
 #endif
 
+// Returns the current resident set size (RSS) of this process in bytes, or 0
+// if unavailable on the host OS.
+uint64_t CurrentProcessRssBytes() noexcept;
+
+// Returns the peak resident set size (high-water mark) of this process in
+// bytes, or 0 if unavailable.
+uint64_t PeakProcessRssBytes() noexcept;
+
+// Asks the global allocator to return freed-but-retained heap pages to the OS
+// (mi_collect(true) under mimalloc, malloc_trim(0) under glibc).  Resident
+// memory that the allocator keeps after free() still counts toward RSS, so a
+// budget that gates on RSS must be able to reclaim it before refusing a
+// reservation.  Rate-limited (at most once per ~20 ms process-wide); returns
+// true when a purge actually ran.  No-op on platforms without a hook.
+bool ReleaseFreeHeapToOs() noexcept;
+
+// Total physical memory of the host in bytes, or 0 if unavailable.
+uint64_t PhysicalMemoryBytes() noexcept;
+
 }  // namespace tinylamb::platform
 
 #endif  // TINYLAMB_COMMON_PLATFORM_PROCESS_HPP

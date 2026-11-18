@@ -87,7 +87,7 @@ $\text{OFFSET } m$ は「ソート順序確定後の先頭 $m$ 行をスキッ�
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` にて以下の動作が検証されています。
+`plan/cascades_test_part3.cpp` にて以下の動作が検証されています。
 
 - `CascadesTest.LimitPushThroughSortKeepsOffsetOnTop`:
   `OFFSET > 0` を含むクエリにおいて、誤った下位押し込みが発生せず、ソート後に Limit 演算子が保持されることを確認します。

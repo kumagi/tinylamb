@@ -152,10 +152,15 @@ int Connect(const Options& options) {
 }
 
 bool ParsePositive(std::string_view input, size_t* result) {
+  if (input.empty() || input.front() == '-' || input.front() == '+') {
+    return false;
+  }
   char* end = nullptr;
   const std::string value(input);
-  const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-  if (end == value.c_str() || *end != '\0' || parsed == 0) {
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+  if (errno != 0 || end == value.c_str() || *end != '\0' || parsed == 0 ||
+      parsed > std::numeric_limits<size_t>::max()) {
     return false;
   }
   *result = static_cast<size_t>(parsed);

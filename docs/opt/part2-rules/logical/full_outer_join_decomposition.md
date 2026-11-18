@@ -110,5 +110,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.FullOuterJoinDecomposition`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.FullOuterJoinDecomposition`
   - `join_type = 2` の `OuterJoin` 式が、`full_to_left_outer` および `full_to_anti_join` タグを持つ 2 つの派生 Group を子とする `kUnionAll` 式へと分解されることを検証。

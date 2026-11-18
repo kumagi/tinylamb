@@ -111,7 +111,7 @@ $$(R \ltimes_{p_1} S) \ltimes_{p_2} T \equiv (R \ltimes_{p_2} T) \ltimes_{p_1} S
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` における以下のテストケースで検証されています。
+`plan/cascades_test_part3.cpp` における以下のテストケースで検証されています。
 
 - `CascadesTest.SemiJoinCommutativity`:
   $(R \ltimes S) \ltimes T$ の入力に対して、右側関係が $S$ である交換済み半結合式がルートグループに生成されることを確認します。

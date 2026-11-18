@@ -74,11 +74,11 @@ return std::vector<PlanAlternative>{
 - `except_to_antijoin`: `kExcept` を `kAntiJoin` へ書き換える論理同値規則です。
 - `intersect_to_semijoin / except_to_antijoin`: 集合差を集合演算として物理化するか、反結合へ降ろすかをコスト比較により決定する制御機構です。
 - `push_filter_past_setop`, `setop_empty_simplification`, `setop_empty_identity`: `kExcept` の子式に対する述語プッシュダウンや空入力簡約を行う論理規則群です。
-- `anti_hash_join`, `anti_nested_loop_join`: 反結合に変換された場合に適用される物理結合規則群です。
+- `anti_hash_join`, `anti_merge_join`: 反結合に変換された場合に適用される物理結合規則群です。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子ノード数バリデーションおよび上流プロパティのドロップ処理を検証します。
   - `CascadesTest.ExceptToAntiJoinRewrite`: EXCEPT から AntiJoin への論理書き換えの正当性を検証します。
   - `CascadesTest.IntersectExceptCostBasedLowering`: EXCEPT の直接実装と AntiJoin 実装の間でのコスト基準の選択を検証します。

@@ -48,7 +48,7 @@ TEST(QueryMemoryTest,
   Row row({Value(1), Value("hello")});
   EXPECT_GT(EstimateRowBytes(row), 0U);
   EXPECT_GE(EstimateValueBytes(Value("hello")), 5U);
-  EXPECT_GE(EstimateValueBytes(Value(1)), 0U);
+  EXPECT_GT(EstimateValueBytes(Value(1)), 0U);
 }
 
 TEST(QueryMemoryTest, RowEstimateIncludesNestedArraysAndScalarPayloads) {
@@ -198,6 +198,39 @@ TEST(QueryMemoryTest, QueryMemoryCharge_MoveSemantics_TransfersOwnership) {
   EXPECT_EQ(budget.Used(), 0U);
   d.ReleaseAll();
   EXPECT_EQ(budget.Used(), 0U);
+}
+
+TEST(
+    QueryMemoryTest,
+    ResetForTest_PreservesProcessLinkageByDefaultAndSupportsExplicitIsolation) {
+  ProcessMemoryBudget& proc = ProcessMemoryBudget::Global();
+  QueryMemoryBudget& budget = QueryMemoryBudget::Global();
+  proc.ResetForTest(/*limit_bytes=*/8192, /*storage_limit_bytes=*/0,
+                    /*columnar_limit_bytes=*/0, /*check_rss_pressure=*/false);
+  budget.ResetForTest(8192);
+
+  ASSERT_TRUE(budget.TryReserve(512));
+  EXPECT_EQ(budget.Used(), 512U);
+  EXPECT_EQ(proc.QueryUsed(), 512U);
+  budget.Release(256);
+  EXPECT_EQ(proc.QueryUsed(), 256U);
+
+  // Explicit isolation detaches from ProcessMemoryBudget and releases prior
+  // usage cleanly.
+  budget.ResetForTest(4096, /*isolate_from_process=*/true);
+  EXPECT_EQ(proc.QueryUsed(), 0U);
+  budget.ReserveForced(1024);
+  EXPECT_EQ(budget.Used(), 1024U);
+  EXPECT_EQ(proc.QueryUsed(), 0U);
+
+  // Subsequent default ResetForTest() re-attaches linkage instead of leaving it
+  // permanently disabled across subsequent tests.
+  budget.ResetForTest(8192);
+  ASSERT_TRUE(budget.TryReserve(512));
+  EXPECT_EQ(proc.QueryUsed(), 512U);
+
+  budget.ResetForTest(0);
+  proc.ResetForTest(0);
 }
 
 }  // namespace tinylamb

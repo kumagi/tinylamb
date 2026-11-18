@@ -35,9 +35,9 @@ struct RoundTripCase {
   std::string_view payload;
 };
 
-// Short strings exercise the inline fast path; a payload of exactly
-// bin_size_t::max would need 64KiB, so the length-boundary tests below use
-// small sizes and the overflow guard is validated by the trailing-byte check.
+// Short strings exercise the inline fast path. Length-prefix decoding is
+// checked against truncated input (6 vs 5 bytes) and the canary byte after a
+// write; no 64KiB boundary or explicit length-overflow case is covered here.
 constexpr std::array<RoundTripCase, 5> kRoundTrip = {
     {RoundTripCase{.name = "empty", .payload = std::string_view()},
      RoundTripCase{.name = "one byte", .payload = std::string_view("x")},

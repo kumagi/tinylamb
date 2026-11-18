@@ -256,6 +256,12 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
         jit_operation_ = instructions[2].binary;
         jit_filter_ = JitInt64Kernels::CompileFilter(jit_operation_);
       }
+      // Lean proof: lean/TinylambOpt/BranchlessJitCodegen.lean
+      //   (if_conversion_sound_and_complete, jit_3vl_lane_sound)
+      jit_branchless_ = JitBranchlessProgram::Compile(*bytecode_, schema_);
+      if (jit_branchless_) {
+        jit_null_scratch_.resize(jit_branchless_->ReferencedColumns().size());
+      }
     }
     // The JIT kernel compares with signed integer semantics over raw int64
     // storage.  Only fire when the runtime batch really carries a signed
@@ -267,14 +273,92 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
         input_batch_.HasLayout(schema_) &&
         input_batch_.ZoneMapAt(jit_column_).Initialized() &&
         input_batch_.ZoneMapAt(jit_column_).NullCount() == 0) {
-      std::vector<uint8_t> result(input_batch_.Size());
+      jit_keep_bytes_.resize(input_batch_.Size());
       jit_filter_->Filter(
           input_batch_.ColumnAt(jit_column_).IntegerData().data(),
-          result.data(), result.size(), jit_constant_);
-      predicates.emplace(ValueType::kInt64, input_batch_.Size());
-      // Bulk-append the 0/1 bytes as int64 payload: no per-row Value.
-      predicates->AppendBoolBatch(result.data(), result.size());
+          jit_keep_bytes_.data(), jit_keep_bytes_.size(), jit_constant_);
+      selection_vector_.clear();
+      for (size_t i = 0; i < jit_keep_bytes_.size(); ++i) {
+        if (jit_keep_bytes_[i] != 0) {
+          selection_vector_.push_back(static_cast<uint32_t>(i));
+        }
+      }
       ++jit_batches_;
+      if (!selection_vector_.empty()) {
+        rows_selected_ += selection_vector_.size();
+        destination->AppendGather(input_batch_, selection_vector_.data(),
+                                  selection_vector_.size());
+      }
+      continue;
+    }
+    if (jit_branchless_ && input_batch_.HasLayout(schema_)) {
+      const auto& ref_cols = jit_branchless_->ReferencedColumns();
+      bool layout_ok = true;
+      for (uint16_t col_idx : ref_cols) {
+        const ColumnVector& col = input_batch_.ColumnAt(col_idx);
+        if (col.Type() != ValueType::kInt64 || col.IsUnsigned() ||
+            col.IsHeterogeneous()) {
+          layout_ok = false;
+          break;
+        }
+      }
+      if (layout_ok) {
+        const size_t n_rows = input_batch_.Size();
+        jit_col_inputs_.resize(ref_cols.size());
+        for (size_t u = 0; u < ref_cols.size(); ++u) {
+          const uint16_t col_idx = ref_cols[u];
+          const ColumnVector& col = input_batch_.ColumnAt(col_idx);
+          const ZoneMap& zone = input_batch_.ZoneMapAt(col_idx);
+          const bool has_nulls = !zone.Initialized() || zone.NullCount() > 0;
+          const uint8_t* null_ptr = nullptr;
+          if (has_nulls) {
+            jit_null_scratch_[u].resize(n_rows);
+            UnpackNullBitmapToBytes(col.NullBitmap(), n_rows,
+                                    jit_null_scratch_[u].data());
+            null_ptr = jit_null_scratch_[u].data();
+          }
+          const bool has_bounds =
+              zone.Initialized() && zone.ValueCount() > 0 &&
+              zone.Minimum().has_value() && zone.Maximum().has_value() &&
+              zone.Minimum()->type == ValueType::kInt64 &&
+              zone.Maximum()->type == ValueType::kInt64 &&
+              !zone.Minimum()->IsUnsigned() && !zone.Maximum()->IsUnsigned();
+          jit_col_inputs_[u] = {
+              .values = col.IntegerData().data(),
+              .nulls = null_ptr,
+              .has_nulls = has_nulls,
+              .has_bounds = has_bounds,
+              .min_value = has_bounds ? zone.Minimum()->value.int_value : 0,
+              .max_value = has_bounds ? zone.Maximum()->value.int_value : 0};
+        }
+        jit_keep_bytes_.resize(n_rows);
+        if (jit_branchless_->Filter(jit_col_inputs_, n_rows,
+                                    jit_keep_bytes_.data())) {
+          selection_vector_.clear();
+          for (size_t i = 0; i < n_rows; ++i) {
+            if (jit_keep_bytes_[i] != 0) {
+              selection_vector_.push_back(static_cast<uint32_t>(i));
+            }
+          }
+          ++jit_batches_;
+          if (!selection_vector_.empty()) {
+            rows_selected_ += selection_vector_.size();
+            destination->AppendGather(input_batch_, selection_vector_.data(),
+                                      selection_vector_.size());
+          }
+          continue;
+        }
+        // When `Filter` returns false, at least one row raised an unguarded
+        // arithmetic/domain error. Fall straight to the tolerant per-row
+        // conjunct path below (skipping whole-expression `TryEvaluateBatch`,
+        // which would fail on the same row anyway).
+      } else if (bytecode_) {
+        StatusOr<ColumnVector> batch =
+            bytecode_->TryEvaluateBatch(input_batch_);
+        if (batch.HasValue()) {
+          predicates.emplace(batch.MoveValue());
+        }
+      }
     } else if (bytecode_) {
       StatusOr<ColumnVector> batch = bytecode_->TryEvaluateBatch(input_batch_);
       if (batch.HasValue()) {
@@ -403,7 +487,8 @@ size_t Selection::NextBatch(DataChunk* destination, size_t max_rows) {
   return destination->Size();
 }
 
-void Selection::Dump(std::ostream& o, int indent) const {
+void Selection::DumpHeader(std::ostream& o, int indent,
+                           bool leading_indent) const {
   std::string predicate = exp_->ToString();
   if (exp_->Type() == TypeTag::kBinaryExp) {
     const BinaryOperation op = exp_->AsBinaryExpression().Op();
@@ -413,17 +498,26 @@ void Selection::Dump(std::ostream& o, int indent) const {
       predicate = "NullSafeEqual";
     }
   }
+  const std::string pad = Indent(static_cast<size_t>(std::max(0, indent)));
+  if (leading_indent) {
+    o << pad;
+  }
   o << "Selection: " << predicate << " (zone-map skipped=" << skipped_batches_
-    << ", jit batches=" << jit_batches_ << ")\n";
+    << ", jit batches=" << jit_batches_ << ")";
   // EXPLAIN (without ANALYZE) calls Dump before this operator has consumed
   // anything.  Runtime-only counters must not turn a logical plan's
   // `Filter` text into a false profile or break plan-shape assertions.
   if (rows_seen_ > 0) {
-    o << "SelectionStats rows_evaluated=" << rows_seen_
+    o << "\n"
+      << pad << "SelectionStats rows_evaluated=" << rows_seen_
       << " rows_selected=" << rows_selected_ << "\n"
-      << "ZoneMap blocks_skipped=" << skipped_batches_ << "\n";
+      << pad << "ZoneMap blocks_skipped=" << skipped_batches_;
   }
-  o << Indent(static_cast<size_t>(indent) + 2);
+}
+
+void Selection::Dump(std::ostream& o, int indent) const {
+  DumpHeader(o, indent, /*leading_indent=*/false);
+  o << "\n" << Indent(static_cast<size_t>(indent) + 2);
   src_->Dump(o, indent + 2);
 }
 

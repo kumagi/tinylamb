@@ -559,7 +559,7 @@ ARRAY<STRUCT<start INT64, end INT64, cnt INT64>>[known order:
 ]
 ==
 
-# In this scenario, the greediness of the (+) quantifier is superceded by
+# In this scenario, the greediness of the (+) quantifier is superseded by
 # longest_match.
 # The greedy (x_eq_1 +) is not consuming matching rows with (x = 1), but leaves
 # the last few to pick up the reluctant (y_eq_101*?) and the subsequent

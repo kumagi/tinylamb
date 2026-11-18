@@ -822,9 +822,9 @@ TEST_F(SqlExpressionMatrixTest, ErrorTable) {
   }
 }
 
-// Mixed BOOL/numeric arithmetic has the same compatibility limitation as
-// the comparison pins above. This coverage sweep does not claim GoogleSQL
-// conformance or freeze the coercion as a supported SQL contract.
+// Mixed BOOL/numeric arithmetic smoke-sweep: each form is exercised for
+// "does not raise", but neither result values nor types are pinned. It does
+// not claim GoogleSQL conformance or freeze the coercion as a SQL contract.
 TEST_F(SqlExpressionMatrixTest, DeviationSweep) {
   const std::vector<std::string> cases = {
       "SELECT 1 + true",   "SELECT 1.5 + true",  "SELECT true + 1",
@@ -836,6 +836,24 @@ TEST_F(SqlExpressionMatrixTest, DeviationSweep) {
     SCOPED_TRACE(sql);
     EXPECT_NO_THROW({ RunSql(engine_.get(), context_.get(), sql); });
   }
+}
+
+TEST_F(SqlExpressionMatrixTest, StructVolatileFieldIsDrawnPerRow) {
+  // STRUCT() fields that evaluate at visit time must not fold a volatile draw:
+  // doing so freezes one RAND() value for every row (and every replay).
+  RunSql(engine_.get(), context_.get(),
+         "CREATE TABLE rand_rows(k INT64);");
+  RunSql(engine_.get(), context_.get(),
+         "INSERT INTO rand_rows VALUES (1), (2), (3), (4), (5), (6);");
+  const auto rows =
+      RunSql(engine_.get(), context_.get(),
+             "SELECT STRUCT(RAND() AS r).r AS b FROM rand_rows;");
+  ASSERT_EQ(rows.size(), 6U);
+  bool all_equal = true;
+  for (size_t i = 1; i < rows.size(); ++i) {
+    all_equal = all_equal && rows[i][0] == rows[0][0];
+  }
+  EXPECT_FALSE(all_equal);
 }
 
 }  // namespace tinylamb

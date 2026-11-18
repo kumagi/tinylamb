@@ -94,7 +94,11 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
 
   // PipelineBreaker interface
   [[nodiscard]] bool IsMaterialized() const override { return materialized_; }
-  void MaterializePipeline() override { FailWith(Materialize()); }
+  void MaterializePipeline() override {
+    if (!MaterializeOrThrow()) {
+      FailWith(materialize_error_);
+    }
+  }
   [[nodiscard]] size_t MaterializedRowCount() const override {
     return rows_.size();
   }
@@ -104,6 +108,7 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
 
  private:
   Status Materialize();
+  bool MaterializeOrThrow();
   Executor source_;
   Schema schema_;
   std::vector<Key> keys_;
@@ -111,6 +116,8 @@ class SortExecutor : public ExecutorBase, public PipelineBreaker {
   std::vector<std::pair<Row, RowPosition>> rows_;
   size_t offset_{0};
   bool materialized_{false};
+  bool materialize_failed_{false};
+  Status materialize_error_;
   size_t worker_count_;
   QueryMemoryCharge rows_charge_;
 };

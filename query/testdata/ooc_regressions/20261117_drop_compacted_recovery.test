@@ -1,0 +1,11 @@
+-- sql_ooc_fuzzer regression
+-- seed: 472
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: crash recovery failed to reopen the database | status: NotExists: no backing tlcs file covers stub page # :: op 6 `crash`: crash recovery failed to reopen the database |   status: NotExists: no backing tlcs file covers stub page 11
+create t1 2 6881 2 2 1000000 1
+ins_bulk t1 10 217 891
+compact t1
+upd t1 range 50 90 1 0 pad 732 46 none 0 0
+drop t1
+commit
+crash

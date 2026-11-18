@@ -90,7 +90,7 @@ graph TD
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` 等における以下のテストケースで検証されています。
+`plan/cascades_test_part*.cpp` 等における以下のテストケースで検証されています。
 
 - `CascadesTest.TopNPropagatesItsKeysAndLimitToTheChild`:
   ソートキーおよび `limit_hint` が子グループの物理要求へ正しく伝播することを確認します。

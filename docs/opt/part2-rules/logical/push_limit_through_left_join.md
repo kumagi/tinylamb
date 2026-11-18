@@ -156,8 +156,7 @@ ON 条件と join_type は元の式からそのまま写されるため、NULL �
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.PushLimitThroughLeftJoin` —
-  `t2.id` を PRIMARY KEY にした LEFT JOIN の上の `Limit(5)` が、左側に
-  `count=5` の Limit を押し込んだ代替を生むことを検証します。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.PushLimitThroughLeftJoinRequiresContainmentProof` / `CascadesTest.PushLimitThroughLeftJoinRejectsUnprovenComparisonTypes` —
+  包含・一意証明が成り立つ場合に左枝へ Limit を押し込み、型や証明が欠ける場合は押し込まないことを検証します。
 - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms` が
   本 Rule の登録を確認します。

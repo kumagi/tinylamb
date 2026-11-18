@@ -65,7 +65,7 @@ void* operator new[](std::size_t n) {
 }
 void* operator new(std::size_t n, std::align_val_t a) {
   CountAllocationIfActive();
-  const std::size_t align = static_cast<std::size_t>(a);
+  const auto align = static_cast<std::size_t>(a);
   std::size_t size = n == 0 ? 1 : n;
   size = (size + align - 1) & ~(align - 1);
   void* p = std::aligned_alloc(align, size);
@@ -79,14 +79,14 @@ void* operator new[](std::size_t n, std::align_val_t a) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept {
+void operator delete(void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t /*unused*/) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t /*unused*/) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
   std::free(p);
 }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept {
+void operator delete[](void* p, std::size_t /*unused*/, std::align_val_t /*unused*/) noexcept {
   std::free(p);
 }
 
@@ -178,7 +178,7 @@ TEST(DecoderTest, AtEndSeesTrueExactlyAtBufferEnd) {
   std::string both;
   {
     Encoder enc(both);
-    enc << TrailingField{42, 0.5};
+    enc << TrailingField{.head=42, .tail=0.5};
   }
   ASSIGN_OR_ASSERT_FAIL(TrailingField, missing,
                         Decode<TrailingField>(head_only));
@@ -196,7 +196,7 @@ TEST(DecoderTest, DecodeOfPlainPayloadPerformsNoHeapAllocation) {
   std::string payload;
   {
     Encoder enc(payload);
-    enc << TrailingField{7, 0.25};
+    enc << TrailingField{.head=7, .tail=0.25};
   }
   // Warm up: the first Decode may pull in lazy static init outside the
   // measurement window.

@@ -53,9 +53,25 @@ rule 6; the reverse acquisition remains forbidden.
   keeping the latch**, ordering enqueue latch → work mutex.  The flush worker
   never acquires the enqueue latch, so the wait can never form a cycle.  A
   record's byte stream is never fragmented by another producer.
-- **No page/tree lock while blocking on disk I/O**: `CheckpointManager` copies
-  an in-memory snapshot of pages and LSM runs before writing `<db>.db` and
-  waiting on WAL durability.
+- **No page/tree lock while blocking on disk I/O**: `CheckpointManager` and
+  `PageManager` avoid holding page latches or `blocks_mu_` across
+  `WaitForDurable` and large sequential companion-file I/O (`<db>.blocks.*`,
+  `<db>.lsm.*`).
+- **`blocks_mu_` vs companion-file / spill mutexes**:
+  `PageManager::eviction_mu_` sits outside `blocks_file_mu_` / `lsm_file_mu_` /
+  `blocks_mu_` / `trees_mu_` (`LoadFuzzyCheckpoint` acquires them in that order;
+  never acquire `eviction_mu_` while holding any of those inner locks).
+  `PageManager::blocks_file_mu_`, `PageManager::lsm_file_mu_`,
+  `PageManager::uncommitted_spill_store_mu_`, `SpillStore::mu_`,
+  `LsmBlockCache::mu_`, `TransactionManager::write_set_spill_mu_`, and
+  `TransactionManager::version_spill_mu_` are leaf mutexes; never acquire
+  `blocks_mu_` or any `PageRef` latch while holding them, and never acquire
+  `Page` latches while holding `blocks_mu_`.
+- **Uncommitted page overlay spill (`ADR 0007`)**: `EvictBatch` snapshots live
+  page state under `Page::Latch()` (`try_to_lock`) + `blocks_mu_`, then writes
+  to `uncommitted_spill_store_` after releasing both latches; final eviction
+  commit re-acquires `Page::Latch()` (`try_to_lock`) -> `blocks_mu_` and
+  verifies `live_seq_` / `committed_seq_`.
 - **Table-tail ownership is a leaf lock**: `PageManager` may inspect or update
   table-tail state while holding a page content latch, but it must release that
   page latch before waiting on `table_tails_cv_`. Never hold `table_tails_mu_`
@@ -68,5 +84,27 @@ rule 6; the reverse acquisition remains forbidden.
 
 ## TSAN / deadlock tests
 
-`transaction_test`, `transaction_extra_test`, and `page_manager_test` cover
-cross-thread concurrency and lock ordering; extend them when adding a new latch.
+`transaction_test`, `transaction_extra_test`, and `page_manager_test` exercise
+cross-thread concurrency; extend them when adding a new latch.
+
+The default TSAN build runs with `detect_deadlocks=0`, so it finds data races
+only and does **not** verify the acquisition order above.  Lock-order (ABBA)
+inversions are checked only by configuring with
+`-DTINYLAMB_ENABLE_TSAN=ON -DTINYLAMB_TSAN_DETECT_DEADLOCKS=ON`; the `tsan`
+workflow's `lock-order` job does this (advisory until its baseline is clean).
+
+## Memory Reservation & Non-Blocking Reclaim Rules (ADR 0003)
+
+- Callers invoke `ProcessMemoryBudget::TryReserveWithReclaim` only while holding
+  no lower-layer latches (`PageRef`, `PageManager::blocks_mu_`,
+  `TableIncarnation::columnar_cache_->mu`, `TlcsFile::cache_mu_`,
+  `TlcsFile::dir_cache_mu_`, `TlcsFile::resident_mu_`). Inside
+  `blocks_mu_` or a `PageRef` latch, use non-reclaiming `TryReserve` (or
+  `ReserveEmergency` for unavoidable small metadata).
+- Reclaim callbacks registered on `ProcessMemoryBudget` (`ReclaimStage::kColumnar`,
+  `kCleanStorage`, `kSpillableQuery`) **must never block**: `ProcessMemoryBudget::hooks_mu_`
+  snapshots hooks before invoking callbacks outside the lock, and `QueryMemoryCoordinator::mu_`
+  coordinates grant waits without holding page or version locks. Every mutex/latch
+  acquisition inside a reclaim hook must use `std::try_to_lock` (`try_lock`) and
+  skip the target immediately if contended. Reclaim hooks must not re-enter
+  `TryReserveWithReclaim`.

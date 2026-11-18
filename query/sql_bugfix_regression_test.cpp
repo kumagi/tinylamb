@@ -315,4 +315,168 @@ TEST_F(SqlBugfixRegressionTest, StaleIndexFallbackKeepsKeyOrder) {
       (std::vector<std::string>{"0,2", "0,21", "0,4", "2,21", "2,4", "4,21"}));
 }
 
+// A non-correlated `col IN (SELECT ...)` pushdown stashes the membership set
+// as raw int64 bits. Those bits are a superset of SQL equality, which is
+// sound only while the equality-IN re-check survives: with dense bits and
+// >= 4096 distinct keys the predicate was dropped, publishing the superset's
+// false matches. UINT64 membership rows store 2^64-1 as the int64 bits -1, so
+// a signed probe column value of -1 was "in" the set although SQL never calls
+// them equal (and the same in reverse for an unsigned probe column).
+TEST_F(SqlBugfixRegressionTest, UnsignedInSubqueryNeverMatchesSignedProbe) {
+  Exec("CREATE TABLE sgn17 (c BIGINT)");
+  Exec("INSERT INTO sgn17 VALUES (-2000), (-1), (0), (5)");
+  Exec("CREATE TABLE m17 (u UINT64)");
+  // 4100 distinct UINT64 keys whose int64 bits form a dense run (-1..-4100):
+  // enough for the dense-bits + >= 4096 gate that drops the predicate.
+  for (int base = 0; base < 4100; base += 820) {
+    std::string insert = "INSERT INTO m17 VALUES ";
+    for (int k = 0; k < 820; ++k) {
+      const uint64_t value =
+          18446744073709551615ULL - static_cast<uint64_t>(base + k);
+      insert += (k > 0 ? ", (" : "(") + std::to_string(value) + ")";
+    }
+    Exec(insert);
+  }
+  EXPECT_TRUE(
+      Query("SELECT c FROM sgn17 WHERE c IN (SELECT u FROM m17)").empty());
+  // Control: shrink the membership below the gate and the predicate survives,
+  // so the same query must stay empty (it always did).
+  Exec("CREATE TABLE m1000 (u UINT64)");
+  {
+    std::string insert = "INSERT INTO m1000 VALUES ";
+    for (int k = 0; k < 1000; ++k) {
+      const uint64_t value = 18446744073709551615ULL - static_cast<uint64_t>(k);
+      insert += (k > 0 ? ", (" : "(") + std::to_string(value) + ")";
+    }
+    Exec(insert);
+  }
+  EXPECT_TRUE(
+      Query("SELECT c FROM sgn17 WHERE c IN (SELECT u FROM m1000)").empty());
+  // Reverse direction: a signed membership with dense negative bits must not
+  // prune an unsigned probe column carrying the very same bits.
+  Exec("CREATE TABLE usgn (c UINT64)");
+  Exec(
+      "INSERT INTO usgn VALUES (18446744073709551615), "
+      "(18446744073709551614), (5)");
+  Exec("CREATE TABLE msgn (v BIGINT)");
+  {
+    std::string insert = "INSERT INTO msgn VALUES ";
+    for (int k = 0; k < 4100; ++k) {
+      insert += (k > 0 ? ", (" : "(") + std::to_string(-1 - k) + ")";
+    }
+    Exec(insert);
+  }
+  EXPECT_TRUE(
+      Query("SELECT c FROM usgn WHERE c IN (SELECT v FROM msgn)").empty());
+  // A genuine match still comes back, signed probe over signed membership.
+  Exec("CREATE TABLE s2 (c BIGINT)");
+  Exec("INSERT INTO s2 VALUES (0), (5), (7)");
+  EXPECT_EQ(Query("SELECT c FROM s2 WHERE c IN (SELECT c FROM s2 WHERE c < 6)"),
+            (std::vector<std::string>{"0", "5"}));
+}
+
+// The CREATE TABLE visitor dropped the parser's is_if_not_exists /
+// is_or_replace detail flags, so CREATE TABLE IF NOT EXISTS on an existing
+// name failed with a bare Conflicts and CREATE OR REPLACE TABLE could never
+// replace. The flags now ride the statement and ExecuteCreateTable honors
+// them: no-op success for IF NOT EXISTS, drop-then-create for OR REPLACE.
+TEST_F(SqlBugfixRegressionTest, CreateTableIfNotExistsAndOrReplaceFlags) {
+  Exec("CREATE TABLE t (k INT64 PRIMARY KEY, v INT64)");
+  Exec("INSERT INTO t VALUES (1, 10)");
+  // IF NOT EXISTS on an existing table is a no-op that keeps the old shape
+  // and data (the offered narrower schema must not replace anything).
+  Exec("CREATE TABLE IF NOT EXISTS t (k INT64)");
+  EXPECT_EQ(Query("SELECT k, v FROM t"), (std::vector<std::string>{"1,10"}));
+  // Without the flag the duplicate still fails.
+  EXPECT_FALSE(
+      engine_->Execute(*context_, "CREATE TABLE t (k INT64)").HasValue());
+  // OR REPLACE drops and recreates with the new shape.
+  Exec("CREATE OR REPLACE TABLE t (k INT64, w STRING(MAX))");
+  EXPECT_TRUE(Query("SELECT k, w FROM t").empty());
+  Exec("INSERT INTO t VALUES (2, 'two')");
+  EXPECT_EQ(Query("SELECT k, w FROM t"), (std::vector<std::string>{"2,two"}));
+  // The parser accepts both flags together; the visitor rejects the
+  // ambiguous combination explicitly instead of picking one silently.
+  EXPECT_FALSE(
+      engine_
+          ->Execute(*context_,
+                    "CREATE OR REPLACE TABLE IF NOT EXISTS t (x INT64)")
+          .HasValue());
+
+  // The flags also apply to the CREATE TABLE AS SELECT form.
+  Exec("CREATE TABLE IF NOT EXISTS t2 AS SELECT 1 AS one");
+  Exec("CREATE TABLE IF NOT EXISTS t2 AS SELECT 2 AS two");
+  EXPECT_EQ(Query("SELECT one FROM t2"), (std::vector<std::string>{"1"}));
+  Exec("CREATE OR REPLACE TABLE t2 AS SELECT 9 AS nine");
+  EXPECT_EQ(Query("SELECT nine FROM t2"), (std::vector<std::string>{"9"}));
+
+  // A name held by a view counts as existing: IF NOT EXISTS is a no-op and
+  // the view survives; OR REPLACE without a physical table keeps the
+  // ordinary already-exists failure instead of deleting the view.
+  Exec("CREATE TABLE holder (k INT64)");
+  Exec("INSERT INTO holder VALUES (7)");
+  Exec("CREATE VIEW vv AS SELECT k FROM holder");
+  Exec("CREATE TABLE IF NOT EXISTS vv (x INT64)");
+  EXPECT_EQ(Query("SELECT k FROM vv"), (std::vector<std::string>{"7"}));
+  EXPECT_FALSE(
+      engine_->Execute(*context_, "CREATE OR REPLACE TABLE vv (x INT64)")
+          .HasValue());
+  EXPECT_EQ(Query("SELECT k FROM vv"), (std::vector<std::string>{"7"}));
+}
+
+// The varchar prefilter swallowed the INTERVAL/STRING type mismatch that the
+// checked evaluator raises, so `WHERE s = INTERVAL 1 DAY` returned a silently
+// empty result and the OR variant let the surviving disjunct answer rows.
+// The compile gate now leaves interval-tagged constants to the residual,
+// which raises exactly like the projection arm always did.
+TEST_F(SqlBugfixRegressionTest, IntervalStringComparisonRaisesInFilter) {
+  Exec("CREATE TABLE it (k INT64, s STRING(MAX))");
+  Exec("INSERT INTO it VALUES (1, 'a'), (2, '1 day 0:0:0')");
+  for (const char* sql :
+       {"SELECT k FROM it WHERE s = INTERVAL 1 DAY",
+        "SELECT k FROM it WHERE s = INTERVAL 1 DAY OR k > 0"}) {
+    SCOPED_TRACE(sql);
+    StatusOr<QueryResult> result = engine_->Execute(*context_, sql);
+    ASSERT_FALSE(result.HasValue()) << sql;
+    const std::string& error = engine_->LastError();
+    EXPECT_TRUE(error.find("INTERVAL") != std::string::npos ||
+                error.find("mismatch") != std::string::npos)
+        << error;
+  }
+  // The projection arm already raised before the fix; it must keep raising.
+  EXPECT_FALSE(engine_->Execute(*context_, "SELECT s = INTERVAL 1 DAY FROM it")
+                   .HasValue());
+}
+
+// INSERT IGNORE / OR REPLACE keyed their conflict gate on the compliance-mock
+// PK flag alone, so a table with a declared PRIMARY KEY rejected every
+// conflict clause with "table does not have a primary key". The gate now
+// accepts a declared PK and the duplicate detection uses the PK's own
+// columns instead of always column 0.
+TEST_F(SqlBugfixRegressionTest, InsertConflictModesUseDeclaredPrimaryKey) {
+  Exec("CREATE TABLE pk (k INT64 PRIMARY KEY, v INT64)");
+  Exec("INSERT INTO pk VALUES (1, 10)");
+  // A plain duplicate still fails (the storage-level unique index).
+  EXPECT_FALSE(
+      engine_->Execute(*context_, "INSERT INTO pk VALUES (1, 99)").HasValue());
+  // IGNORE skips the duplicate instead of erroring about the key.
+  Exec("INSERT IGNORE INTO pk VALUES (1, 99)");
+  EXPECT_EQ(Query("SELECT k, v FROM pk"), (std::vector<std::string>{"1,10"}));
+  // OR REPLACE overwrites through the declared PK.
+  Exec("INSERT OR REPLACE INTO pk VALUES (1, 20)");
+  EXPECT_EQ(Query("SELECT k, v FROM pk"), (std::vector<std::string>{"1,20"}));
+  // A table without any key keeps rejecting conflict clauses.
+  Exec("CREATE TABLE nopk (k INT64, v INT64)");
+  EXPECT_FALSE(
+      engine_->Execute(*context_, "INSERT IGNORE INTO nopk VALUES (1, 2)")
+          .HasValue());
+  // A non-first-column PK drives the detection (not column 0).
+  Exec("CREATE TABLE pk2 (v INT64, k INT64 PRIMARY KEY)");
+  Exec("INSERT INTO pk2 VALUES (100, 7)");
+  Exec("INSERT IGNORE INTO pk2 VALUES (999, 7)");
+  EXPECT_EQ(Query("SELECT v, k FROM pk2"), (std::vector<std::string>{"100,7"}));
+  Exec("INSERT OR REPLACE INTO pk2 VALUES (555, 7)");
+  EXPECT_EQ(Query("SELECT v, k FROM pk2"), (std::vector<std::string>{"555,7"}));
+}
+
 }  // namespace tinylamb

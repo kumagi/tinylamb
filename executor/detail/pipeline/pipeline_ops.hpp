@@ -169,7 +169,7 @@ class LimitOp final : public PipelineOperator {
   bool early_stop_{false};
 };
 
-// Streaming O(1) adjacent duplicate suppressor for `SortDistinctPlan`.
+// Streaming adjacent duplicate suppressor for `SortDistinctPlan`.
 class AdjacentDistinctOp final : public PipelineOperator {
  public:
   Status Process(PipelineContext* ctx, const DataChunk& input,

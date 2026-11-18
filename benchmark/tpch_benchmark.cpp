@@ -838,7 +838,7 @@ int main(int argc, char** argv) {
     RemoveDatabaseFiles(options.database_path);
   }
 
-  // Cap query working memory so join/agg/sort spill before the host thrashs.
+  // Cap query working memory so join/agg/sort spill before the host thrashes.
   if (std::getenv("TINYLAMB_QUERY_MEMORY_BYTES") == nullptr) {
     tinylamb::platform::SetEnv("TINYLAMB_QUERY_MEMORY_BYTES", "8589934592",
                                0);  // 8 GiB

@@ -127,10 +127,10 @@ return std::vector<PlanAlternative>{
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `OptimizerTest.LimitEstimateAccountsForOffset`: OFFSET を考慮した行数推定の精度を検証します。
   - `OptimizerTest.UnorderedLimitPushesRowCapIntoFullScan`: 順序なし LIMIT が全表走査に対して読み取り行数上限（Early-out）を伝播させることを検証します。
   - `OptimizerTest.LimitWithOrderedIndexStreamsOnlyTopKRows`: 順序付き索引スキャンと LIMIT の連携により上位 K 行のみがストリーミングされることを検証します。
   - `OptimizerTest.PhysicalRuleSubsetsPreserveOrderedLimitResults`: 物理規則の適用サブセットを変調させた環境下でも順序付き LIMIT の結果整合性が保たれることを検証します。
-- `executor/executor_test.cpp`:
+- `executor/executor_test_part2.cpp`:
   - `ExecutorTest.LimitOffsetSkipsLeadingRows`: 実行時における OFFSET スキップと行制限の正確性を検証します。

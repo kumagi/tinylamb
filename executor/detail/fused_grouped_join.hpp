@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "common/constants.hpp"
+#include "common/parallel_work.hpp"
 #include "common/status_or.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/planning_heuristics.hpp"
@@ -49,14 +51,16 @@ struct DeferredLSTableProbe {
   std::vector<slot_t> projection;
   ScanRuntimeFilter runtime_filter;
   std::vector<Expression> local_preds;
+  bool local_preds_covered_by_peeks{false};
   std::vector<IntegerPeekCompare> integer_peeks;
   std::vector<NullPeekCompare> null_peeks;
   std::vector<DeferredLSTablePkLookup> pk_lookups;
+  bool columnar_output{false};
 };
 
-template <typename Key, typename Hash = std::hash<Key>,
+template <typename Key, typename Mapped, typename Hash = std::hash<Key>,
           typename Equal = std::equal_to<Key>>
-class FlatJoinBuckets {
+class FlatJoinValueBuckets {
   struct Entry;
   static constexpr uint32_t kNoEntry = std::numeric_limits<uint32_t>::max();
 
@@ -64,7 +68,7 @@ class FlatJoinBuckets {
   class const_iterator {
    public:
     const_iterator() = default;
-    const_iterator(const FlatJoinBuckets* buckets, uint32_t index)
+    const_iterator(const FlatJoinValueBuckets* buckets, uint32_t index)
         : buckets_(buckets), index_(index) {}
 
     const Entry& operator*() const { return buckets_->entries_[index_]; }
@@ -76,7 +80,7 @@ class FlatJoinBuckets {
     bool operator==(const const_iterator& other) const = default;
 
    private:
-    const FlatJoinBuckets* buckets_{nullptr};
+    const FlatJoinValueBuckets* buckets_{nullptr};
     uint32_t index_{kNoEntry};
   };
 
@@ -102,19 +106,26 @@ class FlatJoinBuckets {
   }
 
   template <typename KeyLike>
-  bool emplace(KeyLike&& key, const Row* row) {
-    const size_t bucket = BucketIndex(key);
-    const uint32_t head = FindHead(key, bucket);
-    const auto index = static_cast<uint32_t>(entries_.size());
-    entries_.push_back(
-        Entry{std::forward<KeyLike>(key), row, head, buckets_[bucket]});
-    buckets_[bucket] = index;
-    return head == kNoEntry;
+  bool emplace(KeyLike&& key, Mapped value) {
+    return emplace_bucket(std::forward<KeyLike>(key), value, BucketIndex(key));
+  }
+
+  template <typename KeyLike>
+  bool emplace_hashed(KeyLike&& key, Mapped value, uint64_t hash) {
+    return emplace_bucket(std::forward<KeyLike>(key), value,
+                          static_cast<size_t>(hash) & (buckets_.size() - 1));
   }
 
   [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range(
       const Key& key) const {
     const size_t bucket = BucketIndex(key);
+    return {const_iterator(this, FindHead(key, bucket)),
+            const_iterator(this, kNoEntry)};
+  }
+
+  [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range_hashed(
+      const Key& key, uint64_t hash) const {
+    const size_t bucket = static_cast<size_t>(hash) & (buckets_.size() - 1);
     return {const_iterator(this, FindHead(key, bucket)),
             const_iterator(this, kNoEntry)};
   }
@@ -127,13 +138,31 @@ class FlatJoinBuckets {
         static_cast<const uint32_t*>(&buckets_[BucketIndex(key)]));
   }
 
+  void PrefetchBucketHashed(uint64_t hash) const {
+    if (buckets_.empty()) {
+      return;
+    }
+    __builtin_prefetch(static_cast<const uint32_t*>(
+        &buckets_[static_cast<size_t>(hash) & (buckets_.size() - 1)]));
+  }
+
  private:
   struct Entry {
     Key first;
-    const Row* second;
+    Mapped second;
     uint32_t duplicate_next;
     uint32_t collision_next;
   };
+
+  template <typename KeyLike>
+  bool emplace_bucket(KeyLike&& key, Mapped value, size_t bucket) {
+    const uint32_t head = FindHead(key, bucket);
+    const auto index = static_cast<uint32_t>(entries_.size());
+    entries_.push_back(
+        Entry{std::forward<KeyLike>(key), value, head, buckets_[bucket]});
+    buckets_[bucket] = index;
+    return head == kNoEntry;
+  }
 
   [[nodiscard]] size_t BucketIndex(const Key& key) const {
     if constexpr (std::is_same_v<Key, int64_t>) {
@@ -160,6 +189,147 @@ class FlatJoinBuckets {
   std::vector<uint32_t> buckets_;
   std::vector<Entry> entries_;
 };
+
+template <typename Key, typename Hash = std::hash<Key>,
+          typename Equal = std::equal_to<Key>>
+using FlatJoinBuckets = FlatJoinValueBuckets<Key, const Row*, Hash, Equal>;
+
+template <typename Key, typename Hash = std::hash<Key>,
+          typename Equal = std::equal_to<Key>>
+using FlatJoinIdxBuckets = FlatJoinValueBuckets<Key, uint32_t, Hash, Equal>;
+
+template <typename Key, typename Mapped, typename Hash = std::hash<Key>,
+          typename Equal = std::equal_to<Key>>
+class ShardedFlatJoinValueBuckets {
+ public:
+  static constexpr size_t kShards = 64;
+  using BucketType = FlatJoinValueBuckets<Key, Mapped, Hash, Equal>;
+  using const_iterator = typename BucketType::const_iterator;
+
+  template <typename KeyOfRow, typename SkipRow>
+  Status BuildParallel(const std::vector<Row>& rows, KeyOfRow key_of_row,
+                       SkipRow skip_row, size_t workers) {
+    return BuildParallelRange(
+        rows.size(),
+        [&](size_t i, Key* out_key, Mapped* out_val) -> bool {
+          const Row& row = rows[i];
+          if (skip_row(row)) {
+            return false;
+          }
+          *out_key = key_of_row(row);
+          if constexpr (std::is_same_v<Mapped, const Row*>) {
+            *out_val = &row;
+          } else {
+            *out_val = static_cast<Mapped>(i);
+          }
+          return true;
+        },
+        workers);
+  }
+
+  template <typename FillFn>
+  Status BuildParallelRange(size_t total, FillFn&& fill_fn, size_t workers) {
+    struct Item {
+      Key key;
+      Mapped value;
+      uint64_t hash;
+    };
+    workers = std::max<size_t>(1, std::min(workers, total));
+    std::vector<std::array<std::vector<Item>, kShards>> worker_parts(workers);
+    const size_t approx_per_shard =
+        std::max<size_t>(4, ((total / workers) / kShards) + 4);
+    for (auto& parts : worker_parts) {
+      for (auto& vec : parts) {
+        vec.reserve(approx_per_shard);
+      }
+    }
+    RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
+      const size_t begin = (total * w) / workers;
+      const size_t end = (total * (w + 1)) / workers;
+      auto& local = worker_parts[w];
+      for (size_t i = begin; i < end; ++i) {
+        Key k;
+        Mapped val;
+        if (!fill_fn(i, &k, &val)) continue;
+        const uint64_t h = HashKey(k);
+        local[static_cast<size_t>(h >> 58)].push_back(
+            Item{std::move(k), val, h});
+      }
+    }));
+    const size_t merge_workers = std::min(workers, kShards);
+    std::mutex error_mutex;
+    Status error = Status::kSuccess;
+    RETURN_IF_FAIL(RunParallelTasks(merge_workers, [&](size_t w) {
+      try {
+        for (size_t s = w; s < kShards; s += merge_workers) {
+          size_t count = 0;
+          for (size_t t = 0; t < workers; ++t) {
+            count += worker_parts[t][s].size();
+          }
+          shards_[s].reserve(count);
+          for (size_t t = 0; t < workers; ++t) {
+            for (Item& item : worker_parts[t][s]) {
+              shards_[s].emplace_hashed(std::move(item.key), item.value,
+                                        item.hash);
+            }
+            std::vector<Item>().swap(worker_parts[t][s]);
+          }
+        }
+      } catch (const std::exception& e) {
+        std::scoped_lock lock(error_mutex);
+        if (error.ok()) {
+          error = StatusError(StatusCode::kRuntimeError, e.what());
+        }
+      }
+    }));
+    return error;
+  }
+
+  [[nodiscard]] uint64_t HashKey(const Key& key) const {
+    uint64_t h = 0;
+    if constexpr (std::is_same_v<Key, int64_t>) {
+      h = static_cast<uint64_t>(key) * 0x94d049bb133111ebULL;
+    } else {
+      h = static_cast<uint64_t>(hash_(key));
+    }
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    return h ^ (h >> 33);
+  }
+
+  [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range(
+      const Key& key) const {
+    return equal_range_hashed(key, HashKey(key));
+  }
+
+  [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range_hashed(
+      const Key& key, uint64_t hash) const {
+    return shards_[static_cast<size_t>(hash >> 58)].equal_range_hashed(key,
+                                                                       hash);
+  }
+
+  void PrefetchBucket(const Key& key) const {
+    PrefetchBucketHashed(HashKey(key));
+  }
+
+  void PrefetchBucketHashed(uint64_t hash) const {
+    shards_[static_cast<size_t>(hash >> 58)].PrefetchBucketHashed(hash);
+  }
+
+ private:
+  Hash hash_{};
+  std::array<BucketType, kShards> shards_;
+};
+
+template <typename Key, typename Hash = std::hash<Key>,
+          typename Equal = std::equal_to<Key>>
+using ShardedFlatJoinBuckets =
+    ShardedFlatJoinValueBuckets<Key, const Row*, Hash, Equal>;
+
+template <typename Key, typename Hash = std::hash<Key>,
+          typename Equal = std::equal_to<Key>>
+using ShardedFlatJoinIdxBuckets =
+    ShardedFlatJoinValueBuckets<Key, uint32_t, Hash, Equal>;
 
 struct ProgramShape {
   int32_t direct_column{-1};

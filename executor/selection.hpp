@@ -47,6 +47,8 @@ class Selection : public ExecutorBase {
                    size_t max_rows = kDefaultVectorSize) override;
 
   void Dump(std::ostream& o, int indent) const override;
+  void DumpHeader(std::ostream& o, int indent,
+                  bool leading_indent = false) const;
   [[nodiscard]] size_t SkippedBatches() const { return skipped_batches_; }
   [[nodiscard]] size_t JitBatches() const { return jit_batches_; }
 
@@ -62,10 +64,14 @@ class Selection : public ExecutorBase {
   size_t skipped_batches_{0};
   std::optional<BytecodeProgram> bytecode_;
   std::optional<JitInt64Kernels> jit_filter_;
+  std::optional<JitBranchlessProgram> jit_branchless_;
   bool jit_attempted_{false};
   uint16_t jit_column_{0};
   int64_t jit_constant_{0};
   BinaryOperation jit_operation_{BinaryOperation::kEquals};
+  std::vector<uint8_t> jit_keep_bytes_;
+  std::vector<std::vector<uint8_t>> jit_null_scratch_;
+  std::vector<JitColumnInput> jit_col_inputs_;
   struct SimdIntFilter {
     bool enabled{false};
     size_t column{0};

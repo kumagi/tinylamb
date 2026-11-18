@@ -33,10 +33,12 @@ bool IsKnownTimeZone(std::string_view name);
 // wall-clock time, i.e. `std::chrono::time_zone::get_info(local).first`:
 // an ambiguous time (DST fall-back overlap) yields the earlier offset and a
 // nonexistent time (spring-forward gap) yields the offset in force before the
-// gap. nullopt when the zone is unknown. Never throws.
+// gap. With at_utc, the fields instead identify an unambiguous UTC instant.
+// Returns nullopt when the zone is unknown. Never throws.
 std::optional<int> TimeZoneOffsetAtLocalTime(std::string_view name, int year,
                                              unsigned month, unsigned day,
-                                             int hour, int minute, int second);
+                                             int hour, int minute, int second,
+                                             bool at_utc = false);
 
 }  // namespace tinylamb::platform
 

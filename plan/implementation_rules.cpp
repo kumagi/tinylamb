@@ -33,6 +33,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/hash_join_mode.hpp"
 #include "expression/binary_expression.hpp"
+#include "expression/cast_expression.hpp"
 #include "expression/collation.hpp"
 #include "expression/column_value.hpp"
 #include "expression/constant_value.hpp"
@@ -127,9 +128,16 @@ bool ResidualContainsQuery(const Expression& expression) {
 }
 
 // Pushdown safety: moving a conjunct below a join changes how often it
-// evaluates (once per child row instead of once per candidate pair), which
-// is only observable for volatile functions like RANDOM().
+// evaluates (once per child row instead of once per candidate pair). That is
+// observable for volatile functions like RANDOM(), and also for deterministic
+// but throwing expressions (CAST of non-numeric text, division by zero,
+// overflow): below the join they are evaluated for child rows that have no
+// matching pair, so an error appears that the original plan never raised.
+// "immutable" is not synonymous with "cannot throw".
 bool DeterministicForPushdown(const Expression& expression) {
+  if (!ExpressionCannotThrowForPlanner(expression)) {
+    return false;
+  }
   if (expression->Type() == TypeTag::kFunctionCallExp &&
       GetFunctionVolatility(
           expression->AsFunctionCallExpression().FuncName()) !=
@@ -146,6 +154,8 @@ size_t RowEstimate(double rows);
 struct Range {
   std::optional<Value> min;
   std::optional<Value> max;
+  // NOTE: these inclusivity flags are currently write-only; effective range
+  // keys are always inclusive and the scan rechecks the original predicate.
   bool min_inclusive{false};
   bool max_inclusive{false};
 
@@ -266,6 +276,11 @@ bool CanPushLimitIntoFullScan(const Expression& filter,
                               const cascades::RuleContext& context) {
   if (filter || context.query == nullptr || context.query->limit_count_ == 0 ||
       context.query->distinct_ || !context.query->order_expressions_.empty() ||
+      // TABLESAMPLE is applied AFTER the scan, so truncating the scan input
+      // changes which rows are even eligible for sampling (REPEATABLE draws
+      // from a different population). The statement-level LimitPlan applies
+      // LIMIT to the sampled output instead.
+      !context.query->samples_.empty() ||
       required.limit_hint == std::numeric_limits<size_t>::max() ||
       required.limit_hint == 0) {
     return false;
@@ -502,7 +517,7 @@ Plan BuildIndexScan(const Table& table, const Index& index,
   return scan;
 }
 
-// Top-K costing (Phase 5): an alternative that already delivers the required
+// Top-K costing: an alternative that already delivers the required
 // ordering only streams limit-hint rows because the executor stack is lazy.
 void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
                     const cascades::RuleContext& context, double selectivity,
@@ -528,7 +543,7 @@ void ApplyLimitHint(const Plan& plan, const PhysicalProperties& required,
   *estimated_rows = std::min(*estimated_rows, rows);
 }
 
-// Clustering penalty for range index scans (TODO.md item 1b). A range scan
+// Clustering penalty for range index scans . A range scan
 // over a physically clustered column reads heap rows mostly sequentially,
 // while the same range over randomly ordered rows pays a seek per row.
 // Point lookups (full equality prefix) are excluded by the caller: they
@@ -558,7 +573,7 @@ double RangeClusteringPenalty(const TableStatistics& statistics, slot_t slot) {
 // Lookup locality (Phase 2 "ソート済み外側からのlookup locality").  When the
 // outer side already arrives in the probe key order, consecutive probes either
 // land on the leaf the previous one used or on the one next to it, so the
-// root-to-leaf descent path and the leaf page stay in the buffer pool instead
+// the looked-up leaf page stays in the buffer pool instead
 // of being re-read per row.  True when `plan` delivers `columns` ascending; the
 // probe's own left-column names are handed over unchanged because every
 // IsOrderedBy implementation resolves the qualified and unqualified spellings.
@@ -756,7 +771,7 @@ std::vector<PlanAlternative> ScanAlternatives(
   const std::string relation = logical.table;
   const std::string physical = std::string(schema.Name());
   // The group filter carries the single-relation conjuncts of the WHERE
-  // clause (Phase 2 pushdown); it must be applied in full because the root
+  // clause; it must be applied in full because the root
   // SelectionPlan wrap no longer exists. Conjuncts speak relation identities
   // while scan machinery speaks physical table names, so translate down.
   Expression filter = QualifyDown(memo.Get(group).filter, relation, physical);
@@ -951,6 +966,11 @@ std::vector<PlanAlternative> ScanAlternatives(
       range_predicates.push_back(conjunct);
     }
 
+    // The AND bitmap below scans every index for a leading-key range, so its
+    // candidate does not depend on the loop's current index: build it once
+    // instead of once per qualifying index (k identical alternatives would
+    // multiply rule time and eat the memo's expression cap).
+    bool and_bitmap_built = false;
     for (size_t index_offset = 0; index_offset < table.IndexCount();
          ++index_offset) {
       const Index& index = table.GetIndex(index_offset);
@@ -1033,8 +1053,9 @@ std::vector<PlanAlternative> ScanAlternatives(
       // path with no write-intent acquisition, so they cannot serve a DML
       // source that must lock and re-resolve each row's committed head
       // (same restriction as index-only scans).
-      if (!required.require_row_position && filter &&
+      if (!and_bitmap_built && !required.require_row_position && filter &&
           leading_key_range(index) != nullptr) {
+        and_bitmap_built = true;
         // AND: every independent indexed predicate contributes one bitmap.
         std::vector<BitmapIndexRange> and_ranges;
         std::unordered_set<slot_t> seen_leading_slots;
@@ -1305,7 +1326,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       // Prefix encoding serves both directions: EncodeParts gives the verbatim
       // begin (the reverse scan's stop condition) while EncodeEndParts turns a
       // short end into a prefix ceiling (the reverse scan's start position,
-      // resolved by BPlusTree::PositionBelow). The residual predicate stays
+      // resolved by the index scan bounds). The residual predicate stays
       // authoritative for inclusive/exclusive edges in either direction.
       const bool reverse_twin = wants_descending && !provided_order.empty();
       for (const bool scan_ascending : {true, false}) {
@@ -1347,7 +1368,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         local_cost = std::min(
             local_cost,
             EqualityPrefixRows(statistics, index, equality_prefix_values));
-        // Random heap I/O for range scans (TODO.md item 1b): a range over a
+        // Random heap I/O for range scans : a range over a
         // clustered column reads mostly sequentially, while the same range
         // over randomly ordered rows seeks per matching row and can cost
         // more than a full sequential scan. Model it as
@@ -1552,7 +1573,7 @@ std::vector<PlanAlternative> ScanAlternatives(
         CanPushLimitIntoFullScan(filter, required, context)
             ? required.limit_hint
             : std::numeric_limits<size_t>::max();
-    // Extract PeekCompare predicates from the filter so the scan iterator
+    // Extract integer peek-compare predicates from the filter so the scan iterator
     // can reject rows at the raw-byte level before full deserialization.
     relational_detail::CompiledScanFilter peek_filter;
     if (filter) {
@@ -1575,7 +1596,7 @@ std::vector<PlanAlternative> ScanAlternatives(
     // reject rows before the exact residual gets a chance to evaluate them.
     std::vector<IntegerPeekCompare> scan_peeks =
         relational_detail::BuildIntegerPeeks(peek_filter, nullptr, schema);
-    // Required-column narrowing (Phase 3, decode floor): when the required
+    // Required-column narrowing (decode floor): when the required
     // list is a strict subset of plain table columns, emit only those
     // columns from the scan itself (the iterator skips the others before
     // deserialize). A ProjectionPlan wrapper would decode every column of
@@ -1645,7 +1666,7 @@ std::vector<PlanAlternative> ScanAlternatives(
       // with unrelated, newly inserted keys in other open transactions.
       local_cost = 2.0 * std::max(1.0, local_cost);
     }
-    // access_method hint (Phase 5): a soft preference against full scans.
+    // access_method hint: a soft preference against full scans.
     if (required.access_method == cascades::AccessMethod::kPreferIndex &&
         table.IndexCount() > 0) {
       local_cost *= 2.0;
@@ -2492,7 +2513,7 @@ std::vector<PlanAlternative> JoinAlternatives(
           // leaves open: at most one lower and one upper conjunct (an
           // interval probe). SetLookupRange rejects the shapes that cannot
           // be probed safely (a later key column, mismatched operand types,
-          // a type outside the range whitelist) and the conjunct then simply
+          // a type outside the range allowlist) and the conjunct then simply
           // stays in the residual predicate below: an explicit fallback,
           // never a silently dropped one.
           std::vector<LookupRangeCandidate> ranges;
@@ -2536,7 +2557,7 @@ std::vector<PlanAlternative> JoinAlternatives(
           // Everything the probe does not decide, and that this
           // executor is not already applying through a child it consumes,
           // becomes the residual predicate. This is where a second range
-          // column, an equality on a non-key column, a range the whitelist
+          // column, an equality on a non-key column, a range the allowlist
           // rejected and the inner relation's whole filter all end up: the
           // probe over-fetches and the predicate decides the rows.
           std::vector<Expression> lookup_residual;
@@ -2553,7 +2574,7 @@ std::vector<PlanAlternative> JoinAlternatives(
                 lookup_plan, CombineConjuncts(lookup_residual),
                 lookup_plan->GetStats());
           }
-          // One B+Tree probe plus row assembly per left row, plus the rows
+          // One index probe plus row assembly per left row, plus the rows
           // the probe is expected to hand back. The probe half is discounted
           // when the outer side already arrives in the probe key order: the
           // descent then amortizes into a left-to-right leaf walk, so the
@@ -2565,7 +2586,24 @@ std::vector<PlanAlternative> JoinAlternatives(
               DeliversProbeOrder(left.plan, probe->left_columns)
                   ? kOrderedLookupProbeFactor
                   : 1.0;
-          double local_cost = (l_rows * probe_factor) + l_rows + equi_estimate;
+          // The lookup bypasses the filtered right plan. Charge for all
+          // candidates read from the index before applying its residuals,
+          // rather than only the much smaller final join result.
+          std::vector<size_t> probe_slots(
+              index_handle.sc_.key_.begin(),
+              index_handle.sc_.key_.begin() +
+                  static_cast<ptrdiff_t>(prefix_len));
+          const double domains = std::max(
+              1.0, stats_it->second->EstimateDistinctRows(probe_slots));
+          const double candidates_per_probe =
+              point_probe && index_handle.StoresSingleValue()
+                  ? 1.0
+                  : std::max(1.0,
+                             static_cast<double>(stats_it->second->Rows()) /
+                                 domains);
+          const double candidate_rows = std::max(
+              equi_estimate, std::max(1.0, l_rows) * candidates_per_probe);
+          double local_cost = (l_rows * probe_factor) + l_rows + candidate_rows;
           if (range_adopted) {
             local_cost = std::max(
                 1.0, local_cost * RangeClusteringPenalty(*stats_it->second,
@@ -3529,6 +3567,150 @@ StatusOr<Plan> OptimizeMinMaxIndex(
   return Status::kNotImplemented;
 }
 
+namespace {
+
+std::string SqlTypeNameForNullCast(ValueType type) {
+  switch (type) {
+    case ValueType::kInt64:
+      return "INT64";
+    case ValueType::kDouble:
+      return "FLOAT64";
+    case ValueType::kVarChar:
+      return "STRING";
+    case ValueType::kDate:
+      return "DATE";
+    default:
+      return "";
+  }
+}
+
+void CollectAntiJoinRightRelations(
+    const cascades::Memo& memo, cascades::GroupId group_id,
+    std::unordered_set<std::string>* out,
+    std::unordered_set<cascades::GroupId>* visited) {
+  if (!visited->insert(group_id).second || group_id >= memo.GroupCount()) {
+    return;
+  }
+  for (const auto& expr : memo.Get(group_id).expressions) {
+    if (expr.operation == cascades::LogicalOperator::kAntiJoin &&
+        expr.children.size() == 2) {
+      for (const std::string& rel : memo.Get(expr.children[1]).relations) {
+        out->insert(rel);
+      }
+    } else if (expr.operation == cascades::LogicalOperator::kSelection &&
+               expr.children.size() == 1) {
+      CollectAntiJoinRightRelations(memo, expr.children[0], out, visited);
+    }
+  }
+}
+
+// Lean proof: lean/TinylambOpt/Discovery.lean (outer_to_anti_join_aggressive)
+Expression FoldAntiJoinColumnsToNull(
+    const Expression& expr, const Schema& child_schema,
+    const std::unordered_set<std::string>& anti_right_rels,
+    const cascades::Memo& memo, const cascades::RuleContext& context,
+    bool* ok) {
+  if (!expr || !*ok) {
+    return expr;
+  }
+  if (expr->Type() == TypeTag::kColumnValue) {
+    const ColumnName& col = expr->AsColumnValue().GetColumnName();
+    if (col.name == "*" || child_schema.Offset(col) >= 0) {
+      return expr;
+    }
+    if (col.schema.empty() || !anti_right_rels.contains(col.schema)) {
+      if (child_schema.Offset(ColumnName("", col.name)) >= 0) {
+        return expr;
+      }
+      *ok = false;
+      return expr;
+    }
+    ValueType col_type = ValueType::kNull;
+    // col.schema may be a query alias (e.g. `t AS a`), not a catalog name.
+    // Resolve by scanning all known schemas for a matching column name.
+    const auto& memo_schemas = memo.GetTableSchemas();
+    for (const auto& [name, schema] : memo_schemas) {
+      const int off = schema.Offset(ColumnName("", col.name));
+      if (off >= 0) {
+        col_type = schema.GetColumn(static_cast<size_t>(off)).Type();
+        break;
+      }
+    }
+    if (col_type == ValueType::kNull) {
+      for (const auto& [name, table] : context.tables) {
+        if (!table) continue;
+        const Schema& schema = table->GetSchema();
+        const int off = schema.Offset(ColumnName("", col.name));
+        if (off >= 0) {
+          col_type = schema.GetColumn(static_cast<size_t>(off)).Type();
+          break;
+        }
+      }
+    }
+    const std::string type_name = SqlTypeNameForNullCast(col_type);
+    if (!type_name.empty()) {
+      return std::make_shared<CastExpression>(ConstantValueExp(Value()),
+                                              type_name);
+    }
+    return ConstantValueExp(Value());
+  }
+  if (expr->Type() == TypeTag::kAggregateExp) {
+    const auto& agg = expr->AsAggregateExpression();
+    if (!agg.Child() || agg.NeedsGroupContext() || agg.HasWhereFilter() ||
+        !agg.InnerGroupBy().empty()) {
+      for (const ColumnName& col : expr->TouchedColumns()) {
+        if (col.name != "*" && child_schema.Offset(col) < 0) {
+          *ok = false;
+          return expr;
+        }
+      }
+      return expr;
+    }
+    Expression folded_child = FoldAntiJoinColumnsToNull(
+        agg.Child(), child_schema, anti_right_rels, memo, context, ok);
+    if (!*ok || folded_child.get() == agg.Child().get()) {
+      return expr;
+    }
+    auto copy = std::make_shared<AggregateExpression>(
+        agg.GetType(), std::move(folded_child), agg.Distinct());
+    copy->SetIgnoreNulls(agg.IgnoreNulls());
+    copy->SetArrayElementSqlType(agg.ArrayElementSqlType());
+    return copy;
+  }
+  if (expr->Type() == TypeTag::kWindowFunctionExp ||
+      expr->Type() == TypeTag::kQueryExp) {
+    for (const ColumnName& col : expr->TouchedColumns()) {
+      if (col.name != "*" && child_schema.Offset(col) < 0) {
+        *ok = false;
+        return expr;
+      }
+    }
+    return expr;
+  }
+  const std::vector<Expression> children = ExpressionChildren(expr);
+  if (children.empty()) {
+    return expr;
+  }
+  bool changed = false;
+  std::vector<Expression> folded_children;
+  folded_children.reserve(children.size());
+  for (const Expression& child : children) {
+    Expression folded = FoldAntiJoinColumnsToNull(
+        child, child_schema, anti_right_rels, memo, context, ok);
+    if (!*ok) {
+      return expr;
+    }
+    if (folded.get() != child.get()) {
+      changed = true;
+    }
+    folded_children.push_back(std::move(folded));
+  }
+  return changed ? WithExpressionChildren(expr, std::move(folded_children))
+                 : expr;
+}
+
+}  // namespace
+
 const cascades::ImplementationRuleSet& DefaultImplementationRules() {
   using cascades::dsl::Any;
   using cascades::dsl::Join;
@@ -3744,7 +3926,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             Plan merged = children[0].plan;
             return std::vector<PlanAlternative>{
                 PlanAlternative{.plan = std::move(merged),
-                                .local_cost = children[0].cost,
+                                .local_cost = 0,
                                 .estimated_rows = children[0].estimated_rows}};
           }
           Plan selection = std::make_shared<SelectionPlan>(
@@ -3786,19 +3968,50 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         c::LogicalOperator::kSample));
     built.Add(c::ImplementationRule(
         "projection", cascades::dsl::Projection(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children, const PhysicalProperties&,
-           const c::RuleContext&) {
+           const c::RuleContext& context) {
           if (children.size() != 1) {
             return std::vector<PlanAlternative>{};
           }
+          const Schema& child_schema = children[0].plan->GetSchema();
+          bool needs_anti_null_fold = false;
           for (const auto& target : logical.target_list) {
             if (!target.expression) {
               return std::vector<PlanAlternative>{};
             }
             for (const auto& column : target.expression->TouchedColumns()) {
-              if (children[0].plan->GetSchema().Offset(column) < 0) {
+              if (child_schema.Offset(column) < 0) {
+                needs_anti_null_fold = true;
+              }
+            }
+          }
+          std::vector<NamedExpression> effective_targets = logical.target_list;
+          if (needs_anti_null_fold) {
+            std::unordered_set<std::string> anti_right_rels;
+            std::unordered_set<c::GroupId> visited;
+            if (!logical.children.empty()) {
+              CollectAntiJoinRightRelations(memo, logical.children[0],
+                                            &anti_right_rels, &visited);
+            }
+            if (anti_right_rels.empty()) {
+              return std::vector<PlanAlternative>{};
+            }
+            bool ok = true;
+            for (auto& target : effective_targets) {
+              if (target.name.empty() &&
+                  target.expression->Type() == TypeTag::kColumnValue) {
+                const ColumnName& col =
+                    target.expression->AsColumnValue().GetColumnName();
+                if (child_schema.Offset(col) < 0) {
+                  target.name = col.ToString();
+                }
+              }
+              target.expression = FoldAntiJoinColumnsToNull(
+                  target.expression, child_schema, anti_right_rels, memo,
+                  context, &ok);
+              if (!ok) {
                 return std::vector<PlanAlternative>{};
               }
             }
@@ -3864,7 +4077,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               for (const auto* selection : filters) {
                 collect(selection->Predicate());
               }
-              for (const auto& target : logical.target_list) {
+              for (const auto& target : effective_targets) {
                 collect(target.expression);
               }
               if (!needed.empty() &&
@@ -3886,7 +4099,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             }
           }
           Plan projection =
-              RemoveIdentityProjection(scan_input, logical.target_list);
+              RemoveIdentityProjection(scan_input, effective_targets);
           return std::vector<PlanAlternative>{
               PlanAlternative{.plan = std::move(projection),
                               .local_cost = children[0].estimated_rows,
@@ -3895,7 +4108,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
         c::LogicalOperator::kProjection));
     built.Add(c::ImplementationRule(
         "aggregation", cascades::dsl::Aggregation(),
-        [](c::GroupId, const c::Memo&, const c::Bindings&,
+        [](c::GroupId, const c::Memo& memo, const c::Bindings&,
            const c::LogicalExpression& logical,
            const std::vector<BestPlan>& children,
            const PhysicalProperties& required, const c::RuleContext& context) {
@@ -3903,12 +4116,72 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
           if (children.size() != 1 || required.require_row_position) {
             return std::vector<PlanAlternative>{};
           }
-          const double rows = children[0].estimated_rows;
-          const std::vector<Expression>& grouping_keys =
+          const Schema& child_schema = children[0].plan->GetSchema();
+          std::vector<Expression> effective_grouping_keys =
               logical.grouping_sets.empty() ? logical.partition_by
                                             : logical.grouping_sets;
+          std::vector<NamedExpression> effective_targets = logical.target_list;
+          bool needs_anti_null_fold = false;
+          for (const Expression& key : effective_grouping_keys) {
+            if (!key) {
+              continue;
+            }
+            for (const ColumnName& col : key->TouchedColumns()) {
+              if (col.name != "*" && child_schema.Offset(col) < 0) {
+                needs_anti_null_fold = true;
+              }
+            }
+          }
+          for (const NamedExpression& target : effective_targets) {
+            if (!target.expression) {
+              continue;
+            }
+            for (const ColumnName& col : target.expression->TouchedColumns()) {
+              if (col.name != "*" && child_schema.Offset(col) < 0) {
+                needs_anti_null_fold = true;
+              }
+            }
+          }
+          if (needs_anti_null_fold) {
+            std::unordered_set<std::string> anti_right_rels;
+            std::unordered_set<c::GroupId> visited;
+            if (!logical.children.empty()) {
+              CollectAntiJoinRightRelations(memo, logical.children[0],
+                                            &anti_right_rels, &visited);
+            }
+            if (!anti_right_rels.empty()) {
+              bool ok = true;
+              for (Expression& key : effective_grouping_keys) {
+                key = FoldAntiJoinColumnsToNull(
+                    key, child_schema, anti_right_rels, memo, context, &ok);
+                if (!ok) {
+                  return std::vector<PlanAlternative>{};
+                }
+              }
+              for (NamedExpression& target : effective_targets) {
+                if (target.name.empty() && target.expression &&
+                    target.expression->Type() == TypeTag::kColumnValue) {
+                  const ColumnName& col =
+                      target.expression->AsColumnValue().GetColumnName();
+                  if (child_schema.Offset(col) < 0 &&
+                      anti_right_rels.contains(col.schema)) {
+                    target.name = col.ToString();
+                  }
+                }
+                target.expression = FoldAntiJoinColumnsToNull(
+                    target.expression, child_schema, anti_right_rels, memo,
+                    context, &ok);
+                if (!ok) {
+                  return std::vector<PlanAlternative>{};
+                }
+              }
+            }
+          }
+          const double rows = children[0].estimated_rows;
+          const std::vector<Expression>& grouping_keys =
+              effective_grouping_keys;
           const bool has_aggregate =
-              std::ranges::any_of(logical.target_list, [](const auto& item) {
+              std::ranges::any_of(effective_targets, [](const auto& item) {
                 return ContainsAggregateExpression(item.expression);
               });
           if (!has_aggregate) {
@@ -3924,12 +4197,12 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
                     grouping_keys,
                     [&](const auto& key) {
                       return std::ranges::any_of(
-                          logical.target_list, [&](const auto& target) {
+                          effective_targets, [&](const auto& target) {
                             return same(key, target.expression);
                           });
                     }) ||
                 !std::ranges::all_of(
-                    logical.target_list, [&](const auto& target) {
+                    effective_targets, [&](const auto& target) {
                       return std::ranges::any_of(
                           grouping_keys, [&](const auto& key) {
                             return same(key, target.expression);
@@ -3938,7 +4211,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
               return std::vector<PlanAlternative>{};
             }
             Plan projection =
-                RemoveIdentityProjection(children[0].plan, logical.target_list);
+                RemoveIdentityProjection(children[0].plan, effective_targets);
             Plan distinct = std::make_shared<DistinctPlan>(projection);
             return std::vector<PlanAlternative>{PlanAlternative{
                 .plan = std::move(distinct),
@@ -3965,7 +4238,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             }
             payload.group_keys.emplace_back(name, key);
           }
-          payload.aggregates = logical.target_list;
+          payload.aggregates = effective_targets;
           // A HAVING on the aggregation node itself is a predicate over the
           // group's output row (keys then aggregates), which is the scope every
           // shape filters in. A HAVING that survived the rewrite as a
@@ -4226,6 +4499,7 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             ordering.push_back(key.expression);
           }
           if (!logical.with_ties &&
+              c::SatisfiesOrderingCollation(children[0].plan, required) &&
               children[0].plan->IsOrderedBy(ordering, logical.sort_ascending,
                                             logical.sort_nulls_first)) {
             Plan limit = std::make_shared<LimitPlan>(
@@ -4242,10 +4516,12 @@ const cascades::ImplementationRuleSet& DefaultImplementationRules() {
             for (size_t count = keys.size(); count > 1;) {
               --count;
               std::vector<Expression> prefix_expressions(
-                  ordering.begin(), ordering.begin() + count);
+                  ordering.begin(),
+                  ordering.begin() + static_cast<std::ptrdiff_t>(count));
               std::vector<bool> directions(
                   logical.sort_ascending.begin(),
-                  logical.sort_ascending.begin() + count);
+                  logical.sort_ascending.begin() +
+                      static_cast<std::ptrdiff_t>(count));
               std::vector<std::optional<bool>> nulls;
               nulls.reserve(count);
               for (size_t i = 0; i < count; ++i) {

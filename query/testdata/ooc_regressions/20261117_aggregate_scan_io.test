@@ -1,0 +1,11 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1301
+-- profile: pool=262144 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: check strag(t#) mismatch :: op 6 `check strag t2`: check strag(t2) mismatch: SELECT g, LENGTH(STRING_AGG(t, ',' ORDER BY k DESC)), SUBSTR(STRING_AGG(t, ',' ORDER BY k DESC), 1, 24), COUNT(t) FROM t2 GROUP BY g ORDER BY g |   expected 2 rows, engine returned 2 |   row 0: expected [0|496|dddd,ccc,bb,dddd,ccc,bb,|124] got [0|292|dddd,ccc,bb,dddd,ccc,bb,|73] |   row 1: expected [1|491|dddd,ccc,bb,dddd,ccc,bb,|123] got [1|290|bb,dddd,ccc,bb,dddd,ccc,|73]
+create t0 2 8 19 1 1 0
+create t2 2 221 794 7 1000000 0
+ins_bulk t2 1 411 301
+commit
+del t2 tag 1 0 1 0
+inject io 14
+check strag t2

@@ -1,6 +1,6 @@
 # Verify that uuid string satisfies the form:
 # xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx
-# where 'x' represents a lowercase hexidecimal digit.
+# where 'x' represents a lowercase hexadecimal digit.
 [name=regexp]
 SELECT
   REGEXP_CONTAINS(

@@ -36,9 +36,11 @@ namespace tinylamb::relational_detail {
 bool Truthy(const Value& value);
 int ThreeValuedEquals(const Value& left, const Value& right);
 StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope);
+Status ValidateExpressionColumnsInScope(const Expression& expression,
+                                        const Schema& schema,
+                                        const Scope* outer);
 
-// EXC-SHIM: remove with the boundary catch (see
-// no-exception-rule-migration.md).
+// Throwing wrapper retained for callers using the throwing API.
 inline Value Lookup(const ColumnName& name, const Scope& scope) {
   return ExcShimUnwrap(TryLookup(name, scope), "Lookup");
 }
@@ -46,8 +48,7 @@ bool Like(std::string_view value, std::string_view pattern);
 StatusOr<Value> TryBinary(BinaryOperation operation, const Value& left,
                           const Value& right);
 
-// EXC-SHIM: remove with the boundary catch (see
-// no-exception-rule-migration.md).
+// Throwing wrapper retained for callers using the throwing API.
 inline Value Binary(BinaryOperation operation, const Value& left,
                     const Value& right) {
   return ExcShimUnwrap(TryBinary(operation, left, right), "Binary");
@@ -158,10 +159,25 @@ struct AggregateAccumulator {
   // serial pass (parallel aggregation semantics); integer overflow and SUM
   // infinity still raise exactly like Add.
   Status Merge(const AggregateAccumulator& other);
+  // Serializes/merges partial state for OOC partitioned aggregation (only true
+  // for non-DISTINCT scalar/associative aggregates without buffered clauses).
+  [[nodiscard]] bool CanSerializePartial() const noexcept;
+  [[nodiscard]] Status SerializePartialState(std::string* dst) const;
+  [[nodiscard]] Status MergeSerializedPartialState(std::string_view* src);
+  // Overload used by OOC sinks that already computed the per-aggregate Shape
+  // once: avoids re-running AnalyzeShape (string scans) on every partial-state
+  // merge.
+  [[nodiscard]] Status MergeSerializedPartialState(std::string_view* src,
+                                                   const Shape& shape);
   // Total distinct int64/date values tracked (inline array + overflow set).
   [[nodiscard]] size_t DistinctIntCount() const;
   // Inserts one int64/date distinct value; false when it was already present.
   bool InsertDistinctInt(int64_t raw);
+  // Total distinct non-integer values tracked (inline array + overflow set).
+  [[nodiscard]] size_t DistinctValueCount() const;
+  // Inserts one canonicalized non-integer distinct value
+  // (CanonicalDistinctValue already applied); false when already present.
+  bool InsertDistinctValue(Value canonical);
   // Full-input accumulation: buffers rows for aggregates that need whole-group
   // context (HAVING modifier, inner ORDER BY/LIMIT, ARRAY_AGG, STRING_AGG).
   Status Add(AggregateInput input);
@@ -199,6 +215,14 @@ struct AggregateAccumulator {
   std::unique_ptr<std::unordered_set<int64_t>> distinct_ints;
   size_t inline_distinct_int_count{0};
   std::array<int64_t, kInlineDistinctIntCapacity> inline_distinct_ints{};
+  // Non-integer DISTINCT values follow the same inline-then-promote shape:
+  // most groups hold only a few distinct values, so a small inline array is
+  // scanned linearly and only overflow allocates `distinct`.  Entries are
+  // CanonicalDistinctValue output; the array is empty whenever `distinct`
+  // is allocated (promotion drains it).
+  static constexpr size_t kInlineDistinctValueCapacity = 4;
+  size_t inline_distinct_value_count{0};
+  std::array<Value, kInlineDistinctValueCapacity> inline_distinct_values{};
 
  private:
   struct BufferedRow {
@@ -283,19 +307,19 @@ struct AggregateAccumulator {
   Status TryApplyCore(const Value& value,
                       const std::vector<Value>& trailing_values = {},
                       const std::vector<Value>& order_keys = {});
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   void ApplyCore(const Value& value, const std::vector<Value>& trailing = {},
                  const std::vector<Value>& order = {}) {
     ExcShimCheck("ApplyCore", TryApplyCore(value, trailing, order));
   }
 
   Status TryRecordQuantileParam(const std::vector<Value>& trailing_values);
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   void RecordQuantileParam(const std::vector<Value>& t) {
     ExcShimCheck("RecordQuantileParam", TryRecordQuantileParam(t));
   }
   Status TryRecordLimitParam(const std::vector<Value>& trailing_values);
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   void RecordLimitParam(const std::vector<Value>& t) {
     ExcShimCheck("RecordLimitParam", TryRecordLimitParam(t));
   }
@@ -304,7 +328,7 @@ struct AggregateAccumulator {
   Status SketchAdd(const Value& value,
                    const std::vector<Value>& trailing_values);
   Status TrySketchMerge(const Value& sketch_bytes);
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   void SketchMerge(const Value& sketch_bytes) {
     ExcShimCheck("SketchMerge", TrySketchMerge(sketch_bytes));
   }
@@ -312,7 +336,7 @@ struct AggregateAccumulator {
   // the merged sketch bytes instead.
   Value FinishSketch(bool extract_count) const;
   Status TryElementwiseApply(const Value& array);
-  // EXC-SHIM (see no-exception-rule-migration.md).
+  // Throwing wrapper retained for callers using the throwing API.
   void ElementwiseApply(const Value& array) {
     ExcShimCheck("ElementwiseApply", TryElementwiseApply(array));
   }
@@ -340,8 +364,7 @@ StatusOr<Value> TryEvaluate(const Expression& expression, const Scope& scope,
                             const AggregateResultMap* aggregates,
                             TransactionContext& context, const CteMap& ctes);
 
-// EXC-SHIM: remove with the boundary catch (see
-// no-exception-rule-migration.md).
+// Throwing wrapper retained for callers using the throwing API.
 inline Value Evaluate(const Expression& expression, const Scope& scope,
                       const AggregateResultMap* aggregates,
                       TransactionContext& context, const CteMap& ctes) {
@@ -350,6 +373,9 @@ inline Value Evaluate(const Expression& expression, const Scope& scope,
 }
 
 Schema QualifySchema(const Schema& schema, std::string_view qualifier);
+
+void CollectExpressionColumns(const Expression& expression,
+                              std::unordered_set<ColumnName>* columns);
 
 void CollectStatementColumns(const SelectStatement& statement,
                              std::unordered_set<ColumnName>* columns);

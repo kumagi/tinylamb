@@ -8,8 +8,10 @@
 #include "common/constants.hpp"
 #include "common/join_kind.hpp"
 #include "executor/constant_executor.hpp"
+#include "executor/detail/relation.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/parallel_merge_join.hpp"
+#include "executor/spill_file.hpp"
 #include "expression/expression.hpp"
 #include "gtest/gtest.h"
 #include "page/row_position.hpp"
@@ -119,6 +121,32 @@ TEST(ParallelMergeJoinExtraTest, DuplicateKeysAtDifferentOffsets) {
     EXPECT_EQ(actual, expected);
     EXPECT_EQ(join.Partitions().size(), workers);
   }
+}
+
+// A repeated spill must append the new generation, not promote it to the head:
+// ForEachRow() reads `spill -> extra_spills -> spill_tail_` from oldest to
+// newest. Promoting the head reverses the row order on the second spill.
+TEST(RelationSpillOrderExtraTest, RepeatedSpillKeepsGenerationOrder) {
+  auto spill_of = [](int64_t value) {
+    auto file = std::make_shared<SpillFile>();
+    EXPECT_EQ(file->Append(Row({Value(value)})), Status::kSuccess);
+    EXPECT_EQ(file->FinishWriting(), Status::kSuccess);
+    return file;
+  };
+  relational_detail::Relation relation;
+  relation.spill = spill_of(1);                       // oldest generation
+  relation.extra_spills.push_back(spill_of(2));        // next generation
+  relation.rows.push_back(Row({Value(int64_t{3})}));   // new in-memory generation
+
+  relation.EnsureSpill();
+
+  std::vector<int64_t> actual;
+  EXPECT_EQ(relation.ForEachRow([&](const Row& row) {
+              actual.push_back(row[0].value.int_value);
+              return Status::kSuccess;
+            }),
+            Status::kSuccess);
+  EXPECT_EQ(actual, std::vector<int64_t>({1, 2, 3}));
 }
 
 }  // namespace

@@ -108,5 +108,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.JoinPredicateTransitivity`: `t1.a = t2.b` および `t2.b = t3.c` を持つ結合式から、親グループ内に `t1.a = t3.c` を含む代替式が生成されることを検証。

@@ -1513,7 +1513,7 @@ ARRAY<STRUCT<DOUBLE>>[{-1}]
 ==
 
 # Repro b/267896406: When COVAR_* works with either a fixed X or Y, the returned
-# value should be 0, instead of indeterministically generate overflow depending
+# value should be 0, instead of indeterminately generating overflow depending
 # on the other value.
 [name=covar_samp_double_max_non_overflow]
 SELECT COVAR_SAMP(x, CAST('1.7317579696886923e+308' AS DOUBLE))
@@ -1530,7 +1530,7 @@ ARRAY<STRUCT<DOUBLE>>[{0}]
 ==
 
 # Repro b/268264381: When CORR works with either a fixed X or Y, the returned
-# value should be NAN, instead of indeterministically generate overflow depending
+# value should be NAN, instead of indeterminately generating overflow depending
 # on the other value.
 [name=corr_double_max_non_overflow]
 SELECT CORR(x, CAST('1.7317579696886923e+308' AS DOUBLE))

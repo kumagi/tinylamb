@@ -91,7 +91,7 @@ ARRAY<STRUCT<id INT64>>[]
 [name=unordered_limit_stops_scan_early]
 SELECT id FROM opt_probe LIMIT 2
 --
-ARRAY<STRUCT<id INT64>>[{1}, {2}]
+ARRAY<STRUCT<id INT64>>[unknown order:{1}, {2}]
 ==
 
 [mode=explain_analyze]

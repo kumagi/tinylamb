@@ -222,6 +222,10 @@ struct OracleIterationStats {
   bool unnest_ran{false};
   bool guard_ran{false};
   bool xmode_ran{false};
+  // Set when the iteration ran no query at all because the harness database
+  // could not be created (ScopedDb quota exhaustion). Kept separate so a
+  // skipped iteration never reports its families as "ran".
+  bool skipped{false};
 };
 
 // QPG-flavoured plan feedback: remembers EXPLAIN fingerprints and rewards
@@ -255,8 +259,17 @@ std::string RunOracleIteration(std::mt19937& rng, bool verbose,
                                OracleSession* session = nullptr);
 
 // Replays a trace on a fresh throwaway database and returns "" when all
-// recorded oracles hold, or the mismatch diagnostic.
-std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose = false);
+// recorded oracles hold, or the mismatch diagnostic.  `skipped`, when
+// non-null, is set when no query ran because the database could not be
+// created; the report is "" there, so callers that report families as "ran"
+// must consult it first.  When `surface_skips` is true (the replay-guard
+// default), a recorded arm whose statements fail to execute is reported as
+// a skip instead of being discarded — a truncated or tampered committed
+// file must not pass vacuously.  The generation path passes false: its
+// probes legitimately skip without being mismatches.
+std::string ReplayOracleTrace(const OracleTrace& trace, bool verbose = false,
+                              bool* skipped = nullptr,
+                              bool surface_skips = true);
 
 // Self-contained text format ("-- key: value" lines; one SQL per line).
 std::string SerializeOracleTest(uint64_t seed, const OracleTrace& trace,

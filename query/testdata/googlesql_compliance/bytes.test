@@ -347,7 +347,7 @@ SELECT REGEXP_INSTR(b"abcabc", b"a(b)c", 2, 1, 1),
        REGEXP_INSTR(b"-2020-jack-class1", b"", 2),
        REGEXP_INSTR(b"abcdef", b"ac.*e.")
 --
-ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{6, 9, 0, 0}]
+ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{7, 9, 0, 0}]
 ==
 
 [name=function_regexp_extract_all]

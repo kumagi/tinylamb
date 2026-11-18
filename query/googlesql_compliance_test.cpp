@@ -70,7 +70,7 @@ std::vector<Row> Drain(SqlEngine& engine, TransactionContext& context,
   }
   // Executors surface query errors as a sticky status (Next returns false
   // at EOF and on failure); inspect it after the drain to tell the two
-  // apart (no-exception-rule-migration.md Phase 6).
+  // apart.
   if (const Status st = prepared.Value()->GetStatus(); st != Status::kSuccess) {
     *status = Status::kUnknown;
     if (error_msg != nullptr) {
@@ -342,6 +342,43 @@ ARRAY<STRUCT<INT64>>[unknown order:{2}, {1}]
   EXPECT_TRUE(cases[2].prepare_database);
   EXPECT_TRUE(cases[3].unknown_order);
   ASSERT_EQ(cases[3].expected_rows.size(), 2U);
+}
+
+// P846: the `[unknown_order]` option line was absorbed by
+// kIgnoredOptionKeys without setting the flag, so the harness compared
+// strict row order against order-unspecified expectations.
+TEST(GoogleSqlComplianceFile, UnknownOrderOptionLineSetsFlag) {
+  constexpr std::string_view kFile = R"test(
+[unknown_order]
+[name=opt]
+SELECT id FROM t
+--
+ARRAY<STRUCT<id INT64>>[{2}, {1}]
+==
+[unknown_order=false]
+[name=opt_off]
+SELECT id FROM t
+--
+ARRAY<STRUCT<id INT64>>[{1}, {2}]
+==
+[mode=explain]
+[unknown_order]
+[name=opt_keep]
+SELECT id FROM t
+--
+ARRAY<STRUCT<id INT64>>[{2}, {1}]
+==
+)test";
+  const std::vector<GoogleSqlComplianceCase> cases =
+      ParseGoogleSqlComplianceFile("unknown_order.test", kFile);
+  ASSERT_EQ(cases.size(), 3U);
+  EXPECT_TRUE(cases[0].unknown_order);
+  EXPECT_FALSE(cases[1].unknown_order);
+  EXPECT_TRUE(cases[2].unknown_order);
+  // Consumed as options: none of the lines leaks into the statement text.
+  EXPECT_EQ(cases[0].sql, "SELECT id FROM t");
+  EXPECT_EQ(cases[1].sql, "SELECT id FROM t");
+  EXPECT_EQ(cases[2].sql, "SELECT id FROM t");
 }
 
 TEST(GoogleSqlComplianceFile, AuditNestedArrayScalarKeepsInnerBrackets) {

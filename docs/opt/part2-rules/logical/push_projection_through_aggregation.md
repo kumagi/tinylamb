@@ -129,6 +129,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part*.cpp` の
   `PushProjectionThroughAggregationMovesProjectionBelow` — 射影が集約の下へ
   移動した等価式が生まれることを検査します。

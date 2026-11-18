@@ -258,6 +258,14 @@ std::string ReplayExprOracleTrace(const ExprOracleTrace& trace, bool verbose) {
   // oracles and compare against the recorded outcome.
   std::mt19937 rng2(seed32);
   std::string report = RunExprOracleIteration(rng2, verbose, &fresh);
+  if (trace.engine_ran && !fresh.engine_ran) {
+    // The recorded run executed the engine; the replay did not (missing
+    // parser binary, resource pressure, unexpected result shape). Passing
+    // that off as an empty report would mistake "the engine stopped running
+    // SQL" for a fixed bug, so fail the replay instead.
+    return "engine did not run on replay (recorded engine_ran=true; sql: " +
+           trace.sql + ")" + (report.empty() ? "" : "\n" + report);
+  }
   if (report.empty()) {
     return "";
   }
@@ -956,9 +964,24 @@ std::string RunRowExprOracleIteration(std::mt19937& rng, bool verbose,
     }
     std::shared_ptr<Table> tbl = tbl_or.MoveValue();
     for (const Row& r : rows) {
-      (void)tbl->Insert(ctx.txn_, r);
+      // A failed insert would leave the engine table shorter than the mirror
+      // `rows` vector and produce a false differential mismatch.
+      const Status insert_st = tbl->Insert(ctx.txn_, r).GetStatus();
+      if (insert_st != Status::kSuccess) {
+        if (verbose) {
+          std::cerr << "[row_expr_fuzz][skip] insert failed: "
+                    << insert_st.GetMessage() << "\n";
+        }
+        return "";
+      }
     }
-    (void)ctx.PreCommit();
+    if (const Status pre = ctx.PreCommit(); pre != Status::kSuccess) {
+      if (verbose) {
+        std::cerr << "[row_expr_fuzz][skip] PreCommit failed: "
+                  << pre.GetMessage() << "\n";
+      }
+      return "";
+    }
   }
 
   TransactionContext read_ctx = db.BeginReadOnlyContext();

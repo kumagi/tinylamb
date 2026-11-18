@@ -107,7 +107,7 @@ NULL安全等値比較（`IS NOT DISTINCT FROM`）への対応は、SQL標準に
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.HashJoinPreferredOverCrossProductForEquiJoin`: 等値結合においてハッシュ結合が直積結合よりも低いコストで採択されることを検証。
   - `OptimizerTest.CascadesSemiAndAntiJoinImplementationsUseHashJoinKind`: セミ結合およびアンチ結合がハッシュ経路において適切な結合種別とプローブ側スキーマを持つことを検証。
   - `HashJoinKindTest.*`: NULL安全等値比較やセミ結合におけるタプルの重複排除など、実行時意味論の正確性を検証。

@@ -3,7 +3,7 @@
 #define TINYLAMB_QUERY_EVALUATION_CONTEXT_IMPL_HPP
 
 // Production implementation of expression/evaluation_context.hpp
-// (improvement3.md A1 / S3).  RelationalEvaluationContext is the transient
+// (the design contract A1 / S3).  RelationalEvaluationContext is the transient
 // adapter that binds the relational execution state of one statement --
 // TransactionContext, the outer Scope chain, inherited CTEs and prepared
 // aggregates -- to the abstract EvaluationContext interface.  Expression

@@ -82,5 +82,5 @@ $$\delta(\delta(X)) \equiv \delta(X)$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.DistinctOverDistinctElimination`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.DistinctOverDistinctElimination`
   - `Distinct(Distinct(scan))` の探索において、外側 Group に scan を直接の子とする `Distinct` 等価式が生成されることを検証。

@@ -96,15 +96,15 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.OuterJoinRuleAddsMergeJoinAlternative`: 本 Rule が外部結合に対してマージ結合代替を追加することを検証。
   - `OptimizerTest.OuterHashResidualPadsWhenAllKeyMatchesFail`: key 一致候補が全て残余述語 FALSE でも hash outer join が preserved row を pad することを検証。
-- `executor/executor_feature_test.cpp`:
+- `executor/executor_feature_test_part1.cpp`:
   - `HashJoinOuterTest.NonRejectingResidualPadsEveryOuterKind`: LEFT/RIGHT/FULL、NULL key、重複 key、空入力、残余 NULL/ERROR を検証。
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part3.cpp`:
   - `CascadesTest.OuterNestedLoopPlansNonEquiLeftJoin`: 非等値 LEFT 結合において `outer_hash_join` が除外され、正しくネステッドループが選択される責務分担を検証。
 - `plan/plan_test.cpp`:
   - `PlanTest.ProductOuterJoinPreservesBothSchemasAndOuterCardinalityBound`: LEFT/RIGHT/FULL の `ProductPlan` が双方のスキーマおよびカーディナリティ下限を維持することを確認。
-- `executor/executor_test.cpp`:
+- `executor/executor_test_part2.cpp`:
   - `ExecutorTest.RelationalRightOuterJoinSpillMatchesUnbudgeted` / `ExecutorTest.RelationalFullOuterJoinSpillMatchesUnbudgeted`: ハイブリッドハッシュ外部結合のスピル実行時の意味論的正確性を検証。
 

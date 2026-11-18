@@ -132,6 +132,23 @@ Status TopNExecutor::Materialize() {
   bool folded = false;
   if (direct_columns.size() == keys_.size()) {
     auto scan = std::dynamic_pointer_cast<ParallelScan>(source_);
+    if (scan && scan->OutputColumnCount() != schema_.ColumnCount()) {
+      scan.reset();
+    }
+    if (scan) {
+      std::vector<slot_t> required;
+      required.reserve(direct_columns.size());
+      for (size_t column : direct_columns) {
+        required.push_back(scan->TableColumnSlot(column));
+      }
+      auto prepared = scan->PrepareLSTableColumns(required);
+      if (!prepared.HasValue()) {
+        return prepared.GetStatus();
+      }
+      if (!prepared.Value()) {
+        scan.reset();
+      }
+    }
     const auto* store = scan ? scan->GetLSTableStore() : nullptr;
     if (store != nullptr &&
         scan->OutputColumnCount() == schema_.ColumnCount()) {
@@ -140,6 +157,13 @@ Status TopNExecutor::Materialize() {
         size_t row{0};
         size_t sequence{0};
       };
+      // Column-store blocks expose raw cells, and a stored VARCHAR never
+      // carries a value-level COLLATE tag (Value::Serialize keeps a tag only
+      // inside an array), so these Values compare exactly like the tag-free
+      // values the chunk path hands the non-fused branches below. That is why
+      // the comparisons here may read the key's static collation alone:
+      // SortKeyOrder::Compare resolves the operands' own tags on top of it,
+      // and for an untagged pair that resolution is the key collation itself.
       const auto value_at = [](const LSTableColumnBlock& column, size_t row) {
         if (column.IsNull(row)) {
           return Value();
@@ -163,9 +187,22 @@ Status TopNExecutor::Materialize() {
           int comparison = 0;
           if (l.type == ValueType::kVarChar && !l.IsNull(left.row) &&
               !r.IsNull(right.row)) {
-            comparison = CompareVarCharForOrderBy(
-                l.VarcharAt(left.row), r.VarcharAt(right.row),
-                orders[k].KeyCollation() == Collation::kCaseInsensitive);
+            if (l.dict && l.dict == r.dict &&
+                l.dict->codes_follow_string_order &&
+                orders[k].KeyCollation() != Collation::kCaseInsensitive) {
+              // codes_follow_string_order is proven against
+              // CompareVarCharForOrderBy(..., case_insensitive=false), and no
+              // stored VARCHAR can carry a tag that would fold the comparison,
+              // so code order *is* the canonical ORDER BY order here. The fold
+              // arm below is the only place a collation changes byte order.
+              const auto a = l.DictionaryCodeAt(left.row);
+              const auto b = r.DictionaryCodeAt(right.row);
+              comparison = a < b ? -1 : (b < a ? 1 : 0);
+            } else {
+              comparison = CompareVarCharForOrderBy(
+                  l.VarcharAt(left.row), r.VarcharAt(right.row),
+                  orders[k].KeyCollation() == Collation::kCaseInsensitive);
+            }
             if (!orders[k].Ascending()) {
               comparison = -comparison;
             }
@@ -202,8 +239,9 @@ Status TopNExecutor::Materialize() {
         }
         std::vector<size_t> counts(workers, 0);
         auto fold = scan->TryFoldLSTableBlocks(
-            workers, [&](size_t w, const LSTablePageBlock& block,
-                         const uint32_t* selected, size_t count) {
+            workers,
+            [&](size_t w, const LSTablePageBlock& block,
+                const uint32_t* selected, size_t count) {
               auto& local = partials[w];
               counts[w] += count;
               const size_t prefix =
@@ -220,6 +258,52 @@ Status TopNExecutor::Materialize() {
                 }
               }
               return Status::kSuccess;
+            },
+            nullptr,
+            [&](size_t w, const LSTablePageBlock& block) {
+              const auto& local = partials[w];
+              if (local.size() < capacity || keys_.empty()) {
+                return true;
+              }
+              const auto slot = scan->TableColumnSlot(direct_columns.front());
+              const auto& column = block.columns[slot];
+              // A NULL might precede the current boundary; leave these blocks
+              // to the normal comparator. Equality also stays for later keys
+              // and stable encounter-order ties.
+              if (column.has_null) {
+                return true;
+              }
+              const auto& boundary = local.top();
+              Value best;
+              if (column.type == ValueType::kVarChar) {
+                // A code bound is a bound under the canonical order only when
+                // the codes follow CompareVarCharForOrderBy(..., false) and the
+                // key does not fold; both are checked here, and stored strings
+                // carry no tag of their own that could resurrect the fold. The
+                // comparison below then runs in the very order the bound was
+                // taken in, so a skipped block cannot hold a winner.
+                if (!column.dict || !column.dict->codes_follow_string_order ||
+                    !column.has_code_min_max ||
+                    orders.front().KeyCollation() ==
+                        Collation::kCaseInsensitive) {
+                  return true;
+                }
+                const auto code = orders.front().Ascending() ? column.min_code
+                                                             : column.max_code;
+                best.type = ValueType::kVarChar;
+                best.value.varchar_value = column.dict->StringEntryAt(code);
+              } else if ((column.type == ValueType::kInt64 ||
+                          column.type == ValueType::kDate) &&
+                         !column.is_unsigned && column.has_min_max) {
+                best = Value(orders.front().Ascending() ? column.min_int
+                                                        : column.max_int);
+                best.type = column.type;
+              } else {
+                return true;
+              }
+              return orders.front().Compare(
+                         best, value_at(boundary.block->columns[slot],
+                                        boundary.row)) <= 0;
             });
         if (!fold.HasValue()) {
           return fold.GetStatus();
@@ -249,11 +333,21 @@ Status TopNExecutor::Materialize() {
             Candidate candidate;
             candidate.sequence = selected.sequence;
             candidate.position = RowPosition(
-                selected.block->page_id, selected.block->slots[selected.row]);
+                selected.block->page_id, selected.block->SlotAt(selected.row));
+            bool cached_payload = true;
             for (size_t c = 0; c < schema_.ColumnCount(); ++c) {
-              candidate.row.values_.push_back(
-                  value_at(selected.block->columns[scan->TableColumnSlot(c)],
-                           selected.row));
+              cached_payload &= store->HasColumn(scan->TableColumnSlot(c));
+            }
+            if (cached_payload) {
+              for (size_t c = 0; c < schema_.ColumnCount(); ++c) {
+                candidate.row.values_.push_back(
+                    value_at(selected.block->columns[scan->TableColumnSlot(c)],
+                             selected.row));
+              }
+            } else {
+              ASSIGN_OR_RETURN(Row, row,
+                               scan->ReadFoldedRow(candidate.position));
+              candidate.row = std::move(row);
             }
             for (size_t c : direct_columns) {
               candidate.keys.push_back(candidate.row[c]);

@@ -213,5 +213,35 @@ TEST_F(FragmentAuditTest, GroupAggregateHonorsAccessMultiplierAndGeneration) {
   EXPECT_TRUE(result.Value().groups.empty());
 }
 
+TEST_F(FragmentAuditTest, GroupSumSkipsNullSummandsOnEveryArtifactKind) {
+  // rows_ has v NULL for id 1: the single-chunk artifact goes through the
+  // GroupBySumColumns kernel while the run/mem artifacts take the generic
+  // AccumulateRow path -- both must agree that the id=1 group exists with
+  // count == 0 (the "SUM is NULL" contract) instead of counting the row.
+  for (const auto& artifact : Artifacts()) {
+    Fragment fragment;
+    fragment.group_cols = {0};
+    fragment.aggregate =
+        Aggregate{.kind = AggregateKind::kSum, .col = 1, .terms = {}};
+    auto result = Execute(Runtime::kNative, {artifact}, fragment, schema_);
+    ASSERT_TRUE(result.HasValue());
+    const std::vector<GroupOutput>& groups = result.Value().groups;
+    ASSERT_EQ(groups.size(), 4U);
+    for (const GroupOutput& group : groups) {
+      ASSERT_EQ(group.key.size(), 1U);
+      if (group.key[0] == 1) {
+        EXPECT_EQ(group.count, 0U) << "a NULL summand still forms the group";
+        EXPECT_EQ(group.sum, 0);
+      } else if (group.key[0] == 2) {
+        EXPECT_EQ(group.count, 1U);
+        EXPECT_EQ(group.sum, 0);
+      } else {
+        EXPECT_EQ(group.count, 1U);
+        EXPECT_EQ(group.sum, 5);
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace tinylamb

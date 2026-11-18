@@ -50,9 +50,10 @@ PaxChunk BuildForced(const Schema& sc, const SchemeCase& c, bool* ok) {
   const int first = slot >= 0 ? slot : 0;
   for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
     setenv("TINYLAMB_FORCE_SCHEME", c.name, 1);
-    PaxChunk chunk = PaxChunk::BuildFromSortedRun(
-                         MakeRun(MakeStorageRows(c.shapes[s]), sc), sc)
-                         .MoveValue();
+    PaxChunk chunk =
+        PaxChunk::BuildFromSortedRun(
+            MakeRun(MakeStorageRows(c.shapes[static_cast<size_t>(s)]), sc), sc)
+            .MoveValue();
     unsetenv("TINYLAMB_FORCE_SCHEME");
     const auto& enc = chunk.GetFooter().encodings;
     if (!enc.empty() && enc[c.col] == static_cast<uint8_t>(c.expected)) {
@@ -139,15 +140,18 @@ int FuzzRegionSchemeOneInput(const uint8_t* data, size_t size) {
                           (static_cast<uint32_t>(data[p + 3]) << 24);
     p += 4;
     size_t site = 0;
-    if ((roll & 3) == 3 && have_other) {
-      site = ob + ((roll >> 2) % (oe - ob));
-    } else if ((roll & 0x1F) == 0x1F) {
+    // Test the footer/header branch first: `(&0x1F)==0x1F` implies
+    // `(&3)==3`, so the old ordering stole every footer case into the
+    // other-column branch and left the structural walk unfuzzed.
+    if ((roll & 0x1F) == 0x1F) {
       size_t fo = 0;
       size_t fs = 0;
       if (!WireLayout(bytes, &fo, &fs)) {
         break;
       }
       site = (roll >> 5) % (fo > 0 ? fo : 1);
+    } else if ((roll & 3) == 3 && have_other) {
+      site = ob + ((roll >> 2) % (oe - ob));
     } else if (have_target) {
       site = tb + ((roll >> 2) % (te - tb));
     } else {

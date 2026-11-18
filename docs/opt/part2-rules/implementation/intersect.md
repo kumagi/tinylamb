@@ -79,7 +79,7 @@ return std::vector<PlanAlternative>{
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `CascadesTest.SetOperationValidatesArityRelationsAndDropsProperties`: 集合演算の子ノード数検証およびプロパティ伝播抑制を検証します。
   - `CascadesTest.IntersectWithEmptyBranchBecomesEmpty`: 入力の一方が空である場合の論理簡約を検証します。
   - `CascadesTest.IntersectToSemiJoinRewrite`: INTERSECT から SemiJoin への論理変換を検証します。

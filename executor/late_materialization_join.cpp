@@ -178,7 +178,9 @@ bool LateMaterializationJoin::Validate() {
 
 StatusOr<Row> LateMaterializationJoin::ExtractLeftKey(
     const Row& left_row) const {
-  if (left_columns_.empty()) return Status::kInvalidArgument;
+  if (left_columns_.empty()) {
+    return Status::kInvalidArgument;
+  }
   return left_row.TryExtract(left_columns_);
 }
 
@@ -250,7 +252,9 @@ bool LateMaterializationJoin::KeyMatches(const Row& left_key,
 
 bool LateMaterializationJoin::LoadEquiCandidates(const Row& left_row) {
   const auto extracted = ExtractLeftKey(left_row);
-  if (!extracted.HasValue()) return FailWith(extracted.GetStatus());
+  if (!extracted.HasValue()) {
+    return FailWith(extracted.GetStatus());
+  }
   const Row& left_key = extracted.Value();
   for (const Value& value : left_key.values_) {
     if (IsUnmatchable(value)) {

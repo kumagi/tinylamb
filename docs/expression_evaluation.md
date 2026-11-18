@@ -36,9 +36,14 @@ value. NULL never jumps (three-valued logic evaluates the right operand
 through `EvaluateBinary`). Consequently `FALSE AND rhs` and `TRUE OR rhs`
 never evaluate `rhs`, so a division-by-zero or other error in `rhs` is
 suppressed on exactly the rows the AST suppresses it on. The VM runs under a
-program counter (previously a range-for) to support these jumps. The JIT
-kernels do not compile AND/OR (they are comparison/projection/sum only), so
-the short-circuit path never reaches the JIT. Coverage lives in
+program counter (previously a range-for) to support these jumps. The JIT kernels (`CompileFilter`, `CompileProjection`, `CompileSum`, plus
+overflow-checked `CompileProjectionChecked` and `CompileSumChecked`) do not
+compile AND/OR (they are comparison/projection/sum only), so the short-circuit
+path never reaches the JIT; checked variants flag integer wraps via output
+booleans so callers raise the same overflow error as AST without C++ throws.
+Diagnostic env vars `TINYLAMB_JIT_DISABLE_OPT` and `TINYLAMB_JIT_DUMP_DIR`
+control LLVM O3 middle-end optimization and IR/object dumps (see
+`docs/jit_profile.md` and `docs/environment_variables.md`). Coverage lives in
 `differential_test.cpp` (`Evaluate_LogicalShortCircuitErrors_MatchAcrossPaths`)
 and `bytecode_test.cpp` (`D7_*`).
 
@@ -57,6 +62,21 @@ before — such shapes stay on the AST evaluator). The fast interpreter supports
 null-check/truthiness unary family (IS [NOT] NULL, IS [NOT] TRUE/FALSE) is
 type-agnostic on both legs and compiles for any operand type. Coverage:
 `bytecode_test.cpp` (`SearchedCase_*`) and `differential_test.cpp`.
+
+### IN lists (kDup / operand-carrying kPop)
+
+`x IN (a, b, ...)` evaluates the child **exactly once**, matching
+`InExpression::TryMembership`: the child value stays under a running
+three-valued OR accumulator and every candidate compares against a `kDup`
+copy of it (the earlier OR-of-equalities expansion re-evaluated the child
+per candidate, diverging on volatile or erroring children and in emitted
+program size). Per item: `JumpIfTrue -> TAIL; Dup(1); <item_i>; Eq_i; Or`,
+with all `JumpIfTrue`s landing on the shared `TAIL: Pop(1)` that drops the
+child under the final result — a truthy equality skips later candidates and
+their errors exactly like the AST's early return. `kPop` takes the depth of
+the element to drop (0 = top, its historical behaviour); `kDup` pushes a
+copy of the element at that depth. Coverage: `bytecode_test.cpp`
+(`InList_*`) and `differential_test.cpp`.
 
 **Bytecode is the authoritative description of what a batch kernel may assume**
 about an expression (column slots, constants, operators, result type).

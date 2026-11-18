@@ -75,7 +75,7 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 
 ## 5. ベクトル式評価
 
-`VectorizedExpression` は式木を列演算へ写像する。列参照は既存ベクトルを読み、定数は同じ値を必要な長さだけ論理的に供給し、算術・比較・論理演算は対応する位置を一括処理する。主な入口は次の三つである。
+式木は Bytecode/AST 評価器で列演算へ写像される。列参照は既存ベクトルを読み、定数は同じ値を必要な長さだけ論理的に供給し、算術・比較・論理演算は対応する位置を一括処理する。主な入口は次の三つである。
 
 1. 値式を評価し、結果の `ColumnVector` を返す。
 2. 述語を評価し、`ValidityBitmap` を返す。
@@ -119,13 +119,13 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 - 保持した行数
 - 推定保持バイト数
 
-これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`IncrementalSortExecutor`、`HashJoin`、`ParallelHashJoin`、`BatchNestedLoopJoin`、`ParallelMergeJoin` などが該当する。
+これにより、実行制御側はパイプライン境界を列挙し、事前実体化、メモリ見積もり、診断表示を行える。`SortExecutor`、`IncrementalSortExecutor`、`HashJoin`、`SharedBuildParallelHashJoin`、`BatchNestedLoopJoin`、`ParallelMergeJoin` などが該当する。
 
-## 7. 問い合わせ作業メモリ
+## 7. 問い合わせ作業メモリとプロセス予算
 
-`QueryMemoryBudget` は、プロセス内で一つの問い合わせに使う作業メモリの合計を追跡する。既定上限は 8 GiB であり、その 80% を軟限界とする。軟限界に達すると新しい予約を拒否し、演算子にスピルまたは低メモリ方式への切り替えを促す。上限が 0 の場合は無制限として扱う。
+既定のパイプライン／OOC 実行では `ProcessMemoryBudget`（`common/memory_budget.hpp`：`kStorage`/`kColumnar`/`kQuery`/`kTx` プール）と `QueryMemoryCoordinator` / `QueryMemoryGrant`（`common/query_grant.hpp`）がクエリごとの入場制御（$G_q$）と演算子予算配分（$B_{op}$、メモリ不足時の `ReclaimStage` 回収および `kMemoryLimitExceeded` 返却）を担う（[ADR 0003](../adr/0003-memory-budget-thresholds.md)、[ADR 0004](../adr/0004-query-memory-grants.md)）。
 
-行の概算サイズは、固定長値、文字列の内容、配列要素などを合計して求める。メモリアロケータが実際に確保した量とは一致しないが、すべての演算子が同じ尺度で判断するための近似値になる。
+旧経路向けには `QueryMemoryBudget`（`executor/query_memory.hpp`）も `kQuery` プールの窓口として残る。行の概算サイズは、固定長値、文字列の内容、配列要素などを合計して求める。メモリアロケータが実際に確保した量とは一致しないが、すべての演算子が同じ尺度で判断するための近似値になる。
 
 `QueryMemoryCharge` は、予約済みのバイト数を RAII で管理する。オブジェクトの破棄、ムーブ、明示的な解放のいずれでも二重計上を避ける。問い合わせが失敗または早期終了した場合も、予約量を全量返却する。
 
@@ -133,9 +133,11 @@ SQL のフィルタでは `TRUE` だけが選択される。`FALSE` と `NULL` �
 
 `OperatorMemoryReservation` は現行コードに存在しない。作業メモリの予算は `executor/query_memory.hpp` と各演算子のメモリ方針を参照する。
 
-## 9. `SpillFile`
+## 9. `SpillStore` / OOC 部品 と旧 `SpillFile`
 
-`SpillFile` は一時的な行ストアである。行だけを保存するモードと、行に `RowPosition` を添えて保存するモードを持ち、同じファイル内で両モードを混在させない。
+既定パイプラインの OOC シンク（`OocSortSink` 等）は定数個の匿名一時ファイル上で 64 KiB ブロックを多重化する `SpillStore`（`common/spill/spill_store.hpp`、`TINYLAMB_TEMP_LIMIT_BYTES` 上限管理）と、`executor/detail/ooc/` 配下の `SpillableStore` / `ExternalSorter` / `RecursivePartitioner` / `ChunkCodec`（`DataChunk` 直列化）を使用する（[ADR 0005](../adr/0005-spill-store-placement.md)）。
+
+旧 `ExecutorBase` 演算子用に残る `SpillFile` は 1 インスタンス 1 ファイルの一時行ストアである。行だけを保存するモードと、行に `RowPosition` を添えて保存するモードを持ち、同じファイル内で両モードを混在させない。
 
 ファイルの先頭には行数を記録するヘッダがあり、書き込みの完了時に確定値へ更新する。読み出し方法は、全行をメモリへ戻す方法と、行をコールバックへ一つずつ渡す方法の二つである。行数の不一致、ファイルの途中での終端、I/O の失敗は、いずれも実行エラーとして報告する。
 

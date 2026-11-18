@@ -17,9 +17,18 @@
 #include "common/platform/process.hpp"
 
 #include <fcntl.h>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
+#if __has_include(<mimalloc.h>)
+#include <mimalloc.h>
+#define TINYLAMB_HAVE_MIMALLOC_COLLECT 1
+#endif
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -39,15 +48,19 @@
 #endif
 #include <io.h>
 #include <process.h>
+#include <psapi.h>
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern "C" {
@@ -343,6 +356,113 @@ int OpenWriteFailingDescriptor() {
   errno = saved;
   return fd;
 #endif
+}
+
+uint64_t CurrentProcessRssBytes() noexcept {
+#ifdef TINYLAMB_OS_WINDOWS
+  PROCESS_MEMORY_COUNTERS pmc{};
+  if (::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc))) {
+    return static_cast<uint64_t>(pmc.WorkingSetSize);
+  }
+  return 0;
+#elif defined(__APPLE__)
+  mach_task_basic_info info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (::task_info(::mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info),
+                  &count) == KERN_SUCCESS) {
+    return static_cast<uint64_t>(info.resident_size);
+  }
+  return 0;
+#elif defined(__linux__)
+  const int fd = ::open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  std::array<char, 128> buf{};
+  const ssize_t n = ::read(fd, buf.data(), buf.size() - 1);
+  ::close(fd);
+  if (n <= 0) {
+    return 0;
+  }
+  char* end = nullptr;
+  // /proc/self/statm fields: size resident shared ... (in pages).
+  (void)::strtoull(buf.data(), &end, 10);
+  if (end == nullptr || *end == '\0') {
+    return 0;
+  }
+  const unsigned long long resident_pages = ::strtoull(end, &end, 10);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return 0;
+  }
+  return static_cast<uint64_t>(resident_pages) *
+         static_cast<uint64_t>(page_size);
+#else
+  return 0;
+#endif
+}
+
+uint64_t PeakProcessRssBytes() noexcept {
+#ifdef TINYLAMB_OS_WINDOWS
+  PROCESS_MEMORY_COUNTERS pmc{};
+  if (::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc))) {
+    return static_cast<uint64_t>(pmc.PeakWorkingSetSize);
+  }
+  return 0;
+#elif defined(__APPLE__) || defined(__linux__)
+  struct rusage ru{};
+  if (::getrusage(RUSAGE_SELF, &ru) != 0) {
+    return 0;
+  }
+#ifdef __APPLE__
+  // macOS ru_maxrss is in bytes.
+  return ru.ru_maxrss > 0 ? static_cast<uint64_t>(ru.ru_maxrss) : 0;
+#else
+  // Linux ru_maxrss is in KiB.
+  return ru.ru_maxrss > 0 ? static_cast<uint64_t>(ru.ru_maxrss) * 1024ULL : 0;
+#endif
+#else
+  return 0;
+#endif
+}
+
+bool ReleaseFreeHeapToOs() noexcept {
+#if defined(TINYLAMB_HAVE_MIMALLOC_COLLECT) || \
+    (defined(__linux__) && defined(__GLIBC__))
+  static std::atomic<int64_t> last_purge_ns{0};
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  int64_t prev = last_purge_ns.load(std::memory_order_relaxed);
+  // Only one caller per ~20 ms pays for the purge; concurrent waiters retry.
+  if (now_ns - prev < 20'000'000LL ||
+      !last_purge_ns.compare_exchange_strong(prev, now_ns,
+                                             std::memory_order_acq_rel)) {
+    return false;
+  }
+#ifdef TINYLAMB_HAVE_MIMALLOC_COLLECT
+  mi_collect(/*force=*/true);
+#endif
+#if defined(__linux__) && defined(__GLIBC__)
+  ::malloc_trim(0);
+#endif
+  return true;
+#else
+  return false;
+#endif
+}
+
+uint64_t PhysicalMemoryBytes() noexcept {
+#if defined(__linux__) || defined(__APPLE__)
+  const long pages = ::sysconf(_SC_PHYS_PAGES);
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (pages > 0 && page_size > 0) {
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+  }
+#endif
+  return 0;
 }
 
 }  // namespace tinylamb::platform

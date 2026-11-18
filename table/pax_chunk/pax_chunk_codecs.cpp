@@ -102,7 +102,7 @@ uint32_t RleBpLengthAt(const RleBpRegion& p, uint32_t run) {
 //
 // Both payload streams reuse the byte-aligned FOR-BA layout (scheme 3) exactly,
 // so the native/WASM decoders, the inner-extent arithmetic in ValidateWalk and
-// the WASM `forba_off` helper are shared with the existing scheme instead of
+// the FOR-BA offset decoding are shared with the existing scheme instead of
 // being re-derived here.
 //
 // The encoder gates on NON-DECREASING input, so the run values are themselves
@@ -421,7 +421,7 @@ int64_t StreamVByteValueAt(const StreamVByteRegion& v, uint32_t i) {
 }
 
 // Bounds-checked header parse. Mirrors ValidateWalk's case 50 and the WASM
-// `streamvbyte_parse` field for field: the header must echo the footer's
+// the WASM stream-vbyte decoder field for field: the header must echo the footer's
 // stream_len, nblk must equal ceil(n/16), the control plane is exactly
 // ceil(n/4) bytes, every block_off must equal the walked prefix sum at its
 // block boundary, and the total must land on stream_len. `end` is the cell's
@@ -1014,8 +1014,6 @@ bool DecodeRleDeltaAll(const char* r, uint32_t n, uint32_t param,
 // PFor reads; the forward decode is two prefix sums. Every load is bounded
 // against `end` before it happens, and n <= PaxChunk::kRowGroupSize caps both
 // the seek table and the inner region.
-// n <= PaxChunk::kRowGroupSize caps the seek table and the inner region; the
-// n >= 3 floor gives the inner PFor at least one value.
 //
 // The interval is 256, not the 128 the first-difference composites share. The
 // second differences are an order of magnitude narrower than the first, so the
@@ -1201,13 +1199,14 @@ uint32_t D2PforLowerBound(const D2PforRegion& p, int64_t key) {
 // Frame-of-reference bit-packing in a four-lane interleaved layout. See the
 // enum comment for the wire format and the rationale; the short version is
 // that a group is 32 bytes = four 8-byte lanes, and value i of the group lives
-// in lane (i mod 4) at bit offset (i div 4) * w. Because w always divides 64,
-// each lane holds exactly 64/w values with no slack, so the four lane loads are
-// independent aligned 8-byte reads.
+// in lane (i mod 4) at bit offset (i div 4) * w. A lane holds floor(64/w)
+// values, so when w does not divide 64 its top w-1 bits (at most) stay
+// unused; each lane is still exactly one 8-byte word, so the four lane loads
+// remain independent aligned 8-byte reads.
 //
 // ANY width 1..64 is supported: a lane holds floor(64/w) values, so the
 // high bits of a lane go unused when w does not divide 64. That costs a few
-// bits per 32 values and keeps all four lane reads aligned 8-byte loads, which
+// bits per group and keeps all four lane reads aligned 8-byte loads, which
 // is the entire point -- see SimdForPerLane for why flooring beats demanding
 // an exact division.
 
@@ -1221,8 +1220,8 @@ bool SimdForWidthOk(uint32_t w) { return w >= 1 && w <= 64; }
 // w | 64 (w in 1,2,4,8,16,32,64) would force the encoder to round a spread of
 // 63 up from 6 bits to 8, which is exactly the case where this scheme is
 // supposed to beat a byte-offset FOR codec -- it would lose to it. With floor
-// the cost of an awkward width is at most a few unused high bits per lane
-// (w = 6 leaves 2, w = 63 leaves 1) rather than a whole width step.
+// the cost of an awkward width is at most w-1 unused high bits per lane
+// (w = 6 leaves 4, w = 63 leaves 1) rather than a whole width step.
 uint32_t SimdForPerLane(uint32_t w) { return 64 / w; }
 uint32_t SimdForGroupValues(uint32_t w) {
   return kSimdForLanes * SimdForPerLane(w);
@@ -1530,9 +1529,9 @@ uint64_t HistogramBin(int64_t v, int64_t mn, int64_t mx, uint64_t B) {
   // Denominator widened to 128-bit: a column spanning the full i64 domain
   // ([INT64_MIN, INT64_MAX]) yields span == UINT64_MAX, so span + 1 would
   // wrap to 0 and divide by zero.
-  const unsigned __int128 num = static_cast<unsigned __int128>(v_u - mn_u) * B;
+  const platform::UInt128 num = static_cast<platform::UInt128>(v_u - mn_u) * B;
   auto idx =
-      static_cast<uint64_t>(num / (static_cast<unsigned __int128>(span) + 1));
+      static_cast<uint64_t>(num / (static_cast<platform::UInt128>(span) + 1));
   if (idx >= B) {
     idx = B - 1;
   }
@@ -1664,8 +1663,8 @@ uint64_t WaveletRValueAt(const WaveletRRegion& p, uint32_t index) {
 bool WaveletRNormalizedRange(const WaveletRRegion& p, PaxChunk::CompareOp op,
                              int64_t literal, uint64_t* low_out,
                              uint64_t* high_out) {
-  __int128 low = INT64_MIN;
-  __int128 high = INT64_MAX;
+  platform::Int128 low = INT64_MIN;
+  platform::Int128 high = INT64_MAX;
   switch (op) {
     case PaxChunk::CompareOp::kEq:
       low = high = literal;
@@ -1674,23 +1673,24 @@ bool WaveletRNormalizedRange(const WaveletRRegion& p, PaxChunk::CompareOp op,
       high = literal;
       break;
     case PaxChunk::CompareOp::kLt:
-      high = static_cast<__int128>(literal) - 1;
+      high = static_cast<platform::Int128>(literal) - 1;
       break;
     case PaxChunk::CompareOp::kGe:
       low = literal;
       break;
     case PaxChunk::CompareOp::kGt:
-      low = static_cast<__int128>(literal) + 1;
+      low = static_cast<platform::Int128>(literal) + 1;
       break;
     default:
       return false;
   }
-  const __int128 minimum = p.minimum;
+  const platform::Int128 minimum = p.minimum;
   const uint64_t domain_max =
       p.width == 64 ? UINT64_MAX : ((1ULL << p.width) - 1ULL);
-  const __int128 normalized_low = std::max(low, minimum) - minimum;
-  const __int128 normalized_high =
-      std::min(high, minimum + static_cast<__int128>(domain_max)) - minimum;
+  const platform::Int128 normalized_low = std::max(low, minimum) - minimum;
+  const platform::Int128 normalized_high =
+      std::min(high, minimum + static_cast<platform::Int128>(domain_max)) -
+      minimum;
   if (normalized_low > normalized_high) {
     *low_out = 1;
     *high_out = 0;
@@ -1817,10 +1817,11 @@ bool WaveletRRegionFold(const WaveletRRegion& p, PaxChunk::CompareOp op,
   return true;
 }
 
-__int128 QppModelValue(const QppPage& p, uint32_t index) {
-  const __int128 i = index;
-  return static_cast<__int128>(p.a) + (i * static_cast<__int128>(p.d1)) +
-         ((i * (i - 1) / 2) * static_cast<__int128>(p.d2));
+platform::Int128 QppModelValue(const QppPage& p, uint32_t index) {
+  const platform::Int128 i = index;
+  return static_cast<platform::Int128>(p.a) +
+         (i * static_cast<platform::Int128>(p.d1)) +
+         ((i * (i - 1) / 2) * static_cast<platform::Int128>(p.d2));
 }
 
 bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
@@ -1899,9 +1900,9 @@ bool ParseQppRegion(const char* region, uint32_t n, uint32_t param,
           page.exceptions + (static_cast<size_t>(page.exception_count) * 10);
     }
     for (uint32_t i = 0; i < rows; ++i) {
-      const __int128 value = QppModelValue(page, i);
-      if (value < static_cast<__int128>(INT64_MIN) ||
-          value > static_cast<__int128>(INT64_MAX)) {
+      const platform::Int128 value = QppModelValue(page, i);
+      if (value < static_cast<platform::Int128>(INT64_MIN) ||
+          value > static_cast<platform::Int128>(INT64_MAX)) {
         return false;
       }
     }
@@ -1974,8 +1975,8 @@ size_t QppSegments(const QppPage& page, std::array<QppSegment, 2>& segments) {
   bool found = false;
   uint32_t turn = page.rows - 1;
   for (uint32_t i = 0; i + 1 < page.rows; ++i) {
-    const __int128 delta =
-        static_cast<__int128>(page.d1) + (static_cast<__int128>(i) * page.d2);
+    const platform::Int128 delta = static_cast<platform::Int128>(page.d1) +
+                                   (static_cast<platform::Int128>(i) * page.d2);
     if ((page.d2 > 0 && delta >= 0) || (page.d2 < 0 && delta <= 0)) {
       turn = i;
       found = true;
@@ -1999,7 +2000,7 @@ size_t QppSegments(const QppPage& page, std::array<QppSegment, 2>& segments) {
 }
 
 uint32_t QppFirstGe(const QppPage& page, const QppSegment& segment,
-                    __int128 target) {
+                    platform::Int128 target) {
   if (segment.begin >= segment.end) {
     return segment.begin;
   }
@@ -2027,7 +2028,7 @@ uint32_t QppFirstGe(const QppPage& page, const QppSegment& segment,
 }
 
 uint32_t QppFirstGt(const QppPage& page, const QppSegment& segment,
-                    __int128 target) {
+                    platform::Int128 target) {
   if (segment.begin >= segment.end) {
     return segment.begin;
   }
@@ -2054,28 +2055,29 @@ uint32_t QppFirstGt(const QppPage& page, const QppSegment& segment,
   return low;
 }
 
-__int128 QppChoose3(uint32_t value) {
+platform::Int128 QppChoose3(uint32_t value) {
   if (value < 3) {
     return 0;
   }
-  const __int128 x = value;
+  const platform::Int128 x = value;
   return x * (x - 1) * (x - 2) / 6;
 }
 
-__int128 QppModelSum(const QppPage& page, uint32_t begin, uint32_t end) {
+platform::Int128 QppModelSum(const QppPage& page, uint32_t begin,
+                             uint32_t end) {
   if (begin >= end) {
     return 0;
   }
-  const __int128 count = end - begin;
-  const __int128 first = begin;
-  const __int128 last = end - 1;
-  const __int128 index_sum = count * (first + last) / 2;
-  const __int128 combination_sum = QppChoose3(end) - QppChoose3(begin);
+  const platform::Int128 count = end - begin;
+  const platform::Int128 first = begin;
+  const platform::Int128 last = end - 1;
+  const platform::Int128 index_sum = count * (first + last) / 2;
+  const platform::Int128 combination_sum = QppChoose3(end) - QppChoose3(begin);
   return (count * page.a) + (index_sum * page.d1) + (combination_sum * page.d2);
 }
 
 uint32_t QppFirstLe(const QppPage& page, const QppSegment& segment,
-                    __int128 target) {
+                    platform::Int128 target) {
   if (segment.begin >= segment.end) {
     return segment.begin;
   }
@@ -2102,7 +2104,7 @@ uint32_t QppFirstLe(const QppPage& page, const QppSegment& segment,
 }
 
 uint32_t QppFirstLt(const QppPage& page, const QppSegment& segment,
-                    __int128 target) {
+                    platform::Int128 target) {
   if (segment.begin >= segment.end) {
     return segment.begin;
   }
@@ -2144,8 +2146,8 @@ uint32_t QppFirstLt(const QppPage& page, const QppSegment& segment,
   return low;
 }
 
-size_t QppModelRanges(const QppPage& page, __int128 low, __int128 high,
-                      std::array<QppRange, 2>& ranges) {
+size_t QppModelRanges(const QppPage& page, platform::Int128 low,
+                      platform::Int128 high, std::array<QppRange, 2>& ranges) {
   std::array<QppSegment, 2> segments{};
   const size_t segment_count = QppSegments(page, segments);
   size_t range_count = 0;
@@ -2165,8 +2167,9 @@ size_t QppModelRanges(const QppPage& page, __int128 low, __int128 high,
 }
 
 void QppPatchExceptionCount(const QppRegion& region, PaxChunk::CompareOp op,
-                            int64_t literal, __int128 low, __int128 high,
-                            int64_t* count, __int128* sum) {
+                            int64_t literal, platform::Int128 low,
+                            platform::Int128 high, int64_t* count,
+                            platform::Int128* sum) {
   for (uint32_t p = 0; p < region.pages; ++p) {
     const QppPage& page = region.page[p];
     for (uint32_t k = 0; k < page.exception_count; ++k) {
@@ -2223,8 +2226,8 @@ void QppSetMaskRange(uint64_t* out, uint32_t begin, uint32_t end) {
   out[last_word] |= last_mask;
 }
 
-__int128 QppRegionSumAll(const QppRegion& region) {
-  __int128 sum = 0;
+platform::Int128 QppRegionSumAll(const QppRegion& region) {
+  platform::Int128 sum = 0;
   for (uint32_t p = 0; p < region.pages; ++p) {
     const QppPage& page = region.page[p];
     sum += QppModelSum(page, 0, page.rows);
@@ -2240,8 +2243,8 @@ __int128 QppRegionSumAll(const QppRegion& region) {
 
 void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
                       uint64_t* out) {
-  __int128 low = INT64_MIN;
-  __int128 high = INT64_MAX;
+  platform::Int128 low = INT64_MIN;
+  platform::Int128 high = INT64_MAX;
   switch (op) {
     case ScanOp::kEq:
       low = high = literal;
@@ -2250,13 +2253,13 @@ void QppFillRangeMask(const QppRegion& region, ScanOp op, int64_t literal,
       high = literal;
       break;
     case ScanOp::kLt:
-      high = static_cast<__int128>(literal) - 1;
+      high = static_cast<platform::Int128>(literal) - 1;
       break;
     case ScanOp::kGe:
       low = literal;
       break;
     case ScanOp::kGt:
-      low = static_cast<__int128>(literal) + 1;
+      low = static_cast<platform::Int128>(literal) + 1;
       break;
     default:
       return;
@@ -2786,7 +2789,7 @@ bool ParseSforRegion(const char* r, uint32_t n, uint32_t param, const char* end,
   p.payload = p.dir + (kSforDirEntry * ng);
   const uint64_t mask = (UINT64_C(1) << s) - 1;
   // One pass pins the directory AND accumulates the payload extent (calling
-  // SforExtent here would be a second O(ng) sweep on every parse; the
+  // a second extent pass here would be a second O(ng) sweep on every parse; the
   // predicate kernel parses per call, so the constant matters).
   uint64_t payload_bytes = 0;
   for (uint32_t g = 0; g < ng; ++g) {
@@ -2839,14 +2842,15 @@ uint64_t SforDeltaAt(const SforRegion& p, uint32_t g, uint32_t t,
 // into ONE contiguous passing run -- the kernel never walks rows. Probes are
 // O(log rows) unpacks; `boff` is the group's payload byte offset.
 uint32_t SforGroupLowerBound(const SforRegion& p, uint32_t g, uint64_t boff,
-                             __int128 x) {
+                             platform::Int128 x) {
   const uint32_t rows = SforGroupRows(p, g);
   const uint64_t head = (SforMsb(p, g) << p.s) | SforBase(p, g);
   uint32_t lo = 0, hi = rows;
   while (lo < hi) {
     const uint32_t mid = lo + ((hi - lo) / 2);
-    const __int128 v = static_cast<__int128>(head) +
-                       static_cast<__int128>(SforDeltaAt(p, g, mid, boff));
+    const platform::Int128 v =
+        static_cast<platform::Int128>(head) +
+        static_cast<platform::Int128>(SforDeltaAt(p, g, mid, boff));
     if (v < x) {
       lo = mid + 1;
     } else {
@@ -4166,13 +4170,13 @@ bool AlpRdTansDecodeBp128(const char* leaf, size_t leaf_len, uint32_t raw_len,
 }
 
 bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
-                          std::vector<uint64_t>* values) {
-  if (values == nullptr || block >= region.block_count) {
+                          std::span<uint64_t> out, uint32_t* rows_out) {
+  if (block >= region.block_count) {
     return false;
   }
   const AlpRdTansBlock& descriptor = region.blocks[block];
   const uint32_t rows = descriptor.rows;
-  if (rows == 0 || descriptor.raw_len < 2U * rows ||
+  if (rows == 0 || rows > out.size() || descriptor.raw_len < 2U * rows ||
       descriptor.raw_len > 4U * rows ||
       ((descriptor.raw_len - 2U * rows) & 1U) != 0) {
     return false;
@@ -4238,11 +4242,10 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
     }
     previous = static_cast<uint32_t>(position);
   }
-  values->assign(rows, 0);
   uint32_t exception_index = 0;
   for (uint32_t row = 0; row < rows; ++row) {
     if (is_exception[row] != 0) {
-      (*values)[row] = static_cast<uint64_t>(
+      out[row] = static_cast<uint64_t>(
           integer_values[exception_value_base + exception_index]);
       ++exception_index;
       continue;
@@ -4256,9 +4259,24 @@ bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
     const uint64_t front = region.fronts[static_cast<uint32_t>(code)];
     const uint64_t shifted =
         region.right_width >= 64 ? 0 : (front << region.right_width);
-    (*values)[row] = shifted | static_cast<uint64_t>(tail);
+    out[row] = shifted | static_cast<uint64_t>(tail);
   }
-  return exception_index == exception_count;
+  if (exception_index != exception_count) {
+    return false;
+  }
+  if (rows_out != nullptr) {
+    *rows_out = rows;
+  }
+  return true;
+}
+
+bool AlpRdTansDecodeBlock(const AlpRdTansRegion& region, uint32_t block,
+                          std::vector<uint64_t>* values) {
+  if (values == nullptr || block >= region.block_count) {
+    return false;
+  }
+  values->assign(region.blocks[block].rows, 0);
+  return AlpRdTansDecodeBlock(region, block, std::span<uint64_t>(*values));
 }
 
 bool ParseAlpRdTansRegion(const char* region, uint32_t n, uint32_t param,
@@ -4782,7 +4800,7 @@ double AlpFactorOf(int exp) {
   static constexpr std::array<double, 19> kFactor = {
       1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8, 1e9,
       1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
-  return kFactor[exp];
+  return kFactor[static_cast<size_t>(exp)];
 }
 
 // --- rANS (kAnsFor) ----------------------------------------------------------
@@ -4896,9 +4914,9 @@ bool AnsForStep(const AnsForRegion& A, uint32_t* x, uint32_t* pos,
   return true;
 }
 
-// Inner-scheme whitelist for the cascaded composites (kFreq exceptions,
+// Inner-scheme allowlist for the cascaded composites (kFreq exceptions,
 // kRleX value/count streams, kDictX code stream, kDeltaSimd's delta stream).
-// Leaf schemes only: the whitelist deliberately excludes the composites
+// Leaf schemes only: the allowlist deliberately excludes the composites
 // themselves (and the varchar-only/double-only encodings), so a cascade is
 // bounded at depth 1 and Int64RegionAt's recursive inner calls can never
 // re-enter a cascaded case.
@@ -4957,10 +4975,10 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
     decoded.rows = std::min<uint32_t>(kBp128BlockRows, n - start);
     decoded.minimum = static_cast<int64_t>(ReadBE64(metadata));
     decoded.maximum = static_cast<int64_t>(ReadBE64(metadata + 8));
-    const unsigned __int128 sum_bits =
-        (static_cast<unsigned __int128>(ReadBE64(metadata + 16)) << 64) |
+    const platform::UInt128 sum_bits =
+        (static_cast<platform::UInt128>(ReadBE64(metadata + 16)) << 64) |
         ReadBE64(metadata + 24);
-    decoded.sum = static_cast<__int128>(sum_bits);
+    decoded.sum = static_cast<platform::Int128>(sum_bits);
     decoded.width = static_cast<uint8_t>(metadata[32]);
     const uint64_t range = static_cast<uint64_t>(decoded.maximum) -
                            static_cast<uint64_t>(decoded.minimum);
@@ -4984,7 +5002,7 @@ bool ParseBp128Region(const char* region, uint32_t n, uint32_t param,
   return true;
 }
 
-__int128 Bp128BlockSum(const Bp128Block& block) { return block.sum; }
+platform::Int128 Bp128BlockSum(const Bp128Block& block) { return block.sum; }
 
 int64_t Bp128ValueAt(const Bp128Region& region, uint32_t index) {
   if (index >= region.n) {
@@ -5172,7 +5190,7 @@ bool Bp128MetadataMatches(const Bp128Region& region) {
     const Bp128Block& block = region.blocks[block_index];
     int64_t minimum = INT64_MAX;
     int64_t maximum = INT64_MIN;
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (uint32_t row = 0; row < block.rows; ++row) {
       const int64_t value =
           Bp128ValueAt(region, (block_index * kBp128BlockRows) + row);
@@ -5255,10 +5273,10 @@ uint64_t FastPforWalk(const char* r, uint32_t n, uint32_t nblk, const char* end,
     blk.rows = start >= n ? 0 : std::min(kFastPforBlockRows, n - start);
     blk.minimum = static_cast<int64_t>(ReadBE64(meta));
     blk.maximum = static_cast<int64_t>(ReadBE64(meta + 8));
-    const unsigned __int128 sum_bits =
-        (static_cast<unsigned __int128>(ReadBE64(meta + 16)) << 64) |
+    const platform::UInt128 sum_bits =
+        (static_cast<platform::UInt128>(ReadBE64(meta + 16)) << 64) |
         ReadBE64(meta + 24);
-    blk.sum = static_cast<__int128>(sum_bits);
+    blk.sum = static_cast<platform::Int128>(sum_bits);
     blk.w = static_cast<uint8_t>(meta[32]);
     blk.nexc = ReadBE16(meta + 33);
     if (blk.rows == 0 || blk.w > 64 || blk.minimum > blk.maximum ||
@@ -5367,7 +5385,7 @@ void FastPforDecodeBlock(const FastPforBlock& blk, int64_t* dst) {
   }
 }
 
-// One parse, then a per-block lane decode (kBp128Block's AVX2 kernels where
+// One parse, then a per-block lane decode (kBp128's AVX2 kernels where
 // compiled in) plus a bitmap-driven exception patch.
 void DecodeFastPforAll(const FastPforRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.block_count; ++b) {
@@ -5389,7 +5407,7 @@ bool FastPforMetadataMatches(const FastPforRegion& p) {
     const FastPforBlock& blk = p.blocks[b];
     int64_t mn = INT64_MAX;
     int64_t mx = INT64_MIN;
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     const FastPforBitmap bmp = FastPforBitmapLoad(blk);
     uint32_t rank = 0;
     for (uint32_t t = 0; t < blk.rows; ++t) {
@@ -5500,10 +5518,10 @@ uint64_t DeltaFastPforWalk(const char* r, uint32_t n, uint32_t nblk,
     blk.base = static_cast<int64_t>(ReadBE64(meta));
     blk.minimum = static_cast<int64_t>(ReadBE64(meta + 8));
     blk.maximum = static_cast<int64_t>(ReadBE64(meta + 16));
-    const unsigned __int128 sum_bits =
-        (static_cast<unsigned __int128>(ReadBE64(meta + 24)) << 64) |
+    const platform::UInt128 sum_bits =
+        (static_cast<platform::UInt128>(ReadBE64(meta + 24)) << 64) |
         ReadBE64(meta + 32);
-    blk.sum = static_cast<__int128>(sum_bits);
+    blk.sum = static_cast<platform::Int128>(sum_bits);
     blk.w = static_cast<uint8_t>(meta[40]);
     blk.nexc = ReadBE16(meta + 41);
     blk.dmin = ReadBE64(meta + 43);
@@ -5615,7 +5633,7 @@ void DeltaFastPforDecodeBlock(const DeltaFastPforBlock& blk, int64_t* dst) {
   }
 }
 
-// One parse, then a per-block lane decode (kBp128Block's AVX2 kernels where
+// One parse, then a per-block lane decode (kBp128's AVX2 kernels where
 // compiled in), an exception patch, and the in-block replay.
 void DecodeDeltaFastPforAll(const DeltaFastPforRegion& p, int64_t* out) {
   for (uint32_t b = 0; b < p.block_count; ++b) {
@@ -5689,7 +5707,7 @@ bool DeltaFastPforMetadataMatches(const DeltaFastPforRegion& p) {
     DeltaFastPforDecodeBlock(blk, decoded.data());
     int64_t mn = INT64_MAX;
     int64_t mx = INT64_MIN;
-    __int128 sum = 0;
+    platform::Int128 sum = 0;
     for (uint32_t t = 0; t < blk.rows; ++t) {
       mn = std::min(mn, decoded[t]);
       mx = std::max(mx, decoded[t]);

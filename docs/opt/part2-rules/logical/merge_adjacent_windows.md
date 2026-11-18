@@ -131,6 +131,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `CascadesTest.MergeAdjacentWindows`: `PARTITION BY dept` を持つ2 段の Window 式から、入力スキャンに直結した単一の Window 代替式が生成されることを検証。
   - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の RuleSet 内に `merge_adjacent_windows` が登録されていることを検証。

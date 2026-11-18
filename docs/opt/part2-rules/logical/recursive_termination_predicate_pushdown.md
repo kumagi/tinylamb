@@ -121,7 +121,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part2.cpp` の
   `CascadesTest.RecursiveTerminationPredicatePushdown` — RecursiveCte 上の
   Selection を探索すると、再帰側グループに Selection を持つ
   RecursiveCte 代替が作られることを検証します。

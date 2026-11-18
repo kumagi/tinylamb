@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/set_operation.hpp"
+#include "executor/distinct.hpp"
 #include "executor/executor_base.hpp"
 #include "executor/spill_file.hpp"
 #include "type/row.hpp"
@@ -24,10 +25,12 @@ struct SetOperationRowEqual {
   bool operator()(const Row& left, const Row& right) const;
 };
 
+// SQL equality folds case-insensitive VARCHAR text, so the hash must fold the
+// same text or CI peers land in different buckets and are never compared.
 using SetOperationRowSet =
-    std::unordered_set<Row, std::hash<Row>, SetOperationRowEqual>;
+    std::unordered_set<Row, DistinctRowHash, SetOperationRowEqual>;
 using SetOperationRowMap =
-    std::unordered_map<Row, size_t, std::hash<Row>, SetOperationRowEqual>;
+    std::unordered_map<Row, size_t, DistinctRowHash, SetOperationRowEqual>;
 
 class SetOperationExecutor : public ExecutorBase {
  public:

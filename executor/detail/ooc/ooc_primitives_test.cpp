@@ -738,7 +738,7 @@ TEST(RecursivePartitionerTest,
         // Spread across 4 root buckets (`[59..61)` via bits 59..60 -> 25% each
         // so root never trips the >80% skew guard), and uniform across child
         // bits `[55..59)` (`[57..59)` then `[55..57)`).
-        const uint64_t v = static_cast<uint64_t>(r[0].AsInt64());
+        const auto v = static_cast<uint64_t>(r[0].AsInt64());
         return ((v & 0x3ULL) << 59) | (((v >> 2) & 0xFULL) << 55);
       });
   const std::string pad(512, 'B');

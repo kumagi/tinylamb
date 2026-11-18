@@ -2,6 +2,7 @@
 
 #include "query/sql_diff_oracle_fuzzer.hpp"
 
+#include <cstdlib>
 #include <random>
 #include <string>
 
@@ -74,6 +75,50 @@ TEST(DiffOracleFuzzer, RadarInstancesAgree) {
     compared += stats.radar_queries;
   }
   EXPECT_EQ(compared, 12 * 4);
+}
+
+TEST(DiffOracleFuzzer, ResourcePressureCountsAsSkippedNotAgreed) {
+  // A ScopedDb creation failure (disk-quota pressure) runs no query at all.
+  // The report is "" there, so an arm that would bulk-add its whole query set
+  // on an empty report has to be told it was skipped instead -- otherwise a
+  // run that executed nothing looks like a fully-agreed sweep.
+  ASSERT_EQ(setenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE", "1", 1), 0);
+  // Fixed seed: the trace must stay reproducible, only the database is gone.
+  std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp)
+  for (int arm = 0; arm < 4; ++arm) {
+    DiffOracleStats stats;
+    DiffOracleTrace trace;
+    std::string report;
+    switch (arm) {
+      case 0:
+        report = RunTqsIteration(rng, false, &stats, &trace);
+        break;
+      case 1:
+        report = RunSubsetIteration(rng, false, &stats, &trace);
+        break;
+      case 2:
+        report = RunDqpIteration(rng, false, &stats, &trace);
+        break;
+      default:
+        report = RunRadarIteration(rng, false, &stats, &trace);
+        break;
+    }
+    EXPECT_EQ(report, "") << "arm " << arm << " (" << trace.kind << ")\n"
+                          << report;
+    EXPECT_EQ(stats.skipped, 1) << "arm " << arm << " (" << trace.kind << ")";
+    EXPECT_EQ(stats.tqs_queries + stats.subset_checks + stats.dqp_queries +
+                  stats.radar_queries,
+              0)
+        << "arm " << arm << " (" << trace.kind
+        << ") counted queries that never ran";
+  }
+  EXPECT_EQ(unsetenv("TINYLAMB_FUZZ_FORCE_SCOPED_DB_CREATE_FAILURE"), 0);
+  // The hatch is off again: the very next sweep must run and count normally.
+  DiffOracleStats stats;
+  DiffOracleTrace trace;
+  EXPECT_EQ(RunTqsIteration(rng, false, &stats, &trace), "") << trace.kind;
+  EXPECT_EQ(stats.skipped, 0);
+  EXPECT_EQ(stats.tqs_queries, 4);
 }
 
 }  // namespace tinylamb

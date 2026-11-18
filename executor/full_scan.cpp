@@ -29,6 +29,8 @@
 #include "table/full_scan_iterator.hpp"
 #include "table/lstable_bridge.hpp"
 #include "table/table.hpp"
+#include "table/tlcs_file.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows,
@@ -45,6 +47,7 @@ FullScan::FullScan(Transaction& txn, const Table& table, size_t max_rows,
         return table_->BeginFullScan(txn, options);
       }()),
       max_rows_(max_rows),
+      lock_rows_(lock_rows),
       output_schema_([&]() {
         if (!projection.has_value()) {
           return table.GetSchema();
@@ -184,6 +187,23 @@ StatusOr<ExecResult> FullScan::ExecuteLSTableFragment(const Fragment& fragment,
     return rejected;
   }
   return store->ExecuteFragment(fragment, runtime);
+}
+
+std::optional<uint64_t> FullScan::TryExactUnfilteredRowCount() const {
+  if (started_ || lock_rows_ ||
+      max_rows_ != std::numeric_limits<size_t>::max() ||
+      runtime_filter_ != nullptr || txn_ == nullptr || table_ == nullptr ||
+      txn_->IsFailed() || !(txn_->IsReadOnly() || txn_->WriteSetEmpty()) ||
+      txn_->HasAnyPageVersionChains() || table_->RowsRewrittenInPlace()) {
+    return std::nullopt;
+  }
+  if (const auto tlcs = table_->GetBackingTLCSStore();
+      tlcs != nullptr &&
+      tlcs->LayoutGeneration() == table_->LayoutGeneration() &&
+      tlcs->FirstPageId() == table_->FirstPageId()) {
+    return tlcs->TotalRows();
+  }
+  return std::nullopt;
 }
 
 void FullScan::Dump(std::ostream& o, int /*indent*/) const {

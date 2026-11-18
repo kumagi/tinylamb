@@ -88,6 +88,31 @@ TEST(QueryParallelismBudgetTest,
   EXPECT_EQ(QueryParallelWorkerLimit(2), 2U);
 }
 
+TEST(RuntimeFilterTest, WideDenseDomainKeepsHolesNullsAndRangeBoundaries) {
+  for (int64_t base : {int64_t{-60000000}, int64_t{0}}) {
+    RuntimeFilterBuilder builder;
+    std::vector<int64_t> keys;
+    for (int64_t i = 0; i <= 60000; ++i) {
+      keys.push_back(base + (i * 1000));
+      builder.Observe(keys.back());
+      builder.Observe(keys.back());
+    }
+    builder.ObserveNull();
+    const auto group = builder.Build();
+    ASSERT_NE(group, nullptr);
+    ASSERT_TRUE(group->has_dense_bits());
+    EXPECT_EQ(group->DistinctKeys(), keys.size());
+    for (int64_t key : keys) {
+      EXPECT_FALSE(group->Reject(key));
+      EXPECT_TRUE(group->Reject(key + 1));
+      EXPECT_FALSE(group->RejectRange(key - 1, key));
+      EXPECT_TRUE(group->RejectRange(key + 1, key + 63));
+    }
+    EXPECT_TRUE(group->RejectRange(base - 1000, base - 1));
+    EXPECT_TRUE(group->RejectRange(base + 60000001, base + 60000100));
+  }
+}
+
 TEST(RuntimeFilterTest, ExactKeyEnclosureKeepsConjunctiveMembership) {
   std::vector<std::unique_ptr<RuntimeFilter>> parts;
   parts.push_back(std::make_unique<ExactSetRuntimeFilter>(
@@ -541,6 +566,48 @@ TEST(RuntimeFilterTest, MalformedBitsetDisablesPruning) {
                                /*distinct_keys=*/0);
   EXPECT_TRUE(zero_bits.disabled());
   EXPECT_FALSE(zero_bits.Reject(-7));
+}
+
+TEST(RuntimeFilterTest, BatchedObservationsPreserveMembershipAndOverflow) {
+  const std::vector<int64_t> keys = {-17, -8, -8, 0, 41, kMinI64, kMaxI64};
+  RuntimeFilterBuilder scalar, batch;
+  batch.Observe(std::span<const int64_t>{});
+  EXPECT_TRUE(batch.empty());
+  scalar.ObserveNull();
+  batch.ObserveNull();
+  for (int64_t key : keys) { scalar.Observe(key);
+}
+  batch.Observe(std::span<const int64_t>(keys).first(3));
+  batch.Observe(keys[3]);
+  batch.Observe(std::span<const int64_t>(keys).subspan(4));
+  EXPECT_EQ(batch.Observations(), scalar.Observations());
+  EXPECT_TRUE(batch.saw_null());
+  const auto expected = scalar.Build();
+  const auto actual = batch.Build();
+  ASSERT_NE(actual, nullptr);
+  EXPECT_EQ(actual->DistinctKeys(), expected->DistinctKeys());
+  for (int64_t key : keys) { EXPECT_FALSE(actual->Reject(key));
+}
+  for (int64_t key : {-18, -7, 1, 40, 42}) {
+    EXPECT_EQ(actual->Reject(key), expected->Reject(key));
+}
+
+  RuntimeFilterBuilder capped;
+  std::vector<int64_t> repeated(RuntimeFilterBuilder::kMaxTrackedKeys, -9);
+  capped.Observe(repeated);
+  EXPECT_FALSE(capped.overflowed());
+  capped.ObserveNull();
+  capped.Observe(std::span<const int64_t>{});
+  EXPECT_FALSE(capped.overflowed());
+  capped.Observe(std::span<const int64_t>(keys));
+  EXPECT_TRUE(capped.overflowed());
+  EXPECT_EQ(capped.DistinctKeys(), 0U);
+  EXPECT_EQ(capped.Observations(), repeated.size() + 1 + keys.size());
+  const auto enclosure = capped.Build();
+  ASSERT_NE(enclosure, nullptr);
+  EXPECT_FALSE(enclosure->Reject(-9));
+  for (int64_t key : keys) { EXPECT_FALSE(enclosure->Reject(key));
+}
 }
 
 }  // namespace

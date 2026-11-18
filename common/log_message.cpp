@@ -24,6 +24,10 @@
 #include <iostream>
 #include <tuple>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include "common/platform/synced_stream.hpp"
 #include "common/platform/time_format.hpp"
 
@@ -31,9 +35,28 @@ namespace tinylamb::detail {
 [[noreturn]] void LogFatalAbort() { std::abort(); }
 }  // namespace tinylamb::detail
 
+namespace {
+bool LogUsesColor() {
+  static const bool kUseColor = [] {
+    if (std::getenv("NO_COLOR") != nullptr) {
+      return false;
+    }
+    if (std::getenv("TINYLAMB_FORCE_COLOR") != nullptr) {
+      return true;
+    }
+#ifndef _WIN32
+    return isatty(2) != 0;
+#else
+    return false;
+#endif
+  }();
+  return kUseColor;
+}
+}  // namespace
+
 LogStream::~LogStream() {
   tinylamb::platform::SyncedOStream(std::cerr)
-      << message_.str() << "\033[0;39;49m\n";
+      << message_.str() << (LogUsesColor() ? "\033[0;39;49m" : "") << "\n";
   if (fatal_) {
     std::abort();
   }
@@ -56,30 +79,46 @@ LogMessage::LogMessage(LogLevel log_level, const char* filename, int lineno,
 
   switch (log_level) {
     case LogLevel::kFatal:
-      ls << "\033[1;31m";
+      if (LogUsesColor()) {
+        ls << "\033[1;31m";
+      }
       break;
     case LogLevel::kError:
-      ls << "\033[4;31m";
+      if (LogUsesColor()) {
+        ls << "\033[4;31m";
+      }
       break;
     case LogLevel::kAlert:
-      ls << "\033[1;5;95m";
+      if (LogUsesColor()) {
+        ls << "\033[1;5;95m";
+      }
       break;
     case LogLevel::kWarn:
-      ls << "\033[33m";
+      if (LogUsesColor()) {
+        ls << "\033[33m";
+      }
       break;
     case LogLevel::kNotice:
-      ls << "\033[1;36m";
+      if (LogUsesColor()) {
+        ls << "\033[1;36m";
+      }
       break;
     case LogLevel::kInfo:
       break;  // Do nothing.
     case LogLevel::kUser:
-      ls << "\033[7;32m";
+      if (LogUsesColor()) {
+        ls << "\033[7;32m";
+      }
       break;
     case LogLevel::kDebug:
-      ls << "\033[1;34m";
+      if (LogUsesColor()) {
+        ls << "\033[1;34m";
+      }
       break;
     case LogLevel::kTrace:
-      ls << "\033[4;36m";
+      if (LogUsesColor()) {
+        ls << "\033[4;36m";
+      }
       break;
     default:
       assert(!"unknown log level");

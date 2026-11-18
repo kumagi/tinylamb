@@ -137,7 +137,7 @@ ARRAY<STRUCT<key INT64, value STRING, k10 INT64>>[unknown order:
 ]
 ==
 
-# Test a DROP case becuase it's one where there could be an extra column
+# Test a DROP case because it's one where there could be an extra column
 # in the column_list that DROP doesn't remove.
 [name=if_in_union_with_drop]
 FROM KeyValue

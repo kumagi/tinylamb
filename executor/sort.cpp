@@ -47,22 +47,45 @@ constexpr size_t kParallelSortMinRows = 4096;
 
 uint64_t BSwap64(uint64_t v) { return __builtin_bswap64(v); }
 
-void AppendMemComparableValue(const Value& v, std::string* out,
-                              bool is_unsigned = false) {
+void AppendMemComparableValue(const Value& v, std::string* out) {
   if (v.IsInterval()) {
+    // ENUM values are interval-tagged VARCHAR.  They must sort by EnumRank
+    // ("TESTENUM"+rank byte), not raw bytes, otherwise ORDER BY over an ENUM
+    // column yields byte order instead of member order (P373).
+    const int rank = EnumRank(v.value.varchar_value);
+    if (rank >= 0) {
+      out->push_back(static_cast<char>(ValueType::kVarChar));
+      out->append("TESTENUM", 8);
+      out->push_back(static_cast<char>(rank));
+      return;
+    }
     out->append(v.EncodeMemcomparableFormat());
     return;
   }
   switch (v.type) {
     case ValueType::kInt64:
     case ValueType::kDate: {
+      // Unsigned INT64 values >= 2^63 sort after all signed and smaller
+      // unsigned values (matching type/value.cpp's TryLess for mixed
+      // signed/unsigned INT64), so they get their own tag band above every
+      // other value-type tag.
+      const bool unsigned_high =
+          v.type == ValueType::kInt64 && v.IsUnsigned() &&
+          static_cast<uint64_t>(v.value.int_value) >= (uint64_t{1} << 63);
+      if (unsigned_high) {
+        out->push_back(static_cast<char>(ValueType::kArray) + 1);
+        const uint64_t be = BSwap64(static_cast<uint64_t>(v.value.int_value));
+        out->append(reinterpret_cast<const char*>(&be), 8);
+        break;
+      }
       out->push_back(static_cast<char>(v.type));
       const uint64_t be = BSwap64(static_cast<uint64_t>(v.value.int_value));
       std::array<char, 8> buf{};
       std::memcpy(buf.data(), &be, buf.size());
-      if (!is_unsigned && !v.IsUnsigned()) {
-        buf[0] ^= static_cast<char>(0x80);
-      }
+      // Flip the sign bit so that negative signed sorts before non-negative,
+      // and unsigned < 2^63 interleaves with non-negative signed by uint
+      // value — matching Value::TryLess for mixed signed/unsigned INT64.
+      buf[0] ^= static_cast<char>(0x80);
       out->append(buf.data(), buf.size());
       break;
     }
@@ -180,19 +203,39 @@ class SortKeyEncoder {
   }
 
   [[nodiscard]] Kind GetKind() const { return kind_; }
-  [[nodiscard]] bool SingleAscending() const { return specs_[0].ascending; }
   [[nodiscard]] bool SingleNullsFirst() const { return specs_[0].nulls_first; }
 
-  uint64_t SingleKey(const Row& row, bool* is_null) const {
+  // A single flipped-sign-bit integer cannot order mixed signedness: signed
+  // 1 and unsigned 2^63+1 both map to 0x8000000000000001, and signed 0 and
+  // unsigned 2^63 both map to 0x8000000000000000.  Value::TryLess orders
+  // three bands (signed negatives < non-negative signed/unsigned < 2^63 <
+  // unsigned >= 2^63), which needs one more bit than the 64-bit key holds.
+  // Return the band separately; the mixed case is sorted by (band, key).
+  uint64_t SingleKey(const Row& row, bool* is_null, uint8_t* band) const {
     const Value& v = row.values_[static_cast<size_t>(specs_[0].column)];
     if (v.IsNull()) {
       *is_null = true;
+      *band = 1;
       return 0;
     }
     *is_null = false;
     const auto bits = static_cast<uint64_t>(v.value.int_value);
     const bool is_unsigned = specs_[0].is_unsigned || v.IsUnsigned();
-    const uint64_t mapped = is_unsigned ? bits : (bits ^ (uint64_t{1} << 63));
+    const bool high = bits >= (uint64_t{1} << 63);
+    // Canonical (ascending) band: 0 = signed negative, 1 = non-negative
+    // signed or unsigned below 2^63, 2 = unsigned >= 2^63.
+    uint8_t canonical_band = 1;
+    if (is_unsigned && high) {
+      canonical_band = 2;
+    } else if (!is_unsigned && high) {
+      canonical_band = 0;
+    }
+    // Within a band the flipped (or, for band 2, raw) bits are monotonic in
+    // the canonical value, so (band, mapped) is the full order.
+    const uint64_t mapped =
+        (canonical_band == 2) ? bits : (bits ^ (uint64_t{1} << 63));
+    *band = specs_[0].ascending ? canonical_band
+                                : static_cast<uint8_t>(2 - canonical_band);
     return specs_[0].ascending ? mapped : ~mapped;
   }
 
@@ -239,7 +282,7 @@ class SortKeyEncoder {
           continue;
         }
         out->push_back('\x01');
-        AppendMemComparableValue(*v, out, spec.is_unsigned);
+        AppendMemComparableValue(*v, out);
       } else {
         if (v->IsNull()) {
           out->push_back(nulls_first ? '\x00' : '\xff');
@@ -247,7 +290,7 @@ class SortKeyEncoder {
         }
         out->push_back('\x01');
         const size_t begin = out->size();
-        AppendMemComparableValue(*v, out, spec.is_unsigned);
+        AppendMemComparableValue(*v, out);
         for (size_t i = begin; i < out->size(); ++i) {
           (*out)[i] = static_cast<char>(~(*out)[i]);
         }
@@ -307,7 +350,12 @@ class KeyOrdering {
   void AppendRow(const Row& row, Status* error = nullptr) {
     if (encoder_.GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
       bool is_null = false;
-      const uint64_t key = encoder_.SingleKey(row, &is_null);
+      uint8_t band = 1;
+      const uint64_t key = encoder_.SingleKey(row, &is_null, &band);
+      if (!bands_.empty() && band != bands_.front()) {
+        mixed_bands_ = true;
+      }
+      bands_.push_back(band);
       raw_keys_.push_back(key);
       null_flags_.push_back(static_cast<uint8_t>(is_null));
       return;
@@ -327,6 +375,8 @@ class KeyOrdering {
     spans_.clear();
     raw_keys_.clear();
     null_flags_.clear();
+    bands_.clear();
+    mixed_bands_ = false;
   }
 
   [[nodiscard]] SortKeyEncoder::Kind GetKind() const {
@@ -377,6 +427,9 @@ class KeyOrdering {
     size_t* base = perm.data() + sortable_begin;
     const auto index_less = [&](size_t a, size_t b) {
       if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
+        if (bands_[a] != bands_[b]) {
+          return bands_[a] < bands_[b];
+        }
         return raw_keys_[a] < raw_keys_[b];
       }
       return CompareSpans(SpanAt(a), SpanAt(b)) < 0;
@@ -384,7 +437,7 @@ class KeyOrdering {
 
     const bool parallel = workers > 1 && sortable_rows >= kParallelSortMinRows;
     if (!parallel) {
-      if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
+      if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 && !mixed_bands_) {
         std::vector<size_t> tmp;
         RadixSortIndices(base, base + sortable_rows, raw_keys_, &tmp);
       } else {
@@ -407,7 +460,8 @@ class KeyOrdering {
       try {
         threads.emplace_back([&, begin, end] {
           try {
-            if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64) {
+            if (GetKind() == SortKeyEncoder::Kind::kSingleUInt64 &&
+                !mixed_bands_) {
               std::vector<size_t> tmp;
               RadixSortIndices(base + begin, base + end, raw_keys_, &tmp);
             } else {
@@ -457,6 +511,9 @@ class KeyOrdering {
   std::vector<Span> spans_;
   std::vector<uint64_t> raw_keys_;
   std::vector<uint8_t> null_flags_;
+  // Mixed signedness needs a band tie-break the 64-bit key cannot express.
+  std::vector<uint8_t> bands_;
+  bool mixed_bands_{false};
 };
 
 class RunReader {
@@ -520,12 +577,19 @@ void ApplyPermutation(std::vector<PositionedRow>* rows,
 }  // namespace
 
 Status SortExecutor::Materialize() {
+  // Re-initialize on every attempt so a partial build from a previous failed
+  // attempt cannot leak into the next (stale rows_, charge, etc.).
+  rows_.clear();
+  rows_.shrink_to_fit();
+  rows_charge_ = QueryMemoryCharge();
+  offset_ = 0;
+  materialized_ = false;
   KeyOrdering ordering(keys_, schema_);
   std::vector<SpillFile> runs;
   const auto write_sorted_run = [&]() -> Status {
     ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
                      ordering.BuildPermutation(rows_.size(), worker_count_));
-    ApplyPermutation(&rows_, std::move(permutation));
+    ApplyPermutation(&rows_, permutation);
     SpillFile run;
     for (const auto& item : rows_) {
       RETURN_IF_FAIL(run.Append(item.first, item.second));
@@ -590,7 +654,7 @@ Status SortExecutor::Materialize() {
             : std::min(worker_count_, std::max<size_t>(1, rows_.size()));
     ASSIGN_OR_RETURN(std::vector<size_t>, permutation,
                      ordering.BuildPermutation(rows_.size(), workers));
-    ApplyPermutation(&rows_, std::move(permutation));
+    ApplyPermutation(&rows_, permutation);
     rows_charge_ = std::move(charge);
   } else {
     if (!rows_.empty()) {
@@ -713,12 +777,27 @@ Status SortExecutor::Materialize() {
   return Status::kSuccess;
 }
 
-size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
+bool SortExecutor::MaterializeOrThrow() {
+  if (materialize_failed_) {
+    return FailWith(materialize_error_);
+  }
+  const Status st = Materialize();
+  if (st != Status::kSuccess) {
+    materialize_failed_ = true;
+    materialize_error_ = st;
+    return FailWith(st);
+  }
+  return true;
+}
+
+size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) try {
   destination->Reset(schema_, max_rows);
+  if (materialize_failed_) {
+    FailWith(materialize_error_);
+    return 0;
+  }
   if (!materialized_) {
-    Status st = Materialize();
-    if (st != Status::kSuccess) {
-      FailWith(st);
+    if (!MaterializeOrThrow()) {
       return 0;
     }
   }
@@ -727,6 +806,20 @@ size_t SortExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
     ++offset_;
   }
   return destination->Size();
+} catch (const std::exception& error) {
+  destination->Reset();
+  materialize_failed_ = true;
+  materialize_error_ =
+      StatusError(StatusCode::kRuntimeError, error.what());
+  FailWith(materialize_error_);
+  return 0;
+} catch (...) {
+  destination->Reset();
+  materialize_failed_ = true;
+  materialize_error_ =
+      StatusError(StatusCode::kRuntimeError, "sort worker failed");
+  FailWith(materialize_error_);
+  return 0;
 }
 
 void SortExecutor::Dump(std::ostream& output, int indent) const {

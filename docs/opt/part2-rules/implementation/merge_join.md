@@ -116,7 +116,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part1.cpp`:
   - `OptimizerTest.MergeJoinRuleUsesChildrenThatAlreadyProvideKeyOrder`: ソート済みの入力に対して追加ソートなしでマージ結合が構築されることを検証。
   - `OptimizerTest.MergeJoinRuleSortsUnorderedChildren`: ソートされていない入力に対して `SortPlan` が正しく挿入されることを検証。
 - `plan/plan_test.cpp`:

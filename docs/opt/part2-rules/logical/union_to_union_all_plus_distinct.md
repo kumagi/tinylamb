@@ -84,4 +84,4 @@ Append 処理をパイプラインストリーミングで行いつつ、子の�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UnionDistinctRewriteAddsUnionAllAndDistinctAlternative`: `kUnion` 式を探索した際、同一グループ内に `kDistinct` の代替式が登録されることを検証します。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.UnionDistinctRewriteAddsUnionAllAndDistinctAlternative`: `kUnion` 式を探索した際、同一グループ内に `kDistinct` の代替式が登録されることを検証します。

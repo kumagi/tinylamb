@@ -60,6 +60,11 @@ uint64_t UniformOffset(Engine& engine, uint64_t urange) {
   static_assert(kMin < kMax);
   constexpr uint64_t kEngineRange = kMax - kMin;
   if (kEngineRange > urange) {
+    // urange == UINT64_MAX wraps to 0; the engine already yields the full
+    // 64-bit domain, so no rejection sampling is needed in that case.
+    if (urange == UINT64_MAX) {
+      return static_cast<uint64_t>(engine());
+    }
     const uint64_t uerange = urange + 1;
 #ifdef __SIZEOF_INT128__
     if constexpr (kEngineRange == UINT64_MAX) {

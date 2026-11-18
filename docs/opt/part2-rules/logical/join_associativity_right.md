@@ -101,9 +101,9 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `AssociativityRulesEnumerateJoinOrdersWithoutEnumeration`: `join_enumeration` を除外した環境において、本 Rule を含む結合則・交換則のみで3 表の全6通りの結合順序が導出されることを検証。
   - `JoinEnumerationPrunesDisconnectedBipartitions`: 刈り込み効果の単離テストにおいて、本 Rule を除外した構成での動作を検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `JoinChainMatchesGoldenResultUnderRuleSubsets`: 結合順序系 Rule の一部を無効化しても最終結果の一貫性が保持されることを検証。
 

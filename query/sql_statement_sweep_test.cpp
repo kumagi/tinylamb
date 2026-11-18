@@ -6,7 +6,7 @@
 // struct-INSERT expansion. Values are engine characterization, not a claim
 // of strict GoogleSQL type analysis. Sparse GROUP BY below is a permissive
 // dialect deviation: non-key columns read a representative row, and that row
-// is not an SQL semantic guarantee across plans. BOOL/numeric coercions have
+// is not a SQL semantic guarantee across plans. BOOL/numeric coercions have
 // the same status (see sql_expression_matrix_test.cpp).
 // Actual successful STRUCT/whole-row NULL inserts and nonempty field UPDATE
 // are covered by SqlAuditRegressionTest.StructInsertExpansionHasRealStoredRows.

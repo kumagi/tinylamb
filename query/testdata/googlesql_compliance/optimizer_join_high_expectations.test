@@ -290,7 +290,14 @@ ARRAY<STRUCT<order_id INT64, customer_name STRING>>[
 ]
 ==
 
+# Dimension elimination for "join_with_unused_dimension" is not implemented
+# (the plan keeps the opt_customers full scan), so the case is feature-gated:
+# the plan_not_contains guard fires once the engine claims the feature.
+# P920: these assertions previously sat below the `==`, orphaned into the
+# next (vacuously true) case, leaving this one asserting only row equality.
 [mode=explain]
+[plan_not_contains=opt_customers]
+[required_features=UNUSED_JOIN_ELIMINATION]
 [name=join_with_unused_dimension_is_eliminated]
 SELECT o.order_id
 FROM opt_orders o JOIN opt_customers c ON c.customer_id = o.customer_id
@@ -298,9 +305,6 @@ ORDER BY o.order_id
 --
 ARRAY<STRUCT<order_id INT64>>[{101}, {102}, {103}, {104}, {105}]
 ==
-
-[mode=explain]
-[plan_not_contains=opt_customers]
 
 [mode=explain]
 [plan_contains=HashJoin keys=2]

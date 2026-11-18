@@ -3,8 +3,8 @@
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
 
 `ExpressionRuleSet` は、スカラー式を直接書き換える最下層の Rule セットです。
-この章ではフレームワークと基本的な 35 本を説明し、適用条件の複雑な 38 本は
-第 2 部の個別章へ分けます。
+この章ではフレームワークと基本的な 35 本を説明し、適用条件の複雑な 36 本は
+第 2 部の個別章へ分けます（合計 71 本）。
 
 ## 70-1. スカラー式を直接変換する Rule
 
@@ -14,10 +14,9 @@
 したがって、メモ、同値 Group、コスト計算のいずれにも依存しません。
 
 定義は `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` にあります。
-基準リビジョンでは `built.Add` を 74 回呼び出しますが、`abs_of_abs` が同名で
-2 回登録されています。`Add` は同名登録を上書きするため（70-2 節）、実効的な
-登録数は 73 本です。本章で 35 本、第 2 部で 38 本を扱い、合計 73 本が
-`00-index.md` の一覧と一致します。
+現行コードでは `built.Add` により 71 本を登録します（かつて重複していた
+`abs_of_abs` の二重登録等は 2026-10-02 の監査で整理済み）。本章で 35 本、
+第 2 部で 36 本を扱い、合計 71 本が `00-index.md` の一覧と一致します。
 
 式書き換えは、オプティマイザの初期処理以外でも実行されます。実行経路は次の
 3 箇所です。
@@ -87,8 +86,7 @@ class ExpressionPattern {
 複数の規則を束ねる `ExpressionRuleSet` は、内部に
 `std::vector<ExpressionRule>` を保持する値型です。`Add` は内部で
 `Remove(rule.Name())` を実行してから、新しい規則を追加します。したがって、
-同名規則の再登録は上書きとして機能します。`abs_of_abs` の 2 回の登録は、
-この動作に依存しています。
+同名規則の再登録は上書きとして機能します（カスタマイズ時に既定規則を差し替える用途でも使われます）。
 
 これらの規則を実行するのが `ExpressionRewriter` です。`ExpressionRewriter` は
 RuleSet への参照とパス数の上限 `pass_limit_` を保持します。書き換え処理の
@@ -342,9 +340,9 @@ Rule はインデックス照合を維持するため、整数型の列にも適
 
 これら 35 本の自明な Rule に共通する原則は、「式を消去または変形する際、その式が本来発生させるはずだった実行時例外や副作用を消失させてはならない」という点です。`ExpressionCannotThrow` や `SafeToReduceEvaluationCount` による事後条件判定は、この意味論的整合性を保証するために設けられています。
 
-## 70-5. 個別に解説する 38 本の Rule
+## 70-5. 個別に解説する 36 本の Rule
 
-残る 38 本の Rule（ド・モルガンの法則、吸収則、共通積因子の抽出など）は、
+残る 36 本の Rule（ド・モルガンの法則、吸収則、共通積因子の抽出など）は、
 適用条件や意味の検証を個別に説明する必要があります。各 Rule は、第 2 部の
 `part2-rules/expression/` で解説します。
 
@@ -352,5 +350,5 @@ Rule はインデックス照合を維持するため、整数型の列にも適
 - ブール論理の簡約（9 本）: `xor_boolean_identity.md`, `xor_to_or_and_not.md`, `absorption_and.md`, `absorption_and_reversed.md`, `absorption_or.md`, `absorption_or_reversed.md`, `boolean_filter_pullup.md`, `distribute_or_over_and_budgeted.md`, `boolean_eq_true_false_three_valued.md`
 - 文字列照合と正規表現（3 本）: `like_equality.md`, `not_like_equality.md`, `regexp_prefix_extraction.md`
 - NULL と三値論理（5 本）: `is_null_of_null_check.md`, `is_not_null_of_null_check.md`, `contradiction_from_null_eq.md`, `in_single_null.md`, `not_in_null_semantics.md`
-- 型変換と関数特性（7 本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `numeric_widening_cast.md`
+- 型変換と関数特性（8 本）: `collapse_nested_identical_cast.md`, `nullif_to_case.md`, `coalesce_and_nullif_simplification.md`, `deterministic_function_cse.md`, `datetime_and_string_fold_extent.md`, `json_path_constant_fold.md`, `json_family_constant_fold.md`, `numeric_widening_cast.md`
 - 述語推論と因子展開（5 本）: `factor_or_common_and.md`, `or_of_ranges_to_in.md`, `interval_normalize.md`, `predicate_pushdown_case.md`, `inner_join_not_null_inference.md`

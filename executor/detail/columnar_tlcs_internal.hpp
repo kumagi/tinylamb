@@ -170,6 +170,15 @@ struct RuntimeAggState {
   const char* str_ptr{nullptr};
   uint32_t str_len{0};
   bool has_value{false};
+  // GoogleSQL MIN/MAX NaN poisoning: any NaN input sets this bit and the
+  // emitted MIN/MAX double is NaN, regardless of the stored extreme.
+  bool saw_nan{false};
+  // Order-preserving / table-owned dictionary tracking for `kMinVarChar` /
+  // `kMaxVarChar` (Lean: ClickBenchDiscovery.lean
+  // order_preserving_dict_min_code_sound, unsorted_dict_min_code_bug).
+  const LSTableColumnDictionary* dict_ptr{nullptr};
+  uint8_t dict_code{0};
+  bool dict_byte_sorted{false};
   std::unique_ptr<FlatIntKeyMap<uint8_t>> distinct_ints;
   // Keys are string_views into PagedStringArena storage (interned once per
   // distinct value), so counting distinct VARCHARs does not allocate a
@@ -348,19 +357,67 @@ struct ColumnarStageSchedule {
   std::vector<slot_t> stage1a_cols;
   std::vector<slot_t> stage1b_cols;
   std::vector<uint8_t> stage1b_len_only;
+  // Full-string residual filter columns without a positive substring precheck
+  // (e.g. `URL NOT LIKE '%.google.%'` alongside `Title LIKE '%Google%'`),
+  // decoded only after `stage1b` and `stage1a` survive!
+  std::vector<slot_t> stage1c_cols;
   std::vector<uint8_t> col_in_payload;
   std::vector<slot_t> stage2_cols;
   std::vector<uint8_t> stage2_len_only;
+  // Conditional `CASE WHEN` target columns decoded only when at least one
+  // surviving row in the block satisfies the guard conjunction (Lean:
+  // ClickBenchDiscovery.lean conditional_key_disjoint_partition_sound).
+  std::vector<slot_t> cond_cols;
+  std::vector<std::vector<TypedFilterCompare>> cond_guards;
 };
 
 struct BlockDecodeScratch {
   TlcsFile::DecodedBlock blk1a;
   TlcsFile::DecodedBlock blk1b;
+  TlcsFile::DecodedBlock blk1c;
   TlcsFile::DecodedBlock blk2;
+  TlcsFile::DecodedBlock blk_cond;
   std::vector<uint8_t> io1a;
   std::vector<uint8_t> io1b;
+  std::vector<uint8_t> io1c;
   std::vector<uint8_t> io2;
+  std::vector<uint8_t> io_cond;
 };
+
+// Reconstructs full key specifications (minus redundant functionally dependent
+// `kColInt64Delta` or `kConstInt64` keys when collapsed) -> physical keys
+// (Lean: ClickBenchDiscovery.lean group_by_functional_expr_reduction_sound,
+// group_by_overflow_expr_drop_bug).
+struct KeyProjectionMap {
+  std::vector<ColGroupKeySpec> phys_specs;
+  std::vector<int32_t> full_to_phys;
+  std::vector<int32_t> delta_base_phys;
+
+  void ReconstructFull(const std::vector<ColGroupKeySpec>& full_specs,
+                       const RuntimeKeyCell* phys_cells,
+                       RuntimeKeyCell* out_full) const noexcept {
+    for (size_t i = 0; i < full_specs.size(); ++i) {
+      const int32_t p = full_to_phys[i];
+      if (p >= 0) {
+        out_full[i] = phys_cells[p];
+      } else if (full_specs[i].kind == ColKeyKind::kConstInt64) {
+        out_full[i] = RuntimeKeyCell{.int_val = full_specs[i].const_int};
+      } else {
+        const RuntimeKeyCell& base = phys_cells[delta_base_phys[i]];
+        if (base.is_null) {
+          out_full[i] = RuntimeKeyCell{.is_null = true};
+        } else {
+          out_full[i] =
+              RuntimeKeyCell{.int_val = base.int_val + full_specs[i].const_int};
+        }
+      }
+    }
+  }
+};
+
+StatusOr<KeyProjectionMap> BuildKeyProjectionMap(
+    const TlcsFile& tlcs, const std::vector<uint32_t>& candidate_blocks,
+    const std::vector<ColGroupKeySpec>& key_specs);
 
 ColumnarStageSchedule BuildColumnarStageSchedule(
     const Schema& table_schema, const ColumnarPredicateSet& preds,
@@ -428,10 +485,16 @@ struct TimestampPrefixCache {
     return true;
   }
 
+  static bool HasCanonicalUtcLen(std::string_view sv) noexcept {
+    return sv.size() == 19 ||
+           (sv.size() == 22 && sv[19] == '+' && sv[20] == '0' && sv[21] == '0');
+  }
+
   bool LookupOrVerifyDate(std::string_view sv, int64_t* yyyymmdd_out,
                           int64_t* hh_out, int64_t* mm_out,
                           int64_t* ss_out) noexcept {
-    if (sv.size() != 19 || !ParseCanonicalTime(sv, hh_out, mm_out, ss_out)) {
+    if (!HasCanonicalUtcLen(sv) ||
+        !ParseCanonicalTime(sv, hh_out, mm_out, ss_out)) {
       return false;
     }
     uint64_t w0 = 0;
@@ -461,7 +524,7 @@ struct TimestampPrefixCache {
   std::optional<int64_t> Trunc(std::string_view sv,
                                UtcTimestampTruncUnit unit) noexcept {
     if (unit == UtcTimestampTruncUnit::kMinute && last_trunc_valid &&
-        last_trunc_unit == unit && sv.size() == 19 &&
+        last_trunc_unit == unit && HasCanonicalUtcLen(sv) &&
         std::memcmp(sv.data(), last_trunc_prefix.data(), 16) == 0 &&
         sv[16] == ':' && sv[17] >= '0' && sv[17] <= '5' && sv[18] >= '0' &&
         sv[18] <= '9') {
@@ -499,7 +562,7 @@ struct TimestampPrefixCache {
                                  UtcTimestampTruncUnit unit) noexcept {
     if ((unit == UtcTimestampTruncUnit::kMinute ||
          unit == UtcTimestampTruncUnit::kHour) &&
-        last_ext_valid && last_ext_unit == unit && sv.size() == 19 &&
+        last_ext_valid && last_ext_unit == unit && HasCanonicalUtcLen(sv) &&
         std::memcmp(sv.data(), last_ext_prefix.data(), 16) == 0 &&
         sv[16] == ':' && sv[17] >= '0' && sv[17] <= '5' && sv[18] >= '0' &&
         sv[18] <= '9') {
@@ -522,14 +585,222 @@ struct TimestampPrefixCache {
   }
 };
 
+// Per-worker dictionary homomorphism + direct-mapped session memo cache for
+// `REGEXP_REPLACE(col, pat, rep)` group keys (ClickBench Q29; Lean:
+// ClickBenchDiscovery.lean dict_code_homomorphism_group_agg_sound).
+struct RegexReplaceCache {
+  static constexpr size_t kMemoSlots = 1024;
+  static constexpr size_t kMemoRingBytes = size_t{128} << 10;
+
+  struct DictCache {
+    const LSTableColumnDictionary* dict{nullptr};
+    const ColGroupKeySpec* spec{nullptr};
+    size_t entry_count{0};
+    std::array<uint32_t, 256> offsets{};
+    std::array<uint32_t, 256> lengths{};
+    std::string arena;
+  };
+
+  struct MemoSlot {
+    uint32_t gen{0};
+    uint64_t hash{0};
+    uint32_t in_off{0};
+    uint32_t in_len{0};
+    uint32_t out_off{0};
+    uint32_t out_len{0};
+  };
+
+  DictCache dict_cache;
+  const ColGroupKeySpec* memo_spec{nullptr};
+  uint32_t memo_gen{1};
+  size_t ring_pos{0};
+  std::vector<MemoSlot> slots;
+  std::vector<char> ring;
+
+  bool Eval(const ColGroupKeySpec& ks, const TlcsFile::DecodedColumnChunk& ch,
+            uint32_t row, std::string* fallback_scratch,
+            std::string_view* out_sv, Status* status_out) {
+    if (ch.dict_encoded && ch.dict != nullptr) {
+      const size_t nd = ch.dict->StringEntryCount();
+      if (nd <= 256 && row < ch.dict_codes.size() && ch.dict_codes[row] < nd) {
+        if (dict_cache.dict != ch.dict || dict_cache.spec != &ks) {
+          dict_cache.arena.clear();
+          dict_cache.arena.reserve(nd * 24);
+          for (size_t d = 0; d < nd; ++d) {
+            auto rep = ReplaceCheckedRegexView(
+                ch.dict->StringEntryAt(d), ks.regex_pattern,
+                ks.regex_replacement, fallback_scratch);
+            if (!rep.HasValue()) {
+              *status_out = rep.GetStatus();
+              return false;
+            }
+            const std::string_view rsv = rep.Value();
+            dict_cache.offsets[d] =
+                static_cast<uint32_t>(dict_cache.arena.size());
+            dict_cache.lengths[d] = static_cast<uint32_t>(rsv.size());
+            dict_cache.arena.append(rsv.data(), rsv.size());
+          }
+          dict_cache.dict = ch.dict;
+          dict_cache.spec = &ks;
+          dict_cache.entry_count = nd;
+        }
+        const uint8_t code = ch.dict_codes[row];
+        *out_sv =
+            std::string_view(dict_cache.arena.data() + dict_cache.offsets[code],
+                             dict_cache.lengths[code]);
+        return true;
+      }
+    }
+
+    const std::string_view in_sv = ch.VarcharAt(row);
+    if (in_sv.size() <= 4096) {
+      if (slots.empty()) {
+        slots.resize(kMemoSlots);
+        ring.resize(kMemoRingBytes);
+      }
+      if (memo_spec != &ks) {
+        memo_spec = &ks;
+        ++memo_gen;
+        if (memo_gen == 0) {
+          std::fill(slots.begin(), slots.end(), MemoSlot{});
+          memo_gen = 1;
+        }
+        ring_pos = 0;
+      }
+      const uint64_t h = HashView64(in_sv);
+      MemoSlot& sl = slots[static_cast<size_t>(h) & (kMemoSlots - 1)];
+      if (sl.gen == memo_gen && sl.hash == h && sl.in_len == in_sv.size() &&
+          (sl.in_len == 0 || std::memcmp(ring.data() + sl.in_off, in_sv.data(),
+                                         sl.in_len) == 0)) {
+        *out_sv = std::string_view(ring.data() + sl.out_off, sl.out_len);
+        return true;
+      }
+      auto rep = ReplaceCheckedRegexView(
+          in_sv, ks.regex_pattern, ks.regex_replacement, fallback_scratch);
+      if (!rep.HasValue()) {
+        *status_out = rep.GetStatus();
+        return false;
+      }
+      const std::string_view rsv = rep.Value();
+      const size_t need = in_sv.size() + rsv.size();
+      if (need <= kMemoRingBytes) {
+        if (ring_pos + need > kMemoRingBytes) {
+          ++memo_gen;
+          if (memo_gen == 0) {
+            std::fill(slots.begin(), slots.end(), MemoSlot{});
+            memo_gen = 1;
+          }
+          ring_pos = 0;
+        }
+        const auto ioff = static_cast<uint32_t>(ring_pos);
+        if (!in_sv.empty()) {
+          std::memcpy(ring.data() + ring_pos, in_sv.data(), in_sv.size());
+          ring_pos += in_sv.size();
+        }
+        const auto ooff = static_cast<uint32_t>(ring_pos);
+        if (!rsv.empty()) {
+          std::memcpy(ring.data() + ring_pos, rsv.data(), rsv.size());
+          ring_pos += rsv.size();
+        }
+        sl = {.gen = memo_gen,
+              .hash = h,
+              .in_off = ioff,
+              .in_len = static_cast<uint32_t>(in_sv.size()),
+              .out_off = ooff,
+              .out_len = static_cast<uint32_t>(rsv.size())};
+        *out_sv = std::string_view(ring.data() + ooff, sl.out_len);
+        return true;
+      }
+      *out_sv = rsv;
+      return true;
+    }
+
+    auto rep = ReplaceCheckedRegexView(in_sv, ks.regex_pattern,
+                                       ks.regex_replacement, fallback_scratch);
+    if (!rep.HasValue()) {
+      *status_out = rep.GetStatus();
+      return false;
+    }
+    *out_sv = rep.Value();
+    return true;
+  }
+};
+
+inline bool RowMatchesCaseConditions(
+    const std::vector<TypedFilterCompare>& conds,
+    const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
+    uint32_t row) noexcept {
+  for (const auto& cc : conds) {
+    const auto* cch = col_ptrs[cc.left];
+    if (cch == nullptr || cch->IsNull(row)) {
+      return false;
+    }
+    const int64_t lv = cch->int_cells[row];
+    bool cmp_ok = false;
+    switch (cc.op) {
+      case BinaryOperation::kEquals:
+        cmp_ok = lv == cc.int_constant;
+        break;
+      case BinaryOperation::kNotEquals:
+        cmp_ok = lv != cc.int_constant;
+        break;
+      case BinaryOperation::kLessThan:
+        cmp_ok = lv < cc.int_constant;
+        break;
+      case BinaryOperation::kLessThanEquals:
+        cmp_ok = lv <= cc.int_constant;
+        break;
+      case BinaryOperation::kGreaterThan:
+        cmp_ok = lv > cc.int_constant;
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        cmp_ok = lv >= cc.int_constant;
+        break;
+      default:
+        cmp_ok = false;
+        break;
+    }
+    if (!cmp_ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline bool ExtractSingleKeyCell(
     const ColGroupKeySpec& ks,
     const std::vector<const TlcsFile::DecodedColumnChunk*>& col_ptrs,
     uint32_t row, RuntimeKeyCell* out_cell, std::string* regex_scratch,
-    TimestampPrefixCache* ts_cache, Status* status_out) {
+    TimestampPrefixCache* ts_cache, Status* status_out,
+    RegexReplaceCache* regex_cache = nullptr) {
   *out_cell = RuntimeKeyCell{};
   if (ks.kind == ColKeyKind::kConstInt64) {
     out_cell->int_val = ks.const_int;
+    return true;
+  }
+  // Lean proof: lean/TinylambOpt/ClickBenchDiscovery.lean
+  // (conditional_key_disjoint_partition_sound): evaluate `CASE WHEN` guard
+  // columns BEFORE touching `col_ptrs[ks.full_col]` so blocks where 0 surviving
+  // rows satisfy `ks.case_conditions` never need to decode `ks.full_col`, and
+  // `CASE WHEN false THEN NULL ELSE '' END` evaluates to `''`, not `NULL`.
+  if (ks.kind == ColKeyKind::kCaseWhenVarChar) {
+    if (!RowMatchesCaseConditions(ks.case_conditions, col_ptrs, row)) {
+      if (ks.case_else_is_null) {
+        out_cell->is_null = true;
+      } else {
+        out_cell->str_ptr = ks.case_else_str.data();
+        out_cell->str_len = static_cast<uint32_t>(ks.case_else_str.size());
+      }
+      return true;
+    }
+    const auto* ch = col_ptrs[ks.full_col];
+    if (ch->IsNull(row)) {
+      out_cell->is_null = true;
+      return true;
+    }
+    const auto sv = ch->VarcharAt(row);
+    out_cell->str_ptr = sv.data();
+    out_cell->str_len = static_cast<uint32_t>(sv.size());
     return true;
   }
   const auto* ch = col_ptrs[ks.full_col];
@@ -587,57 +858,18 @@ inline bool ExtractSingleKeyCell(
       out_cell->int_val = *packed;
       return true;
     }
-    case ColKeyKind::kCaseWhenVarChar: {
-      bool matched = true;
-      for (const auto& cc : ks.case_conditions) {
-        const auto* cch = col_ptrs[cc.left];
-        if (cch->IsNull(row)) {
-          matched = false;
-          break;
+    case ColKeyKind::kCaseWhenVarChar:
+      return true;
+    case ColKeyKind::kRegexReplaceVarChar: {
+      if (regex_cache != nullptr) {
+        std::string_view sv;
+        if (!regex_cache->Eval(ks, *ch, row, regex_scratch, &sv, status_out)) {
+          return false;
         }
-        const int64_t lv = cch->int_cells[row];
-        bool cmp_ok = false;
-        switch (cc.op) {
-          case BinaryOperation::kEquals:
-            cmp_ok = lv == cc.int_constant;
-            break;
-          case BinaryOperation::kNotEquals:
-            cmp_ok = lv != cc.int_constant;
-            break;
-          case BinaryOperation::kLessThan:
-            cmp_ok = lv < cc.int_constant;
-            break;
-          case BinaryOperation::kLessThanEquals:
-            cmp_ok = lv <= cc.int_constant;
-            break;
-          case BinaryOperation::kGreaterThan:
-            cmp_ok = lv > cc.int_constant;
-            break;
-          case BinaryOperation::kGreaterThanEquals:
-            cmp_ok = lv >= cc.int_constant;
-            break;
-          default:
-            cmp_ok = false;
-            break;
-        }
-        if (!cmp_ok) {
-          matched = false;
-          break;
-        }
-      }
-      if (matched) {
-        const auto sv = ch->VarcharAt(row);
         out_cell->str_ptr = sv.data();
         out_cell->str_len = static_cast<uint32_t>(sv.size());
-      } else if (ks.case_else_is_null) {
-        out_cell->is_null = true;
-      } else {
-        out_cell->str_ptr = ks.case_else_str.data();
-        out_cell->str_len = static_cast<uint32_t>(ks.case_else_str.size());
+        return true;
       }
-      return true;
-    }
-    case ColKeyKind::kRegexReplaceVarChar: {
       auto rep = ReplaceCheckedRegexView(ch->VarcharAt(row), ks.regex_pattern,
                                          ks.regex_replacement, regex_scratch);
       if (!rep.HasValue()) {

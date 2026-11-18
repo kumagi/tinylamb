@@ -157,4 +157,63 @@ TEST_F(SqlDmlPathsCoverageTest, DmlOnSecondTableKeepsScansIndependent) {
   ExpectRows("SELECT k FROM a ORDER BY k", {Row({Value(2)})});
 }
 
+// A duplicate SET target names a real column: the per-column loop adopts the
+// first entry and leaves the second unconsumed, so the residual check used to
+// answer "target not found: a" for a column that exists (and on a single-column
+// table it fell into the proto path and blamed the TEXT payload). Both are
+// second-order lies about a duplicate assignment.
+TEST_F(SqlDmlPathsCoverageTest, DuplicateSetTargetReportsDuplicateNotMissing) {
+  Query("CREATE TABLE m (a INT64, b INT64)");
+  Query("INSERT INTO m VALUES (1, 2)");
+  const auto message_of = [this](const std::string& sql) {
+    try {
+      Query(sql);
+      return std::string("<no error>");
+    } catch (const std::runtime_error& error) {
+      return std::string(error.what());
+    }
+  };
+  const std::string twice = message_of("UPDATE m SET a = 5, a = 6");
+  EXPECT_NE(twice.find("appears more than once"), std::string::npos) << twice;
+  EXPECT_EQ(twice.find("not found"), std::string::npos) << twice;
+  // A case-variant spelling of the same column is the same duplicate.
+  const std::string twice_case = message_of("UPDATE m SET a = 5, A = 6");
+  EXPECT_NE(twice_case.find("appears more than once"), std::string::npos)
+      << twice_case;
+  // Single-column (proto) table: the duplicate must not be re-labelled as a
+  // malformed TEXT payload.
+  Query("CREATE TABLE s1 (k INT64)");
+  Query("INSERT INTO s1 VALUES (1)");
+  const std::string twice_single = message_of("UPDATE s1 SET k = 5, k = 6");
+  EXPECT_NE(twice_single.find("appears more than once"), std::string::npos)
+      << twice_single;
+  EXPECT_EQ(twice_single.find("malformed proto"), std::string::npos)
+      << twice_single;
+  // A genuinely unknown target is still a missing-column diagnostic.
+  const std::string missing = message_of("UPDATE m SET zz = 5");
+  EXPECT_NE(missing.find("target not found"), std::string::npos) << missing;
+  // Nothing was modified by the rejected statements.
+  ExpectRows("SELECT a, b FROM m", {Row({Value(1), Value(2)})});
+}
+
+// A STRUCT-shaped text INSERT into a multi-column table expands member-wise,
+// and its string members must decode the full JSON escape set. The local
+// decoder handled only \n \t \r and dropped the backslash of anything else, so
+// "caf\u00e9" was silently stored as the literal text "cafu00e9".
+TEST_F(SqlDmlPathsCoverageTest, StructTextInsertDecodesJsonEscapes) {
+  Query("CREATE TABLE j2 (a STRING(MAX), b INT64)");
+  // The SQL literal's doubled backslash reaches the decoder as one backslash.
+  Query(R"(INSERT INTO j2 VALUES ('{"caf\\u00e9", 2}'))");
+  ExpectRows("SELECT a, b FROM j2",
+             {Row({Value(std::string("caf\xC3\xA9")), Value(2)})});
+  // The short escapes, including the \b / \f forms that were missing.
+  Query("CREATE TABLE j3 (s STRING(MAX))");
+  Query(R"(INSERT INTO j3 VALUES ('{"a\\tb\\fc"}'))");
+  ExpectRows("SELECT s FROM j3", {Row({Value(std::string("a\tb\fc"))})});
+  // A surrogate pair decodes to its astral code point (U+1F600).
+  Query(R"(INSERT INTO j3 VALUES ('{"\\ud83d\\ude00"}'))");
+  ExpectRows("SELECT s FROM j3",
+             {Row({Value(std::string("\xF0\x9F\x98\x80"))})});
+}
+
 }  // namespace tinylamb

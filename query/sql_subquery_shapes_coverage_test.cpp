@@ -308,9 +308,7 @@ TEST_F(SqlSubqueryShapesCoverageTest, CorrelatedRowValueIn) {
 
 TEST_F(SqlSubqueryShapesCoverageTest, SubqueriesInHavingAndDerived) {
   // Groups whose total exceeds the constant-scalar 4: cust 10 (12.5) and
-  // the NULL-cust group (9.0).
-  // Groups whose total exceeds the constant-scalar 4: cust 10 (12.5) and
-  // the NULL-cust group (9.0).  Only the set is pinned: NULL ordering
+  // the NULL-cust group (9.0). Only the set is pinned: NULL ordering
   // relative to values is a per-plan detail here.
   const auto rows = Query(
       "SELECT cust FROM orders GROUP BY cust "

@@ -24,7 +24,11 @@ bool ParseLocation(std::string& label, size_t* start, size_t* end) {
   if (open == std::string::npos) {
     return false;
   }
-  const size_t dash = label.find('-', open + 2);
+  // The end offset follows the LAST '-' in the location range.
+  const size_t dash = label.rfind('-', label.size() - 2);
+  if (dash == std::string::npos || dash < open + 2) {
+    return false;
+  }
   if (dash == std::string::npos) {
     return false;
   }
@@ -86,6 +90,7 @@ bool LabelContinues(std::string_view label) {
     if (cursor >= label.size()) {
       return true;
     }
+    const bool raw = cursor > label.find('(') + 1;
     const char quote = label[cursor];
     if (quote != '\'' && quote != '"') {
       return false;
@@ -96,7 +101,7 @@ bool LabelContinues(std::string_view label) {
     const size_t quote_size = triple ? 3 : 1;
     cursor += quote_size;
     for (; cursor < label.size(); ++cursor) {
-      if (label[cursor] == '\\') {
+      if (!raw && label[cursor] == '\\') {
         ++cursor;
       } else if (label[cursor] == quote &&
                  (!triple ||
@@ -181,7 +186,8 @@ StatusOr<std::unique_ptr<GoogleSqlAstNode>> GoogleSqlAstParser::Parse(
       ++spaces;
     }
     if (spaces % 2 != 0 || spaces == full_line.size()) {
-      return Status::kUnknown;
+      return StatusError(StatusCode::kInvalidArgument,
+                         "malformed AST dump indentation");
     }
     const size_t depth = spaces / 2;
     if (depth >= kMaxGoogleSqlAstDepth) {

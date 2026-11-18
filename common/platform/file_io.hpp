@@ -43,8 +43,16 @@ struct OpenFlags {
 int OpenFile(const std::filesystem::path& path, OpenFlags flags,
              int mode = 0666);
 
-// Closes a descriptor returned by OpenFile / OpenWriteFailingDescriptor.
+// Closes a descriptor returned by OpenFile / OpenUnlinkedTempFile.
 int CloseFile(int fd);
+
+// Opens a writable, unlinked temporary file whose backing blocks are reclaimed
+// automatically on CloseFile or process exit. If `dir` is empty, selects
+// `std::filesystem::temp_directory_path()` (falling back to `.`).
+// Linux uses `O_TMPFILE` with `mkstemp` + immediate `unlink` fallback;
+// other POSIX uses `mkstemp` + `unlink`; Windows uses DELETE_ON_CLOSE.
+// Returns fd >= 0 on success, or -1 with errno set on failure.
+int OpenUnlinkedTempFile(const std::filesystem::path& dir = {});
 
 // Duplicates `oldfd` onto `newfd` (dup2 semantics: returns `newfd` on success
 // and -1 with errno set on failure, even on Windows where _dup2 returns 0).

@@ -17,6 +17,7 @@
 #include "expression/expression.hpp"
 #include "expression/rewrite.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/schema.hpp"
 #include "type/value.hpp"
@@ -82,11 +83,17 @@ int MergeJoin::CompareKeys(const Row& left, const Row& right) const {
     // cross-type order is the ValueType tag order (INT64 < VARCHAR < DOUBLE
     // < DATE < ARRAY). CompareForOrderBy ranks DOUBLE before VARCHAR; walking
     // with that order against tag-ordered input skips matching runs. Steer
-    // the cursors by the same order the inputs were sorted in.
+    // the cursors by the same order the inputs were sorted in.  For
+    // case-insensitive VARCHAR pairs that order is the folded order
+    // (CompareUnderCollation), not the raw byte order of CompareForOrderBy --
+    // otherwise a CI pair like "B" vs "a" steers the wrong cursor and drops a
+    // matching run (P342).
     if (!lhs.IsNull() && !rhs.IsNull() && lhs.type != rhs.type) {
       return static_cast<int>(lhs.type) < static_cast<int>(rhs.type) ? -1 : 1;
     }
-    return CompareForOrderBy(lhs, rhs) < 0 ? -1 : 1;
+    return CompareUnderCollation(lhs, rhs, ResolveCollation(lhs, rhs)) < 0
+               ? -1
+               : 1;
   }
   return 0;
 }

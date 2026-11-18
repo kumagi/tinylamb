@@ -101,7 +101,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.ExtractYearSargableAddsScanRange`
+- `plan/cascades_test_part3.cpp`: `CascadesTest.ExtractYearSargableAddsScanRange`
   - `EXTRACT(YEAR FROM d) = 2026` を持つ論理プランにおいて、対象テーブルの scan filter に `d >= 2026-01-01` かつ `d < 2027-01-01` の境界条件が追加されることを検証。
-- `query/query_test.cpp`: `QueryTest.SqlEngineExtractYearPredicateUsesDateRange`
+- `query/query_test_part3.cpp`: `QueryTest.SqlEngineExtractYearPredicateUsesDateRange`
   - SQL クエリ実行において、年抽出フィルタが日付範囲インデックス走査として評価され、正確な結果タプルを返すことを end-to-end で検証。

@@ -103,4 +103,4 @@ UNION DISTINCT に対しては、重複排除が分岐をまたいで行われ�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UnionAllLimitCapsEveryChildAndKeepsGlobalLimit`: `Limit(3, offset=2)` の下の各枝に `count=5, offset=0` の Limit が配置され、全体として元の Limit(3, 2) が維持されることを検証します。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.UnionAllLimitCapsEveryChildAndKeepsGlobalLimit`: `Limit(3, offset=2)` の下の各枝に `count=5, offset=0` の Limit が配置され、全体として元の Limit(3, 2) が維持されることを検証します。

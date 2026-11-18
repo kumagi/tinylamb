@@ -161,7 +161,7 @@ guard は次の 2 つだけです。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.PushNotThroughExpression` —
+- `plan/cascades_test_part*.cpp` の `CascadesTest.PushNotThroughExpression` —
   `NOT (t.v < 10)` を探索すると、`kGreaterThanEquals` の述語を持つ
   Selection 代替が現れることを検証します。
 - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms` —

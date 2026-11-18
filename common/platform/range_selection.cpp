@@ -16,11 +16,12 @@ namespace {
 uint32_t SelectScalar(const int64_t* values, uint32_t count, int64_t lower,
                       int64_t upper, uint32_t* output) {
   uint32_t selected = 0;
-  const uint64_t lo = static_cast<uint64_t>(lower);
+  const auto lo = static_cast<uint64_t>(lower);
   const uint64_t span = static_cast<uint64_t>(upper) - lo;
   for (uint32_t row = 0; row < count; ++row) {
-    if (static_cast<uint64_t>(values[row]) - lo <= span)
+    if (static_cast<uint64_t>(values[row]) - lo <= span) {
       output[selected++] = row;
+}
   }
   return selected;
 }
@@ -31,7 +32,7 @@ uint32_t CompactDoubleScalar(const int64_t* values, uint32_t* positions,
   uint32_t out = 0;
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t row = positions[i];
-    const double v = std::bit_cast<double>(values[row]);
+    const auto v = std::bit_cast<double>(values[row]);
     const bool hit = (lower_inclusive ? v >= lower : v > lower) &
                      (upper_inclusive ? v <= upper : v < upper);
     positions[out] = row;
@@ -40,7 +41,7 @@ uint32_t CompactDoubleScalar(const int64_t* values, uint32_t* positions,
   return out;
 }
 
-#if defined(TINYLAMB_RANGE_X86)
+#ifdef TINYLAMB_RANGE_X86
 __attribute__((target("avx2"))) uint32_t SelectAvx2(const int64_t* values,
                                                     uint32_t count,
                                                     int64_t lower,
@@ -63,8 +64,10 @@ __attribute__((target("avx2"))) uint32_t SelectAvx2(const int64_t* values,
       mask &= mask - 1;
     }
   }
-  for (; row < count; ++row)
-    if (values[row] >= lower && values[row] <= upper) output[selected++] = row;
+  for (; row < count; ++row) {
+    if (values[row] >= lower && values[row] <= upper) { output[selected++] = row;
+}
+}
   return selected;
 }
 
@@ -85,8 +88,10 @@ SelectAvx512(const int64_t* values, uint32_t count, int64_t lower,
     _mm256_mask_compressstoreu_epi32(output + selected, mask, positions);
     selected += std::popcount(static_cast<uint32_t>(mask));
   }
-  for (; row < count; ++row)
-    if (values[row] >= lower && values[row] <= upper) output[selected++] = row;
+  for (; row < count; ++row) {
+    if (values[row] >= lower && values[row] <= upper) { output[selected++] = row;
+}
+}
   return selected;
 }
 template <bool lower_inclusive, bool upper_inclusive>
@@ -111,10 +116,11 @@ CompactDoubleAvx512(const int64_t* values, uint32_t* positions, uint32_t count,
   }
   for (; i < count; ++i) {
     const uint32_t row = positions[i];
-    const double v = std::bit_cast<double>(values[row]);
+    const auto v = std::bit_cast<double>(values[row]);
     if ((lower_inclusive ? v >= lower : v > lower) &
-        (upper_inclusive ? v <= upper : v < upper))
+        (upper_inclusive ? v <= upper : v < upper)) {
       positions[out++] = row;
+}
   }
   return out;
 }
@@ -126,13 +132,16 @@ CompactDoubleAvx512(const int64_t* values, uint32_t* positions, uint32_t count,
 uint32_t SelectInt64ClosedRange(const int64_t* values, uint32_t count,
                                 int64_t lower, int64_t upper,
                                 uint32_t* output) {
-  if (lower > upper || count == 0) return 0;
+  if (lower > upper || count == 0) { return 0;
+}
   using Kernel = decltype(&SelectScalar);
   static const Kernel kernel = []() -> Kernel {
-#if defined(TINYLAMB_RANGE_X86)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl"))
+#ifdef TINYLAMB_RANGE_X86
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl")) {
       return SelectAvx512;
-    if (__builtin_cpu_supports("avx2")) return SelectAvx2;
+}
+    if (__builtin_cpu_supports("avx2")) { return SelectAvx2;
+}
 #endif
     return SelectScalar;
   }();
@@ -147,17 +156,18 @@ uint32_t CompactDoubleRange(const int64_t* values, uint32_t* positions,
     struct Kernels {
       Kernel functions[4];
     };
-#if defined(TINYLAMB_RANGE_X86)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl"))
+#ifdef TINYLAMB_RANGE_X86
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl")) {
       return Kernels{
           {CompactDoubleAvx512<false, false>, CompactDoubleAvx512<false, true>,
            CompactDoubleAvx512<true, false>, CompactDoubleAvx512<true, true>}};
+}
 #endif
     return Kernels{
         {CompactDoubleScalar<false, false>, CompactDoubleScalar<false, true>,
          CompactDoubleScalar<true, false>, CompactDoubleScalar<true, true>}};
   }();
-  return kernels.functions[2 * lower_inclusive + upper_inclusive](
+  return kernels.functions[(2 * static_cast<int>(lower_inclusive)) + static_cast<int>(upper_inclusive)](
       values, positions, count, lower, upper);
 }
 

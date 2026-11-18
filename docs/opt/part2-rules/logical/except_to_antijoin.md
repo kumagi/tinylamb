@@ -91,5 +91,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`: `CascadesTest.ExceptToAntiJoinRewrite`
+- `plan/cascades_test_part2.cpp`: `CascadesTest.ExceptToAntiJoinRewrite`
   - `kExcept` 式に対して本 Rule が適用され、同一の子ノードを持つ `kAntiJoin` 式が Memo 内に登録されることを検証。

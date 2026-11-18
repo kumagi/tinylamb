@@ -50,7 +50,7 @@
 namespace tinylamb {
 namespace {
 
-// PrefetchingIndexScan: how many entries the look-ahead cursor runs ahead of
+// IndexScan prefetch: how many entries the look-ahead cursor runs ahead of
 // the main iterator.  One prefetch per main step keeps the lead constant, so
 // the page the scan is about to need is fetched while the previous row is
 // still being processed -- the I/O is grouped ahead of the consumer instead

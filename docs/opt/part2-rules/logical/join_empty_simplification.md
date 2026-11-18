@@ -105,5 +105,5 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part2.cpp`:
   - `CascadesTest.JoinEmptySimplification`: 左入力グループに `kEmpty` を持つ `kJoin` 式を探索した際、結合グループ内に `kEmpty` 式が正しく追加されることを検証。

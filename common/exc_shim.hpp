@@ -4,8 +4,7 @@
 // may still throw.  Layers converted to Status/StatusOr keep their old
 // throwing entry points as thin wrappers around this helper so engine layers
 // that have not been converted yet preserve their current behaviour
-// (throw -> boundary catch).  Phase 7 removes every call site of
-// ExcShimUnwrap and deletes this file; grep for "ExcShimUnwrap" to audit.
+// (throw -> boundary catch).  Prefer the Try* APIs for new code.
 //
 #ifndef TINYLAMB_EXC_SHIM_HPP
 #define TINYLAMB_EXC_SHIM_HPP

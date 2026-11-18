@@ -16,7 +16,7 @@ TEST(RangeSelectionTest, SignedBoundsTailsAndUnalignedBuffers) {
   uint64_t seed = 42;
   std::vector<int64_t> input(1026);
   for (size_t i = 0; i < input.size(); ++i) {
-    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    seed = (seed * 6364136223846793005ULL) + 1442695040888963407ULL;
     input[i] = i % 7 == 0    ? low
                : i % 11 == 0 ? high
                : i % 3 == 0  ? static_cast<int64_t>(i % 17) - 8
@@ -29,9 +29,11 @@ TEST(RangeSelectionTest, SignedBoundsTailsAndUnalignedBuffers) {
   for (uint32_t count = 0; count <= 1024; ++count) {
     for (const auto [lower, upper] : ranges) {
       std::vector<uint32_t> expected;
-      for (uint32_t row = 0; row < count; ++row)
-        if (input[row + 1] >= lower && input[row + 1] <= upper)
+      for (uint32_t row = 0; row < count; ++row) {
+        if (input[row + 1] >= lower && input[row + 1] <= upper) {
           expected.push_back(row);
+}
+}
       std::vector<uint32_t> output(count + 2, UINT32_MAX);
       const uint32_t size = SelectInt64ClosedRange(
           input.data() + 1, count, lower, upper, output.data() + 1);
@@ -50,7 +52,9 @@ TEST(RangeSelectionTest, DoubleCompactionKeepsOrderNanInfinityAndTails) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const std::vector<double> values{nan, -inf, inf, -0.0, 0.0, -1, 1, 2, 0.5};
   std::vector<int64_t> cells;
-  for (const double v : values) cells.push_back(std::bit_cast<int64_t>(v));
+  cells.reserve(values.size());
+for (const double v : values) { cells.push_back(std::bit_cast<int64_t>(v));
+}
   for (uint32_t count = 0; count < 128; ++count) {
     for (const double lo : values) {
       for (const double hi : values) {
@@ -62,8 +66,9 @@ TEST(RangeSelectionTest, DoubleCompactionKeepsOrderNanInfinityAndTails) {
               positions[i + 1] = row;
               const double v = values[row];
               if ((lower_inclusive ? v >= lo : v > lo) &&
-                  (upper_inclusive ? v <= hi : v < hi))
+                  (upper_inclusive ? v <= hi : v < hi)) {
                 expected.push_back(row);
+}
             }
             const uint32_t size =
                 CompactDoubleRange(cells.data(), positions.data() + 1, count,

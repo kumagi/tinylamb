@@ -1,6 +1,6 @@
 # Verify that uuid value returned by NEW_UUID() satisfies the form:
 # xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx
-# where 'x' represents a lowercase hexidecimal digit.
+# where 'x' represents a lowercase hexadecimal digit.
 [default required_features=UUID_TYPE]
 [name=regexp]
 SELECT

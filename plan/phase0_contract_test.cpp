@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -336,49 +339,144 @@ TEST_F(Phase0ContractTest, SqlCascadesAndDirectExecutorShareExpectedRows) {
   EXPECT_EQ(direct_rows, expected);
 }
 
+// The Phase 0 manifest is normative prose in docs/cascades_optimizer.md, not
+// something the test may invent.  Read it and make the executed matrix answer
+// to the document, so dropping a todo or a semantic class from either side is
+// a real failure instead of a tautology.
+static std::string_view SemanticDocName(Semantic semantic) {
+  switch (semantic) {
+    case Semantic::kSuccess:
+      return "success";
+    case Semantic::kNull:
+      return "NULL";
+    case Semantic::kEmpty:
+      return "empty-input";
+    case Semantic::kDuplicate:
+      return "duplicate";
+    case Semantic::kBoundary:
+      return "boundary";
+    case Semantic::kError:
+      return "error";
+  }
+  return {};
+}
+
+static std::string LoadPhase0ManifestDoc() {
+  std::error_code ec;
+  std::filesystem::path dir = std::filesystem::current_path(ec);
+  for (int depth = 0; depth < 8 && !ec && !dir.empty(); ++depth) {
+    const std::filesystem::path doc = dir / "docs" / "cascades_optimizer.md";
+    if (std::filesystem::is_regular_file(doc, ec)) {
+      std::ifstream in(doc);
+      std::ostringstream contents;
+      contents << in.rdbuf();
+      return contents.str();
+    }
+    const std::filesystem::path parent = dir.parent_path();
+    if (parent.empty() || parent == dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return {};
+}
+
+static std::optional<size_t> ParseTodoNumber(const std::string& text, size_t& pos,
+                                      size_t limit) {
+  while (pos < limit &&
+         (std::isdigit(static_cast<unsigned char>(text[pos])) == 0)) {
+    ++pos;
+  }
+  size_t value = 0;
+  bool found = false;
+  while (pos < limit && (std::isdigit(static_cast<unsigned char>(text[pos])) != 0)) {
+    value = (value * 10) + static_cast<size_t>(text[pos] - '0');
+    ++pos;
+    found = true;
+  }
+  return found ? std::optional<size_t>(value) : std::nullopt;
+}
+
+struct ManifestClaim {
+  std::string semantic_classes;
+  std::optional<size_t> first_todo;
+  std::optional<size_t> last_todo;
+};
+
+static ManifestClaim ParsePhase0Manifest(const std::string& doc) {
+  constexpr std::string_view kIntro = "manifest repeats the ";
+  constexpr std::string_view kRange = "cases for Phase 0 items ";
+  ManifestClaim claim;
+  const size_t begin = doc.find(kIntro);
+  if (begin == std::string::npos) {
+    return claim;
+  }
+  const size_t classes_begin = begin + kIntro.size();
+  const size_t classes_end = doc.find(kRange, classes_begin);
+  if (classes_end == std::string::npos) {
+    return claim;
+  }
+  claim.semantic_classes =
+      doc.substr(classes_begin, classes_end - classes_begin);
+  size_t pos = classes_end + kRange.size();
+  const size_t limit = std::min(doc.size(), pos + 32);
+  claim.first_todo = ParseTodoNumber(doc, pos, limit);
+  claim.last_todo = ParseTodoNumber(doc, pos, limit);
+  return claim;
+}
+
 TEST_F(Phase0ContractTest, ManifestCoversEveryTodoAndSemanticClass) {
+  constexpr size_t kFirstTodo = 55;
+  constexpr size_t kLastTodo = 59;
+
+  const std::string doc = LoadPhase0ManifestDoc();
+  ASSERT_FALSE(doc.empty()) << "docs/cascades_optimizer.md not found relative "
+                               "to the working directory";
+  const ManifestClaim claim = ParsePhase0Manifest(doc);
+  ASSERT_FALSE(claim.semantic_classes.empty())
+      << "Phase 0 manifest sentence not found in docs/cascades_optimizer.md";
+  ASSERT_TRUE(claim.first_todo.has_value());
+  ASSERT_TRUE(claim.last_todo.has_value());
+  EXPECT_EQ(claim.first_todo.value(), kFirstTodo);
+  EXPECT_EQ(claim.last_todo.value(), kLastTodo);
+  // Six classes => five separators in the documented comma-separated list.
+  EXPECT_EQ(std::count(claim.semantic_classes.begin(),
+                       claim.semantic_classes.end(), ','),
+            5);
+  for (const Semantic semantic : kSemantics) {
+    EXPECT_NE(claim.semantic_classes.find(SemanticDocName(semantic)),
+              std::string::npos)
+        << "undocumented semantic class: " << SemanticDocName(semantic);
+  }
+
   struct Entry {
     size_t todo;
     Semantic semantic;
   };
   std::vector<Entry> manifest;
-  for (size_t todo = 55; todo <= 59; ++todo) {
+  for (size_t todo = kFirstTodo; todo <= kLastTodo; ++todo) {
     for (const Semantic semantic : kSemantics) {
       manifest.push_back(Entry{.todo = todo, .semantic = semantic});
     }
   }
   ASSERT_EQ(manifest.size(), 30U);
-  for (size_t todo = 55; todo <= 59; ++todo) {
-    for (const Semantic semantic : kSemantics) {
-      const auto found =
-          std::ranges::find_if(manifest, [todo, semantic](const Entry& entry) {
-            return entry.todo == todo && entry.semantic == semantic;
-          });
-      ASSERT_NE(found, manifest.end());
-    }
-  }
 
   if (!GoogleSqlFrontend::Available()) {
     GTEST_SKIP();
   }
-  std::array<std::vector<Row>, 6> results;
-  std::array<bool, 6> ran{};
+  // Every (todo, semantic) pair must actually run its SQL.  Caching one result
+  // per semantic class made the five todo iterations indistinguishable.
   for (const Entry& entry : manifest) {
-    const auto index = static_cast<size_t>(entry.semantic);
-    if (!ran[index]) {
-      if (entry.semantic == Semantic::kError) {
-        const StatusOr<Executor> prepared =
-            engine_->Prepare(*context_, SemanticSql(entry.semantic));
-        EXPECT_FALSE(prepared.HasValue());
-        EXPECT_NE(prepared.GetStatus(), Status::kSuccess);
-      } else {
-        results[index] = RunSql(SemanticSql(entry.semantic));
-      }
-      ran[index] = true;
-    }
-    if (entry.semantic != Semantic::kError) {
-      EXPECT_EQ(results[index], ExpectedRows(entry.semantic))
-          << "todo=" << entry.todo;
+    SCOPED_TRACE("todo=" + std::to_string(entry.todo) +
+                 " semantic=" + std::string(SemanticDocName(entry.semantic)));
+    if (entry.semantic == Semantic::kError) {
+      const StatusOr<Executor> prepared =
+          engine_->Prepare(*context_, SemanticSql(entry.semantic));
+      EXPECT_FALSE(prepared.HasValue());
+      EXPECT_NE(prepared.GetStatus(), Status::kSuccess);
+    } else {
+      EXPECT_EQ(RunSql(SemanticSql(entry.semantic)),
+                ExpectedRows(entry.semantic));
     }
   }
 }

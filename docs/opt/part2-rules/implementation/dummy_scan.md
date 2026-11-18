@@ -87,5 +87,5 @@ return std::vector<PlanAlternative>{PlanAlternative{
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.DummyScanAndValuesHavePhysicalImplementationRules`: 手動で構築した `kDummyScan` 式が正しく `DummyScanPlan` に変換され、表示名に "DummyScan" が現れることを検証。
-- `plan/optimizer_test.cpp` の `OptimizerTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のない定数射影クエリが `DummyScanPlan` を起点として計画されることを検証。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.DummyScanAndValuesHavePhysicalImplementationRules`: 手動で構築した `kDummyScan` 式が正しく `DummyScanPlan` に変換され、表示名に "DummyScan" が現れることを検証。
+- `plan/optimizer_test_part2.cpp` の `OptimizerTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のない定数射影クエリが `DummyScanPlan` を起点として計画されることを検証。

@@ -1,0 +1,22 @@
+-- sql_ooc_fuzzer regression
+-- seed: 350
+-- profile: pool=65536 columnar=0 opmem=262144 spill=1 temp=0 route=1
+-- failure: hang / q :: op ran longer than 10 s (hang or livelock): q ord=0 heavy=0 take=-1 nv=2 vs=522695457 ex=1 snap=0 :: SELECT a.k AS c1, b.v AS c2, c.k AS c3, c.t AS c4 FROM t0 a JOIN t0 b ON a.k = b.k JOIN (SELECT * FROM t2 WHERE k BETWEEN 5165 AND 5186) c ON b.g = c.g | still running after 20 s
+create t0 2 8 17 3 1 0
+create t1 1 281 1 7 1 1
+create t2 2 7 2 3 2 1
+index t2 ix0 uk
+ins_bulk t0 1 485 832
+ins_bulk t0 486 5164 621
+ins_bulk t1 1 182 698
+ins_bulk t1 183 547 291
+ins_copy t0 t2 3010 3177 2155
+q ord=0 heavy=0 take=-1 nv=1 vs=420429137 ex=0 snap=0 :: SELECT a.k AS c1, b.v AS c2, c.k AS c3, c.t AS c4 FROM t0 a JOIN t0 b ON a.k = b.k JOIN (SELECT * FROM t1 WHERE k BETWEEN 345 AND 355) c ON b.g = c.g
+ins_bulk t2 3592 5637 3
+upd t2 range 3209 3577 1 0 tagnull 0 0 pad 1419 91
+knob columnar 65536
+compact t2
+index t2 ix2 g
+checkpoint
+q ord=1 heavy=0 take=-1 nv=1 vs=731456914 ex=0 snap=0 :: SELECT k, v, t FROM t2 ORDER BY t DESC, MOD(k, 9), k
+q ord=0 heavy=0 take=-1 nv=2 vs=522695457 ex=1 snap=0 :: SELECT a.k AS c1, b.v AS c2, c.k AS c3, c.t AS c4 FROM t0 a JOIN t0 b ON a.k = b.k JOIN (SELECT * FROM t2 WHERE k BETWEEN 5165 AND 5186) c ON b.g = c.g

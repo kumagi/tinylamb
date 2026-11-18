@@ -67,6 +67,11 @@ class IndexScanPlan final : public PlanBase {
     return stats_;
   }
 
+  // NaN is encoded as the largest memcomparable DOUBLE key, while ORDER BY
+  // places it before every number. An index order on a DOUBLE key is only
+  // reusable when the seek bounds prove NaN cannot be visited.
+  [[nodiscard]] bool DoubleKeyOrderIsSound() const noexcept;
+
   [[nodiscard]] size_t AccessRowCount() const override;
   [[nodiscard]] size_t EmitRowCount() const override;
   [[nodiscard]] bool IsOrderedBy(

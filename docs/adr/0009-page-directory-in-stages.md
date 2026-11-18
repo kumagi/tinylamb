@@ -9,7 +9,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 段階 1 実装済み: `Evicte
 
 `PageManager::blocks_` は全ページの `Page` オブジェクトを持ち続ける。ペイロードを退避しても、
 `Page` と `RowPage` の本体（ラッチ、ベクタ、ディスク上の位置など）は残る。ほかにも
-ページ数に比例するものがある（`eviction_fifo_`、`free_pages_`、
+ページ数に比例するものがある（`eviction_fifo_`、`BoundedFreeIdSet`、
 `WriteCompactedBlocksFile` に渡す全ページのベクタ、チェックポイントで書き出す全ページのメタ）。
 
 元の設計（`ooca.md`）は「チェックポイントのメタを固定チャンクで逐次書く」と
@@ -26,7 +26,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 段階 1 実装済み: `Evicte
 
 - 非常駐ページについて RAM に残すのは「ページ ID → ファイル上の位置と長さ」だけにする。
   `RowPage` の本体は常駐している間だけ存在する。
-- `eviction_fifo_` と `free_pages_` も、ページ数に比例して伸び続けない形にする。
+- `eviction_fifo_` と `BoundedFreeIdSet` も、ページ数に比例して伸び続けない形にする。
 - チェックポイントとブロックファイルの再編成は、ページを 1 枚ずつ処理し、
   全ページ分のベクタを作らない。
 - ディスク形式は変えない。

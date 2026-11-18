@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -294,6 +295,14 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
       relational_detail::HasWindowFunctions(select)) {
     return std::optional<PipelineGraph>(std::nullopt);
   }
+  if (select.Distinct() && !select.OrderBy().empty()) {
+    // DISTINCT before Sort on the OOC lane picks a different survivor
+    // representative for groups sharing the visible prefix than the
+    // relational lane's first-occurrence fold (the hidden __ord_ payload of
+    // the survivor decides the final sort position), inverting the row
+    // order between lanes. Delegate the combination to the relational path.
+    return std::optional<PipelineGraph>(std::nullopt);
+  }
   for (const NamedExpression& item : select.SelectList()) {
     if (!item.expression || item.star_modifiers != nullptr) {
       return std::optional<PipelineGraph>(std::nullopt);
@@ -371,6 +380,17 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     }
   }
 
+  // Reserve synthetic ORDER BY names against every user-visible projection
+  // name. A collision would make the name-based KeySpec resolve to the user's
+  // column instead of the synthesized sort value, silently sorting by the
+  // wrong key (the legacy slot-based route cannot collide).
+  std::unordered_set<std::string> reserved_names;
+  for (const auto& item : proj_items) {
+    reserved_names.insert(item.name);
+  }
+  for (const auto& name : select.GroupBy()) {
+    reserved_names.insert(name->ToString());
+  }
   std::vector<OocSortSink::KeySpec> order_keys;
   order_keys.reserve(select.OrderBy().size());
   for (size_t i = 0; i < select.OrderBy().size(); ++i) {
@@ -380,7 +400,11 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
     if (!rewriter.valid) {
       return std::optional<PipelineGraph>(std::nullopt);
     }
-    const std::string col_name = "__tinylamb_ord_" + std::to_string(i);
+    std::string col_name = "__tinylamb_ord_" + std::to_string(i);
+    while (reserved_names.contains(col_name)) {
+      col_name.push_back('_');
+    }
+    reserved_names.insert(col_name);
     proj_items.emplace_back(col_name, std::move(ord_rewritten));
     order_keys.push_back(OocSortSink::KeySpec{
         .expression = MakeSynthCol(col_name),
@@ -552,6 +576,9 @@ StatusOr<std::optional<PipelineGraph>> TryLowerGroupedStatementToPipeline(
   const size_t core_rows = core_plan->EmitRowCount();
   const size_t core_cols = std::max<size_t>(1, core_schema.ColumnCount());
   const size_t est_bytes =
+      // ~24 bytes per Value slot is an optimistic fixed-size estimate;
+      // VARCHAR/PAX cells can be much larger. This guards size_t overflow,
+      // not a real memory bound.
       core_rows > std::numeric_limits<size_t>::max() / (core_cols * 24)
           ? std::numeric_limits<size_t>::max()
           : core_rows * core_cols * 24;

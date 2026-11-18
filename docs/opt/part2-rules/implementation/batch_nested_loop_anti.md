@@ -130,5 +130,5 @@ return {PlanAlternative{.plan = std::move(join),
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: 非等値反結合が `AntiJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` に変換され、`BatchNestedLoopJoin` エグゼキュータによって正しい行数が出力されることを検証。
+- `plan/optimizer_test_part2.cpp` の `OptimizerTest.BatchNestedLoopCoversNonEquiSemiAntiAndFullJoin`: 非等値反結合が `AntiJoinKind` かつ `PrefersBatchNestedLoop()` を持つ `ProductPlan` に変換され、`BatchNestedLoopJoin` エグゼキュータによって正しい行数が出力されることを検証。
 - `executor/executor_extra_test.cpp` の `BatchNestedLoopJoinTest.PredicateErrorPropagatesForAntiJoin`: 反結合実行時における述語評価中の例外やエラーが正しく上位へ伝播することを検証。

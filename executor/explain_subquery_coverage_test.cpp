@@ -165,6 +165,23 @@ TEST_F(ExplainSubqueryCoverageTest, EstimatedPlanRendersEveryShape) {
       "(SELECT cust FROM orders WHERE amt = 5.0)");
 }
 
+// One EXISTS conjunct rendered as a SemiHashJoin used to suppress every other
+// WHERE conjunct from the plan text, even though the engine evaluates them.
+TEST_F(ExplainSubqueryCoverageTest, ExistsConjunctDoesNotSuppressPlainFilter) {
+  // A grouped query routes through WriteEstimatedPhysicalPlan, where the
+  // WHERE clause is rendered as "Filter ..." lines.
+  const auto rows = Query(
+      "EXPLAIN SELECT cust, COUNT(*) FROM orders WHERE amt > 1.0 AND EXISTS "
+      "(SELECT 1 FROM custs WHERE custs.id = orders.cust) GROUP BY cust");
+  std::string plan;
+  for (const Row& row : rows) {
+    plan += row[0].AsString() + "\n";
+  }
+  EXPECT_NE(plan.find("SemiHashJoin"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("Filter"), std::string::npos) << plan;
+  EXPECT_NE(plan.find("amt"), std::string::npos) << plan;
+}
+
 TEST_F(ExplainSubqueryCoverageTest, CorrelatedSubqueriesRepeatAndCache) {
   const std::vector<Row> expected = {
       Row({Value(1), Value("a")}),

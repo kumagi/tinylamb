@@ -1,0 +1,11 @@
+-- sql_ooc_fuzzer regression
+-- seed: 851
+-- profile: pool=32768 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: UPDATE failed unexpectedly | stream: Corrupt :: op 6 `upd t2 grp 26 0 1 0 vadd 11 0 none 0 0`: UPDATE failed unexpectedly: UPDATE t2 SET v = v + 11 WHERE g = 26; |   stream: Corrupt: update failed on table t2: Corrupt
+create t2 53 240 214
+commit
+ins_bulk t2 1 446 175
+index t2 ix1 pad
+upd t2 all 0 0 1 0 pad 315 97 gmod 21 0
+checkpoint
+upd t2 grp 26 0 1 0 vadd 11 0 none 0 0

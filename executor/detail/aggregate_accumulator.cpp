@@ -32,6 +32,7 @@
 #include "common/digest.hpp"
 #include "common/math_utils.hpp"
 #include "common/platform/extended_float.hpp"
+#include "common/platform/int128_conversion.hpp"
 #include "common/regex_guard.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/expression_eval.hpp"
@@ -61,6 +62,7 @@
 #include "type/column_name.hpp"
 #include "type/date.hpp"
 #include "type/interval.hpp"
+#include "type/row_block_codec.hpp"
 #include "type/schema.hpp"
 #include "type/type.hpp"
 #include "type/value.hpp"
@@ -141,17 +143,39 @@ void CollectAggregates(  // NOLINT(misc-no-recursion)
   }
 }
 
+namespace {
+
+// Lean proof: lean/TinylambOpt/AvgMinMaxHavingDistinct.lean
+//   (min_max_distinct_elim_sound)
+constexpr bool IsIdempotentDistinctInsensitive(AggregationType type) noexcept {
+  switch (type) {
+    case AggregationType::kMin:
+    case AggregationType::kMax:
+    case AggregationType::kLogicalAnd:
+    case AggregationType::kLogicalOr:
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
 AggregateAccumulator::Shape AggregateAccumulator::AnalyzeShape(
     const AggregateExpression* aggregate, const Schema* input_schema) {
   Shape shape;
   // The DISTINCT hash set is allocated lazily (EnsureDistinctSet): INT64/DATE
   // distinct tracking never needs it, and per-group allocation dominated
   // multi-million-group COUNT(DISTINCT) builds.
-  // ARRAY_AGG over a column whose declared type is known keeps that type
-  // even when every input element is NULL; InferAggregateArrayElementType
-  // only covers literal/CAST arguments, so plain column references arrive
-  // here without a static type.
-  shape.distinct_mode = aggregate->Distinct();
+  // For idempotent folds (MIN/MAX/LOGICAL_AND/LOGICAL_OR/BIT_AND/BIT_OR)
+  // without group-context modifiers, DISTINCT is a mathematical no-op (even
+  // with DOUBLE NaN poisoning, since saw_nan_ is boolean OR).
+  shape.distinct_mode =
+      aggregate->Distinct() &&
+      (aggregate->NeedsGroupContext() ||
+       !IsIdempotentDistinctInsensitive(aggregate->GetType()));
   shape.resolved_element_type = aggregate->ArrayElementSqlType();
   if (shape.resolved_element_type.empty() && input_schema != nullptr &&
       aggregate->GetType() == AggregationType::kArrayAgg &&
@@ -290,9 +314,7 @@ Status AggregateAccumulator::TryApplyCore(
       if (!InsertDistinctInt(value.value.int_value)) {
         return Status::kSuccess;
       }
-    } else if (!EnsureDistinctSet()
-                    .insert(CanonicalDistinctValue(value))
-                    .second) {
+    } else if (!InsertDistinctValue(CanonicalDistinctValue(value))) {
       return Status::kSuccess;
     }
   }
@@ -310,14 +332,17 @@ Status AggregateAccumulator::TryApplyCore(
       } else if (value.type == ValueType::kInt64 ||
                  value.type == ValueType::kDate) {
         if (sum_is_uint64 || value.IsUnsigned()) {
-          const __int128 prior =
-              sum_is_uint64 ? static_cast<__int128>(uint_total) : int_total;
-          const __int128 input =
-              value.IsUnsigned() ? static_cast<__int128>(static_cast<uint64_t>(
-                                       value.value.int_value))
-                                 : static_cast<__int128>(value.value.int_value);
-          const __int128 next = prior + input;
-          constexpr __int128 max_uint64 = std::numeric_limits<uint64_t>::max();
+          const platform::Int128 prior =
+              sum_is_uint64 ? static_cast<platform::Int128>(uint_total)
+                            : int_total;
+          const platform::Int128 input =
+              value.IsUnsigned()
+                  ? static_cast<platform::Int128>(
+                        static_cast<uint64_t>(value.value.int_value))
+                  : static_cast<platform::Int128>(value.value.int_value);
+          const platform::Int128 next = prior + input;
+          constexpr platform::Int128 max_uint64 =
+              std::numeric_limits<uint64_t>::max();
           if (next < 0 || next > max_uint64) {
             return StatusError(StatusCode::kIsInfinity,
                                "uint64 overflow in SUM");
@@ -568,7 +593,7 @@ Status AggregateAccumulator::TryApplyCore(
       const double p = percentile.type == ValueType::kInt64
                            ? static_cast<double>(percentile.value.int_value)
                            : percentile.value.double_value;
-      if (p < 0.0 || p > 1.0) {
+      if (!std::isfinite(p) || p < 0.0 || p > 1.0) {
         return StatusError(
             StatusCode::kInvalidArgument,
             "The second argument to PERCENTILE_CONT must be between 0 and 1");
@@ -1300,6 +1325,32 @@ bool AggregateAccumulator::InsertDistinctInt(int64_t raw) {
   return distinct_ints->insert(raw).second;
 }
 
+size_t AggregateAccumulator::DistinctValueCount() const {
+  return distinct != nullptr ? distinct->size() : inline_distinct_value_count;
+}
+
+bool AggregateAccumulator::InsertDistinctValue(Value canonical) {
+  if (distinct != nullptr) {
+    return distinct->insert(std::move(canonical)).second;
+  }
+  for (size_t i = 0; i < inline_distinct_value_count; ++i) {
+    if (DistinctValueEqual{}(inline_distinct_values[i], canonical)) {
+      return false;
+    }
+  }
+  if (inline_distinct_value_count < kInlineDistinctValueCapacity) {
+    inline_distinct_values[inline_distinct_value_count++] =
+        std::move(canonical);
+    return true;
+  }
+  EnsureDistinctSet().reserve(kInlineDistinctValueCapacity * 2);
+  for (size_t i = 0; i < inline_distinct_value_count; ++i) {
+    distinct->insert(std::move(inline_distinct_values[i]));
+  }
+  inline_distinct_value_count = 0;
+  return distinct->insert(std::move(canonical)).second;
+}
+
 bool AggregateAccumulator::CanMerge() const {
   return buffer_ == nullptr && !expression->NeedsGroupContext() &&
          (expression->GetType() == AggregationType::kCount ||
@@ -1307,10 +1358,11 @@ bool AggregateAccumulator::CanMerge() const {
           expression->GetType() == AggregationType::kAvg ||
           expression->GetType() == AggregationType::kMin ||
           expression->GetType() == AggregationType::kMax) &&
-         // COUNT(DISTINCT) merges by set union below; every other DISTINCT
-         // aggregate has no exact partial merge.
+         // COUNT(DISTINCT) merges by set union below; MIN/MAX(DISTINCT) are
+         // idempotent folds whose DISTINCT modifier is a no-op.
          (!expression->Distinct() ||
-          expression->GetType() == AggregationType::kCount);
+          expression->GetType() == AggregationType::kCount ||
+          IsIdempotentDistinctInsensitive(expression->GetType()));
 }
 
 Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
@@ -1322,8 +1374,12 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
       // everything else in the canonical Value set; the merged count is the
       // merged-set size, exactly like the serial Add path kept it.
       if (other.distinct != nullptr) {
-        EnsureDistinctSet().insert(other.distinct->begin(),
-                                   other.distinct->end());
+        for (const Value& value : *other.distinct) {
+          static_cast<void>(InsertDistinctValue(value));
+        }
+      }
+      for (size_t i = 0; i < other.inline_distinct_value_count; ++i) {
+        static_cast<void>(InsertDistinctValue(other.inline_distinct_values[i]));
       }
       if (other.distinct_ints != nullptr) {
         for (const int64_t raw : *other.distinct_ints) {
@@ -1333,8 +1389,7 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
       for (size_t i = 0; i < other.inline_distinct_int_count; ++i) {
         static_cast<void>(InsertDistinctInt(other.inline_distinct_ints[i]));
       }
-      count = static_cast<int64_t>(
-          DistinctIntCount() + (distinct != nullptr ? distinct->size() : 0));
+      count = static_cast<int64_t>(DistinctIntCount() + DistinctValueCount());
       return Status::kSuccess;
     }
     count += other.count;
@@ -1343,13 +1398,14 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
   if (type == AggregationType::kSum) {
     count += other.count;
     if (sum_is_uint64 || other.sum_is_uint64) {
-      const __int128 left =
-          sum_is_uint64 ? static_cast<__int128>(uint_total) : int_total;
-      const __int128 right = other.sum_is_uint64
-                                 ? static_cast<__int128>(other.uint_total)
-                                 : other.int_total;
-      const __int128 next = left + right;
-      constexpr __int128 max_uint64 = std::numeric_limits<uint64_t>::max();
+      const platform::Int128 left =
+          sum_is_uint64 ? static_cast<platform::Int128>(uint_total) : int_total;
+      const platform::Int128 right =
+          other.sum_is_uint64 ? static_cast<platform::Int128>(other.uint_total)
+                              : other.int_total;
+      const platform::Int128 next = left + right;
+      constexpr platform::Int128 max_uint64 =
+          std::numeric_limits<uint64_t>::max();
       if (next < 0 || next > max_uint64) {
         return StatusError(StatusCode::kIsInfinity, "uint64 overflow in SUM");
       }
@@ -1387,6 +1443,194 @@ Status AggregateAccumulator::Merge(const AggregateAccumulator& other) {
     }
   }
   return Status::kSuccess;
+}
+
+bool AggregateAccumulator::CanSerializePartial() const noexcept {
+  if (buffer_ != nullptr || distinct_mode_ || expression == nullptr ||
+      expression->NeedsGroupContext() ||
+      (expression->Distinct() &&
+       !IsIdempotentDistinctInsensitive(core_type_))) {
+    return false;
+  }
+  switch (core_type_) {
+    case AggregationType::kCount:
+    case AggregationType::kCountIf:
+    case AggregationType::kSum:
+    case AggregationType::kAvg:
+    case AggregationType::kMin:
+    case AggregationType::kMax:
+    case AggregationType::kLogicalAnd:
+    case AggregationType::kLogicalOr:
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor:
+    case AggregationType::kAnyValue:
+      return true;
+    default:
+      return false;
+  }
+}
+
+namespace {
+
+template <typename T>
+void AppendAggPod(T v, std::string* dst) {
+  const size_t off = dst->size();
+  dst->resize(off + sizeof(T));
+  std::memcpy(dst->data() + off, &v, sizeof(T));
+}
+
+template <typename T>
+Status ReadAggPod(std::string_view* src, T* out) {
+  if (src->size() < sizeof(T)) {
+    return StatusError(StatusCode::kCorrupt,
+                       "truncated partial aggregate state");
+  }
+  src->copy(reinterpret_cast<char*>(out), sizeof(T));
+  src->remove_prefix(sizeof(T));
+  return Status::kSuccess;
+}
+
+}  // namespace
+
+Status AggregateAccumulator::SerializePartialState(std::string* dst) const {
+  if (dst == nullptr || !CanSerializePartial()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate cannot serialize partial state");
+  }
+  switch (core_type_) {
+    case AggregationType::kCount:
+    case AggregationType::kCountIf:
+      AppendAggPod(count, dst);
+      return Status::kSuccess;
+    case AggregationType::kSum: {
+      AppendAggPod(count, dst);
+      AppendAggPod(int_total, dst);
+      AppendAggPod(uint_total, dst);
+      AppendAggPod(total, dst);
+      const auto flags = static_cast<uint8_t>(
+          (sum_is_uint64 ? 1U : 0U) | (total_is_double ? 2U : 0U) |
+          (sum_saw_infinite_input_ ? 4U : 0U));
+      AppendAggPod(flags, dst);
+      return Status::kSuccess;
+    }
+    case AggregationType::kAvg:
+      AppendAggPod(count, dst);
+      AppendAggPod(total, dst);
+      return Status::kSuccess;
+    case AggregationType::kMin:
+    case AggregationType::kMax:
+      AppendAggPod(count, dst);
+      AppendAggPod(static_cast<uint8_t>(saw_nan_ ? 1U : 0U), dst);
+      return EncodeSpillValue(extreme, dst);
+    case AggregationType::kLogicalAnd:
+    case AggregationType::kLogicalOr:
+      return EncodeSpillValue(extreme, dst);
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor:
+      AppendAggPod(bit_acc_, dst);
+      AppendAggPod(static_cast<uint8_t>(bit_saw_value_ ? 1U : 0U), dst);
+      AppendAggPod(static_cast<uint8_t>(bit_is_uint64_ ? 1U : 0U), dst);
+      return Status::kSuccess;
+    case AggregationType::kAnyValue:
+      AppendAggPod(static_cast<uint8_t>(saw_any_ ? 1U : 0U), dst);
+      return EncodeSpillValue(extreme, dst);
+    default:
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported aggregate partial serialization");
+  }
+}
+
+Status AggregateAccumulator::MergeSerializedPartialState(
+    std::string_view* src) {
+  return MergeSerializedPartialState(src, AnalyzeShape(expression, nullptr));
+}
+
+Status AggregateAccumulator::MergeSerializedPartialState(std::string_view* src,
+                                                         const Shape& shape) {
+  if (src == nullptr || !CanSerializePartial()) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "aggregate cannot merge serialized partial state");
+  }
+  switch (core_type_) {
+    case AggregationType::kCount:
+    case AggregationType::kCountIf: {
+      int64_t other_count = 0;
+      RETURN_IF_FAIL(ReadAggPod(src, &other_count));
+      count += other_count;
+      return Status::kSuccess;
+    }
+    case AggregationType::kSum: {
+      AggregateAccumulator tmp(expression, shape);
+      uint8_t flags = 0;
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.count));
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.int_total));
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.uint_total));
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.total));
+      RETURN_IF_FAIL(ReadAggPod(src, &flags));
+      tmp.sum_is_uint64 = (flags & 1U) != 0U;
+      tmp.total_is_double = (flags & 2U) != 0U;
+      tmp.sum_saw_infinite_input_ = (flags & 4U) != 0U;
+      return Merge(tmp);
+    }
+    case AggregationType::kAvg: {
+      AggregateAccumulator tmp(expression, shape);
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.count));
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.total));
+      return Merge(tmp);
+    }
+    case AggregationType::kMin:
+    case AggregationType::kMax: {
+      AggregateAccumulator tmp(expression, shape);
+      uint8_t other_nan = 0;
+      RETURN_IF_FAIL(ReadAggPod(src, &tmp.count));
+      RETURN_IF_FAIL(ReadAggPod(src, &other_nan));
+      tmp.saw_nan_ = (other_nan != 0U);
+      ASSIGN_OR_RETURN(Value, other_extreme, DecodeSpillValue(src));
+      tmp.extreme = std::move(other_extreme);
+      return Merge(tmp);
+    }
+    case AggregationType::kLogicalAnd:
+    case AggregationType::kLogicalOr: {
+      ASSIGN_OR_RETURN(Value, other_val, DecodeSpillValue(src));
+      if (!other_val.IsNull()) {
+        RETURN_IF_FAIL(Add(other_val));
+      }
+      return Status::kSuccess;
+    }
+    case AggregationType::kBitAnd:
+    case AggregationType::kBitOr:
+    case AggregationType::kBitXor: {
+      int64_t other_acc = 0;
+      uint8_t other_saw = 0;
+      uint8_t other_uint = 0;
+      RETURN_IF_FAIL(ReadAggPod(src, &other_acc));
+      RETURN_IF_FAIL(ReadAggPod(src, &other_saw));
+      RETURN_IF_FAIL(ReadAggPod(src, &other_uint));
+      if (other_saw != 0U) {
+        Value v(other_acc);
+        if (other_uint != 0U) {
+          v.SetUnsigned();
+        }
+        RETURN_IF_FAIL(Add(v));
+      }
+      return Status::kSuccess;
+    }
+    case AggregationType::kAnyValue: {
+      uint8_t other_saw = 0;
+      RETURN_IF_FAIL(ReadAggPod(src, &other_saw));
+      ASSIGN_OR_RETURN(Value, other_val, DecodeSpillValue(src));
+      if (other_saw != 0U && !saw_any_) {
+        extreme = std::move(other_val);
+        saw_any_ = true;
+      }
+      return Status::kSuccess;
+    }
+    default:
+      return StatusError(StatusCode::kInvalidArgument,
+                         "unsupported aggregate partial merge");
+  }
 }
 
 Status AggregateAccumulator::Add(const Value& value) {
@@ -1498,13 +1742,20 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
                          return false;
                        });
     }
-    if (expression->InnerLimit().has_value()) {
-      const size_t limit = *expression->InnerLimit();
-      if (rows.size() > limit) {
-        rows.resize(limit);
-      }
-    }
+    // Inner LIMIT applies to the post-DISTINCT / post-NULL-filter element
+    // stream, not to the raw buffered rows. Count accepted elements: IGNORE
+    // NULLS / DISTINCT removal happens inside TryApplyCore, so truncating
+    // `rows` up front would drop elements the user should still see.
+    const bool limited =
+        expression->InnerLimit().has_value() &&
+        (expression->GetType() == AggregationType::kArrayAgg ||
+         expression->GetType() == AggregationType::kStringAgg ||
+         expression->GetType() == AggregationType::kArrayConcatAgg);
+    const size_t limit = limited ? *expression->InnerLimit() : 0;
     for (const BufferedRow& row : rows) {
+      if (limited && array_values_.size() >= limit) {
+        break;
+      }
       // Finish() is const by contract; replay mutates only scratch state.
       RETURN_IF_FAIL(const_cast<AggregateAccumulator*>(this)->TryApplyCore(
           row.value, row.trailing_values, row.order_keys));
@@ -1955,6 +2206,13 @@ StatusOr<Value> AggregateAccumulator::TryFinish() const {
                 nan_first);
       const double position =
           percentile_p_ * static_cast<double>(percentile_values_.size() - 1);
+      // Defensive: p is validated in Add(), but a corrupted partial state must
+      // not turn into an out-of-range index on a hostile deserialized value.
+      if (!std::isfinite(position) || position < 0.0 ||
+          position > static_cast<double>(percentile_values_.size() - 1)) {
+        return StatusError(StatusCode::kInvalidArgument,
+                           "invalid percentile position");
+      }
       const auto low = static_cast<size_t>(position);
       const size_t high = low + 1 < percentile_values_.size() ? low + 1 : low;
       const double a = percentile_values_[low];

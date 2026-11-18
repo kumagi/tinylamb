@@ -277,7 +277,7 @@ TEST(ColumnarTlcsFastPathTest, PartitionedAggStrategiesAndTightBudgetFallback) {
   budget.ResetForTest(size_t{256} << 20, size_t{64} << 20, size_t{64} << 20,
                       /*check_rss_pressure=*/false);
 
-  const std::string prefix = "tlcs_part_strat_" + RandomString();
+  const std::string prefix = "tlcs_part_start_" + RandomString();
   Schema schema(
       "hits",
       {Column("ip", ValueType::kInt64), Column("uid", ValueType::kInt64),
@@ -656,6 +656,236 @@ TEST(ColumnarTlcsFastPathTest, DistinctAggregateSkipsAbsentDictionaryKeys) {
   }
 
   db->DeleteAll();
+}
+
+TEST(ColumnarTlcsFastPathTest, ClickBenchSixOptimizationsAndSemanticTraps) {
+  if (!GoogleSqlFrontend::Available()) {
+    GTEST_SKIP() << "execute_query unavailable";
+  }
+  BudgetResetGuard budget_guard;
+  auto& budget = ProcessMemoryBudget::Global();
+  // Small columnar pool cap forces paged TLCS mode so multi-block pruning,
+  // key-fiber subsetting, two-stage Top-N, and monotone cutoff are exercised.
+  budget.ResetForTest(size_t{512} << 20, size_t{128} << 20, size_t{2} << 20,
+                      /*check_rss_pressure=*/false);
+
+  const std::string prefix = "tlcs_cb6_" + RandomString();
+  Schema schema(
+      "hits_cb",
+      {Column("uid", ValueType::kInt64), Column("ip", ValueType::kInt64),
+       Column("counter_id", ValueType::kInt64),
+       Column("se_id", ValueType::kInt64), Column("ae_id", ValueType::kInt64),
+       Column("phrase", ValueType::kVarChar),
+       Column("url", ValueType::kVarChar), Column("title", ValueType::kVarChar),
+       Column("referer", ValueType::kVarChar),
+       Column("event_time", ValueType::kVarChar)});
+  std::unique_ptr<Database> db = Database::Create(prefix).MoveValue();
+  // ~10 blocks (> 8 blocks so CB-2 key-fiber & CB-6 monotone cutoff activate).
+  constexpr int64_t kRows = 10 * 16384;
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CreateTable(ctx, schema).GetStatus(), Status::kSuccess);
+    Table tbl = db->GetTable(ctx, "hits_cb").MoveValue();
+    for (int64_t i = 0; i < kRows; ++i) {
+      const int64_t blk = i / 16384;
+      const int64_t uid = (blk * 1000) + (i % 25);
+      const int64_t ip = 1000 + (i % 50);
+      const int64_t cid = (i % 8 == 0) ? 62 : 10;
+      // Only block 0 has se_id = 0 AND ae_id = 0; blocks 1..9 have se_id = 1
+      // and NULL referer on odd rows (testing CB-5 conditional column elision +
+      // `CASE WHEN false THEN NULL ELSE '' END == ''`!).
+      const int64_t se_id = (blk == 0 && (i % 4 == 0)) ? 0 : 1;
+      const int64_t ae_id = 0;
+      // Make NULL `phrase` the #1 most frequent group so CB-3's Top-N winner
+      // set includes a NULL group (`two_stage_late_agg_sql_in_null_group_bug`)!
+      Value phrase_v =
+          (i % 3 == 0) ? Value() : Value("kw_" + std::to_string(i % 40));
+      Value url_v("https://example.org/google/p" +
+                  std::to_string(999 - (i % 200)));
+      Value title_v("Google Search " + std::to_string(i % 50));
+      Value ref_v = (se_id == 1 && (i % 2 == 1))
+                        ? Value()
+                        : Value("https://www.dom" + std::to_string(i % 12) +
+                                ".com/path/" + std::to_string(i % 7));
+      // Strictly non-decreasing canonical 19-byte UTC timestamps across blocks:
+      // 1 minute per 512 rows (~32 distinct minutes per block, 320 total).
+      const int64_t total_min = i / 512;
+      const int64_t hh = (total_min / 60) % 24;
+      const int64_t mm = total_min % 60;
+      const int64_t day = 14 + ((total_min / 60) / 24);
+      char ts_buf[32];
+      (void)std::snprintf(
+          ts_buf, sizeof(ts_buf), "2013-07-%02lld %02lld:%02lld:%02lld",
+          static_cast<long long>(day), static_cast<long long>(hh),
+          static_cast<long long>(mm), static_cast<long long>(i % 60));
+      ASSERT_TRUE(
+          tbl.Insert(ctx.txn_,
+                     Row({Value(uid), Value(ip), Value(cid), Value(se_id),
+                          Value(ae_id), std::move(phrase_v), std::move(url_v),
+                          std::move(title_v), std::move(ref_v),
+                          Value(std::string(ts_buf))}))
+              .HasValue());
+    }
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  {
+    TransactionContext ctx = db->BeginContext();
+    ASSERT_EQ(db->CompactTableToTlcs(ctx, "hits_cb"), Status::kSuccess);
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+
+  auto run_fast = [&](const std::string& sql) {
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    SqlEngine eng(*db);
+    return RunSql(&eng, &ctx, sql);
+  };
+  auto run_ref = [&](const std::string& sql) {
+    struct ScopedDisableTlcsAgg {
+      ScopedDisableTlcsAgg() {
+        setenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG", "1", 1);
+      }
+      ~ScopedDisableTlcsAgg() {
+        unsetenv("TINYLAMB_DISABLE_COLUMNAR_TLCS_AGG");
+      }
+    } guard;
+    TransactionContext ctx = db->BeginReadOnlyContext();
+    SqlEngine eng(*db);
+    eng.SetForceRelationalFallback(true);
+    return RunSql(&eng, &ctx, sql);
+  };
+
+  // CB-1: Q35 (`GROUP BY 1, url`) & Q36 (`GROUP BY ip, ip-1, ip-2, ip-3`).
+  const std::string q35 =
+      "SELECT 1, url, COUNT(*) AS c FROM hits_cb GROUP BY 1, url "
+      "ORDER BY c DESC, url ASC LIMIT 5";
+  EXPECT_EQ(run_fast(q35), run_ref(q35));
+
+  const std::string q36 =
+      "SELECT ip, ip - 1, ip - 2, ip - 3, COUNT(*) AS c FROM hits_cb "
+      "GROUP BY ip, ip - 1, ip - 2, ip - 3 ORDER BY c DESC, ip ASC LIMIT 5";
+  EXPECT_EQ(run_fast(q36), run_ref(q36));
+
+  // CB-2: Q18 (`SELECT uid, phrase, COUNT(*) FROM hits_cb GROUP BY uid, phrase
+  // LIMIT 10`) — verify exact subset membership against full-table GROUP BY!
+  const auto full_q18 = run_fast(
+      "SELECT uid, phrase, COUNT(*) FROM hits_cb GROUP BY uid, phrase");
+  TlcsFile::ResetDecodeCallsForTest();
+  const auto fast_q18 = run_fast(
+      "SELECT uid, phrase, COUNT(*) FROM hits_cb GROUP BY uid, phrase "
+      "LIMIT 10");
+  ASSERT_EQ(fast_q18.size(), 10U);
+  for (size_t i = 0; i < fast_q18.size(); ++i) {
+    for (size_t j = i + 1; j < fast_q18.size(); ++j) {
+      EXPECT_FALSE(fast_q18[i][0] == fast_q18[j][0] &&
+                   fast_q18[i][1] == fast_q18[j][1]);
+    }
+    bool found_exact = false;
+    for (const Row& f : full_q18) {
+      if (f == fast_q18[i]) {
+        found_exact = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(found_exact) << "CB-2 fiber group count mismatch at row " << i;
+  }
+
+  // CB-3: Two-Stage Top-N Late Aggregate Materialization WITH a winning `NULL`
+  // group (`two_stage_late_agg_sql_in_null_group_bug` regression guard!).
+  const std::string q23 =
+      "SELECT phrase, MIN(url), MIN(title), COUNT(*) AS c, "
+      "COUNT(DISTINCT uid) FROM hits_cb "
+      "WHERE title LIKE '%Google%' "
+      "GROUP BY phrase ORDER BY c DESC LIMIT 4";
+  const auto fast_q23 = run_fast(q23);
+  const auto ref_q23 = run_ref(q23);
+  ASSERT_EQ(fast_q23.size(), 4U);
+  EXPECT_TRUE(fast_q23[0][0].IsNull()) << "Top group should be NULL phrase";
+  EXPECT_FALSE(fast_q23[0][1].IsNull()) << "NULL group MIN(url) must survive";
+  EXPECT_EQ(fast_q23, ref_q23);
+
+  const std::string q10 =
+      "SELECT se_id, SUM(ae_id), COUNT(*) AS c, AVG(ip), COUNT(DISTINCT uid) "
+      "FROM hits_cb GROUP BY se_id ORDER BY c DESC LIMIT 2";
+  EXPECT_EQ(run_fast(q10), run_ref(q10));
+
+  // CB-4: Dictionary / memoized `REGEXP_REPLACE` + late `MIN(referer)` (Q29).
+  const std::string q29 =
+      "SELECT REGEXP_REPLACE(referer, '^https?://(?:www\\\\.)?([^/]+)/.*$', "
+      "'\\\\1') AS k, AVG(BYTE_LENGTH(referer)) AS l, COUNT(*) AS c, "
+      "MIN(referer) FROM hits_cb WHERE referer IS NOT NULL AND referer <> '' "
+      "GROUP BY k HAVING COUNT(*) > 10 ORDER BY l DESC, k ASC LIMIT 5";
+  EXPECT_EQ(run_fast(q29), run_ref(q29));
+
+  // CB-5: Conditional `CASE WHEN` key partition + `ELSE ''` on NULL `referer`
+  // (Q40).
+  const std::string q40 =
+      "SELECT counter_id, se_id, ae_id, "
+      "CASE WHEN (se_id = 0 AND ae_id = 0) THEN referer ELSE '' END AS src, "
+      "url, COUNT(*) AS pv FROM hits_cb WHERE counter_id = 62 "
+      "GROUP BY counter_id, se_id, ae_id, src, url "
+      "ORDER BY pv DESC, src ASC, url ASC LIMIT 8";
+  EXPECT_EQ(run_fast(q40), run_ref(q40));
+
+  // CB-6: Monotone `TIMESTAMP_TRUNC` early cutoff (Q43) vs periodic `EXTRACT`
+  // (Q19 `periodic_extract_breaks_monotone_runs_bug`).
+  // First warm VarcharBlockBound cache on `hits_cb`, then reset decode counter
+  // and measure `run_fast(q43)` BEFORE `run_ref(q43)`!
+  const std::string q43 =
+      "SELECT TIMESTAMP_TRUNC(event_time, MINUTE) AS m, COUNT(*) AS pv "
+      "FROM hits_cb GROUP BY m ORDER BY m ASC LIMIT 5 OFFSET 2";
+  (void)run_fast(q43);
+  TlcsFile::ResetDecodeCallsForTest();
+  const auto fast_q43 = run_fast(q43);
+  const size_t q43_decode_calls = TlcsFile::DecodeCallsForTest();
+  EXPECT_LE(q43_decode_calls, 2U)
+      << "CB-6 monotone cutoff should visit only the leading block(s)";
+  EXPECT_EQ(fast_q43, run_ref(q43));
+
+  const std::string q19_extract =
+      "SELECT EXTRACT(MINUTE FROM TIMESTAMP(event_time)) AS m, COUNT(*) AS pv "
+      "FROM hits_cb GROUP BY m ORDER BY m ASC LIMIT 5";
+  EXPECT_EQ(run_fast(q19_extract), run_ref(q19_extract));
+
+  db->DeleteAll();
+
+  // CB-1 Trap test (`group_by_overflow_expr_drop_bug`): `ip - 3` on a non-top
+  // `INT64_MIN` group MUST still raise an overflow error (`kInvalidArgument`)
+  // even under `ORDER BY c DESC LIMIT 1`!
+  const std::string ovf_prefix = "tlcs_cb1_ovf_" + RandomString();
+  std::unique_ptr<Database> ovf_db = Database::Create(ovf_prefix).MoveValue();
+  Schema ovf_schema("t_ovf", {Column("ip", ValueType::kInt64)});
+  {
+    TransactionContext ctx = ovf_db->BeginContext();
+    ASSERT_EQ(ovf_db->CreateTable(ctx, ovf_schema).GetStatus(),
+              Status::kSuccess);
+    Table tbl = ovf_db->GetTable(ctx, "t_ovf").MoveValue();
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_TRUE(tbl.Insert(ctx.txn_, Row({Value(int64_t{500})})).HasValue());
+    }
+    ASSERT_TRUE(
+        tbl.Insert(ctx.txn_, Row({Value(std::numeric_limits<int64_t>::min())}))
+            .HasValue());
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  {
+    TransactionContext ctx = ovf_db->BeginContext();
+    ASSERT_EQ(ovf_db->CompactTableToTlcs(ctx, "t_ovf"), Status::kSuccess);
+    ASSERT_EQ(ctx.txn_.PreCommit(), Status::kSuccess);
+  }
+  {
+    TransactionContext ctx = ovf_db->BeginReadOnlyContext();
+    SqlEngine eng(*ovf_db);
+    StatusOr<Executor> prep =
+        eng.Prepare(ctx,
+                    "SELECT ip, ip - 3, COUNT(*) AS c FROM t_ovf "
+                    "GROUP BY ip, ip - 3 ORDER BY c DESC LIMIT 1");
+    ASSERT_TRUE(prep.HasValue());
+    Row row;
+    while (prep.Value()->Next(&row, nullptr)) {
+    }
+    EXPECT_EQ(prep.Value()->GetStatus(), Status::kInvalidArgument);
+  }
+  ovf_db->DeleteAll();
 }
 
 }  // namespace

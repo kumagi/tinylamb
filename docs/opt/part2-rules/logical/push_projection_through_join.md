@@ -97,7 +97,7 @@ $$\Pi_A (L \Join_p R) \equiv \Pi_A (\Pi_{U_L}(L) \Join_p \Pi_{U_R}(R))$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `ProjectionIsPushedThroughInnerJoinWithRequiredColumns`:
     内部結合に対して必要列のみを含む事前射影が正しく生成されることを確認します。
   - `ProjectionThroughOuterJoinIsConservativelySkipped`:

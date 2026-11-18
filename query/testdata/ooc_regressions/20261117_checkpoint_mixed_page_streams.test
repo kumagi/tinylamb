@@ -1,0 +1,19 @@
+-- sql_ooc_fuzzer regression
+-- seed: 578
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: post-crash count(t#) query failed | stream: NotExists :: op 14 `crash`: post-crash count(t1) query failed: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t1 |   stream: NotExists
+create t1 54 7129 4071
+ins_bulk t1 1 178 905
+ins_bulk t1 179 392 930
+ins_bulk t1 393 656 233
+commit
+ins_bulk t1 2098 2219 386
+ins_bulk t1 2220 2226 66
+abort
+ins_bulk t1 2883 2951 708
+ins_bulk t1 2952 3000 871
+knob pool 131072
+commit
+ins_bulk t1 3012 3042 819
+checkpoint
+crash

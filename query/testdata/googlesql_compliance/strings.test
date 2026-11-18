@@ -639,7 +639,7 @@ SELECT REGEXP_INSTR("abcabc", "a(b)c", 2, 1, 1),
        REGEXP_INSTR("-2020-jack-class1", "", 2),
        REGEXP_INSTR("abcdef", "ac.*e.")
 --
-ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{6, 5, 0, 0}]
+ARRAY<STRUCT<INT64, INT64, INT64, INT64>>[{7, 5, 0, 0}]
 ==
 
 [name=strings_function_regexp_extract]
@@ -686,20 +686,20 @@ select format((((NULL))), 1),
 ARRAY<STRUCT<STRING>>[{NULL}]
 ==
 
-[name=nested_format_with_temlpate_as_parenthesized_null]
+[name=nested_format_with_template_as_parenthesized_null]
 select format(format(((NULL)), 1), 2)
 --
 ARRAY<STRUCT<STRING>>[{NULL}]
 ==
 
-[name=format_with_temlpate_as_foldable_expression_evaluating_to_null]
+[name=format_with_template_as_foldable_expression_evaluating_to_null]
 select format(CONCAT(CAST(NULL AS STRING), CAST(NULL AS STRING)), 1)
 --
 ARRAY<STRUCT<STRING>>[{NULL}]
 ==
 
 # non-foldable
-[name=format_with_temlpate_as_typed_parameter]
+[name=format_with_template_as_typed_parameter]
 [parameters=CAST(NULL AS STRING) AS template]
 select format(@template, 1)
 --
@@ -707,7 +707,7 @@ ARRAY<STRUCT<STRING>>[{NULL}]
 ==
 
 # ERROR() function is untyped
-[name=format_with_temlpate_as_error_function]
+[name=format_with_template_as_error_function]
 select format(ERROR("foo"), 1)
 --
 ERROR: generic::out_of_range: foo

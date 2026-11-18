@@ -89,4 +89,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.PushTopNThroughProjectionRewritesOrderingExpression`: ソートキー `value` が射影を通じて `items.v` へ書き換えられ、射影の下に TopN が配置された論理式が生成されることを検証します。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.PushTopNThroughProjectionRewritesOrderingExpression`: ソートキー `value` が射影を通じて `items.v` へ書き換えられ、射影の下に TopN が配置された論理式が生成されることを検証します。

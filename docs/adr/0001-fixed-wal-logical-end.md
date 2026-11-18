@@ -58,8 +58,7 @@ WAL-before-data、own/observed commitの同期バリア、recycle floorは維持
 利用者DBを移行したという記録ではない。
 
 C34で全4,178テスト・失敗0（既存skip 3）、SQL oracle 602秒771入力・不一致0、
-同じ同期commit条件のPG比較を保存した。標準フル比較と精密再測定の結果は
-[最終レポート](../postgresql_twofold_results_2026-10-30.md)を参照する。
+同じ同期commit条件のPG比較を保存した（2026-10-30 記録；当時の旧詳細レポート `../postgresql_twofold_results_2026-10-30.md` はアーカイブ整理で削除済み、WAL レコード本体はその後 [wal_format.md](../wal_format.md) のとおり v7 へ更新済み）。
 固定長化単独の寄与は他の変更・I/O変動と分離していないため、比較全体の改善率を
 この形式だけの効果とは主張しない。WAL-before-dataとD4 barrierを省略しないこと、
 既存形式の維持、破損時の既定fail-stopを採用条件として継続する。

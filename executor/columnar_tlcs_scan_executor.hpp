@@ -16,8 +16,8 @@ namespace tinylamb {
 class TransactionContext;
 
 // Attempts to lower a single-table plain scan / filter / ORDER BY / LIMIT
-// plan directly to a lazy parallel columnar TLCS executor (`ColumnarTlcsTopN`
-// or `ColumnarTlcsScan`). Returns nullptr when the plan shape or transaction
+// plan directly to a lazy parallel columnar TLCS executor (the columnar TLCS
+// scan executor). Returns nullptr when the plan shape or transaction
 // snapshot state is outside the columnar fast path.
 StatusOr<Executor> TryCreateDirectColumnarScanOrTopNExecutor(
     const Plan& plan, TransactionContext& ctx, bool distinct,

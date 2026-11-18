@@ -61,6 +61,8 @@ class JoinHashIndex {
   [[nodiscard]] static uint64_t HashBytes(std::string_view key);
 
  private:
+  friend class JoinHashIndexTest_ByteSpanRetainsOffsetsAboveFourGiB_Test;
+
   struct Entry {
     size_t row;
     size_t next;
@@ -78,7 +80,8 @@ class JoinHashIndex {
   std::vector<Entry> entries_;
   std::vector<int64_t> slot_int_keys_;
   std::string arena_;
-  std::vector<std::pair<uint32_t, uint32_t>> slot_byte_keys_;
+  // Offsets and lengths must cover the entire std::string arena.
+  std::vector<std::pair<size_t, size_t>> slot_byte_keys_;
 };
 
 class HashJoin : public ExecutorBase, public PipelineBreaker {
@@ -214,6 +217,7 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
   // Test hook: the domain cap is a run-time guard, so a test lowers it to
   // exercise the fallback without materializing a million distinct keys.
   static void SetSemiReductionMaxDomainKeysForTest(size_t keys);
+  static size_t SemiReductionMaxDomainKeysForTest();
   [[nodiscard]] bool DynamicFilterEnabled() const { return dynamic_filter_; }
   [[nodiscard]] bool DynamicFilterPublished() const {
     return dynamic_filter_published_;
@@ -236,7 +240,6 @@ class HashJoin : public ExecutorBase, public PipelineBreaker {
 
   Status Materialize();
   Status MaterializeInMemory();
-  Status MaterializeInMemorySetup();
   // Build side first, publish the filter, then probe side.
   Status MaterializeDynamicFilter();
   [[nodiscard]] bool DynamicFilterEligible() const;

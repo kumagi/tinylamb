@@ -104,7 +104,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part2.cpp`:
   - `OptimizerTest.MergeSemiJoinRuleBuildsSortedProbeOnlyPlan`: プローブ側の属性のみを出力スキーマに持ち、適切なソート順序を要求する計画が生成されることを検証。
   - `OptimizerTest.MergeSemiJoinRuleCarriesInequalityResidual`: 等値結合キーと不等値残余述語が共存する場合、残差が `MergeJoinPlan` の内部残差式へと正しく格納されることを検証。
 - `plan/plan_test.cpp`:

@@ -243,11 +243,7 @@ class DistinctOutputSource final : public PipelineSource {
       }
       const PartitionLeaf& leaf = leaves_.leaves[leaf_idx_++];
       // Dedup EVERY spilled leaf through ExternalSorter, which streams under
-      // this source's query grant. A resident GroupKeyMap of normalized keys
-      // plus an active_rows_ vector of payloads held the whole leaf twice
-      // outside any grant (and duplicated most of the payload in the key map
-      // for full-row keys), breaking the operator budget exactly after the
-      // sink spilled. The sorter path removes consecutive equal keys during
+      // this source's query grant and removes consecutive equal keys during
       // emission, so no leaf-sized resident containers are needed here.
       ASSIGN_OR_RETURN(std::unique_ptr<ExternalSorter>, sk,
                        BuildSkewSorter(leaf));

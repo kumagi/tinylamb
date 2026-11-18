@@ -101,6 +101,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.MergeLimitsComposesNestedLimits`: `Limit(10, 0)` の直上に `Limit(3, 1)` が配置されたプランを探索し、`count=3, offset=1` でスキャンに直結する単一 Limit 代替が生成されることを検証。
   - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の RuleSet 内に `merge_limits` が登録されていることを検証。

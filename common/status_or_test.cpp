@@ -30,5 +30,12 @@ TEST(StatusOrTest, ConvertingValuesAndErrorsRemainDistinct) {
   const StatusOr<std::optional<int>> failure = Status::kCorrupt;
   EXPECT_FALSE(failure.HasValue());
   EXPECT_EQ(failure.GetStatus(), Status::kCorrupt);
+
+  EXPECT_EQ(ToString(StatusCode::kMemoryLimitExceeded), "MemoryLimitExceeded");
+  EXPECT_EQ(SqlStateForStatus(Status::kMemoryLimitExceeded), "53200");
+  EXPECT_EQ(SqlStateForStatus(Status::kNoSpace), "53100");
+  EXPECT_EQ(SqlStateForStatus(Status::kConflicts), "40001");
+  EXPECT_EQ(SqlStateForStatus(Status::kDuplicates), "23505");
+  EXPECT_EQ(SqlStateForStatus(Status::kInvalidArgument, "42601"), "42601");
 }
 }  // namespace tinylamb

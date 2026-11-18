@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -76,11 +77,18 @@ inline bool MatchTypedStringCompare(
              : matched;
 }
 
+struct TypedNullCompare {
+  slot_t column{0};
+  bool is_null{true};
+};
+
 struct TypedConditionalInput {
   TypedFilterCompare condition;
   std::optional<slot_t> then_column;
   int64_t then_int_constant{0};
   ValueType result_type{ValueType::kNull};
+  bool has_else_constant{false};
+  int64_t else_int_constant{0};
 };
 
 struct TypedDoubleExprOp {
@@ -137,11 +145,17 @@ struct TypedIntExprInput {
   std::vector<TypedIntExprOp> ops;
 };
 
+struct TypedCoalesceDoubleInput {
+  TypedDoubleExprInput expr;
+  Value fallback;
+};
+
 struct TypedAggregateInput {
   const AggregateExpression* aggregate{nullptr};
   std::optional<slot_t> column;
   std::optional<TypedConditionalInput> conditional;
   std::optional<TypedDoubleExprInput> double_expr;
+  std::optional<TypedCoalesceDoubleInput> coalesce_double;
   std::optional<TypedIntExprInput> int_expr;
   std::optional<BytecodeProgram> child;
 };
@@ -154,6 +168,12 @@ enum class SlimAggKind : uint8_t {
   kAvgDouble,
   kCountDistinctInt64,
   kCountDistinctDouble,
+  kMinInt64,
+  kMaxInt64,
+  kMinDate,
+  kMaxDate,
+  kMinDouble,
+  kMaxDouble,
 };
 
 [[nodiscard]] constexpr bool IsSlimDistinctKind(SlimAggKind kind) {
@@ -161,13 +181,31 @@ enum class SlimAggKind : uint8_t {
          kind == SlimAggKind::kCountDistinctDouble;
 }
 
+[[nodiscard]] constexpr bool IsSlimMinMaxKind(SlimAggKind kind) {
+  return kind == SlimAggKind::kMinInt64 || kind == SlimAggKind::kMaxInt64 ||
+         kind == SlimAggKind::kMinDate || kind == SlimAggKind::kMaxDate ||
+         kind == SlimAggKind::kMinDouble || kind == SlimAggKind::kMaxDouble;
+}
+
 constexpr size_t kSlimDistinctSlots = 8;
+
+struct PostAggExpr {
+  struct Slot {
+    bool is_key{false};
+    size_t index{0};
+  };
+  std::vector<Slot> slots;
+  Expression expr;
+  Schema eval_schema;
+  std::optional<BytecodeProgram> program;
+};
 
 struct TypedEmitItem {
   bool is_key{false};
   size_t index{0};
   std::optional<Value> constant{std::nullopt};
   std::optional<size_t> dependent_key{std::nullopt};
+  std::shared_ptr<const PostAggExpr> post_agg{nullptr};
 };
 
 struct TypedInListCompare {
@@ -202,6 +240,8 @@ struct TypedAggregationPlan {
   // conjunctions. NULL comparisons cannot make an AND branch pass.
   std::vector<std::vector<std::vector<TypedFilterCompare>>> filter_disjunctions;
   std::vector<TypedInListCompare> inlist_compares;
+  std::vector<TypedNullCompare> null_filters;
+  bool only_null_filter_programs{false};
 };
 
 struct PositionalHaving {
@@ -209,6 +249,8 @@ struct PositionalHaving {
   BinaryOperation op{BinaryOperation::kEquals};
   Value constant;
   bool has_constant{false};
+  bool rhs_is_agg{false};
+  size_t rhs_agg_index{0};
 };
 
 bool HavingReferencesOnlyKeysAndAggregates(
@@ -457,6 +499,9 @@ std::optional<TypedConditionalInput> TryCompileTypedConditionalInput(
 std::optional<TypedDoubleExprInput> TryCompileTypedDoubleExpr(
     const Expression& expr, const Schema& scan_schema);
 
+std::optional<TypedCoalesceDoubleInput> TryCompileTypedCoalesceDouble(
+    const Expression& expr, const Schema& scan_schema);
+
 std::optional<TypedIntExprInput> TryCompileTypedIntExpr(
     const Expression& expr, const Schema& scan_schema);
 
@@ -465,6 +510,9 @@ Value EvaluateTypedConditionalOnRow(const TypedConditionalInput& cond,
 
 Value EvaluateTypedDoubleExprOnRow(const TypedDoubleExprInput& expr,
                                    const Row& row);
+
+Value EvaluateTypedCoalesceDoubleOnRow(const TypedCoalesceDoubleInput& coalesce,
+                                       const Row& row);
 
 StatusOr<Value> EvaluateTypedIntExprOnRow(const TypedIntExprInput& expr,
                                           const Row& row);
@@ -482,11 +530,12 @@ TypedAggregationPlan PlanTypedAggregation(
     const SelectStatement& stmt, const Expression& having_expr,
     const Schema& scan_schema,
     const std::vector<const AggregateExpression*>& aggregate_expressions,
-    const std::vector<Expression>& scan_predicates);
+    const std::vector<Expression>& scan_predicates,
+    bool allow_composite_select = false);
 
 StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
     TransactionContext& context,
-    const std::vector<const SelectStatement*>& sets, const Relation& input);
+    const std::vector<const SelectStatement*>& sets, Relation& input);
 
 StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
     TransactionContext& context, const SelectStatement& statement,
@@ -501,8 +550,9 @@ StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
 
 // Partial COUNT(*) by physical dictionary code, followed by one scalar key
 // evaluation per observed value and canonical regrouping. No shared scan-cache
-// publication; callers must decline reusable sources and HAVING.
-StatusOr<std::optional<Relation>> TryDictionaryExpressionCountTopN(
+// publication: reusable sources read the validated snapshot independently.
+// Callers must decline HAVING; LIMIT is optional for inner aggregate stages.
+StatusOr<std::optional<Relation>> TryDictionaryExpressionAggregate(
     TransactionContext& context, const SelectStatement& statement,
     const Table& table, const std::vector<slot_t>& projection,
     const Schema& qualified_schema,
@@ -513,7 +563,7 @@ StatusOr<std::optional<Relation>> TryDictionaryExpressionCountTopN(
 // multiplicities. Shared dictionaries avoid repeated scalar work; otherwise
 // bounded waves read the column directly. COUNT, MIN/MAX and proven-exact
 // BYTE_LENGTH averages permit parallel partial states. Workers evaluate only
-// whitelisted pure AST expressions, after filtering; callbacks run serially
+// allowlisted pure AST expressions, after filtering; callbacks run serially
 // in encounter order. The ordinary callback must apply the original filter.
 StatusOr<bool> TryFoldDictionaryAggregateRows(
     TransactionContext& context, const SelectStatement& statement,
@@ -545,6 +595,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
 struct ExactIntegerGroupingSets {
   SelectStatement partial;
   std::vector<SelectStatement> sets;
+  bool allow_float_sums{false};
 };
 
 std::optional<ExactIntegerGroupingSets> PlanExactIntegerGroupingSets(

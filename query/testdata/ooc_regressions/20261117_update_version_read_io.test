@@ -1,0 +1,18 @@
+-- sql_ooc_fuzzer regression
+-- seed: 638
+-- profile: pool=65536 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: sweep io / UPDATE failed unexpectedly | stream: Conflicts :: op 13 `sweep io 65 :: upd t2 grp 8 0 1 0 vadd -13 0 tag 3 0`: sweep io `upd t2 grp 8 0 1 0 vadd -13 0 tag 3 0` with failure #6: UPDATE failed unexpectedly: UPDATE t2 SET v = v + -13, t = 'ccc' WHERE g = 8; |   stream: Conflicts: update failed on table t2: Conflicts: table update in-place row write at 94/1: Conflicts
+create t0 32 243 394 1000 3 0
+create t1 1 77 582
+ins_bulk t0 253 352 919
+ins_bulk t0 353 542 521
+ins_bulk t1 1 320 995
+create t2 43 4742 4880
+sweep io 69 :: ins_bulk t0 543 864 658
+index t2 ix1 gv
+upd t1 range 195 448 1 0 pad 2815 26 none 0 0
+upd t0 range 271 665 1 0 pad 1279 66 tag 3 0
+ins_bulk t2 7 68 56
+ins_copy t2 t1 46 298 253
+ins_bulk t2 552 870 868
+sweep io 65 :: upd t2 grp 8 0 1 0 vadd -13 0 tag 3 0

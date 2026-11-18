@@ -99,7 +99,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
       }
     }
     assert(ctx.txn_.PreCommit() == Status::kSuccess);
-    if (stream.Pick(4) == 0) {
+    // A 1-in-4 chance of ending the whole run kept almost every input from
+    // reaching the deep operation sequences kMaxOps is meant to explore.
+    if (stream.Pick(32) == 0) {
       db->EmulateCrash();
       db.reset();
       auto recovered = Database::Create(db_name).MoveValue();
@@ -114,8 +116,9 @@ inline void Try(const uint8_t* data, size_t size, bool verbose) {
         }
         assert(verify_ctx.txn_.PreCommit() == Status::kSuccess);
       }
-      recovered->DeleteAll();
-      return;
+      // Continue the operation sequence against the recovered database so
+      // post-crash Insert/Delete/Verify interleavings are actually exercised.
+      db = std::move(recovered);
     }
   }
   db->DeleteAll();

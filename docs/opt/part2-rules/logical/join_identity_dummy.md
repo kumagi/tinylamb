@@ -108,6 +108,7 @@ $$R \times D_1 \equiv R$$
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.JoinIdentityDummyEliminatesDummySide`: 片側が `DummyScan` であるクロス結合を探索した際、DummyScan 側が除去され生存側の式が親グループに追加されることを検証。
-  - `CascadesTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のないクエリにおいて DummyScan を用いた最適化が正常に機能することを検証。
+- `plan/optimizer_test_part2.cpp`:
+  - `OptimizerTest.OptimizeWithoutFromUsesDummyScanForConstantProjection`: FROM 句のないクエリにおいて DummyScan を用いた最適化が正常に機能することを検証。

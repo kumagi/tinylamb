@@ -823,6 +823,36 @@ TEST_F(PlanTest, AuditAffineOrderingRejectsMultiplierOverflow) {
   EXPECT_FALSE(scan.IsOrderedBy({key}, {true}));
 }
 
+TEST_F(PlanTest, DoubleKeyIndexDoesNotAdvertiseNaNIncompatibleOrder) {
+  auto ctx = rs_->BeginContext();
+  const Schema schema("double_key", {Column("f", ValueType::kDouble)});
+  ASSIGN_OR_ASSERT_FAIL(Table, table, rs_->CreateTable(ctx, schema));
+  for (const double d : {1.0, 2.0, std::numeric_limits<double>::quiet_NaN()}) {
+    ASSERT_SUCCESS(table.Insert(ctx.txn_, Row({Value(d)})).GetStatus());
+  }
+  ASSERT_SUCCESS(table.CreateIndex(
+      ctx.txn_, IndexSchema("f_idx", {0}, {}, IndexMode::kUnique)));
+  TableStatistics statistics(schema);
+  ASSERT_SUCCESS(statistics.Update(ctx.txn_, table));
+  const Index& index = table.GetIndex(0);
+  const ColumnName key("double_key.f");
+  const Expression order_key = ColumnValueExp(key);
+
+  // Statistics show a NaN in the column; an unbounded scan may visit it, and
+  // memcomparable encodes it above every number, so byte order != ORDER BY.
+  IndexScanPlan unbounded(table, index, statistics, {}, {}, true, nullptr,
+                          {key});
+  EXPECT_FALSE(unbounded.IsOrderedBy({order_key}, {true}));
+  EXPECT_FALSE(
+      unbounded.IsOrderedBy({order_key}, {true}, {std::optional<bool>(true)}));
+
+  // A finite upper bound excludes NaN, so the index order is reusable.
+  IndexScanPlan bounded(table, index, statistics, {}, {Value(2.0)}, true,
+                        nullptr, {key});
+  EXPECT_TRUE(bounded.IsOrderedBy({order_key}, {true}));
+  ASSERT_SUCCESS(ctx.PreCommit());
+}
+
 TEST_F(PlanTest, AuditLeadingRangeIndexOnlyUsesUndampedSelectivity) {
   auto ctx = rs_->BeginContext();
   const Schema schema("composite_range",

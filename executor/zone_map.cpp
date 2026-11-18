@@ -104,6 +104,109 @@ void ZoneMap::AddNull() {
   ++null_count_;
 }
 
+void ZoneMap::AddNulls(size_t count) {
+  if (count == 0) {
+    return;
+  }
+  initialized_ = true;
+  null_count_ += count;
+}
+
+void ZoneMap::AddIntRange(int64_t mn, int64_t mx, size_t count) {
+  if (count == 0) {
+    return;
+  }
+  initialized_ = true;
+  value_count_ += count;
+  if (minimum_ && minimum_->type != ValueType::kInt64) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  if (!minimum_ || mn < minimum_->value.int_value) {
+    minimum_ = Value(mn);
+  }
+  if (!maximum_ || maximum_->value.int_value < mx) {
+    maximum_ = Value(mx);
+  }
+}
+
+void ZoneMap::AddDateRange(int64_t mn, int64_t mx, size_t count) {
+  if (count == 0) {
+    return;
+  }
+  initialized_ = true;
+  value_count_ += count;
+  if (minimum_ && minimum_->type != ValueType::kDate) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  if (!minimum_ || mn < minimum_->value.int_value) {
+    minimum_ = Value::DateFromDays(mn);
+  }
+  if (!maximum_ || maximum_->value.int_value < mx) {
+    maximum_ = Value::DateFromDays(mx);
+  }
+}
+
+void ZoneMap::AddDoubleRange(double mn, double mx, bool has_bounds,
+                             bool saw_nan, size_t count) {
+  if (count == 0) {
+    return;
+  }
+  initialized_ = true;
+  value_count_ += count;
+  if (saw_nan) {
+    has_nan_ = true;
+  }
+  if (!has_bounds) {
+    return;
+  }
+  if (minimum_ && minimum_->type != ValueType::kDouble) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  // A reversed interval would make MayMatch reject every row.
+  if (mn > mx) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  if (!minimum_ || mn < minimum_->value.double_value) {
+    minimum_ = Value(mn);
+  }
+  if (!maximum_ || maximum_->value.double_value < mx) {
+    maximum_ = Value(mx);
+  }
+}
+
+void ZoneMap::AddStringRange(std::string_view mn, std::string_view mx,
+                             size_t count) {
+  if (count == 0) {
+    return;
+  }
+  initialized_ = true;
+  value_count_ += count;
+  if (minimum_ && minimum_->type != ValueType::kVarChar) {
+    has_nan_ = true;
+    minimum_.reset();
+    maximum_.reset();
+    return;
+  }
+  if (!minimum_ || mn < minimum_->value.varchar_value) {
+    minimum_ = Value(std::string(mn));
+  }
+  if (!maximum_ || maximum_->value.varchar_value < mx) {
+    maximum_ = Value(std::string(mx));
+  }
+}
+
 void ZoneMap::AddOpaque() {
   initialized_ = true;
   ++value_count_;
@@ -171,6 +274,13 @@ bool ZoneMap::MayMatch(BinaryOperation operation, const Value& constant) const {
   // Cross-type comparisons (e.g. int constant vs double zone) may match after
   // implicit conversion; pruning them would silently drop rows.
   if (minimum_->type != constant.type) {
+    return true;
+  }
+  // An interval-tagged constant compared against an envelope built from
+  // untagged VARCHAR values uses non-commutative TryLess semantics
+  // (untagged < tagged is always true, tagged < untagged is always false),
+  // so envelope pruning is unsound.  Keep the batch.
+  if (constant.IsInterval()) {
     return true;
   }
   // A collation can change the order of values inside a byte-order range:

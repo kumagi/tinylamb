@@ -122,6 +122,6 @@ list の射影が来れば別グループに隔離**されます。次に各分�
 
 ## 検証テスト
 
-`plan/cascades_test.cpp`、`plan/optimizer_test.cpp`、`plan/plan_test.cpp`、
+`plan/cascades_test_part*.cpp`、`plan/optimizer_test_part*.cpp`、`plan/plan_test.cpp`、
 `plan/plan_extra_test.cpp` を検索しましたが、本 Rule 名・`setop-projection`
 タグに対応する個別テストは確認できませんでした。

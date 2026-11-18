@@ -232,7 +232,7 @@ class PaxChunk final {
                       // [vparam u32 BE][cparam u32 BE][vlen u32 BE]
                       // [values region: runs entries][counts region: runs
                       //   entries]
-                      // Inner schemes are restricted to the leaf whitelist
+                      // Inner schemes are restricted to the leaf allowlist
                       // (PLAIN/CONST/RLE/FORBA/DICT/BITWEAVE): depth-1
                       // cascade, no recursion. param = runs.
     kDictX = 26,      // cascaded dictionary (BtrBlocks Dict+FSST family):
@@ -764,7 +764,7 @@ class PaxChunk final {
                  //   code(2j+1), codes 0..d-1 = hot[d], 15 = exception,
                  //   d..14 never emitted]
                  // [inner region: nexc exception values in row order, leaf
-                 //   whitelist; omitted when nexc == 0]
+                 //   allowlist; omitted when nexc == 0]
                  // param = nexc (echoed in the header, kFreq-style).
                  // Applicability gate mirrors the family: d == 1 is kConst's
                  // (rejected), and the encoder bails when the top-15 head
@@ -790,7 +790,7 @@ class PaxChunk final {
                  // the Elf line (Li et al., PVLDB'23) -- and the group
                  // directory is what buys the compressed-domain queries:
                  // the per-group bracket [msb<<s, msb<<s | (2^s-1)] lets
-                 // ANY range predicate fold to whole-group SvSetRanges,
+                 // ANY range predicate fold to whole-group SvSetRangeRaw,
                  // and because the values ALSO ascend inside a group, the
                  // (at most two) boundary groups resolve by two in-group
                  // bisects into one contiguous range set -- the answer
@@ -807,7 +807,7 @@ class PaxChunk final {
                  // (timestamps ~1.7e9, prices, sorted sensor readings)
                  // where the per-group delta width collapses; the encoder
                  // tries every split 1..63 and the byte race against
-                 // kGorilla/kChimp/kAlp/kPatAs decides, so a dense
+                 // kGorilla/kChimp/kAlp/kPatA decides, so a dense
                  // integer-like ramp is NOT automatically its win (the
                  // directory is 19B/group). The NON-NEGATIVE gate is
                  // structural, not a shortcut: with the sign bit set the
@@ -1203,7 +1203,7 @@ class PaxChunk final {
     //   (the kArith on-model convention); popcount(bmp) == n - nexc
     // [per segment: ischeme u8][iparam u32 BE][vlen u32 BE][inner region:
     //   vlen bytes, the n - nexc conforming values in row order, any
-    //   whitelisted int64 leaf scheme (EncodeInnerI64's best-of)]
+    //   allowlisted int64 leaf scheme (EncodeInnerI64's best-of)]
     // [exceptions: nexc x (u32 len BE + bytes)]  -- row order, the kPlain
     //   varchar layout
     // Encoder gates: n >= 8; the template inferred from row 0 has 1..8 digit
@@ -1875,7 +1875,7 @@ class PaxChunk final {
   void DecodeInt64ColumnRg(slot_t col, uint32_t g, int64_t* out) const;
 
   // The encoder's per-scheme linear decode cost, normalized to PLAIN = 1.0
-  // (the unit Interface.md §6.1 defines as "compare one PLAIN int64 against
+  // (the unit the comparison contract defines as "compare one PLAIN int64 against
   // one literal"). The same table drives the adaptive encoder's choice and
   // the fragment IR's estimate, so the two can never disagree about what a
   // scheme costs to expand. The cost of a COMPRESSED-DOMAIN kernel (a count
@@ -2292,17 +2292,22 @@ bool Bp128RegionCountSum(const char* region, uint32_t n, uint32_t param,
 // compressed paths. Entries are returned in first-seen group order.
 struct GroupByEntry {
   int64_t key = 0;
-  int64_t sum = 0;     // Σ sum-col values (two's-complement truncation)
-  uint64_t count = 0;  // rows in the group
+  int64_t sum = 0;     // Σ non-NULL sum-col values
+  uint64_t count = 0;  // rows in the group with a non-NULL summand; a group
+                       // seen only through NULL summands reports count == 0,
+                       // the consumer's "SUM is NULL" flag (Accumulator's
+                       // contract in fragment.cpp)
 };
 
-std::vector<GroupByEntry> GroupBySumColumn(const PaxChunk& chunk,
-                                           slot_t group_col, slot_t sum_col,
-                                           const Schema* sc = nullptr,
-                                           WorkloadTracker* workload = nullptr);
+// A group total that leaves int64 returns "integer overflow in SUM"
+// (kIsInfinity), matching the row-level aggregate path.
+StatusOr<std::vector<GroupByEntry>> GroupBySumColumn(
+    const PaxChunk& chunk, slot_t group_col, slot_t sum_col,
+    const Schema* sc = nullptr, WorkloadTracker* workload = nullptr);
 
 // One entry of an N-key GROUP BY: the group key (one value per group
-// column), the sum and the row count.
+// column), the sum over non-NULL summands, and the count of rows that
+// contributed one (count == 0 is the "SUM is NULL" contract).
 struct GroupByEntryN {
   std::vector<int64_t> key;
   int64_t sum = 0;
@@ -2323,8 +2328,9 @@ struct GroupByEntryN {
 //
 // The group key values are the raw int64 values (a NULL cell participates
 // as raw 0, matching the decode path and the WASM pushdown). Entries are
-// returned in first-seen group order. SUM wraps in two's-complement int64,
-// like GroupBySumColumn. Invalid arguments or corrupt row groups return Status;
+// returned in first-seen group order. A group total that leaves int64 returns
+// "integer overflow in SUM" (kIsInfinity), matching the row-level aggregate
+// path. Invalid arguments or corrupt row groups return Status;
 // no partial aggregate is returned on failure.
 StatusOr<std::vector<GroupByEntryN>> GroupBySumColumns(
     const PaxChunk& chunk, const std::vector<slot_t>& group_cols,

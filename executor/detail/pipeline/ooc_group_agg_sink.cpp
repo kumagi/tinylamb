@@ -141,7 +141,7 @@ class GroupAggLeafSource final : public PipelineSource {
             64;
         if (!leaf_grant_cache_->Reserve(group_cost)) {
           fallback_to_skew = true;
-          return Status(StatusCode::kMemoryLimitExceeded);
+          return {StatusCode::kMemoryLimitExceeded};
         }
         return Status::kSuccess;
       };
@@ -418,7 +418,7 @@ class GroupAggLeafSource final : public PipelineSource {
         }
       } else if (UseSingleCountDistinctSort()) {
         // Sorted by (group_key, distinct_val): deduplicate adjacent equal
-        // distinct_vals in O(1) memory instead of materializing a DistinctSet!
+        // distinct_vals in O(1) memory instead of materializing a distinct-value set!
         const Value& dval = sorted_row[skew_raw_width_ + gcnt];
         if (!dval.IsNull()) {
           if (!have_prev_distinct_ || !relational_detail::DistinctValueEqual{}(

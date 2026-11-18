@@ -2214,7 +2214,7 @@ NOTE: Reference implementation reports non-determinism.
 
 # The array with kIgnoresOrder only has one element, so the result is
 # deterministic.
-[name=array_zip_igore_order_array_only_has_one_element]
+[name=array_zip_ignore_order_array_only_has_one_element]
 [required_features=ARRAY_ZIP,NAMED_ARGUMENTS]
 SELECT ARRAY_ZIP(ARRAY(SELECT * FROM UNNEST([1])), [2, 3], [4], mode => 'TRUNCATE')
 --
@@ -2223,7 +2223,7 @@ ARRAY<STRUCT<ARRAY<>>>[{ARRAY<STRUCT<INT64, INT64, INT64>>[{1, 2, 4}]}]
 
 # Lambda signature: The array with kIgnoresOrder only has one element, so the
 # result is deterministic.
-[name=array_zip_igore_order_array_only_has_one_element_lambda]
+[name=array_zip_ignore_order_array_only_has_one_element_lambda]
 [required_features=ARRAY_ZIP,NAMED_ARGUMENTS,INLINE_LAMBDA_ARGUMENT]
 SELECT ARRAY_ZIP(
   ARRAY(SELECT * FROM UNNEST([1])),
@@ -2237,7 +2237,7 @@ ARRAY<STRUCT<ARRAY<>>>[{ARRAY<INT64>[7]}]
 
 # All elements of the array with kIgnoresOrder are equal, so the result is still
 # deterministic.
-[name=array_zip_igore_order_array_all_elements_are_the_same]
+[name=array_zip_ignore_order_array_all_elements_are_the_same]
 [required_features=ARRAY_ZIP,NAMED_ARGUMENTS]
 SELECT ARRAY_ZIP(
   [2, 3],
@@ -2258,7 +2258,7 @@ ARRAY<STRUCT<ARRAY<>>>[
 
 # Lambda signature: All elements of the array with kIgnoresOrder are equal, so
 # the result is still deterministic.
-[name=array_zip_igore_order_array_all_elements_are_the_same_lambda]
+[name=array_zip_ignore_order_array_all_elements_are_the_same_lambda]
 [required_features=ARRAY_ZIP,NAMED_ARGUMENTS,INLINE_LAMBDA_ARGUMENT]
 SELECT ARRAY_ZIP(
   [2, 3],

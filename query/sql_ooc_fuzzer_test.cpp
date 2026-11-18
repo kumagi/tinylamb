@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -71,7 +72,14 @@ class OpWatchdog {
  public:
   explicit OpWatchdog(uint64_t seed) : seed_(seed) {
     const char* env = std::getenv("TINYLAMB_OOC_FUZZ_OP_TIMEOUT");
-    timeout_ = env != nullptr ? std::strtod(env, nullptr) : 45.0;
+    timeout_ = 45.0;
+    if (env != nullptr) {
+      char* end = nullptr;
+      const double parsed = std::strtod(env, &end);
+      if (end != env && *end == '\0' && std::isfinite(parsed) && parsed > 0.0) {
+        timeout_ = parsed;
+      }
+    }
     if (timeout_ > 0) {
       thread_ = std::thread([this]() { Run(); });
     }

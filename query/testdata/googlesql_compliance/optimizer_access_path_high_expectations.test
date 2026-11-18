@@ -232,7 +232,7 @@ ARRAY<STRUCT<id INT64, score INT64>>[
 [name=secondary_range_without_order_requirement]
 SELECT id, score FROM access_input WHERE score >= 80
 --
-ARRAY<STRUCT<id INT64, score INT64>>[
+ARRAY<STRUCT<id INT64, score INT64>>[unknown order:
   {3, 80}, {2, 90}, {1, 100}
 ]
 ==

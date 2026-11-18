@@ -62,13 +62,12 @@ bool AffineColumn(const Expression& expression, const ColumnName& target,
   }
   const auto& binary = expression->AsBinaryExpression();
   int64_t constant = 0;
-  if (binary.Op() == BinaryOperation::kAdd &&
-      IntConstant(binary.Right(), &constant)) {
-    return AffineColumn(binary.Left(), target, multiplier);
-  }
-  if (binary.Op() == BinaryOperation::kSubtract &&
-      IntConstant(binary.Right(), &constant)) {
-    return AffineColumn(binary.Left(), target, multiplier);
+  // `k + c` / `k - c` would need an overflow-proof ordered mapping. The
+  // constant used to be read and discarded, so a wrapped value could be
+  // treated as still index-ordered; decline the shortcut and keep the sort.
+  if (binary.Op() == BinaryOperation::kAdd ||
+      binary.Op() == BinaryOperation::kSubtract) {
+    return false;
   }
   if (binary.Op() == BinaryOperation::kMultiply &&
       IntConstant(binary.Right(), &constant)) {
@@ -274,11 +273,64 @@ size_t IndexScanPlan::EmitRowCount() const {
   return stats_.Rows();
 }
 
+bool IndexScanPlan::DoubleKeyOrderIsSound() const noexcept {
+  if (provided_order_.empty() || index_.sc_.key_.empty()) {
+    return true;
+  }
+  size_t key_pos = index_.sc_.key_.size();
+  for (size_t k = 0; k < index_.sc_.key_.size(); ++k) {
+    if (table_.GetSchema().GetColumn(index_.sc_.key_[k]).Name() ==
+        provided_order_.front()) {
+      key_pos = k;
+      break;
+    }
+  }
+  if (key_pos == index_.sc_.key_.size()) {
+    return false;
+  }
+  if (table_.GetSchema().GetColumn(index_.sc_.key_[key_pos]).Type() !=
+      ValueType::kDouble) {
+    return true;
+  }
+  // A finite upper bound on that key excludes NaN: memcomparable NaN sorts
+  // above every finite value and +inf, so an unbounded scan (or a bound that
+  // could itself be NaN) must not advertise ORDER BY compatibility.
+  const auto finite_bound = [&](const std::vector<Value>& key) {
+    return key.size() > key_pos && key[key_pos].type == ValueType::kDouble &&
+           std::isfinite(key[key_pos].value.double_value);
+  };
+  if (!end_key_.empty() && finite_bound(end_key_)) {
+    return true;
+  }
+  if (!point_ranges_.empty() &&
+      std::ranges::all_of(point_ranges_, [&](const auto& r) {
+        return finite_bound(r.second);
+      })) {
+    return true;
+  }
+  // ANALYZE ranks NaN before every number, so a finite lowest boundary value
+  // proves the column has no NaN. TableStatistics is generation-gated, so a
+  // later row mutation invalidates the proof with the cached stats.
+  // Statistics may be older than a newly added index key column: never prove
+  // an order from a column the snapshot does not describe.
+  if (static_cast<size_t>(index_.sc_.key_[key_pos]) >= stats_.Columns()) {
+    return false;
+  }
+  const ColumnStats& col = stats_.Column(index_.sc_.key_[key_pos]);
+  if (col.Unmeasured() || col.NonNullCount() == 0) {
+    return col.NonNullCount() == 0;
+  }
+  const auto& lowest = col.LowestValues();
+  return !lowest.empty() && lowest.front().value.type == ValueType::kDouble &&
+         std::isfinite(lowest.front().value.value.double_value);
+}
+
 bool IndexScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                 const std::vector<bool>& ascending) const {
   // Point ranges are sorted and disjoint before construction, so scanning
   // them in sequence preserves the advertised global key order.
-  return OrderMatches(provided_order_, ascending_, expressions, ascending);
+  return OrderMatches(provided_order_, ascending_, expressions, ascending) &&
+         DoubleKeyOrderIsSound();
 }
 
 bool IndexScanPlan::IsOrderedBy(
@@ -286,7 +338,8 @@ bool IndexScanPlan::IsOrderedBy(
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending,
-                      nulls_first);
+                      nulls_first) &&
+         DoubleKeyOrderIsSound();
 }
 
 void IndexScanPlan::Dump(std::ostream& o, int /*indent*/) const {

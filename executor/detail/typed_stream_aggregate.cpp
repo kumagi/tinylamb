@@ -32,17 +32,22 @@
 #include <utility>
 #include <vector>
 
-#include "common/exception_status.hpp"
 #include "common/constants.hpp"
 #include "common/exc_shim.hpp"
+#include "common/exception_status.hpp"
 #include "common/parallel_work.hpp"
 #include "common/platform/extended_float.hpp"
+#include "common/platform/int128_conversion.hpp"
+#include "common/platform/range_selection.hpp"
 #include "common/query_parallelism.hpp"
+#include "common/regex_guard.hpp"
 #include "common/sorted_distinct_runs.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/aggregation.hpp"
+#include "executor/detail/columnar_table.hpp"
+#include "executor/detail/columnar_tlcs_fast_path.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/flat_int_key_map.hpp"
 #include "executor/detail/planning_heuristics.hpp"
@@ -50,6 +55,7 @@
 #include "executor/detail/scan_filter.hpp"
 #include "executor/detail/subquery_runtime.hpp"
 #include "executor/detail/timestamp_trunc_kernel.hpp"
+#include "executor/detail/typed_stream_aggregate_internal.hpp"
 #include "executor/detail/window_eval.hpp"
 #include "executor/query_memory.hpp"
 #include "expression/aggregate_expression.hpp"
@@ -81,4664 +87,3868 @@
 
 namespace tinylamb::relational_detail {
 
-// Group states local to one worker (or to the merged result on the main
-// thread).  Single INT64/DATE key statements index groups by the raw int
-// value; everything else keys a canonical Value row.
-// Chunked storage for the flat per-group accumulator states.  A plain
-// std::vector<AggregateAccumulator> reallocates on geometric growth, and the
-// realloc transient (old buffer + new buffer live together) peaks at ~3x the
-// final state size — with 16 workers each folding 1.4M groups x ~300 bytes
-// that was a ~20 GB transient spike whose page faults and cache thrash
-// dominated the very scans the flat layout was meant to speed up.  Fixed
-// chunks never move, and the chunk-pointer vector's growth moves 16-byte
-// handles.
-class AccumulatorChunks {
- public:
-  static constexpr size_t kSlotsPerChunk = 512;
-
-  void Configure(size_t stride) { stride_ = stride; }
-
-  // Wholesale adoption when a merge target takes over a worker's whole state
-  // (same stride and chunk geometry, so slot positions carry over as-is).
-  void AdoptChunksFrom(AccumulatorChunks&& other) {
-    chunks_ = std::move(other.chunks_);
-    stride_ = other.stride_;
-  }
-
-  [[nodiscard]] AggregateAccumulator& State(size_t group, size_t i) {
-    const size_t slot = (group * stride_) + i;
-    return chunks_[slot / kSlotsPerChunk]->At(slot % kSlotsPerChunk);
-  }
-  [[nodiscard]] const AggregateAccumulator& State(size_t group,
-                                                  size_t i) const {
-    const size_t slot = (group * stride_) + i;
-    return chunks_[slot / kSlotsPerChunk]->At(slot % kSlotsPerChunk);
-  }
-
-  void AppendGroup(const std::vector<const AggregateExpression*>& aggregates,
-                   const std::vector<AggregateAccumulator::Shape>* shapes) {
-    for (size_t i = 0; i < aggregates.size(); ++i) {
-      if (chunks_.empty() || chunks_.back()->constructed() == kSlotsPerChunk) {
-        chunks_.push_back(std::make_unique<Chunk>(kSlotsPerChunk));
-      }
-      if (shapes != nullptr) {
-        chunks_.back()->ConstructAt((*aggregates[i]), (*shapes)[i]);
-      } else {
-        chunks_.back()->ConstructAt((*aggregates[i]));
-      }
-    }
-  }
-
- private:
-  class Chunk {
-   public:
-    explicit Chunk(size_t capacity)
-        : storage_(new std::byte[capacity * sizeof(AggregateAccumulator)]) {}
-    Chunk(const Chunk&) = delete;
-    Chunk& operator=(const Chunk&) = delete;
-    Chunk(Chunk&&) = delete;
-    Chunk& operator=(Chunk&&) = delete;
-    ~Chunk() {
-      for (size_t i = 0; i < constructed_; ++i) {
-        At(i).~AggregateAccumulator();
-      }
-    }
-    AggregateAccumulator& At(size_t index) {
-      return *std::launder(reinterpret_cast<AggregateAccumulator*>(
-          storage_.get() + (index * sizeof(AggregateAccumulator))));
-    }
-    AggregateAccumulator& ConstructAt(const AggregateExpression& aggregate) {
-      auto* placed =  // NOLINT(cppcoreguidelines-owning-memory)
-          new (storage_.get() + (constructed_ * sizeof(AggregateAccumulator)))
-              AggregateAccumulator(&aggregate);
-      ++constructed_;
-      return *placed;
-    }
-    AggregateAccumulator& ConstructAt(
-        const AggregateExpression& aggregate,
-        const AggregateAccumulator::Shape& shape) {
-      auto* placed =  // NOLINT(cppcoreguidelines-owning-memory)
-          new (storage_.get() + (constructed_ * sizeof(AggregateAccumulator)))
-              AggregateAccumulator(&aggregate, shape);
-      ++constructed_;
-      return *placed;
-    }
-    [[nodiscard]] size_t constructed() const { return constructed_; }
-
-   private:
-    // NOLINTNEXTLINE(modernize-avoid-c-arrays)
-    std::unique_ptr<std::byte[]> storage_;
-    size_t constructed_{0};
-  };
-
-  std::vector<std::unique_ptr<Chunk>> chunks_;
-  size_t stride_{1};
-};
-
-struct TypedWorkerGroups {
-  bool int_key{false};
-  bool packed_varchar_key{false};
-  // Open-addressing: a fresh multi-million-group build (Q18/Q21 shapes) costs
-  // no per-group node allocation, unlike the node-based row_index below.
-  FlatIntKeyMap<size_t> int_index;
-  // The group payload already owns canonical keys. Index their group IDs,
-  // avoiding a second owned Row and a node allocation for every group.
-  struct KeySlot {
-    size_t hash{0};
-    size_t group{SIZE_MAX};
-  };
-  std::vector<KeySlot> key_index;
-  size_t indexed_groups{0};
-
-  void ReserveKeyIndex(size_t capacity) {
-    std::vector<KeySlot> replacement(capacity);
-    for (const auto& old : key_index) {
-      if (old.group == SIZE_MAX) {
-        continue;
-      }
-      size_t slot = old.hash & (capacity - 1);
-      while (replacement[slot].group != SIZE_MAX) {
-        slot = (slot + 1) & (capacity - 1);
-      }
-      replacement[slot] = old;
-    }
-    key_index = std::move(replacement);
-  }
-  // A/B hatch: TINYLAMB_DISABLE_FLAT_GROUP_FOLD=1 restores the per-group
-  // vector-of-vector layout.  The flat layout below strides two contiguous
-  // vectors instead: group g's canonical keys live at
-  // flat_group_keys[g * key_stride + k] and its accumulators at
-  // flat_group_states[g * agg_stride + i].  The previous layout cost one heap
-  // allocation per group per container — across Q21's two 1.4M-group builds
-  // and Q18's 1.5M-group build that is ~5.7M allocations the flat layout
-  // never makes, with the group states gaining contiguous locality in the
-  // bargain.
-  bool flat_layout{true};
-  // Slim SoA mode (plan.slim): no AggregateAccumulator storage at all —
-  // per (group, aggregate) slots live in three parallel vectors indexed by
-  // group * agg_stride + i.  Element width is 8 bytes, so geometric growth
-  // moves are cheap (the chunked layout above exists for the ~300-byte
-  // accumulators; these need no chunking).
-  bool slim{false};
-  const std::vector<SlimAggKind>* slim_kinds{nullptr};
-  // Resident grouping sets can prove a dynamic expression only produces
-  // signed integers/doubles. Keep their sums separate, as the AST accumulator
-  // does, and remember whether each group observed a DOUBLE (flag bit 1).
-  std::vector<bool> mixed_numeric_sums;
-  std::vector<int64_t> slim_counts;
-  std::vector<int64_t> slim_int_totals;
-  std::vector<double> slim_double_totals;
-  std::vector<uint8_t> slim_flags;  // bit0: saw an infinite input (SUM double)
-  // kCountDistinctInt64 state: kSlimDistinctSlots inline int64 slots per
-  // (group, aggregate), the inline occupancy count, and a lazily materialized
-  // overflow set.  Slot stride is kSlimDistinctSlots * agg_stride.
-  std::vector<int64_t> slim_distinct;
-  std::vector<uint8_t> slim_distinct_n;
-  std::vector<std::unique_ptr<std::unordered_set<int64_t>>>
-      slim_distinct_overflow;
-  // Legacy layout (hatch only).
-  std::vector<std::vector<Value>> group_keys;  // canonical key values
-  std::vector<std::vector<AggregateAccumulator>> group_states;
-  // Flat layout: canonical keys in one contiguous vector, accumulators in
-  // fixed-size chunks (never moved, so no realloc transient).
-  std::vector<Value> flat_group_keys;
-  // Compact grouping sets can borrow canonical keys from their immutable
-  // input until all sets have emitted their owned result rows.
-  const std::vector<slot_t>* borrowed_key_offsets{nullptr};
-  std::vector<const Row*> borrowed_key_rows;
-  AccumulatorChunks chunked_states;
-  size_t key_stride{0};
-  size_t agg_stride{0};
-  size_t group_count{0};
-  int64_t min_int_key{std::numeric_limits<int64_t>::max()};
-  int64_t max_int_key{std::numeric_limits<int64_t>::min()};
-  bool has_non_int_key{false};
-  static constexpr size_t kMruSlots = 8;
-  std::array<int64_t, kMruSlots> mru_keys{};
-  std::array<size_t, kMruSlots> mru_groups{SIZE_MAX, SIZE_MAX, SIZE_MAX,
-                                           SIZE_MAX, SIZE_MAX, SIZE_MAX,
-                                           SIZE_MAX, SIZE_MAX};
-  static size_t MruSlot(int64_t raw_key) {
-    const auto u = static_cast<uint64_t>(raw_key);
-    return static_cast<size_t>(((u ^ (u >> 33)) * 0x9E3779B97F4A7C15ULL) >> 61);
-  }
-  // Per-aggregate classification shared by every FindOrInsert of this worker;
-  // null falls back to per-construction analysis.
-  const std::vector<AggregateAccumulator::Shape>* shapes{nullptr};
-
-  void Configure(bool flat, size_t keys_per_group,
-                 size_t aggregates_per_group) {
-    flat_layout = flat;
-    key_stride = keys_per_group;
-    agg_stride = aggregates_per_group;
-    chunked_states.Configure(std::max<size_t>(aggregates_per_group, 1));
-  }
-
-  void ConfigureSlim(const TypedAggregationPlan& plan) {
-    slim = plan.slim;
-    slim_kinds = &plan.slim_kinds;
-  }
-
-  // Slim state accessors for group g, aggregate i.
-  [[nodiscard]] int64_t& SlimCount(size_t g, size_t i) {
-    return slim_counts[(g * agg_stride) + i];
-  }
-  [[nodiscard]] int64_t& SlimIntTotal(size_t g, size_t i) {
-    return slim_int_totals[(g * agg_stride) + i];
-  }
-  [[nodiscard]] double& SlimDoubleTotal(size_t g, size_t i) {
-    return slim_double_totals[(g * agg_stride) + i];
-  }
-  [[nodiscard]] uint8_t& SlimFlags(size_t g, size_t i) {
-    return slim_flags[(g * agg_stride) + i];
-  }
-
-  // Inserts one int64/date distinct value for kCountDistinctInt64; false when
-  // it was already present.  Mirrors AggregateAccumulator::InsertDistinctInt.
-  bool SlimInsertDistinct(size_t g, size_t i, int64_t raw) {
-    const size_t state = (g * agg_stride) + i;
-    int64_t* slots = &slim_distinct[state * kSlimDistinctSlots];
-    const uint8_t n = slim_distinct_n[state];
-    for (size_t s = 0; s < n; ++s) {
-      if (slots[s] == raw) {
-        return false;
-      }
-    }
-    if (n < kSlimDistinctSlots) {
-      slots[n] = raw;
-      slim_distinct_n[state] = static_cast<uint8_t>(n + 1);
-      return true;
-    }
-    if (state >= slim_distinct_overflow.size()) {
-      slim_distinct_overflow.resize(slim_distinct_n.size());
-    }
-    auto& overflow = slim_distinct_overflow[state];
-    if (!overflow) {
-      overflow = std::make_unique<std::unordered_set<int64_t>>();
-    }
-    return overflow->insert(raw).second;
-  }
-
-  // Distinct values seen so far for kCountDistinctInt64 (the value COUNT
-  // (DISTINCT) finishes to).
-  [[nodiscard]] size_t SlimDistinctTotal(size_t g, size_t i) const {
-    const size_t state = (g * agg_stride) + i;
-    size_t total = slim_distinct_n[state];
-    if (state < slim_distinct_overflow.size() &&
-        slim_distinct_overflow[state]) {
-      total += slim_distinct_overflow[state]->size();
-    }
-    return total;
-  }
-
-  [[nodiscard]] size_t GroupCount() const {
-    return flat_layout ? group_count : group_states.size();
-  }
-  [[nodiscard]] const Value& GroupKey(size_t group, size_t k) const {
-    if (borrowed_key_offsets != nullptr) {
-      return (*borrowed_key_rows[group])[(*borrowed_key_offsets)[k]];
-    }
-    if (flat_layout) {
-      return flat_group_keys[(group * key_stride) + k];
-    }
-    return group_keys[group][k];
-  }
-  [[nodiscard]] const AggregateAccumulator& State(size_t group,
-                                                  size_t i) const {
-    if (flat_layout) {
-      return chunked_states.State(group, i);
-    }
-    return group_states[group][i];
-  }
-  AggregateAccumulator& State(size_t group, size_t i) {
-    if (flat_layout) {
-      return chunked_states.State(group, i);
-    }
-    return group_states[group][i];
-  }
-
-  void ReserveGroups(size_t target_groups) {
-    if (target_groups == 0) {
-      return;
-    }
-    if (int_key) {
-      int_index.Reserve(target_groups);
-    }
-    if (flat_layout) {
-      if (borrowed_key_offsets != nullptr) {
-        borrowed_key_rows.reserve(target_groups);
-      } else {
-        flat_group_keys.reserve(target_groups * key_stride);
-      }
-      if (slim) {
-        const size_t stride = agg_stride;
-        const size_t have_groups = slim_counts.size() / stride;
-        if (target_groups > have_groups) {
-          const size_t cells = target_groups * stride;
-          slim_counts.resize(cells, 0);
-          slim_int_totals.resize(cells, 0);
-          slim_double_totals.resize(cells, 0.0);
-          slim_flags.resize(cells, 0);
-          if (std::ranges::any_of(*slim_kinds, [](SlimAggKind kind) {
-                return IsSlimDistinctKind(kind);
-              })) {
-            slim_distinct.resize(cells * kSlimDistinctSlots, 0);
-            slim_distinct_n.resize(cells, 0);
-          }
-        }
-      }
-    }
-  }
-
- private:
-  // Slim group state grows in blocks of groups: one zeroing resize per block
-  // instead of one tail-insert per group.  Multi-million-group folds paid a
-  // vector::_M_fill_insert call (plus its capacity dance) per new group per
-  // array before, which callgrind put at ~7% of the fold.  Capacity is
-  // derived from the arrays themselves (not a separate counter), so the
-  // merge path's std::move adoption carries the padding along for free.
-  static constexpr size_t kSlimGroupBlock = 4096;
-  void ReserveSlimBlock() {
-    const size_t stride = agg_stride;
-    const size_t have_groups = slim_counts.size() / stride;
-    if (group_count < have_groups) {
-      return;
-    }
-    const size_t groups = have_groups + kSlimGroupBlock;
-    const size_t cells = groups * stride;
-    slim_counts.resize(cells, 0);
-    slim_int_totals.resize(cells, 0);
-    slim_double_totals.resize(cells, 0.0);
-    slim_flags.resize(cells, 0);
-    if (std::ranges::any_of(*slim_kinds, [](SlimAggKind kind) {
-          return IsSlimDistinctKind(kind);
-        })) {
-      slim_distinct.resize(cells * kSlimDistinctSlots, 0);
-      slim_distinct_n.resize(cells, 0);
-    }
-  }
-
-  void AppendGroup(const std::vector<Value>& canonical_keys,
-                   size_t aggregate_count,
-                   const std::vector<const AggregateExpression*>& aggregates) {
-    if (int_key && canonical_keys.size() == 1 && !canonical_keys[0].IsNull()) {
-      const int64_t k = canonical_keys[0].value.int_value;
-      min_int_key = std::min(min_int_key, k);
-      max_int_key = std::max(max_int_key, k);
-    } else {
-      has_non_int_key = true;
-    }
-    if (flat_layout) {
-      flat_group_keys.insert(flat_group_keys.end(), canonical_keys.begin(),
-                             canonical_keys.end());
-      if (!slim && aggregate_count != 0) {
-        chunked_states.AppendGroup(aggregates, shapes);
-      }
-    } else {
-      group_keys.push_back(canonical_keys);
-      group_states.emplace_back();
-      auto& states = group_states.back();
-      states.reserve(aggregate_count);
-      for (size_t i = 0; i < aggregate_count; ++i) {
-        if (shapes != nullptr) {
-          states.emplace_back(aggregates[i], (*shapes)[i]);
-        } else {
-          states.emplace_back(aggregates[i]);
-        }
-      }
-    }
-    if (slim) {
-      ReserveSlimBlock();
-    }
-    ++group_count;
-  }
-
- public:
-  bool TryPackCanonicalKeys(const std::vector<Value>& canonical_keys,
-                            int64_t* raw_key) const {
-    if (int_key) {
-      if (canonical_keys.empty() || canonical_keys[0].IsNull()) {
-        return false;
-      }
-      *raw_key = canonical_keys[0].value.int_value;
-      return true;
-    }
-    if (!packed_varchar_key || canonical_keys.empty() ||
-        canonical_keys.size() > 2) {
-      return false;
-    }
-    uint64_t packed = 0;
-    for (size_t k = 0; k < canonical_keys.size(); ++k) {
-      const Value& key = canonical_keys[k];
-      if (key.IsNull() || key.type != ValueType::kVarChar ||
-          key.IsCaseInsensitive()) {
-        return false;
-      }
-      uint32_t part = 0;
-      if (!TryPackShortVarcharSpan(key.value.varchar_value, &part)) {
-        return false;
-      }
-      packed |= static_cast<uint64_t>(part) << (k * 32);
-    }
-    *raw_key = static_cast<int64_t>(packed);
-    return true;
-  }
-
-  size_t FindOrInsert(const std::vector<Value>& canonical_keys, int64_t raw_key,
-                      size_t aggregate_count,
-                      const std::vector<const AggregateExpression*>& aggregates,
-                      bool* inserted) {
-    // A NULL key must stay its own group: the raw int64 slot cannot encode
-    // null-ness (NULL's bit pattern collides with 0), so NULL keys always go
-    // through the canonical row index even on the int_key fast path.
-    int64_t packed_key = raw_key;
-    const bool use_int_key =
-        (int_key && !canonical_keys.empty() && !canonical_keys[0].IsNull()) ||
-        (packed_varchar_key &&
-         TryPackCanonicalKeys(canonical_keys, &packed_key));
-    if (use_int_key) {
-      bool emplaced = false;
-      size_t* slot = int_index.TryEmplace(packed_key, &emplaced);
-      *inserted = emplaced;
-      if (emplaced) {
-        *slot = GroupCount();
-        AppendGroup(canonical_keys, aggregate_count, aggregates);
-      }
-      return *slot;
-    }
-    if ((indexed_groups + 1) * 10 > key_index.size() * 7) {
-      ReserveKeyIndex(key_index.empty() ? 16 : key_index.size() * 2);
-    }
-    uint64_t mixed = GroupKeyTransparentHash{}(canonical_keys);
-    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
-    const auto hash = static_cast<size_t>(mixed ^ (mixed >> 31));
-    const size_t mask = key_index.size() - 1;
-    size_t slot = hash & mask;
-    while (key_index[slot].group != SIZE_MAX) {
-      const auto& candidate = key_index[slot];
-      if (candidate.hash == hash) {
-        bool equal = true;
-        for (size_t k = 0; k < canonical_keys.size(); ++k) {
-          if (!DistinctValueEqual{}(canonical_keys[k],
-                                    GroupKey(candidate.group, k))) {
-            equal = false;
-            break;
-          }
-        }
-        if (equal) {
-          *inserted = false;
-          return candidate.group;
-        }
-      }
-      slot = (slot + 1) & mask;
-    }
-    const size_t group = GroupCount();
-    AppendGroup(canonical_keys, aggregate_count, aggregates);
-    key_index[slot] = KeySlot{.hash = hash, .group = group};
-    ++indexed_groups;
-    *inserted = true;
-    return group;
-  }
-
-  static size_t HashRowKey(const Row& row, const std::vector<slot_t>& offsets) {
-    uint64_t mixed = 0x9e3779b97f4a7c15ULL;
-    for (const slot_t slot : offsets) {
-      mixed = (mixed << 7) | (mixed >> 57);
-      mixed ^= std::hash<Value>{}(row[slot]);
-      mixed *= 0x100000001b3ULL;
-    }
-    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
-    return static_cast<size_t>(mixed ^ (mixed >> 31));
-  }
-
-  // Resident inputs remain alive throughout the fold. Probe their key cells
-  // directly and only own/canonicalize a tuple when it creates a group.
-  size_t FindOrInsertRow(
-      const Row& row, const std::vector<slot_t>& offsets,
-      const std::vector<const AggregateExpression*>& aggregates,
-      std::vector<Value>* scratch, bool* inserted,
-      std::optional<size_t> precomputed_hash = std::nullopt) {
-    const auto append_row_group = [&] {
-      borrowed_key_rows.push_back(&row);
-      if (slim) {
-        ReserveSlimBlock();
-      } else if (!aggregates.empty()) {
-        chunked_states.AppendGroup(aggregates, shapes);
-      }
-      ++group_count;
-    };
-    const auto copy_keys = [&] {
-      scratch->clear();
-      for (const slot_t slot : offsets) {
-        scratch->push_back(CanonicalDistinctValue(row[slot]));
-      }
-    };
-    if (borrowed_key_offsets != nullptr && int_key &&
-        !row[offsets[0]].IsNull()) {
-      size_t* slot =
-          int_index.TryEmplace(row[offsets[0]].value.int_value, inserted);
-      if (*inserted) {
-        *slot = GroupCount();
-        append_row_group();
-      }
-      return *slot;
-    }
-    if (borrowed_key_offsets == nullptr &&
-        (int_key || std::ranges::any_of(offsets, [&](slot_t slot) {
-           return row[slot].IsCaseInsensitive();
-         }))) {
-      copy_keys();
-      return FindOrInsert(*scratch,
-                          int_key && !scratch->front().IsNull()
-                              ? scratch->front().value.int_value
-                              : 0,
-                          aggregates.size(), aggregates, inserted);
-    }
-    if ((indexed_groups + 1) * 10 > key_index.size() * 7) {
-      ReserveKeyIndex(key_index.empty() ? 16 : key_index.size() * 2);
-    }
-    const size_t hash =
-        precomputed_hash ? *precomputed_hash : HashRowKey(row, offsets);
-    const size_t mask = key_index.size() - 1;
-    size_t slot = hash & mask;
-    while (key_index[slot].group != SIZE_MAX) {
-      const auto& candidate = key_index[slot];
-      bool equal = candidate.hash == hash;
-      for (size_t k = 0; equal && k < offsets.size(); ++k) {
-        equal =
-            DistinctValueEqual{}(row[offsets[k]], GroupKey(candidate.group, k));
-      }
-      if (equal) {
-        *inserted = false;
-        return candidate.group;
-      }
-      slot = (slot + 1) & mask;
-    }
-    const size_t group = GroupCount();
-    if (borrowed_key_offsets != nullptr) {
-      append_row_group();
-    } else {
-      copy_keys();
-      AppendGroup(*scratch, aggregates.size(), aggregates);
-    }
-    key_index[slot] = KeySlot{.hash = hash, .group = group};
-    ++indexed_groups;
-    *inserted = true;
-    return group;
-  }
-
-  // Raw-slot access for the arena fold fast path: the caller holds the raw
-  // int64 key, probes it directly, and builds canonical keys only on first
-  // insert.  Semantics identical to FindOrInsert's int-key branch (NULL keys
-  // never reach here; callers fall back to the Row path for those).
-  size_t* RawIntSlot(int64_t raw_key, bool* emplaced) {
-    return int_index.TryEmplace(raw_key, emplaced);
-  }
-  // Warms the group slot for a key that FindOrInsert/RawIntSlot will probe a
-  // few rows later; the intervening filter work hides the line fill.
-  void PrefetchGroupSlot(int64_t raw_key) const { int_index.Prefetch(raw_key); }
-  size_t ClaimSlotForNewGroup(
-      size_t* slot, const std::vector<Value>& canonical_keys,
-      size_t aggregate_count,
-      const std::vector<const AggregateExpression*>& aggregates) {
-    *slot = GroupCount();
-    AppendGroup(canonical_keys, aggregate_count, aggregates);
-    return *slot;
-  }
-
-  size_t AppendMonotonicIntGroup(int64_t raw_key, ValueType key_type,
-                                 bool is_unsigned) {
-    min_int_key = std::min(min_int_key, raw_key);
-    max_int_key = std::max(max_int_key, raw_key);
-    Value kv;
-    kv.type = key_type;
-    kv.value.int_value = raw_key;
-    if (key_type == ValueType::kInt64 && is_unsigned) {
-      kv.SetUnsigned();
-    }
-    flat_group_keys.push_back(kv);
-    ReserveSlimBlock();
-    return group_count++;
-  }
-
-  void ResetMonotonicIntGroup(size_t g, int64_t new_raw_key, ValueType key_type,
-                              bool is_unsigned) {
-    min_int_key = std::min(min_int_key, new_raw_key);
-    max_int_key = std::max(max_int_key, new_raw_key);
-    Value kv;
-    kv.type = key_type;
-    kv.value.int_value = new_raw_key;
-    if (key_type == ValueType::kInt64 && is_unsigned) {
-      kv.SetUnsigned();
-    }
-    flat_group_keys[g * key_stride] = kv;
-    const size_t base = g * agg_stride;
-    for (size_t i = 0; i < agg_stride; ++i) {
-      const size_t st = base + i;
-      slim_counts[st] = 0;
-      slim_int_totals[st] = 0;
-      slim_double_totals[st] = 0.0;
-      slim_flags[st] = 0;
-      if (st < slim_distinct_n.size()) {
-        slim_distinct_n[st] = 0;
-      }
-      if (st < slim_distinct_overflow.size() && slim_distinct_overflow[st]) {
-        slim_distinct_overflow[st]->clear();
-      }
-    }
-  }
-};
-
 namespace {
 
-// SQL DISTINCT puts all NaNs in one peer class and folds signed zeros.
-// Other DOUBLE values can use their exact representation in the integer set.
-int64_t CanonicalDistinctDoubleBits(double value) {
-  if (value == 0.0) {
-    return 0;
+struct DirectBlockCol {
+  const LSTableColumnBlock* col{nullptr};
+  const int64_t* cells{nullptr};
+  bool has_null{false};
+  std::vector<int64_t> scratch;
+
+  void Bind(const LSTableColumnBlock& blk_col, uint32_t row_count) {
+    col = &blk_col;
+    has_null = blk_col.has_null;
+    if (blk_col.type == ValueType::kVarChar) {
+      cells = nullptr;
+      return;
+    }
+    if (blk_col.HasRawIntCells()) {
+      cells = blk_col.int_cells.data();
+    } else {
+      scratch.resize(row_count);
+      blk_col.MaterializeIntSlice(0, row_count, scratch.data());
+      cells = scratch.data();
+    }
   }
-  if (std::isnan(value)) {
-    value = std::numeric_limits<double>::quiet_NaN();
+
+  [[nodiscard]] bool IsNull(uint32_t r) const noexcept {
+    return has_null && col->IsNull(r);
   }
-  return std::bit_cast<int64_t>(value);
+  [[nodiscard]] int64_t Int(uint32_t r) const noexcept { return cells[r]; }
+  [[nodiscard]] double Double(uint32_t r) const noexcept {
+    return std::bit_cast<double>(cells[r]);
+  }
+  [[nodiscard]] std::string_view VarChar(uint32_t r) const noexcept {
+    return col->VarcharAt(r);
+  }
+};
+
+template <typename T>
+inline bool CompareDirectScalar(BinaryOperation op, T a, T b) noexcept {
+  switch (op) {
+    case BinaryOperation::kEquals:
+      return a == b;
+    case BinaryOperation::kNotEquals:
+      return a != b;
+    case BinaryOperation::kLessThan:
+      return a < b;
+    case BinaryOperation::kLessThanEquals:
+      return a <= b;
+    case BinaryOperation::kGreaterThan:
+      return a > b;
+    case BinaryOperation::kGreaterThanEquals:
+      return a >= b;
+    default:
+      return false;
+  }
 }
 
-// One (group, aggregate) slim-state update for an already-resolved input
-// value.  Shared by the Row-based accumulate loop and the cached-arena fold
-// fast path so the two can never drift; false (with *error set) on a raise.
-// A null `value` is the COUNT(*) sentinel and always counts.
-bool ApplySlimValue(TypedWorkerGroups* local, size_t group_index, size_t i,
-                    SlimAggKind kind, const Value* value, Status* error) {
-  if (kind == SlimAggKind::kCount) {
-    // COUNT(*): value == nullptr counts every surviving row; COUNT(expr)
-    // skips NULLs exactly like the streaming accumulator.
-    if (value == nullptr || !value->IsNull()) {
-      ++local->SlimCount(group_index, i);
-    }
-    return true;
+inline bool IsStandardCompareOp(BinaryOperation op) noexcept {
+  return op == BinaryOperation::kEquals || op == BinaryOperation::kNotEquals ||
+         op == BinaryOperation::kLessThan ||
+         op == BinaryOperation::kLessThanEquals ||
+         op == BinaryOperation::kGreaterThan ||
+         op == BinaryOperation::kGreaterThanEquals;
+}
+
+enum class BlockFilterStatus : uint8_t {
+  kAllFail = 0,
+  kAllPass = 1,
+  kMixed = 2,
+};
+
+struct CompiledComparePred {
+  TypedFilterCompare cmp;
+  slot_t full_left{0};
+  slot_t full_right{0};
+  bool is_int{false};
+  bool is_double{false};
+  bool is_string{false};
+};
+
+inline BlockFilterStatus CheckCompareBlockStatus(
+    const CompiledComparePred& pred, const LSTablePageBlock& blk) noexcept {
+  if (!pred.cmp.constant_payload || pred.is_string) {
+    return BlockFilterStatus::kMixed;
   }
-  if (value == nullptr || value->IsNull()) {
-    return true;
-  }
-  if (kind == SlimAggKind::kCountDistinctDouble) {
-    if (value->type != ValueType::kDouble) {
-      *error = StatusError(StatusCode::kInvalidArgument,
-                           "slim COUNT(DISTINCT) input type mismatch");
-      return false;
+  const LSTableColumnBlock& col = blk.columns[pred.full_left];
+  if (pred.is_double) {
+    const double k = pred.cmp.double_constant;
+    if (!col.has_double_min_max || col.has_nan || std::isnan(k)) {
+      return BlockFilterStatus::kMixed;
     }
-    static_cast<void>(local->SlimInsertDistinct(
-        group_index, i,
-        CanonicalDistinctDoubleBits(value->value.double_value)));
-    return true;
-  }
-  if (kind == SlimAggKind::kCountDistinctInt64) {
-    // NULL inputs never enter the set (mirrored by the skip above); the
-    // running count stays 0 because the finish derives the cardinality from
-    // the inline occupancy and the overflow set.
-    if (value->type == ValueType::kInt64 || value->type == ValueType::kDate) {
-      static_cast<void>(
-          local->SlimInsertDistinct(group_index, i, value->value.int_value));
-      return true;
+    const double lo = col.min_double;
+    const double hi = col.max_double;
+    bool all_fail = false;
+    bool all_pass = false;
+    switch (pred.cmp.op) {
+      case BinaryOperation::kEquals:
+        all_fail = (k < lo || k > hi);
+        all_pass = (lo == k && hi == k);
+        break;
+      case BinaryOperation::kNotEquals:
+        all_fail = (lo == k && hi == k);
+        all_pass = (k < lo || k > hi);
+        break;
+      case BinaryOperation::kLessThan:
+        all_fail = (lo >= k);
+        all_pass = (hi < k);
+        break;
+      case BinaryOperation::kLessThanEquals:
+        all_fail = (lo > k);
+        all_pass = (hi <= k);
+        break;
+      case BinaryOperation::kGreaterThan:
+        all_fail = (hi <= k);
+        all_pass = (lo > k);
+        break;
+      case BinaryOperation::kGreaterThanEquals:
+        all_fail = (hi < k);
+        all_pass = (lo >= k);
+        break;
+      default:
+        break;
     }
-    *error = StatusError(StatusCode::kInvalidArgument,
-                         "slim COUNT(DISTINCT) input type mismatch");
+    if (all_fail) {
+      return BlockFilterStatus::kAllFail;
+    }
+    if (all_pass && !col.has_null) {
+      return BlockFilterStatus::kAllPass;
+    }
+    return BlockFilterStatus::kMixed;
+  }
+  const int64_t k = pred.cmp.int_constant;
+  if (!col.has_min_max) {
+    return BlockFilterStatus::kMixed;
+  }
+  const int64_t lo = col.min_int;
+  const int64_t hi = col.max_int;
+  bool all_fail = false;
+  bool all_pass = false;
+  switch (pred.cmp.op) {
+    case BinaryOperation::kEquals:
+      all_fail = (k < lo || k > hi || !col.BlockBloomMayContain(k));
+      all_pass = (lo == k && hi == k);
+      break;
+    case BinaryOperation::kNotEquals:
+      all_fail = (lo == k && hi == k);
+      all_pass = (k < lo || k > hi);
+      break;
+    case BinaryOperation::kLessThan:
+      all_fail = (lo >= k);
+      all_pass = (hi < k);
+      break;
+    case BinaryOperation::kLessThanEquals:
+      all_fail = (lo > k);
+      all_pass = (hi <= k);
+      break;
+    case BinaryOperation::kGreaterThan:
+      all_fail = (hi <= k);
+      all_pass = (lo > k);
+      break;
+    case BinaryOperation::kGreaterThanEquals:
+      all_fail = (hi < k);
+      all_pass = (lo >= k);
+      break;
+    default:
+      break;
+  }
+  if (all_fail) {
+    return BlockFilterStatus::kAllFail;
+  }
+  if (all_pass && !col.has_null) {
+    return BlockFilterStatus::kAllPass;
+  }
+  return BlockFilterStatus::kMixed;
+}
+
+inline bool EvalCompiledCompareRow(const CompiledComparePred& pred,
+                                   const std::vector<DirectBlockCol>& cols,
+                                   uint32_t r) noexcept {
+  const DirectBlockCol& lcol = cols[pred.full_left];
+  if (lcol.IsNull(r)) {
     return false;
   }
-  switch (kind) {
-    case SlimAggKind::kSumInt64: {
-      if (value->type != ValueType::kInt64 || value->IsUnsigned()) {
-        *error = StatusError(StatusCode::kInvalidArgument,
-                             "slim SUM input type mismatch");
-        return false;
-      }
-      int64_t updated = 0;
-      if (__builtin_add_overflow(local->SlimIntTotal(group_index, i),
-                                 value->value.int_value, &updated)) {
-        *error =
-            StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
-        return false;
-      }
-      local->SlimIntTotal(group_index, i) = updated;
-      ++local->SlimCount(group_index, i);
-      return true;
+  if (pred.cmp.constant_payload) {
+    if (pred.is_string) {
+      return MatchTypedStringCompare(lcol.VarChar(r), pred.cmp);
     }
-    case SlimAggKind::kSumDouble: {
-      if (!local->mixed_numeric_sums.empty() && local->mixed_numeric_sums[i]) {
-        if (value->type == ValueType::kInt64 && !value->IsUnsigned()) {
-          int64_t next = 0;
-          if (__builtin_add_overflow(local->SlimIntTotal(group_index, i),
-                                     value->value.int_value, &next)) {
-            *error =
-                StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
-            return false;
-          }
-          local->SlimIntTotal(group_index, i) = next;
-          ++local->SlimCount(group_index, i);
-          return true;
-        }
-        local->SlimFlags(group_index, i) |= 2;
-      }
-      if (value->type != ValueType::kDouble) {
-        *error = StatusError(StatusCode::kInvalidArgument,
-                             "slim SUM input type mismatch");
-        return false;
-      }
-      if (std::isinf(value->value.double_value)) {
-        local->SlimFlags(group_index, i) |= 1;
-      }
-      local->SlimDoubleTotal(group_index, i) += value->value.double_value;
-      ++local->SlimCount(group_index, i);
-      return true;
+    if (pred.is_double) {
+      return CompareDirectScalar(pred.cmp.op, lcol.Double(r),
+                                 pred.cmp.double_constant);
     }
-    case SlimAggKind::kAvgDouble: {
-      // AVG(INT64) sums through a double intermediate, so INT64
-      // overflow never applies here (mirrors TryApplyCore).
-      double addend = 0.0;
-      if (value->type == ValueType::kDouble) {
-        addend = value->value.double_value;
-      } else if (value->type == ValueType::kInt64) {
-        addend = value->IsUnsigned()
-                     ? static_cast<double>(
-                           static_cast<uint64_t>(value->value.int_value))
-                     : static_cast<double>(value->value.int_value);
-      } else {
-        *error = StatusError(StatusCode::kInvalidArgument,
-                             "slim AVG input type mismatch");
-        return false;
-      }
-      local->SlimDoubleTotal(group_index, i) += addend;
-      ++local->SlimCount(group_index, i);
-      return true;
-    }
-    default:
-      *error = StatusError(StatusCode::kInvalidArgument,
-                           "aggregate has no slim state");
+    return CompareDirectScalar(pred.cmp.op, lcol.Int(r), pred.cmp.int_constant);
+  }
+  const DirectBlockCol& rcol = cols[pred.full_right];
+  if (rcol.IsNull(r)) {
+    return false;
+  }
+  if (pred.is_string) {
+    return CompareDirectScalar(pred.cmp.op, lcol.VarChar(r), rcol.VarChar(r));
+  }
+  if (pred.is_double) {
+    return CompareDirectScalar(pred.cmp.op, lcol.Double(r), rcol.Double(r));
+  }
+  return CompareDirectScalar(pred.cmp.op, lcol.Int(r), rcol.Int(r));
+}
+
+struct CompiledLSTableBlockFilter {
+  struct NullPred {
+    slot_t full_col{0};
+    bool is_null{true};
+  };
+  struct IntInterval {
+    slot_t full_col{0};
+    int64_t lo{std::numeric_limits<int64_t>::min()};
+    int64_t hi{std::numeric_limits<int64_t>::max()};
+    bool empty{false};
+  };
+  struct Branch {
+    std::vector<CompiledComparePred> preds;
+  };
+  struct Disjunction {
+    std::vector<Branch> branches;
+  };
+
+  std::vector<NullPred> null_preds;
+  std::vector<IntInterval> int_intervals;
+  std::vector<CompiledComparePred> stage1_preds;
+  std::vector<Disjunction> disjunctions;
+  std::vector<uint8_t> referenced_full_cols;
+  bool always_false{false};
+
+  static bool CompileCompare(const TypedFilterCompare& cmp,
+                             const std::vector<slot_t>& proj_to_full,
+                             const std::vector<ValueType>& proj_types,
+                             const std::vector<uint8_t>& proj_unsigned,
+                             const LSTableStore& store,
+                             std::vector<uint8_t>* referenced,
+                             CompiledComparePred* out) {
+    if (cmp.left >= proj_types.size()) {
       return false;
+    }
+    const slot_t full_left = proj_to_full[cmp.left];
+    if (full_left >= store.column_has_null.size()) {
+      return false;
+    }
+    const ValueType ltype = proj_types[cmp.left];
+    out->cmp = cmp;
+    out->full_left = full_left;
+    out->full_right = 0;
+    out->is_int = false;
+    out->is_double = false;
+    out->is_string = false;
+    if (cmp.constant_payload) {
+      if (cmp.string_payload) {
+        if (ltype != ValueType::kVarChar) {
+          return false;
+        }
+        if (!IsStandardCompareOp(cmp.op) && cmp.op != BinaryOperation::kLike &&
+            cmp.op != BinaryOperation::kNotLike) {
+          return false;
+        }
+        out->is_string = true;
+      } else if (cmp.is_double) {
+        if (ltype != ValueType::kDouble || !IsStandardCompareOp(cmp.op)) {
+          return false;
+        }
+        out->is_double = true;
+      } else {
+        if ((ltype != ValueType::kInt64 && ltype != ValueType::kDate) ||
+            proj_unsigned[cmp.left] != 0 || !IsStandardCompareOp(cmp.op)) {
+          return false;
+        }
+        out->is_int = true;
+      }
+      (*referenced)[full_left] = 1;
+      return true;
+    }
+    if (cmp.right >= proj_types.size() || !IsStandardCompareOp(cmp.op)) {
+      return false;
+    }
+    const slot_t full_right = proj_to_full[cmp.right];
+    if (full_right >= store.column_has_null.size() ||
+        ltype != proj_types[cmp.right]) {
+      return false;
+    }
+    if (cmp.string_payload) {
+      if (ltype != ValueType::kVarChar) {
+        return false;
+      }
+      out->is_string = true;
+    } else if (cmp.is_double) {
+      if (ltype != ValueType::kDouble) {
+        return false;
+      }
+      out->is_double = true;
+    } else {
+      if ((ltype != ValueType::kInt64 && ltype != ValueType::kDate) ||
+          proj_unsigned[cmp.left] != 0 || proj_unsigned[cmp.right] != 0) {
+        return false;
+      }
+      out->is_int = true;
+    }
+    out->full_right = full_right;
+    (*referenced)[full_left] = 1;
+    (*referenced)[full_right] = 1;
+    return true;
   }
-}
 
-// Per-morsel cache-fill buffer owned by a scan worker.  Rows land in the
-// worker's vector (published in morsel order later); fixed-width fills also
-// append row-major int64 cells + null bytes so the published cache gets its
-// int64 arena mirror without per-row work under the publish lock.  The typed
-// fill instead decodes straight into `mirror` (same arena layout, no Rows).
-struct MorselFillBuffer {
-  std::vector<Row> rows;
-  size_t arena_stride{0};  // 0 = no arena mirror for this morsel.
-  std::vector<int64_t> arena_cells;
-  std::vector<uint8_t> arena_nulls;
-  // Cells actually written (arena_cells/arena_nulls grow geometrically and
-  // are cut to this length at publish, keeping the rows*stride == cells.size
-  // invariant while skipping the per-row zeroing resize).
-  size_t arena_used{0};
-  // Typed-fill mirror (rows without Row objects); published through
-  // BaseRelationArena::AppendTyped.
-  BaseRelationArena mirror;
-};
-
-// Appends a decoded TypedCellBatch range (all columns, kept or filtered rows —
-// cache fills are unfiltered) into an arena run: null bytes fold into the
-// per-column bitmaps, cells copy verbatim, varchar bytes extend the run's
-// byte arenas with offset-adjusted end marks.
-void AppendBatchToArena(const TypedCellBatch& batch, size_t first_row,
-                        size_t run_rows, BaseRelationArena* arena) {
-  if (run_rows == 0) {
-    return;
-  }
-  const size_t stride = arena->stride;
-  const size_t first = arena->rows;
-  arena->cells.insert(
-      arena->cells.end(),
-      batch.cells.begin() + static_cast<std::ptrdiff_t>(first_row * stride),
-      batch.cells.begin() +
-          static_cast<std::ptrdiff_t>((first_row + run_rows) * stride));
-  for (size_t c = 0; c < stride; ++c) {
-    auto& bits = arena->null_bits[c];
-    bits.resize(((first + run_rows - 1) >> 6) + 1, 0);
-    for (size_t r = 0; r < run_rows; ++r) {
-      if (batch.nulls[((first_row + r) * stride) + c] != 0) {
-        const size_t row = first + r;
-        bits[row >> 6] |= uint64_t{1} << (row & 63);
+  bool Init(const TypedAggregationPlan& plan,
+            const std::vector<slot_t>& proj_to_full,
+            const std::vector<ValueType>& proj_types,
+            const std::vector<uint8_t>& proj_unsigned,
+            const LSTableStore& store) {
+    referenced_full_cols.assign(store.column_has_null.size(), 0);
+    std::vector<int> interval_idx(store.column_has_null.size(), -1);
+    for (const TypedNullCompare& nf : plan.null_filters) {
+      if (nf.column >= proj_types.size()) {
+        return false;
+      }
+      const slot_t full_col = proj_to_full[nf.column];
+      if (full_col >= store.column_has_null.size()) {
+        return false;
+      }
+      null_preds.push_back(
+          NullPred{.full_col = full_col, .is_null = nf.is_null});
+      referenced_full_cols[full_col] = 1;
+    }
+    for (const TypedFilterCompare& cmp : plan.filter_compares) {
+      CompiledComparePred pred;
+      if (!CompileCompare(cmp, proj_to_full, proj_types, proj_unsigned, store,
+                          &referenced_full_cols, &pred)) {
+        return false;
+      }
+      if (pred.cmp.constant_payload && pred.is_int &&
+          pred.cmp.op != BinaryOperation::kNotEquals) {
+        int& slot = interval_idx[pred.full_left];
+        if (slot < 0) {
+          slot = static_cast<int>(int_intervals.size());
+          int_intervals.push_back(IntInterval{.full_col = pred.full_left});
+        }
+        IntInterval& iv = int_intervals[static_cast<size_t>(slot)];
+        const int64_t k = pred.cmp.int_constant;
+        switch (pred.cmp.op) {
+          case BinaryOperation::kEquals:
+            iv.lo = std::max(iv.lo, k);
+            iv.hi = std::min(iv.hi, k);
+            break;
+          case BinaryOperation::kGreaterThanEquals:
+            iv.lo = std::max(iv.lo, k);
+            break;
+          case BinaryOperation::kGreaterThan:
+            if (k == std::numeric_limits<int64_t>::max()) {
+              iv.empty = true;
+            } else {
+              iv.lo = std::max(iv.lo, k + 1);
+            }
+            break;
+          case BinaryOperation::kLessThanEquals:
+            iv.hi = std::min(iv.hi, k);
+            break;
+          case BinaryOperation::kLessThan:
+            if (k == std::numeric_limits<int64_t>::min()) {
+              iv.empty = true;
+            } else {
+              iv.hi = std::min(iv.hi, k - 1);
+            }
+            break;
+          default:
+            break;
+        }
+        iv.empty = iv.empty || iv.lo > iv.hi;
+        if (iv.empty) {
+          always_false = true;
+        }
+      } else {
+        stage1_preds.push_back(std::move(pred));
       }
     }
-  }
-  size_t varchar_slot = 0;
-  for (size_t c = 0; c < stride; ++c) {
-    if (arena->slot_types[c] != ValueType::kVarChar) {
-      continue;
-    }
-    BaseRelationArena::VarcharRun& run = arena->varchars[varchar_slot];
-    const std::vector<uint32_t>& batch_ends = batch.varchar_ends[varchar_slot];
-    const auto run_bytes = static_cast<uint32_t>(run.bytes.size());
-    const uint32_t batch_prefix =
-        first_row == 0 ? 0U : batch_ends[first_row - 1];
-    run.bytes.insert(run.bytes.end(),
-                     batch.varchar_bytes[varchar_slot].begin() + batch_prefix,
-                     batch.varchar_bytes[varchar_slot].begin() +
-                         batch_ends[first_row + run_rows - 1]);
-    run.ends.reserve(run.ends.size() + run_rows);
-    for (size_t r = 0; r < run_rows; ++r) {
-      run.ends.push_back(run_bytes +
-                         (batch_ends[first_row + r] - batch_prefix));
-    }
-    ++varchar_slot;
-  }
-  arena->rows += run_rows;
-}
-
-// Typed cell value for the arena fold: the payload layout follows the slot
-// type (DOUBLE bit-casts through the int64 cell; VARCHAR slots never reach
-// this helper on the raw-cell paths because their folds need byte strings).
-inline Value ArenaCellValue(const BaseRelationArena& arena,
-                            const int64_t* cells, size_t column,
-                            const Schema& schema) {
-  Value value;
-  const ValueType type = arena.slot_types.size() == arena.stride
-                             ? arena.slot_types[column]
-                             : schema.GetColumn(column).Type();
-  value.type = type;
-  if (type == ValueType::kDouble) {
-    value.value.double_value = std::bit_cast<double>(cells[column]);
-  } else {
-    value.value.int_value = cells[column];
-  }
-  if (type == ValueType::kInt64 && schema.GetColumn(column).IsUnsigned()) {
-    value.SetUnsigned();
-  }
-  return value;
-}
-
-// MaterializeArenaRange and MaterializeCacheRowsIfNeeded live in
-// subquery_runtime.cpp next to the arena they serve.
-
-// Appends one decoded row to the morsel fill buffer (Row + optional arena
-// mirror).  `row` must not be touched afterwards when !fill_copy (the row
-// moves).
-template <typename RowLike>
-void AppendFillRow(RowLike&& row, MorselFillBuffer* fill, bool fill_copy) {
-  if (fill->arena_stride != 0) {
-    const size_t width = fill->arena_stride;
-    const size_t base = fill->arena_used;
-    if (base + width > fill->arena_cells.size()) {
-      const size_t grown = std::max(base + width, fill->arena_cells.size() * 2);
-      fill->arena_cells.resize(grown, 0);
-      fill->arena_nulls.resize(grown, 0);
-    }
-    for (size_t c = 0; c < width && c < row.values_.size(); ++c) {
-      const Value& value = row.values_[c];
-      fill->arena_cells[base + c] =
-          value.IsNull()
-              ? 0
-              : (value.type == ValueType::kDouble
-                     ? std::bit_cast<int64_t>(value.value.double_value)
-                     : value.value.int_value);
-      fill->arena_nulls[base + c] = value.IsNull() ? 1 : 0;
-    }
-    fill->arena_used = base + width;
-  }
-  if (fill_copy) {
-    fill->rows.emplace_back(row);
-  } else {
-    fill->rows.push_back(std::forward<RowLike>(row));
-  }
-}
-
-}  // namespace
-
-namespace {
-StatusOr<std::vector<Value>> EvaluateDependentKeys(
-    const TypedAggregationPlan& plan, const TypedWorkerGroups& groups,
-    size_t group) {
-  std::vector<Value> results;
-  if (plan.dependent_key_programs.empty()) {
-    return results;
-  }
-  std::vector<Value> keys;
-  keys.reserve(plan.key_offsets.size());
-  for (size_t k = 0; k < plan.key_offsets.size(); ++k) {
-    keys.push_back(groups.GroupKey(group, k));
-  }
-  const Row row(std::move(keys));
-  results.reserve(plan.dependent_key_programs.size());
-  for (const auto& program : plan.dependent_key_programs) {
-    ASSIGN_OR_RETURN(Value, value, TryEvaluateRowAuto(program, row));
-    results.push_back(std::move(value));
-  }
-  return results;
-}
-
-StatusOr<Relation> FinishCompactGroups(
-    ExecutionRuntime* runtime, const SelectStatement& statement,
-    const Relation& input,
-    const std::vector<const AggregateExpression*>& aggregates,
-    const TypedAggregationPlan& plan, TypedWorkerGroups& groups,
-    const std::vector<PositionalHaving>* having = nullptr,
-    size_t begin_group = 0, size_t end_group = SIZE_MAX,
-    const std::vector<uint8_t>* keep = nullptr) {
-  end_group = std::min(end_group, groups.GroupCount());
-  Relation output(runtime);
-  CopyExecutionStats(&output, input);
-  std::vector<Column> columns;
-  columns.reserve(statement.SelectList().size());
-  for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-    columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                         ValueType::kNull);
-  }
-  std::vector<Value> finished;
-  finished.reserve(aggregates.size());
-  bool output_type_set = false;
-  for (size_t group = begin_group; group < end_group; ++group) {
-    if (keep != nullptr && (group >= keep->size() || (*keep)[group] == 0)) {
-      continue;
-    }
-    ASSIGN_OR_RETURN(std::vector<Value>, dependent_keys,
-                     EvaluateDependentKeys(plan, groups, group));
-    finished.clear();
-    for (size_t i = 0; i < aggregates.size(); ++i) {
-      if (!plan.slim) {
-        ASSIGN_OR_RETURN(Value, value, groups.State(group, i).TryFinish());
-        finished.push_back(std::move(value));
+    for (const auto& raw_disj : plan.filter_disjunctions) {
+      if (raw_disj.empty()) {
+        always_false = true;
         continue;
       }
-      const int64_t count = groups.SlimCount(group, i);
-      Value value;
-      switch (plan.slim_kinds[i]) {
-        case SlimAggKind::kCount:
-          value = Value(count);
+      Disjunction disj;
+      for (const auto& raw_branch : raw_disj) {
+        Branch branch;
+        for (const TypedFilterCompare& cmp : raw_branch) {
+          CompiledComparePred pred;
+          if (!CompileCompare(cmp, proj_to_full, proj_types, proj_unsigned,
+                              store, &referenced_full_cols, &pred)) {
+            return false;
+          }
+          branch.preds.push_back(std::move(pred));
+        }
+        disj.branches.push_back(std::move(branch));
+      }
+      disjunctions.push_back(std::move(disj));
+    }
+    return true;
+  }
+
+  struct Scratch {
+    struct ActiveBranchSlice {
+      uint32_t pred_begin{0};
+      uint32_t pred_end{0};
+      bool double_range{false};
+      slot_t range_col{0};
+      double lo{0};
+      double hi{0};
+    };
+    struct ActiveDisjSlice {
+      uint32_t br_begin{0};
+      uint32_t br_end{0};
+    };
+    std::vector<DirectBlockCol> cols;
+    std::vector<uint8_t> col_bound;
+    std::vector<const NullPred*> active_nulls;
+    std::vector<const IntInterval*> active_intervals;
+    std::vector<const CompiledComparePred*> active_stage1;
+    std::vector<const CompiledComparePred*> flat_disj_preds;
+    std::vector<ActiveBranchSlice> flat_disj_branches;
+    std::vector<ActiveDisjSlice> active_disjs;
+  };
+
+  static void InitScratch(size_t num_store_cols, Scratch* ws) {
+    ws->cols.resize(num_store_cols);
+    ws->col_bound.assign(num_store_cols, 0);
+  }
+
+  uint32_t FilterBlock(const LSTablePageBlock& blk,
+                       const std::vector<uint8_t>& always_bind_cols,
+                       Scratch* ws, bool* all_pass,
+                       std::vector<uint32_t>* sel) const {
+    if (always_false || blk.row_count == 0) {
+      *all_pass = false;
+      return 0;
+    }
+    ws->active_nulls.clear();
+    for (const NullPred& nf : null_preds) {
+      const LSTableColumnBlock& col = blk.columns[nf.full_col];
+      if (!col.has_null) {
+        if (nf.is_null) {
+          *all_pass = false;
+          return 0;
+        }
+        continue;
+      }
+      ws->active_nulls.push_back(&nf);
+    }
+    ws->active_intervals.clear();
+    for (const IntInterval& iv : int_intervals) {
+      const LSTableColumnBlock& col = blk.columns[iv.full_col];
+      if (col.has_min_max) {
+        if (col.max_int < iv.lo || col.min_int > iv.hi) {
+          *all_pass = false;
+          return 0;
+        }
+        if (iv.lo == iv.hi && !col.BlockBloomMayContain(iv.lo)) {
+          *all_pass = false;
+          return 0;
+        }
+        if (!col.has_null && col.min_int >= iv.lo && col.max_int <= iv.hi) {
+          continue;
+        }
+      }
+      ws->active_intervals.push_back(&iv);
+    }
+    ws->active_stage1.clear();
+    for (const CompiledComparePred& pred : stage1_preds) {
+      const BlockFilterStatus st = CheckCompareBlockStatus(pred, blk);
+      if (st == BlockFilterStatus::kAllFail) {
+        *all_pass = false;
+        return 0;
+      }
+      if (st == BlockFilterStatus::kMixed) {
+        ws->active_stage1.push_back(&pred);
+      }
+    }
+    ws->flat_disj_preds.clear();
+    ws->flat_disj_branches.clear();
+    ws->active_disjs.clear();
+    for (const Disjunction& disj : disjunctions) {
+      bool disj_all_pass = false;
+      const auto br_start =
+          static_cast<uint32_t>(ws->flat_disj_branches.size());
+      const auto pred_saved = static_cast<uint32_t>(ws->flat_disj_preds.size());
+      for (const Branch& branch : disj.branches) {
+        bool branch_fail = false;
+        const auto p_begin = static_cast<uint32_t>(ws->flat_disj_preds.size());
+        for (const CompiledComparePred& pred : branch.preds) {
+          const BlockFilterStatus st = CheckCompareBlockStatus(pred, blk);
+          if (st == BlockFilterStatus::kAllFail) {
+            branch_fail = true;
+            break;
+          }
+          if (st == BlockFilterStatus::kMixed) {
+            ws->flat_disj_preds.push_back(&pred);
+          }
+        }
+        if (branch_fail) {
+          ws->flat_disj_preds.resize(p_begin);
+          continue;
+        }
+        const auto p_end = static_cast<uint32_t>(ws->flat_disj_preds.size());
+        if (p_begin == p_end) {
+          ws->flat_disj_preds.resize(pred_saved);
+          ws->flat_disj_branches.resize(br_start);
+          disj_all_pass = true;
           break;
-        case SlimAggKind::kSumInt64:
-          value = count == 0 ? Value() : Value(groups.SlimIntTotal(group, i));
-          break;
-        case SlimAggKind::kSumDouble:
-          if (count != 0) {
-            const bool mixed = !groups.mixed_numeric_sums.empty() &&
-                               groups.mixed_numeric_sums[i];
-            if (mixed && (groups.SlimFlags(group, i) & 2) == 0) {
-              value = Value(groups.SlimIntTotal(group, i));
+        }
+        Scratch::ActiveBranchSlice slice{p_begin, p_end};
+        // BETWEEN branches otherwise dispatch two generic comparisons and
+        // load the same cell/null flag twice for each surviving row.
+        if (p_end == p_begin + 2) {
+          const auto* lower = ws->flat_disj_preds[p_begin];
+          const auto* upper = ws->flat_disj_preds[p_begin + 1];
+          if (lower->cmp.op == BinaryOperation::kLessThanEquals) {
+            std::swap(lower, upper);
+          }
+          if (lower->is_double && upper->is_double &&
+              lower->cmp.constant_payload && upper->cmp.constant_payload &&
+              lower->full_left == upper->full_left &&
+              lower->cmp.op == BinaryOperation::kGreaterThanEquals &&
+              upper->cmp.op == BinaryOperation::kLessThanEquals) {
+            slice.double_range = true;
+            slice.range_col = lower->full_left;
+            slice.lo = lower->cmp.double_constant;
+            slice.hi = upper->cmp.double_constant;
+          }
+        }
+        ws->flat_disj_branches.push_back(slice);
+      }
+      if (disj_all_pass) {
+        continue;
+      }
+      const auto br_end = static_cast<uint32_t>(ws->flat_disj_branches.size());
+      if (br_start == br_end) {
+        *all_pass = false;
+        return 0;
+      }
+      ws->active_disjs.push_back({br_start, br_end});
+    }
+
+    const uint32_t n = blk.row_count;
+    const auto ensure_col_bound = [&](slot_t c) {
+      if (ws->col_bound[c] == 0) {
+        ws->cols[c].Bind(blk.columns[c], n);
+        ws->col_bound[c] = 1;
+      }
+    };
+    std::ranges::fill(ws->col_bound, 0);
+    for (size_t c = 0; c < always_bind_cols.size(); ++c) {
+      if (always_bind_cols[c] != 0) {
+        ensure_col_bound(static_cast<slot_t>(c));
+      }
+    }
+    if (ws->active_nulls.empty() && ws->active_intervals.empty() &&
+        ws->active_stage1.empty() && ws->active_disjs.empty()) {
+      *all_pass = true;
+      return n;
+    }
+
+    for (const NullPred* nf : ws->active_nulls) {
+      ensure_col_bound(nf->full_col);
+    }
+    for (const IntInterval* iv : ws->active_intervals) {
+      ensure_col_bound(iv->full_col);
+    }
+    for (const CompiledComparePred* pred : ws->active_stage1) {
+      ensure_col_bound(pred->full_left);
+      if (!pred->cmp.constant_payload) {
+        ensure_col_bound(pred->full_right);
+      }
+    }
+    for (const CompiledComparePred* pred : ws->flat_disj_preds) {
+      ensure_col_bound(pred->full_left);
+      if (!pred->cmp.constant_payload) {
+        ensure_col_bound(pred->full_right);
+      }
+    }
+
+    *all_pass = false;
+    sel->resize(n);
+    uint32_t m = 0;
+    bool initialized_sel = false;
+
+    if (!ws->active_nulls.empty()) {
+      const NullPred* nf0 = ws->active_nulls[0];
+      const DirectBlockCol& col = ws->cols[nf0->full_col];
+      const bool target_null = nf0->is_null;
+      for (uint32_t r = 0; r < n; ++r) {
+        if (col.IsNull(r) == target_null) {
+          (*sel)[m++] = r;
+        }
+      }
+      initialized_sel = true;
+      for (size_t ni = 1; ni < ws->active_nulls.size() && m > 0; ++ni) {
+        const NullPred* nf = ws->active_nulls[ni];
+        const DirectBlockCol& ncol = ws->cols[nf->full_col];
+        const bool tn = nf->is_null;
+        uint32_t out_m = 0;
+        for (uint32_t idx = 0; idx < m; ++idx) {
+          const uint32_t r = (*sel)[idx];
+          if (ncol.IsNull(r) == tn) {
+            (*sel)[out_m++] = r;
+          }
+        }
+        m = out_m;
+      }
+      if (m == 0) {
+        return 0;
+      }
+    }
+
+    for (const IntInterval* iv : ws->active_intervals) {
+      const DirectBlockCol& col = ws->cols[iv->full_col];
+      // Unsigned subtraction represents the inclusive signed interval even
+      // when it crosses zero or touches either INT64 endpoint. Compact the
+      // selection without a data-dependent branch for every input row.
+      const uint64_t lo = static_cast<uint64_t>(iv->lo);
+      const uint64_t width = static_cast<uint64_t>(iv->hi) - lo;
+      const uint32_t count = initialized_sel ? m : n;
+      uint32_t out_m = 0;
+      const auto select = [&]<bool selected, bool nullable>() {
+        if constexpr (!selected) {
+          out_m = platform::SelectInt64ClosedRange(col.cells, count, iv->lo,
+                                                   iv->hi, sel->data());
+          if constexpr (nullable) {
+            uint32_t nonnull = 0;
+            for (uint32_t i = 0; i < out_m; ++i) {
+              const uint32_t row = (*sel)[i];
+              if (!col.IsNull(row)) (*sel)[nonnull++] = row;
+            }
+            out_m = nonnull;
+          }
+          return;
+        }
+        for (uint32_t idx = 0; idx < count; ++idx) {
+          const uint32_t r = selected ? (*sel)[idx] : idx;
+          const bool in_range = static_cast<uint64_t>(col.Int(r)) - lo <= width;
+          bool matches = in_range;
+          if constexpr (nullable) {
+            matches &= !col.IsNull(r);
+          }
+          (*sel)[out_m] = r;
+          out_m += static_cast<uint32_t>(matches);
+        }
+      };
+      if (initialized_sel) {
+        if (col.has_null) {
+          select.template operator()<true, true>();
+        } else {
+          select.template operator()<true, false>();
+        }
+      } else if (col.has_null) {
+        select.template operator()<false, true>();
+      } else {
+        select.template operator()<false, false>();
+      }
+      m = out_m;
+      initialized_sel = true;
+      if (m == 0) {
+        return 0;
+      }
+    }
+
+    for (size_t predicate = 0; predicate < ws->active_stage1.size();
+         ++predicate) {
+      const CompiledComparePred* pred = ws->active_stage1[predicate];
+      if (pred->is_double && pred->cmp.constant_payload) {
+        const auto& column = ws->cols[pred->full_left];
+        const double constant = pred->cmp.double_constant;
+        const uint32_t count = initialized_sel ? m : n;
+        const auto select_compare = [&](auto compare) {
+          const auto run = [&]<bool selected, bool nullable>() {
+            uint32_t out = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+              const uint32_t row = selected ? (*sel)[i] : i;
+              bool hit = compare(column.Double(row), constant);
+              if constexpr (nullable) hit &= !column.IsNull(row);
+              (*sel)[out] = row;
+              out += static_cast<uint32_t>(hit);
+            }
+            m = out;
+          };
+          if (initialized_sel) {
+            if (column.has_null)
+              run.template operator()<true, true>();
+            else
+              run.template operator()<true, false>();
+          } else {
+            if (column.has_null)
+              run.template operator()<false, true>();
+            else
+              run.template operator()<false, false>();
+          }
+        };
+        const CompiledComparePred* paired =
+            predicate + 1 < ws->active_stage1.size()
+                ? ws->active_stage1[predicate + 1]
+                : nullptr;
+        if (paired && paired->is_double && paired->cmp.constant_payload &&
+            paired->full_left == pred->full_left &&
+            ((pred->cmp.op == BinaryOperation::kGreaterThanEquals &&
+              paired->cmp.op == BinaryOperation::kLessThanEquals) ||
+             (pred->cmp.op == BinaryOperation::kLessThanEquals &&
+              paired->cmp.op == BinaryOperation::kGreaterThanEquals))) {
+          const bool lower_first =
+              pred->cmp.op == BinaryOperation::kGreaterThanEquals;
+          const double lower =
+              lower_first ? constant : paired->cmp.double_constant;
+          const double upper =
+              lower_first ? paired->cmp.double_constant : constant;
+          if (initialized_sel && !column.has_null) {
+            m = platform::CompactDoubleRange(column.cells, sel->data(), count,
+                                             lower, upper, true, true);
+          } else {
+            select_compare([&](double value, double) {
+              return (value >= lower) & (value <= upper);
+            });
+          }
+          ++predicate;
+        } else {
+          switch (pred->cmp.op) {
+            case BinaryOperation::kEquals:
+              select_compare(std::equal_to<double>{});
+              break;
+            case BinaryOperation::kNotEquals:
+              select_compare(std::not_equal_to<double>{});
+              break;
+            case BinaryOperation::kLessThan:
+              if (initialized_sel && !column.has_null) {
+                m = platform::CompactDoubleRange(
+                    column.cells, sel->data(), count,
+                    -std::numeric_limits<double>::infinity(), constant, true,
+                    false);
+              } else {
+                select_compare(std::less<double>{});
+              }
+              break;
+            case BinaryOperation::kLessThanEquals:
+              select_compare(std::less_equal<double>{});
+              break;
+            case BinaryOperation::kGreaterThan:
+              select_compare(std::greater<double>{});
+              break;
+            case BinaryOperation::kGreaterThanEquals:
+              select_compare(std::greater_equal<double>{});
+              break;
+            default:
+              return 0;
+          }
+        }
+        initialized_sel = true;
+        if (m == 0) return 0;
+        continue;
+      }
+      if (!initialized_sel) {
+        for (uint32_t r = 0; r < n; ++r) {
+          if (EvalCompiledCompareRow(*pred, ws->cols, r)) {
+            (*sel)[m++] = r;
+          }
+        }
+        initialized_sel = true;
+      } else {
+        uint32_t out_m = 0;
+        for (uint32_t idx = 0; idx < m; ++idx) {
+          const uint32_t r = (*sel)[idx];
+          if (EvalCompiledCompareRow(*pred, ws->cols, r)) {
+            (*sel)[out_m++] = r;
+          }
+        }
+        m = out_m;
+      }
+      if (m == 0) {
+        return 0;
+      }
+    }
+
+    for (const Scratch::ActiveDisjSlice& dslice : ws->active_disjs) {
+      const auto eval_disj = [&](uint32_t r) noexcept -> bool {
+        for (uint32_t bi = dslice.br_begin; bi < dslice.br_end; ++bi) {
+          const Scratch::ActiveBranchSlice& br = ws->flat_disj_branches[bi];
+          if (br.double_range) {
+            const DirectBlockCol& col = ws->cols[br.range_col];
+            const double v = col.Double(r);
+            if (!col.IsNull(r) && v >= br.lo && v <= br.hi) {
+              return true;
+            }
+            continue;
+          }
+          bool ok = true;
+          for (uint32_t pi = br.pred_begin; pi < br.pred_end; ++pi) {
+            if (!EvalCompiledCompareRow(*ws->flat_disj_preds[pi], ws->cols,
+                                        r)) {
+              ok = false;
               break;
             }
-            const double total =
-                groups.SlimDoubleTotal(group, i) +
-                (mixed ? static_cast<double>(groups.SlimIntTotal(group, i))
-                       : 0.0);
-            if ((groups.SlimFlags(group, i) & 1) == 0 && std::isinf(total)) {
-              return StatusError(StatusCode::kIsInfinity,
-                                 "SUM overflow: result is infinite");
-            }
-            value = Value(total);
+          }
+          if (ok) {
+            return true;
+          }
+        }
+        return false;
+      };
+      if (!initialized_sel) {
+        for (uint32_t r = 0; r < n; ++r) {
+          if (eval_disj(r)) {
+            (*sel)[m++] = r;
+          }
+        }
+        initialized_sel = true;
+      } else {
+        uint32_t out_m = 0;
+        for (uint32_t idx = 0; idx < m; ++idx) {
+          const uint32_t r = (*sel)[idx];
+          if (eval_disj(r)) {
+            (*sel)[out_m++] = r;
+          }
+        }
+        m = out_m;
+      }
+      if (m == 0) {
+        return 0;
+      }
+    }
+    return m;
+  }
+};
+
+struct DirectAggBinding {
+  SlimAggKind kind{SlimAggKind::kNone};
+  bool is_count_star{false};
+  std::optional<slot_t> full_col;
+  ValueType col_type{ValueType::kNull};
+  const TypedDoubleExprInput* double_expr{nullptr};
+  const TypedIntExprInput* int_expr{nullptr};
+};
+
+inline bool CollectDirectAggBindings(
+    const TypedAggregationPlan& plan, const LSTableStore& store,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned,
+    std::vector<DirectAggBinding>* out_bindings,
+    std::vector<uint8_t>* agg_bind_cols) {
+  out_bindings->clear();
+  out_bindings->reserve(plan.aggregates.size());
+  agg_bind_cols->assign(store.column_has_null.size(), 0);
+  for (size_t i = 0; i < plan.aggregates.size(); ++i) {
+    const TypedAggregateInput& input = plan.aggregates[i];
+    const SlimAggKind kind = plan.slim_kinds[i];
+    if (input.child.has_value() || input.conditional.has_value() ||
+        input.coalesce_double.has_value() || kind == SlimAggKind::kNone) {
+      return false;
+    }
+    DirectAggBinding b;
+    b.kind = kind;
+    if (kind == SlimAggKind::kCount && IsCountStar(*input.aggregate)) {
+      b.is_count_star = true;
+      out_bindings->push_back(b);
+      continue;
+    }
+    if (input.column.has_value()) {
+      if (*input.column >= proj_types.size()) {
+        return false;
+      }
+      const slot_t fc = proj_to_full[*input.column];
+      if (fc >= store.column_has_null.size()) {
+        return false;
+      }
+      const ValueType vt = proj_types[*input.column];
+      const bool is_unsigned = proj_unsigned[*input.column] != 0;
+      switch (kind) {
+        case SlimAggKind::kCount:
+          break;
+        case SlimAggKind::kSumInt64:
+        case SlimAggKind::kMinInt64:
+        case SlimAggKind::kMaxInt64:
+          if (vt != ValueType::kInt64 || is_unsigned) {
+            return false;
+          }
+          break;
+        case SlimAggKind::kMinDate:
+        case SlimAggKind::kMaxDate:
+          if (vt != ValueType::kDate) {
+            return false;
+          }
+          break;
+        case SlimAggKind::kSumDouble:
+        case SlimAggKind::kMinDouble:
+        case SlimAggKind::kMaxDouble:
+        case SlimAggKind::kCountDistinctDouble:
+          if (vt != ValueType::kDouble) {
+            return false;
           }
           break;
         case SlimAggKind::kAvgDouble:
-          value = count == 0 ? Value()
-                             : Value(groups.SlimDoubleTotal(group, i) /
-                                     static_cast<double>(count));
+          if (vt != ValueType::kDouble &&
+              (vt != ValueType::kInt64 || is_unsigned)) {
+            return false;
+          }
+          break;
+        case SlimAggKind::kCountDistinctInt64:
+          if ((vt != ValueType::kInt64 && vt != ValueType::kDate) ||
+              is_unsigned) {
+            return false;
+          }
           break;
         default:
-          return StatusError(StatusCode::kInvalidArgument,
-                             "aggregate has no compact state");
+          return false;
       }
-      finished.push_back(std::move(value));
-    }
-    bool keep = true;
-    if (having != nullptr) {
-      for (const auto& clause : *having) {
-        const auto& value = finished[clause.agg_index];
-        if (clause.has_constant) {
-          ASSIGN_OR_RETURN(Value, predicate,
-                           TryBinary(clause.op, value, clause.constant));
-          keep = Truthy(predicate);
-        } else {
-          keep = Truthy(value);
-        }
-        if (!keep) {
-          break;
-        }
-      }
-    }
-    if (!keep) {
+      b.full_col = fc;
+      b.col_type = vt;
+      (*agg_bind_cols)[fc] = 1;
+      out_bindings->push_back(b);
       continue;
     }
-    std::vector<Value> values;
-    values.reserve(plan.emit_items.size());
-    for (const auto& item : plan.emit_items) {
-      if (item.dependent_key) {
-        values.push_back(dependent_keys[*item.dependent_key]);
-        continue;
+    if (input.double_expr.has_value()) {
+      if (kind != SlimAggKind::kCount && kind != SlimAggKind::kSumDouble &&
+          kind != SlimAggKind::kAvgDouble && kind != SlimAggKind::kMinDouble &&
+          kind != SlimAggKind::kMaxDouble) {
+        return false;
       }
-      values.push_back(item.constant ? *item.constant
-                       : item.is_key ? groups.GroupKey(group, item.index)
-                                     : finished[item.index]);
-    }
-    if (!output_type_set) {
-      output_type_set = true;
-      for (size_t i = 0; i < columns.size(); ++i) {
-        columns[i] = Column(columns[i].Name(), ValueTypeOf(values[i]));
-        columns[i].SetUnsigned(values[i].IsUnsigned());
+      const TypedDoubleExprInput& de = *input.double_expr;
+      const auto valid_dcol = [&](slot_t c) -> bool {
+        if (c >= proj_types.size() || proj_types[c] != ValueType::kDouble) {
+          return false;
+        }
+        const slot_t fc = proj_to_full[c];
+        if (fc >= store.column_has_null.size()) {
+          return false;
+        }
+        (*agg_bind_cols)[fc] = 1;
+        return true;
+      };
+      switch (de.shape) {
+        case TypedDoubleExprInput::Shape::kSingleDoubleCol:
+          if (!valid_dcol(de.col0)) {
+            return false;
+          }
+          break;
+        case TypedDoubleExprInput::Shape::kMulTwoDoubleCols:
+        case TypedDoubleExprInput::Shape::kMulConstMinusCol:
+          if (!valid_dcol(de.col0) || !valid_dcol(de.col1)) {
+            return false;
+          }
+          break;
+        case TypedDoubleExprInput::Shape::kMulConstMinusColMulConstPlusCol:
+          if (!valid_dcol(de.col0) || !valid_dcol(de.col1) ||
+              !valid_dcol(de.col2)) {
+            return false;
+          }
+          break;
+        case TypedDoubleExprInput::Shape::kGeneric:
+          for (const TypedDoubleExprOp& op : de.ops) {
+            if (op.kind == TypedDoubleExprOp::Kind::kLoadDoubleCol) {
+              if (!valid_dcol(op.column)) {
+                return false;
+              }
+            } else if (op.kind ==
+                       TypedDoubleExprOp::Kind::kLoadIntColAsDouble) {
+              if (op.column >= proj_types.size() ||
+                  proj_types[op.column] != ValueType::kInt64 ||
+                  proj_unsigned[op.column] != 0) {
+                return false;
+              }
+              const slot_t fc = proj_to_full[op.column];
+              if (fc >= store.column_has_null.size()) {
+                return false;
+              }
+              (*agg_bind_cols)[fc] = 1;
+            }
+          }
+          break;
       }
+      b.double_expr = &de;
+      out_bindings->push_back(b);
+      continue;
     }
-    output.AddRow(Row(std::move(values)));
+    if (input.int_expr.has_value()) {
+      if (kind != SlimAggKind::kCount && kind != SlimAggKind::kSumInt64 &&
+          kind != SlimAggKind::kAvgDouble && kind != SlimAggKind::kMinInt64 &&
+          kind != SlimAggKind::kMaxInt64) {
+        return false;
+      }
+      const TypedIntExprInput& ie = *input.int_expr;
+      for (const TypedIntExprOp& op : ie.ops) {
+        if (op.kind == TypedIntExprOp::Kind::kLoadIntCol) {
+          if (op.column >= proj_types.size() ||
+              proj_types[op.column] != ValueType::kInt64 ||
+              proj_unsigned[op.column] != 0) {
+            return false;
+          }
+          const slot_t fc = proj_to_full[op.column];
+          if (fc >= store.column_has_null.size()) {
+            return false;
+          }
+          (*agg_bind_cols)[fc] = 1;
+        }
+      }
+      b.int_expr = &ie;
+      out_bindings->push_back(b);
+      continue;
+    }
+    return false;
   }
-  output.schema = Schema("", std::move(columns));
-  RETURN_IF_FAIL(output.GetStatus());
-  if (runtime != nullptr) {
-    if (begin_group == 0) {
-      runtime->aggregate_input_rows += input.TotalRows();
-      runtime->aggregate_updates += input.TotalRows() * aggregates.size();
+  return true;
+}
+
+inline bool EvalDirectDoubleExpr(const TypedDoubleExprInput& expr,
+                                 const std::vector<slot_t>& proj_to_full,
+                                 const std::vector<DirectBlockCol>& cols,
+                                 uint32_t r, double* out) noexcept {
+  switch (expr.shape) {
+    case TypedDoubleExprInput::Shape::kSingleDoubleCol: {
+      const DirectBlockCol& c0 = cols[proj_to_full[expr.col0]];
+      if (c0.IsNull(r)) {
+        return false;
+      }
+      *out = c0.Double(r);
+      return true;
     }
-    runtime->aggregate_groups += end_group - begin_group;
+    case TypedDoubleExprInput::Shape::kMulTwoDoubleCols: {
+      const DirectBlockCol& c0 = cols[proj_to_full[expr.col0]];
+      const DirectBlockCol& c1 = cols[proj_to_full[expr.col1]];
+      if (c0.IsNull(r) || c1.IsNull(r)) {
+        return false;
+      }
+      *out = c0.Double(r) * c1.Double(r);
+      return true;
+    }
+    case TypedDoubleExprInput::Shape::kMulConstMinusCol: {
+      const DirectBlockCol& c0 = cols[proj_to_full[expr.col0]];
+      const DirectBlockCol& c1 = cols[proj_to_full[expr.col1]];
+      if (c0.IsNull(r) || c1.IsNull(r)) {
+        return false;
+      }
+      *out = c0.Double(r) * (expr.k0 - c1.Double(r));
+      return true;
+    }
+    case TypedDoubleExprInput::Shape::kMulConstMinusColMulConstPlusCol: {
+      const DirectBlockCol& c0 = cols[proj_to_full[expr.col0]];
+      const DirectBlockCol& c1 = cols[proj_to_full[expr.col1]];
+      const DirectBlockCol& c2 = cols[proj_to_full[expr.col2]];
+      if (c0.IsNull(r) || c1.IsNull(r) || c2.IsNull(r)) {
+        return false;
+      }
+      *out = c0.Double(r) * (expr.k0 - c1.Double(r)) * (expr.k1 + c2.Double(r));
+      return true;
+    }
+    case TypedDoubleExprInput::Shape::kGeneric:
+      break;
+  }
+  std::array<double, 16> stack{};
+  size_t sp = 0;
+  for (const TypedDoubleExprOp& op : expr.ops) {
+    switch (op.kind) {
+      case TypedDoubleExprOp::Kind::kLoadDoubleCol: {
+        const DirectBlockCol& c = cols[proj_to_full[op.column]];
+        if (c.IsNull(r)) {
+          return false;
+        }
+        stack[sp++] = c.Double(r);
+        break;
+      }
+      case TypedDoubleExprOp::Kind::kLoadIntColAsDouble: {
+        const DirectBlockCol& c = cols[proj_to_full[op.column]];
+        if (c.IsNull(r)) {
+          return false;
+        }
+        stack[sp++] = static_cast<double>(c.Int(r));
+        break;
+      }
+      case TypedDoubleExprOp::Kind::kConstant:
+        stack[sp++] = op.constant;
+        break;
+      case TypedDoubleExprOp::Kind::kAdd:
+        stack[sp - 2] += stack[sp - 1];
+        --sp;
+        break;
+      case TypedDoubleExprOp::Kind::kSub:
+        stack[sp - 2] -= stack[sp - 1];
+        --sp;
+        break;
+      case TypedDoubleExprOp::Kind::kMul:
+        stack[sp - 2] *= stack[sp - 1];
+        --sp;
+        break;
+    }
+  }
+  *out = stack[0];
+  return true;
+}
+
+inline bool EvalDirectIntExpr(const TypedIntExprInput& expr,
+                              const std::vector<slot_t>& proj_to_full,
+                              const std::vector<DirectBlockCol>& cols,
+                              uint32_t r, int64_t* out, Status* err) noexcept {
+  std::array<int64_t, 16> stack{};
+  size_t sp = 0;
+  for (const TypedIntExprOp& op : expr.ops) {
+    switch (op.kind) {
+      case TypedIntExprOp::Kind::kLoadIntCol: {
+        const DirectBlockCol& c = cols[proj_to_full[op.column]];
+        if (c.IsNull(r)) {
+          return false;
+        }
+        stack[sp++] = c.Int(r);
+        break;
+      }
+      case TypedIntExprOp::Kind::kConstant:
+        stack[sp++] = op.constant;
+        break;
+      case TypedIntExprOp::Kind::kAdd: {
+        int64_t v = 0;
+        if (__builtin_add_overflow(stack[sp - 2], stack[sp - 1], &v)) {
+          *err =
+              StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
+          return false;
+        }
+        stack[sp - 2] = v;
+        --sp;
+        break;
+      }
+      case TypedIntExprOp::Kind::kSub: {
+        int64_t v = 0;
+        if (__builtin_sub_overflow(stack[sp - 2], stack[sp - 1], &v)) {
+          *err =
+              StatusError(StatusCode::kIsInfinity, "integer overflow on '-'");
+          return false;
+        }
+        stack[sp - 2] = v;
+        --sp;
+        break;
+      }
+      case TypedIntExprOp::Kind::kMul: {
+        int64_t v = 0;
+        if (__builtin_mul_overflow(stack[sp - 2], stack[sp - 1], &v)) {
+          *err =
+              StatusError(StatusCode::kIsInfinity, "integer overflow on '*'");
+          return false;
+        }
+        stack[sp - 2] = v;
+        --sp;
+        break;
+      }
+    }
+  }
+  *out = stack[0];
+  return true;
+}
+
+inline Value FinishDirectState(SlimAggKind kind, int64_t cnt, int64_t itot,
+                               double dtot, uint8_t flags, size_t distinct_cnt,
+                               Status* error) {
+  switch (kind) {
+    case SlimAggKind::kCount:
+      return Value(cnt);
+    case SlimAggKind::kSumInt64:
+      return cnt == 0 ? Value() : Value(itot);
+    case SlimAggKind::kSumDouble:
+      if (cnt == 0) {
+        return {};
+      }
+      if ((flags & 1) == 0 && std::isinf(dtot)) {
+        *error = StatusError(StatusCode::kIsInfinity,
+                             "SUM overflow: result is infinite");
+        return {};
+      }
+      return Value(dtot);
+    case SlimAggKind::kAvgDouble:
+      return cnt == 0 ? Value() : Value(dtot / static_cast<double>(cnt));
+    case SlimAggKind::kCountDistinctInt64:
+    case SlimAggKind::kCountDistinctDouble:
+      return Value(static_cast<int64_t>(distinct_cnt));
+    case SlimAggKind::kMinInt64:
+    case SlimAggKind::kMaxInt64:
+      return cnt == 0 ? Value() : Value(itot);
+    case SlimAggKind::kMinDate:
+    case SlimAggKind::kMaxDate:
+      return cnt == 0 ? Value() : Value::DateFromDays(itot);
+    case SlimAggKind::kMinDouble:
+    case SlimAggKind::kMaxDouble:
+      if (cnt == 0) {
+        return {};
+      }
+      if ((flags & 1) != 0) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      return Value(dtot);
+    default:
+      *error = StatusError(StatusCode::kInvalidArgument,
+                           "unsupported direct slim aggregate");
+      return {};
+  }
+}
+
+inline uint64_t MixScalarHash64(uint64_t z) noexcept {
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  z ^= z >> 31;
+  return z == 0 ? 1ULL : z;
+}
+
+inline uint64_t MixStringHash64(std::string_view sv) noexcept {
+  return MixScalarHash64(std::hash<std::string_view>{}(sv));
+}
+
+Relation BuildScalarDirectOutput(
+    const TypedAggregationPlan& plan, const SelectStatement& stmt,
+    const Schema& qualified_schema, const Schema& table_schema,
+    const std::vector<Value>& finished_values, size_t total_scanned,
+    size_t total_matching, size_t total_updates, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin,
+    std::chrono::steady_clock::time_point merge_begin,
+    ExecutionRuntime* runtime) {
+  if (publish_lstable_marker && runtime != nullptr) {
+    auto marker = std::make_shared<Relation>(runtime);
+    marker->schema = qualified_schema;
+    runtime->base_relations.emplace(fold_cache_key, std::move(marker));
+  }
+
+  std::vector<Value> row_values;
+  row_values.reserve(plan.emit_items.size());
+  for (const TypedEmitItem& item : plan.emit_items) {
+    row_values.push_back(item.constant ? *item.constant
+                                       : finished_values[item.index]);
+  }
+  std::vector<Column> output_columns;
+  output_columns.reserve(stmt.SelectList().size());
+  for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
+    Column col(ProjectionName(stmt.SelectList()[i], i),
+               ValueTypeOf(row_values[i]));
+    col.SetUnsigned(row_values[i].IsUnsigned());
+    output_columns.push_back(std::move(col));
+  }
+  Relation output(runtime);
+  output.AddRow(Row(std::move(row_values)));
+  output.schema = Schema("", std::move(output_columns));
+
+  if (runtime != nullptr) {
+    const double scan_ms = ElapsedMs(scan_begin);
+    runtime->scan_ms += scan_ms;
+    runtime->filter_ms += scan_ms;
+    runtime->scan_rows += total_scanned;
+    runtime->scan_output_rows += total_matching;
+    runtime->scan_values_decoded +=
+        total_scanned * qualified_schema.ColumnCount();
+    runtime->scan_values_available +=
+        total_scanned * table_schema.ColumnCount();
+    runtime->typed_parallel_aggregations += 1;
+    runtime->aggregate_groups += 1;
+    runtime->aggregate_input_rows += total_matching;
+    runtime->aggregate_updates += total_updates;
+    runtime->aggregate_ms += ElapsedMs(merge_begin);
   }
   return output;
 }
 
-StatusOr<Value> CompactArgument(const TypedAggregateInput& item,
-                                const Row& row) {
-  if (item.column) {
-    return row[*item.column];
+// Two-pass sharded parallel scalar COUNT(DISTINCT col) over LSTableStore.
+// Supports both numeric/DATE columns and zero-copy VarChar slices without
+// allocating per-row Strings or doing single-threaded full-table map merges.
+StatusOr<std::optional<Relation>> TryRunParallelScalarCountDistinct(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const Expression& having_expr,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, bool direct_children,
+    const RuntimeFilterGroup* stream_runtime_filter,
+    const PrebuiltMembershipPredicate* stream_prebuilt_membership,
+    size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin) {
+  if (!direct_children || stream_runtime_filter != nullptr ||
+      stream_prebuilt_membership != nullptr ||
+      (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
+      !(stmt.GroupBy().empty() || stmt.IsGroupAll()) ||
+      !plan.key_offsets.empty() || having_expr != nullptr || stmt.HasLimit() ||
+      stmt.Distinct() || stmt.WithTies() || !plan.order_items.empty() ||
+      !plan.dependent_key_programs.empty() || !plan.inlist_compares.empty() ||
+      plan.aggregates.size() != 1 || plan.emit_items.size() != 1 ||
+      store.total_rows < 1024) {
+    return std::optional<Relation>{};
   }
-  if (item.conditional) {
-    return EvaluateTypedConditionalOnRow(*item.conditional, row);
+  const TypedEmitItem& emit_item = plan.emit_items[0];
+  if (emit_item.is_key || emit_item.dependent_key ||
+      emit_item.post_agg != nullptr || emit_item.constant ||
+      emit_item.index != 0) {
+    return std::optional<Relation>{};
   }
-  if (item.double_expr) {
-    return EvaluateTypedDoubleExprOnRow(*item.double_expr, row);
+  const TypedAggregateInput& input = plan.aggregates[0];
+  if (input.aggregate == nullptr ||
+      input.aggregate->GetType() != AggregationType::kCount ||
+      !input.aggregate->Distinct() || input.aggregate->HasWhereFilter() ||
+      input.aggregate->NeedsGroupContext() || input.child.has_value() ||
+      input.conditional.has_value() || input.double_expr.has_value() ||
+      input.coalesce_double.has_value() || input.int_expr.has_value() ||
+      !input.column.has_value() || *input.column >= proj_types.size()) {
+    return std::optional<Relation>{};
   }
-  if (item.int_expr) {
-    return EvaluateTypedIntExprOnRow(*item.int_expr, row);
+  const slot_t proj_col = *input.column;
+  const slot_t full_col = proj_to_full[proj_col];
+  if (full_col >= store.column_has_null.size() ||
+      proj_unsigned[proj_col] != 0) {
+    return std::optional<Relation>{};
   }
-  if (item.child) {
-    return TryEvaluateRowAuto(*item.child, row);
+  const ValueType vt = proj_types[proj_col];
+  if (vt != ValueType::kInt64 && vt != ValueType::kDate &&
+      vt != ValueType::kDouble && vt != ValueType::kVarChar) {
+    return std::optional<Relation>{};
   }
-  return Value(1);
-}
-}  // namespace
+  if (vt == ValueType::kVarChar &&
+      (full_col >= table_schema.ColumnCount() ||
+       table_schema.GetColumn(full_col).IsInterval())) {
+    return std::optional<Relation>{};
+  }
 
-StatusOr<std::optional<Relation>> TryCompactStatisticalAggregate(
-    TransactionContext& context, const SelectStatement& statement,
-    const Relation& input,
-    const std::vector<const AggregateExpression*>& aggregates,
-    const CteMap& ctes) {
-  if (input.HasSpill() || input.rows.empty() || aggregates.empty() ||
-      input.rows.size() > static_cast<size_t>(INT64_MAX) ||
-      !statement.OrderBy().empty() || statement.Distinct() ||
-      HasWindowFunctions(statement) ||
-      std::getenv("TINYLAMB_DISABLE_COMPACT_STATISTICS") != nullptr) {
+  CompiledLSTableBlockFilter filter;
+  if (!filter.Init(plan, proj_to_full, proj_types, proj_unsigned, store)) {
     return std::optional<Relation>{};
   }
-  std::vector<slot_t> keys;
-  for (const auto& key : statement.GroupBy()) {
-    if (!key || key->Type() != TypeTag::kColumnValue) {
-      return std::optional<Relation>{};
-    }
-    const auto column =
-        LocalColumnOffset(input.schema, key->AsColumnValue().GetColumnName());
-    if (!column) {
-      return std::optional<Relation>{};
-    }
-    keys.push_back(*column);
+  if (filter.always_false) {
+    const auto merge_begin = std::chrono::steady_clock::now();
+    return std::optional<Relation>(BuildScalarDirectOutput(
+        plan, stmt, qualified_schema, table_schema, {Value(int64_t{0})}, 0, 0,
+        0, publish_lstable_marker, fold_cache_key, scan_begin, merge_begin,
+        runtime));
   }
-  struct Argument {
-    AggregationType kind;
-    size_t state;
-  };
-  struct Input {
-    std::optional<slot_t> column;
-    bool average{false};
-    bool statistics{false};
-  };
-  std::vector<Argument> arguments;
-  std::vector<Input> inputs;
-  const auto add_argument = [&](AggregationType kind,
-                                std::optional<slot_t> column, bool statistics) {
-    auto existing = std::ranges::find(inputs, column, &Input::column);
-    if (existing == inputs.end()) {
-      inputs.push_back({column});
-      existing = inputs.end() - 1;
-    }
-    existing->average = existing->average || kind == AggregationType::kAvg;
-    existing->statistics = existing->statistics || statistics;
-    arguments.push_back({kind, static_cast<size_t>(existing - inputs.begin())});
-  };
-  bool has_statistics = false;
-  for (const auto* aggregate : aggregates) {
-    const auto kind = aggregate->GetType();
-    const bool statistical = kind == AggregationType::kVarPop ||
-                             kind == AggregationType::kVarSamp ||
-                             kind == AggregationType::kStddevPop ||
-                             kind == AggregationType::kStddevSamp;
-    if ((!statistical && kind != AggregationType::kAvg &&
-         kind != AggregationType::kCount) ||
-        aggregate->Distinct() || aggregate->NeedsGroupContext() ||
-        aggregate->WhereFilter() ||
-        aggregate->Having() != AggregateHavingModifier::kNone ||
-        aggregate->HavingCondition() || !aggregate->InnerOrderBy().empty() ||
-        aggregate->InnerLimit() || aggregate->SecondaryArg() ||
-        !aggregate->ExtraArgs().empty() || !aggregate->TrailingArgs().empty()) {
-      return std::optional<Relation>{};
-    }
-    has_statistics = has_statistics || statistical;
-    if (IsCountStar(*aggregate)) {
-      add_argument(kind, std::nullopt, false);
-      continue;
-    }
-    const auto& child = aggregate->Child();
-    if (!child || child->Type() != TypeTag::kColumnValue) {
-      return std::optional<Relation>{};
-    }
-    const auto column =
-        LocalColumnOffset(input.schema, child->AsColumnValue().GetColumnName());
-    if (!column || input.schema.GetColumn(*column).IsUnsigned()) {
-      return std::optional<Relation>{};
-    }
-    add_argument(kind, static_cast<slot_t>(*column), statistical);
-  }
-  if (!has_statistics || !std::ranges::all_of(input.rows, [&](const Row& row) {
-        return std::ranges::all_of(keys,
-                                   [&](slot_t key) {
-                                     const auto& value = row[key];
-                                     return !value.IsCaseInsensitive() &&
-                                            !value.IsUnsigned() &&
-                                            (value.IsNull() ||
-                                             value.type == ValueType::kInt64 ||
-                                             value.type == ValueType::kDate ||
-                                             value.type == ValueType::kVarChar);
-                                   }) &&
-               std::ranges::all_of(inputs, [&](const Input& argument) {
-                 if (!argument.column) {
-                   return true;
-                 }
-                 const auto& value = row[*argument.column];
-                 return value.IsNull() || (!value.IsUnsigned() &&
-                                           (value.type == ValueType::kInt64 ||
-                                            value.type == ValueType::kDouble));
-               });
-      })) {
-    return std::optional<Relation>{};
-  }
-  // These are the same sequential moments as AggregateAccumulator, including
-  // extended precision and its un-clamped variance. Never merge partial
-  // moments: every group's owner consumes its original row sequence.
-  struct Moments {
-    platform::ExtendedFloat sx{0};
-    platform::ExtendedFloat sxx{0};
-    double total{0};
-    int64_t count{0};
-  };
-  const size_t bytes_per_row = 192 + (inputs.size() * sizeof(Moments) * 2);
-  if (input.rows.size() > SIZE_MAX / bytes_per_row) {
-    return std::optional<Relation>{};
-  }
-  auto charge = TryReserveQueryMemory(input.rows.size() * bytes_per_row);
-  if (!charge) {
-    return std::optional<Relation>{};
-  }
-  const size_t workers =
-      keys.empty() ? 1 : ParallelWorkerCount(input.rows.size() / 8192);
-  std::vector<size_t> hashes(input.rows.size());
-  RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
-    const size_t begin = (input.rows.size() * w) / workers;
-    const size_t end = (input.rows.size() * (w + 1)) / workers;
-    for (size_t r = begin; r < end; ++r) {
-      hashes[r] = TypedWorkerGroups::HashRowKey(input.rows[r], keys);
-    }
-  }));
-  std::vector<std::vector<size_t>> partitions(workers);
-  for (size_t r = 0; r < input.rows.size(); ++r) {
-    partitions[hashes[r] % workers].push_back(r);
-  }
-  std::vector<TypedWorkerGroups> groups(workers);
-  std::vector<std::vector<Moments>> moments(workers);
-  std::vector<size_t> first(input.rows.size(), SIZE_MAX);
-  for (auto& group : groups) {
-    group.Configure(true, keys.size(), 0);
-    group.borrowed_key_offsets = &keys;
-  }
-  RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t w) {
-    std::vector<Value> scratch;
-    for (const size_t r : partitions[w]) {
-      bool inserted = false;
-      const auto& row = input.rows[r];
-      const size_t group = groups[w].FindOrInsertRow(row, keys, {}, &scratch,
-                                                     &inserted, hashes[r]);
-      if (inserted) {
-        first[r] = group;
-        moments[w].resize((group + 1) * inputs.size());
-      }
-      for (size_t a = 0; a < inputs.size(); ++a) {
-        const auto& argument = inputs[a];
-        auto& state = moments[w][(group * inputs.size()) + a];
-        if (!argument.column) {
-          ++state.count;
-          continue;
-        }
-        const auto& value = row[*argument.column];
-        if (value.IsNull()) {
-          continue;
-        }
-        ++state.count;
-        if (argument.average) {
-          state.total += value.type == ValueType::kDouble
-                             ? value.value.double_value
-                             : static_cast<double>(value.value.int_value);
-        }
-        if (argument.statistics) {
-          const platform::ExtendedFloat x =
-              value.type == ValueType::kDouble
-                  ? static_cast<platform::ExtendedFloat>(
-                        value.value.double_value)
-                  : static_cast<platform::ExtendedFloat>(value.value.int_value);
-          state.sx += x;
-          state.sxx += x * x;
-        }
-      }
-    }
-  }));
-  Relation output(context.execution_runtime());
-  CopyExecutionStats(&output, input);
-  std::vector<Column> columns;
-  columns.reserve(statement.SelectList().size());
-  for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-    columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                         ValueType::kNull);
-  }
-  for (size_t r = 0; r < first.size(); ++r) {
-    if (first[r] == SIZE_MAX) {
-      continue;
-    }
-    AggregateResultMap finished;
-    finished.reserve(arguments.size());
-    for (size_t a = 0; a < arguments.size(); ++a) {
-      const auto& state =
-          moments[hashes[r] % workers]
-                 [(first[r] * inputs.size()) + arguments[a].state];
-      const auto kind = arguments[a].kind;
-      Value value;
-      if (kind == AggregationType::kCount) {
-        value = Value(state.count);
-      } else if (kind == AggregationType::kAvg) {
-        if (state.count != 0) {
-          value = Value(state.total / static_cast<double>(state.count));
-        }
-      } else {
-        const bool sample = kind == AggregationType::kVarSamp ||
-                            kind == AggregationType::kStddevSamp;
-        if (state.count >= (sample ? 2 : 1)) {
-          const platform::ExtendedFloat mean = state.sx / state.count;
-          const platform::ExtendedFloat ssd =
-              state.sxx - (state.count * mean * mean);
-          const platform::ExtendedFloat variance =
-              ssd / (sample ? state.count - 1 : state.count);
-          value = Value(
-              static_cast<double>(kind == AggregationType::kStddevPop ||
-                                          kind == AggregationType::kStddevSamp
-                                      ? platform::Sqrt(variance)
-                                      : variance));
-        }
-      }
-      finished.emplace(aggregates[a], std::move(value));
-    }
-    Scope scope{.row = &input.rows[r], .schema = &input.schema};
-    if (statement.Having()) {
-      ASSIGN_OR_RETURN(
-          Value, accepted,
-          TryEvaluate(statement.Having(), scope, &finished, context, ctes));
-      if (!Truthy(accepted)) {
-        continue;
-      }
-    }
-    Row row;
-    row.values_.reserve(statement.SelectList().size());
-    for (const auto& item : statement.SelectList()) {
-      ASSIGN_OR_RETURN(
-          Value, value,
-          TryEvaluate(item.expression, scope, &finished, context, ctes));
-      row.values_.push_back(std::move(value));
-    }
-    output.AddRow(std::move(row));
-  }
-  if (!output.rows.empty()) {
-    for (size_t i = 0; i < columns.size(); ++i) {
-      columns[i] =
-          Column(columns[i].Name(), ValueTypeOf(output.rows.front()[i]));
-      columns[i].SetUnsigned(output.rows.front()[i].IsUnsigned());
-    }
-  }
-  output.schema = Schema("", std::move(columns));
-  RETURN_IF_FAIL(output.FinishSpill());
-  RETURN_IF_FAIL(output.GetStatus());
-  if (auto* runtime = context.execution_runtime()) {
-    runtime->typed_parallel_aggregations += workers > 1 ? 1 : 0;
-    runtime->aggregate_input_rows += input.rows.size();
-    runtime->aggregate_groups += std::ranges::count_if(
-        first, [](size_t group) { return group != SIZE_MAX; });
-    runtime->aggregate_updates += input.rows.size() * arguments.size();
-  }
-  return std::optional<Relation>(std::move(output));
-}
 
-StatusOr<std::optional<Relation>> TryCompactRelationAggregate(
-    TransactionContext& context, const SelectStatement& statement,
-    const Relation& input,
-    const std::vector<const AggregateExpression*>& aggregates) {
-  if (input.HasSpill() || input.rows.size() != input.TotalRows() ||
-      !statement.OrderBy().empty() || HasWindowFunctions(statement)) {
-    return std::optional<Relation>{};
-  }
-  auto plan =
-      PlanTypedAggregation(statement, nullptr, input.schema, aggregates, {});
-  if (!plan.eligible ||
-      std::ranges::any_of(aggregates, [](const auto* aggregate) {
-        return aggregate->Distinct();
-      })) {
-    return std::optional<Relation>{};
-  }
-  std::vector<PositionalHaving> having;
-  if (statement.Having() && !TryCompilePositionalHavingConjuncts(
-                                statement.Having(), plan.aggregates, &having)) {
-    return std::optional<Relation>{};
-  }
-  // Reserve a conservative bound for keys, hash slots, and padded slim state.
-  // Oversized inputs keep the existing partitioned aggregation path.
-  const size_t group_bytes =
-      128 + (plan.key_offsets.size() * sizeof(Value) * 2) +
-      (aggregates.size() * (plan.slim ? 64 : sizeof(AggregateAccumulator)));
-  if (input.TotalRows() > SIZE_MAX - 4096 ||
-      input.TotalRows() + 4096 >
-          (SIZE_MAX - input.charged_bytes_) / group_bytes) {
-    return std::optional<Relation>{};
-  }
-  const size_t bytes =
-      input.charged_bytes_ + ((input.TotalRows() + 4096) * group_bytes);
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return std::optional<Relation>{};
-  }
-  QueryMemoryCharge charge(bytes);
-  const auto started = std::chrono::steady_clock::now();
-  TypedWorkerGroups groups;
-  groups.int_key =
-      plan.key_offsets.size() == 1 &&
-      (input.schema.GetColumn(plan.key_offsets[0]).Type() ==
-           ValueType::kInt64 ||
-       input.schema.GetColumn(plan.key_offsets[0]).Type() == ValueType::kDate);
-  groups.Configure(true, plan.key_offsets.size(), plan.aggregates.size());
-  const bool borrow_keys =
-      !input.rows.empty() &&
-      std::ranges::all_of(input.rows, [&](const Row& row) {
-        return std::ranges::all_of(plan.key_offsets, [&](slot_t slot) {
-          const auto& value = row[slot];
-          return !value.IsCaseInsensitive() && !value.IsUnsigned() &&
-                 (value.IsNull() || value.type == ValueType::kInt64 ||
-                  value.type == ValueType::kDate ||
-                  value.type == ValueType::kVarChar);
-        });
-      });
-  if (borrow_keys) {
-    groups.borrowed_key_offsets = &plan.key_offsets;
-  }
-  std::vector<AggregateAccumulator::Shape> shapes;
-  if (plan.slim) {
-    groups.ConfigureSlim(plan);
-  } else {
-    for (const auto* aggregate : aggregates) {
-      shapes.push_back(
-          AggregateAccumulator::AnalyzeShape(aggregate, &input.schema));
-    }
-    groups.shapes = &shapes;
-  }
-  // A scalar aggregate has exactly one state. It does not need to hash the
-  // empty key again for each row (notably an AVG over UNION ALL inputs).
-  const bool scalar = plan.key_offsets.empty();
-  if (scalar && !input.rows.empty()) {
-    bool inserted = false;
-    static_cast<void>(
-        groups.FindOrInsert({}, 0, aggregates.size(), aggregates, &inserted));
-  }
-  const auto accumulate = [&](TypedWorkerGroups& target, size_t group,
-                              const Row& row) -> Status {
-    for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-      const auto& item = plan.aggregates[i];
-      Value computed;
-      const Value* value = nullptr;
-      if (item.column) {
-        value = &row[*item.column];
-      } else if (item.conditional) {
-        computed = EvaluateTypedConditionalOnRow(*item.conditional, row);
-        value = &computed;
-      } else if (item.double_expr) {
-        computed = EvaluateTypedDoubleExprOnRow(*item.double_expr, row);
-        value = &computed;
-      } else if (item.int_expr) {
-        ASSIGN_OR_RETURN(Value, evaluated,
-                         EvaluateTypedIntExprOnRow(*item.int_expr, row));
-        computed = std::move(evaluated);
-        value = &computed;
-      } else if (item.child) {
-        ASSIGN_OR_RETURN(Value, evaluated,
-                         TryEvaluateRowAuto(*item.child, row));
-        computed = std::move(evaluated);
-        value = &computed;
-      }
-      if (!plan.slim) {
-        RETURN_IF_FAIL(target.State(group, i).Add(value ? *value : Value(1)));
-        continue;
-      }
-      Status error{Status::kSuccess};
-      if (!ApplySlimValue(&target, group, i, plan.slim_kinds[i], value,
-                          &error)) {
-        return error;
-      }
-    }
-    return Status::kSuccess;
-  };
-  static const bool partition_disabled =
-      std::getenv("TINYLAMB_DISABLE_COMPACT_PARTITION_AGG") != nullptr;
-  const size_t partitions = ParallelWorkerCount(input.rows.size() / 8192);
-  const size_t staging_per_row = 160 + (plan.aggregates.size() * 64);
-  const size_t padding = partitions * 4096 * plan.aggregates.size() * 64;
-  auto partition_charge =
-      !partition_disabled && borrow_keys && !scalar && plan.slim &&
-              partitions > 1 && input.rows.size() >= 32768 &&
-              input.rows.size() <= (SIZE_MAX - padding) / staging_per_row
-          ? TryReserveQueryMemory((input.rows.size() * staging_per_row) +
-                                  padding)
-          : nullptr;
-  if (partition_charge) {
-    // Each key has one owner; its original row order is retained. This also
-    // avoids reassociating floating sums or hiding intermediate overflows.
-    std::vector<size_t> hashes(input.rows.size());
-    RETURN_IF_FAIL(RunParallelTasks(partitions, [&](size_t p) {
-      const size_t begin = input.rows.size() * p / partitions;
-      const size_t end = input.rows.size() * (p + 1) / partitions;
-      for (size_t r = begin; r < end; ++r) {
-        hashes[r] =
-            TypedWorkerGroups::HashRowKey(input.rows[r], plan.key_offsets);
-      }
-    }));
-    std::vector<std::vector<size_t>> rows(partitions);
-    for (auto& bucket : rows) {
-      bucket.reserve(input.rows.size() / partitions);
-    }
-    for (size_t r = 0; r < input.rows.size(); ++r) {
-      rows[hashes[r] % partitions].push_back(r);
-    }
-    std::vector<TypedWorkerGroups> local(partitions);
-    for (auto& part : local) {
-      part.Configure(true, plan.key_offsets.size(), plan.aggregates.size());
-      part.ConfigureSlim(plan);
-      part.int_key = groups.int_key;
-      part.borrowed_key_offsets = &plan.key_offsets;
-    }
-    std::vector<size_t> first(input.rows.size(), SIZE_MAX);
-    std::vector<Status> errors(partitions, Status::kSuccess);
-    std::vector<size_t> error_rows(partitions, SIZE_MAX);
-    RETURN_IF_FAIL(RunParallelTasks(partitions, [&](size_t p) {
-      std::vector<Value> keys;
-      for (const size_t r : rows[p]) {
-        bool inserted = false;
-        const size_t group =
-            local[p].FindOrInsertRow(input.rows[r], plan.key_offsets,
-                                     aggregates, &keys, &inserted, hashes[r]);
-        if (inserted) {
-          first[r] = group;
-        }
-        const Status status = accumulate(local[p], group, input.rows[r]);
-        if (status != Status::kSuccess) {
-          errors[p] = status;
-          error_rows[p] = r;
-          return;
+  const bool no_predicates =
+      filter.null_preds.empty() && filter.int_intervals.empty() &&
+      filter.stage1_preds.empty() && filter.disjunctions.empty();
+  if (no_predicates && full_col < store.dictionaries.size()) {
+    const LSTableColumnDictionary& dict = store.dictionaries[full_col];
+    const size_t entry_count =
+        vt == ValueType::kVarChar
+            ? dict.StringEntryCount()
+            : (vt == ValueType::kDouble ? dict.DoubleEntryCount()
+                                        : dict.IntEntryCount());
+    if (dict.active && dict.code_counts.size() == entry_count + 1 &&
+        (vt != ValueType::kVarChar || dict.bytewise_equality)) {
+      int64_t non_null_distinct = 0;
+      for (size_t c = 0; c < entry_count; ++c) {
+        if (dict.code_counts[c] > 0) {
+          ++non_null_distinct;
         }
       }
-    }));
-    const auto error = std::ranges::min_element(error_rows);
-    if (*error != SIZE_MAX) {
-      return errors[static_cast<size_t>(error - error_rows.begin())];
-    }
-    size_t group_count = 0;
-    for (const auto& part : local) {
-      group_count += part.GroupCount();
-    }
-    groups.ReserveGroups(group_count);
-    // No second hash build: emit only needs group IDs and their keys/states.
-    // Encounter-order adoption keeps LIMIT/tie behavior deterministic.
-    for (size_t r = 0; r < first.size(); ++r) {
-      if (first[r] == SIZE_MAX) {
-        continue;
-      }
-      auto& part = local[hashes[r] % partitions];
-      const size_t source = first[r];
-      const size_t group = groups.group_count++;
-      groups.borrowed_key_rows.push_back(&input.rows[r]);
-      for (size_t a = 0; a < aggregates.size(); ++a) {
-        groups.SlimCount(group, a) = part.SlimCount(source, a);
-        groups.SlimIntTotal(group, a) = part.SlimIntTotal(source, a);
-        groups.SlimDoubleTotal(group, a) = part.SlimDoubleTotal(source, a);
-        groups.SlimFlags(group, a) = part.SlimFlags(source, a);
-      }
-    }
-    if (auto* runtime = context.execution_runtime()) {
-      ++runtime->typed_parallel_aggregations;
-    }
-  } else {
-    std::vector<Value> keys;
-    keys.reserve(plan.key_offsets.size());
-    for (const auto& row : input.rows) {
-      bool inserted = false;
-      const size_t group =
-          scalar ? 0
-                 : groups.FindOrInsertRow(row, plan.key_offsets, aggregates,
-                                          &keys, &inserted);
-      RETURN_IF_FAIL(accumulate(groups, group, row));
+      const auto merge_begin = std::chrono::steady_clock::now();
+      return std::optional<Relation>(BuildScalarDirectOutput(
+          plan, stmt, qualified_schema, table_schema,
+          {Value(non_null_distinct)}, store.total_rows, store.total_rows,
+          store.total_rows, publish_lstable_marker, fold_cache_key, scan_begin,
+          merge_begin, runtime));
     }
   }
-  if (groups.GroupCount() == 0 &&
-      (statement.GroupBy().empty() || statement.IsGroupAll())) {
-    bool inserted = false;
-    static_cast<void>(
-        groups.FindOrInsert({}, 0, aggregates.size(), aggregates, &inserted));
-  }
-  ASSIGN_OR_RETURN(
-      Relation, output,
-      (FinishCompactGroups(context.execution_runtime(), statement, input,
-                           aggregates, plan, groups, &having)));
-  if (auto* runtime = context.execution_runtime()) {
-    runtime->project_ms += ElapsedMs(started);
-  }
-  return std::optional<Relation>(std::move(output));
-}
 
-// Factor the finest grouping key once per input row. Every coarser set
-// maps that key's group id to its own state, so repeated strings and computed
-// aggregate arguments are not evaluated again for every ROLLUP branch.
-// Accumulators still receive the original rows in original order.
-StatusOr<std::optional<std::vector<Relation>>> TryCompactGroupingSets(
-    TransactionContext& context,
-    const std::vector<const SelectStatement*>& sets, const Relation& input) {
-  if (sets.size() < 3 || sets.size() > 32 || input.HasSpill()) {
-    return std::optional<std::vector<Relation>>{};
-  }
-  const size_t count = sets.size();
-  std::vector<TypedAggregationPlan> plans;
-  plans.reserve(count);
-  std::vector<std::vector<const AggregateExpression*>> aggregates(count);
-  std::vector<std::vector<AggregateAccumulator::Shape>> shapes(count);
-  std::vector<std::vector<size_t>> key_maps(count);
-  for (size_t s = 0; s < count; ++s) {
-    const auto& statement = *sets[s];
-    if (statement.Having() || statement.Qualify() ||
-        !statement.OrderBy().empty() || HasWindowFunctions(statement) ||
-        StatementContainsVolatileFunction(statement)) {
-      return std::optional<std::vector<Relation>>{};
-    }
-    std::unordered_set<const AggregateExpression*> seen;
-    for (const auto& item : statement.SelectList()) {
-      CollectAggregates(item.expression, &aggregates[s], &seen);
-    }
-    auto plan = PlanTypedAggregation(statement, nullptr, input.schema,
-                                     aggregates[s], {});
-    if (!plan.eligible || !plan.dependent_key_programs.empty() ||
-        aggregates[s].empty() ||
-        std::ranges::any_of(
-            aggregates[s],
-            [](const auto* aggregate) { return aggregate->Distinct(); }) ||
-        (s == 0 && plan.key_offsets.empty()) ||
-        aggregates[s].size() != aggregates[0].size()) {
-      return std::optional<std::vector<Relation>>{};
-    }
-    for (size_t a = 0; a < aggregates[s].size(); ++a) {
-      if (aggregates[s][a]->ToString() != aggregates[0][a]->ToString()) {
-        return std::optional<std::vector<Relation>>{};
+  std::vector<uint8_t> agg_bind_cols(store.column_has_null.size(), 0);
+  agg_bind_cols[full_col] = 1;
+  const size_t nblocks = store.blocks.size();
+  const size_t workers_used =
+      std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
+  constexpr size_t kShards = 64;
+  constexpr size_t kShardMask = kShards - 1;
+
+  std::atomic<bool> budget_exceeded{false};
+  std::vector<QueryMemoryCharge> worker_charges(workers_used);
+  std::vector<size_t> worker_scanned(workers_used, 0);
+  std::vector<size_t> worker_matching(workers_used, 0);
+
+  if (vt == ValueType::kVarChar) {
+    struct StrSlice {
+      const char* ptr{nullptr};
+      uint32_t len{0};
+      uint32_t h32{0};
+    };
+    struct StrCacheSlot {
+      uint64_t h64{0};
+      const char* ptr{nullptr};
+      uint32_t len{0};
+    };
+    constexpr size_t kCacheSlots = 4096;
+    constexpr size_t kCacheMask = kCacheSlots - 1;
+    std::vector<std::array<std::vector<StrSlice>, kShards>> worker_shards(
+        workers_used);
+    std::vector<uint8_t> worker_saw_empty(workers_used, 0);
+
+    RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+      if (budget_exceeded.load(std::memory_order_relaxed)) {
+        return;
       }
-      shapes[s].push_back(
-          AggregateAccumulator::AnalyzeShape(aggregates[s][a], &input.schema));
-    }
-    const auto& finest = s == 0 ? plan.key_offsets : plans[0].key_offsets;
-    for (const auto slot : plan.key_offsets) {
-      const auto found = std::ranges::find(finest, slot);
-      if (found == finest.end()) {
-        return std::optional<std::vector<Relation>>{};
+      QueryMemoryCharge& qcharge = worker_charges[w];
+      if (!qcharge.TryAdd(kCacheSlots * sizeof(StrCacheSlot))) {
+        budget_exceeded.store(true, std::memory_order_relaxed);
+        return;
       }
-      key_maps[s].push_back(
-          static_cast<size_t>(std::distance(finest.begin(), found)));
-    }
-    plans.push_back(std::move(plan));
-  }
-  std::vector<bool> mixed_numeric_sums(aggregates[0].size(), false);
-  bool can_use_slim = !plans[0].slim;
-  bool needs_dynamic_sum = false;
-  std::vector<slot_t> numeric_columns;
-  const std::function<bool(const Expression&)> numeric_expression =
-      [&](const Expression& expression) {
-        if (!expression) {
-          return false;
+      std::vector<StrCacheSlot> cache(kCacheSlots);
+      size_t charged_shard_bytes = 0;
+      auto& shards = worker_shards[w];
+
+      CompiledLSTableBlockFilter::Scratch ws;
+      filter.InitScratch(store.column_has_null.size(), &ws);
+      std::vector<uint32_t> sel;
+      const size_t blk_begin = (nblocks * w) / workers_used;
+      const size_t blk_end = (nblocks * (w + 1)) / workers_used;
+      bool saw_empty = false;
+      size_t scanned = 0;
+      size_t matching = 0;
+
+      auto sync_charge = [&]() -> bool {
+        size_t cur_cap = 0;
+        for (const auto& s : shards) {
+          cur_cap += s.capacity() * sizeof(StrSlice);
         }
-        if (expression->Type() == TypeTag::kConstantValue) {
-          const auto& value = expression->AsConstantValue().GetValue();
-          return value.IsNull() ||
-                 (!value.IsUnsigned() && (value.type == ValueType::kInt64 ||
-                                          value.type == ValueType::kDouble));
-        }
-        if (expression->Type() == TypeTag::kColumnValue) {
-          const auto offset = LocalColumnOffset(
-              input.schema, expression->AsColumnValue().GetColumnName());
-          if (!offset) {
+        if (cur_cap > charged_shard_bytes) {
+          if (!qcharge.TryAdd(cur_cap - charged_shard_bytes)) {
+            budget_exceeded.store(true, std::memory_order_relaxed);
             return false;
           }
-          const auto& column = input.schema.GetColumn(*offset);
-          if (column.IsUnsigned() || (column.Type() != ValueType::kInt64 &&
-                                      column.Type() != ValueType::kDouble)) {
-            return false;
-          }
-          numeric_columns.push_back(static_cast<slot_t>(*offset));
+          charged_shard_bytes = cur_cap;
+        }
+        return true;
+      };
+
+      auto push_sv = [&](std::string_view sv) -> bool {
+        if (sv.empty()) {
+          saw_empty = true;
           return true;
         }
-        if (expression->Type() == TypeTag::kBinaryExp) {
-          const auto& binary = expression->AsBinaryExpression();
-          const auto op = binary.Op();
-          return (op == BinaryOperation::kAdd ||
-                  op == BinaryOperation::kSubtract ||
-                  op == BinaryOperation::kMultiply ||
-                  op == BinaryOperation::kDivide ||
-                  op == BinaryOperation::kModulo) &&
-                 numeric_expression(binary.Left()) &&
-                 numeric_expression(binary.Right());
+        if (sv.size() > std::numeric_limits<uint32_t>::max()) {
+          budget_exceeded.store(true, std::memory_order_relaxed);
+          return false;
         }
-        if (expression->Type() == TypeTag::kFunctionCallExp) {
-          const auto& function = expression->AsFunctionCallExpression();
-          return (IdentifierEquals(function.FuncName(), "coalesce") ||
-                  IdentifierEquals(function.FuncName(), "ifnull")) &&
-                 std::ranges::all_of(function.Args(), numeric_expression);
+        const uint64_t h64 = MixStringHash64(sv);
+        StrCacheSlot& cs = cache[static_cast<size_t>(h64) & kCacheMask];
+        if (cs.ptr != nullptr && cs.h64 == h64 && cs.len == sv.size() &&
+            std::memcmp(cs.ptr, sv.data(), sv.size()) == 0) {
+          return true;
         }
-        return false;
+        cs = StrCacheSlot{h64, sv.data(), static_cast<uint32_t>(sv.size())};
+        auto h32 = static_cast<uint32_t>((h64 >> 6) ^ (h64 >> 32));
+        if (h32 == 0) {
+          h32 = 1;
+        }
+        auto& shard_vec = shards[static_cast<size_t>(h64) & kShardMask];
+        const size_t old_cap = shard_vec.capacity();
+        shard_vec.push_back(
+            StrSlice{sv.data(), static_cast<uint32_t>(sv.size()), h32});
+        return shard_vec.capacity() == old_cap || sync_charge();
       };
-  for (size_t a = 0; can_use_slim && a < aggregates[0].size(); ++a) {
-    if (plans[0].slim_kinds[a] != SlimAggKind::kNone) {
-      continue;
-    }
-    if (aggregates[0][a]->GetType() != AggregationType::kSum ||
-        !plans[0].aggregates[a].child ||
-        !numeric_expression(aggregates[0][a]->Child())) {
-      can_use_slim = false;
-      break;
-    }
-    mixed_numeric_sums[a] = true;
-    needs_dynamic_sum = true;
-  }
-  std::ranges::sort(numeric_columns);
-  numeric_columns.erase(
-      std::unique(numeric_columns.begin(), numeric_columns.end()),
-      numeric_columns.end());
-  for (const slot_t column : numeric_columns) {
-    const auto type = input.schema.GetColumn(column).Type();
-    can_use_slim =
-        can_use_slim && std::ranges::all_of(input.rows, [&](const Row& row) {
-          return row[column].IsNull() ||
-                 (row[column].type == type && !row[column].IsUnsigned());
-        });
-  }
-  if (can_use_slim && needs_dynamic_sum) {
-    for (auto& plan : plans) {
-      plan.slim = true;
-      for (size_t a = 0; a < mixed_numeric_sums.size(); ++a) {
-        if (mixed_numeric_sums[a]) {
-          plan.slim_kinds[a] = SlimAggKind::kSumDouble;
+
+      for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+        if (budget_exceeded.load(std::memory_order_relaxed)) {
+          return;
         }
-      }
-    }
-  } else {
-    mixed_numeric_sums.clear();
-  }
-  // Dynamic numeric expressions may have just qualified for slim state.
-  // Account for the selected representation, not the discarded generic
-  // accumulator bound, before reserving optional parallel workspaces.
-  size_t per_row = count * sizeof(size_t);
-  for (const auto& plan : plans) {
-    per_row += 128 + (plan.key_offsets.size() * sizeof(Value) * 2) +
-               (plan.aggregates.size() *
-                (plan.slim ? 64 : sizeof(AggregateAccumulator)));
-  }
-  if (per_row == 0 || input.TotalRows() > SIZE_MAX - 4096 ||
-      input.TotalRows() + 4096 > (SIZE_MAX - input.charged_bytes_) / per_row) {
-    return std::optional<std::vector<Relation>>{};
-  }
-  const size_t bytes =
-      input.charged_bytes_ + ((input.TotalRows() + 4096) * per_row);
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return std::optional<std::vector<Relation>>{};
-  }
-  QueryMemoryCharge charge(bytes);
-  const auto started = std::chrono::steady_clock::now();
-  const bool group_phases = std::getenv("TINYLAMB_GROUP_PHASES") != nullptr &&
-                            input.rows.size() >= 100000;
-  const auto phase = [&](const char* name) {
-    if (!group_phases) {
-      return;
-    }
-    const double ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - started)
-                          .count();
-    std::cerr << "[group] " << name << " " << ms
-              << " rows=" << input.rows.size() << " sets=" << count << "\n";
-  };
-  std::vector<TypedWorkerGroups> groups(count);
-  const bool borrow_keys =
-      !input.rows.empty() &&
-      std::ranges::all_of(input.rows, [&](const Row& row) {
-        return std::ranges::all_of(plans[0].key_offsets, [&](slot_t slot) {
-          const auto& value = row[slot];
-          return !value.IsCaseInsensitive() &&
-                 (value.type == ValueType::kNull ||
-                  value.type == ValueType::kInt64 ||
-                  value.type == ValueType::kDate ||
-                  value.type == ValueType::kVarChar);
-        });
-      });
-  for (size_t s = 0; s < count; ++s) {
-    const auto& plan = plans[s];
-    groups[s].Configure(true, plan.key_offsets.size(), plan.aggregates.size());
-    if (borrow_keys) {
-      groups[s].borrowed_key_offsets = &plan.key_offsets;
-    }
-    groups[s].int_key = plan.key_offsets.size() == 1 &&
-                        (input.schema.GetColumn(plan.key_offsets[0]).Type() ==
-                             ValueType::kInt64 ||
-                         input.schema.GetColumn(plan.key_offsets[0]).Type() ==
-                             ValueType::kDate);
-    if (plan.slim) {
-      groups[s].ConfigureSlim(plan);
-      groups[s].mixed_numeric_sums = mixed_numeric_sums;
-    } else {
-      groups[s].shapes = &shapes[s];
-    }
-  }
-  // Each grouping set receives rows in their original order. Build the
-  // finest IDs once, then let independent workers fold coarser sets. This
-  // avoids sharing accumulator state or reassociating integer/floating sums.
-  const size_t set_workers = std::min<size_t>(
-      count - 1, QueryParallelWorkerLimit(std::thread::hardware_concurrency()));
-  const auto shareable_argument = [](const TypedAggregateInput& argument) {
-    if (argument.conditional || argument.int_expr) {
-      return false;
-    }
-    if (!argument.child) {
-      return true;
-    }
-    const auto& program = *argument.child;
-    return std::ranges::all_of(
-        program.Instructions(), [&](const auto& instruction) {
-          switch (instruction.opcode) {
-            case BytecodeOp::kLoadColumn:
-            case BytecodeOp::kJumpIfNotNull:
-            case BytecodeOp::kPop:
-              return true;
-            case BytecodeOp::kLoadConstant: {
-              const auto& value = program.Constants()[instruction.operand];
-              return value.IsNull() || (!value.IsUnsigned() &&
-                                        (value.type == ValueType::kInt64 ||
-                                         value.type == ValueType::kDouble));
+        const auto& blk = store.blocks[bi];
+        scanned += blk.row_count;
+        bool all_pass = false;
+        const uint32_t m =
+            filter.FilterBlock(blk, agg_bind_cols, &ws, &all_pass, &sel);
+        if (m == 0) {
+          continue;
+        }
+        matching += m;
+        const DirectBlockCol& col = ws.cols[full_col];
+        const uint32_t* sel_ptr = sel.data();
+        if (!col.has_null) {
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              if (!push_sv(col.VarChar(r))) {
+                return;
+              }
             }
-            case BytecodeOp::kBinaryDouble:
-              return instruction.binary == BinaryOperation::kAdd ||
-                     instruction.binary == BinaryOperation::kSubtract ||
-                     instruction.binary == BinaryOperation::kMultiply;
-            default:
-              return false;
-          }
-        });
-  };
-  bool parallel_sets =
-      input.rows.size() >= 32768 && set_workers > 1 && plans[0].slim &&
-      std::ranges::all_of(plans[0].aggregates, shareable_argument);
-  const size_t argument_count = plans[0].aggregates.size();
-  std::shared_ptr<QueryMemoryCharge> argument_charge;
-  if (parallel_sets) {
-    const size_t bytes_per_row =
-        sizeof(size_t) + (argument_count * sizeof(Value));
-    if (input.rows.size() <= SIZE_MAX / bytes_per_row) {
-      argument_charge =
-          TryReserveQueryMemory(input.rows.size() * bytes_per_row);
-    }
-    parallel_sets = argument_charge != nullptr;
-  }
-  std::vector<Value> arguments;
-  if (parallel_sets) {
-    arguments.reserve(input.rows.size() * argument_count);
-    for (const Row& row : input.rows) {
-      for (size_t a = 0; a < argument_count; ++a) {
-        const auto& item = plans[0].aggregates[a];
-        if (plans[0].slim_kinds[a] == SlimAggKind::kCount && item.column) {
-          arguments.push_back(row[*item.column].IsNull() ? Value() : Value(1));
-          continue;
-        }
-        ASSIGN_OR_RETURN(Value, value, CompactArgument(item, row));
-        if (!value.IsNull() &&
-            (value.IsUnsigned() || (value.type != ValueType::kInt64 &&
-                                    value.type != ValueType::kDouble))) {
-          parallel_sets = false;
-          break;
-        }
-        arguments.push_back(std::move(value));
-      }
-      if (!parallel_sets) {
-        break;
-      }
-    }
-  }
-  phase("arguments");
-  if (parallel_sets) {
-    // Integer partial sums can be reassociated only after proving that every
-    // possible prefix remains exact. The sum of absolute input values bounds
-    // every subset, including groups with cancellation. AVG uses binary64;
-    // SUM(INT64) must also preserve its checked intermediate-overflow contract.
-    bool exact_partial_merge =
-        input.rows.size() <= static_cast<size_t>(INT64_MAX);
-    for (size_t a = 0; exact_partial_merge && a < argument_count; ++a) {
-      const auto kind = plans[0].slim_kinds[a];
-      if (kind == SlimAggKind::kCount) {
-        continue;
-      }
-      if (kind != SlimAggKind::kSumInt64 && kind != SlimAggKind::kAvgDouble) {
-        exact_partial_merge = false;
-        break;
-      }
-      const uint64_t limit = kind == SlimAggKind::kSumInt64
-                                 ? static_cast<uint64_t>(INT64_MAX)
-                                 : uint64_t{1} << 53;
-      uint64_t magnitude_sum = 0;
-      for (size_t r = 0; r < input.rows.size(); ++r) {
-        const auto& value = arguments[(r * argument_count) + a];
-        if (value.IsNull()) {
-          continue;
-        }
-        if (value.type != ValueType::kInt64 || value.IsUnsigned()) {
-          exact_partial_merge = false;
-          break;
-        }
-        const auto raw = static_cast<uint64_t>(value.value.int_value);
-        const uint64_t magnitude = value.value.int_value < 0 ? 0 - raw : raw;
-        if (magnitude > limit - magnitude_sum) {
-          exact_partial_merge = false;
-          break;
-        }
-        magnitude_sum += magnitude;
-      }
-    }
-    // A single finite DOUBLE SUM needs only its running total. COALESCE may
-    // also produce signed integer zero; preserve that distinction for groups
-    // that never see a DOUBLE. No row is reordered or reassociated.
-    const bool finite_sum =
-        argument_count == 1 &&
-        plans[0].slim_kinds[0] == SlimAggKind::kSumDouble &&
-        std::ranges::all_of(arguments, [&](const Value& value) {
-          return value.IsNull() ||
-                 (value.type == ValueType::kDouble &&
-                  std::isfinite(value.value.double_value)) ||
-                 (!mixed_numeric_sums.empty() && mixed_numeric_sums[0] &&
-                  value.type == ValueType::kInt64 && !value.IsUnsigned() &&
-                  value.value.int_value == 0);
-        });
-    const bool all_double =
-        finite_sum && std::ranges::all_of(arguments, [](const Value& value) {
-          return value.type == ValueType::kDouble;
-        });
-    const bool no_nulls =
-        finite_sum && std::ranges::none_of(arguments, [](const Value& value) {
-          return value.IsNull();
-        });
-    const auto add_finite_sum = [no_nulls](TypedWorkerGroups& local,
-                                           size_t group, const Value& value) {
-      if (!no_nulls && !value.IsNull()) {
-        local.slim_counts[group] = 1;
-      }
-      if (value.type == ValueType::kDouble) {
-        local.slim_double_totals[group] += value.value.double_value;
-        local.slim_flags[group] = 2;
-      }
-    };
-    std::vector<size_t> row_groups(input.rows.size());
-    const size_t finest_workers = std::min<size_t>(8, set_workers);
-    std::shared_ptr<QueryMemoryCharge> partition_charge;
-    if (borrow_keys && plans[0].key_offsets.size() > 1 && finest_workers > 1) {
-      const size_t bytes_per_row = 256 + (argument_count * 64);
-      const size_t padding = finest_workers * 4096 * argument_count * 64;
-      if (input.rows.size() <= (SIZE_MAX - padding) / bytes_per_row) {
-        partition_charge = TryReserveQueryMemory(
-            (input.rows.size() * bytes_per_row) + padding);
-      }
-    }
-    if (partition_charge) {
-      // Assign every key to exactly one worker. Each worker visits its rows
-      // in input order, so SUM retains the original per-group operation
-      // sequence. Global IDs are rebuilt in first-encounter order afterward.
-      std::vector<size_t> hashes(input.rows.size());
-      RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
-        const size_t chunk = input.rows.size() / finest_workers;
-        const size_t begin = w * chunk;
-        const size_t end =
-            w + 1 == finest_workers ? input.rows.size() : begin + chunk;
-        for (size_t r = begin; r < end; ++r) {
-          hashes[r] = TypedWorkerGroups::HashRowKey(input.rows[r],
-                                                    plans[0].key_offsets);
-        }
-      }));
-      std::vector<std::vector<size_t>> partition_rows(finest_workers);
-      for (auto& rows : partition_rows) {
-        rows.reserve(input.rows.size() / finest_workers);
-      }
-      for (size_t r = 0; r < hashes.size(); ++r) {
-        partition_rows[hashes[r] % finest_workers].push_back(r);
-      }
-      std::vector<TypedWorkerGroups> partials(finest_workers);
-      for (auto& partial : partials) {
-        partial.Configure(true, plans[0].key_offsets.size(), argument_count);
-        partial.ConfigureSlim(plans[0]);
-        partial.borrowed_key_offsets = &plans[0].key_offsets;
-        partial.mixed_numeric_sums = mixed_numeric_sums;
-      }
-      std::vector<Status> errors(finest_workers, Status::kSuccess);
-      std::vector<size_t> error_rows(finest_workers, SIZE_MAX);
-      std::vector<size_t> local_groups(input.rows.size());
-      RETURN_IF_FAIL(RunParallelTasks(finest_workers, [&](size_t w) {
-        auto& partial = partials[w];
-        std::vector<Value> keys;
-        for (const size_t r : partition_rows[w]) {
-          bool inserted = false;
-          const size_t group = partial.FindOrInsertRow(
-              input.rows[r], plans[0].key_offsets, aggregates[0], &keys,
-              &inserted, hashes[r]);
-          local_groups[r] = group;
-          if (finite_sum) {
-            add_finite_sum(partial, group, arguments[r]);
           } else {
-            for (size_t a = 0; a < argument_count; ++a) {
-              if (!ApplySlimValue(&partial, group, a, plans[0].slim_kinds[a],
-                                  &arguments[(r * argument_count) + a],
-                                  &errors[w])) {
-                error_rows[w] = r;
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              if (!push_sv(col.VarChar(sel_ptr[idx]))) {
+                return;
+              }
+            }
+          }
+        } else {
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              if (!col.IsNull(r) && !push_sv(col.VarChar(r))) {
+                return;
+              }
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              const uint32_t r = sel_ptr[idx];
+              if (!col.IsNull(r) && !push_sv(col.VarChar(r))) {
                 return;
               }
             }
           }
         }
-      }));
-      const auto first_error = std::ranges::min_element(error_rows);
-      if (*first_error != SIZE_MAX) {
-        return errors[static_cast<size_t>(first_error - error_rows.begin())];
       }
-      std::vector<std::vector<size_t>> global_ids(finest_workers);
-      size_t total_groups = 0;
-      for (size_t w = 0; w < finest_workers; ++w) {
-        global_ids[w].resize(partials[w].GroupCount(), SIZE_MAX);
-        total_groups += partials[w].GroupCount();
+      worker_saw_empty[w] = saw_empty ? 1 : 0;
+      worker_scanned[w] = scanned;
+      worker_matching[w] = matching;
+    }));
+    if (budget_exceeded.load(std::memory_order_acquire)) {
+      return std::optional<Relation>{};
+    }
+
+    const auto merge_begin = std::chrono::steady_clock::now();
+    std::array<size_t, kShards> shard_distinct{};
+    std::atomic<size_t> next_shard{0};
+    RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+      std::vector<StrSlice> table;
+      size_t charged_table_cap = 0;
+      while (true) {
+        if (budget_exceeded.load(std::memory_order_relaxed)) {
+          return;
+        }
+        const size_t s = next_shard.fetch_add(1, std::memory_order_relaxed);
+        if (s >= kShards) {
+          return;
+        }
+        size_t total_in_shard = 0;
+        for (size_t src = 0; src < workers_used; ++src) {
+          total_in_shard += worker_shards[src][s].size();
+        }
+        if (total_in_shard == 0) {
+          shard_distinct[s] = 0;
+          continue;
+        }
+        size_t cap = 16;
+        const size_t min_cap = total_in_shard * 2;
+        while (cap < min_cap) {
+          cap *= 2;
+        }
+        if (cap > charged_table_cap) {
+          if (!worker_charges[w].TryAdd((cap - charged_table_cap) *
+                                        sizeof(StrSlice))) {
+            budget_exceeded.store(true, std::memory_order_relaxed);
+            return;
+          }
+          table.resize(cap);
+          charged_table_cap = cap;
+        }
+        std::fill_n(table.begin(), cap, StrSlice{});
+        const size_t mask = cap - 1;
+        size_t unique_count = 0;
+        for (size_t src = 0; src < workers_used; ++src) {
+          for (const StrSlice& item : worker_shards[src][s]) {
+            size_t slot = static_cast<size_t>(MixScalarHash64(item.h32)) & mask;
+            bool dup = false;
+            while (table[slot].ptr != nullptr) {
+              if (table[slot].h32 == item.h32 && table[slot].len == item.len &&
+                  std::memcmp(table[slot].ptr, item.ptr, item.len) == 0) {
+                dup = true;
+                break;
+              }
+              slot = (slot + 1) & mask;
+            }
+            if (!dup) {
+              table[slot] = item;
+              ++unique_count;
+            }
+          }
+          std::vector<StrSlice>().swap(worker_shards[src][s]);
+        }
+        shard_distinct[s] = unique_count;
       }
-      auto& finest = groups[0];
-      finest.ReserveGroups(total_groups);
-      for (size_t r = 0; r < input.rows.size(); ++r) {
-        const size_t worker = hashes[r] % finest_workers;
-        const size_t local = local_groups[r];
-        size_t& global = global_ids[worker][local];
-        if (global == SIZE_MAX) {
-          global = finest.group_count++;
-          finest.borrowed_key_rows.push_back(&input.rows[r]);
-          for (size_t a = 0; a < argument_count; ++a) {
-            finest.SlimCount(global, a) = partials[worker].SlimCount(local, a);
-            finest.SlimIntTotal(global, a) =
-                partials[worker].SlimIntTotal(local, a);
-            finest.SlimDoubleTotal(global, a) =
-                partials[worker].SlimDoubleTotal(local, a);
-            finest.SlimFlags(global, a) = partials[worker].SlimFlags(local, a);
+    }));
+    if (budget_exceeded.load(std::memory_order_acquire)) {
+      return std::optional<Relation>{};
+    }
+
+    int64_t total_distinct = 0;
+    for (size_t s = 0; s < kShards; ++s) {
+      total_distinct += static_cast<int64_t>(shard_distinct[s]);
+    }
+    for (uint8_t seen : worker_saw_empty) {
+      if (seen != 0) {
+        ++total_distinct;
+        break;
+      }
+    }
+    const size_t total_scanned = std::accumulate(
+        worker_scanned.begin(), worker_scanned.end(), size_t{0});
+    const size_t total_matching = std::accumulate(
+        worker_matching.begin(), worker_matching.end(), size_t{0});
+    return std::optional<Relation>(BuildScalarDirectOutput(
+        plan, stmt, qualified_schema, table_schema, {Value(total_distinct)},
+        total_scanned, total_matching, total_matching, publish_lstable_marker,
+        fold_cache_key, scan_begin, merge_begin, runtime));
+  }
+
+  // Numeric (Int64 / Date / Double) 64-shard parallel COUNT(DISTINCT col).
+  const bool is_dbl = (vt == ValueType::kDouble);
+  struct IntCacheSlot {
+    uint64_t h64{0};
+    int64_t key{0};
+  };
+  constexpr size_t kIntCacheSlots = 16384;
+  constexpr size_t kIntCacheMask = kIntCacheSlots - 1;
+  std::vector<std::array<std::vector<int64_t>, kShards>> worker_shards(
+      workers_used);
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    if (budget_exceeded.load(std::memory_order_relaxed)) {
+      return;
+    }
+    QueryMemoryCharge& qcharge = worker_charges[w];
+    if (!qcharge.TryAdd(kIntCacheSlots * sizeof(IntCacheSlot))) {
+      budget_exceeded.store(true, std::memory_order_relaxed);
+      return;
+    }
+    std::vector<IntCacheSlot> cache(kIntCacheSlots);
+    size_t charged_shard_bytes = 0;
+    auto& shards = worker_shards[w];
+
+    CompiledLSTableBlockFilter::Scratch ws;
+    filter.InitScratch(store.column_has_null.size(), &ws);
+    std::vector<uint32_t> sel;
+    const size_t blk_begin = (nblocks * w) / workers_used;
+    const size_t blk_end = (nblocks * (w + 1)) / workers_used;
+    size_t scanned = 0;
+    size_t matching = 0;
+
+    auto sync_charge = [&]() -> bool {
+      size_t cur_cap = 0;
+      for (const auto& s : shards) {
+        cur_cap += s.capacity() * sizeof(int64_t);
+      }
+      if (cur_cap > charged_shard_bytes) {
+        if (!qcharge.TryAdd(cur_cap - charged_shard_bytes)) {
+          budget_exceeded.store(true, std::memory_order_relaxed);
+          return false;
+        }
+        charged_shard_bytes = cur_cap;
+      }
+      return true;
+    };
+
+    auto push_key = [&](int64_t key) -> bool {
+      const uint64_t h64 = MixScalarHash64(static_cast<uint64_t>(key));
+      IntCacheSlot& cs = cache[static_cast<size_t>(h64) & kIntCacheMask];
+      if (cs.h64 == h64 && cs.key == key) {
+        return true;
+      }
+      cs = IntCacheSlot{h64, key};
+      auto& shard_vec = shards[static_cast<size_t>(h64) & kShardMask];
+      const size_t old_cap = shard_vec.capacity();
+      shard_vec.push_back(key);
+      return shard_vec.capacity() == old_cap || sync_charge();
+    };
+
+    for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+      if (budget_exceeded.load(std::memory_order_relaxed)) {
+        return;
+      }
+      const auto& blk = store.blocks[bi];
+      scanned += blk.row_count;
+      bool all_pass = false;
+      const uint32_t m =
+          filter.FilterBlock(blk, agg_bind_cols, &ws, &all_pass, &sel);
+      if (m == 0) {
+        continue;
+      }
+      matching += m;
+      const DirectBlockCol& col = ws.cols[full_col];
+      const uint32_t* sel_ptr = sel.data();
+      if (!col.has_null) {
+        if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            const int64_t k = is_dbl
+                                  ? CanonicalDistinctDoubleBits(col.Double(r))
+                                  : col.Int(r);
+            if (!push_key(k)) {
+              return;
+            }
+          }
+        } else {
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            const uint32_t r = sel_ptr[idx];
+            const int64_t k = is_dbl
+                                  ? CanonicalDistinctDoubleBits(col.Double(r))
+                                  : col.Int(r);
+            if (!push_key(k)) {
+              return;
+            }
           }
         }
-        row_groups[r] = global;
+      } else {
+        if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            if (!col.IsNull(r)) {
+              const int64_t k = is_dbl
+                                    ? CanonicalDistinctDoubleBits(col.Double(r))
+                                    : col.Int(r);
+              if (!push_key(k)) {
+                return;
+              }
+            }
+          }
+        } else {
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            const uint32_t r = sel_ptr[idx];
+            if (!col.IsNull(r)) {
+              const int64_t k = is_dbl
+                                    ? CanonicalDistinctDoubleBits(col.Double(r))
+                                    : col.Int(r);
+              if (!push_key(k)) {
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+    worker_scanned[w] = scanned;
+    worker_matching[w] = matching;
+  }));
+  if (budget_exceeded.load(std::memory_order_acquire)) {
+    return std::optional<Relation>{};
+  }
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  std::array<size_t, kShards> shard_distinct{};
+  std::atomic<size_t> next_shard{0};
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    FlatIntKeyMap<uint8_t> dmap;
+    size_t charged_cap = 0;
+    while (true) {
+      if (budget_exceeded.load(std::memory_order_relaxed)) {
+        return;
+      }
+      const size_t s = next_shard.fetch_add(1, std::memory_order_relaxed);
+      if (s >= kShards) {
+        return;
+      }
+      size_t total_in_shard = 0;
+      for (size_t src = 0; src < workers_used; ++src) {
+        total_in_shard += worker_shards[src][s].size();
+      }
+      if (total_in_shard == 0) {
+        shard_distinct[s] = 0;
+        continue;
+      }
+      const size_t min_cap = (total_in_shard * 10 + 6) / 7;
+      size_t next_cap = 16;
+      while (next_cap < min_cap) {
+        next_cap *= 2;
+      }
+      if (next_cap > charged_cap) {
+        if (!worker_charges[w].TryAdd((next_cap - charged_cap) * 16)) {
+          budget_exceeded.store(true, std::memory_order_relaxed);
+          return;
+        }
+        charged_cap = next_cap;
+      }
+      dmap.Clear();
+      dmap.Reserve(total_in_shard);
+      for (size_t src = 0; src < workers_used; ++src) {
+        for (const int64_t key : worker_shards[src][s]) {
+          bool inserted = false;
+          uint8_t* slot = dmap.TryEmplace(key, &inserted);
+          if (inserted) {
+            *slot = 1;
+          }
+        }
+        std::vector<int64_t>().swap(worker_shards[src][s]);
+      }
+      shard_distinct[s] = dmap.Size();
+    }
+  }));
+  if (budget_exceeded.load(std::memory_order_acquire)) {
+    return std::optional<Relation>{};
+  }
+
+  int64_t total_distinct = 0;
+  for (size_t s = 0; s < kShards; ++s) {
+    total_distinct += static_cast<int64_t>(shard_distinct[s]);
+  }
+  const size_t total_scanned =
+      std::accumulate(worker_scanned.begin(), worker_scanned.end(), size_t{0});
+  const size_t total_matching = std::accumulate(
+      worker_matching.begin(), worker_matching.end(), size_t{0});
+  return std::optional<Relation>(BuildScalarDirectOutput(
+      plan, stmt, qualified_schema, table_schema, {Value(total_distinct)},
+      total_scanned, total_matching, total_matching, publish_lstable_marker,
+      fold_cache_key, scan_begin, merge_begin, runtime));
+}
+
+// O(blocks) metadata fast path for unfiltered scalar MIN/MAX(Int64/Date)
+// and COUNT(*) when every non-empty block carries valid min/max bounds.
+std::optional<std::vector<Value>> TryScalarBlockMetaMinMax(
+    const LSTableStore& store, const CompiledLSTableBlockFilter& filter,
+    const std::vector<DirectAggBinding>& bindings) {
+  if (filter.always_false || !filter.null_preds.empty() ||
+      !filter.int_intervals.empty() || !filter.stage1_preds.empty() ||
+      !filter.disjunctions.empty()) {
+    return std::nullopt;
+  }
+  const size_t naggs = bindings.size();
+  for (const DirectAggBinding& b : bindings) {
+    if (b.is_count_star) {
+      continue;
+    }
+    if (b.int_expr != nullptr || b.double_expr != nullptr ||
+        !b.full_col.has_value() ||
+        (b.kind != SlimAggKind::kMinInt64 && b.kind != SlimAggKind::kMaxInt64 &&
+         b.kind != SlimAggKind::kMinDate && b.kind != SlimAggKind::kMaxDate)) {
+      return std::nullopt;
+    }
+  }
+  for (const LSTablePageBlock& blk : store.blocks) {
+    if (blk.row_count == 0) {
+      continue;
+    }
+    for (const DirectAggBinding& b : bindings) {
+      if (b.is_count_star) {
+        continue;
+      }
+      const std::optional<slot_t> full_col = b.full_col;
+      if (!full_col.has_value() || !blk.columns[*full_col].has_min_max) {
+        return std::nullopt;
+      }
+    }
+  }
+  std::vector<int64_t> counts(naggs, 0);
+  std::vector<int64_t> itot(naggs, 0);
+  for (const LSTablePageBlock& blk : store.blocks) {
+    if (blk.row_count == 0) {
+      continue;
+    }
+    for (size_t a = 0; a < naggs; ++a) {
+      const DirectAggBinding& b = bindings[a];
+      if (b.is_count_star) {
+        counts[a] += static_cast<int64_t>(blk.row_count);
+        continue;
+      }
+      const std::optional<slot_t> full_col = b.full_col;
+      if (!full_col.has_value()) {
+        return std::nullopt;
+      }
+      const LSTableColumnBlock& col = blk.columns[*full_col];
+      const bool is_min =
+          (b.kind == SlimAggKind::kMinInt64 || b.kind == SlimAggKind::kMinDate);
+      const int64_t bv = is_min ? col.min_int : col.max_int;
+      if (counts[a] == 0 || (is_min ? bv < itot[a] : itot[a] < bv)) {
+        itot[a] = bv;
+      }
+      counts[a] += static_cast<int64_t>(blk.row_count);
+    }
+  }
+  std::vector<Value> finished(naggs);
+  for (size_t a = 0; a < naggs; ++a) {
+    Status err = Status::kSuccess;
+    finished[a] = FinishDirectState(bindings[a].kind, counts[a], itot[a], 0.0,
+                                    0, 0, &err);
+    if (!err.ok()) {
+      return std::nullopt;
+    }
+  }
+  return finished;
+}
+
+// O(domain <= 255) fast path for single-column narrow dictionary scalar aggs.
+StatusOr<std::optional<std::vector<Value>>> TryScalarNarrowDictShortcut(
+    const LSTableStore& store, const Schema& table_schema,
+    const CompiledLSTableBlockFilter& filter,
+    const std::vector<DirectAggBinding>& bindings, size_t* matching_rows_out) {
+  if (filter.always_false || !filter.disjunctions.empty()) {
+    return std::optional<std::vector<Value>>{};
+  }
+  std::optional<slot_t> target_col;
+  for (const auto& np : filter.null_preds) {
+    if (target_col && *target_col != np.full_col) {
+      return std::optional<std::vector<Value>>{};
+    }
+    target_col = np.full_col;
+  }
+  for (const auto& iv : filter.int_intervals) {
+    if (target_col && *target_col != iv.full_col) {
+      return std::optional<std::vector<Value>>{};
+    }
+    target_col = iv.full_col;
+  }
+  for (const auto& pred : filter.stage1_preds) {
+    if (!pred.cmp.constant_payload) {
+      return std::optional<std::vector<Value>>{};
+    }
+    if (target_col && *target_col != pred.full_left) {
+      return std::optional<std::vector<Value>>{};
+    }
+    target_col = pred.full_left;
+  }
+  for (const DirectAggBinding& b : bindings) {
+    if (b.is_count_star) {
+      continue;
+    }
+    if (b.int_expr != nullptr || b.double_expr != nullptr ||
+        !b.full_col.has_value()) {
+      return std::optional<std::vector<Value>>{};
+    }
+    if (target_col && *target_col != *b.full_col) {
+      return std::optional<std::vector<Value>>{};
+    }
+    target_col = b.full_col;
+    switch (b.kind) {
+      case SlimAggKind::kCount:
+      case SlimAggKind::kSumInt64:
+      case SlimAggKind::kAvgDouble:
+      case SlimAggKind::kCountDistinctInt64:
+      case SlimAggKind::kMinInt64:
+      case SlimAggKind::kMaxInt64:
+      case SlimAggKind::kMinDate:
+      case SlimAggKind::kMaxDate:
+        break;
+      default:
+        return std::optional<std::vector<Value>>{};
+    }
+  }
+  if (!target_col.has_value() || *target_col >= store.dictionaries.size() ||
+      *target_col >= table_schema.ColumnCount() ||
+      table_schema.GetColumn(*target_col).IsUnsigned()) {
+    return std::optional<std::vector<Value>>{};
+  }
+  const slot_t c = *target_col;
+  const LSTableColumnDictionary& dict = store.dictionaries[c];
+  const ValueType vt = dict.value_type;
+  if (!dict.active) {
+    return std::optional<std::vector<Value>>{};
+  }
+  if (vt != ValueType::kInt64 && vt != ValueType::kDate &&
+      vt != ValueType::kVarChar) {
+    return std::optional<std::vector<Value>>{};
+  }
+  if (vt == ValueType::kVarChar &&
+      (!dict.bytewise_equality || table_schema.GetColumn(c).IsInterval())) {
+    return std::optional<std::vector<Value>>{};
+  }
+  const size_t entry_count = vt == ValueType::kVarChar ? dict.StringEntryCount()
+                                                       : dict.IntEntryCount();
+  if (dict.code_counts.size() != entry_count + 1) {
+    return std::optional<std::vector<Value>>{};
+  }
+
+  const size_t naggs = bindings.size();
+  std::vector<int64_t> counts(naggs, 0);
+  std::vector<int64_t> itot(naggs, 0);
+  std::vector<double> dtot(naggs, 0.0);
+  std::vector<size_t> distinct_cnts(naggs, 0);
+  std::vector<platform::Int128> sum_pos(naggs, 0);
+  std::vector<platform::Int128> sum_neg(naggs, 0);
+  std::vector<platform::Int128> sum_run(naggs, 0);
+  size_t total_matching = 0;
+
+  for (size_t code = 0; code <= entry_count; ++code) {
+    const int64_t cnt = dict.code_counts[code];
+    if (cnt <= 0) {
+      continue;
+    }
+    const bool is_null = (code == entry_count);
+    bool pass = true;
+    for (const auto& np : filter.null_preds) {
+      if (is_null != np.is_null) {
+        pass = false;
+        break;
+      }
+    }
+    if (!pass) {
+      continue;
+    }
+    if (is_null) {
+      if (!filter.int_intervals.empty() || !filter.stage1_preds.empty()) {
+        continue;
+      }
+      total_matching += static_cast<size_t>(cnt);
+      for (size_t a = 0; a < naggs; ++a) {
+        if (bindings[a].is_count_star) {
+          counts[a] += cnt;
+        }
+      }
+      continue;
+    }
+
+    if (vt == ValueType::kVarChar) {
+      const std::string_view sv = dict.StringEntryAt(code);
+      for (const auto& pred : filter.stage1_preds) {
+        if (!MatchTypedStringCompare(sv, pred.cmp)) {
+          pass = false;
+          break;
+        }
+      }
+      if (!pass) {
+        continue;
+      }
+      total_matching += static_cast<size_t>(cnt);
+      for (size_t a = 0; a < naggs; ++a) {
+        if (bindings[a].is_count_star ||
+            bindings[a].kind == SlimAggKind::kCount) {
+          counts[a] += cnt;
+        }
+      }
+      continue;
+    }
+
+    const int64_t iv = dict.IntEntryAt(code);
+    for (const auto& iv_pred : filter.int_intervals) {
+      if (iv < iv_pred.lo || iv > iv_pred.hi) {
+        pass = false;
+        break;
+      }
+    }
+    if (!pass) {
+      continue;
+    }
+    for (const auto& pred : filter.stage1_preds) {
+      if (!CompareDirectScalar(pred.cmp.op, iv, pred.cmp.int_constant)) {
+        pass = false;
+        break;
+      }
+    }
+    if (!pass) {
+      continue;
+    }
+    total_matching += static_cast<size_t>(cnt);
+    for (size_t a = 0; a < naggs; ++a) {
+      const SlimAggKind kind = bindings[a].kind;
+      if (bindings[a].is_count_star || kind == SlimAggKind::kCount) {
+        counts[a] += cnt;
+      } else if (kind == SlimAggKind::kSumInt64) {
+        // Row-ordered evaluation raises "integer overflow in SUM" the moment
+        // a *partial* sum leaves int64, and that outcome depends on scan
+        // order. Every prefix sums a subset of the observed values, so it is
+        // bounded by [sum_neg, sum_pos] regardless of order; this
+        // order-independent shortcut may answer only when both extremes fit.
+        const platform::Int128 prod = static_cast<platform::Int128>(iv) * cnt;
+        sum_run[a] += prod;
+        if (prod < 0) {
+          sum_neg[a] += prod;
+        } else {
+          sum_pos[a] += prod;
+        }
+        counts[a] += cnt;
+      } else if (kind == SlimAggKind::kAvgDouble) {
+        dtot[a] += static_cast<double>(iv) * static_cast<double>(cnt);
+        counts[a] += cnt;
+      } else if (kind == SlimAggKind::kCountDistinctInt64) {
+        ++distinct_cnts[a];
+      } else if (kind == SlimAggKind::kMinInt64 ||
+                 kind == SlimAggKind::kMinDate) {
+        if (counts[a] == 0 || iv < itot[a]) {
+          itot[a] = iv;
+        }
+        counts[a] += cnt;
+      } else if (kind == SlimAggKind::kMaxInt64 ||
+                 kind == SlimAggKind::kMaxDate) {
+        if (counts[a] == 0 || itot[a] < iv) {
+          itot[a] = iv;
+        }
+        counts[a] += cnt;
+      }
+    }
+  }
+
+  for (size_t a = 0; a < naggs; ++a) {
+    if (bindings[a].kind != SlimAggKind::kSumInt64) {
+      continue;
+    }
+    if (sum_pos[a] > std::numeric_limits<int64_t>::max() ||
+        sum_neg[a] < std::numeric_limits<int64_t>::min()) {
+      // A row-order partial sum could escape int64 somewhere; whether the
+      // ordered evaluation errors depends on the unseen scan order, so defer
+      // to it instead of diverging from ground truth.
+      return std::optional<std::vector<Value>>{};
+    }
+    itot[a] = static_cast<int64_t>(sum_run[a]);
+  }
+  std::vector<Value> finished(naggs);
+  for (size_t a = 0; a < naggs; ++a) {
+    Status err = Status::kSuccess;
+    finished[a] = FinishDirectState(bindings[a].kind, counts[a], itot[a],
+                                    dtot[a], 0, distinct_cnts[a], &err);
+    if (!err.ok()) {
+      return err;
+    }
+  }
+  *matching_rows_out = total_matching;
+  return std::optional<std::vector<Value>>(std::move(finished));
+}
+
+// Fuses multiple `SUM(col + K)` / `SUM(col - K)` / `SUM(col)` scalar aggs
+// over identical base integer columns when overflow is provably impossible.
+StatusOr<std::optional<Relation>> TryRunFusedLinearIntSums(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const CompiledLSTableBlockFilter& filter,
+    const std::vector<DirectAggBinding>& bindings,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, size_t worker_count, ExecutionRuntime* runtime,
+    bool publish_lstable_marker, const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin) {
+  if (bindings.size() < 2 || filter.always_false || store.total_rows == 0) {
+    return std::optional<Relation>{};
+  }
+  struct Term {
+    size_t agg_idx{0};
+    slot_t full_col{0};
+    int64_t delta{0};
+  };
+  struct ColGroup {
+    slot_t full_col{0};
+    int64_t min_delta{0};
+    int64_t max_delta{0};
+  };
+  std::vector<Term> terms;
+  terms.reserve(bindings.size());
+  std::vector<ColGroup> groups;
+  std::vector<int> col_to_group(store.column_has_null.size(), -1);
+  std::vector<uint8_t> agg_bind_cols(store.column_has_null.size(), 0);
+
+  for (size_t a = 0; a < bindings.size(); ++a) {
+    const DirectAggBinding& b = bindings[a];
+    if (b.kind != SlimAggKind::kSumInt64 || b.double_expr != nullptr) {
+      return std::optional<Relation>{};
+    }
+    slot_t full_col = 0;
+    int64_t delta = 0;
+    if (b.full_col.has_value() && b.int_expr == nullptr) {
+      full_col = *b.full_col;
+      delta = 0;
+    } else if (b.int_expr != nullptr && b.int_expr->ops.size() == 3) {
+      const auto& ops = b.int_expr->ops;
+      slot_t proj_c = 0;
+      if (ops[0].kind == TypedIntExprOp::Kind::kLoadIntCol &&
+          ops[1].kind == TypedIntExprOp::Kind::kConstant &&
+          ops[2].kind == TypedIntExprOp::Kind::kAdd) {
+        proj_c = ops[0].column;
+        delta = ops[1].constant;
+      } else if (ops[0].kind == TypedIntExprOp::Kind::kConstant &&
+                 ops[1].kind == TypedIntExprOp::Kind::kLoadIntCol &&
+                 ops[2].kind == TypedIntExprOp::Kind::kAdd) {
+        proj_c = ops[1].column;
+        delta = ops[0].constant;
+      } else if (ops[0].kind == TypedIntExprOp::Kind::kLoadIntCol &&
+                 ops[1].kind == TypedIntExprOp::Kind::kConstant &&
+                 ops[2].kind == TypedIntExprOp::Kind::kSub &&
+                 ops[1].constant != std::numeric_limits<int64_t>::min()) {
+        proj_c = ops[0].column;
+        delta = -ops[1].constant;
+      } else {
+        return std::optional<Relation>{};
+      }
+      if (proj_c >= proj_types.size() ||
+          proj_types[proj_c] != ValueType::kInt64 ||
+          proj_unsigned[proj_c] != 0) {
+        return std::optional<Relation>{};
+      }
+      full_col = proj_to_full[proj_c];
+      if (full_col >= store.column_has_null.size()) {
+        return std::optional<Relation>{};
       }
     } else {
-      std::vector<Value> fine_keys;
-      for (size_t r = 0; r < input.rows.size(); ++r) {
-        bool inserted = false;
-        const size_t group =
-            groups[0].FindOrInsertRow(input.rows[r], plans[0].key_offsets,
-                                      aggregates[0], &fine_keys, &inserted);
-        row_groups[r] = group;
-        if (finite_sum) {
-          add_finite_sum(groups[0], group, arguments[r]);
+      return std::optional<Relation>{};
+    }
+    agg_bind_cols[full_col] = 1;
+    if (col_to_group[full_col] < 0) {
+      col_to_group[full_col] = static_cast<int>(groups.size());
+      groups.push_back(ColGroup{
+          .full_col = full_col, .min_delta = delta, .max_delta = delta});
+    } else {
+      ColGroup& g = groups[static_cast<size_t>(col_to_group[full_col])];
+      g.min_delta = std::min(g.min_delta, delta);
+      g.max_delta = std::max(g.max_delta, delta);
+    }
+    terms.push_back(Term{.agg_idx = a, .full_col = full_col, .delta = delta});
+  }
+  if (groups.size() >= bindings.size()) {
+    return std::optional<Relation>{};
+  }
+
+  for (const ColGroup& g : groups) {
+    int64_t g_min = std::numeric_limits<int64_t>::max();
+    int64_t g_max = std::numeric_limits<int64_t>::min();
+    bool saw_block = false;
+    for (const LSTablePageBlock& blk : store.blocks) {
+      if (blk.row_count == 0) {
+        continue;
+      }
+      const LSTableColumnBlock& col = blk.columns[g.full_col];
+      if (!col.has_min_max) {
+        return std::optional<Relation>{};
+      }
+      saw_block = true;
+      g_min = std::min(g_min, col.min_int);
+      g_max = std::max(g_max, col.max_int);
+    }
+    if (!saw_block) {
+      return std::optional<Relation>{};
+    }
+    const platform::Int128 lo =
+        static_cast<platform::Int128>(g_min) + g.min_delta;
+    const platform::Int128 hi =
+        static_cast<platform::Int128>(g_max) + g.max_delta;
+    constexpr platform::Int128 kI64Min = std::numeric_limits<int64_t>::min();
+    constexpr platform::Int128 kI64Max = std::numeric_limits<int64_t>::max();
+    if (lo < kI64Min || hi > kI64Max) {
+      return std::optional<Relation>{};
+    }
+    auto abs128 = [](platform::Int128 v) { return v < 0 ? -v : v; };
+    const platform::Int128 max_abs =
+        std::max({abs128(g_min), abs128(g_max), abs128(lo), abs128(hi),
+                  abs128(static_cast<platform::Int128>(g_min) + g.max_delta),
+                  abs128(static_cast<platform::Int128>(g_max) + g.min_delta)});
+    if (max_abs > kI64Max / static_cast<platform::Int128>(store.total_rows)) {
+      return std::optional<Relation>{};
+    }
+  }
+
+  const size_t nblocks = store.blocks.size();
+  const size_t ngroups = groups.size();
+  const size_t workers_used =
+      std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
+  struct alignas(64) GroupWorkerState {
+    std::vector<int64_t> sums;
+    std::vector<int64_t> counts;
+    size_t scanned_rows{0};
+    size_t matching_rows{0};
+  };
+  std::vector<GroupWorkerState> states(workers_used);
+  for (auto& st : states) {
+    st.sums.assign(ngroups, 0);
+    st.counts.assign(ngroups, 0);
+  }
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    GroupWorkerState& st = states[w];
+    CompiledLSTableBlockFilter::Scratch ws;
+    filter.InitScratch(store.column_has_null.size(), &ws);
+    std::vector<uint32_t> sel;
+    const size_t blk_begin = (nblocks * w) / workers_used;
+    const size_t blk_end = (nblocks * (w + 1)) / workers_used;
+    for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+      const auto& blk = store.blocks[bi];
+      st.scanned_rows += blk.row_count;
+      bool all_pass = false;
+      const uint32_t m =
+          filter.FilterBlock(blk, agg_bind_cols, &ws, &all_pass, &sel);
+      if (m == 0) {
+        continue;
+      }
+      st.matching_rows += m;
+      const uint32_t* sel_ptr = sel.data();
+      for (size_t gi = 0; gi < ngroups; ++gi) {
+        const DirectBlockCol& col = ws.cols[groups[gi].full_col];
+        int64_t tot = 0;
+        int64_t cnt = 0;
+        if (!col.has_null) {
+          if (all_pass) {
+            const int64_t* __restrict cells = col.cells;
+            for (uint32_t r = 0; r < m; ++r) {
+              tot += cells[r];
+            }
+            cnt = static_cast<int64_t>(m);
+          } else {
+            const int64_t* __restrict cells = col.cells;
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              tot += cells[sel_ptr[idx]];
+            }
+            cnt = static_cast<int64_t>(m);
+          }
+        } else if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            if (!col.IsNull(r)) {
+              tot += col.Int(r);
+              ++cnt;
+            }
+          }
         } else {
-          for (size_t a = 0; a < argument_count; ++a) {
-            Status error{Status::kSuccess};
-            if (!ApplySlimValue(groups.data(), group, a, plans[0].slim_kinds[a],
-                                &arguments[(r * argument_count) + a], &error)) {
-              return error;
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            const uint32_t r = sel_ptr[idx];
+            if (!col.IsNull(r)) {
+              tot += col.Int(r);
+              ++cnt;
             }
           }
         }
+        st.sums[gi] += tot;
+        st.counts[gi] += cnt;
       }
     }
-    if (no_nulls) {
-      // SUM only observes whether its count is zero. Every group was formed
-      // from at least one non-NULL argument, so a presence count is sufficient.
-      std::ranges::fill(groups[0].slim_counts, int64_t{1});
+  }));
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  std::vector<int64_t> group_sums(ngroups, 0);
+  std::vector<int64_t> group_cnts(ngroups, 0);
+  size_t total_scanned = 0;
+  size_t total_matching = 0;
+  for (const auto& st : states) {
+    total_scanned += st.scanned_rows;
+    total_matching += st.matching_rows;
+    for (size_t gi = 0; gi < ngroups; ++gi) {
+      group_sums[gi] += st.sums[gi];
+      group_cnts[gi] += st.counts[gi];
     }
-    phase("inserted");
-    // A coarser grouping set can project any already-built finer set.
-    // ROLLUP therefore hashes each distinct parent tuple only once instead
-    // of copying the same prefix from every finest-level group at every
-    // level. The ID maps compose back to finest IDs, preserving first-seen
-    // group order and the original row order of every accumulation.
-    std::vector<std::vector<size_t>> coarse_maps(count);
-    bool parallel_from_finest =
-        borrow_keys && groups[0].GroupCount() >= 65536 && count >= 3;
-    for (size_t s = 1; parallel_from_finest && s < count; ++s) {
-      parallel_from_finest =
-          std::ranges::all_of(plans[s].key_offsets, [&](slot_t key) {
-            return std::ranges::find(plans[0].key_offsets, key) !=
-                   plans[0].key_offsets.end();
-          });
+  }
+  std::vector<Value> finished_values(bindings.size());
+  for (const Term& term : terms) {
+    const auto gi = static_cast<size_t>(col_to_group[term.full_col]);
+    const int64_t cnt = group_cnts[gi];
+    if (cnt == 0) {
+      finished_values[term.agg_idx] = Value();
+    } else {
+      const platform::Int128 adjusted =
+          static_cast<platform::Int128>(group_sums[gi]) +
+          (static_cast<platform::Int128>(term.delta) * cnt);
+      finished_values[term.agg_idx] = Value(static_cast<int64_t>(adjusted));
     }
-    if (parallel_from_finest) {
-      // Every coarser set is a projection of the finest groups. Building
-      // those tables independently lets the cores overlap; a serial chain
-      // of shrinking parents leaves the same first-seen order when each
-      // table is filled by scanning finest groups from low to high.
-      const size_t workers = std::min(set_workers, count - 1);
-      std::vector<Status> build_errors(count, Status::kSuccess);
-      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
-        for (size_t s = worker + 1; s < count; s += workers) {
-          try {
-            std::vector<size_t> parent_groups;
-            parent_groups.reserve(groups[0].GroupCount());
-            std::vector<Value> coarse_keys;
-            for (size_t group = 0; group < groups[0].GroupCount(); ++group) {
-              bool inserted = false;
-              parent_groups.push_back(groups[s].FindOrInsertRow(
-                  *groups[0].borrowed_key_rows[group], plans[s].key_offsets,
-                  aggregates[s], &coarse_keys, &inserted));
-            }
-            coarse_maps[s] = std::move(parent_groups);
-          } catch (const std::exception& error) {
-            build_errors[s] =
-                StatusError(StatusCode::kRuntimeError, error.what());
-          } catch (...) {
-            build_errors[s] = StatusError(StatusCode::kRuntimeError,
-                                          "parallel grouping set failed");
-          }
-        }
-      }));
-      for (const Status& error : build_errors) {
-        RETURN_IF_FAIL(error);
+  }
+  return std::optional<Relation>(BuildScalarDirectOutput(
+      plan, stmt, qualified_schema, table_schema, finished_values,
+      total_scanned, total_matching, total_matching * bindings.size(),
+      publish_lstable_marker, fold_cache_key, scan_begin, merge_begin,
+      runtime));
+}
+
+StatusOr<std::optional<Relation>> TryRunDirectLSTableScalarFast(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const Expression& having_expr,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, bool direct_children,
+    const RuntimeFilterGroup* stream_runtime_filter,
+    const PrebuiltMembershipPredicate* stream_prebuilt_membership,
+    size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin) {
+  ASSIGN_OR_RETURN(
+      std::optional<Relation>, count_distinct_result,
+      TryRunParallelScalarCountDistinct(
+          store, plan, stmt, having_expr, proj_to_full, proj_types,
+          proj_unsigned, qualified_schema, table_schema, direct_children,
+          stream_runtime_filter, stream_prebuilt_membership, worker_count,
+          runtime, publish_lstable_marker, fold_cache_key, scan_begin));
+  if (count_distinct_result) {
+    return count_distinct_result;
+  }
+  if (!direct_children || stream_runtime_filter != nullptr ||
+      stream_prebuilt_membership != nullptr ||
+      (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
+      !(stmt.GroupBy().empty() || stmt.IsGroupAll()) ||
+      !plan.key_offsets.empty() || having_expr != nullptr || stmt.HasLimit() ||
+      stmt.Distinct() || stmt.WithTies() || !plan.order_items.empty() ||
+      !plan.dependent_key_programs.empty() || !plan.inlist_compares.empty() ||
+      !plan.slim || plan.aggregates.empty() || plan.aggregates.size() > 128) {
+    return std::optional<Relation>{};
+  }
+  for (const TypedEmitItem& item : plan.emit_items) {
+    if (item.post_agg != nullptr || item.dependent_key || item.is_key) {
+      return std::optional<Relation>{};
+    }
+  }
+  CompiledLSTableBlockFilter filter;
+  if (!filter.Init(plan, proj_to_full, proj_types, proj_unsigned, store)) {
+    return std::optional<Relation>{};
+  }
+  std::vector<DirectAggBinding> bindings;
+  std::vector<uint8_t> agg_bind_cols;
+  if (!CollectDirectAggBindings(plan, store, proj_to_full, proj_types,
+                                proj_unsigned, &bindings, &agg_bind_cols)) {
+    return std::optional<Relation>{};
+  }
+
+  if (auto meta_finished = TryScalarBlockMetaMinMax(store, filter, bindings)) {
+    const auto merge_begin = std::chrono::steady_clock::now();
+    return std::optional<Relation>(BuildScalarDirectOutput(
+        plan, stmt, qualified_schema, table_schema, *meta_finished,
+        store.total_rows, store.total_rows, store.total_rows,
+        publish_lstable_marker, fold_cache_key, scan_begin, merge_begin,
+        runtime));
+  }
+  size_t dict_matching = 0;
+  ASSIGN_OR_RETURN(std::optional<std::vector<Value>>, dict_finished,
+                   TryScalarNarrowDictShortcut(store, table_schema, filter,
+                                               bindings, &dict_matching));
+  if (dict_finished) {
+    const auto merge_begin = std::chrono::steady_clock::now();
+    return std::optional<Relation>(BuildScalarDirectOutput(
+        plan, stmt, qualified_schema, table_schema, *dict_finished,
+        store.total_rows, dict_matching, dict_matching, publish_lstable_marker,
+        fold_cache_key, scan_begin, merge_begin, runtime));
+  }
+  ASSIGN_OR_RETURN(
+      std::optional<Relation>, linear_sum_result,
+      TryRunFusedLinearIntSums(
+          store, plan, stmt, filter, bindings, proj_to_full, proj_types,
+          proj_unsigned, qualified_schema, table_schema, worker_count, runtime,
+          publish_lstable_marker, fold_cache_key, scan_begin));
+  if (linear_sum_result) {
+    return linear_sum_result;
+  }
+
+  // Resident numeric columns are contiguous across physical pages. Batch
+  // them without repeating predicate setup for every small row-page slice.
+  // Nullable/encoded/string columns retain the ordinary block path.
+  constexpr size_t kFlatBatchRows = 16384;
+  std::vector<uint8_t> flat_needed = filter.referenced_full_cols;
+  for (size_t c = 0; c < agg_bind_cols.size(); ++c)
+    flat_needed[c] |= agg_bind_cols[c];
+  bool coalesce = store.total_rows >= 4096 && !store.blocks.empty();
+  for (size_t c = 0; coalesce && c < flat_needed.size(); ++c) {
+    if (!flat_needed[c]) continue;
+    coalesce = c < store.integer_columns.size() &&
+               store.integer_columns[c].size() == store.total_rows &&
+               !store.column_has_null[c] &&
+               (store.blocks.front().columns[c].type == ValueType::kInt64 ||
+                store.blocks.front().columns[c].type == ValueType::kDate ||
+                store.blocks.front().columns[c].type == ValueType::kDouble);
+    // Preserve page-level range pruning for ordered predicate columns.
+    if (filter.referenced_full_cols[c] &&
+        c < store.column_is_monotonic.size() && store.column_is_monotonic[c])
+      coalesce = false;
+  }
+  std::shared_ptr<QueryMemoryCharge> flat_scratch_charge;
+  if (coalesce) {
+    flat_scratch_charge = TryReserveQueryMemory(
+        worker_count * (kFlatBatchRows * sizeof(uint32_t) +
+                        flat_needed.size() * sizeof(LSTableColumnBlock)));
+    coalesce = flat_scratch_charge != nullptr;
+  }
+  const size_t nblocks =
+      coalesce ? (store.total_rows + kFlatBatchRows - 1) / kFlatBatchRows
+               : store.blocks.size();
+  const size_t naggs = bindings.size();
+  const size_t workers_used =
+      std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
+  struct alignas(64) ScalarWorkerState {
+    std::vector<int64_t> counts;
+    std::vector<int64_t> int_totals;
+    std::vector<double> double_totals;
+    std::vector<uint8_t> flags;
+    std::vector<std::unique_ptr<FlatIntKeyMap<uint8_t>>> distinct_maps;
+    size_t scanned_rows{0};
+    size_t matching_rows{0};
+    size_t updates{0};
+    Status err{Status::kSuccess};
+  };
+  std::vector<ScalarWorkerState> states(workers_used);
+  for (auto& st : states) {
+    st.counts.assign(naggs, 0);
+    st.int_totals.assign(naggs, 0);
+    st.double_totals.assign(naggs, 0.0);
+    st.flags.assign(naggs, 0);
+    st.distinct_maps.resize(naggs);
+  }
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    ScalarWorkerState& st = states[w];
+    CompiledLSTableBlockFilter::Scratch ws;
+    filter.InitScratch(store.column_has_null.size(), &ws);
+    std::vector<uint32_t> sel;
+    const size_t blk_begin = (nblocks * w) / workers_used;
+    const size_t blk_end = (nblocks * (w + 1)) / workers_used;
+
+    LSTablePageBlock flat_block;
+    if (coalesce) {
+      flat_block.columns.resize(flat_needed.size());
+      for (size_t c = 0; c < flat_needed.size(); ++c)
+        if (flat_needed[c])
+          flat_block.columns[c].type = store.blocks.front().columns[c].type;
+    }
+    for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+      if (coalesce) {
+        const size_t begin = bi * kFlatBatchRows;
+        flat_block.row_count = static_cast<uint32_t>(
+            std::min<uint64_t>(kFlatBatchRows, store.total_rows - begin));
+        for (size_t c = 0; c < flat_needed.size(); ++c)
+          if (flat_needed[c])
+            flat_block.columns[c].int_cells =
+                std::span<const int64_t>(store.integer_columns[c])
+                    .subspan(begin, flat_block.row_count);
       }
-    } else
-      for (size_t s = 1; s < count; ++s) {
-        size_t parent = 0;
-        for (size_t candidate = 1; candidate < s; ++candidate) {
-          if (groups[candidate].GroupCount() < groups[parent].GroupCount() &&
-              std::ranges::all_of(plans[s].key_offsets, [&](slot_t key) {
-                return std::ranges::find(plans[candidate].key_offsets, key) !=
-                       plans[candidate].key_offsets.end();
-              })) {
-            parent = candidate;
-          }
-        }
-        std::vector<size_t> parent_keys;
-        for (const slot_t key : plans[s].key_offsets) {
-          const auto found = std::ranges::find(plans[parent].key_offsets, key);
-          parent_keys.push_back(static_cast<size_t>(
-              std::distance(plans[parent].key_offsets.begin(), found)));
-        }
-        std::vector<size_t> parent_groups;
-        parent_groups.reserve(groups[parent].GroupCount());
-        std::vector<Value> coarse_keys;
-        coarse_keys.reserve(parent_keys.size());
-        for (size_t group = 0; group < groups[parent].GroupCount(); ++group) {
-          if (borrow_keys) {
-            bool inserted = false;
-            parent_groups.push_back(groups[s].FindOrInsertRow(
-                *groups[parent].borrowed_key_rows[group], plans[s].key_offsets,
-                aggregates[s], &coarse_keys, &inserted));
-            continue;
-          }
-          coarse_keys.clear();
-          for (const size_t key : parent_keys) {
-            coarse_keys.push_back(groups[parent].GroupKey(group, key));
-          }
-          bool inserted = false;
-          parent_groups.push_back(groups[s].FindOrInsert(
-              coarse_keys,
-              groups[s].int_key && !coarse_keys[0].IsNull()
-                  ? coarse_keys[0].value.int_value
-                  : 0,
-              argument_count, aggregates[s], &inserted));
-        }
-        if (parent == 0) {
-          coarse_maps[s] = std::move(parent_groups);
-        } else {
-          coarse_maps[s].reserve(groups[0].GroupCount());
-          for (const size_t parent_group : coarse_maps[parent]) {
-            coarse_maps[s].push_back(parent_groups[parent_group]);
-          }
-        }
+      const auto& blk = coalesce ? flat_block : store.blocks[bi];
+      st.scanned_rows += blk.row_count;
+      bool all_pass = false;
+      const uint32_t m =
+          filter.FilterBlock(blk, agg_bind_cols, &ws, &all_pass, &sel);
+      if (m == 0) {
+        continue;
       }
-    phase("finest");
-    std::vector<Status> errors(count, Status::kSuccess);
-    const auto fold_sets = [&](size_t worker) {
-      for (size_t s = worker + 1; s < count; s += set_workers) {
-        try {
-          const auto& coarse_groups = coarse_maps[s];
-          if (exact_partial_merge) {
-            auto& local = groups[s];
-            auto& finest = groups[0];
-            for (size_t fine = 0; fine < finest.GroupCount(); ++fine) {
-              const size_t coarse = coarse_groups[fine];
-              for (size_t a = 0; a < argument_count; ++a) {
-                local.SlimCount(coarse, a) += finest.SlimCount(fine, a);
-                local.SlimIntTotal(coarse, a) += finest.SlimIntTotal(fine, a);
-                local.SlimDoubleTotal(coarse, a) +=
-                    finest.SlimDoubleTotal(fine, a);
+      st.matching_rows += m;
+      const uint32_t* sel_ptr = sel.data();
+
+      for (size_t a = 0; a < naggs; ++a) {
+        const DirectAggBinding& b = bindings[a];
+        if (b.is_count_star) {
+          st.counts[a] += static_cast<int64_t>(m);
+          ++st.updates;
+          continue;
+        }
+        if (b.full_col.has_value()) {
+          const DirectBlockCol& col = ws.cols[*b.full_col];
+          if (b.kind == SlimAggKind::kCount) {
+            if (!col.has_null) {
+              st.counts[a] += static_cast<int64_t>(m);
+            } else {
+              int64_t cnt = 0;
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  cnt += static_cast<int64_t>(!col.IsNull(r));
+                }
+              } else {
+                for (uint32_t idx = 0; idx < m; ++idx) {
+                  cnt += static_cast<int64_t>(!col.IsNull(sel_ptr[idx]));
+                }
               }
+              st.counts[a] += cnt;
             }
+            st.updates += m;
             continue;
           }
-          if (finite_sum) {
-            auto& local = groups[s];
-            if (no_nulls) {
-              std::ranges::fill(local.slim_counts, int64_t{1});
-            }
-            if (all_double) {
-              std::ranges::fill(local.slim_flags, uint8_t{2});
-              for (size_t r = 0; r < row_groups.size(); ++r) {
-                local.slim_double_totals[coarse_groups[row_groups[r]]] +=
-                    arguments[r].value.double_value;
+          if (b.kind == SlimAggKind::kSumDouble ||
+              b.kind == SlimAggKind::kAvgDouble) {
+            double sum = 0.0;
+            int64_t cnt = 0;
+            uint8_t saw_inf = 0;
+            if (b.col_type == ValueType::kDouble) {
+              if (!col.has_null) {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    const double v = col.Double(r);
+                    sum += v;
+                    saw_inf |= static_cast<uint8_t>(std::isinf(v));
+                  }
+                } else {
+                  for (uint32_t idx = 0; idx < m; ++idx) {
+                    const double v = col.Double(sel_ptr[idx]);
+                    sum += v;
+                    saw_inf |= static_cast<uint8_t>(std::isinf(v));
+                  }
+                }
+                cnt = static_cast<int64_t>(m);
+              } else {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    if (!col.IsNull(r)) {
+                      const double v = col.Double(r);
+                      sum += v;
+                      saw_inf |= static_cast<uint8_t>(std::isinf(v));
+                      ++cnt;
+                    }
+                  }
+                } else {
+                  for (uint32_t idx = 0; idx < m; ++idx) {
+                    const uint32_t r = sel_ptr[idx];
+                    if (!col.IsNull(r)) {
+                      const double v = col.Double(r);
+                      sum += v;
+                      saw_inf |= static_cast<uint8_t>(std::isinf(v));
+                      ++cnt;
+                    }
+                  }
+                }
               }
             } else {
-              for (size_t r = 0; r < row_groups.size(); ++r) {
-                add_finite_sum(local, coarse_groups[row_groups[r]],
-                               arguments[r]);
+              if (!col.has_null) {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    sum += static_cast<double>(col.Int(r));
+                  }
+                } else {
+                  for (uint32_t idx = 0; idx < m; ++idx) {
+                    sum += static_cast<double>(col.Int(sel_ptr[idx]));
+                  }
+                }
+                cnt = static_cast<int64_t>(m);
+              } else {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    if (!col.IsNull(r)) {
+                      sum += static_cast<double>(col.Int(r));
+                      ++cnt;
+                    }
+                  }
+                } else {
+                  for (uint32_t idx = 0; idx < m; ++idx) {
+                    const uint32_t r = sel_ptr[idx];
+                    if (!col.IsNull(r)) {
+                      sum += static_cast<double>(col.Int(r));
+                      ++cnt;
+                    }
+                  }
+                }
               }
             }
+            st.double_totals[a] += sum;
+            st.counts[a] += cnt;
+            if (b.kind == SlimAggKind::kSumDouble) {
+              st.flags[a] |= saw_inf;
+            }
+            st.updates += static_cast<size_t>(cnt);
             continue;
           }
+          if (b.kind == SlimAggKind::kSumInt64) {
+            int64_t tot = st.int_totals[a];
+            int64_t cnt = 0;
+            const auto add_int = [&](int64_t v) -> bool {
+              int64_t next = 0;
+              if (__builtin_add_overflow(tot, v, &next)) {
+                st.err = StatusError(StatusCode::kIsInfinity,
+                                     "integer overflow in SUM");
+                return false;
+              }
+              tot = next;
+              ++cnt;
+              return true;
+            };
+            if (!col.has_null) {
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  if (!add_int(col.Int(r))) {
+                    return;
+                  }
+                }
+              } else {
+                for (uint32_t idx = 0; idx < m; ++idx) {
+                  if (!add_int(col.Int(sel_ptr[idx]))) {
+                    return;
+                  }
+                }
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                if (!col.IsNull(r) && !add_int(col.Int(r))) {
+                  return;
+                }
+              }
+            } else {
+              for (uint32_t idx = 0; idx < m; ++idx) {
+                const uint32_t r = sel_ptr[idx];
+                if (!col.IsNull(r) && !add_int(col.Int(r))) {
+                  return;
+                }
+              }
+            }
+            st.int_totals[a] = tot;
+            st.counts[a] += cnt;
+            st.updates += static_cast<size_t>(cnt);
+            continue;
+          }
+          if (b.kind == SlimAggKind::kCountDistinctInt64 ||
+              b.kind == SlimAggKind::kCountDistinctDouble) {
+            if (!st.distinct_maps[a]) {
+              st.distinct_maps[a] = std::make_unique<FlatIntKeyMap<uint8_t>>();
+              st.distinct_maps[a]->Reserve(std::min<size_t>(
+                  16384, std::max<size_t>(256, store.total_rows / 64)));
+            }
+            auto& dmap = *st.distinct_maps[a];
+            int64_t cnt = 0;
+            const bool is_dbl = (b.kind == SlimAggKind::kCountDistinctDouble);
+            const auto ins = [&](uint32_t r) {
+              const int64_t raw =
+                  is_dbl ? CanonicalDistinctDoubleBits(col.Double(r))
+                         : col.Int(r);
+              bool inserted = false;
+              uint8_t* slot = dmap.TryEmplace(raw, &inserted);
+              if (inserted) {
+                *slot = 1;
+              }
+              ++cnt;
+            };
+            if (!col.has_null) {
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  ins(r);
+                }
+              } else {
+                for (uint32_t idx = 0; idx < m; ++idx) {
+                  ins(sel_ptr[idx]);
+                }
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                if (!col.IsNull(r)) {
+                  ins(r);
+                }
+              }
+            } else {
+              for (uint32_t idx = 0; idx < m; ++idx) {
+                const uint32_t r = sel_ptr[idx];
+                if (!col.IsNull(r)) {
+                  ins(r);
+                }
+              }
+            }
+            st.updates += static_cast<size_t>(cnt);
+            continue;
+          }
+          if (b.kind == SlimAggKind::kMinInt64 ||
+              b.kind == SlimAggKind::kMaxInt64 ||
+              b.kind == SlimAggKind::kMinDate ||
+              b.kind == SlimAggKind::kMaxDate) {
+            const bool is_min = (b.kind == SlimAggKind::kMinInt64 ||
+                                 b.kind == SlimAggKind::kMinDate);
+            int64_t best = st.int_totals[a];
+            int64_t cnt = st.counts[a];
+            int64_t added = 0;
+            const auto upd = [&](int64_t v) {
+              if (cnt == 0 || (is_min ? v < best : best < v)) {
+                best = v;
+              }
+              ++cnt;
+              ++added;
+            };
+            if (!col.has_null) {
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  upd(col.Int(r));
+                }
+              } else {
+                for (uint32_t idx = 0; idx < m; ++idx) {
+                  upd(col.Int(sel_ptr[idx]));
+                }
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                if (!col.IsNull(r)) {
+                  upd(col.Int(r));
+                }
+              }
+            } else {
+              for (uint32_t idx = 0; idx < m; ++idx) {
+                const uint32_t r = sel_ptr[idx];
+                if (!col.IsNull(r)) {
+                  upd(col.Int(r));
+                }
+              }
+            }
+            st.int_totals[a] = best;
+            st.counts[a] = cnt;
+            st.updates += static_cast<size_t>(added);
+            continue;
+          }
+          // kMinDouble / kMaxDouble
+          const bool is_min = (b.kind == SlimAggKind::kMinDouble);
+          double best = st.double_totals[a];
+          int64_t cnt = st.counts[a];
+          uint8_t flags = st.flags[a];
+          int64_t added = 0;
+          const auto upd = [&](double v) {
+            if (std::isnan(v)) {
+              flags |= 1;
+            } else if (cnt == 0 || (is_min ? v < best : best < v)) {
+              best = v;
+            }
+            ++cnt;
+            ++added;
+          };
+          if (!col.has_null) {
+            if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                upd(col.Double(r));
+              }
+            } else {
+              for (uint32_t idx = 0; idx < m; ++idx) {
+                upd(col.Double(sel_ptr[idx]));
+              }
+            }
+          } else if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              if (!col.IsNull(r)) {
+                upd(col.Double(r));
+              }
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              const uint32_t r = sel_ptr[idx];
+              if (!col.IsNull(r)) {
+                upd(col.Double(r));
+              }
+            }
+          }
+          st.double_totals[a] = best;
+          st.counts[a] = cnt;
+          st.flags[a] = flags;
+          st.updates += static_cast<size_t>(added);
+          continue;
+        }
 
-          for (size_t r = 0; r < row_groups.size() && errors[s].ok(); ++r) {
-            const size_t group = coarse_groups[row_groups[r]];
-            for (size_t a = 0; a < argument_count; ++a) {
-              if (!ApplySlimValue(&groups[s], group, a, plans[s].slim_kinds[a],
-                                  &arguments[(r * argument_count) + a],
-                                  &errors[s])) {
+        if (b.double_expr != nullptr) {
+          const TypedDoubleExprInput& de = *b.double_expr;
+          double sum_or_best = st.double_totals[a];
+          int64_t cnt = st.counts[a];
+          uint8_t flags = st.flags[a];
+          int64_t added = 0;
+          // Recognized non-null arithmetic needs no per-row shape or NULL
+          // dispatch. Preserve operation order and SUM's infinity tracking.
+          if (b.kind == SlimAggKind::kSumDouble ||
+              b.kind == SlimAggKind::kAvgDouble) {
+            const auto fold = [&](auto evaluate) {
+              const auto run = [&]<bool selected, bool track_infinity>() {
+                bool infinite = false;
+                for (uint32_t i = 0; i < m; ++i) {
+                  const uint32_t row = selected ? sel_ptr[i] : i;
+                  const double value = evaluate(row);
+                  sum_or_best += value;
+                  if constexpr (track_infinity) infinite |= std::isinf(value);
+                }
+                if (infinite) flags |= 1;
+              };
+              if (all_pass) {
+                if (b.kind == SlimAggKind::kSumDouble)
+                  run.template operator()<false, true>();
+                else
+                  run.template operator()<false, false>();
+              } else {
+                if (b.kind == SlimAggKind::kSumDouble)
+                  run.template operator()<true, true>();
+                else
+                  run.template operator()<true, false>();
+              }
+            };
+            bool folded = false;
+            if (de.shape != TypedDoubleExprInput::Shape::kGeneric) {
+              const auto& x = ws.cols[proj_to_full[de.col0]];
+              if (!x.has_null &&
+                  de.shape == TypedDoubleExprInput::Shape::kSingleDoubleCol) {
+                fold([&](uint32_t row) { return x.Double(row); });
+                folded = true;
+              } else if (!x.has_null) {
+                const auto& y = ws.cols[proj_to_full[de.col1]];
+                if (!y.has_null &&
+                    de.shape ==
+                        TypedDoubleExprInput::Shape::kMulTwoDoubleCols) {
+                  fold([&](uint32_t row) {
+                    return x.Double(row) * y.Double(row);
+                  });
+                  folded = true;
+                } else if (!y.has_null &&
+                           de.shape ==
+                               TypedDoubleExprInput::Shape::kMulConstMinusCol) {
+                  fold([&](uint32_t row) {
+                    return x.Double(row) * (de.k0 - y.Double(row));
+                  });
+                  folded = true;
+                } else if (!y.has_null &&
+                           de.shape == TypedDoubleExprInput::Shape::
+                                           kMulConstMinusColMulConstPlusCol) {
+                  const auto& z = ws.cols[proj_to_full[de.col2]];
+                  if (!z.has_null) {
+                    fold([&](uint32_t row) {
+                      return x.Double(row) * (de.k0 - y.Double(row)) *
+                             (de.k1 + z.Double(row));
+                    });
+                    folded = true;
+                  }
+                }
+              }
+            }
+            if (folded) {
+              st.double_totals[a] = sum_or_best;
+              st.counts[a] = cnt + m;
+              st.flags[a] = flags;
+              st.updates += m;
+              continue;
+            }
+          }
+          const auto handle_val = [&](double v) {
+            if (b.kind == SlimAggKind::kCount) {
+              ++cnt;
+              ++added;
+              return;
+            }
+            if (b.kind == SlimAggKind::kSumDouble ||
+                b.kind == SlimAggKind::kAvgDouble) {
+              sum_or_best += v;
+              if (b.kind == SlimAggKind::kSumDouble && std::isinf(v)) {
+                flags |= 1;
+              }
+            } else {
+              const bool is_min = (b.kind == SlimAggKind::kMinDouble);
+              if (std::isnan(v)) {
+                flags |= 1;
+              } else if (cnt == 0 ||
+                         (is_min ? v < sum_or_best : sum_or_best < v)) {
+                sum_or_best = v;
+              }
+            }
+            ++cnt;
+            ++added;
+          };
+          if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              double v = 0.0;
+              if (EvalDirectDoubleExpr(de, proj_to_full, ws.cols, r, &v)) {
+                handle_val(v);
+              }
+            }
+          } else {
+            for (uint32_t idx = 0; idx < m; ++idx) {
+              double v = 0.0;
+              if (EvalDirectDoubleExpr(de, proj_to_full, ws.cols, sel_ptr[idx],
+                                       &v)) {
+                handle_val(v);
+              }
+            }
+          }
+          st.double_totals[a] = sum_or_best;
+          st.counts[a] = cnt;
+          st.flags[a] = flags;
+          st.updates += static_cast<size_t>(added);
+          continue;
+        }
+
+        const TypedIntExprInput& ie = *b.int_expr;
+        int64_t cnt = st.counts[a];
+        int64_t itot = st.int_totals[a];
+        double dtot = st.double_totals[a];
+        int64_t added = 0;
+        const auto handle_ival = [&](int64_t v) -> bool {
+          if (b.kind == SlimAggKind::kCount) {
+            ++cnt;
+          } else if (b.kind == SlimAggKind::kSumInt64) {
+            int64_t next = 0;
+            if (__builtin_add_overflow(itot, v, &next)) {
+              st.err = StatusError(StatusCode::kIsInfinity,
+                                   "integer overflow in SUM");
+              return false;
+            }
+            itot = next;
+            ++cnt;
+          } else if (b.kind == SlimAggKind::kAvgDouble) {
+            dtot += static_cast<double>(v);
+            ++cnt;
+          } else {
+            const bool is_min = (b.kind == SlimAggKind::kMinInt64);
+            if (cnt == 0 || (is_min ? v < itot : itot < v)) {
+              itot = v;
+            }
+            ++cnt;
+          }
+          ++added;
+          return true;
+        };
+        if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            int64_t v = 0;
+            if (EvalDirectIntExpr(ie, proj_to_full, ws.cols, r, &v, &st.err)) {
+              if (!handle_ival(v)) {
+                return;
+              }
+            } else if (!st.err.ok()) {
+              return;
+            }
+          }
+        } else {
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            int64_t v = 0;
+            if (EvalDirectIntExpr(ie, proj_to_full, ws.cols, sel_ptr[idx], &v,
+                                  &st.err)) {
+              if (!handle_ival(v)) {
+                return;
+              }
+            } else if (!st.err.ok()) {
+              return;
+            }
+          }
+        }
+        st.counts[a] = cnt;
+        st.int_totals[a] = itot;
+        st.double_totals[a] = dtot;
+        st.updates += static_cast<size_t>(added);
+      }
+    }
+  }));
+
+  for (const auto& st : states) {
+    if (!st.err.ok()) {
+      return st.err;
+    }
+  }
+  const auto merge_begin = std::chrono::steady_clock::now();
+  size_t total_scanned = 0;
+  size_t total_matching = 0;
+  size_t total_updates = 0;
+  for (const auto& st : states) {
+    total_scanned += st.scanned_rows;
+    total_matching += st.matching_rows;
+    total_updates += st.updates;
+  }
+
+  std::vector<Value> finished_values(naggs);
+  for (size_t a = 0; a < naggs; ++a) {
+    const SlimAggKind kind = bindings[a].kind;
+    int64_t total_cnt = 0;
+    int64_t total_int = 0;
+    double total_dbl = 0.0;
+    uint8_t total_flags = 0;
+    size_t distinct_cnt = 0;
+    if (IsSlimDistinctKind(kind)) {
+      std::unique_ptr<FlatIntKeyMap<uint8_t>> merged_dmap;
+      for (size_t w = 0; w < workers_used; ++w) {
+        if (!states[w].distinct_maps[a]) {
+          continue;
+        }
+        if (!merged_dmap) {
+          merged_dmap = std::move(states[w].distinct_maps[a]);
+        } else {
+          states[w].distinct_maps[a]->ForEach([&](int64_t raw, uint8_t) {
+            bool inserted = false;
+            uint8_t* slot = merged_dmap->TryEmplace(raw, &inserted);
+            if (inserted) {
+              *slot = 1;
+            }
+          });
+        }
+      }
+      distinct_cnt = merged_dmap ? merged_dmap->Size() : 0;
+    } else if (IsSlimMinMaxKind(kind)) {
+      const bool is_min =
+          (kind == SlimAggKind::kMinInt64 || kind == SlimAggKind::kMinDate ||
+           kind == SlimAggKind::kMinDouble);
+      for (size_t w = 0; w < workers_used; ++w) {
+        const int64_t wc = states[w].counts[a];
+        if (wc == 0) {
+          continue;
+        }
+        if (kind == SlimAggKind::kMinDouble ||
+            kind == SlimAggKind::kMaxDouble) {
+          total_flags |= states[w].flags[a];
+          const double wv = states[w].double_totals[a];
+          if ((states[w].flags[a] & 1) == 0 &&
+              (total_cnt == 0 || (is_min ? wv < total_dbl : total_dbl < wv))) {
+            total_dbl = wv;
+          }
+        } else {
+          const int64_t wv = states[w].int_totals[a];
+          if (total_cnt == 0 || (is_min ? wv < total_int : total_int < wv)) {
+            total_int = wv;
+          }
+        }
+        total_cnt += wc;
+      }
+    } else {
+      for (size_t w = 0; w < workers_used; ++w) {
+        const int64_t wc = states[w].counts[a];
+        if (wc == 0) {
+          continue;
+        }
+        if (kind == SlimAggKind::kSumInt64) {
+          int64_t next = 0;
+          if (__builtin_add_overflow(total_int, states[w].int_totals[a],
+                                     &next)) {
+            return StatusError(StatusCode::kIsInfinity,
+                               "integer overflow in SUM");
+          }
+          total_int = next;
+        } else if (kind == SlimAggKind::kSumDouble ||
+                   kind == SlimAggKind::kAvgDouble) {
+          total_dbl += states[w].double_totals[a];
+          total_flags |= states[w].flags[a];
+        }
+        total_cnt += wc;
+      }
+    }
+    Status finish_err = Status::kSuccess;
+    finished_values[a] =
+        FinishDirectState(kind, total_cnt, total_int, total_dbl, total_flags,
+                          distinct_cnt, &finish_err);
+    if (!finish_err.ok()) {
+      return finish_err;
+    }
+  }
+  return std::optional<Relation>(BuildScalarDirectOutput(
+      plan, stmt, qualified_schema, table_schema, finished_values,
+      total_scanned, total_matching, total_updates, publish_lstable_marker,
+      fold_cache_key, scan_begin, merge_begin, runtime));
+}
+
+StatusOr<std::optional<Relation>> TryRunDirectLSTableBoundedIntFast(
+    const LSTableStore& store, const TypedAggregationPlan& plan,
+    const SelectStatement& stmt, const Expression& having_expr,
+    TransactionContext& context, const CteMap& ctes,
+    const std::vector<slot_t>& proj_to_full,
+    const std::vector<ValueType>& proj_types,
+    const std::vector<uint8_t>& proj_unsigned, const Schema& qualified_schema,
+    const Schema& table_schema, bool direct_children,
+    const RuntimeFilterGroup* stream_runtime_filter,
+    const PrebuiltMembershipPredicate* stream_prebuilt_membership,
+    size_t worker_count, ExecutionRuntime* runtime, bool publish_lstable_marker,
+    const std::string& fold_cache_key,
+    std::chrono::steady_clock::time_point scan_begin) {
+  if (!direct_children || stream_runtime_filter != nullptr ||
+      stream_prebuilt_membership != nullptr ||
+      (!plan.filter_programs.empty() && !plan.only_null_filter_programs) ||
+      stmt.GroupBy().empty() || stmt.IsGroupAll() ||
+      plan.key_offsets.size() != 1 || stmt.HasLimit() || stmt.Distinct() ||
+      stmt.WithTies() || !plan.order_items.empty() ||
+      !plan.dependent_key_programs.empty() || !plan.inlist_compares.empty() ||
+      !plan.slim || plan.aggregates.empty() || plan.aggregates.size() > 4) {
+    return std::optional<Relation>{};
+  }
+  const slot_t key_proj = plan.key_offsets[0];
+  const ValueType key_type = proj_types[key_proj];
+  if ((key_type != ValueType::kInt64 && key_type != ValueType::kDate) ||
+      proj_unsigned[key_proj] != 0) {
+    return std::optional<Relation>{};
+  }
+  const slot_t key_full = proj_to_full[key_proj];
+  if (key_full >= store.column_has_null.size() ||
+      key_full >= store.column_min_int.size() ||
+      (key_full < store.column_is_monotonic.size() &&
+       store.column_is_monotonic[key_full] != 0 && store.total_rows >= 65536)) {
+    return std::optional<Relation>{};
+  }
+  const bool key_nullable = store.column_has_null[key_full] != 0;
+  const int64_t key_min = store.column_min_int[key_full];
+  const int64_t key_max = store.column_max_int[key_full];
+  size_t span = 0;
+  if (key_min <= key_max) {
+    const uint64_t raw_span =
+        static_cast<uint64_t>(key_max) - static_cast<uint64_t>(key_min) + 1ULL;
+    if (raw_span == 0 || raw_span > 65536ULL) {
+      return std::optional<Relation>{};
+    }
+    span = static_cast<size_t>(raw_span);
+  } else if (!key_nullable) {
+    return std::optional<Relation>{};
+  }
+  const size_t total_slots = span + (key_nullable ? 1 : 0);
+
+  for (const SlimAggKind k : plan.slim_kinds) {
+    if (IsSlimDistinctKind(k)) {
+      return std::optional<Relation>{};
+    }
+  }
+  for (const TypedEmitItem& item : plan.emit_items) {
+    if (item.post_agg != nullptr || item.dependent_key) {
+      return std::optional<Relation>{};
+    }
+  }
+  std::vector<PositionalHaving> positional_having;
+  if (having_expr != nullptr) {
+    if (!TryCompilePositionalHavingConjuncts(having_expr, plan.aggregates,
+                                             &positional_having)) {
+      positional_having.clear();
+    }
+  }
+  CompiledLSTableBlockFilter filter;
+  if (!filter.Init(plan, proj_to_full, proj_types, proj_unsigned, store)) {
+    return std::optional<Relation>{};
+  }
+  std::vector<DirectAggBinding> bindings;
+  std::vector<uint8_t> always_bind_cols;
+  if (!CollectDirectAggBindings(plan, store, proj_to_full, proj_types,
+                                proj_unsigned, &bindings, &always_bind_cols)) {
+    return std::optional<Relation>{};
+  }
+  always_bind_cols[key_full] = 1;
+
+  // Defer to existing fast_dict_double_agg when no nullable columns, no
+  // null_filters, no disjunctions, no min/max, no non-constant/double compares,
+  // and at most 1 aggregate exist.
+  bool needs_this_path = key_nullable || !plan.filter_programs.empty() ||
+                         !plan.filter_disjunctions.empty() ||
+                         bindings.size() > 1 ||
+                         (having_expr != nullptr && positional_having.empty());
+  for (const DirectAggBinding& b : bindings) {
+    if (IsSlimMinMaxKind(b.kind)) {
+      needs_this_path = true;
+    }
+    if (b.full_col.has_value() && store.column_has_null[*b.full_col] != 0) {
+      needs_this_path = true;
+    }
+  }
+  for (size_t c = 0; c < filter.referenced_full_cols.size(); ++c) {
+    if (filter.referenced_full_cols[c] != 0 && store.column_has_null[c] != 0) {
+      needs_this_path = true;
+    }
+  }
+  for (const TypedFilterCompare& cmp : plan.filter_compares) {
+    if (!cmp.constant_payload || cmp.is_double) {
+      needs_this_path = true;
+    }
+  }
+  if (!needs_this_path) {
+    return std::optional<Relation>{};
+  }
+
+  const size_t nblocks = store.blocks.size();
+  const size_t naggs = bindings.size();
+  const size_t workers_used =
+      std::max<size_t>(1, std::min(worker_count, std::max<size_t>(1, nblocks)));
+  struct alignas(64) BoundedWorkerState {
+    std::vector<uint8_t> present;
+    std::array<std::vector<int64_t>, 4> counts;
+    std::array<std::vector<int64_t>, 4> int_totals;
+    std::array<std::vector<double>, 4> double_totals;
+    std::array<std::vector<uint8_t>, 4> flags;
+    size_t scanned_rows{0};
+    size_t matching_rows{0};
+    size_t updates{0};
+    Status err{Status::kSuccess};
+
+    void EnsureAllocated(size_t s, const std::vector<DirectAggBinding>& bs) {
+      if (!present.empty()) {
+        return;
+      }
+      present.assign(s, 0);
+      for (size_t a = 0; a < bs.size(); ++a) {
+        counts[a].assign(s, 0);
+        const SlimAggKind k = bs[a].kind;
+        if (k == SlimAggKind::kSumInt64 || k == SlimAggKind::kMinInt64 ||
+            k == SlimAggKind::kMaxInt64 || k == SlimAggKind::kMinDate ||
+            k == SlimAggKind::kMaxDate) {
+          int_totals[a].assign(s, 0);
+        }
+        if (k == SlimAggKind::kSumDouble || k == SlimAggKind::kAvgDouble ||
+            k == SlimAggKind::kMinDouble || k == SlimAggKind::kMaxDouble) {
+          double_totals[a].assign(s, 0.0);
+        }
+        if (k == SlimAggKind::kSumDouble || k == SlimAggKind::kMinDouble ||
+            k == SlimAggKind::kMaxDouble) {
+          flags[a].assign(s, 0);
+        }
+      }
+    }
+  };
+  std::vector<BoundedWorkerState> states(workers_used);
+
+  RETURN_IF_FAIL(RunParallelTasks(workers_used, [&](size_t w) {
+    BoundedWorkerState& st = states[w];
+    CompiledLSTableBlockFilter::Scratch ws;
+    filter.InitScratch(store.column_has_null.size(), &ws);
+    std::vector<uint32_t> sel;
+    std::vector<uint32_t> row_gidx;
+    const size_t blk_begin = (nblocks * w) / workers_used;
+    const size_t blk_end = (nblocks * (w + 1)) / workers_used;
+
+    for (size_t bi = blk_begin; bi < blk_end; ++bi) {
+      const auto& blk = store.blocks[bi];
+      st.scanned_rows += blk.row_count;
+      bool all_pass = false;
+      const uint32_t m =
+          filter.FilterBlock(blk, always_bind_cols, &ws, &all_pass, &sel);
+      if (m == 0) {
+        continue;
+      }
+      st.EnsureAllocated(total_slots, bindings);
+      st.matching_rows += m;
+      const DirectBlockCol& kcol = ws.cols[key_full];
+      const int64_t* keys = kcol.cells;
+      const uint32_t* sel_ptr = sel.data();
+      uint8_t* __restrict__ pres = st.present.data();
+      row_gidx.resize(m);
+      uint32_t* __restrict__ gidx = row_gidx.data();
+      if (!kcol.has_null) {
+        if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            const auto gi =
+                static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                      static_cast<uint64_t>(key_min));
+            gidx[r] = gi;
+            pres[gi] = 1;
+          }
+        } else {
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            const uint32_t r = sel_ptr[idx];
+            const auto gi =
+                static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                      static_cast<uint64_t>(key_min));
+            gidx[idx] = gi;
+            pres[gi] = 1;
+          }
+        }
+      } else {
+        const auto null_gi = static_cast<uint32_t>(span);
+        if (all_pass) {
+          for (uint32_t r = 0; r < m; ++r) {
+            const uint32_t gi =
+                kcol.IsNull(r)
+                    ? null_gi
+                    : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                            static_cast<uint64_t>(key_min));
+            gidx[r] = gi;
+            pres[gi] = 1;
+          }
+        } else {
+          for (uint32_t idx = 0; idx < m; ++idx) {
+            const uint32_t r = sel_ptr[idx];
+            const uint32_t gi =
+                kcol.IsNull(r)
+                    ? null_gi
+                    : static_cast<uint32_t>(static_cast<uint64_t>(keys[r]) -
+                                            static_cast<uint64_t>(key_min));
+            gidx[idx] = gi;
+            pres[gi] = 1;
+          }
+        }
+      }
+
+      for (size_t a = 0; a < naggs; ++a) {
+        const DirectAggBinding& b = bindings[a];
+        int64_t* __restrict__ cnts = st.counts[a].data();
+        if (b.is_count_star) {
+          for (uint32_t i = 0; i < m; ++i) {
+            ++cnts[gidx[i]];
+          }
+          st.updates += m;
+          continue;
+        }
+        if (b.full_col.has_value()) {
+          const DirectBlockCol& col = ws.cols[*b.full_col];
+          if (b.kind == SlimAggKind::kCount) {
+            if (!col.has_null) {
+              for (uint32_t i = 0; i < m; ++i) {
+                ++cnts[gidx[i]];
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                cnts[gidx[r]] += static_cast<int64_t>(!col.IsNull(r));
+              }
+            } else {
+              for (uint32_t i = 0; i < m; ++i) {
+                cnts[gidx[i]] += static_cast<int64_t>(!col.IsNull(sel_ptr[i]));
+              }
+            }
+            st.updates += m;
+            continue;
+          }
+          if (b.kind == SlimAggKind::kSumDouble ||
+              b.kind == SlimAggKind::kAvgDouble) {
+            double* __restrict__ dtot = st.double_totals[a].data();
+            uint8_t* flg = (b.kind == SlimAggKind::kSumDouble)
+                               ? st.flags[a].data()
+                               : nullptr;
+            size_t upd = 0;
+            const auto add_d = [&](uint32_t gi, double v) {
+              dtot[gi] += v;
+              ++cnts[gi];
+              if (flg != nullptr && std::isinf(v)) {
+                flg[gi] |= 1;
+              }
+              ++upd;
+            };
+            if (b.col_type == ValueType::kDouble) {
+              if (!col.has_null) {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    add_d(gidx[r], col.Double(r));
+                  }
+                } else {
+                  for (uint32_t i = 0; i < m; ++i) {
+                    add_d(gidx[i], col.Double(sel_ptr[i]));
+                  }
+                }
+              } else if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  if (!col.IsNull(r)) {
+                    add_d(gidx[r], col.Double(r));
+                  }
+                }
+              } else {
+                for (uint32_t i = 0; i < m; ++i) {
+                  const uint32_t r = sel_ptr[i];
+                  if (!col.IsNull(r)) {
+                    add_d(gidx[i], col.Double(r));
+                  }
+                }
+              }
+            } else {
+              if (!col.has_null) {
+                if (all_pass) {
+                  for (uint32_t r = 0; r < m; ++r) {
+                    add_d(gidx[r], static_cast<double>(col.Int(r)));
+                  }
+                } else {
+                  for (uint32_t i = 0; i < m; ++i) {
+                    add_d(gidx[i], static_cast<double>(col.Int(sel_ptr[i])));
+                  }
+                }
+              } else if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  if (!col.IsNull(r)) {
+                    add_d(gidx[r], static_cast<double>(col.Int(r)));
+                  }
+                }
+              } else {
+                for (uint32_t i = 0; i < m; ++i) {
+                  const uint32_t r = sel_ptr[i];
+                  if (!col.IsNull(r)) {
+                    add_d(gidx[i], static_cast<double>(col.Int(r)));
+                  }
+                }
+              }
+            }
+            st.updates += upd;
+            continue;
+          }
+          if (b.kind == SlimAggKind::kSumInt64) {
+            int64_t* __restrict__ itot = st.int_totals[a].data();
+            size_t upd = 0;
+            const auto add_i = [&](uint32_t gi, int64_t v) -> bool {
+              int64_t next = 0;
+              if (__builtin_add_overflow(itot[gi], v, &next)) {
+                st.err = StatusError(StatusCode::kIsInfinity,
+                                     "integer overflow in SUM");
+                return false;
+              }
+              itot[gi] = next;
+              ++cnts[gi];
+              ++upd;
+              return true;
+            };
+            if (!col.has_null) {
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  if (!add_i(gidx[r], col.Int(r))) {
+                    return;
+                  }
+                }
+              } else {
+                for (uint32_t i = 0; i < m; ++i) {
+                  if (!add_i(gidx[i], col.Int(sel_ptr[i]))) {
+                    return;
+                  }
+                }
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                if (!col.IsNull(r) && !add_i(gidx[r], col.Int(r))) {
+                  return;
+                }
+              }
+            } else {
+              for (uint32_t i = 0; i < m; ++i) {
+                const uint32_t r = sel_ptr[i];
+                if (!col.IsNull(r) && !add_i(gidx[i], col.Int(r))) {
+                  return;
+                }
+              }
+            }
+            st.updates += upd;
+            continue;
+          }
+          if (b.kind == SlimAggKind::kMinInt64 ||
+              b.kind == SlimAggKind::kMaxInt64 ||
+              b.kind == SlimAggKind::kMinDate ||
+              b.kind == SlimAggKind::kMaxDate) {
+            const bool is_min = (b.kind == SlimAggKind::kMinInt64 ||
+                                 b.kind == SlimAggKind::kMinDate);
+            int64_t* __restrict__ itot = st.int_totals[a].data();
+            size_t upd = 0;
+            const auto upd_i = [&](uint32_t gi, int64_t v) {
+              if (cnts[gi] == 0 || (is_min ? v < itot[gi] : itot[gi] < v)) {
+                itot[gi] = v;
+              }
+              ++cnts[gi];
+              ++upd;
+            };
+            if (!col.has_null) {
+              if (all_pass) {
+                for (uint32_t r = 0; r < m; ++r) {
+                  upd_i(gidx[r], col.Int(r));
+                }
+              } else {
+                for (uint32_t i = 0; i < m; ++i) {
+                  upd_i(gidx[i], col.Int(sel_ptr[i]));
+                }
+              }
+            } else if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                if (!col.IsNull(r)) {
+                  upd_i(gidx[r], col.Int(r));
+                }
+              }
+            } else {
+              for (uint32_t i = 0; i < m; ++i) {
+                const uint32_t r = sel_ptr[i];
+                if (!col.IsNull(r)) {
+                  upd_i(gidx[i], col.Int(r));
+                }
+              }
+            }
+            st.updates += upd;
+            continue;
+          }
+          const bool is_min = (b.kind == SlimAggKind::kMinDouble);
+          double* __restrict__ dtot = st.double_totals[a].data();
+          uint8_t* __restrict__ flg = st.flags[a].data();
+          size_t upd = 0;
+          const auto upd_d = [&](uint32_t gi, double v) {
+            if (std::isnan(v)) {
+              flg[gi] |= 1;
+            } else if (cnts[gi] == 0 ||
+                       (is_min ? v < dtot[gi] : dtot[gi] < v)) {
+              dtot[gi] = v;
+            }
+            ++cnts[gi];
+            ++upd;
+          };
+          if (!col.has_null) {
+            if (all_pass) {
+              for (uint32_t r = 0; r < m; ++r) {
+                upd_d(gidx[r], col.Double(r));
+              }
+            } else {
+              for (uint32_t i = 0; i < m; ++i) {
+                upd_d(gidx[i], col.Double(sel_ptr[i]));
+              }
+            }
+          } else if (all_pass) {
+            for (uint32_t r = 0; r < m; ++r) {
+              if (!col.IsNull(r)) {
+                upd_d(gidx[r], col.Double(r));
+              }
+            }
+          } else {
+            for (uint32_t i = 0; i < m; ++i) {
+              const uint32_t r = sel_ptr[i];
+              if (!col.IsNull(r)) {
+                upd_d(gidx[i], col.Double(r));
+              }
+            }
+          }
+          st.updates += upd;
+          continue;
+        }
+
+        if (b.double_expr != nullptr) {
+          const TypedDoubleExprInput& de = *b.double_expr;
+          double* dtot = st.double_totals[a].data();
+          uint8_t* flg = st.flags[a].data();
+          size_t upd = 0;
+          const auto handle_d = [&](uint32_t gi, double v) {
+            if (b.kind == SlimAggKind::kCount) {
+              ++cnts[gi];
+            } else if (b.kind == SlimAggKind::kSumDouble ||
+                       b.kind == SlimAggKind::kAvgDouble) {
+              dtot[gi] += v;
+              if (b.kind == SlimAggKind::kSumDouble && std::isinf(v)) {
+                flg[gi] |= 1;
+              }
+              ++cnts[gi];
+            } else {
+              const bool is_min = (b.kind == SlimAggKind::kMinDouble);
+              if (std::isnan(v)) {
+                flg[gi] |= 1;
+              } else if (cnts[gi] == 0 ||
+                         (is_min ? v < dtot[gi] : dtot[gi] < v)) {
+                dtot[gi] = v;
+              }
+              ++cnts[gi];
+            }
+            ++upd;
+          };
+          for (uint32_t i = 0; i < m; ++i) {
+            const uint32_t r = all_pass ? i : sel_ptr[i];
+            double v = 0.0;
+            if (EvalDirectDoubleExpr(de, proj_to_full, ws.cols, r, &v)) {
+              handle_d(gidx[i], v);
+            }
+          }
+          st.updates += upd;
+          continue;
+        }
+
+        const TypedIntExprInput& ie = *b.int_expr;
+        int64_t* itot = st.int_totals[a].data();
+        double* dtot = st.double_totals[a].data();
+        size_t upd = 0;
+        for (uint32_t i = 0; i < m; ++i) {
+          const uint32_t r = all_pass ? i : sel_ptr[i];
+          int64_t v = 0;
+          if (EvalDirectIntExpr(ie, proj_to_full, ws.cols, r, &v, &st.err)) {
+            const uint32_t gi = gidx[i];
+            if (b.kind == SlimAggKind::kCount) {
+              ++cnts[gi];
+            } else if (b.kind == SlimAggKind::kSumInt64) {
+              int64_t next = 0;
+              if (__builtin_add_overflow(itot[gi], v, &next)) {
+                st.err = StatusError(StatusCode::kIsInfinity,
+                                     "integer overflow in SUM");
+                return;
+              }
+              itot[gi] = next;
+              ++cnts[gi];
+            } else if (b.kind == SlimAggKind::kAvgDouble) {
+              dtot[gi] += static_cast<double>(v);
+              ++cnts[gi];
+            } else {
+              const bool is_min = (b.kind == SlimAggKind::kMinInt64);
+              if (cnts[gi] == 0 || (is_min ? v < itot[gi] : itot[gi] < v)) {
+                itot[gi] = v;
+              }
+              ++cnts[gi];
+            }
+            ++upd;
+          } else if (!st.err.ok()) {
+            return;
+          }
+        }
+        st.updates += upd;
+      }
+    }
+  }));
+
+  for (const auto& st : states) {
+    if (!st.err.ok()) {
+      return st.err;
+    }
+  }
+  if (publish_lstable_marker && runtime != nullptr) {
+    auto marker = std::make_shared<Relation>(runtime);
+    marker->schema = qualified_schema;
+    runtime->base_relations.emplace(fold_cache_key, std::move(marker));
+  }
+
+  const auto merge_begin = std::chrono::steady_clock::now();
+  size_t total_scanned = 0;
+  size_t total_matching = 0;
+  size_t total_updates = 0;
+  std::vector<size_t> active_workers;
+  active_workers.reserve(workers_used);
+  for (size_t w = 0; w < workers_used; ++w) {
+    total_scanned += states[w].scanned_rows;
+    total_matching += states[w].matching_rows;
+    total_updates += states[w].updates;
+    if (!states[w].present.empty()) {
+      active_workers.push_back(w);
+    }
+  }
+
+  const bool parallel_having =
+      having_expr == nullptr || !positional_having.empty();
+  const size_t emit_workers = (parallel_having && total_slots >= 4096 &&
+                               workers_used > 1 && !active_workers.empty())
+                                  ? workers_used
+                                  : 1;
+  std::vector<std::vector<Row>> emit_rows(emit_workers);
+  std::vector<size_t> emit_groups(emit_workers, 0);
+  std::vector<Status> emit_errors(emit_workers, Status::kSuccess);
+
+  RETURN_IF_FAIL(RunParallelTasks(emit_workers, [&](size_t ew) {
+    try {
+      if (active_workers.empty()) {
+        return;
+      }
+      const size_t idx_begin = (total_slots * ew) / emit_workers;
+      const size_t idx_end = (total_slots * (ew + 1)) / emit_workers;
+      std::vector<Value> finished(naggs);
+      Row representative;
+      AggregateResultMap aggregate_results;
+      bool map_initialized = false;
+      auto& out = emit_rows[ew];
+      for (size_t idx = idx_begin; idx < idx_end; ++idx) {
+        bool any = false;
+        for (const size_t w : active_workers) {
+          if (states[w].present[idx] != 0) {
+            any = true;
+            break;
+          }
+        }
+        if (!any) {
+          continue;
+        }
+        ++emit_groups[ew];
+        for (size_t a = 0; a < naggs; ++a) {
+          const SlimAggKind kind = bindings[a].kind;
+          int64_t total_cnt = 0;
+          int64_t total_int = 0;
+          double total_dbl = 0.0;
+          uint8_t total_flags = 0;
+          if (IsSlimMinMaxKind(kind)) {
+            const bool is_min = (kind == SlimAggKind::kMinInt64 ||
+                                 kind == SlimAggKind::kMinDate ||
+                                 kind == SlimAggKind::kMinDouble);
+            for (const size_t w : active_workers) {
+              const int64_t wc = states[w].counts[a][idx];
+              if (wc == 0) {
+                continue;
+              }
+              if (kind == SlimAggKind::kMinDouble ||
+                  kind == SlimAggKind::kMaxDouble) {
+                total_flags |= states[w].flags[a][idx];
+                const double wv = states[w].double_totals[a][idx];
+                if ((states[w].flags[a][idx] & 1) == 0 &&
+                    (total_cnt == 0 ||
+                     (is_min ? wv < total_dbl : total_dbl < wv))) {
+                  total_dbl = wv;
+                }
+              } else {
+                const int64_t wv = states[w].int_totals[a][idx];
+                if (total_cnt == 0 ||
+                    (is_min ? wv < total_int : total_int < wv)) {
+                  total_int = wv;
+                }
+              }
+              total_cnt += wc;
+            }
+          } else {
+            for (const size_t w : active_workers) {
+              const int64_t wc = states[w].counts[a][idx];
+              if (wc == 0) {
+                continue;
+              }
+              if (kind == SlimAggKind::kSumInt64) {
+                int64_t next = 0;
+                if (__builtin_add_overflow(
+                        total_int, states[w].int_totals[a][idx], &next)) {
+                  emit_errors[ew] = StatusError(StatusCode::kIsInfinity,
+                                                "integer overflow in SUM");
+                  return;
+                }
+                total_int = next;
+              } else if (kind == SlimAggKind::kSumDouble ||
+                         kind == SlimAggKind::kAvgDouble) {
+                total_dbl += states[w].double_totals[a][idx];
+                if (!states[w].flags[a].empty()) {
+                  total_flags |= states[w].flags[a][idx];
+                }
+              }
+              total_cnt += wc;
+            }
+          }
+          finished[a] = FinishDirectState(kind, total_cnt, total_int, total_dbl,
+                                          total_flags, 0, &emit_errors[ew]);
+          if (!emit_errors[ew].ok()) {
+            return;
+          }
+        }
+        const Value key_val =
+            (key_nullable && idx == span)
+                ? Value()
+                : (key_type == ValueType::kDate
+                       ? Value::DateFromDays(key_min +
+                                             static_cast<int64_t>(idx))
+                       : Value(key_min + static_cast<int64_t>(idx)));
+        if (having_expr != nullptr) {
+          if (!positional_having.empty()) {
+            bool keep_group = true;
+            for (const PositionalHaving& clause : positional_having) {
+              const Value* right_ptr =
+                  clause.rhs_is_agg ? &finished[clause.rhs_agg_index] : nullptr;
+              keep_group =
+                  EvalPositionalHavingValues(clause, finished[clause.agg_index],
+                                             right_ptr, &emit_errors[ew]);
+              if (!emit_errors[ew].ok()) {
+                return;
+              }
+              if (!keep_group) {
                 break;
               }
             }
-          }
-        } catch (const std::exception& error) {
-          errors[s] = StatusError(StatusCode::kRuntimeError, error.what());
-        } catch (...) {
-          errors[s] = StatusError(StatusCode::kRuntimeError,
-                                  "parallel grouping set failed");
-        }
-      }
-    };
-    {
-      std::vector<std::jthread> workers;
-      workers.reserve(set_workers - 1);
-      for (size_t worker = 1; worker < set_workers; ++worker) {
-        workers.emplace_back([&, worker] { fold_sets(worker); });
-      }
-      fold_sets(0);
-    }
-    for (const auto& error : errors) {
-      RETURN_IF_FAIL(error);
-    }
-    phase("fold");
-    if (auto* runtime = context.execution_runtime()) {
-      ++runtime->typed_parallel_aggregations;
-    }
-  } else {
-    // Drop the optional argument cache before the original streaming route.
-    std::vector<Value>().swap(arguments);
-    argument_charge.reset();
-    std::vector<size_t> mapping;
-    std::vector<Value> keys, coarse, values;
-    keys.reserve(plans[0].key_offsets.size());
-    coarse.reserve(plans[0].key_offsets.size());
-    values.reserve(aggregates[0].size());
-    for (const auto& row : input.rows) {
-      bool inserted = false;
-      const size_t finest = groups[0].FindOrInsertRow(
-          row, plans[0].key_offsets, aggregates[0], &keys, &inserted);
-      if (inserted) {
-        mapping.push_back(finest);
-        for (size_t s = 1; s < count; ++s) {
-          if (borrow_keys) {
-            bool added = false;
-            mapping.push_back(groups[s].FindOrInsertRow(
-                row, plans[s].key_offsets, aggregates[s], &coarse, &added));
-            continue;
-          }
-          coarse.clear();
-          for (const auto key : key_maps[s]) {
-            coarse.push_back(keys[key]);
-          }
-          bool added = false;
-          mapping.push_back(groups[s].FindOrInsert(
-              coarse,
-              groups[s].int_key && !coarse[0].IsNull()
-                  ? coarse[0].value.int_value
-                  : 0,
-              aggregates[s].size(), aggregates[s], &added));
-        }
-      }
-      values.clear();
-      for (const auto& item : plans[0].aggregates) {
-        ASSIGN_OR_RETURN(Value, value, CompactArgument(item, row));
-        values.push_back(std::move(value));
-      }
-      for (size_t s = 0; s < count; ++s) {
-        const size_t group = mapping[(finest * count) + s];
-        for (size_t a = 0; a < values.size(); ++a) {
-          if (plans[s].slim) {
-            Status error{Status::kSuccess};
-            if (!ApplySlimValue(&groups[s], group, a, plans[s].slim_kinds[a],
-                                &values[a], &error)) {
-              return error;
+            if (!keep_group) {
+              continue;
             }
           } else {
-            RETURN_IF_FAIL(groups[s].State(group, a).Add(values[a]));
-          }
-        }
-      }
-    }
-  }
-  std::vector<Relation> output(count);
-  // A parent RANK() <= K only needs the groups that can still place. Keeping
-  // boundary ties preserves the rank values of every surviving row.
-  std::vector<std::vector<uint8_t>> rank_keep;
-  const auto* rank_limit =
-      context.execution_runtime() != nullptr
-          ? context.execution_runtime()->grouping_rank_limit
-                ? &*context.execution_runtime()->grouping_rank_limit
-                : nullptr
-          : nullptr;
-  if (rank_limit != nullptr && rank_limit->limit > 0 &&
-      std::ranges::all_of(plans, [](const auto& plan) { return plan.slim; })) {
-    struct RankRef {
-      size_t set{0};
-      size_t group{0};
-      double sum{0};
-    };
-    struct Category {
-      std::string_view name;
-      bool is_null{false};
-      bool is_int{false};
-      int64_t int_key{0};
-      std::vector<RankRef> rows;
-    };
-    std::vector<Category> categories;
-    auto category_of = [&](const Value& value) -> size_t {
-      if (value.IsNull()) {
-        for (size_t i = 0; i < categories.size(); ++i) {
-          if (categories[i].is_null) {
-            return i;
-          }
-        }
-        categories.push_back(Category{.is_null = true});
-        return categories.size() - 1;
-      }
-      if (value.type == ValueType::kInt64 || value.type == ValueType::kDate) {
-        for (size_t i = 0; i < categories.size(); ++i) {
-          if (categories[i].is_int && categories[i].int_key == value.value.int_value) {
-            return i;
-          }
-        }
-        categories.push_back(
-            Category{.is_int = true, .int_key = value.value.int_value});
-        return categories.size() - 1;
-      }
-      if (value.type == ValueType::kVarChar) {
-        const std::string_view name = value.value.varchar_value;
-        for (size_t i = 0; i < categories.size(); ++i) {
-          if (!categories[i].is_null && !categories[i].is_int &&
-              categories[i].name == name) {
-            return i;
-          }
-        }
-        categories.push_back(Category{.name = name});
-        return categories.size() - 1;
-      }
-      return SIZE_MAX;
-    };
-    bool shaped = true;
-    std::vector<std::optional<size_t>> partition_item(count);
-    std::vector<std::optional<size_t>> order_item(count);
-    for (size_t s = 0; shaped && s < count; ++s) {
-      const auto& list = sets[s]->SelectList();
-      if (list.size() != plans[s].emit_items.size()) {
-        shaped = false;
-        break;
-      }
-      for (size_t i = 0; i < list.size(); ++i) {
-        const std::string name = ProjectionName(list[i], i);
-        if (name == rank_limit->partition_name) {
-          partition_item[s] = i;
-        } else if (name == rank_limit->order_name) {
-          order_item[s] = i;
-        }
-      }
-      if (!partition_item[s] || !order_item[s]) {
-        shaped = false;
-        break;
-      }
-      const auto& order = plans[s].emit_items[*order_item[s]];
-      const auto& part = plans[s].emit_items[*partition_item[s]];
-      if (order.is_key || order.constant ||
-          order.index >= plans[s].slim_kinds.size() ||
-          plans[s].slim_kinds[order.index] != SlimAggKind::kSumDouble ||
-          !(part.is_key || part.constant)) {
-        shaped = false;
-      }
-    }
-    if (shaped) {
-      for (size_t s = 0; s < count; ++s) {
-        const auto& part = plans[s].emit_items[*partition_item[s]];
-        const auto& order = plans[s].emit_items[*order_item[s]];
-        const bool mixed = !groups[s].mixed_numeric_sums.empty() &&
-                           groups[s].mixed_numeric_sums[order.index];
-        for (size_t group = 0; group < groups[s].GroupCount(); ++group) {
-          size_t category = SIZE_MAX;
-          if (part.constant) {
-            category = category_of(*part.constant);
-          } else {
-            category = category_of(groups[s].GroupKey(group, part.index));
-          }
-          if (category == SIZE_MAX) {
-            shaped = false;
-            break;
-          }
-          RankRef ref{.set = s, .group = group, .sum = 0};
-          if (groups[s].SlimCount(group, order.index) != 0) {
-            ref.sum = groups[s].SlimDoubleTotal(group, order.index);
-            if (mixed) {
-              ref.sum += static_cast<double>(
-                  groups[s].SlimIntTotal(group, order.index));
-            }
-            categories[category].rows.push_back(ref);
-          } else {
-            ref.sum = std::numeric_limits<double>::quiet_NaN();
-            categories[category].rows.push_back(ref);
-          }
-        }
-        if (!shaped) {
-          break;
-        }
-      }
-    }
-    if (shaped) {
-      rank_keep.assign(count, {});
-      for (size_t s = 0; s < count; ++s) {
-        rank_keep[s].assign(groups[s].GroupCount(), 0);
-      }
-      for (Category& category : categories) {
-        std::vector<RankRef> numbers;
-        std::vector<RankRef> missing;
-        for (const RankRef& ref : category.rows) {
-          if (std::isnan(ref.sum)) {
-            missing.push_back(ref);
-          } else {
-            numbers.push_back(ref);
-          }
-        }
-        const auto mark = [&](const RankRef& ref) {
-          rank_keep[ref.set][ref.group] = 1;
-        };
-        if (numbers.size() >= rank_limit->limit) {
-          const auto nth = numbers.begin() +
-                           static_cast<std::ptrdiff_t>(rank_limit->limit - 1);
-          std::nth_element(numbers.begin(), nth, numbers.end(),
-                           [](const RankRef& a, const RankRef& b) {
-                             return a.sum > b.sum;
-                           });
-          const double threshold = nth->sum;
-          for (const RankRef& ref : numbers) {
-            if (ref.sum >= threshold) {
-              mark(ref);
-            }
-          }
-        } else {
-          for (const RankRef& ref : numbers) {
-            mark(ref);
-          }
-          for (const RankRef& ref : missing) {
-            mark(ref);
-          }
-        }
-      }
-    }
-  }
-  size_t output_groups = 0;
-  for (size_t s = 0; s < count; ++s) {
-    if (groups[s].GroupCount() == 0 && sets[s]->IsGroupAll()) {
-      bool inserted = false;
-      static_cast<void>(groups[s].FindOrInsert({}, 0, aggregates[s].size(),
-                                               aggregates[s], &inserted));
-    }
-    output_groups += groups[s].GroupCount();
-  }
-  // Building has finished: the per-input-row, per-set upper bound is no
-  // longer live workspace. Retain the actual slim vector capacities and a
-  // conservative bound for the integer hash tables instead. Keeping the old
-  // bound while materializing results can spill a small output even though
-  // the grouping tables themselves occupy only a fraction of that bound.
-  // Borrowed keys have no separately owned string payload to account for.
-  std::vector<Value>().swap(arguments);
-  argument_charge.reset();
-  if (borrow_keys && std::ranges::all_of(groups, [](const auto& group) {
-        return group.slim;
-      })) {
-    size_t retained = groups.capacity() * sizeof(TypedWorkerGroups);
-    for (const auto& group : groups) {
-      retained +=
-          group.key_index.capacity() * sizeof(TypedWorkerGroups::KeySlot);
-      retained += group.borrowed_key_rows.capacity() * sizeof(const Row*);
-      retained += group.flat_group_keys.capacity() * sizeof(Value);
-      retained +=
-          (group.slim_counts.capacity() + group.slim_int_totals.capacity()) *
-          sizeof(int64_t);
-      retained += group.slim_double_totals.capacity() * sizeof(double);
-      retained += group.slim_flags.capacity() * sizeof(uint8_t);
-      retained += group.mixed_numeric_sums.capacity();
-      // FlatIntKeyMap grows by at most four at a 70% load factor, with
-      // 16-byte slots. This also covers its minimum allocation.
-      retained += (group.GroupCount() + 2) * 128;
-    }
-    if (retained < charge.Bytes()) {
-      charge = QueryMemoryCharge(retained);
-    }
-  }
-  if (set_workers > 1 && output_groups >= 4096) {
-    // A large finest set must not monopolize one worker while the small
-    // rollup totals finish early. Schedule contiguous group ranges across
-    // all sets, then concatenate each set in its original encounter order.
-    static const bool split_disabled =
-        std::getenv("TINYLAMB_DISABLE_GROUPING_SET_EMIT_SPLIT") != nullptr;
-    const size_t workers = split_disabled
-                               ? std::min<size_t>(8, set_workers)
-                               : ParallelWorkerCount(output_groups / 8192);
-    const size_t chunk = std::max<size_t>(
-        4096, (output_groups + workers * 4 - 1) / (workers * 4));
-    struct EmitRange {
-      size_t set;
-      size_t begin;
-      size_t end;
-    };
-    std::vector<EmitRange> ranges;
-    for (size_t s = 0; s < count; ++s) {
-      const size_t size = groups[s].GroupCount();
-      const size_t stride =
-          split_disabled || !plans[s].slim ? std::max<size_t>(1, size) : chunk;
-      for (size_t begin = 0; begin < std::max<size_t>(1, size);
-           begin += stride) {
-        ranges.push_back({s, begin, std::min(size, begin + stride)});
-      }
-    }
-    std::vector<ExecutionRuntime> runtimes(workers);
-    std::vector<Relation> shards(ranges.size());
-    std::vector<Status> errors(ranges.size(), Status::kSuccess);
-    std::atomic<size_t> next{0};
-    RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
-      for (size_t i = next.fetch_add(1); i < ranges.size();
-           i = next.fetch_add(1)) {
-        const auto [s, begin, end] = ranges[i];
-        const std::vector<uint8_t>* keep =
-            rank_keep.empty() ? nullptr : &rank_keep[s];
-        auto relation = FinishCompactGroups(&runtimes[worker], *sets[s], input,
-                                            aggregates[s], plans[s], groups[s],
-                                            nullptr, begin, end, keep);
-        if (!relation.HasValue()) {
-          errors[i] = relation.GetStatus();
-          continue;
-        }
-        shards[i] = relation.MoveValue();
-        shards[i].set_runtime(context.execution_runtime());
-      }
-    }));
-    for (const auto& error : errors) {
-      RETURN_IF_FAIL(error);
-    }
-    for (size_t s = 0; s < count; ++s) {
-      output[s].set_runtime(context.execution_runtime());
-      CopyExecutionStats(&output[s], input);
-    }
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      const size_t s = ranges[i].set;
-      if (ranges[i].begin == 0 ||
-          (output[s].rows.empty() && shards[i].TotalRows() > 0)) {
-        output[s].schema = shards[i].schema;
-      }
-      RETURN_IF_FAIL(shards[i].FinishSpill());
-      output[s].MergeInMemoryShard(std::move(shards[i]));
-      RETURN_IF_FAIL(output[s].GetStatus());
-    }
-    if (auto* runtime = context.execution_runtime()) {
-      for (const auto& local : runtimes) {
-        runtime->aggregate_input_rows += local.aggregate_input_rows;
-        runtime->aggregate_groups += local.aggregate_groups;
-        runtime->aggregate_updates += local.aggregate_updates;
-        runtime->relation_spills += local.relation_spills;
-      }
-    }
-  } else {
-    for (size_t s = 0; s < count; ++s) {
-      ASSIGN_OR_RETURN(
-          Relation, relation,
-          (FinishCompactGroups(context.execution_runtime(), *sets[s], input,
-                               aggregates[s], plans[s], groups[s], nullptr, 0,
-                               SIZE_MAX,
-                               rank_keep.empty() ? nullptr : &rank_keep[s])));
-      output[s] = std::move(relation);
-    }
-  }
-  phase("emit");
-  if (auto* runtime = context.execution_runtime()) {
-    runtime->project_ms += ElapsedMs(started);
-  }
-  return std::optional<std::vector<Relation>>(std::move(output));
-}
-
-namespace {
-std::shared_ptr<const LSTableStore> SnapshotColumnStore(
-    TransactionContext& context, const Table& table,
-    const std::vector<slot_t>& projection, size_t column_count) {
-  std::vector<slot_t> needed = projection;
-  if (projection.empty()) {
-    needed.reserve(column_count);
-    for (size_t c = 0; c < column_count; ++c) {
-      needed.push_back(static_cast<slot_t>(c));
-    }
-  }
-  std::shared_ptr<const LSTableStore> store =
-      GetOrBuildLSTableStore(context.txn_, table, true, &needed);
-  if (store != nullptr &&
-      store->layout_generation == table.LayoutGeneration() &&
-      store->first_pid == table.FirstPageId()) {
-    bool valid = true;
-    if (store->uncommitted_owner_txn != 0) {
-      valid = (store->uncommitted_owner_txn == context.txn_.ID());
-    } else if (!context.txn_.IsReadOnly() && !context.txn_.WriteSetEmpty()) {
-      valid = false;
-    } else if (context.txn_.HasAnyPageVersionChains()) {
-      for (const page_id_t pid : store->page_ids) {
-        if (context.txn_.HasPageVersionChains(pid) ||
-            store->FindBlock(pid) == nullptr) {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) {
-      return store;
-    }
-  }
-  return nullptr;
-}
-
-uint32_t ReadDictionaryCode(const LSTableColumnDictionary& dictionary,
-                            size_t row) noexcept {
-  if (dictionary.active) {
-    return dictionary.narrow_codes[row];
-  }
-  if (dictionary.packed_code_bits != 0) {
-    return dictionary.DictionaryCodeAt(row);
-  }
-  const auto* data =
-      dictionary.wide_codes.data() + (row * dictionary.wide_code_bytes);
-  if (dictionary.wide_code_bytes == 2) {
-    uint16_t code = 0;
-    std::memcpy(&code, data, sizeof(code));
-    return code;
-  }
-  uint32_t code = 0;
-  std::memcpy(&code, data, sizeof(code));
-  return code;
-}
-
-struct EncodedDictionaryPredicate {
-  const LSTableColumnDictionary* dictionary;
-  size_t null_code;
-  std::vector<uint8_t> allowed;
-  std::optional<bool> constant;
-  double domain_fraction;
-
-  [[nodiscard]] bool Matches(size_t row) const noexcept {
-    return constant
-               ? *constant
-               : allowed[std::min<size_t>(ReadDictionaryCode(*dictionary, row),
-                                          null_code)] != 0;
-  }
-};
-
-// These masks contain only non-throwing comparisons. Remove proven true
-// predicates and try the narrowest accepted dictionary domain first. This is
-// a selectivity estimate, never a proof that a particular row passes.
-void OrderDictionaryPredicates(
-    std::vector<EncodedDictionaryPredicate>& filters) {
-  std::erase_if(filters, [](const auto& filter) {
-    return filter.constant.value_or(false);
-  });
-  std::stable_sort(filters.begin(), filters.end(),
-                   [](const auto& a, const auto& b) {
-                     return a.domain_fraction < b.domain_fraction;
-                   });
-}
-
-template <typename Predicate>
-std::optional<EncodedDictionaryPredicate> CompileDictionaryMask(
-    const LSTableStore& store, slot_t column, bool string_payload,
-    Predicate&& predicate, QueryMemoryCharge& charge) {
-  const auto& dictionary = store.dictionaries[column];
-  if ((!dictionary.active && dictionary.wide_code_bytes != 2 &&
-       dictionary.wide_code_bytes != 4) ||
-      (string_payload ? dictionary.value_type != ValueType::kVarChar
-                      : (dictionary.value_type != ValueType::kInt64 &&
-                         dictionary.value_type != ValueType::kDate)) ||
-      dictionary.DictionaryCodeCount() != store.total_rows) {
-    return std::nullopt;
-  }
-  const size_t domain = string_payload ? dictionary.entries.size()
-                                       : dictionary.int_entries.size();
-  if (domain == SIZE_MAX ||
-      !QueryMemoryBudget::Global().CanReserve(domain + 1)) {
-    return std::nullopt;
-  }
-  charge.Add(domain + 1);
-  EncodedDictionaryPredicate result{
-      .dictionary = &dictionary,
-      .null_code = domain,
-      .allowed = std::vector<uint8_t>(domain + 1, 0),
-      .constant = std::nullopt,
-      .domain_fraction = 0};
-  size_t accepted = 0;
-  for (size_t code = 0; code < domain; ++code) {
-    const bool pass = predicate(dictionary, code);
-    result.allowed[code] = static_cast<uint8_t>(pass);
-    accepted += pass ? 1 : 0;
-  }
-  result.domain_fraction =
-      static_cast<double>(accepted) / static_cast<double>(domain + 1);
-  if (accepted == 0) {
-    result.constant = false;
-  } else if (accepted == domain && store.column_has_null[column] == 0) {
-    result.constant = true;
-  }
-  return result;
-}
-
-std::optional<EncodedDictionaryPredicate> CompileDictionaryPredicate(
-    const LSTableStore& store, const TypedFilterCompare& filter,
-    const std::vector<slot_t>& projection, QueryMemoryCharge& charge) {
-  if (!filter.constant_payload || filter.is_double) {
-    return std::nullopt;
-  }
-  const slot_t column =
-      projection.empty() ? filter.left : projection[filter.left];
-  const auto matches = [](auto a, auto b, BinaryOperation op) {
-    switch (op) {
-      case BinaryOperation::kEquals:
-        return a == b;
-      case BinaryOperation::kNotEquals:
-        return a != b;
-      case BinaryOperation::kLessThan:
-        return a < b;
-      case BinaryOperation::kLessThanEquals:
-        return a <= b;
-      case BinaryOperation::kGreaterThan:
-        return a > b;
-      default:
-        return a >= b;
-    }
-  };
-  return CompileDictionaryMask(
-      store, column, filter.string_payload,
-      [&](const LSTableColumnDictionary& dictionary, size_t code) {
-        return filter.string_payload
-                   ? MatchTypedStringCompare(dictionary.entries[code], filter)
-                   : matches(dictionary.int_entries[code], filter.int_constant,
-                             filter.op);
-      },
-      charge);
-}
-
-std::optional<EncodedDictionaryPredicate> CompileDictionaryInList(
-    const LSTableStore& store, const TypedInListCompare& filter,
-    const std::vector<slot_t>& projection, QueryMemoryCharge& charge) {
-  if (filter.is_double || filter.prefix_len != 0) {
-    return std::nullopt;
-  }
-  const slot_t column =
-      projection.empty() ? filter.column : projection[filter.column];
-  return CompileDictionaryMask(
-      store, column, filter.is_string,
-      [&](const LSTableColumnDictionary& dictionary, size_t code) {
-        return filter.is_string
-                   ? std::ranges::find(filter.strings,
-                                       dictionary.entries[code]) !=
-                         filter.strings.end()
-                   : std::ranges::find(filter.int_values,
-                                       dictionary.int_entries[code]) !=
-                         filter.int_values.end();
-      },
-      charge);
-}
-
-// A proven unique grouping key makes every group a singleton. COUNT(*) is
-// then constant, so ordering exclusively by it (and constants) cannot change
-// the LIMIT tie boundary. Only direct, non-throwing inputs may skip unseen
-// groups: computed keys, residual predicates and aggregate modifiers retain
-// the ordinary path, including their errors outside the returned prefix.
-StatusOr<std::optional<Relation>> TryUniqueGroupLimit(
-    const LSTableStore& store, const TypedAggregationPlan& plan,
-    const SelectStatement& statement, const std::vector<slot_t>& projection,
-    const Schema& schema, ExecutionRuntime* runtime) try {
-  if (!statement.HasLimit() || statement.WithTies() || statement.Distinct() ||
-      statement.Having() || !plan.dependent_key_programs.empty() ||
-      !plan.filter_programs.empty() || !plan.filter_disjunctions.empty() ||
-      !plan.inlist_compares.empty() ||
-      statement.Offset() > SIZE_MAX - statement.Limit()) {
-    return std::optional<Relation>{};
-  }
-  const size_t capacity = statement.Offset() + statement.Limit();
-  if (capacity > store.total_rows / 2) {
-    return std::optional<Relation>{};
-  }
-  const auto column_at = [&](slot_t offset) {
-    return projection.empty() ? offset : projection[offset];
-  };
-  if (std::ranges::none_of(plan.key_offsets, [&](slot_t offset) {
-        const slot_t column = column_at(offset);
-        return column < store.column_is_unique_nonnull.size() &&
-               store.column_is_unique_nonnull[column] != 0;
-      })) {
-    return std::optional<Relation>{};
-  }
-  for (const auto& item : plan.order_items) {
-    if (!item.constant &&
-        (item.is_key || item.dependent_key ||
-         !IsCountStar(*plan.aggregates[item.index].aggregate))) {
-      return std::optional<Relation>{};
-    }
-  }
-  for (const auto& input : plan.aggregates) {
-    const auto& aggregate = *input.aggregate;
-    if (aggregate.WhereFilter() || aggregate.NeedsGroupContext() ||
-        aggregate.HasInnerGroupBy() ||
-        aggregate.Having() != AggregateHavingModifier::kNone ||
-        aggregate.HavingCondition() || !aggregate.InnerOrderBy().empty() ||
-        aggregate.SecondaryArg() || !aggregate.ExtraArgs().empty() ||
-        !aggregate.TrailingArgs().empty()) {
-      return std::optional<Relation>{};
-    }
-    if (IsCountStar(aggregate)) {
-      continue;
-    }
-    if (!input.column || input.child || input.conditional || input.int_expr ||
-        input.double_expr) {
-      return std::optional<Relation>{};
-    }
-    const auto& column = schema.GetColumn(*input.column);
-    const auto type = aggregate.GetType();
-    if (type != AggregationType::kCount &&
-        (column.IsUnsigned() || column.IsInterval() ||
-         (column.Type() != ValueType::kInt64 &&
-          column.Type() != ValueType::kDouble) ||
-         (type != AggregationType::kSum && type != AggregationType::kAvg &&
-          type != AggregationType::kMin && type != AggregationType::kMax))) {
-      return std::optional<Relation>{};
-    }
-  }
-  const auto started = std::chrono::steady_clock::now();
-  Relation output(runtime);
-  size_t visited = 0;
-  std::vector<Column> columns;
-  for (size_t i = 0; i < plan.emit_items.size(); ++i) {
-    const auto& item = plan.emit_items[i];
-    ValueType type = ValueType::kNull;
-    bool is_unsigned = false;
-    if (item.constant) {
-      type = ValueTypeOf(*item.constant);
-      is_unsigned = item.constant->IsUnsigned();
-    } else if (item.is_key) {
-      const auto& column = schema.GetColumn(plan.key_offsets[item.index]);
-      type = column.Type();
-      is_unsigned = column.IsUnsigned();
-    } else {
-      const auto& input = plan.aggregates[item.index];
-      const auto kind = input.aggregate->GetType();
-      type = kind == AggregationType::kCount ? ValueType::kInt64
-             : kind == AggregationType::kAvg
-                 ? ValueType::kDouble
-                 : schema.GetColumn(*input.column).Type();
-    }
-    columns.emplace_back(ProjectionName(statement.SelectList()[i], i), type);
-    columns.back().SetUnsigned(is_unsigned);
-  }
-  for (const auto& block : store.blocks) {
-    for (size_t row = 0; row < block.row_count && output.TotalRows() < capacity;
-         ++row) {
-      ++visited;
-      const auto value_at = [&](slot_t offset) {
-        const auto& column = block.columns[column_at(offset)];
-        if (column.IsNull(row)) {
-          return Value();
-        }
-        if (column.type == ValueType::kVarChar) {
-          return Value(std::string(column.VarcharAt(row)));
-        }
-        Value value;
-        value.type = column.type;
-        value.value.int_value = column.int_cells[row];
-        if (column.is_unsigned) {
-          value.SetUnsigned();
-        }
-        return value;
-      };
-      const bool keep = std::ranges::all_of(
-          plan.filter_compares, [&](const TypedFilterCompare& compare) {
-            const Value left = value_at(compare.left);
-            const Value right =
-                compare.constant_payload ? left : value_at(compare.right);
-            return !left.IsNull() && !right.IsNull() &&
-                   DecideTypedFilterCompare(left, right, compare);
-          });
-      if (!keep) {
-        continue;
-      }
-      std::vector<Value> finished;
-      finished.reserve(plan.aggregates.size());
-      for (const auto& input : plan.aggregates) {
-        AggregateAccumulator state(input.aggregate, &schema);
-        RETURN_IF_FAIL(state.Add(IsCountStar(*input.aggregate)
-                                     ? Value(1)
-                                     : value_at(*input.column)));
-        ASSIGN_OR_RETURN(Value, value, state.TryFinish());
-        finished.push_back(std::move(value));
-      }
-      std::vector<Value> values;
-      values.reserve(plan.emit_items.size());
-      for (const auto& item : plan.emit_items) {
-        values.push_back(item.constant ? *item.constant
-                         : item.is_key ? value_at(plan.key_offsets[item.index])
-                                       : finished[item.index]);
-      }
-      output.AddRow(Row(std::move(values)));
-      RETURN_IF_FAIL(output.GetStatus());
-    }
-    if (output.TotalRows() == capacity) {
-      break;
-    }
-  }
-  if (runtime != nullptr) {
-    runtime->scan_rows += visited;
-    runtime->scan_output_rows += output.TotalRows();
-    runtime->aggregate_input_rows += output.TotalRows();
-    runtime->aggregate_groups += output.TotalRows();
-    runtime->aggregate_updates += output.TotalRows() * plan.aggregates.size();
-    runtime->aggregate_ms += ElapsedMs(started);
-  }
-  output.schema = Schema("", std::move(columns));
-  RETURN_IF_FAIL(output.FinishSpill());
-  return std::optional<Relation>(std::move(output));
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError, "singleton aggregate failed");
-}
-
-// Packed dictionary pairs are unsigned integers. Stable byte passes avoid
-// comparison sorting for large inputs; constant bytes need no pass.
-void SortSparseDistinctPairs(std::vector<uint64_t>& pairs) {
-  if (pairs.size() < 2048) {
-    std::ranges::sort(pairs);
-    return;
-  }
-  uint64_t varying = 0;
-  for (const uint64_t pair : pairs) {
-    varying |= pair ^ pairs.front();
-  }
-  std::vector<uint64_t> scratch(pairs.size());
-  for (unsigned shift = 0; shift < 64; shift += 8) {
-    if (((varying >> shift) & 0xffU) == 0) {
-      continue;
-    }
-    std::array<size_t, 256> offsets{};
-    for (const uint64_t pair : pairs) {
-      ++offsets[(pair >> shift) & 0xffU];
-    }
-    size_t position = 0;
-    for (size_t& offset : offsets) {
-      const size_t count = offset;
-      offset = position;
-      position += count;
-    }
-    for (const uint64_t pair : pairs) {
-      scratch[offsets[(pair >> shift) & 0xffU]++] = pair;
-    }
-    pairs.swap(scratch);
-  }
-}
-
-// Exact whole-column bounds cover every filtered subset, group, prefix and
-// worker subtotal. AVG also requires exact addition of promoted DOUBLE inputs.
-// Keep NULLs, unsigned values and unproved arithmetic on the ordinary path.
-const int64_t* BoundedIntegerAggregateColumn(
-    const LSTableStore& store, const TypedAggregateInput& input,
-    const std::vector<slot_t>& projection) {
-  const auto type = input.aggregate->GetType();
-  if (!input.column || input.aggregate->Distinct() ||
-      (type != AggregationType::kSum && type != AggregationType::kAvg)) {
-    return nullptr;
-  }
-  const slot_t column =
-      projection.empty() ? *input.column : projection[*input.column];
-  if (store.blocks.empty() || store.total_rows == 0 ||
-      store.blocks.front().columns[column].type != ValueType::kInt64 ||
-      store.blocks.front().columns[column].is_unsigned ||
-      store.column_has_null[column] != 0 ||
-      store.integer_columns[column].size() != store.total_rows ||
-      store.column_min_int[column] > store.column_max_int[column]) {
-    return nullptr;
-  }
-  const __int128_t lo = store.column_min_int[column];
-  const __int128_t hi = store.column_max_int[column];
-  const __int128_t maximum = std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi);
-  const __int128_t limit = type == AggregationType::kAvg
-                               ? static_cast<__int128_t>(int64_t{1} << 53)
-                               : static_cast<__int128_t>(INT64_MAX);
-  if (maximum > limit / store.total_rows) {
-    return nullptr;
-  }
-  return store.integer_columns[column].data();
-}
-
-// A shared dictionary with SQL-distinct entries is already a perfect group
-// index. Count by code, merge counters, and decode only the TopN winners.
-// The caller must first establish the store's snapshot and cache validity.
-StatusOr<std::optional<Relation>> TryDictionaryCountTopN(
-    const LSTableStore& store, const TypedAggregationPlan& plan,
-    const SelectStatement& statement, const std::vector<slot_t>& projection,
-    ExecutionRuntime* runtime,
-    const std::function<StatusOr<Value>(size_t)>* transform_key = nullptr,
-    const UtcTimestampTruncUnit* temporal_unit = nullptr) try {
-  if (plan.key_offsets.size() != 1 || !plan.filter_programs.empty() ||
-      !plan.filter_disjunctions.empty() || statement.Distinct() ||
-      !statement.HasLimit() || statement.WithTies() ||
-      statement.Offset() > SIZE_MAX - statement.Limit() ||
-      store.total_rows > static_cast<uint64_t>(INT64_MAX) ||
-      !std::ranges::all_of(plan.filter_compares, [](const auto& compare) {
-        return compare.constant_payload;
-      })) {
-    return std::optional<Relation>{};
-  }
-  const auto column_at = [&](slot_t offset) {
-    return projection.empty() ? offset : projection[offset];
-  };
-  const LSTableColumnDictionary* distinct_dictionary = nullptr;
-  std::vector<const int64_t*> numeric_inputs;
-  std::vector<size_t> numeric_slots(plan.aggregates.size(), SIZE_MAX);
-  for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-    const auto& input = plan.aggregates[i];
-    if (IsCountStar(*input.aggregate) && !input.aggregate->Distinct()) {
-      continue;
-    }
-    const auto type = input.aggregate->GetType();
-    if (transform_key == nullptr && input.column &&
-        !input.aggregate->Distinct() &&
-        (type == AggregationType::kSum || type == AggregationType::kAvg)) {
-      const int64_t* column =
-          BoundedIntegerAggregateColumn(store, input, projection);
-      if (column == nullptr) {
-        return std::optional<Relation>{};
-      }
-      numeric_slots[i] = numeric_inputs.size();
-      numeric_inputs.push_back(column);
-      continue;
-    }
-    // One shared bitmap can serve repeated COUNT(DISTINCT column) terms.
-    // Keep casts/expressions on the normal path: dictionary-code equality
-    // need not equal equality after evaluating a cast.
-    if (transform_key != nullptr || !input.column ||
-        input.aggregate->GetType() != AggregationType::kCount ||
-        !input.aggregate->Distinct() || !input.aggregate->Child() ||
-        input.aggregate->Child()->Type() != TypeTag::kColumnValue) {
-      return std::optional<Relation>{};
-    }
-    const auto& argument = store.dictionaries[column_at(*input.column)];
-    if ((distinct_dictionary != nullptr && distinct_dictionary != &argument) ||
-        (argument.value_type != ValueType::kInt64 &&
-         argument.value_type != ValueType::kDate) ||
-        (!argument.active && argument.wide_code_bytes != 2 &&
-         argument.wide_code_bytes != 4) ||
-        argument.DictionaryCodeCount() != store.total_rows) {
-      return std::optional<Relation>{};
-    }
-    distinct_dictionary = &argument;
-  }
-  const slot_t key_column = column_at(plan.key_offsets.front());
-  const auto& dictionary = store.dictionaries[key_column];
-  const bool numeric_dictionary = dictionary.value_type == ValueType::kInt64 ||
-                                  dictionary.value_type == ValueType::kDate;
-  if (dictionary.wide_code_bytes == 0 ||
-      (!numeric_dictionary && transform_key == nullptr &&
-       !dictionary.bytewise_equality)) {
-    return std::optional<Relation>{};
-  }
-  const size_t dependent_count = plan.dependent_key_programs.size();
-  // The planner compiles dependent expressions against the plain signed
-  // integer keys. Transformed/string/date dictionaries keep their old path.
-  if (dependent_count != 0 && (dictionary.value_type != ValueType::kInt64 ||
-                               transform_key != nullptr)) {
-    return std::optional<Relation>{};
-  }
-  const size_t domain = (numeric_dictionary ? dictionary.int_entries.size()
-                                            : dictionary.entries.size()) +
-                        1;
-  const size_t null_code = domain - 1;
-  const size_t workers = ParallelWorkerCount(store.blocks.size());
-  // Two counters per worker/code, the result permutation and predicate mask.
-  size_t bytes_per_code =
-      (workers * 2 * sizeof(uint64_t)) + sizeof(size_t) + sizeof(uint8_t) +
-      (transform_key == nullptr ? 0 : (sizeof(Value) * 2) + 128);
-  size_t dependent_bytes_per_code = 0;
-  size_t numeric_bytes_per_code = 0;
-  if (__builtin_mul_overflow(dependent_count, sizeof(Value),
-                             &dependent_bytes_per_code) ||
-      __builtin_add_overflow(bytes_per_code, dependent_bytes_per_code,
-                             &bytes_per_code) ||
-      __builtin_mul_overflow(numeric_inputs.size(), workers * sizeof(int64_t),
-                             &numeric_bytes_per_code) ||
-      __builtin_add_overflow(bytes_per_code, numeric_bytes_per_code,
-                             &bytes_per_code)) {
-    return std::optional<Relation>{};
-  }
-  if (store.blocks.size() > SIZE_MAX / sizeof(uint64_t) - 1 ||
-      domain > (SIZE_MAX - ((store.blocks.size() + 1) * sizeof(uint64_t))) /
-                   bytes_per_code) {
-    return std::optional<Relation>{};
-  }
-  size_t bytes = (domain * bytes_per_code) +
-                 ((store.blocks.size() + 1) * sizeof(uint64_t));
-  const size_t distinct_domain = distinct_dictionary == nullptr
-                                     ? 0
-                                     : distinct_dictionary->int_entries.size();
-  const auto distinct_code_bits = static_cast<unsigned>(
-      distinct_domain == 0 ? 0 : std::bit_width(distinct_domain - 1));
-  // The product is an exact domain bound, not an NDV estimate. If the bitmap
-  // would be too large, retain only observed (group, argument) code pairs.
-  const size_t words_per_group =
-      (distinct_domain / 64) + (distinct_domain % 64 != 0 ? 1 : 0);
-  size_t bitmap_words = 0;
-  size_t bitmap_bytes = 0;
-  bool sparse_distinct = false;
-  size_t pair_capacity = 0;
-  if (__builtin_mul_overflow(domain, words_per_group, &bitmap_words) ||
-      __builtin_mul_overflow(bitmap_words, workers * sizeof(uint64_t),
-                             &bitmap_bytes) ||
-      bitmap_bytes > size_t{64} * 1024 * 1024) {
-    if (null_code > UINT32_MAX || distinct_domain > UINT32_MAX) {
-      return std::optional<Relation>{};
-    }
-    // Bound resident pairs, not input cardinality. Full buffers become sorted
-    // unique runs; binary external merges retain logarithmically many files.
-    // Reserve scratch/output plus fixed merge I/O buffers per worker.
-    const size_t io_bytes = workers * (size_t{128} << 10);
-    const size_t available = std::min<size_t>(
-        size_t{64} << 20, QueryMemoryBudget::Global().Remaining() / 2);
-    if (available <= io_bytes + (workers * 2 * sizeof(uint64_t))) {
-      return std::optional<Relation>{};
-    }
-    bitmap_bytes = available;
-    pair_capacity = (available - io_bytes) / (workers * 2 * sizeof(uint64_t));
-    bitmap_words = 0;
-    sparse_distinct = true;
-  }
-  if (__builtin_add_overflow(bytes, bitmap_bytes, &bytes) ||
-      (distinct_dictionary != nullptr &&
-       (__builtin_mul_overflow(domain, sizeof(uint64_t), &bitmap_bytes) ||
-        __builtin_add_overflow(bytes, bitmap_bytes, &bytes)))) {
-    return std::optional<Relation>{};
-  }
-  if (!QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return std::optional<Relation>{};
-  }
-  QueryMemoryCharge charge(bytes);
-  const auto started = std::chrono::steady_clock::now();
-  const auto matches = [](auto left, auto right, BinaryOperation op) {
-    switch (op) {
-      case BinaryOperation::kEquals:
-        return left == right;
-      case BinaryOperation::kNotEquals:
-        return left != right;
-      case BinaryOperation::kLessThan:
-        return left < right;
-      case BinaryOperation::kLessThanEquals:
-        return left <= right;
-      case BinaryOperation::kGreaterThan:
-        return left > right;
-      default:
-        return left >= right;
-    }
-  };
-  std::vector<uint8_t> allowed(domain, 1);
-  std::vector<TypedFilterCompare> filters;
-  for (const auto& compare : plan.filter_compares) {
-    if (compare.string_payload && column_at(compare.left) == key_column) {
-      for (size_t code = 0; code < null_code; ++code) {
-        allowed[code] &= static_cast<uint8_t>(
-            MatchTypedStringCompare(dictionary.entries[code], compare));
-      }
-      allowed[null_code] = 0;
-    } else if (numeric_dictionary && !compare.string_payload &&
-               !compare.is_double && column_at(compare.left) == key_column) {
-      for (size_t code = 0; code < null_code; ++code) {
-        allowed[code] &= static_cast<uint8_t>(matches(
-            dictionary.int_entries[code], compare.int_constant, compare.op));
-      }
-      allowed[null_code] = 0;
-    } else {
-      filters.push_back(compare);
-      filters.back().left = column_at(compare.left);
-    }
-  }
-  std::vector<EncodedDictionaryPredicate> encoded_filters;
-  bool all_encoded = true;
-  for (const auto& compare : filters) {
-    auto encoded = CompileDictionaryPredicate(store, compare, {}, charge);
-    if (!encoded) {
-      all_encoded = false;
-      break;
-    }
-    encoded_filters.push_back(std::move(*encoded));
-  }
-  for (const auto& list : plan.inlist_compares) {
-    auto encoded = CompileDictionaryInList(store, list, projection, charge);
-    if (!all_encoded || !encoded) {
-      return std::optional<Relation>{};
-    }
-    encoded_filters.push_back(std::move(*encoded));
-  }
-  OrderDictionaryPredicates(encoded_filters);
-  std::vector<uint64_t> row_base(store.blocks.size() + 1, 0);
-  for (size_t block = 0; block < store.blocks.size(); ++block) {
-    row_base[block + 1] = row_base[block] + store.blocks[block].row_count;
-  }
-  struct Counts {
-    std::vector<uint64_t> count;
-    std::vector<uint64_t> first;
-    std::vector<uint64_t> distinct;
-    std::vector<uint64_t> distinct_pairs;
-    SortedDistinctRuns runs;
-    Status error{Status::kSuccess};
-    std::vector<int64_t> sums;
-  };
-  std::vector<Counts> local(workers);
-  const auto execute_worker = [&]<bool Sparse>(size_t worker) {
-    auto& state = local[worker];
-    state.count.resize(domain, 0);
-    state.first.resize(domain, UINT64_MAX);
-    state.distinct.resize(bitmap_words, 0);
-    if constexpr (Sparse) {
-      const size_t begin =
-          all_encoded ? store.total_rows * worker / workers
-                      : row_base[store.blocks.size() * worker / workers];
-      const size_t end =
-          all_encoded ? store.total_rows * (worker + 1) / workers
-                      : row_base[store.blocks.size() * (worker + 1) / workers];
-      state.distinct_pairs.reserve(std::min(end - begin, pair_capacity));
-    }
-    state.sums.resize(numeric_inputs.size() * domain, 0);
-    const auto observe_arguments = [&](size_t group, size_t row) {
-      if (distinct_dictionary != nullptr) {
-        const size_t code = ReadDictionaryCode(*distinct_dictionary, row);
-        // NULL is excluded from COUNT(DISTINCT), but the group itself still
-        // exists, even when all of its argument values are NULL.
-        if (code < distinct_domain) {
-          if constexpr (Sparse) {
-            if (!state.error.ok()) {
-              return;
-            }
-            if (state.distinct_pairs.size() == pair_capacity) {
-              SortSparseDistinctPairs(state.distinct_pairs);
-              const auto duplicates = std::ranges::unique(state.distinct_pairs);
-              state.distinct_pairs.erase(duplicates.begin(), duplicates.end());
-              state.error = state.runs.Add(state.distinct_pairs);
-              state.distinct_pairs.clear();
-              if (!state.error.ok()) {
-                return;
+            if (!map_initialized) {
+              representative = Row(
+                  std::vector<Value>(qualified_schema.ColumnCount(), Value()));
+              aggregate_results.reserve(naggs);
+              for (size_t a = 0; a < naggs; ++a) {
+                aggregate_results.emplace(plan.aggregates[a].aggregate,
+                                          finished[a]);
+              }
+              map_initialized = true;
+            } else {
+              for (size_t a = 0; a < naggs; ++a) {
+                aggregate_results[plan.aggregates[a].aggregate] = finished[a];
               }
             }
-            state.distinct_pairs.push_back(
-                (static_cast<uint64_t>(group) << distinct_code_bits) |
-                static_cast<uint64_t>(code));
+            representative.values_[key_proj] = key_val;
+            Scope scope{.row = &representative,
+                        .schema = &qualified_schema,
+                        .outer = nullptr};
+            scope.aggregates = &aggregate_results;
+            StatusOr<Value> having_value = TryEvaluate(
+                having_expr, scope, &aggregate_results, context, ctes);
+            if (!having_value.HasValue()) {
+              emit_errors[ew] = having_value.GetStatus();
+              return;
+            }
+            if (!Truthy(having_value.MoveValue())) {
+              continue;
+            }
+          }
+        }
+        std::vector<Value> row_values;
+        row_values.reserve(plan.emit_items.size());
+        for (const TypedEmitItem& item : plan.emit_items) {
+          if (item.constant) {
+            row_values.push_back(*item.constant);
+          } else if (item.is_key) {
+            row_values.push_back(key_val);
           } else {
-            state.distinct[(group * words_per_group) + (code / 64)] |=
-                uint64_t{1} << (code % 64);
+            row_values.push_back(finished[item.index]);
           }
         }
+        out.emplace_back(std::move(row_values));
       }
-      for (size_t i = 0; i < numeric_inputs.size(); ++i) {
-        state.sums[(i * domain) + group] += numeric_inputs[i][row];
-      }
-    };
-    if (all_encoded) {
-      // Evaluate predicates by code and traverse contiguous compressed columns
-      // without chasing the metadata of every row-storage page.
-      const size_t rows = dictionary.DictionaryCodeCount();
-      for (size_t row = rows * worker / workers;
-           row < rows * (worker + 1) / workers; ++row) {
-        if (!std::ranges::all_of(encoded_filters, [&](const auto& filter) {
-              return filter.Matches(row);
-            })) {
-          continue;
-        }
-        const size_t code =
-            std::min<size_t>(ReadDictionaryCode(dictionary, row), null_code);
-        if (allowed[code] != 0) {
-          if (state.count[code]++ == 0) {
-            state.first[code] = row;
-          }
-          observe_arguments(code, row);
-        }
-      }
-      if constexpr (Sparse) {
-        SortSparseDistinctPairs(state.distinct_pairs);
-        const auto duplicates = std::ranges::unique(state.distinct_pairs);
-        state.distinct_pairs.erase(duplicates.begin(), duplicates.end());
-      }
-      return;
-    }
-    std::vector<const TypedFilterCompare*> remaining;
-    for (size_t b = store.blocks.size() * worker / workers;
-         b < store.blocks.size() * (worker + 1) / workers; ++b) {
-      const auto& block = store.blocks[b];
-      const auto& key = block.columns[key_column];
-      remaining.clear();
-      for (const auto& filter : filters) {
-        const auto& column = block.columns[filter.left];
-        // Integer zone maps prove an entire block passes. For <> the two
-        // endpoints alone do not exclude a matching value in the interior.
-        bool all_pass = false;
-        if (!filter.string_payload && !filter.is_double && !column.has_null &&
-            column.has_min_max) {
-          all_pass =
-              filter.op == BinaryOperation::kNotEquals
-                  ? (filter.int_constant < column.min_int ||
-                     filter.int_constant > column.max_int)
-                  : (matches(column.min_int, filter.int_constant, filter.op) &&
-                     matches(column.max_int, filter.int_constant, filter.op));
-        }
-        if (!all_pass) {
-          remaining.push_back(&filter);
-        }
-      }
-      for (size_t r = 0; r < block.row_count; ++r) {
-        const size_t code = key.IsNull(r) ? null_code : key.DictionaryCodeAt(r);
-        if (allowed[code] == 0) {
-          continue;
-        }
-        bool pass = true;
-        for (const auto* filter : remaining) {
-          const auto& column = block.columns[filter->left];
-          if (column.IsNull(r)) {
-            pass = false;
-          } else if (filter->string_payload) {
-            pass = MatchTypedStringCompare(column.VarcharAt(r), *filter);
-          } else if (filter->is_double) {
-            pass = matches(std::bit_cast<double>(column.int_cells[r]),
-                           filter->double_constant, filter->op);
-          } else {
-            pass =
-                matches(column.int_cells[r], filter->int_constant, filter->op);
-          }
-          if (!pass) {
-            break;
-          }
-        }
-        if (pass) {
-          if (state.count[code]++ == 0) {
-            state.first[code] = row_base[b] + r;
-          }
-          observe_arguments(code, row_base[b] + r);
-        }
-      }
-    }
-    if constexpr (Sparse) {
-      SortSparseDistinctPairs(state.distinct_pairs);
-      const auto duplicates = std::ranges::unique(state.distinct_pairs);
-      state.distinct_pairs.erase(duplicates.begin(), duplicates.end());
-    }
-  };
-  RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
-    if (sparse_distinct) {
-      execute_worker.template operator()<true>(worker);
-    } else {
-      execute_worker.template operator()<false>(worker);
+    } catch (const std::exception& error) {
+      emit_errors[ew] = StatusError(StatusCode::kRuntimeError, error.what());
+    } catch (...) {
+      emit_errors[ew] =
+          StatusError(StatusCode::kRuntimeError, "bounded int emit failed");
     }
   }));
-  for (const auto& state : local) {
-    RETURN_IF_FAIL(state.error);
-  }
-  auto& merged = local.front();
-  for (size_t w = 1; w < workers; ++w) {
-    for (size_t code = 0; code < domain; ++code) {
-      merged.count[code] += local[w].count[code];
-      merged.first[code] = std::min(merged.first[code], local[w].first[code]);
-    }
-    for (size_t word = 0; word < bitmap_words; ++word) {
-      merged.distinct[word] |= local[w].distinct[word];
-    }
-    for (size_t cell = 0; cell < merged.sums.size(); ++cell) {
-      merged.sums[cell] += local[w].sums[cell];
+
+  for (const Status& err : emit_errors) {
+    if (!err.ok()) {
+      return err;
     }
   }
-  std::vector<uint64_t> distinct_counts;
-  if (distinct_dictionary != nullptr) {
-    distinct_counts.resize(domain, 0);
-    if (sparse_distinct) {
-      const bool spilled = std::ranges::any_of(
-          local, [](const Counts& state) { return !state.runs.Empty(); });
-      if (spilled) {
-        SortedDistinctRuns runs;
-        for (auto& state : local) {
-          RETURN_IF_FAIL(state.runs.Add(state.distinct_pairs));
-          std::vector<uint64_t>().swap(state.distinct_pairs);
-          RETURN_IF_FAIL(runs.Absorb(std::move(state.runs)));
-        }
-        RETURN_IF_FAIL(runs.ForEach([&](uint64_t pair) {
-          ++distinct_counts[pair >> distinct_code_bits];
-        }));
-      } else {
-        auto pairs = std::move(local.front().distinct_pairs);
-        for (size_t w = 1; w < workers; ++w) {
-          const auto& right = local[w].distinct_pairs;
-          std::vector<uint64_t> next;
-          next.reserve(pairs.size() + right.size());
-          std::set_union(pairs.begin(), pairs.end(), right.begin(), right.end(),
-                         std::back_inserter(next));
-          pairs.swap(next);
-          // Release consumed inputs before merging the next worker. At peak,
-          // the retained inputs and merge output hold at most two pairs/row.
-          std::vector<uint64_t>().swap(local[w].distinct_pairs);
-        }
-        for (const uint64_t pair : pairs) {
-          ++distinct_counts[pair >> distinct_code_bits];
-        }
-      }
-    } else {
-      for (size_t code = 0; code < domain; ++code) {
-        for (size_t word = 0; word < words_per_group; ++word) {
-          distinct_counts[code] += static_cast<uint64_t>(
-              std::popcount(merged.distinct[(code * words_per_group) + word]));
-        }
-      }
-    }
+
+  std::vector<Column> output_columns;
+  output_columns.reserve(stmt.SelectList().size());
+  for (size_t i = 0; i < stmt.SelectList().size(); ++i) {
+    output_columns.emplace_back(ProjectionName(stmt.SelectList()[i], i),
+                                ValueType::kNull);
   }
-  const auto aggregate_count = [&](size_t aggregate, size_t code) {
-    return plan.aggregates[aggregate].aggregate->Distinct()
-               ? distinct_counts[code]
-               : merged.count[code];
-  };
-  const auto aggregate_value = [&](size_t aggregate, size_t code) {
-    const size_t slot = numeric_slots[aggregate];
-    if (slot == SIZE_MAX) {
-      return Value(static_cast<int64_t>(aggregate_count(aggregate, code)));
-    }
-    const int64_t sum = merged.sums[(slot * domain) + code];
-    return plan.aggregates[aggregate].aggregate->GetType() ==
-                   AggregationType::kAvg
-               ? Value(static_cast<double>(sum) /
-                       static_cast<double>(merged.count[code]))
-               : Value(sum);
-  };
-  std::vector<Value> transformed_keys;
-  size_t group_domain = domain;
-  if (transform_key != nullptr) {
-    std::unordered_map<Value, size_t, DistinctValueHash, DistinctValueEqual>
-        ids;
-    ids.reserve(domain);
-    transformed_keys.reserve(domain);
-    Counts transformed;
-    transformed.count.reserve(domain);
-    transformed.first.reserve(domain);
-    for (size_t code = 0; code < domain; ++code) {
-      if (merged.count[code] == 0) {
-        continue;
-      }
-      // Only values observed after WHERE may raise an expression error.
-      // Evaluate all such values before LIMIT can hide a failing group.
-      Value value;
-      if (temporal_unit != nullptr) {
-        if (code != null_code) {
-          const auto temporal =
-              TryUtcTimestampTruncKey(dictionary.entries[code], *temporal_unit);
-          if (!temporal) {
-            // Do not mix packed keys with generic values. The ordinary
-            // evaluator handles unsupported spellings, timezones and errors.
-            return std::optional<Relation>{};
-          }
-          value = Value(*temporal);
-        }
-      } else {
-        ASSIGN_OR_RETURN(Value, evaluated, (*transform_key)(code));
-        value = std::move(evaluated);
-      }
-      Value canonical = CanonicalDistinctValue(value);
-      const size_t value_bytes = EstimateValueBytes(canonical) * 2;
-      if (!QueryMemoryBudget::Global().CanReserve(value_bytes)) {
-        return std::optional<Relation>{};
-      }
-      const auto [entry, inserted] = ids.try_emplace(canonical, ids.size());
-      if (inserted) {
-        charge.Add(value_bytes);
-        transformed_keys.push_back(std::move(canonical));
-        transformed.count.push_back(0);
-        transformed.first.push_back(UINT64_MAX);
-      }
-      const size_t id = entry->second;
-      transformed.count[id] += merged.count[code];
-      transformed.first[id] =
-          std::min(transformed.first[id], merged.first[code]);
-    }
-    merged = std::move(transformed);
-    group_domain = transformed_keys.size();
-  }
-  std::vector<size_t> groups;
-  groups.reserve(group_domain);
-  std::vector<Value> dependent_values(domain * dependent_count);
-  Row dependent_input(std::vector<Value>(dependent_count == 0 ? 0 : 1));
-  uint64_t input_rows = 0;
-  for (size_t code = 0; code < group_domain; ++code) {
-    if (merged.count[code] != 0) {
-      groups.push_back(code);
-      input_rows += merged.count[code];
-      if (dependent_count != 0) {
-        dependent_input[0] =
-            code == null_code ? Value() : Value(dictionary.int_entries[code]);
-        // Evaluate every observed group before TopN, including groups that
-        // will not be emitted. WHERE-rejected codes must not raise errors.
-        for (size_t k = 0; k < dependent_count; ++k) {
-          if (code != null_code &&
-              plan.dependent_key_inputs.size() == dependent_count) {
-            int64_t raw = 0;
-            Status error = Status::kSuccess;
-            if (EvaluateTypedIntExprCells(
-                    plan.dependent_key_inputs[k], &dictionary.int_entries[code],
-                    [](slot_t) { return false; }, &raw, &error)) {
-              dependent_values[(code * dependent_count) + k] = Value(raw);
-              continue;
-            }
-          }
-          // Preserve the reference evaluator's NULL/error order, including
-          // overflow in an intermediate operation whose final value fits.
-          ASSIGN_OR_RETURN(Value, value,
-                           TryEvaluateRowAuto(plan.dependent_key_programs[k],
-                                              dependent_input));
-          dependent_values[(code * dependent_count) + k] = std::move(value);
-        }
-      }
-    }
-  }
-  const auto precedes = [&](size_t left, size_t right) {
-    for (size_t i = 0; i < plan.order_items.size(); ++i) {
-      const auto& item = plan.order_items[i];
-      if (item.constant) {
-        continue;
-      }
-      int comparison = 0;
-      if (item.dependent_key) {
-        const auto& a =
-            dependent_values[(left * dependent_count) + *item.dependent_key];
-        const auto& b =
-            dependent_values[(right * dependent_count) + *item.dependent_key];
-        if (a.IsNull() || b.IsNull()) {
-          if (a.IsNull() == b.IsNull()) {
-            continue;
-          }
-          return a.IsNull() ? plan.order_nulls_first[i]
-                            : !plan.order_nulls_first[i];
-        }
-        comparison = CompareForOrderBy(a, b);
-      } else if (item.is_key) {
-        const bool left_null = transform_key != nullptr
-                                   ? transformed_keys[left].IsNull()
-                                   : left == null_code;
-        const bool right_null = transform_key != nullptr
-                                    ? transformed_keys[right].IsNull()
-                                    : right == null_code;
-        if (left_null || right_null) {
-          if (left_null == right_null) {
-            continue;
-          }
-          return left_null ? plan.order_nulls_first[i]
-                           : !plan.order_nulls_first[i];
-        }
-        if (transform_key != nullptr) {
-          comparison = CompareForOrderBy(transformed_keys[left],
-                                         transformed_keys[right]);
-        } else if (numeric_dictionary) {
-          comparison =
-              (dictionary.int_entries[left] > dictionary.int_entries[right]) -
-              (dictionary.int_entries[left] < dictionary.int_entries[right]);
-        } else {
-          // Borrow dictionary text only for this comparison. Value ordering
-          // also handles interval-shaped strings correctly.
-          Value a;
-          a.type = ValueType::kVarChar;
-          a.value.varchar_value = dictionary.entries[left];
-          Value b;
-          b.type = ValueType::kVarChar;
-          b.value.varchar_value = dictionary.entries[right];
-          comparison = CompareForOrderBy(a, b);
-        }
-      } else {
-        if (numeric_slots[item.index] == SIZE_MAX) {
-          const uint64_t a = aggregate_count(item.index, left);
-          const uint64_t b = aggregate_count(item.index, right);
-          comparison = (a > b) - (a < b);
-        } else {
-          comparison = CompareForOrderBy(aggregate_value(item.index, left),
-                                         aggregate_value(item.index, right));
-        }
-      }
-      if (comparison != 0) {
-        return plan.order_ascending[i] ? comparison < 0 : comparison > 0;
-      }
-    }
-    return merged.first[left] < merged.first[right];
-  };
-  const size_t capacity = statement.Offset() + statement.Limit();
-  const size_t retained = std::min(capacity, groups.size());
-  std::partial_sort(groups.begin(), groups.begin() + retained, groups.end(),
-                    precedes);
-  if (runtime != nullptr) {
-    runtime->scan_rows += store.total_rows;
-    runtime->scan_output_rows += input_rows;
-    ++runtime->typed_parallel_aggregations;
-    runtime->aggregate_input_rows += input_rows;
-    runtime->aggregate_updates += input_rows * plan.aggregates.size();
-    runtime->aggregate_groups += groups.size();
-    ++runtime->topn_finish_uses;
-    runtime->topn_finish_capacity = capacity;
-    runtime->topn_finish_input_rows = groups.size();
-    runtime->aggregate_ms += ElapsedMs(started);
-  }
-  groups.resize(retained);
   Relation output(runtime);
-  std::vector<Column> columns;
-  columns.reserve(statement.SelectList().size());
-  for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-    columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                         ValueType::kNull);
+  size_t total_out_rows = 0;
+  size_t formed_groups = 0;
+  for (size_t ew = 0; ew < emit_workers; ++ew) {
+    total_out_rows += emit_rows[ew].size();
+    formed_groups += emit_groups[ew];
   }
-  for (const size_t code : groups) {
-    std::vector<Value> values;
-    values.reserve(plan.emit_items.size());
-    for (const auto& item : plan.emit_items) {
-      if (item.dependent_key) {
-        values.push_back(
-            dependent_values[(code * dependent_count) + *item.dependent_key]);
-      } else if (item.constant) {
-        values.push_back(*item.constant);
-      } else if (item.is_key) {
-        if (transform_key != nullptr) {
-          if (temporal_unit != nullptr && !transformed_keys[code].IsNull()) {
-            ASSIGN_OR_RETURN(Value, formatted,
-                             FormatUtcTimestampTruncKey(
-                                 transformed_keys[code].value.int_value));
-            values.push_back(std::move(formatted));
-          } else {
-            values.push_back(transformed_keys[code]);
-          }
-        } else if (numeric_dictionary) {
-          values.push_back(
-              code == null_code
-                  ? Value()
-                  : (dictionary.value_type == ValueType::kDate
-                         ? Value::DateFromDays(dictionary.int_entries[code])
-                         : Value(dictionary.int_entries[code])));
-        } else {
-          values.push_back(code == null_code
-                               ? Value()
-                               : Value(std::string(dictionary.entries[code])));
-        }
-      } else {
-        values.push_back(aggregate_value(item.index, code));
-      }
+  output.rows.reserve(total_out_rows);
+  for (auto& er : emit_rows) {
+    for (Row& r : er) {
+      output.AddRow(std::move(r));
     }
-    if (output.TotalRows() == 0) {
-      for (size_t i = 0; i < columns.size(); ++i) {
-        columns[i] = Column(columns[i].Name(), ValueTypeOf(values[i]));
-        columns[i].SetUnsigned(values[i].IsUnsigned());
-      }
-    }
-    output.AddRow(Row(std::move(values)));
   }
-  RETURN_IF_FAIL(output.GetStatus());
-  output.schema = Schema("", std::move(columns));
+  if (!output.rows.empty()) {
+    for (size_t i = 0; i < output_columns.size(); ++i) {
+      output_columns[i] =
+          Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
+      output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
+    }
+  }
+  output.schema = Schema("", std::move(output_columns));
+
+  if (runtime != nullptr) {
+    const double scan_ms = ElapsedMs(scan_begin);
+    runtime->scan_ms += scan_ms;
+    runtime->filter_ms += scan_ms;
+    runtime->scan_rows += total_scanned;
+    runtime->scan_output_rows += total_matching;
+    runtime->scan_values_decoded +=
+        total_scanned * qualified_schema.ColumnCount();
+    runtime->scan_values_available +=
+        total_scanned * table_schema.ColumnCount();
+    runtime->typed_parallel_aggregations += 1;
+    runtime->aggregate_groups += formed_groups;
+    runtime->aggregate_input_rows += total_matching;
+    runtime->aggregate_updates += total_updates;
+    runtime->aggregate_ms += ElapsedMs(merge_begin);
+  }
   return std::optional<Relation>(std::move(output));
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError, "dictionary aggregate failed");
-}
-struct DictionaryCaseInput {
-  std::vector<TypedFilterCompare> conditions;
-  Value otherwise;
-};
-
-// Pack independent, SQL-distinct dictionary domains into one exact integer
-// key. NULL occupies one extra code in each domain. This avoids hashing or
-// copying variable-length values in a multi-column COUNT group. Key-only
-// constant predicates are evaluated once over each dictionary domain.
-StatusOr<std::optional<Relation>> TryCompositeDictionaryCountTopN(
-    const LSTableStore& store, const TypedAggregationPlan& plan,
-    const SelectStatement& statement, const std::vector<slot_t>& projection,
-    const Schema& schema, ExecutionRuntime* runtime,
-    const std::vector<std::function<StatusOr<Value>(size_t)>>* transforms =
-        nullptr,
-    const std::vector<std::optional<DictionaryCaseInput>>* cases =
-        nullptr) try {
-  if (plan.key_offsets.size() < 2 || plan.key_offsets.size() > 8 ||
-      !plan.dependent_key_programs.empty() || !plan.filter_programs.empty() ||
-      !plan.filter_disjunctions.empty() ||
-      (transforms != nullptr &&
-       (!plan.filter_compares.empty() || !plan.inlist_compares.empty())) ||
-      statement.Distinct() || !statement.HasLimit() || statement.WithTies() ||
-      statement.Offset() > SIZE_MAX - statement.Limit() ||
-      store.total_rows > static_cast<uint64_t>(INT64_MAX)) {
-    return std::optional<Relation>{};
-  }
-  std::vector<const int64_t*> numeric_inputs;
-  std::vector<size_t> numeric_slots(plan.aggregates.size(), SIZE_MAX);
-  for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-    const auto& input = plan.aggregates[i];
-    if (IsCountStar(*input.aggregate) && !input.aggregate->Distinct()) {
-      continue;
-    }
-    const int64_t* column =
-        transforms == nullptr && cases == nullptr
-            ? BoundedIntegerAggregateColumn(store, input, projection)
-            : nullptr;
-    if (column == nullptr) {
-      return std::optional<Relation>{};
-    }
-    numeric_slots[i] = numeric_inputs.size();
-    numeric_inputs.push_back(column);
-  }
-  const auto started = std::chrono::steady_clock::now();
-  struct Key {
-    const LSTableColumnDictionary* dictionary;
-    uint32_t null_code;
-    unsigned shift;
-    uint64_t mask;
-    std::vector<uint32_t> remap;
-    std::vector<Value> values;
-    std::optional<Value> extra;
-    std::optional<uint32_t> otherwise_code;
-    std::vector<EncodedDictionaryPredicate> conditions;
-  };
-  QueryMemoryCharge transform_charge;
-  std::vector<Key> keys;
-  keys.reserve(plan.key_offsets.size());
-  unsigned shift = 0;
-  for (const slot_t offset : plan.key_offsets) {
-    // Small dictionaries can contain UINT64 bit patterns too. This kernel
-    // emits signed Values; retain the ordinary typed path's unsigned tags.
-    if (schema.GetColumn(offset).IsUnsigned()) {
-      return std::optional<Relation>{};
-    }
-    const slot_t column = projection.empty() ? offset : projection[offset];
-    const auto& dictionary = store.dictionaries[column];
-    const bool numeric = dictionary.value_type == ValueType::kInt64 ||
-                         dictionary.value_type == ValueType::kDate;
-    const bool transformed =
-        transforms != nullptr && (*transforms)[keys.size()];
-    if ((!dictionary.active && dictionary.wide_code_bytes != 2 &&
-         dictionary.wide_code_bytes != 4) ||
-        (!numeric && !transformed && !dictionary.bytewise_equality)) {
-      return std::optional<Relation>{};
-    }
-    const size_t domain =
-        numeric ? dictionary.int_entries.size() : dictionary.entries.size();
-    if (domain > UINT32_MAX ||
-        dictionary.DictionaryCodeCount() != store.total_rows) {
-      return std::optional<Relation>{};
-    }
-    Key key{.dictionary = &dictionary,
-            .null_code = static_cast<uint32_t>(domain),
-            .shift = shift,
-            .mask = 0,
-            .remap = {},
-            .values = {},
-            .extra = std::nullopt,
-            .otherwise_code = std::nullopt,
-            .conditions = {}};
-    size_t max_code = domain;
-    if (transformed) {
-      // The fold accepts only an unfiltered visible snapshot: every physical
-      // dictionary entry occurs in its input. NULL is evaluated only if it
-      // actually occurs. Scalar errors therefore cannot be hidden by TopN.
-      const size_t entries = domain + 1;
-      size_t transform_bytes = 0;
-      if (__builtin_mul_overflow(entries,
-                                 (sizeof(Value) * 2) + sizeof(uint32_t) + 96,
-                                 &transform_bytes) ||
-          !QueryMemoryBudget::Global().CanReserve(transform_bytes)) {
-        return std::optional<Relation>{};
-      }
-      transform_charge.Add(transform_bytes);
-      key.remap.resize(entries, 0);
-      key.values.reserve(entries);
-      std::unordered_map<Value, uint32_t, DistinctValueHash, DistinctValueEqual>
-          ids;
-      ids.reserve(entries);
-      const size_t observed =
-          domain + (store.column_has_null[column] != 0 ? 1 : 0);
-      for (size_t code = 0; code < observed; ++code) {
-        ASSIGN_OR_RETURN(Value, value, (*transforms)[keys.size()](code));
-        Value canonical = CanonicalDistinctValue(value);
-        const size_t value_bytes = EstimateValueBytes(canonical) * 2;
-        if (!QueryMemoryBudget::Global().CanReserve(value_bytes)) {
-          return std::optional<Relation>{};
-        }
-        const auto [entry, inserted] =
-            ids.try_emplace(canonical, static_cast<uint32_t>(ids.size()));
-        if (inserted) {
-          transform_charge.Add(value_bytes);
-          key.values.push_back(std::move(canonical));
-        }
-        key.remap[code] = entry->second;
-      }
-      max_code = key.values.empty() ? 0 : key.values.size() - 1;
-    }
-    if (cases != nullptr && (*cases)[keys.size()]) {
-      const auto& input = *(*cases)[keys.size()];
-      if (transformed || numeric) {
-        return std::optional<Relation>{};
-      }
-      key.otherwise_code = key.null_code;
-      if (!input.otherwise.IsNull()) {
-        const auto found = std::ranges::find(dictionary.entries,
-                                             input.otherwise.AsStringView());
-        if (found != dictionary.entries.end()) {
-          key.otherwise_code =
-              static_cast<uint32_t>(found - dictionary.entries.begin());
-        } else {
-          if (domain >= UINT32_MAX) {
-            return std::optional<Relation>{};
-          }
-          const size_t extra_bytes = EstimateValueBytes(input.otherwise);
-          if (!QueryMemoryBudget::Global().CanReserve(extra_bytes)) {
-            return std::optional<Relation>{};
-          }
-          transform_charge.Add(extra_bytes);
-          key.extra = input.otherwise;
-          key.otherwise_code = static_cast<uint32_t>(domain + 1);
-          max_code = domain + 1;
-        }
-      }
-      for (const auto& condition : input.conditions) {
-        auto compiled = CompileDictionaryPredicate(store, condition, projection,
-                                                   transform_charge);
-        if (!compiled) {
-          return std::optional<Relation>{};
-        }
-        key.conditions.push_back(std::move(*compiled));
-      }
-    }
-    const auto bits =
-        static_cast<unsigned>(std::max(1, std::bit_width(max_code)));
-    if (bits >= 64 || shift > 64 - bits) {
-      return std::optional<Relation>{};
-    }
-    key.mask = (uint64_t{1} << bits) - 1;
-    keys.push_back(std::move(key));
-    shift += bits;
-  }
-  std::vector<EncodedDictionaryPredicate> filters;
-  for (const auto& filter : plan.filter_compares) {
-    auto compiled =
-        CompileDictionaryPredicate(store, filter, projection, transform_charge);
-    if (!compiled) {
-      return std::optional<Relation>{};
-    }
-    filters.push_back(std::move(*compiled));
-  }
-  for (const auto& list : plan.inlist_compares) {
-    auto compiled =
-        CompileDictionaryInList(store, list, projection, transform_charge);
-    if (!compiled) {
-      return std::optional<Relation>{};
-    }
-    filters.push_back(std::move(*compiled));
-  }
-  OrderDictionaryPredicates(filters);
-  const auto rows = static_cast<size_t>(store.total_rows);
-  // Worker/merge tables, their rounded capacities, TopN and (when needed)
-  // selection vectors are bounded by input rows. A worker reserves its exact
-  // passing-row bound once, so rejected rows never initialize hash buckets.
-  size_t bytes_per_row = 160 + (filters.empty() ? 0 : sizeof(size_t));
-  size_t numeric_bytes = 0;
-  size_t bytes = 0;
-  // Worker groups together and the merged table each hold at most rows
-  // numeric tuples. Reserve their full bound before building either table.
-  if (__builtin_mul_overflow(numeric_inputs.size(), 2 * sizeof(int64_t),
-                             &numeric_bytes) ||
-      __builtin_add_overflow(bytes_per_row, numeric_bytes, &bytes_per_row) ||
-      __builtin_mul_overflow(rows, bytes_per_row, &bytes) ||
-      !QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return std::optional<Relation>{};
-  }
-  QueryMemoryCharge charge(bytes);
-  // Keep COUNT-only kernels free of numeric state updates and branches.
-  const auto execute =
-      [&]<bool Numeric>() -> StatusOr<std::optional<Relation>> {
-    struct Group {
-      uint64_t key;
-      uint64_t count;
-      uint64_t first;
-    };
-    struct Groups {
-      FlatIntKeyMap<size_t> index;
-      std::vector<Group> values;
-      std::vector<int64_t> sums;
-      size_t numeric_count = 0;
-      void Reserve(size_t count, size_t width) {
-        index.Reserve(count);
-        values.reserve(count);
-        numeric_count = width;
-        sums.reserve(count * width);
-      }
-      size_t Add(uint64_t key, uint64_t count, uint64_t first) {
-        bool inserted = false;
-        size_t* slot = index.TryEmplace(std::bit_cast<int64_t>(key), &inserted);
-        if (inserted) {
-          *slot = values.size();
-          values.push_back({key, count, first});
-          if constexpr (Numeric) {
-            sums.resize(sums.size() + numeric_count, 0);
-          }
-        } else {
-          auto& group = values[*slot];
-          group.count += count;
-          group.first = std::min(group.first, first);
-        }
-        return *slot;
-      }
-    };
-    const size_t workers = std::max<size_t>(
-        1, std::min<size_t>(
-               {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-                store.blocks.size(), 16}));
-    std::vector<Groups> local(workers);
-    RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
-      const size_t begin =
-          ((rows / workers) * worker) + std::min(rows % workers, worker);
-      const size_t end = ((rows / workers) * (worker + 1)) +
-                         std::min(rows % workers, worker + 1);
-      auto& groups = local[worker];
-      std::vector<size_t> selected;
-      if (!filters.empty()) {
-        selected.reserve(end - begin);
-        for (size_t row = begin; row < end; ++row) {
-          if (std::ranges::all_of(filters, [&](const auto& filter) {
-                return filter.Matches(row);
-              })) {
-            selected.push_back(row);
-          }
-        }
-      }
-      const size_t passing = filters.empty() ? end - begin : selected.size();
-      groups.Reserve(passing, numeric_inputs.size());
-      for (size_t i = 0; i < passing; ++i) {
-        const size_t row = filters.empty() ? begin + i : selected[i];
-        uint64_t packed = 0;
-        for (const auto& key : keys) {
-          uint64_t code = 0;
-          if (key.otherwise_code &&
-              !std::ranges::all_of(key.conditions, [&](const auto& condition) {
-                return condition.Matches(row);
-              })) {
-            code = *key.otherwise_code;
-          } else {
-            const size_t input_code = std::min(
-                ReadDictionaryCode(*key.dictionary, row), key.null_code);
-            code = key.remap.empty() ? input_code : key.remap[input_code];
-          }
-          packed |= code << key.shift;
-        }
-        const size_t group = groups.Add(packed, 1, row);
-        if constexpr (Numeric) {
-          for (size_t a = 0; a < numeric_inputs.size(); ++a) {
-            groups.sums[(group * numeric_inputs.size()) + a] +=
-                numeric_inputs[a][row];
-          }
-        }
-      }
-    }));
-    // The workers already know an exact upper bound on merged groups. Avoid
-    // initializing a table sized for all rows after a selective filter.
-    size_t group_bound = 0;
-    for (const auto& groups : local) {
-      group_bound += groups.values.size();
-    }
-    Groups merged;
-    merged.Reserve(group_bound, numeric_inputs.size());
-    uint64_t input_rows = 0;
-    for (const auto& groups : local) {
-      for (size_t i = 0; i < groups.values.size(); ++i) {
-        const auto& group = groups.values[i];
-        input_rows += group.count;
-        const size_t target = merged.Add(group.key, group.count, group.first);
-        if constexpr (Numeric) {
-          for (size_t a = 0; a < numeric_inputs.size(); ++a) {
-            merged.sums[(target * numeric_inputs.size()) + a] +=
-                groups.sums[(i * numeric_inputs.size()) + a];
-          }
-        }
-      }
-    }
-    const auto aggregate_value = [&](size_t aggregate, size_t group) {
-      if constexpr (Numeric) {
-        const size_t slot = numeric_slots[aggregate];
-        if (slot != SIZE_MAX) {
-          const int64_t sum =
-              merged.sums[(group * numeric_inputs.size()) + slot];
-          return plan.aggregates[aggregate].aggregate->GetType() ==
-                         AggregationType::kAvg
-                     ? Value(static_cast<double>(sum) /
-                             static_cast<double>(merged.values[group].count))
-                     : Value(sum);
-        }
-      }
-      return Value(static_cast<int64_t>(merged.values[group].count));
-    };
-    const auto value_at = [&](uint64_t packed, size_t index, bool own) {
-      const auto& key = keys[index];
-      const size_t code = (packed >> key.shift) & key.mask;
-      if (!key.remap.empty()) {
-        return key.values[code];
-      }
-      if (key.extra && code == static_cast<size_t>(key.null_code) + 1) {
-        return *key.extra;
-      }
-      if (code == key.null_code) {
-        return Value();
-      }
-      const auto& dictionary = *key.dictionary;
-      if (dictionary.value_type == ValueType::kInt64) {
-        return Value(dictionary.int_entries[code]);
-      }
-      if (dictionary.value_type == ValueType::kDate) {
-        return Value::DateFromDays(dictionary.int_entries[code]);
-      }
-      if (own) {
-        return Value(std::string(dictionary.entries[code]));
-      }
-      Value borrowed;
-      borrowed.type = ValueType::kVarChar;
-      borrowed.value.varchar_value = dictionary.entries[code];
-      return borrowed;
-    };
-    std::vector<size_t> order(merged.values.size());
-    std::iota(order.begin(), order.end(), size_t{0});
-    const auto precedes = [&](size_t a, size_t b) {
-      const auto& left = merged.values[a];
-      const auto& right = merged.values[b];
-      for (size_t i = 0; i < plan.order_items.size(); ++i) {
-        const auto& item = plan.order_items[i];
-        if (item.constant) {
-          continue;
-        }
-        int comparison = 0;
-        if (item.is_key) {
-          const Value l = value_at(left.key, item.index, false);
-          const Value r = value_at(right.key, item.index, false);
-          if (l.IsNull() || r.IsNull()) {
-            if (l.IsNull() == r.IsNull()) {
-              continue;
-            }
-            return l.IsNull() ? plan.order_nulls_first[i]
-                              : !plan.order_nulls_first[i];
-          }
-          comparison = CompareForOrderBy(l, r);
-        } else {
-          if constexpr (Numeric) {
-            comparison =
-                numeric_slots[item.index] == SIZE_MAX
-                    ? (left.count > right.count) - (left.count < right.count)
-                    : CompareForOrderBy(aggregate_value(item.index, a),
-                                        aggregate_value(item.index, b));
-          } else {
-            comparison =
-                (left.count > right.count) - (left.count < right.count);
-          }
-        }
-        if (comparison != 0) {
-          return plan.order_ascending[i] ? comparison < 0 : comparison > 0;
-        }
-      }
-      return left.first < right.first;
-    };
-    const size_t capacity = statement.Offset() + statement.Limit();
-    const size_t retained = std::min(capacity, order.size());
-    std::partial_sort(order.begin(), order.begin() + retained, order.end(),
-                      precedes);
-    if (runtime != nullptr) {
-      runtime->scan_rows += rows;
-      runtime->scan_output_rows += input_rows;
-      ++runtime->typed_parallel_aggregations;
-      runtime->aggregate_input_rows += input_rows;
-      runtime->aggregate_updates += input_rows * plan.aggregates.size();
-      runtime->aggregate_groups += order.size();
-      ++runtime->topn_finish_uses;
-      runtime->topn_finish_capacity = capacity;
-      runtime->topn_finish_input_rows = order.size();
-      runtime->aggregate_ms += ElapsedMs(started);
-    }
-    order.resize(retained);
-    Relation output(runtime);
-    std::vector<Column> columns;
-    columns.reserve(statement.SelectList().size());
-    for (size_t i = 0; i < statement.SelectList().size(); ++i) {
-      columns.emplace_back(ProjectionName(statement.SelectList()[i], i),
-                           ValueType::kNull);
-    }
-    for (const size_t index : order) {
-      const auto& group = merged.values[index];
-      std::vector<Value> values;
-      values.reserve(plan.emit_items.size());
-      for (const auto& item : plan.emit_items) {
-        if (item.constant) {
-          values.push_back(*item.constant);
-        } else if (item.is_key) {
-          values.push_back(value_at(group.key, item.index, true));
-        } else {
-          values.push_back(aggregate_value(item.index, index));
-        }
-      }
-      if (output.TotalRows() == 0) {
-        for (size_t i = 0; i < columns.size(); ++i) {
-          columns[i] = Column(columns[i].Name(), ValueTypeOf(values[i]));
-          columns[i].SetUnsigned(values[i].IsUnsigned());
-        }
-      }
-      output.AddRow(Row(std::move(values)));
-    }
-    RETURN_IF_FAIL(output.GetStatus());
-    output.schema = Schema("", std::move(columns));
-    return std::optional<Relation>(std::move(output));
-  };
-  if (numeric_inputs.empty()) {
-    return execute.template operator()<false>();
-  }
-  return execute.template operator()<true>();
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError,
-                     "composite dictionary aggregate failed");
-}
-
-Expression DictionaryScalarColumn(const Expression& key) {
-  if (!key || key->Type() != TypeTag::kFunctionCallExp ||
-      ContainsParameterSlot(key)) {
-    return {};
-  }
-  const auto& call = key->AsFunctionCallExpression();
-  const auto& name = call.FuncName();
-  if (name != "timestamp_trunc" && name != "datetime_trunc" &&
-      name != "date_trunc" && name != "extract_minute" &&
-      name != "extract_hour" && name != "byte_length" && name != "length" &&
-      name != "octet_length" && name != "lower" && name != "upper" &&
-      name != "regexp_replace") {
-    return {};
-  }
-  if (call.Args().empty() || !call.Args().front() ||
-      call.Args().front()->Type() != TypeTag::kColumnValue) {
-    return {};
-  }
-  for (size_t i = 1; i < call.Args().size(); ++i) {
-    const auto& argument = call.Args()[i];
-    const bool unit_identifier =
-        i == 1 &&
-        (name == "timestamp_trunc" || name == "datetime_trunc" ||
-         name == "date_trunc") &&
-        argument && argument->Type() == TypeTag::kColumnValue;
-    if (!argument ||
-        (argument->Type() != TypeTag::kConstantValue && !unit_identifier)) {
-      return {};
-    }
-  }
-  return call.Args().front();
-}
-
-StatusOr<std::optional<Relation>> TryCompositeDictionaryExpressions(
-    TransactionContext& context, const SelectStatement& statement,
-    const Table& table, const std::vector<slot_t>& projection,
-    const Schema& schema,
-    const std::vector<const AggregateExpression*>& aggregates,
-    const std::vector<Expression>& predicates, const CteMap& ctes) {
-  std::vector<Expression> columns;
-  std::vector<size_t> offsets;
-  std::vector<bool> computed;
-  bool any_computed = false;
-  bool any_scalar = false;
-  bool any_case = false;
-  std::vector<std::optional<DictionaryCaseInput>> cases;
-  for (const auto& key : statement.GroupBy()) {
-    const bool is_computed = key && key->Type() != TypeTag::kColumnValue;
-    Expression column;
-    std::optional<DictionaryCaseInput> conditional;
-    if (key && key->Type() == TypeTag::kCaseExp &&
-        !ContainsParameterSlot(key)) {
-      const auto& expression = key->AsCaseExpression();
-      if (expression.when_clauses_.size() != 1 ||
-          !expression.when_clauses_[0].first || !expression.else_clause_ ||
-          expression.else_clause_->Type() != TypeTag::kConstantValue) {
-        return std::optional<Relation>{};
-      }
-      const auto& otherwise =
-          expression.else_clause_->AsConstantValue().GetValue();
-      if ((!otherwise.IsNull() &&
-           (otherwise.type != ValueType::kVarChar ||
-            !PlainStringComparable(otherwise.AsStringView()))) ||
-          otherwise.IsCaseInsensitive()) {
-        return std::optional<Relation>{};
-      }
-      column = expression.when_clauses_[0].second;
-      if (!column || column->Type() != TypeTag::kColumnValue) {
-        return std::optional<Relation>{};
-      }
-      conditional.emplace(
-          DictionaryCaseInput{.conditions = {}, .otherwise = otherwise});
-      for (const auto& conjunct :
-           SplitConjuncts(expression.when_clauses_[0].first)) {
-        auto condition = TryCompileTypedFilterCompare(conjunct, schema, true);
-        if (!condition || !condition->constant_payload ||
-            condition->is_double) {
-          return std::optional<Relation>{};
-        }
-        conditional->conditions.push_back(std::move(*condition));
-      }
-      any_case = true;
-    } else {
-      column = is_computed ? DictionaryScalarColumn(key) : key;
-      any_scalar |= is_computed;
-    }
-    cases.push_back(std::move(conditional));
-    if (!column) {
-      return std::optional<Relation>{};
-    }
-    const auto offset =
-        LocalColumnOffset(schema, column->AsColumnValue().GetColumnName());
-    if (!offset ||
-        (is_computed &&
-         schema.GetColumn(*offset).Type() != ValueType::kVarChar) ||
-        std::ranges::find(offsets, *offset) != offsets.end()) {
-      // Replacing two different expressions over the same column would make
-      // positional classification ambiguous. Keep that shape on the ordinary
-      // evaluator until it has explicit computed-column identities.
-      return std::optional<Relation>{};
-    }
-    columns.push_back(std::move(column));
-    offsets.push_back(*offset);
-    computed.push_back(is_computed);
-    any_computed |= is_computed;
-  }
-  if (!any_computed || (any_scalar && (!predicates.empty() || any_case))) {
-    return std::optional<Relation>{};
-  }
-  SelectStatement raw(statement);
-  raw.SetGroupBy(columns);
-  const auto replace = [&](Expression expression) {
-    if (expression) {
-      for (size_t i = 0; i < columns.size(); ++i) {
-        if (computed[i] &&
-            expression->ToString() == statement.GroupBy()[i]->ToString()) {
-          return columns[i];
-        }
-      }
-    }
-    return expression;
-  };
-  auto select = raw.SelectList();
-  for (auto& item : select) {
-    item.expression = replace(item.expression);
-  }
-  raw.SetSelectList(std::move(select));
-  auto order = raw.OrderBy();
-  for (auto& term : order) {
-    term.expression = replace(term.expression);
-  }
-  raw.SetOrderBy(std::move(order));
-  const auto plan =
-      PlanTypedAggregation(raw, nullptr, schema, aggregates, predicates);
-  if (!plan.eligible) {
-    return std::optional<Relation>{};
-  }
-  const auto store =
-      SnapshotColumnStore(context, table, projection, schema.ColumnCount());
-  if (store == nullptr) {
-    return std::optional<Relation>{};
-  }
-  Row representative(std::vector<Value>(schema.ColumnCount()));
-  std::vector<std::function<StatusOr<Value>(size_t)>> transforms(
-      columns.size());
-  for (size_t i = 0; i < columns.size(); ++i) {
-    if (!computed[i] || cases[i]) {
-      continue;
-    }
-    const auto offset = offsets[i];
-    const auto column = projection.empty() ? offset : projection[offset];
-    const auto* dictionary = &store->dictionaries[column];
-    const Expression key = statement.GroupBy()[i];
-    transforms[i] = [&, offset, dictionary, key](size_t code) {
-      representative[offset] =
-          code == dictionary->entries.size()
-              ? Value()
-              : Value(std::string(dictionary->entries[code]));
-      const Scope scope{.row = &representative, .schema = &schema};
-      return TryEvaluate(key, scope, nullptr, context, ctes);
-    };
-  }
-  return TryCompositeDictionaryCountTopN(
-      *store, plan, statement, projection, schema, context.execution_runtime(),
-      any_scalar ? &transforms : nullptr, any_case ? &cases : nullptr);
 }
 
 }  // namespace
-
-StatusOr<std::optional<Relation>> TryDictionaryExpressionCountTopN(
-    TransactionContext& context, const SelectStatement& statement,
-    const Table& table, const std::vector<slot_t>& projection,
-    const Schema& qualified_schema,
-    const std::vector<const AggregateExpression*>& aggregates,
-    const std::vector<Expression>& predicates, const CteMap& ctes) try {
-  auto* runtime = context.execution_runtime();
-  if (statement.GroupBy().empty() || statement.GroupBy().size() > 8 ||
-      statement.Having() || !statement.HasLimit() || statement.WithTies() ||
-      statement.Distinct() ||
-      (runtime != nullptr && !runtime->table_key_filters.empty())) {
-    return std::optional<Relation>{};
-  }
-  if (statement.GroupBy().size() != 1) {
-    return TryCompositeDictionaryExpressions(context, statement, table,
-                                             projection, qualified_schema,
-                                             aggregates, predicates, ctes);
-  }
-  const Expression key = statement.GroupBy().front();
-  const Expression column = DictionaryScalarColumn(key);
-  if (!column) {
-    return std::optional<Relation>{};
-  }
-  const auto offset = LocalColumnOffset(
-      qualified_schema, column->AsColumnValue().GetColumnName());
-  if (!offset ||
-      qualified_schema.GetColumn(*offset).Type() != ValueType::kVarChar) {
-    return std::optional<Relation>{};
-  }
-  // Classify only direct uses of this key, constants and COUNT(*). The
-  // original key is evaluated after partial counts and before final grouping.
-  SelectStatement raw = statement;
-  raw.SetGroupBy({column});
-  const std::string identity = key->ToString();
-  auto select = raw.SelectList();
-  for (auto& item : select) {
-    if (item.expression && item.expression->ToString() == identity) {
-      item.expression = column;
-    }
-  }
-  raw.SetSelectList(std::move(select));
-  auto order = raw.OrderBy();
-  for (auto& term : order) {
-    if (term.expression && term.expression->ToString() == identity) {
-      term.expression = column;
-    }
-  }
-  raw.SetOrderBy(std::move(order));
-  const auto plan = PlanTypedAggregation(raw, nullptr, qualified_schema,
-                                         aggregates, predicates);
-  if (!plan.eligible) {
-    return std::optional<Relation>{};
-  }
-  const auto store = SnapshotColumnStore(context, table, projection,
-                                         qualified_schema.ColumnCount());
-  if (store == nullptr) {
-    return std::optional<Relation>{};
-  }
-  const slot_t full_column = projection.empty() ? *offset : projection[*offset];
-  const auto& dictionary = store->dictionaries[full_column];
-  const auto temporal_unit =
-      CompileUtcTimestampTrunc(key->AsFunctionCallExpression());
-  Row representative(std::vector<Value>(qualified_schema.ColumnCount()));
-  const std::function<StatusOr<Value>(size_t)> transform = [&](size_t code) {
-    representative[*offset] =
-        code == dictionary.entries.size()
-            ? Value()
-            : Value(std::string(dictionary.entries[code]));
-    const Scope scope{.row = &representative, .schema = &qualified_schema};
-    return TryEvaluate(key, scope, nullptr, context, ctes);
-  };
-  return TryDictionaryCountTopN(*store, plan, statement, projection, runtime,
-                                &transform,
-                                temporal_unit ? &*temporal_unit : nullptr);
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError,
-                     "dictionary expression aggregate failed");
-}
-
-StatusOr<bool> TryFoldDictionaryAggregateRows(
-    TransactionContext& context, const SelectStatement& statement,
-    const Table& table, const std::vector<slot_t>& projection,
-    const Schema& schema,
-    const std::vector<const AggregateExpression*>& aggregates,
-    const std::vector<Expression>& predicates,
-    const std::function<Status(const Row&, int64_t)>& consume,
-    const std::function<Status(const Row&, int64_t, const Value&,
-                               const std::vector<AggregateAccumulator>&)>&
-        prepared_consume) try {
-  auto* runtime = context.execution_runtime();
-  if (schema.ColumnCount() != 1 ||
-      schema.GetColumn(0).Type() != ValueType::kVarChar ||
-      statement.GroupBy().size() != 1 ||
-      (runtime != nullptr && !runtime->table_key_filters.empty())) {
-    return false;
-  }
-  const auto is_input = [&](const Expression& expression) {
-    return expression && expression->Type() == TypeTag::kColumnValue &&
-           LocalColumnOffset(schema,
-                             expression->AsColumnValue().GetColumnName()) == 0;
-  };
-  const auto& key = statement.GroupBy().front();
-  if (!is_input(key) && !is_input(DictionaryScalarColumn(key))) {
-    return false;
-  }
-  // Relational temporal calls may contain identifier-shaped date-part tokens
-  // and SQL-specific temporal metadata. Those keep their original evaluator;
-  // only these context-free keys can run on the pure AST worker path.
-  bool pure_key = is_input(key);
-  if (!pure_key) {
-    const auto& name = key->AsFunctionCallExpression().FuncName();
-    pure_key = name == "regexp_replace" || name == "lower" || name == "upper" ||
-               name == "byte_length" || name == "length" ||
-               name == "octet_length";
-  }
-  for (const auto& predicate : predicates) {
-    if (!predicate || predicate->Type() != TypeTag::kBinaryExp) {
-      return false;
-    }
-    const auto& binary = predicate->AsBinaryExpression();
-    const bool left_input = is_input(binary.Left()) &&
-                            binary.Right()->Type() == TypeTag::kConstantValue;
-    const bool right_input = is_input(binary.Right()) &&
-                             binary.Left()->Type() == TypeTag::kConstantValue;
-    if (!left_input && !right_input) {
-      return false;
-    }
-    const auto compare = TryCompileTypedFilterCompare(predicate, schema, true);
-    if (!compare || !compare->string_payload || !compare->constant_payload ||
-        compare->left != 0) {
-      return false;
-    }
-  }
-  for (const auto* aggregate : aggregates) {
-    if (aggregate->Distinct() || aggregate->NeedsGroupContext() ||
-        aggregate->WhereFilter() || aggregate->SecondaryArg() ||
-        aggregate->HasInnerGroupBy()) {
-      return false;
-    }
-    const auto type = aggregate->GetType();
-    if ((type == AggregationType::kCount && IsCountStar(*aggregate)) ||
-        ((type == AggregationType::kCount || type == AggregationType::kMin ||
-          type == AggregationType::kMax) &&
-         is_input(aggregate->Child()))) {
-      continue;
-    }
-    Expression child = aggregate->Child();
-    if (child && child->Type() == TypeTag::kCastExp &&
-        child->AsCastExpression().TargetValueType() == ValueType::kDouble) {
-      child = child->AsCastExpression().Child();
-    }
-    if (type != AggregationType::kAvg || !child ||
-        child->Type() != TypeTag::kFunctionCallExp) {
-      return false;
-    }
-    const auto& call = child->AsFunctionCallExpression();
-    if (call.FuncName() != "byte_length" || call.Args().size() != 1 ||
-        !is_input(call.Args()[0])) {
-      return false;
-    }
-  }
-  const auto store =
-      SnapshotColumnStore(context, table, projection, schema.ColumnCount());
-  if (!store || store->total_rows > static_cast<uint64_t>(INT64_MAX)) {
-    return false;
-  }
-  const slot_t column = projection.empty() ? 0 : projection[0];
-  const auto& dictionary = store->dictionaries[column];
-  const size_t domain = dictionary.entries.size();
-  const bool encoded =
-      (dictionary.wide_code_bytes == 2 || dictionary.wide_code_bytes == 4) &&
-      dictionary.value_type == ValueType::kVarChar && domain <= UINT32_MAX &&
-      dictionary.DictionaryCodeCount() == store->total_rows;
-  if (!encoded && (!prepared_consume || !pure_key)) {
-    return false;
-  }
-  // Every partial and final length sum stays exactly representable as a
-  // double, irrespective of the order in which dictionary values are folded.
-  constexpr uint64_t kExactDoubleInteger = uint64_t{1} << 53;
-  if (encoded) {
-    for (const auto& text : dictionary.entries) {
-      if (store->total_rows != 0 &&
-          text.size() > kExactDoubleInteger / store->total_rows) {
-        return false;
-      }
-    }
-  } else {
-    for (const auto& block : store->blocks) {
-      const auto& values = block.columns[column];
-      for (size_t row = 0; row < block.row_count; ++row) {
-        if (!values.IsNull(row) && store->total_rows != 0 &&
-            values.VarcharAt(row).size() >
-                kExactDoubleInteger / store->total_rows) {
-          return false;
-        }
-      }
-    }
-  }
-  const size_t entries = encoded ? domain + 1 : 0;
-  size_t bytes = 0;
-  if (__builtin_mul_overflow(entries, sizeof(int64_t) + sizeof(size_t),
-                             &bytes) ||
-      !QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return false;
-  }
-  const size_t block_bytes =
-      encoded ? 0 : (store->blocks.size() + 1) * sizeof(size_t);
-  if (__builtin_add_overflow(bytes, block_bytes, &bytes) ||
-      !QueryMemoryBudget::Global().CanReserve(bytes)) {
-    return false;
-  }
-  QueryMemoryCharge charge(bytes);
-  std::vector<int64_t> counts(entries, 0);
-  std::vector<size_t> order;
-  order.reserve(entries);
-  const auto read_code = [&](size_t row) {
-    return std::min<size_t>(ReadDictionaryCode(dictionary, row), domain);
-  };
-  if (encoded) {
-    for (size_t row = 0; row < store->total_rows; ++row) {
-      const size_t code = read_code(row);
-      if (counts[code]++ == 0) {
-        // The physical scan is already in encounter order. Record each code
-        // once here instead of sorting the dictionary by saved row positions.
-        order.push_back(code);
-      }
-    }
-  }
-  std::vector<size_t> block_offsets;
-  if (!encoded) {
-    block_offsets.reserve(store->blocks.size() + 1);
-    block_offsets.push_back(0);
-    for (const auto& block : store->blocks) {
-      block_offsets.push_back(block_offsets.back() + block.row_count);
-    }
-  }
-  const size_t input_count = encoded ? order.size() : store->total_rows;
-  const auto input_row = [&](size_t index) {
-    if (encoded) {
-      const size_t code = order[index];
-      return Row({code == domain
-                      ? Value()
-                      : Value(std::string(dictionary.entries[code]))});
-    }
-    const size_t block = static_cast<size_t>(
-        std::upper_bound(block_offsets.begin(), block_offsets.end(), index) -
-        block_offsets.begin() - 1);
-    const size_t row = index - block_offsets[block];
-    const auto& values = store->blocks[block].columns[column];
-    return Row({values.IsNull(row)
-                    ? Value()
-                    : Value(std::string(values.VarcharAt(row)))});
-  };
-  if (runtime != nullptr) {
-    runtime->scan_rows += store->total_rows;
-    runtime->scan_values_available += store->total_rows;
-    runtime->scan_values_decoded += input_count;
-  }
-  // Pure scalar evaluation and partial aggregation are independent per
-  // observed dictionary entry (or source row without a shared dictionary).
-  // Keep bounded waves in encounter order, but dynamically distribute small
-  // morsels: long strings must not strand one statically assigned worker.
-  // Workers never access the transaction or its runtime counters. A value
-  // that does not fit the retained staging budget uses the serial callback.
-  struct PartialGroup {
-    Row row;
-    Value key;
-    std::vector<AggregateAccumulator> states;
-    int64_t rows{0};
-  };
-  struct LocalGroups {
-    GroupKeyMap offsets;
-    std::vector<PartialGroup> groups;
-  };
-  struct Prepared {
-    Status status{Status::kSuccess};
-    size_t worker{0};
-    std::optional<size_t> group;
-    bool evaluated{false};
-  };
-  std::vector<AggregateAccumulator::Shape> shapes;
-  shapes.reserve(aggregates.size());
-  for (const auto* aggregate : aggregates) {
-    shapes.push_back(AggregateAccumulator::AnalyzeShape(aggregate, &schema));
-  }
-  constexpr size_t kWaveEntries = 4096;
-  constexpr size_t kMorselEntries = 64;
-  const size_t worker_limit =
-      ParallelWorkerCount((input_count / kMorselEntries) +
-                          (input_count % kMorselEntries != 0 ? 1 : 0));
-  const size_t workspace = std::min<size_t>(
-      size_t{64} << 20, QueryMemoryBudget::Global().Remaining() / 4);
-  const bool prepare = pure_key && prepared_consume && worker_limit > 1 &&
-                       workspace >= kWaveEntries * sizeof(Prepared) * 2 &&
-                       QueryMemoryBudget::Global().CanReserve(workspace);
-  QueryMemoryCharge staging_charge(prepare ? workspace : 0);
-  for (size_t begin = 0; begin < input_count;) {
-    const size_t count = std::min(kWaveEntries, input_count - begin);
-    std::vector<Prepared> prepared(prepare ? count : 0);
-    const size_t workers =
-        prepare ? std::min(worker_limit,
-                           (count + kMorselEntries - 1) / kMorselEntries)
-                : 0;
-    std::vector<LocalGroups> local(workers);
-    if (prepare) {
-      std::atomic<size_t> next{0};
-      std::atomic<size_t> retained{count * sizeof(Prepared)};
-      const auto evaluate = [&](size_t worker, size_t i) -> Status {
-        Row row = input_row(begin + i);
-        for (const auto& predicate : predicates) {
-          ASSIGN_OR_RETURN(Value, passes, predicate->TryEvaluate(row, schema));
-          if (!Truthy(passes)) {
-            prepared[i].evaluated = true;
-            return Status::kSuccess;
-          }
-        }
-        ASSIGN_OR_RETURN(Value, value, key->TryEvaluate(row, schema));
-        std::vector<Value> arguments;
-        arguments.reserve(aggregates.size());
-        for (const auto* aggregate : aggregates) {
-          ASSIGN_OR_RETURN(Value, argument,
-                           IsCountStar(*aggregate)
-                               ? StatusOr<Value>(Value(1))
-                               : aggregate->Child()->TryEvaluate(row, schema));
-          arguments.push_back(std::move(argument));
-        }
-        size_t needed = EstimateRowBytes(row) +
-                        (2 * EstimateValueBytes(value)) + sizeof(PartialGroup) +
-                        128 +
-                        (aggregates.size() * sizeof(AggregateAccumulator));
-        for (const auto& argument : arguments) {
-          needed += EstimateValueBytes(argument);
-        }
-        size_t used = retained.load(std::memory_order_relaxed);
-        do {
-          if (needed > workspace || used > workspace - needed) {
-            return Status::kSuccess;
-          }
-        } while (!retained.compare_exchange_weak(used, used + needed,
-                                                 std::memory_order_relaxed));
-        auto& state = local[worker];
-        std::vector<Value> group_key{CanonicalDistinctValue(value)};
-        size_t group = state.groups.size();
-        if (auto found = state.offsets.find(group_key);
-            found != state.offsets.end()) {
-          group = found->second;
-        } else {
-          state.offsets.emplace(Row(std::move(group_key)), group);
-          PartialGroup output{
-              .row = std::move(row), .key = std::move(value), .states = {}};
-          output.states.reserve(aggregates.size());
-          for (size_t arg = 0; arg < aggregates.size(); ++arg) {
-            output.states.emplace_back(aggregates[arg], shapes[arg]);
-          }
-          state.groups.push_back(std::move(output));
-          prepared[i].worker = worker;
-          prepared[i].group = group;
-        }
-        const int64_t repetitions = encoded ? counts[order[begin + i]] : 1;
-        auto& output = state.groups[group];
-        output.rows += repetitions;
-        for (size_t arg = 0; arg < aggregates.size(); ++arg) {
-          const auto& argument = arguments[arg];
-          if (argument.IsNull()) {
-            continue;
-          }
-          auto& accumulator = output.states[arg];
-          switch (aggregates[arg]->GetType()) {
-            case AggregationType::kCount:
-              accumulator.count += repetitions;
-              break;
-            case AggregationType::kAvg:
-              accumulator.count += repetitions;
-              accumulator.total +=
-                  (argument.type == ValueType::kDouble
-                       ? argument.value.double_value
-                       : static_cast<double>(argument.value.int_value)) *
-                  static_cast<double>(repetitions);
-              break;
-            default:
-              RETURN_IF_FAIL(accumulator.Add(argument));
-              break;
-          }
-        }
-        prepared[i].evaluated = true;
-        return Status::kSuccess;
-      };
-      RETURN_IF_FAIL(RunParallelTasks(workers, [&](size_t worker) {
-        for (;;) {
-          const size_t first =
-              next.fetch_add(kMorselEntries, std::memory_order_relaxed);
-          if (first >= count) {
-            break;
-          }
-          for (size_t i = first; i < std::min(count, first + kMorselEntries);
-               ++i) {
-            prepared[i].status = evaluate(worker, i);
-          }
-        }
-      }));
-    }
-    for (size_t i = 0; i < count; ++i) {
-      const int64_t repetitions = encoded ? counts[order[begin + i]] : 1;
-      if (prepare) {
-        const auto& value = prepared[i];
-        RETURN_IF_FAIL(value.status);
-        if (value.evaluated) {
-          if (value.group) {
-            const auto& group = local[value.worker].groups[*value.group];
-            RETURN_IF_FAIL(prepared_consume(group.row, group.rows, group.key,
-                                            group.states));
-          }
-          continue;
-        }
-      }
-      const Row row = input_row(begin + i);
-      RETURN_IF_FAIL(consume(row, repetitions));
-    }
-    begin += count;
-  }
-  return true;
-} catch (const std::exception& error) {
-  return StatusError(StatusCode::kRuntimeError, error.what());
-} catch (...) {
-  return StatusError(StatusCode::kRuntimeError, "dictionary row fold failed");
-}
 
 StatusOr<Relation> RunTypedParallelStreamAggregate(
     TransactionContext& context, const SelectStatement& stmt,
@@ -4755,6 +3965,16 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     const PrebuiltMembershipPredicate* stream_prebuilt_membership) {
   ExecutionRuntime* runtime = context.execution_runtime();
   const auto scan_begin = std::chrono::steady_clock::now();
+  const bool group_phases = std::getenv("TINYLAMB_GROUP_PHASES") != nullptr;
+  auto phase_begin = scan_begin;
+  const auto phase = [&](const char* name, size_t workers, size_t groups) {
+    if (group_phases) {
+      std::cerr << "[typed-aggregate] " << name
+                << " ms=" << ElapsedMs(phase_begin) << " workers=" << workers
+                << " groups=" << groups << '\n';
+      phase_begin = std::chrono::steady_clock::now();
+    }
+  };
   const auto direct_lstable_store = SnapshotColumnStore(
       context, table, projection, qualified_schema.ColumnCount());
   const bool int_key =
@@ -4785,8 +4005,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   const bool lstable_skip_cache_copy =
       (direct_lstable_store != nullptr &&
        direct_lstable_store->total_rows > 16384) ||
-      (table.GetLSTableStore() != nullptr &&
-       table.GetLSTableStore()->total_rows > 16384);
+      table.BackingColumnarRowCount() > 16384;
   if (reusable && runtime != nullptr && stream_runtime_filter == nullptr) {
     fold_cache_key = BaseRelationCacheKey(
         table_name, projection.empty() ? nullptr : &projection);
@@ -4794,9 +4013,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     if (found != runtime->base_relations.end()) {
       cached_relation = found->second;
       ++runtime->base_scan_cache_hits;
-      if (lstable_skip_cache_copy && cached_relation != nullptr &&
-          cached_relation->rows.empty() && !cached_relation->HasSpill() &&
-          !runtime->base_relation_arenas.contains(fold_cache_key)) {
+      if (cached_relation != nullptr && cached_relation->rows.empty() &&
+          !cached_relation->HasSpill() &&
+          !runtime->base_relation_arenas.contains(fold_cache_key) &&
+          (!cached_relation->HasColumnarOnly() || lstable_skip_cache_copy)) {
         cached_relation.reset();
       }
     } else {
@@ -4851,37 +4071,118 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     }
     direct_children = direct_children && byte_length_columns[i].has_value();
   }
+  // The slim fold paths below stream raw cells through a fixed
+  // std::array<Value, 8> per-row scratch indexed by aggregate slot.  Plans
+  // with more than 8 aggregates must keep the generic path (or they write
+  // past the array); the non-slim folds never touch the scratch and stay
+  // eligible at any aggregate count.
   const bool use_direct_lstable =
       direct_lstable_store != nullptr && cached_relation == nullptr &&
-      !fill_cache && plan.filter_programs.empty() && direct_children;
-  if (use_direct_lstable && !reusable && !having_expr &&
-      stream_runtime_filter == nullptr &&
+      !fill_cache && plan.filter_programs.empty() && plan.null_filters.empty() &&
+      direct_children &&
+      (!plan.slim || plan.aggregates.size() <= 8);
+  if (use_direct_lstable && !having_expr && stream_runtime_filter == nullptr &&
       stream_prebuilt_membership == nullptr) {
-    ASSIGN_OR_RETURN(
-        std::optional<Relation>, unique_result,
-        TryUniqueGroupLimit(*direct_lstable_store, plan, stmt, projection,
-                            qualified_schema, runtime));
-    if (unique_result) {
-      return std::move(*unique_result);
+    if (!reusable) {
+      ASSIGN_OR_RETURN(
+          std::optional<Relation>, unique_result,
+          TryUniqueGroupLimit(*direct_lstable_store, plan, stmt, projection,
+                              qualified_schema, runtime));
+      if (unique_result) {
+        return std::move(*unique_result);
+      }
     }
-    ASSIGN_OR_RETURN(std::optional<Relation>, dictionary_result,
-                     TryDictionaryCountTopN(*direct_lstable_store, plan, stmt,
-                                            projection, runtime));
+    ASSIGN_OR_RETURN(
+        std::optional<Relation>, dictionary_result,
+        TryDictionaryAggregate(*direct_lstable_store, plan, stmt, projection,
+                               qualified_schema, runtime));
     if (dictionary_result) {
       return std::move(*dictionary_result);
     }
     ASSIGN_OR_RETURN(
         std::optional<Relation>, composite_result,
-        TryCompositeDictionaryCountTopN(*direct_lstable_store, plan, stmt,
+        TryCompositeDictionaryAggregate(*direct_lstable_store, plan, stmt,
                                         projection, qualified_schema, runtime));
     if (composite_result) {
       return std::move(*composite_result);
     }
+    if (!reusable) {
+      ASSIGN_OR_RETURN(
+          std::optional<Relation>, partitioned_result,
+          TryPartitionedNumericTopN(*direct_lstable_store, plan, stmt,
+                                    projection, qualified_schema, runtime));
+      if (partitioned_result) {
+        return std::move(*partitioned_result);
+      }
+    }
   }
+  if (direct_lstable_store != nullptr && cached_relation == nullptr &&
+      !fill_cache && direct_children && stream_runtime_filter == nullptr &&
+      stream_prebuilt_membership == nullptr &&
+      (plan.filter_programs.empty() || plan.only_null_filter_programs)) {
+    std::vector<slot_t> fast_proj_to_full(qualified_schema.ColumnCount());
+    std::vector<ValueType> fast_proj_types(qualified_schema.ColumnCount());
+    std::vector<uint8_t> fast_proj_unsigned(qualified_schema.ColumnCount(), 0);
+    for (slot_t c = 0; c < qualified_schema.ColumnCount(); ++c) {
+      fast_proj_to_full[c] = projection.empty() ? c : projection[c];
+      fast_proj_types[c] = qualified_schema.GetColumn(c).Type();
+      fast_proj_unsigned[c] =
+          qualified_schema.GetColumn(c).IsUnsigned() ? 1 : 0;
+    }
+    const size_t early_workers = std::max<size_t>(
+        1, std::min<size_t>(
+               {QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+                std::max<size_t>(1, direct_lstable_store->blocks.size()),
+                size_t{16}}));
+    ASSIGN_OR_RETURN(
+        std::optional<Relation>, scalar_fast_result,
+        TryRunDirectLSTableScalarFast(
+            *direct_lstable_store, plan, stmt, having_expr, fast_proj_to_full,
+            fast_proj_types, fast_proj_unsigned, qualified_schema, table_schema,
+            direct_children, stream_runtime_filter, stream_prebuilt_membership,
+            early_workers, runtime, publish_lstable_marker, fold_cache_key,
+            scan_begin));
+    if (scalar_fast_result) {
+      phase("lstable-scalar-fast", early_workers, 1);
+      return std::move(*scalar_fast_result);
+    }
+    ASSIGN_OR_RETURN(
+        std::optional<Relation>, bounded_fast_result,
+        TryRunDirectLSTableBoundedIntFast(
+            *direct_lstable_store, plan, stmt, having_expr, context, ctes,
+            fast_proj_to_full, fast_proj_types, fast_proj_unsigned,
+            qualified_schema, table_schema, direct_children,
+            stream_runtime_filter, stream_prebuilt_membership, early_workers,
+            runtime, publish_lstable_marker, fold_cache_key, scan_begin));
+    if (bounded_fast_result) {
+      phase("lstable-bounded-int-fast", early_workers,
+            bounded_fast_result->rows.size());
+      return std::move(*bounded_fast_result);
+    }
+  }
+  if (cached_relation == nullptr && !fill_cache &&
+      stream_runtime_filter == nullptr &&
+      stream_prebuilt_membership == nullptr) {
+    ASSIGN_OR_RETURN(
+        std::optional<Relation>, columnar_tlcs_result,
+        TryRunColumnarTlcsAggregate(
+            context, stmt, having_expr, table, projection, qualified_schema,
+            table_schema, &plan, aggregate_expressions, {},
+            direct_lstable_store.get(), runtime, publish_lstable_marker,
+            fold_cache_key, scan_begin));
+    if (columnar_tlcs_result) {
+      phase("columnar-tlcs-agg",
+            QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+            columnar_tlcs_result->rows.size());
+      return std::move(*columnar_tlcs_result);
+    }
+  }
+  Status morsel_status = Status::kSuccess;
   const std::vector<Table::ScanMorsel> morsels =
       (use_direct_lstable || cached_relation != nullptr)
           ? std::vector<Table::ScanMorsel>{}
-          : table.BuildScanMorsels(context.txn_, 8);
+          : table.BuildScanMorsels(context.txn_, 8, &morsel_status);
+  RETURN_IF_FAIL(morsel_status);
   const std::vector<IntegerPeekCompare>* peek_ptr =
       fill_cache || peek_compares.empty() ? nullptr : &peek_compares;
   const bool compares_covered_by_peeks =
@@ -5459,9 +4760,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         if (input.conditional.has_value()) {
           if (!DecideTypedFilterCompareCells(input.conditional->condition,
                                              row_cells, is_null, make_value)) {
-            continue;
-          }
-          if (input.conditional->then_column.has_value()) {
+            if (!input.conditional->has_else_constant) {
+              continue;
+            }
+            cell_type = input.conditional->result_type;
+            cell = input.conditional->else_int_constant;
+          } else if (input.conditional->then_column.has_value()) {
             const slot_t col = *input.conditional->then_column;
             if (is_null(col)) {
               continue;
@@ -5496,73 +4800,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           continue;
         }
         bool handled = true;
-        switch (kind) {
-          case SlimAggKind::kCount:
-            ++local->SlimCount(group_index, i);
-            break;
-          case SlimAggKind::kSumInt64:
-            if (cell_type == ValueType::kInt64 && !cell_unsigned) {
-              int64_t updated = 0;
-              if (__builtin_add_overflow(local->SlimIntTotal(group_index, i),
-                                         cell, &updated)) {
-                *error = StatusError(StatusCode::kIsInfinity,
-                                     "integer overflow in SUM");
-                return;
-              }
-              local->SlimIntTotal(group_index, i) = updated;
-              ++local->SlimCount(group_index, i);
-            } else {
-              handled = false;
-            }
-            break;
-          case SlimAggKind::kSumDouble:
-            if (cell_type == ValueType::kDouble) {
-              const auto addend = std::bit_cast<double>(cell);
-              if (std::isinf(addend)) {
-                local->SlimFlags(group_index, i) |= 1;
-              }
-              local->SlimDoubleTotal(group_index, i) += addend;
-              ++local->SlimCount(group_index, i);
-            } else {
-              handled = false;
-            }
-            break;
-          case SlimAggKind::kAvgDouble:
-            if (cell_type == ValueType::kDouble) {
-              local->SlimDoubleTotal(group_index, i) +=
-                  std::bit_cast<double>(cell);
-              ++local->SlimCount(group_index, i);
-            } else if (cell_type == ValueType::kInt64) {
-              local->SlimDoubleTotal(group_index, i) +=
-                  cell_unsigned
-                      ? static_cast<double>(static_cast<uint64_t>(cell))
-                      : static_cast<double>(cell);
-              ++local->SlimCount(group_index, i);
-            } else {
-              handled = false;
-            }
-            break;
-          case SlimAggKind::kCountDistinctDouble:
-            if (cell_type == ValueType::kDouble) {
-              static_cast<void>(local->SlimInsertDistinct(
-                  group_index, i,
-                  CanonicalDistinctDoubleBits(std::bit_cast<double>(cell))));
-            } else {
-              handled = false;
-            }
-            break;
-          case SlimAggKind::kCountDistinctInt64:
-            if (cell_type == ValueType::kInt64 ||
-                cell_type == ValueType::kDate) {
-              static_cast<void>(
-                  local->SlimInsertDistinct(group_index, i, cell));
-            } else {
-              handled = false;
-            }
-            break;
-          default:
-            handled = false;
-            break;
+        if (!ApplySlimCell(local, group_index, i, kind, cell_type, cell,
+                           cell_unsigned, &handled, error)) {
+          return;
         }
         if (handled) {
           continue;
@@ -5605,6 +4845,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             value = Value(input.conditional->then_int_constant);
             value.type = input.conditional->result_type;
           }
+        } else if (input.conditional->has_else_constant) {
+          value = Value(input.conditional->else_int_constant);
         }
         if (Status st = accumulator.Add(value); st != Status::kSuccess) {
           *error = st;
@@ -5675,7 +4917,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   std::shared_ptr<BaseRelationArena> fill_arena;
   std::vector<int64_t> arena_cell_buffer;
   std::vector<char> arena_null_buffer;
-  // Typed fill (TINYLAMB_TYPED_FILL=1): the scan decodes schema-typed cell
+  // Typed fill: the scan decodes schema-typed cell
   // batches instead of Rows, the fold consumes raw cells, and the cache is
   // published with the arena only (rows are materialized from it on demand by
   // consumers that cannot take the arena path). Non-reusable scans fold the
@@ -5781,6 +5023,26 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   if (worker_count < 2) {
     worker_count = 1;
   }
+  // Floating-point SUM/AVG over workers merges partial sums with a blind `+=`,
+  // which reassociates the additions and can differ from the canonical
+  // row-order accumulator (e.g. 2^53 + many small terms). Keep DOUBLE sums on
+  // one worker so the fold order matches the AST ground truth.
+  // A checked SUM(INT64) is order-sensitive the same way: per-worker partial
+  // accumulators start at 0, so a range-local running sum that wraps
+  // fabricates "integer overflow in SUM" the row-order canonical never
+  // raises, and an overflow that only materializes across range boundaries
+  // goes undetected (each partial stays inside INT64). The checked add lives
+  // both in the per-row fold and in the worker-order merge, so splitting is
+  // unsound for it in every shape; keep the fold on one worker (COUNT/MIN/
+  // MAX stay parallel-capable kinds).
+  if (plan.slim && std::ranges::any_of(
+                       plan.slim_kinds, [](SlimAggKind k) {
+                         return k == SlimAggKind::kSumDouble ||
+                                k == SlimAggKind::kAvgDouble ||
+                                k == SlimAggKind::kSumInt64;
+                       })) {
+    worker_count = 1;
+  }
   bool bounded = false;
   size_t topn_capacity = 0;
   if (!stmt.Distinct() && stmt.HasLimit() && !stmt.WithTies() &&
@@ -5848,15 +5110,22 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
       }
     }
-    if (!fold_can_stream_arena && cached_relation->rows.empty()) {
+    if (!fold_can_stream_arena && cached_relation->rows.empty() &&
+        !cached_relation->HasColumnarOnly()) {
       RETURN_IF_FAIL(MaterializeCacheRowsParallel(
           fold_cache_key, cached_relation.get(), runtime));
     }
   }
   std::vector<Status> worker_errors(worker_count, Status::kSuccess);
-  std::vector<size_t> scanned(worker_count, 0);
-  std::vector<size_t> emitted(worker_count, 0);
-  std::vector<size_t> aggregate_updates(worker_count, 0);
+  // Row-level instrumentation must not make all workers invalidate the same
+  // cache line. Keep each worker's frequently updated counters together and
+  // isolate them from its neighbours; publish totals only after the join.
+  struct alignas(64) WorkerCounters {
+    size_t scanned{0};
+    size_t emitted{0};
+    size_t updates{0};
+  };
+  std::vector<WorkerCounters> counters(worker_count);
   std::vector<size_t> reclaimed_groups(worker_count, 0);
 
   std::vector<slot_t> proj_to_full(qualified_schema.ColumnCount());
@@ -6280,8 +5549,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       return full_col < direct_lstable_store->column_has_null.size() &&
              direct_lstable_store->column_has_null[full_col] == 0;
     };
-    const auto safe_int_col_bounds = [&](slot_t full_col, __int128_t* lo_out,
-                                         __int128_t* hi_out) noexcept -> bool {
+    const auto safe_int_col_bounds =
+        [&](slot_t full_col, platform::Int128* lo_out,
+            platform::Int128* hi_out) noexcept -> bool {
       if (!col_no_null(full_col) ||
           full_col >= direct_lstable_store->column_min_int.size() ||
           direct_lstable_store->column_min_int[full_col] >
@@ -6292,15 +5562,17 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       *hi_out = direct_lstable_store->column_max_int[full_col];
       return true;
     };
-    const auto safe_int_sum_bound = [&](__int128_t lo, __int128_t hi,
-                                        __int128_t limit) noexcept -> bool {
+    const auto safe_int_sum_bound =
+        [&](platform::Int128 lo, platform::Int128 hi,
+            platform::Int128 limit) noexcept -> bool {
       if (lo < std::numeric_limits<int64_t>::min() ||
           hi > std::numeric_limits<int64_t>::max()) {
         return false;
       }
-      const __int128_t max_abs = std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi);
-      const __int128_t nrows =
-          std::max<__int128_t>(direct_lstable_store->total_rows, 1);
+      const platform::Int128 max_abs =
+          std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi);
+      const platform::Int128 nrows =
+          std::max<platform::Int128>(direct_lstable_store->total_rows, 1);
       return max_abs <= limit / nrows;
     };
     for (const IntegerPeekCompare& pred : peek_compares) {
@@ -6361,7 +5633,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       if (byte_length &&
           (kind == SlimAggKind::kSumInt64 || kind == SlimAggKind::kAvgDouble)) {
         term.full_col0 = proj_to_full[*byte_length_columns[i]];
-        __int128_t upper_bound = 0;
+        platform::Int128 upper_bound = 0;
         const auto& dictionary =
             direct_lstable_store->dictionaries[term.full_col0];
         if (dictionary.active || dictionary.wide_code_bytes != 0) {
@@ -6369,7 +5641,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           for (const auto& entry : dictionary.entries) {
             maximum = std::max(maximum, entry.size());
           }
-          upper_bound = static_cast<__int128_t>(maximum) *
+          upper_bound = static_cast<platform::Int128>(maximum) *
                         direct_lstable_store->total_rows;
         } else {
           for (const auto& block : direct_lstable_store->blocks) {
@@ -6378,10 +5650,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
         // Every prefix and worker subtotal is exact in both INT64 and
         // DOUBLE. This permits an integer sum without changing AVG rounding.
-        const __int128_t limit =
+        const platform::Int128 limit =
             kind == SlimAggKind::kAvgDouble
-                ? static_cast<__int128_t>(int64_t{1} << 53)
-                : static_cast<__int128_t>(std::numeric_limits<int64_t>::max());
+                ? static_cast<platform::Int128>(int64_t{1} << 53)
+                : static_cast<platform::Int128>(
+                      std::numeric_limits<int64_t>::max());
         if (!col_no_null(term.full_col0) || upper_bound > limit) {
           eligible = false;
           break;
@@ -6425,12 +5698,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                  proj_types[*input.column] == ValueType::kInt64 &&
                  proj_unsigned[*input.column] == 0) {
         const slot_t full0 = proj_to_full[*input.column];
-        __int128_t lo0 = 0;
-        __int128_t hi0 = 0;
-        const __int128_t limit =
+        platform::Int128 lo0 = 0;
+        platform::Int128 hi0 = 0;
+        const platform::Int128 limit =
             kind == SlimAggKind::kAvgDouble
-                ? static_cast<__int128_t>(int64_t{1} << 53)
-                : static_cast<__int128_t>(std::numeric_limits<int64_t>::max());
+                ? static_cast<platform::Int128>(int64_t{1} << 53)
+                : static_cast<platform::Int128>(
+                      std::numeric_limits<int64_t>::max());
         if (!safe_int_col_bounds(full0, &lo0, &hi0) ||
             !safe_int_sum_bound(lo0, hi0, limit)) {
           eligible = false;
@@ -6448,22 +5722,22 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         const slot_t full0 = proj_to_full[ie.col0];
         const slot_t full1 = proj_to_full[ie.col1];
         const slot_t full2 = proj_to_full[ie.col2];
-        __int128_t lo0 = 0, hi0 = 0;
+        platform::Int128 lo0 = 0, hi0 = 0;
         if (!safe_int_col_bounds(full0, &lo0, &hi0)) {
           eligible = false;
           break;
         }
-        __int128_t lo = lo0, hi = hi0;
+        platform::Int128 lo = lo0, hi = hi0;
         if (ie.shape != TypedIntExprInput::Shape::kSingleIntCol) {
-          __int128_t lo1 = 0, hi1 = 0;
+          platform::Int128 lo1 = 0, hi1 = 0;
           if (!safe_int_col_bounds(full1, &lo1, &hi1)) {
             eligible = false;
             break;
           }
-          const __int128_t p0 = lo0 * lo1;
-          const __int128_t p1 = lo0 * hi1;
-          const __int128_t p2 = hi0 * lo1;
-          const __int128_t p3 = hi0 * hi1;
+          const platform::Int128 p0 = lo0 * lo1;
+          const platform::Int128 p1 = lo0 * hi1;
+          const platform::Int128 p2 = hi0 * lo1;
+          const platform::Int128 p3 = hi0 * hi1;
           lo = std::min({p0, p1, p2, p3});
           hi = std::max({p0, p1, p2, p3});
           if (lo < std::numeric_limits<int64_t>::min() ||
@@ -6472,7 +5746,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             break;
           }
           if (ie.shape == TypedIntExprInput::Shape::kMulTwoIntColsPlusCol) {
-            __int128_t lo2 = 0, hi2 = 0;
+            platform::Int128 lo2 = 0, hi2 = 0;
             if (!safe_int_col_bounds(full2, &lo2, &hi2)) {
               eligible = false;
               break;
@@ -6481,10 +5755,11 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             hi += hi2;
           }
         }
-        const __int128_t limit =
+        const platform::Int128 limit =
             kind == SlimAggKind::kAvgDouble
-                ? static_cast<__int128_t>(int64_t{1} << 53)
-                : static_cast<__int128_t>(std::numeric_limits<int64_t>::max());
+                ? static_cast<platform::Int128>(int64_t{1} << 53)
+                : static_cast<platform::Int128>(
+                      std::numeric_limits<int64_t>::max());
         if (!safe_int_sum_bound(lo, hi, limit)) {
           eligible = false;
           break;
@@ -6555,129 +5830,22 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   const auto check_slim_group_having = [&](TypedWorkerGroups& local,
                                            size_t group, Status* err) -> bool {
     for (const PositionalHaving& clause : positional_having) {
-      const size_t i = clause.agg_index;
-      const int64_t count = local.SlimCount(group, i);
       Value finished;
-      switch ((*local.slim_kinds)[i]) {
-        case SlimAggKind::kCount:
-          finished = Value(count);
-          break;
-        case SlimAggKind::kSumInt64:
-          finished = count == 0 ? Value() : Value(local.SlimIntTotal(group, i));
-          break;
-        case SlimAggKind::kSumDouble: {
-          if (count == 0) {
-            break;
-          }
-          const double sum_result = local.SlimDoubleTotal(group, i);
-          if ((local.SlimFlags(group, i) & 1) == 0 && std::isinf(sum_result)) {
-            *err = StatusError(StatusCode::kIsInfinity,
-                               "SUM overflow: result is infinite");
-            return false;
-          }
-          finished = Value(sum_result);
-          break;
-        }
-        case SlimAggKind::kAvgDouble:
-          finished = count == 0 ? Value()
-                                : Value(local.SlimDoubleTotal(group, i) /
-                                        static_cast<double>(count));
-          break;
-        case SlimAggKind::kCountDistinctDouble:
-        case SlimAggKind::kCountDistinctInt64:
-          finished =
-              Value(static_cast<int64_t>(local.SlimDistinctTotal(group, i)));
-          break;
-        default:
-          *err = StatusError(StatusCode::kInvalidArgument,
-                             "aggregate has no slim state");
-          return false;
-      }
-      if (!clause.has_constant) {
-        if (!Truthy(finished)) {
-          return false;
-        }
-        continue;
-      }
-      if (finished.IsNull() || clause.constant.IsNull()) {
+      if (!FinishSlimCell(local, group, clause.agg_index,
+                          (*local.slim_kinds)[clause.agg_index], &finished,
+                          err)) {
         return false;
       }
-      if (finished.type == ValueType::kInt64 &&
-          clause.constant.type == ValueType::kInt64 && !finished.IsUnsigned() &&
-          !clause.constant.IsUnsigned()) {
-        const int64_t a = finished.value.int_value;
-        const int64_t b = clause.constant.value.int_value;
-        bool ok = false;
-        switch (clause.op) {
-          case BinaryOperation::kEquals:
-            ok = (a == b);
-            break;
-          case BinaryOperation::kNotEquals:
-            ok = (a != b);
-            break;
-          case BinaryOperation::kLessThan:
-            ok = (a < b);
-            break;
-          case BinaryOperation::kLessThanEquals:
-            ok = (a <= b);
-            break;
-          case BinaryOperation::kGreaterThan:
-            ok = (a > b);
-            break;
-          default:
-            ok = (a >= b);
-            break;
-        }
-        if (!ok) {
-          return false;
-        }
-        continue;
-      }
-      if ((finished.type == ValueType::kDouble ||
-           finished.type == ValueType::kInt64) &&
-          (clause.constant.type == ValueType::kDouble ||
-           clause.constant.type == ValueType::kInt64) &&
-          !finished.IsUnsigned() && !clause.constant.IsUnsigned()) {
-        const double a = finished.type == ValueType::kDouble
-                             ? finished.value.double_value
-                             : static_cast<double>(finished.value.int_value);
-        const double b =
-            clause.constant.type == ValueType::kDouble
-                ? clause.constant.value.double_value
-                : static_cast<double>(clause.constant.value.int_value);
-        bool ok = false;
-        switch (clause.op) {
-          case BinaryOperation::kEquals:
-            ok = (a == b);
-            break;
-          case BinaryOperation::kNotEquals:
-            ok = (a != b);
-            break;
-          case BinaryOperation::kLessThan:
-            ok = (a < b);
-            break;
-          case BinaryOperation::kLessThanEquals:
-            ok = (a <= b);
-            break;
-          case BinaryOperation::kGreaterThan:
-            ok = (a > b);
-            break;
-          default:
-            ok = (a >= b);
-            break;
-        }
-        if (!ok) {
-          return false;
-        }
-        continue;
-      }
-      StatusOr<Value> compared =
-          TryBinary(clause.op, finished, clause.constant);
-      if (!compared.HasValue()) {
-        *err = compared.GetStatus();
+      Value right_finished;
+      if (clause.rhs_is_agg &&
+          !FinishSlimCell(local, group, clause.rhs_agg_index,
+                          (*local.slim_kinds)[clause.rhs_agg_index],
+                          &right_finished, err)) {
         return false;
       }
-      if (!Truthy(compared.Value())) {
+      if (!EvalPositionalHavingValues(
+              clause, finished, clause.rhs_is_agg ? &right_finished : nullptr,
+              err)) {
         return false;
       }
     }
@@ -6699,6 +5867,39 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if (found_arena != runtime->base_relation_arenas.end()) {
             hit_arena = found_arena->second;
           }
+        }
+        if (rows.empty() && hit_arena == nullptr &&
+            cached_relation->HasColumnarOnly() &&
+            cached_relation->columnar != nullptr) {
+          const auto& chunks = cached_relation->columnar->chunks;
+          const size_t col_total = cached_relation->columnar->total_rows;
+          const size_t begin = col_total * worker / worker_count;
+          const size_t end = col_total * (worker + 1) / worker_count;
+          Row chunk_row;
+          size_t offset = 0;
+          for (const ColumnarChunk& chunk : chunks) {
+            const size_t chunk_end_row = offset + chunk.rows;
+            if (chunk_end_row > begin && offset < end) {
+              const size_t r_begin = begin > offset ? begin - offset : 0;
+              const size_t r_end = std::min(chunk.rows, end - offset);
+              for (size_t r = r_begin; r < r_end; ++r) {
+                if (worker_errors[worker] != Status::kSuccess) {
+                  return;
+                }
+                chunk.MaterializeRowInto(r, &chunk_row);
+                ++counters[worker].scanned;
+                accumulate_row(chunk_row, &workers[worker],
+                               &worker_errors[worker],
+                               &counters[worker].emitted,
+                               &counters[worker].updates, nullptr, &scratch);
+              }
+            }
+            offset = chunk_end_row;
+            if (offset >= end) {
+              break;
+            }
+          }
+          return;
         }
         const size_t total =
             !rows.empty() ? rows.size() : (hit_arena ? hit_arena->rows : 0);
@@ -6745,7 +5946,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             if (worker_errors[worker] != Status::kSuccess) {
               return;
             }
-            ++scanned[worker];
+            ++counters[worker].scanned;
             const int64_t* cells = arena->cells.data() + (index * stride);
             const auto arena_is_null = [&](slot_t c) {
               return arena->IsNull(index, c);
@@ -6781,13 +5982,14 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 if (arena->IsNull(index, c)) {
                   fallback_row_values.emplace_back();
                 } else {
-                  fallback_row_values.push_back(arena_make_value(c));
+                  fallback_row_values.push_back(
+                      arena_make_value(static_cast<slot_t>(c)));
                 }
               }
               Row fallback_row(std::move(fallback_row_values));
               accumulate_row(fallback_row, &workers[worker],
-                             &worker_errors[worker], &emitted[worker],
-                             &aggregate_updates[worker], nullptr, &scratch);
+                             &worker_errors[worker], &counters[worker].emitted,
+                             &counters[worker].updates, nullptr, &scratch);
               fallback_row_values = std::move(fallback_row.values_);
               continue;
             }
@@ -6836,7 +6038,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             if (!keep) {
               continue;
             }
-            ++emitted[worker];
+            ++counters[worker].emitted;
             bool inserted = false;
             const int64_t raw_key = cells[plan.key_offsets[0]];
             size_t* slot = workers[worker].RawIntSlot(raw_key, &inserted);
@@ -6858,7 +6060,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             } else {
               group_index = *slot;
             }
-            ++aggregate_updates[worker];
+            ++counters[worker].updates;
             std::array<Value, 8>& stack_values = cache_hit_values;
             std::array<const Value*, 8>& value_ptrs = cache_hit_value_ptrs;
             for (size_t i = 0; i < plan.aggregates.size(); ++i) {
@@ -6874,7 +6076,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 continue;
               }
               if (input.conditional.has_value()) {
-                stack_values[i] = Value();
+                stack_values[i] =
+                    input.conditional->has_else_constant
+                        ? Value(input.conditional->else_int_constant)
+                        : Value();
                 if (DecideTypedFilterCompareCells(input.conditional->condition,
                                                   cells, arena_is_null,
                                                   arena_make_value)) {
@@ -6940,10 +6145,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if (worker_errors[worker] != Status::kSuccess) {
             return;
           }
-          ++scanned[worker];
+          ++counters[worker].scanned;
           accumulate_row(rows[index], &workers[worker], &worker_errors[worker],
-                         &emitted[worker], &aggregate_updates[worker], nullptr,
-                         &scratch);
+                         &counters[worker].emitted, &counters[worker].updates,
+                         nullptr, &scratch);
         }
         return;
       }
@@ -6960,13 +6165,13 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           if (error != Status::kSuccess) {
             return;
           }
-          ++scanned[worker];
+          ++counters[worker].scanned;
           accumulate_row(row, &workers[worker], &error, &rows_output, &updates,
                          nullptr, &scratch);
         });
         worker_errors[worker] = error;
-        emitted[worker] += rows_output;
-        aggregate_updates[worker] += updates;
+        counters[worker].emitted += rows_output;
+        counters[worker].updates += updates;
         return;
       }
       // Static rotation, same contract as the grouped-chunk fold above:
@@ -7075,9 +6280,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 local.SlimFlags(group, 0) |= 1;
               }
             }
-            scanned[worker] += matching_rows;
-            emitted[worker] += matching_rows;
-            aggregate_updates[worker] += matching_rows;
+            counters[worker].scanned += matching_rows;
+            counters[worker].emitted += matching_rows;
+            counters[worker].updates += matching_rows;
           }
           return;
         }
@@ -7092,7 +6297,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               continue;
             }
             if (peek_ptr == nullptr || peek_ptr->empty()) {
-              scanned[worker] += blk.row_count;
+              counters[worker].scanned += blk.row_count;
               matching_rows += blk.row_count;
               continue;
             }
@@ -7138,7 +6343,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 default:
                   break;
               }
-              scanned[worker] += blk_cnt;
+              counters[worker].scanned += blk_cnt;
               matching_rows += blk_cnt;
               continue;
             }
@@ -7154,7 +6359,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 }
               }
               if (ok) {
-                ++scanned[worker];
+                ++counters[worker].scanned;
                 ++matching_rows;
               }
             }
@@ -7175,8 +6380,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
               count += static_cast<int64_t>(matching_rows);
             }
-            emitted[worker] += matching_rows;
-            aggregate_updates[worker] += matching_rows;
+            counters[worker].emitted += matching_rows;
+            counters[worker].updates += matching_rows;
           }
           return;
         }
@@ -7449,9 +6654,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                    .double_entries.data()
                              : nullptr;
             const uint32_t nrows = blk.row_count;
-            scanned[worker] += nrows;
-            emitted[worker] += nrows;
-            aggregate_updates[worker] += nrows;
+            counters[worker].scanned += nrows;
+            counters[worker].emitted += nrows;
+            counters[worker].updates += nrows;
             const bool can_fast_having =
                 having_expr != nullptr && positional_having.size() == 1 &&
                 positional_having[0].agg_index == 0 &&
@@ -8461,9 +7666,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                   }
                 }
               }
-              scanned[worker] += blk_matched;
-              emitted[worker] += blk_matched;
-              aggregate_updates[worker] += blk_matched;
+              counters[worker].scanned += blk_matched;
+              counters[worker].emitted += blk_matched;
+              counters[worker].updates += blk_matched;
               continue;
             } else {
               const BlockSelectivityMode mode = build_block_selection();
@@ -8597,9 +7802,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
             }
             if (blk_matched > 0) {
-              scanned[worker] += blk_matched;
-              emitted[worker] += blk_matched;
-              aggregate_updates[worker] += blk_matched;
+              counters[worker].scanned += blk_matched;
+              counters[worker].emitted += blk_matched;
+              counters[worker].updates += blk_matched;
               for (size_t g = 0; g < local.GroupCount() && g < 256; ++g) {
                 const uint32_t cnt = blk_group_counts[g];
                 if (cnt == 0) {
@@ -8814,7 +8019,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 continue;
               }
             }
-            ++scanned[worker];
+            ++counters[worker].scanned;
 
             const auto is_null = [&](slot_t c) noexcept -> bool {
               return blk.has_any_null && blk.columns[proj_to_full[c]].IsNull(r);
@@ -9166,7 +8371,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
             }
 
-            ++emitted[worker];
+            ++counters[worker].emitted;
             size_t group_index = 0;
             if (plan.key_offsets.empty()) {
               if (!has_ungrouped) {
@@ -9359,7 +8564,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                      aggregate_expressions, &inserted);
             }
 
-            ++aggregate_updates[worker];
+            ++counters[worker].updates;
             if (local.slim) {
               const std::vector<SlimAggKind>& kinds = *local.slim_kinds;
               for (size_t i = 0; i < plan.aggregates.size(); ++i) {
@@ -9447,9 +8652,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 std::optional<slot_t> fallback_col;
                 if (input.conditional.has_value()) {
                   if (!eval_filter_compare(input.conditional->condition)) {
-                    continue;
-                  }
-                  if (input.conditional->then_column.has_value()) {
+                    if (!input.conditional->has_else_constant) {
+                      continue;
+                    }
+                    cell_type = input.conditional->result_type;
+                    cell = input.conditional->else_int_constant;
+                  } else if (input.conditional->then_column.has_value()) {
                     const slot_t col = *input.conditional->then_column;
                     if (is_null(col)) {
                       continue;
@@ -9491,75 +8699,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                   continue;
                 }
                 bool handled = true;
-                switch (kind) {
-                  case SlimAggKind::kCount:
-                    ++local.SlimCount(group_index, i);
-                    break;
-                  case SlimAggKind::kSumInt64:
-                    if (cell_type == ValueType::kInt64 && !cell_unsigned) {
-                      int64_t updated = 0;
-                      if (__builtin_add_overflow(
-                              local.SlimIntTotal(group_index, i), cell,
-                              &updated)) {
-                        err = StatusError(StatusCode::kIsInfinity,
-                                          "integer overflow in SUM");
-                        return;
-                      }
-                      local.SlimIntTotal(group_index, i) = updated;
-                      ++local.SlimCount(group_index, i);
-                    } else {
-                      handled = false;
-                    }
-                    break;
-                  case SlimAggKind::kSumDouble:
-                    if (cell_type == ValueType::kDouble) {
-                      const auto addend = std::bit_cast<double>(cell);
-                      if (std::isinf(addend)) {
-                        local.SlimFlags(group_index, i) |= 1;
-                      }
-                      local.SlimDoubleTotal(group_index, i) += addend;
-                      ++local.SlimCount(group_index, i);
-                    } else {
-                      handled = false;
-                    }
-                    break;
-                  case SlimAggKind::kAvgDouble:
-                    if (cell_type == ValueType::kDouble) {
-                      local.SlimDoubleTotal(group_index, i) +=
-                          std::bit_cast<double>(cell);
-                      ++local.SlimCount(group_index, i);
-                    } else if (cell_type == ValueType::kInt64) {
-                      local.SlimDoubleTotal(group_index, i) +=
-                          cell_unsigned
-                              ? static_cast<double>(static_cast<uint64_t>(cell))
-                              : static_cast<double>(cell);
-                      ++local.SlimCount(group_index, i);
-                    } else {
-                      handled = false;
-                    }
-                    break;
-                  case SlimAggKind::kCountDistinctDouble:
-                    if (cell_type == ValueType::kDouble) {
-                      static_cast<void>(local.SlimInsertDistinct(
-                          group_index, i,
-                          CanonicalDistinctDoubleBits(
-                              std::bit_cast<double>(cell))));
-                    } else {
-                      handled = false;
-                    }
-                    break;
-                  case SlimAggKind::kCountDistinctInt64:
-                    if (cell_type == ValueType::kInt64 ||
-                        cell_type == ValueType::kDate) {
-                      static_cast<void>(
-                          local.SlimInsertDistinct(group_index, i, cell));
-                    } else {
-                      handled = false;
-                    }
-                    break;
-                  default:
-                    handled = false;
-                    break;
+                if (!ApplySlimCell(&local, group_index, i, kind, cell_type,
+                                   cell, cell_unsigned, &handled, &err)) {
+                  return;
                 }
                 if (handled) {
                   continue;
@@ -9604,6 +8746,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                     value = Value(input.conditional->then_int_constant);
                     value.type = input.conditional->result_type;
                   }
+                } else if (input.conditional->has_else_constant) {
+                  value = Value(input.conditional->else_int_constant);
                 }
                 if (Status st = accumulator.Add(value);
                     st != Status::kSuccess) {
@@ -9680,7 +8824,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             if (decoded == 0) {
               break;
             }
-            scanned[worker] += decoded;
+            counters[worker].scanned += decoded;
             iterator.DropPageLatch();
             if (fill_cache) {
               AppendBatchToArena(batch, 0, decoded, &fill_buffer.mirror);
@@ -9701,15 +8845,19 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 }
                 count += static_cast<int64_t>(decoded);
               }
-              emitted[worker] += decoded;
-              aggregate_updates[worker] += decoded;
+              counters[worker].emitted += decoded;
+              counters[worker].updates += decoded;
               if (!worker_errors[worker].ok()) {
                 break;
               }
               continue;
             }
+            // Slim folds index the fixed 8-slot fold_row_values scratch by
+            // aggregate slot; more than 8 aggregates must take the generic
+            // decoded-row path (accumulate_row) instead.
             const bool direct_fold =
                 plan.filter_programs.empty() &&
+                (!plan.slim || plan.aggregates.size() <= 8) &&
                 std::ranges::none_of(plan.aggregates, [](const auto& input) {
                   return input.child.has_value();
                 });
@@ -9740,8 +8888,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                   decoded_row.values_[c] = std::move(value);
                 }
                 accumulate_row(decoded_row, &workers[worker],
-                               &worker_errors[worker], &emitted[worker],
-                               &aggregate_updates[worker], nullptr, &scratch);
+                               &worker_errors[worker],
+                               &counters[worker].emitted,
+                               &counters[worker].updates, nullptr, &scratch);
                 if (!worker_errors[worker].ok()) {
                   break;
                 }
@@ -9759,8 +8908,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                                 plan.key_offsets[0]]);
               }
               fold_cell_row(batch, r, &workers[worker], &worker_errors[worker],
-                            &emitted[worker], &aggregate_updates[worker],
-                            &scratch, &fold_row_values);
+                            &counters[worker].emitted,
+                            &counters[worker].updates, &scratch,
+                            &fold_row_values);
               if (worker_errors[worker] != Status::kSuccess) {
                 break;
               }
@@ -9787,9 +8937,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         }
         MorselFillBuffer* fill_target = fill_cache ? &fill_buffer : nullptr;
         for (; iterator.IsValid(); ++iterator) {
-          ++scanned[worker];
+          ++counters[worker].scanned;
           accumulate_row(*iterator, &workers[worker], &worker_errors[worker],
-                         &emitted[worker], &aggregate_updates[worker],
+                         &counters[worker].emitted, &counters[worker].updates,
                          fill_target, &scratch);
           if (worker_errors[worker] != Status::kSuccess) {
             break;
@@ -9814,7 +8964,9 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
           StatusError(StatusCode::kRuntimeError, "parallel aggregate failed");
     }
   };
+  phase("prepare", worker_count, 0);
   RETURN_IF_FAIL(RunParallelTasks(worker_count, run_worker));
+  phase("fold", worker_count, 0);
   for (const Status& error : worker_errors) {
     if (error != Status::kSuccess) {
       return error;
@@ -9945,6 +9097,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   }
   if (can_parallel_disjoint_emit) {
     std::vector<size_t> skipped_group(worker_count, SIZE_MAX);
+    // Where each skipped boundary group was absorbed (worker, group).  When a
+    // single-group worker B (min == max == K) is itself absorbed into the
+    // previous worker A, the next worker C must merge into A's group, not
+    // into B's skipped one, or C's partial would never be emitted.
+    std::vector<std::pair<size_t, size_t>> skipped_into(worker_count,
+                                                        {SIZE_MAX, SIZE_MAX});
     size_t boundary_merged_groups = 0;
     size_t prev_w = worker_count;
     for (size_t w = 0; w < worker_count; ++w) {
@@ -9957,9 +9115,15 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
         const size_t* dst_slot = workers[prev_w].int_index.Find(bkey);
         const size_t* src_slot = workers[w].int_index.Find(bkey);
         if (dst_slot != nullptr && src_slot != nullptr) {
-          const size_t target = *dst_slot;
+          size_t dst_w = prev_w;
+          size_t target = *dst_slot;
+          while (skipped_group[dst_w] == target) {
+            const auto [next_w, next_group] = skipped_into[dst_w];
+            dst_w = next_w;
+            target = next_group;
+          }
           const size_t group = *src_slot;
-          TypedWorkerGroups& dst = workers[prev_w];
+          TypedWorkerGroups& dst = workers[dst_w];
           TypedWorkerGroups& src = workers[w];
           for (size_t i = 0; i < plan.aggregates.size(); ++i) {
             const SlimAggKind kind = (*dst.slim_kinds)[i];
@@ -9976,47 +9140,20 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
               }
               if (src_state < src.slim_distinct_overflow.size() &&
                   src.slim_distinct_overflow[src_state]) {
-                for (const int64_t raw :
-                     *src.slim_distinct_overflow[src_state]) {
-                  static_cast<void>(dst.SlimInsertDistinct(target, i, raw));
-                }
+                src.slim_distinct_overflow[src_state]->ForEach(
+                    [&](int64_t raw, uint8_t) {
+                      static_cast<void>(dst.SlimInsertDistinct(target, i, raw));
+                    });
               }
               continue;
             }
-            if (src.SlimCount(group, i) == 0) {
-              continue;
-            }
-            switch (kind) {
-              case SlimAggKind::kCount:
-                dst.SlimCount(target, i) += src.SlimCount(group, i);
-                break;
-              case SlimAggKind::kSumInt64: {
-                int64_t updated = 0;
-                if (__builtin_add_overflow(dst.SlimIntTotal(target, i),
-                                           src.SlimIntTotal(group, i),
-                                           &updated)) {
-                  return StatusError(StatusCode::kIsInfinity,
-                                     "integer overflow in SUM");
-                }
-                dst.SlimIntTotal(target, i) = updated;
-                dst.SlimCount(target, i) += src.SlimCount(group, i);
-                break;
-              }
-              case SlimAggKind::kSumDouble:
-                dst.SlimDoubleTotal(target, i) += src.SlimDoubleTotal(group, i);
-                dst.SlimFlags(target, i) |= src.SlimFlags(group, i);
-                dst.SlimCount(target, i) += src.SlimCount(group, i);
-                break;
-              case SlimAggKind::kAvgDouble:
-                dst.SlimDoubleTotal(target, i) += src.SlimDoubleTotal(group, i);
-                dst.SlimCount(target, i) += src.SlimCount(group, i);
-                break;
-              default:
-                return StatusError(StatusCode::kInvalidArgument,
-                                   "aggregate has no slim state");
+            Status merge_err = Status::kSuccess;
+            if (!MergeSlimCell(&dst, target, src, group, i, kind, &merge_err)) {
+              return merge_err;
             }
           }
           skipped_group[w] = group;
+          skipped_into[w] = {dst_w, target};
           ++boundary_merged_groups;
         }
       }
@@ -10026,8 +9163,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     size_t total_scan_rows = 0;
     size_t total_scan_output = 0;
     for (size_t worker = 0; worker < worker_count; ++worker) {
-      total_scan_rows += scanned[worker];
-      total_scan_output += emitted[worker];
+      total_scan_rows += counters[worker].scanned;
+      total_scan_output += counters[worker].emitted;
     }
     if (runtime != nullptr) {
       runtime->scan_ms += ElapsedMs(scan_begin);
@@ -10042,8 +9179,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       runtime->aggregate_groups +=
           total_worker_groups + total_reclaimed_groups - boundary_merged_groups;
       runtime->aggregate_input_rows += total_scan_output;
-      for (const size_t worker_updates : aggregate_updates) {
-        runtime->aggregate_updates += worker_updates;
+      for (const auto& counter : counters) {
+        runtime->aggregate_updates += counter.updates;
       }
     }
 
@@ -10068,67 +9205,26 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             }
             local_finished.clear();
             for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-              const int64_t count = local.SlimCount(group, i);
               Value finished;
-              switch ((*local.slim_kinds)[i]) {
-                case SlimAggKind::kCount:
-                  finished = Value(count);
-                  break;
-                case SlimAggKind::kSumInt64:
-                  finished = count == 0 ? Value()
-                                        : Value(local.SlimIntTotal(group, i));
-                  break;
-                case SlimAggKind::kSumDouble: {
-                  if (count == 0) {
-                    break;
-                  }
-                  const double sum_result = local.SlimDoubleTotal(group, i);
-                  if ((local.SlimFlags(group, i) & 1) == 0 &&
-                      std::isinf(sum_result)) {
-                    emit_errors[w] =
-                        StatusError(StatusCode::kIsInfinity,
-                                    "SUM overflow: result is infinite");
-                    return;
-                  }
-                  finished = Value(sum_result);
-                  break;
-                }
-                case SlimAggKind::kAvgDouble:
-                  finished = count == 0
-                                 ? Value()
-                                 : Value(local.SlimDoubleTotal(group, i) /
-                                         static_cast<double>(count));
-                  break;
-                case SlimAggKind::kCountDistinctDouble:
-                case SlimAggKind::kCountDistinctInt64:
-                  finished = Value(
-                      static_cast<int64_t>(local.SlimDistinctTotal(group, i)));
-                  break;
-                default:
-                  emit_errors[w] = StatusError(StatusCode::kInvalidArgument,
-                                               "aggregate has no slim state");
-                  return;
+              if (!FinishSlimCell(local, group, i, (*local.slim_kinds)[i],
+                                  &finished, &emit_errors[w])) {
+                return;
               }
               local_finished.push_back(std::move(finished));
             }
             if (having_expr) {
               bool keep_group = true;
               for (const PositionalHaving& clause : positional_having) {
-                const Value& left_value = local_finished[clause.agg_index];
-                Value having_value;
-                if (clause.has_constant) {
-                  StatusOr<Value> compared =
-                      TryBinary(clause.op, left_value, clause.constant);
-                  if (!compared.HasValue()) {
-                    emit_errors[w] = compared.GetStatus();
-                    return;
-                  }
-                  having_value = compared.MoveValue();
-                } else {
-                  having_value = left_value;
+                const Value* right_ptr =
+                    clause.rhs_is_agg ? &local_finished[clause.rhs_agg_index]
+                                      : nullptr;
+                keep_group = EvalPositionalHavingValues(
+                    clause, local_finished[clause.agg_index], right_ptr,
+                    &emit_errors[w]);
+                if (!emit_errors[w].ok()) {
+                  return;
                 }
-                if (!Truthy(having_value)) {
-                  keep_group = false;
+                if (!keep_group) {
                   break;
                 }
               }
@@ -10186,17 +9282,23 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     for (const auto& out_rows : worker_outputs) {
       total_emitted += out_rows.size();
     }
-    output.rows.reserve(total_emitted);
+    const size_t reserve_rows = QueryMemoryBudget::Global().CanReserve(
+                                    (total_emitted * sizeof(Row)) + 64)
+                                    ? total_emitted
+                                    : std::min<size_t>(total_emitted, 65536);
+    output.rows.reserve(reserve_rows);
+    bool schema_types_set = false;
     for (auto& out_rows : worker_outputs) {
       for (Row& r : out_rows) {
+        if (!schema_types_set) {
+          for (size_t i = 0; i < output_columns.size(); ++i) {
+            output_columns[i] =
+                Column(output_columns[i].Name(), ValueTypeOf(r[i]));
+            output_columns[i].SetUnsigned(r[i].IsUnsigned());
+          }
+          schema_types_set = true;
+        }
         output.AddRow(std::move(r));
-      }
-    }
-    if (!output.rows.empty()) {
-      for (size_t i = 0; i < output_columns.size(); ++i) {
-        output_columns[i] =
-            Column(output_columns[i].Name(), ValueTypeOf(output.rows[0][i]));
-        output_columns[i].SetUnsigned(output.rows[0][i].IsUnsigned());
       }
     }
     if (runtime != nullptr) {
@@ -10220,8 +9322,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   size_t total_scan_rows = 0;
   size_t total_scan_output = 0;
   for (size_t worker = 0; worker < worker_count; ++worker) {
-    total_scan_rows += scanned[worker];
-    total_scan_output += emitted[worker];
+    total_scan_rows += counters[worker].scanned;
+    total_scan_output += counters[worker].emitted;
     TypedWorkerGroups& local = workers[worker];
     if (local.GroupCount() == 0) {
       continue;
@@ -10339,46 +9441,17 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
             }
             if (src_state < local.slim_distinct_overflow.size() &&
                 local.slim_distinct_overflow[src_state]) {
-              for (const int64_t raw :
-                   *local.slim_distinct_overflow[src_state]) {
+              local.slim_distinct_overflow[src_state]->ForEach([&](int64_t raw,
+                                                                   uint8_t) {
                 static_cast<void>(merged.SlimInsertDistinct(target, i, raw));
-              }
+              });
             }
             continue;
           }
-          if (local.SlimCount(group, i) == 0) {
-            continue;
-          }
-          switch (kind) {
-            case SlimAggKind::kCount:
-              merged.SlimCount(target, i) += local.SlimCount(group, i);
-              break;
-            case SlimAggKind::kSumInt64: {
-              int64_t updated = 0;
-              if (__builtin_add_overflow(merged.SlimIntTotal(target, i),
-                                         local.SlimIntTotal(group, i),
-                                         &updated)) {
-                return StatusError(StatusCode::kIsInfinity,
-                                   "integer overflow in SUM");
-              }
-              merged.SlimIntTotal(target, i) = updated;
-              merged.SlimCount(target, i) += local.SlimCount(group, i);
-              break;
-            }
-            case SlimAggKind::kSumDouble:
-              merged.SlimDoubleTotal(target, i) +=
-                  local.SlimDoubleTotal(group, i);
-              merged.SlimFlags(target, i) |= local.SlimFlags(group, i);
-              merged.SlimCount(target, i) += local.SlimCount(group, i);
-              break;
-            case SlimAggKind::kAvgDouble:
-              merged.SlimDoubleTotal(target, i) +=
-                  local.SlimDoubleTotal(group, i);
-              merged.SlimCount(target, i) += local.SlimCount(group, i);
-              break;
-            default:
-              return StatusError(StatusCode::kInvalidArgument,
-                                 "aggregate has no slim state");
+          Status merge_err = Status::kSuccess;
+          if (!MergeSlimCell(&merged, target, local, group, i, kind,
+                             &merge_err)) {
+            return merge_err;
           }
           continue;
         }
@@ -10392,6 +9465,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     }
   }
+  phase("merge", worker_count, merged.GroupCount());
   if (runtime != nullptr) {
     runtime->scan_ms += ElapsedMs(scan_begin);
     runtime->filter_ms += ElapsedMs(scan_begin);
@@ -10404,8 +9478,8 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     runtime->typed_parallel_aggregations += 1;
     runtime->aggregate_groups += merged.GroupCount();
     runtime->aggregate_input_rows += total_scan_output;
-    for (const size_t worker_updates : aggregate_updates) {
-      runtime->aggregate_updates += worker_updates;
+    for (const auto& counter : counters) {
+      runtime->aggregate_updates += counter.updates;
     }
   }
 
@@ -10492,45 +9566,12 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     finished_values.clear();
     finished_values.reserve(plan.aggregates.size());
     if (merged.slim) {
+      Status finish_err = Status::kSuccess;
       for (size_t i = 0; i < plan.aggregates.size(); ++i) {
-        const int64_t count = merged.SlimCount(group, i);
         Value finished;
-        switch ((*merged.slim_kinds)[i]) {
-          case SlimAggKind::kCount:
-            finished = Value(count);
-            break;
-          case SlimAggKind::kSumInt64:
-            finished =
-                count == 0 ? Value() : Value(merged.SlimIntTotal(group, i));
-            break;
-          case SlimAggKind::kSumDouble: {
-            if (count == 0) {
-              break;
-            }
-            const double sum_result = merged.SlimDoubleTotal(group, i);
-            if ((merged.SlimFlags(group, i) & 1) == 0 &&
-                std::isinf(sum_result)) {
-              // Finite inputs whose sum leaves the double range overflow:
-              // GoogleSQL raises instead of returning inf.
-              return StatusError(StatusCode::kIsInfinity,
-                                 "SUM overflow: result is infinite");
-            }
-            finished = Value(sum_result);
-            break;
-          }
-          case SlimAggKind::kAvgDouble:
-            finished = count == 0 ? Value()
-                                  : Value(merged.SlimDoubleTotal(group, i) /
-                                          static_cast<double>(count));
-            break;
-          case SlimAggKind::kCountDistinctDouble:
-          case SlimAggKind::kCountDistinctInt64:
-            finished =
-                Value(static_cast<int64_t>(merged.SlimDistinctTotal(group, i)));
-            break;
-          default:
-            return StatusError(StatusCode::kInvalidArgument,
-                               "aggregate has no slim state");
+        if (!FinishSlimCell(merged, group, i, (*merged.slim_kinds)[i],
+                            &finished, &finish_err)) {
+          return finish_err;
         }
         finished_values.push_back(std::move(finished));
       }
@@ -10544,25 +9585,21 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
     // group cost one allocation per group on multi-million-group folds.
     AggregateResultMap aggregate_results;
     if (having_expr && !positional_having.empty()) {
-      // `AGG op literal` / bare `AGG` (or a conjunction of them): decide
-      // straight from the finished values.  A NULL aggregate result compares
-      // to UNKNOWN, so the group drops.
+      // `AGG op literal`, `AGG op AGG`, or bare `AGG` (or a conjunction of
+      // them): decide straight from the finished values.  A NULL aggregate
+      // result compares to UNKNOWN, so the group drops.
       bool keep_group = true;
+      Status having_err = Status::kSuccess;
       for (const PositionalHaving& clause : positional_having) {
-        const Value& left_value = finished_values[clause.agg_index];
-        Value having_value;
-        if (clause.has_constant) {
-          StatusOr<Value> compared =
-              TryBinary(clause.op, left_value, clause.constant);
-          if (!compared.HasValue()) {
-            return compared.GetStatus();
-          }
-          having_value = compared.MoveValue();
-        } else {
-          having_value = left_value;
+        const Value* right_ptr = clause.rhs_is_agg
+                                     ? &finished_values[clause.rhs_agg_index]
+                                     : nullptr;
+        keep_group = EvalPositionalHavingValues(
+            clause, finished_values[clause.agg_index], right_ptr, &having_err);
+        if (!having_err.ok()) {
+          return having_err;
         }
-        if (!Truthy(having_value)) {
-          keep_group = false;
+        if (!keep_group) {
           break;
         }
       }
@@ -10630,7 +9667,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
       }
     }
     Row output_row(std::move(values));
-    if (output.rows.empty() && sortable.empty()) {
+    if (output.TotalRows() == 0 && sortable.empty()) {
       for (size_t i = 0; i < output_columns.size(); ++i) {
         output_columns[i] =
             Column(output_columns[i].Name(), ValueTypeOf(output_row[i]));
@@ -10662,6 +9699,7 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
   if (runtime != nullptr) {
     runtime->aggregate_ms += ElapsedMs(aggregate_begin);
   }
+  phase("finish", worker_count, merged.GroupCount());
   output.schema = Schema("", std::move(output_columns));
   return output;
 }

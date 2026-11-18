@@ -90,4 +90,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.CompatibleNestedSortsCollapseToOneOrder`: 内側 `(a ASC, b ASC)`、外側 `(a ASC)` の入れ子ソートに対し、スキャンに直結したキー数 2 の単一 Sort 代替式が生成されることを検証します。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.CompatibleNestedSortsCollapseToOneOrder`: 内側 `(a ASC, b ASC)`、外側 `(a ASC)` の入れ子ソートに対し、スキャンに直結したキー数 2 の単一 Sort 代替式が生成されることを検証します。

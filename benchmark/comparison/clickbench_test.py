@@ -31,6 +31,14 @@ class SessionTest(unittest.TestCase):
                 with self.subTest(rows=rows), self.assertRaises(ValueError):
                     clickbench.check_native_utc(Client(rows), Path(directory))
 
+    def test_clickhouse_server_timezone_is_validated(self):
+        good = Client([['UTC', '2000-01-02 03:04:05']])
+        self.assertEqual(clickbench.check_clickhouse_utc(good)['timezone'], 'UTC')
+        for rows in [[['Asia/Tokyo', '2000-01-02 12:04:05']],
+                     [['UTC', '2000-01-02 12:04:05']], [], None]:
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                clickbench.check_clickhouse_utc(Client(rows))
+
 
 class VerificationTest(unittest.TestCase):
     meta = [{'name': 'key', 'type': 'String'}, {'name': 'n', 'type': 'UInt64'}]

@@ -208,7 +208,7 @@ SELECT s.id FROM opt_skew s JOIN opt_skew_dim d
 ON s.hot_key = d.hot_key
 WHERE MOD(s.correlated, 30) = 0 ORDER BY s.id
 --
-ARRAY<STRUCT<id INT64>>[unknown order:{3}, {6}]
+ARRAY<STRUCT<id INT64>>[{3}, {6}]
 ==
 
 # -- Contradiction detection tests --

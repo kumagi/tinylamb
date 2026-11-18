@@ -89,10 +89,9 @@ return std::vector<PlanAlternative>{
 
 ## 関連 Rule との相互作用
 
-
-
+- **非相関化・派生表の平坦化**: 相関のない `FROM` サブクエリや平坦化可能な構造は計画前処理で通常の結合や `FlattenDerivedSources` へ降り、`apply` には到達しません。残余の相関式のみが本 Rule で `ApplyPlan` として物理化されます。
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.ApplyToJoinDecorrelation` / `CascadesTest.DecorrelateAggregateApply`: 相関クエリの生成とデコリレーションの挙動検証。
-- `executor/executor_test.cpp` の `ExecutorTest.RelationalCorrelatedDerivedSubqueryUsesApplyCache`: 相関サブクエリ実行時における Apply キャッシュの動作検証。
+- `plan/cascades_test_part3.cpp` / `plan/cascades_rules_coverage_test.cpp`: `kApply` を含む計画の生成とルール到達性の検証。
+- `executor/executor_test_part2.cpp` の `ExecutorTest.RelationalCorrelatedDerivedSubqueryUsesApplyCache`: 相関サブクエリ実行時における Apply キャッシュの動作検証。

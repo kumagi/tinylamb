@@ -2,6 +2,7 @@
 #include "executor/detail/scan_filter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -26,10 +28,12 @@
 
 #include "common/constants.hpp"
 #include "common/exception_status.hpp"
+#include "common/parallel_work.hpp"
 #include "common/query_parallelism.hpp"
 #include "common/status_or.hpp"
 #include "common/string_util.hpp"
 #include "database/transaction_context.hpp"
+#include "executor/detail/columnar_table.hpp"
 #include "executor/detail/expression_eval.hpp"
 #include "executor/detail/relation.hpp"
 #include "executor/detail/subquery_runtime.hpp"
@@ -113,8 +117,10 @@ BinaryOperation FlipCompare(BinaryOperation operation) {
 
 namespace {
 
-// Raw comparison dispatch shared by the column-vs-column fast path.  Callers
-// pre-verify the type pair, so every case below is total.
+// Raw comparison dispatch used by the column-vs-column fast path, constant
+// comparisons and columnar VARCHAR/DOUBLE checks. Higher-level matchers verify
+// the type pair before reaching this function; do not call it with arbitrary
+// mixed types assuming it is total.
 template <typename Left, typename Right>
 bool ComparePositional(BinaryOperation op, const Left& left,
                        const Right& right) {
@@ -222,7 +228,20 @@ bool FastLikeMatch(std::string_view value, std::string_view pattern) {
   return pattern_pos == pattern.size();
 }
 
-bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
+bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred,
+                        Status* error) {
+  // A failed exact comparison is not a clean FALSE. Record it for the caller
+  // (MatchScanFilter applies the commutative WHERE rule) instead of folding
+  // it into an ordinary reject that would hide a genuine evaluation error.
+  const auto exact = [&](StatusOr<Value> cmp) {
+    if (!cmp.HasValue()) {
+      if (error != nullptr && error->ok()) {
+        *error = cmp.GetStatus();
+      }
+      return false;
+    }
+    return cmp.Value().Truthy();
+  };
   if (pred.column_payload) {
     const Value& left = row[pred.column];
     const Value& right = row[pred.right_column];
@@ -234,19 +253,22 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
     if (IsIntLike(left) && IsIntLike(right)) {
       if (left.IsUnsigned() || right.IsUnsigned()) {
         StatusOr<Value> cmp = TryBinary(pred.op, left, right);
-        return cmp.HasValue() && cmp.Value().Truthy();
+        return exact(std::move(cmp));
       }
       return ComparePositional(pred.op, left.value.int_value,
                                right.value.int_value);
     }
     if (left.type == ValueType::kDouble && right.type == ValueType::kDouble) {
-      return ComparePositional(pred.op, left.value.double_value,
-                               right.value.double_value);
+      // The canonical Value comparison folds all NaNs equal (matching group
+      // keys / hashing); a raw IEEE `==` would reject NaN=NaN rows when this
+      // predicate is pushed into the scan.
+      StatusOr<Value> cmp = TryBinary(pred.op, left, right);
+      return exact(std::move(cmp));
     }
     if (left.type == ValueType::kVarChar && right.type == ValueType::kVarChar) {
       if (left.IsCaseInsensitive() || right.IsCaseInsensitive()) {
         StatusOr<Value> cmp = TryBinary(pred.op, left, right);
-        return cmp.HasValue() && cmp.Value().Truthy();
+        return exact(std::move(cmp));
       }
       return ComparePositional(
           pred.op, static_cast<std::string_view>(left.value.varchar_value),
@@ -257,7 +279,7 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
     // cache); route the rest through the exact evaluator rather than
     // guessing a verdict.
     StatusOr<Value> cmp = TryBinary(pred.op, left, right);
-    return cmp.HasValue() && cmp.Value().Truthy();
+    return exact(std::move(cmp));
   }
   const Value& value = row[pred.column];
   if (value.IsNull() || pred.constant.IsNull()) {
@@ -271,7 +293,7 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   if (pred.plain_string_payload && value.type == ValueType::kVarChar &&
       value.IsCaseInsensitive()) {
     StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
-    return cmp.HasValue() && cmp.Value().Truthy();
+    return exact(std::move(cmp));
   }
   if (pred.plain_string_payload && value.type == ValueType::kVarChar) {
     const std::string_view l = value.value.varchar_value;
@@ -300,7 +322,7 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
   if ((value.type == ValueType::kInt64 || value.type == ValueType::kDate) &&
       (value.IsUnsigned() || pred.constant.IsUnsigned())) {
     StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
-    return cmp.HasValue() && cmp.Value().Truthy();
+    return exact(std::move(cmp));
   }
 
   // The scan fast path must use the same coercions as the full expression
@@ -345,7 +367,7 @@ bool MatchSimpleCompare(const Row& row, const SimpleComparePredicate& pred) {
       return pred.op == BinaryOperation::kLike ? matched : !matched;
     }
     StatusOr<Value> cmp = TryBinary(pred.op, value, pred.constant);
-    return cmp.HasValue() && cmp.Value().Truthy();
+    return exact(std::move(cmp));
   }
 
   if (pred.int_payload &&
@@ -673,6 +695,15 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
       return std::nullopt;
     }
   }
+  // An interval-tagged constant compared with a plain string column raises
+  // "INTERVAL/STRING type mismatch" in the checked evaluator; a fast-path
+  // match would swallow that error and silently reject every row. (LIKE
+  // with an INTERVAL argument is FALSE everywhere in the canonical
+  // evaluator, so the like arm needs no delegation.)
+  if (!is_like && compiled.constant.IsInterval() &&
+      target_col.Type() == ValueType::kVarChar) {
+    return std::nullopt;
+  }
   if (is_like) {
     if (target_col.Type() != ValueType::kVarChar ||
         compiled.constant.type != ValueType::kVarChar ||
@@ -732,6 +763,16 @@ std::optional<SimpleComparePredicate> TryCompileSimpleCompare(
              !compiled.constant.IsCaseInsensitive() &&
              PlainStringComparable(compiled.constant.value.varchar_value)) {
     compiled.plain_string_payload = true;
+  }
+  // A type pair that reaches none of the payload branches above (arrays,
+  // timestamps, intervals, BOOL, ...) has no comparison kernel. The matcher
+  // would fall through to "no match" for every row, silently turning a TRUE
+  // predicate into an empty result. Leave such expressions in the residual
+  // evaluator, as the column-vs-column path already does.
+  if (!compiled.int_payload && !compiled.double_payload &&
+      !compiled.plain_string_payload && !compiled.date_string_payload &&
+      !compiled.column_payload) {
+    return std::nullopt;
   }
   return compiled;
 }
@@ -894,7 +935,8 @@ Expression ConjoinAll(const std::vector<Expression>& predicates);
 // without the contextful evaluator.  Anything else keeps the residual path.
 std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
     const Expression& predicate, const Schema& schema,
-    TransactionContext& context, const CteMap& ctes) {
+    TransactionContext& context, const CteMap& ctes,
+    bool allow_grouped_override = false) {
   static const bool membership_peel_disabled =
       std::getenv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") != nullptr;
   static const bool membership_peel_debug =
@@ -944,7 +986,8 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
   // set; GROUP BY / HAVING produce aggregate rows.  None of those shapes
   // reduce to a plain value set.
   if (statement.AsStruct() || statement.HasLimit() || statement.Offset() != 0 ||
-      (grouped_subquery && !allow_grouped_subquery) ||
+      (grouped_subquery && !allow_grouped_subquery &&
+       !allow_grouped_override) ||
       statement.SelectList().size() != 1) {
     return mbail("sub shape");
   }
@@ -1136,12 +1179,98 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
                            std::thread::hardware_concurrency()),
                        size_t{16}});
                   if (nworkers >= 2) {
+                    const bool flat_ready =
+                        std::ranges::all_of(needed, [&](slot_t col) {
+                          return col < store->integer_columns.size() &&
+                                 store->integer_columns[col].size() ==
+                                     store->total_rows &&
+                                 col < store->column_has_null.size() &&
+                                 !store->column_has_null[col];
+                        });
                     std::vector<char> worker_saw_null(nworkers, 0);
                     {
                       std::vector<std::jthread> threads;
                       threads.reserve(nworkers);
                       for (size_t w = 0; w < nworkers; ++w) {
                         threads.emplace_back([&, w] {
+                          if (flat_ready) {
+                            const auto* keys =
+                                store->integer_columns[col_idx].data();
+                            const size_t begin =
+                                store->total_rows * w / nworkers;
+                            const size_t end =
+                                store->total_rows * (w + 1) / nworkers;
+                            const bool ordered_keys =
+                                col_idx < store->column_is_monotonic.size() &&
+                                store->column_is_monotonic[col_idx];
+                            const auto scan = [&](auto&& matches) {
+                              FlatIntSet::DenseWriter writer(*values);
+                              bool have_last = false;
+                              int64_t last = 0;
+                              for (size_t r = begin; r < end; ++r) {
+                                const int64_t key = keys[r];
+                                if (have_last && key == last) { continue;
+}
+                                if (!matches(r)) { continue;
+}
+                                if (ordered_keys) {
+                                  writer.Insert(key);
+                                } else {
+                                  values->InsertDenseAtomic(key);
+}
+                                have_last = true;
+                                last = key;
+                              }
+                            };
+                            // Hoist the comparison dispatch out of the hot
+                            // loop for a single column-to-column predicate.
+                            if (local_simple.size() == 1 &&
+                                local_simple[0].column_payload) {
+                              const auto& compare = local_simple[0];
+                              const auto* a =
+                                  store->integer_columns[compare.column].data();
+                              const auto* b =
+                                  store->integer_columns[compare.right_column]
+                                      .data();
+                              switch (compare.op) {
+                                case BinaryOperation::kEquals:
+                                  scan([&](size_t r) { return a[r] == b[r]; });
+                                  return;
+                                case BinaryOperation::kNotEquals:
+                                  scan([&](size_t r) { return a[r] != b[r]; });
+                                  return;
+                                case BinaryOperation::kLessThan:
+                                  scan([&](size_t r) { return a[r] < b[r]; });
+                                  return;
+                                case BinaryOperation::kLessThanEquals:
+                                  scan([&](size_t r) { return a[r] <= b[r]; });
+                                  return;
+                                case BinaryOperation::kGreaterThan:
+                                  scan([&](size_t r) { return a[r] > b[r]; });
+                                  return;
+                                case BinaryOperation::kGreaterThanEquals:
+                                  scan([&](size_t r) { return a[r] >= b[r]; });
+                                  return;
+                                default:
+                                  break;
+                              }
+                            }
+                            scan([&](size_t r) {
+                              return std::ranges::all_of(
+                                  local_simple, [&](const auto& compare) {
+                                    const int64_t a =
+                                        store->integer_columns[compare.column]
+                                                              [r];
+                                    const int64_t b =
+                                        compare.column_payload
+                                            ? store->integer_columns
+                                                  [compare.right_column][r]
+                                            : compare.int_constant;
+                                    return ComparePositional(compare.op, a, b);
+                                  });
+                            });
+                            return;
+                          }
                           const size_t b_begin =
                               (store->blocks.size() * w) / nworkers;
                           const size_t b_end =
@@ -1254,9 +1383,13 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltMembership(
             // stale-stats fallback decision stays identical.
             std::vector<Table::ScanMorsel> morsels;
             size_t worker_count = 0;
+            Status morsel_status = Status::kSuccess;
             if (!parallel_membership_disabled && reserve_members >= 65536) {
-              morsels = table.Value()->BuildScanMorsels(context.txn_, 8);
-              if (morsels.size() >= 4) {
+              morsels = table.Value()->BuildScanMorsels(context.txn_, 8,
+                                                        &morsel_status);
+              if (morsel_status != Status::kSuccess) {
+                overflow = true;
+              } else if (morsels.size() >= 4) {
                 worker_count =
                     std::min<size_t>({morsels.size(),
                                       QueryParallelWorkerLimit(
@@ -1599,13 +1732,129 @@ std::shared_ptr<const FlatIntSet> TryBuildIndexedExistsKeys(
 // A selective, single-key EXISTS can build one row-independent membership
 // set instead of re-entering the correlated runtime for every outer row.
 // Keep the domain-pruned correlated build for large/nonselective inner inputs.
+bool IsNonThrowingLocalFilter(  // NOLINT(misc-no-recursion)
+    const Expression& expr, const Schema& local_schema, bool* simple_ok) {
+  if (!expr) {
+    return false;
+  }
+  if (IsNonThrowingScanComparison(expr, local_schema)) {
+    return true;
+  }
+  if (simple_ok != nullptr) {
+    *simple_ok = false;
+  }
+  if (expr->Type() == TypeTag::kUnaryExp) {
+    const auto& unary = expr->AsUnaryExpression();
+    if ((unary.Op() == UnaryOperation::kIsNull ||
+         unary.Op() == UnaryOperation::kIsNotNull) &&
+        unary.Child() && unary.Child()->Type() == TypeTag::kColumnValue) {
+      return LocalColumnOffset(local_schema,
+                               unary.Child()->AsColumnValue().GetColumnName())
+          .has_value();
+    }
+    return false;
+  }
+  if (expr->Type() == TypeTag::kInExp) {
+    const auto& in = expr->AsInExpression();
+    if (!in.child_ || in.child_->Type() != TypeTag::kColumnValue ||
+        in.list_.empty()) {
+      return false;
+    }
+    const auto offset = LocalColumnOffset(
+        local_schema, in.child_->AsColumnValue().GetColumnName());
+    if (!offset) {
+      return false;
+    }
+    const ValueType col_type = local_schema.GetColumn(*offset).Type();
+    if (col_type != ValueType::kInt64 && col_type != ValueType::kDate &&
+        col_type != ValueType::kDouble && col_type != ValueType::kVarChar) {
+      return false;
+    }
+    return std::ranges::all_of(in.list_, [&](const Expression& item) {
+      if (!item || item->Type() != TypeTag::kConstantValue) {
+        return false;
+      }
+      const ValueType item_type = item->AsConstantValue().GetValue().type;
+      return item_type == ValueType::kNull || item_type == col_type ||
+             (col_type == ValueType::kDouble &&
+              item_type == ValueType::kInt64) ||
+             (col_type == ValueType::kInt64 && item_type == ValueType::kDouble);
+    });
+  }
+  if (expr->Type() != TypeTag::kBinaryExp) {
+    return false;
+  }
+  const auto& binary = expr->AsBinaryExpression();
+  if (binary.Op() == BinaryOperation::kAnd ||
+      binary.Op() == BinaryOperation::kOr) {
+    return IsNonThrowingLocalFilter(binary.Left(), local_schema, nullptr) &&
+           IsNonThrowingLocalFilter(binary.Right(), local_schema, nullptr);
+  }
+  switch (binary.Op()) {
+    case BinaryOperation::kEquals:
+    case BinaryOperation::kNotEquals:
+    case BinaryOperation::kLessThan:
+    case BinaryOperation::kLessThanEquals:
+    case BinaryOperation::kGreaterThan:
+    case BinaryOperation::kGreaterThanEquals:
+      break;
+    default:
+      return false;
+  }
+  auto is_const_operand = [](const Expression& operand,
+                             std::optional<ValueType>* out_type) -> bool {
+    if (!operand) {
+      return false;
+    }
+    if (operand->Type() == TypeTag::kConstantValue) {
+      *out_type = operand->AsConstantValue().GetValue().type;
+      return true;
+    }
+    if (!ContainsVolatileCall(operand) && !ContainsParameterSlot(operand) &&
+        !ContainsQuery(operand) && !ContainsAggregate(operand) &&
+        operand->TouchedColumns().empty()) {
+      StatusOr<Value> evaluated = operand->TryEvaluate(Row(), Schema());
+      if (evaluated.HasValue()) {
+        *out_type = evaluated.Value().type;
+        return true;
+      }
+    }
+    return false;
+  };
+  const Expression* col_side = nullptr;
+  const Expression* const_side = nullptr;
+  if (binary.Left() && binary.Left()->Type() == TypeTag::kColumnValue) {
+    col_side = &binary.Left();
+    const_side = &binary.Right();
+  } else if (binary.Right() &&
+             binary.Right()->Type() == TypeTag::kColumnValue) {
+    col_side = &binary.Right();
+    const_side = &binary.Left();
+  } else {
+    return false;
+  }
+  const auto col_off = LocalColumnOffset(
+      local_schema, (*col_side)->AsColumnValue().GetColumnName());
+  std::optional<ValueType> const_type;
+  if (!col_off.has_value() || !is_const_operand(*const_side, &const_type) ||
+      !const_type.has_value()) {
+    return false;
+  }
+  const ValueType col_type = local_schema.GetColumn(*col_off).Type();
+  const ValueType rhs_type = *const_type;
+  return rhs_type == col_type || rhs_type == ValueType::kNull ||
+         (col_type == ValueType::kDouble && rhs_type == ValueType::kInt64) ||
+         (col_type == ValueType::kInt64 && rhs_type == ValueType::kDouble);
+}
+
 std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
     const Expression& predicate, const Schema& schema,
     const FilterCompileEnv& env) {
   static const bool disabled =
       std::getenv("TINYLAMB_DISABLE_PREBUILT_MEMBERSHIP") != nullptr;
   if (disabled || !predicate || predicate->Type() != TypeTag::kQueryExp ||
-      env.input_rows == 0) {
+      env.input_rows == 0 || env.context == nullptr || env.ctes == nullptr ||
+      env.context->execution_runtime() == nullptr) {
     return std::nullopt;
   }
   const auto& query = predicate->AsQueryExpression();
@@ -1613,26 +1862,54 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
     return std::nullopt;
   }
   const SelectStatement& sub = *query.Query();
-  if (sub.Sources().size() != 1 || !sub.WithQueries().empty() ||
+  if (sub.Sources().empty() || !sub.WithQueries().empty() ||
       !sub.UnionAll().empty() || sub.GetSetOperationTree() || sub.Qualify() ||
       sub.HasLimit() || sub.Offset() != 0 || !sub.GroupBy().empty() ||
       sub.Having() || sub.Distinct() || !sub.OrderBy().empty() ||
       sub.AsStruct() || sub.ForUpdate() || sub.HasDistinctOn()) {
     return std::nullopt;
   }
-  const auto& source = sub.Sources()[0];
-  if (source.query || source.unnest || source.sample || source.join_condition ||
-      env.ctes->contains(source.table)) {
-    return std::nullopt;
+  Schema local_schema;
+  std::shared_ptr<Table> single_table;
+  std::shared_ptr<TableStatistics> single_stats;
+  for (const auto& source : sub.Sources()) {
+    if (source.query || source.unnest || source.sample ||
+        source.join_condition ||
+        (source.join_type != JoinType::kCross &&
+         source.join_type != JoinType::kInner)) {
+      return std::nullopt;
+    }
+    const std::string& qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    Schema part;
+    if (env.ctes->contains(source.table)) {
+      const Relation* cte = env.ctes->at(source.table).get();
+      if (cte == nullptr) {
+        return std::nullopt;
+      }
+      part = qualifier.empty() ? cte->schema
+                               : QualifySchema(cte->schema, qualifier);
+    } else {
+      auto table = env.context->GetTable(source.table);
+      auto stats = env.context->GetStats(source.table);
+      if (!table.HasValue() || !stats.HasValue() ||
+          stats.Value()->Rows() == 0) {
+        return std::nullopt;
+      }
+      if (sub.Sources().size() > 1 && env.input_rows < 64) {
+        return std::nullopt;
+      }
+      part = qualifier.empty()
+                 ? table.Value()->GetSchema()
+                 : QualifySchema(table.Value()->GetSchema(), qualifier);
+      if (sub.Sources().size() == 1) {
+        single_table = table.Value();
+        single_stats = stats.Value();
+      }
+    }
+    local_schema = local_schema.ColumnCount() == 0 ? std::move(part)
+                                                   : (local_schema + part);
   }
-  auto table = env.context->GetTable(source.table);
-  auto stats = env.context->GetStats(source.table);
-  if (!table.HasValue() || !stats.HasValue() || stats.Value()->Rows() == 0) {
-    return std::nullopt;
-  }
-  const Schema local_schema =
-      QualifySchema(table.Value()->GetSchema(),
-                    source.alias.empty() ? source.table : source.alias);
   for (const auto& item : sub.SelectList()) {
     if (!item.expression ||
         (item.expression->Type() != TypeTag::kConstantValue &&
@@ -1647,6 +1924,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
   Expression local_key;
   ColumnName outer_key;
   std::vector<Expression> rest;
+  bool all_rest_simple = true;
   for (const auto& conjunct : SplitConjuncts(sub.WhereClause())) {
     if (!conjunct) {
       return std::nullopt;
@@ -1672,7 +1950,7 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
         }
       }
     }
-    if (!IsNonThrowingScanComparison(conjunct, local_schema)) {
+    if (!IsNonThrowingLocalFilter(conjunct, local_schema, &all_rest_simple)) {
       return std::nullopt;
     }
     rest.push_back(conjunct);
@@ -1695,15 +1973,100 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
       inner_column.IsUnsigned() != outer_column.IsUnsigned()) {
     return std::nullopt;
   }
+  // Lean proof: lean/TinylambOpt/TpcdsExecCodegen.lean
+  //   (prebuilt_exists_outer_domain_filter_sound,
+  //    not_exists_on_null_outer_key_is_true)
+  // Restrict the inner membership build to the non-NULL probe keys actually
+  // present in `env.input_relation` when bounded in memory.
+  std::vector<int64_t> outer_domain_keys;
+  bool have_outer_domain = false;
+  if (env.input_relation != nullptr && !env.input_relation->HasSpill() &&
+      env.input_relation->TotalRows() <= 32768 &&
+      static_cast<size_t>(*probe) < env.input_relation->schema.ColumnCount() &&
+      !outer_column.IsUnsigned()) {
+    bool domain_ok = true;
+    const auto probe_idx = static_cast<size_t>(*probe);
+    const ValueType expected_t = outer_column.Type();
+    outer_domain_keys.reserve(env.input_relation->TotalRows());
+    if (env.input_relation->HasColumnarOnly()) {
+      for (const ColumnarChunk& ch : env.input_relation->columnar->chunks) {
+        if (probe_idx >= ch.columns.size()) {
+          domain_ok = false;
+          break;
+        }
+        const ColumnarColumn& cc = ch.columns[probe_idx];
+        for (size_t r = 0; r < ch.rows; ++r) {
+          if (cc.IsNull(r)) {
+            continue;
+          }
+          if (cc.is_uniform) {
+            if (cc.type != expected_t || cc.is_unsigned) {
+              domain_ok = false;
+              break;
+            }
+            outer_domain_keys.push_back(cc.IntAt(r));
+          } else {
+            Value tmp;
+            cc.WriteValueInto(r, &tmp);
+            if (tmp.IsNull()) {
+              continue;
+            }
+            if (tmp.type != expected_t || tmp.IsUnsigned()) {
+              domain_ok = false;
+              break;
+            }
+            outer_domain_keys.push_back(tmp.value.int_value);
+          }
+        }
+        if (!domain_ok) {
+          break;
+        }
+      }
+    } else {
+      for (const Row& r : env.input_relation->rows) {
+        if (probe_idx >= r.values_.size()) {
+          domain_ok = false;
+          break;
+        }
+        const Value& v = r.values_[probe_idx];
+        if (v.IsNull()) {
+          continue;
+        }
+        if (v.type != expected_t || v.IsUnsigned()) {
+          domain_ok = false;
+          break;
+        }
+        outer_domain_keys.push_back(v.value.int_value);
+      }
+    }
+    if (domain_ok) {
+      std::ranges::sort(outer_domain_keys);
+      const auto dup = std::ranges::unique(outer_domain_keys);
+      outer_domain_keys.erase(dup.begin(), dup.end());
+      have_outer_domain = true;
+    }
+  }
+  if (have_outer_domain && outer_domain_keys.empty()) {
+    PrebuiltMembershipPredicate empty_compiled;
+    empty_compiled.column = static_cast<slot_t>(*probe);
+    empty_compiled.negated = query.Negated();
+    empty_compiled.domain_type = outer_column.Type();
+    empty_compiled.values = std::make_shared<FlatIntSet>();
+    empty_compiled.existence = true;
+    empty_compiled.contains_null = false;
+    return empty_compiled;
+  }
+
   const Expression local_filter = rest.empty() ? nullptr : ConjoinAll(rest);
-  const double build_rows = static_cast<double>(stats.Value()->Rows()) *
-                            (local_filter ? stats.Value()->EstimateSelectivity(
-                                                local_schema, local_filter)
-                                          : 1.0);
-  if (!rest.empty()) {
+  if (single_table != nullptr && single_stats != nullptr && !rest.empty() &&
+      all_rest_simple) {
+    const double build_rows = static_cast<double>(single_stats->Rows()) *
+                              (local_filter ? single_stats->EstimateSelectivity(
+                                                  local_schema, local_filter)
+                                            : 1.0);
     if (auto values = TryBuildIndexedExistsKeys(
-            *table.Value(), local_schema, static_cast<slot_t>(*local), rest,
-            *stats.Value(), build_rows, env)) {
+            *single_table, local_schema, static_cast<slot_t>(*local), rest,
+            *single_stats, build_rows, env)) {
       PrebuiltMembershipPredicate compiled;
       compiled.column = static_cast<slot_t>(*probe);
       compiled.negated = query.Negated();
@@ -1713,13 +2076,142 @@ std::optional<PrebuiltMembershipPredicate> TryCompilePrebuiltExists(
       return compiled;
     }
   }
+  if (StatementContainsVolatileFunctionCached(env.context->execution_runtime(),
+                                              sub)) {
+    return std::nullopt;
+  }
+  const bool group_keys = sub.Sources().size() > 1 || single_table == nullptr;
+  if (have_outer_domain && outer_domain_keys.size() <= 8192) {
+    const auto make_val = [&](int64_t k) {
+      return outer_column.Type() == ValueType::kDate ? Value::DateFromDays(k)
+                                                     : Value(k);
+    };
+    std::vector<Expression> restricted_preds = rest;
+    restricted_preds.push_back(
+        UnaryExpressionExp(local_key, UnaryOperation::kIsNotNull));
+    if (outer_domain_keys.size() == 1) {
+      restricted_preds.push_back(BinaryExpressionExp(
+          local_key, BinaryOperation::kEquals,
+          ConstantValueExp(make_val(outer_domain_keys[0]))));
+    } else {
+      restricted_preds.push_back(BinaryExpressionExp(
+          local_key, BinaryOperation::kGreaterThanEquals,
+          ConstantValueExp(make_val(outer_domain_keys.front()))));
+      restricted_preds.push_back(BinaryExpressionExp(
+          local_key, BinaryOperation::kLessThanEquals,
+          ConstantValueExp(make_val(outer_domain_keys.back()))));
+      std::vector<Expression> in_items;
+      in_items.reserve(outer_domain_keys.size());
+      for (const int64_t k : outer_domain_keys) {
+        in_items.push_back(ConstantValueExp(make_val(k)));
+      }
+      restricted_preds.push_back(InExpressionExp(local_key, std::move(in_items)));
+    }
+    auto restricted_stmt = std::make_shared<SelectStatement>(sub);
+    restricted_stmt->SetWhereClause(ConjoinAll(restricted_preds));
+    restricted_stmt->SetSelectList({NamedExpression("", local_key)});
+    if (group_keys) {
+      restricted_stmt->SetGroupBy({local_key});
+    }
+    if (StatementUsesOnlyScopes(*env.context, *restricted_stmt, {},
+                                *env.ctes)) {
+      StatusOr<Relation> exec_res =
+          ExecuteQuery(*env.context, *restricted_stmt, nullptr, *env.ctes,
+                       nullptr, true);
+      if (exec_res.HasValue() && exec_res.Value().GetStatus().ok() &&
+          exec_res.Value().schema.ColumnCount() == 1 &&
+          !exec_res.Value().HasSpill()) {
+        const Relation& members = exec_res.Value();
+        auto values = std::make_shared<FlatIntSet>();
+        if (!values->TryReserveDense(outer_domain_keys.front(),
+                                     outer_domain_keys.back())) {
+          values->Reserve(
+              std::min(outer_domain_keys.size(), members.TotalRows()));
+        }
+        bool domain_clean = true;
+        const ValueType expected_t = outer_column.Type();
+        if (members.HasColumnarOnly()) {
+          for (const ColumnarChunk& ch : members.columnar->chunks) {
+            const ColumnarColumn& cc = ch.columns[0];
+            for (size_t r = 0; r < ch.rows; ++r) {
+              if (cc.IsNull(r)) {
+                continue;
+              }
+              if (cc.is_uniform) {
+                if (cc.type != expected_t || cc.is_unsigned) {
+                  domain_clean = false;
+                  break;
+                }
+                values->Insert(cc.IntAt(r));
+              } else {
+                Value tmp;
+                cc.WriteValueInto(r, &tmp);
+                if (tmp.IsNull()) {
+                  continue;
+                }
+                if (tmp.type != expected_t || tmp.IsUnsigned()) {
+                  domain_clean = false;
+                  break;
+                }
+                values->Insert(tmp.value.int_value);
+              }
+            }
+            if (!domain_clean) {
+              break;
+            }
+          }
+        } else {
+          for (const Row& row : members.rows) {
+            if (row.values_.empty() || row.values_[0].IsNull()) {
+              continue;
+            }
+            if (row.values_[0].type != expected_t ||
+                row.values_[0].IsUnsigned() ||
+                row.values_[0].Collation() != 0) {
+              domain_clean = false;
+              break;
+            }
+            values->Insert(row.values_[0].value.int_value);
+          }
+        }
+        if (domain_clean && !values->DenseOverflowed()) {
+          if (auto* runtime = env.context->execution_runtime()) {
+            ++runtime->prebuilt_exists_index_builds;
+            runtime->prebuilt_exists_keys += values->Size();
+          }
+          PrebuiltMembershipPredicate compiled;
+          compiled.column = static_cast<slot_t>(*probe);
+          compiled.negated = query.Negated();
+          compiled.domain_type = expected_t;
+          compiled.values = std::move(values);
+          compiled.existence = true;
+          compiled.contains_null = false;
+          return compiled;
+        }
+      }
+    }
+  }
   auto rewritten = std::make_shared<SelectStatement>(sub);
-  rewritten->SetWhereClause(local_filter);
-  rewritten->SetSelectList({NamedExpression("", local_key)});
+  if (group_keys) {
+    std::vector<Expression> inner_preds = std::move(rest);
+    inner_preds.push_back(
+        UnaryExpressionExp(local_key, UnaryOperation::kIsNotNull));
+    rewritten->SetWhereClause(ConjoinAll(inner_preds));
+    rewritten->SetSelectList({NamedExpression("", local_key)});
+    rewritten->SetGroupBy({local_key});
+  } else {
+    rewritten->SetWhereClause(local_filter);
+    rewritten->SetSelectList({NamedExpression("", local_key)});
+  }
+  if (!StatementUsesOnlyScopes(*env.context, *rewritten, {}, *env.ctes) ||
+      StatementContainsVolatileFunctionCached(env.context->execution_runtime(),
+                                              sub)) {
+    return std::nullopt;
+  }
   Expression membership = QueryExpressionExp(
       std::move(rewritten), ColumnValueExp(outer_key), false, query.Negated());
-  auto compiled =
-      TryCompilePrebuiltMembership(membership, schema, *env.context, *env.ctes);
+  auto compiled = TryCompilePrebuiltMembership(membership, schema, *env.context,
+                                               *env.ctes, group_keys);
   if (compiled) {
     compiled->existence = true;
     compiled->contains_null = false;
@@ -2050,9 +2542,10 @@ Expression TryExpandConstantInList(const Expression& expr) {
   } else {
     return expr;
   }
+  constexpr size_t kMaxInListDisjunctiveExpansion = 8;
   const InExpression& in = *in_ptr;
   if (!in.child_ || in.child_->Type() != TypeTag::kColumnValue ||
-      in.list_.empty() || in.list_.size() > kMaxDisjunctiveBranches) {
+      in.list_.empty() || in.list_.size() > kMaxInListDisjunctiveExpansion) {
     return expr;
   }
   std::vector<Expression> constants;
@@ -2080,8 +2573,98 @@ Expression TryExpandConstantInList(const Expression& expr) {
   return acc;
 }
 
+std::optional<PrebuiltMembershipPredicate> TryCompileConstantInMembership(
+    const Expression& predicate, const Schema& schema) {
+  if (!predicate) {
+    return std::nullopt;
+  }
+  bool negated = false;
+  const InExpression* in_ptr = nullptr;
+  if (predicate->Type() == TypeTag::kInExp) {
+    in_ptr = &predicate->AsInExpression();
+  } else if (predicate->Type() == TypeTag::kUnaryExp &&
+             predicate->AsUnaryExpression().Op() == UnaryOperation::kNot &&
+             predicate->AsUnaryExpression().Child() &&
+             predicate->AsUnaryExpression().Child()->Type() ==
+                 TypeTag::kInExp) {
+    negated = true;
+    in_ptr = &predicate->AsUnaryExpression().Child()->AsInExpression();
+  } else {
+    return std::nullopt;
+  }
+  const InExpression& in = *in_ptr;
+  if (!in.child_ || in.child_->Type() != TypeTag::kColumnValue ||
+      in.list_.size() < 2) {
+    return std::nullopt;
+  }
+  const auto offset =
+      LocalColumnOffset(schema, in.child_->AsColumnValue().GetColumnName());
+  if (!offset) {
+    return std::nullopt;
+  }
+  const Column& probe_col = schema.GetColumn(static_cast<size_t>(*offset));
+  const ValueType probe_type = probe_col.Type();
+  if (probe_col.IsInterval() || probe_col.IsUnsigned() ||
+      (probe_type != ValueType::kInt64 && probe_type != ValueType::kDate &&
+       probe_type != ValueType::kVarChar)) {
+    return std::nullopt;
+  }
+  PrebuiltMembershipPredicate compiled;
+  compiled.column = static_cast<slot_t>(*offset);
+  compiled.negated = negated;
+  compiled.domain_type = probe_type;
+  compiled.existence = false;
+  if (probe_type == ValueType::kVarChar) {
+    auto strings = std::make_shared<MembershipStringSet>();
+    strings->reserve(in.list_.size());
+    for (const Expression& item : in.list_) {
+      std::optional<Value> val = TryDecideConstantConjunct(item);
+      if (!val.has_value()) {
+        return std::nullopt;
+      }
+      if (val->IsNull()) {
+        compiled.contains_null = true;
+        continue;
+      }
+      if (val->type != ValueType::kVarChar || val->Collation() != 0 ||
+          !PlainStringComparable(val->AsStringView())) {
+        return std::nullopt;
+      }
+      strings->emplace(val->AsStringView());
+    }
+    compiled.string_values = std::move(strings);
+    return compiled;
+  }
+  auto values = std::make_shared<FlatIntSet>();
+  std::vector<int64_t> int_vals;
+  int_vals.reserve(in.list_.size());
+  for (const Expression& item : in.list_) {
+    std::optional<Value> val = TryDecideConstantConjunct(item);
+    if (!val.has_value()) {
+      return std::nullopt;
+    }
+    if (val->IsNull()) {
+      compiled.contains_null = true;
+      continue;
+    }
+    if (val->type != probe_type || val->IsUnsigned()) {
+      return std::nullopt;
+    }
+    int_vals.push_back(val->value.int_value);
+  }
+  if (!int_vals.empty()) {
+    values->Reserve(int_vals.size());
+    for (int64_t v : int_vals) {
+      values->Insert(v);
+    }
+  }
+  compiled.values = std::move(values);
+  return compiled;
+}
+
 CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
-    const Expression& and_expr, const Schema& schema) {
+    const Expression& and_expr, const Schema& schema,
+    const FilterCompileEnv* env) {
   CompiledScanFilter::DisjunctiveBranch branch;
   std::vector<Expression> conjuncts = SplitConjuncts(and_expr);
   for (const Expression& raw_conjunct : conjuncts) {
@@ -2095,6 +2678,22 @@ CompiledScanFilter::DisjunctiveBranch CompileAndBranch(
         branch.simple.push_back(std::move(*simple));
       } else if (auto prefix_in = TryCompilePrefixIn(conjunct, schema)) {
         branch.prefix_in.push_back(std::move(*prefix_in));
+      } else if (auto const_mem =
+                     TryCompileConstantInMembership(conjunct, schema)) {
+        branch.prebuilt_membership.push_back(std::move(*const_mem));
+      } else if (env != nullptr) {
+        if (auto membership =
+                env->prebuild_only_exists
+                    ? std::optional<PrebuiltMembershipPredicate>()
+                    : TryCompilePrebuiltMembership(conjunct, schema,
+                                                   *env->context, *env->ctes)) {
+          branch.prebuilt_membership.push_back(std::move(*membership));
+        } else if (auto existence =
+                       TryCompilePrebuiltExists(conjunct, schema, *env)) {
+          branch.prebuilt_membership.push_back(std::move(*existence));
+        } else {
+          branch.residual.push_back(conjunct);
+        }
       } else {
         branch.residual.push_back(conjunct);
       }
@@ -2170,7 +2769,7 @@ CompiledScanFilter CompileScanFilterUncached(
     // references a column cannot be resolved and stays a runtime predicate.
     if (std::optional<Value> decided = TryDecideConstantConjunct(predicate);
         decided.has_value()) {
-      // Mirror MatchRow's conjunct rule exactly once instead of per row:
+      // Mirror the constant-conjunct rule exactly once instead of per row:
       // non-NULL truthy decides TRUE (discharge), FALSE or NULL rejects the
       // conjunction cleanly (sibling errors never surface with a
       // rejecting conjunct present; EvaluateConjunctsTolerant).
@@ -2211,11 +2810,19 @@ CompiledScanFilter CompileScanFilterUncached(
     if (eff_predicate->Type() == TypeTag::kBinaryExp &&
         eff_predicate->AsBinaryExpression().Op() == BinaryOperation::kOr) {
       std::vector<Expression> disjuncts = SplitDisjuncts(eff_predicate);
-      if (disjuncts.size() >= 2 && !ContainsQuery(eff_predicate)) {
+      const bool had_query = ContainsQuery(eff_predicate);
+      if (disjuncts.size() >= 2 && (!had_query || env != nullptr)) {
         bool all_branches_usable = true;
         std::vector<CompiledScanFilter::DisjunctiveBranch> new_branches;
         for (const Expression& disjunct : disjuncts) {
-          auto branch = CompileAndBranch(disjunct, schema);
+          auto branch = CompileAndBranch(disjunct, schema, env);
+          if (had_query &&
+              std::ranges::any_of(branch.residual, [](const Expression& expr) {
+                return ContainsQuery(expr);
+              })) {
+            all_branches_usable = false;
+            break;
+          }
           if (branch.residual.size() == 1 &&
               branch.residual[0]->Type() == TypeTag::kInExp) {
             const Expression expanded_in =
@@ -2244,6 +2851,7 @@ CompiledScanFilter CompileScanFilterUncached(
                     sub_b.simple = branch.simple;
                     sub_b.simple.push_back(std::move(sc));
                     sub_b.prefix_in = branch.prefix_in;
+                    sub_b.prebuilt_membership = branch.prebuilt_membership;
                     new_branches.push_back(std::move(sub_b));
                   }
                   continue;
@@ -2251,10 +2859,10 @@ CompiledScanFilter CompileScanFilterUncached(
               }
             }
           }
-          // A prefix predicate (or an IN list expanded above) is already a
-          // complete branch. Requiring an additional comparison left mixed
-          // prefix/IN/range disjunctions on the recursive AST path.
-          if (branch.simple.empty() && branch.prefix_in.empty()) {
+          // A prefix, IN-list, or prebuilt-membership predicate is already a
+          // complete branch.
+          if (branch.simple.empty() && branch.prefix_in.empty() &&
+              branch.prebuilt_membership.empty()) {
             all_branches_usable = false;
             break;
           }
@@ -2280,6 +2888,11 @@ CompiledScanFilter CompileScanFilterUncached(
                 merged.prefix_in.insert(merged.prefix_in.end(),
                                         right.prefix_in.begin(),
                                         right.prefix_in.end());
+                merged.prebuilt_membership = left.prebuilt_membership;
+                merged.prebuilt_membership.insert(
+                    merged.prebuilt_membership.end(),
+                    right.prebuilt_membership.begin(),
+                    right.prebuilt_membership.end());
                 merged.residual = left.residual;
                 merged.residual.insert(merged.residual.end(),
                                        right.residual.begin(),
@@ -2293,10 +2906,15 @@ CompiledScanFilter CompileScanFilterUncached(
         }
       }
     }
-    if (auto simple = TryCompileSimpleCompare(predicate, schema)) {
+    // A singleton IN expands to one comparison, not an OR/AND tree. Compile
+    // that comparison too instead of sending it back to per-row evaluation.
+    if (auto simple = TryCompileSimpleCompare(eff_predicate, schema)) {
       compiled.simple.push_back(std::move(*simple));
     } else if (auto prefix_in = TryCompilePrefixIn(predicate, schema)) {
       compiled.prefix_in.push_back(std::move(*prefix_in));
+    } else if (auto const_mem =
+                   TryCompileConstantInMembership(predicate, schema)) {
+      compiled.prebuilt_membership.push_back(std::move(*const_mem));
     } else if (env != nullptr) {
       // With a compile-time environment, an uncorrelated membership probe
       // over an INT64/DATE column compiles to one immutable value set; the
@@ -2493,7 +3111,8 @@ bool MatchPrebuiltMembership(const Row& row,
 }
 
 bool MatchPrebuiltScalarCompare(const Row& row,
-                                const PrebuiltScalarComparePredicate& pred) {
+                                const PrebuiltScalarComparePredicate& pred,
+                                Status* error) {
   const Value& key = row[pred.key_column];
   if (key.IsNull() || key.type != pred.key_type) {
     return false;  // NULL key never matches a group.
@@ -2509,7 +3128,13 @@ bool MatchPrebuiltScalarCompare(const Row& row,
     return false;  // Comparison against a NULL scalar is UNKNOWN.
   }
   StatusOr<Value> cmp = TryBinary(pred.op, probe, it->second);
-  return cmp.HasValue() && cmp.Value().Truthy();
+  if (!cmp.HasValue()) {
+    if (error != nullptr && error->ok()) {
+      *error = cmp.GetStatus();
+    }
+    return false;
+  }
+  return cmp.Value().Truthy();
 }
 
 bool MatchScanFilter(const Row& row, const Schema& schema,
@@ -2537,9 +3162,21 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
     }
     match_row = &tagged;
   }
+  // An exact-evaluator raise inside a `simple` predicate is not a clean
+  // reject. Keep it aside while the sibling conjuncts run: a clean FALSE
+  // from any of them suppresses the error under the commutative WHERE rule,
+  // otherwise the error must reach the caller instead of an empty result.
+  Status simple_error{Status::kSuccess};
   // Evaluate top-level simple predicates (conjunction).
   for (const SimpleComparePredicate& pred : filter.simple) {
-    if (!MatchSimpleCompare(*match_row, pred)) {
+    Status pred_error{Status::kSuccess};
+    if (!MatchSimpleCompare(*match_row, pred, &pred_error)) {
+      if (!pred_error.ok()) {
+        if (simple_error.ok()) {
+          simple_error = std::move(pred_error);
+        }
+        continue;
+      }
       return false;
     }
   }
@@ -2555,7 +3192,14 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   }
   for (const PrebuiltScalarComparePredicate& pred :
        filter.prebuilt_scalar_compare) {
-    if (!MatchPrebuiltScalarCompare(*match_row, pred)) {
+    Status pred_error{Status::kSuccess};
+    if (!MatchPrebuiltScalarCompare(*match_row, pred, &pred_error)) {
+      if (!pred_error.ok()) {
+        if (simple_error.ok()) {
+          simple_error = std::move(pred_error);
+        }
+        continue;
+      }
       return false;
     }
   }
@@ -2568,15 +3212,29 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
     Status first_branch_error{Status::kSuccess};
     for (const auto& branch : filter.disjunctive_branches) {
       bool branch_ok = true;
+      Status branch_error{Status::kSuccess};
       for (const SimpleComparePredicate& pred : branch.simple) {
-        if (!MatchSimpleCompare(*match_row, pred)) {
+        Status pred_error{Status::kSuccess};
+        if (!MatchSimpleCompare(*match_row, pred, &pred_error)) {
           branch_ok = false;
+          if (!pred_error.ok() && branch_error.ok()) {
+            branch_error = std::move(pred_error);
+          }
           break;
         }
       }
       if (branch_ok) {
         for (const PrefixInPredicate& pred : branch.prefix_in) {
           if (!MatchPrefixIn(*match_row, pred)) {
+            branch_ok = false;
+            break;
+          }
+        }
+      }
+      if (branch_ok) {
+        for (const PrebuiltMembershipPredicate& pred :
+             branch.prebuilt_membership) {
+          if (!MatchPrebuiltMembership(*match_row, pred)) {
             branch_ok = false;
             break;
           }
@@ -2610,6 +3268,9 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
           }
         }
       }
+      if (!branch_error.ok() && first_branch_error.ok()) {
+        first_branch_error = std::move(branch_error);
+      }
       if (branch_ok) {
         any_branch_passed = true;
         break;
@@ -2623,6 +3284,12 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
     }
   }
   if (filter.residual.empty()) {
+    if (!simple_error.ok()) {
+      if (error != nullptr && error->ok()) {
+        *error = std::move(simple_error);
+      }
+      return false;
+    }
     return true;
   }
   // Use bytecode evaluator when available: avoids recursive expression tree
@@ -2637,7 +3304,14 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
     StatusOr<Value> result =
         TryEvaluateRowAuto(*filter.residual_bytecode, *match_row);
     if (result.HasValue()) {
-      return !result.Value().IsNull() && result.Value().Truthy();
+      const bool matches = !result.Value().IsNull() && result.Value().Truthy();
+      if (matches && !simple_error.ok()) {
+        if (error != nullptr && error->ok()) {
+          *error = std::move(simple_error);
+        }
+        return false;
+      }
+      return matches;
     }
     residual_error = result.GetStatus();
   }
@@ -2660,6 +3334,12 @@ bool MatchScanFilter(const Row& row, const Schema& schema,
   if (!residual_error.ok()) {
     if (error != nullptr && error->ok()) {
       *error = std::move(residual_error);
+    }
+    return false;
+  }
+  if (!simple_error.ok()) {
+    if (error != nullptr && error->ok()) {
+      *error = std::move(simple_error);
     }
     return false;
   }
@@ -2959,6 +3639,15 @@ int MatchScanFilterWorker(const Row& row, const Schema& schema,
           }
         }
       }
+      if (branch_ok) {
+        for (const PrebuiltMembershipPredicate& pred :
+             branch.prebuilt_membership) {
+          if (!MatchPrebuiltMembership(match_row, pred)) {
+            branch_ok = false;
+            break;
+          }
+        }
+      }
       if (branch_ok && !branch.residual.empty()) {
         StatusOr<Value> decided = TryEvaluateRowAuto(
             // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
@@ -2993,6 +3682,1315 @@ int MatchScanFilterWorker(const Row& row, const Schema& schema,
   return Truthy(decided.Value()) ? 1 : 0;
 }
 
+namespace {
+
+bool BytecodeColumnTruthy(const ColumnarColumn& col, size_t r) {
+  if (!col.is_uniform) {
+    return col.ValueAt(r).Truthy();
+  }
+  if (col.IsNull(r)) {
+    return false;
+  }
+  switch (col.type) {
+    case ValueType::kInt64:
+    case ValueType::kDate:
+      return col.IntAt(r) != 0;
+    case ValueType::kDouble:
+      return col.DoubleAt(r) != 0.0;
+    case ValueType::kVarChar:
+      return !col.StringAt(r).empty();
+    default:
+      return false;
+  }
+}
+
+template <typename PredFn>
+void NarrowSelection(size_t nrows, std::vector<uint32_t>* sel, bool* has_sel,
+                     PredFn&& pred) {
+  if (!*has_sel) {
+    sel->clear();
+    for (uint32_t r = 0; r < static_cast<uint32_t>(nrows); ++r) {
+      if (pred(r)) {
+        sel->push_back(r);
+      }
+    }
+    *has_sel = true;
+    return;
+  }
+  size_t out = 0;
+  for (const uint32_t r : *sel) {
+    if (pred(r)) {
+      (*sel)[out++] = r;
+    }
+  }
+  sel->resize(out);
+}
+
+bool ComputeColumnarUniformNonNull(const ColumnarTable& table) {
+  if (table.total_rows == 0 || table.chunks.empty()) {
+    return false;
+  }
+  size_t ncols = 0;
+  for (const ColumnarChunk& chunk : table.chunks) {
+    if (chunk.rows > 0) {
+      ncols = chunk.columns.size();
+      break;
+    }
+  }
+  if (ncols == 0) {
+    return false;
+  }
+  for (size_t c = 0; c < ncols; ++c) {
+    bool saw_non_null = false;
+    ValueType vt = ValueType::kNull;
+    bool is_unsigned = false;
+    bool is_interval = false;
+    for (const ColumnarChunk& chunk : table.chunks) {
+      if (chunk.rows == 0) {
+        continue;
+      }
+      if (c >= chunk.columns.size()) {
+        return false;
+      }
+      const ColumnarColumn& col = chunk.columns[c];
+      if (!col.is_uniform) {
+        return false;
+      }
+      if (col.type == ValueType::kNull || !col.AnyNonNull(chunk.rows)) {
+        continue;
+      }
+      if (!saw_non_null) {
+        saw_non_null = true;
+        vt = col.type;
+        is_unsigned = col.is_unsigned;
+        is_interval = col.is_interval;
+      } else if (col.type != vt || col.is_unsigned != is_unsigned ||
+                 col.is_interval != is_interval) {
+        return false;
+      }
+    }
+    if (!saw_non_null) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TryFilterColumnarTable(TransactionContext& context,
+                            const ColumnarTable& input,
+                            const CompiledScanFilter& filter,
+                            const Schema& match_schema, const Scope* outer,
+                            const CteMap& ctes,
+                            const ScanRuntimeFilter* runtime_filter,
+                            Relation* result, Status* error,
+                            bool parallel_disabled) {
+  if (filter.needs_unsigned_tagging) {
+    return false;
+  }
+  if (filter.compile_decided_reject) {
+    auto empty = std::make_shared<ColumnarTable>();
+    empty->keepalives = input.keepalives;
+    result->SetColumnarTable(std::move(empty), false);
+    return true;
+  }
+  const bool has_rf = runtime_filter != nullptr && runtime_filter->enabled();
+  const bool filter_empty =
+      !has_rf && filter.simple.empty() && filter.prefix_in.empty() &&
+      filter.prebuilt_membership.empty() &&
+      filter.prebuilt_scalar_compare.empty() &&
+      filter.disjunctive_branches.empty() && filter.residual.empty();
+  if (filter_empty || input.total_rows == 0 || input.chunks.empty()) {
+    auto copy = std::make_shared<ColumnarTable>();
+    copy->total_rows = input.total_rows;
+    copy->chunks = input.chunks;
+    copy->keepalives = input.keepalives;
+    const bool uniform = ComputeColumnarUniformNonNull(*copy);
+    result->SetColumnarTable(std::move(copy), uniform);
+    return true;
+  }
+  const WorkerScanFilterPrograms programs =
+      CompileWorkerFilter(filter, match_schema);
+  if (!programs.complete) {
+    return false;
+  }
+
+  const size_t nchunks = input.chunks.size();
+  const size_t max_workers =
+      (!parallel_disabled && input.total_rows >= 16384 && nchunks >= 2)
+          ? std::min<size_t>(
+                {size_t{16},
+                 QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
+                 nchunks, std::max<size_t>(1, input.total_rows / 4096)})
+          : 1;
+  const size_t workers = std::max<size_t>(1, max_workers);
+
+  struct DeferredChunkRow {
+    size_t preceding_rows;
+    Row row;
+  };
+  struct DictFilterCacheEntry {
+    const void* pred_ptr{nullptr};
+    const LSTableColumnDictionary* dict{nullptr};
+    std::vector<uint8_t> pass;
+    bool supported{true};
+  };
+  std::vector<ColumnarTable> worker_tables(workers);
+  std::vector<std::vector<DeferredChunkRow>> deferred(workers);
+  std::vector<std::vector<DictFilterCacheEntry>> worker_dict_caches(workers);
+  std::atomic<size_t> key_rejected{0};
+  std::atomic<size_t> key_null_rejected{0};
+
+  const auto eval_rf_col = [&](const ColumnarChunk& chunk,
+                               const ScanRuntimeFilter& rf, bool count_nulls,
+                               std::vector<uint32_t>* sel, bool* has_sel,
+                               size_t* rej, size_t* null_rej) {
+    if (rf.column >= chunk.columns.size()) {
+      return;
+    }
+    const ColumnarColumn& col = chunk.columns[rf.column];
+    const size_t nrows = chunk.rows;
+    if (col.is_uniform && col.type == ValueType::kNull) {
+      if (rf.Reject(static_cast<int8_t>(ValueType::kNull), true, 0)) {
+        const size_t n = *has_sel ? sel->size() : nrows;
+        *rej += n;
+        if (count_nulls) {
+          *null_rej += n;
+        }
+        sel->clear();
+        *has_sel = true;
+      }
+      return;
+    }
+    if (col.encoding == ColumnarColumn::Encoding::kConstant && col.is_uniform &&
+        (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
+      if (rf.Reject(static_cast<int8_t>(col.type), col.const_is_null,
+                    col.const_is_null ? 0 : col.const_int)) {
+        const size_t n = *has_sel ? sel->size() : nrows;
+        *rej += n;
+        if (count_nulls && col.const_is_null) {
+          *null_rej += n;
+        }
+        sel->clear();
+        *has_sel = true;
+      }
+      return;
+    }
+    if (col.IsFlat() && col.is_uniform &&
+        (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
+      const auto vt = static_cast<int8_t>(col.type);
+      const bool has_null = col.has_null;
+      const uint8_t* nulls = col.nulls.data();
+      const int64_t* ints = col.ints.data();
+      NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+        const bool is_null = has_null && nulls[r] != 0;
+        if (rf.Reject(vt, is_null, is_null ? 0 : ints[r])) {
+          ++(*rej);
+          if (count_nulls && is_null) {
+            ++(*null_rej);
+          }
+          return false;
+        }
+        return true;
+      });
+      return;
+    }
+    if (col.is_uniform &&
+        (col.type == ValueType::kInt64 || col.type == ValueType::kDate)) {
+      const auto vt = static_cast<int8_t>(col.type);
+      NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+        const bool is_null = col.IsNull(r);
+        if (rf.Reject(vt, is_null, is_null ? 0 : col.IntAt(r))) {
+          ++(*rej);
+          if (count_nulls && is_null) {
+            ++(*null_rej);
+          }
+          return false;
+        }
+        return true;
+      });
+      return;
+    }
+    Value kv;
+    NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+      col.WriteValueInto(r, &kv);
+      if (rf.Reject(static_cast<int8_t>(kv.type), kv.IsNull(),
+                    kv.value.int_value)) {
+        ++(*rej);
+        if (count_nulls && kv.IsNull()) {
+          ++(*null_rej);
+        }
+        return false;
+      }
+      return true;
+    });
+  };
+
+  const auto apply_simple_pred = [&](size_t worker_id,
+                                     const ColumnarChunk& chunk,
+                                     const SimpleComparePredicate& pred,
+                                     Row* scratch_row,
+                                     std::vector<uint32_t>* sel,
+                                     bool* has_sel) {
+    const size_t nrows = chunk.rows;
+    if (pred.column_payload || pred.column >= chunk.columns.size()) {
+      const size_t need = std::max<size_t>(pred.column, pred.right_column) + 1;
+      if (scratch_row->values_.size() < need) {
+        scratch_row->values_.resize(need);
+      }
+      NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+        if (pred.column < chunk.columns.size()) {
+          chunk.columns[pred.column].WriteValueInto(
+              r, &scratch_row->values_[pred.column]);
+        }
+        if (pred.column_payload && pred.right_column < chunk.columns.size()) {
+          chunk.columns[pred.right_column].WriteValueInto(
+              r, &scratch_row->values_[pred.right_column]);
+        }
+        return MatchSimpleCompare(*scratch_row, pred);
+      });
+      return;
+    }
+    if (pred.constant.IsNull()) {
+      sel->clear();
+      *has_sel = true;
+      return;
+    }
+    const ColumnarColumn& col = chunk.columns[pred.column];
+    if (col.is_uniform && col.type == ValueType::kNull) {
+      sel->clear();
+      *has_sel = true;
+      return;
+    }
+    if (col.encoding == ColumnarColumn::Encoding::kConstant && col.is_uniform) {
+      if (col.const_is_null) {
+        sel->clear();
+        *has_sel = true;
+        return;
+      }
+      if (scratch_row->values_.size() <= pred.column) {
+        scratch_row->values_.resize(pred.column + 1);
+      }
+      col.WriteValueInto(0, &scratch_row->values_[pred.column]);
+      if (!MatchSimpleCompare(*scratch_row, pred)) {
+        sel->clear();
+        *has_sel = true;
+      }
+      return;
+    }
+    if (col.is_uniform && !col.is_unsigned &&
+        (col.type == ValueType::kInt64 || col.type == ValueType::kDate) &&
+        (pred.int_payload ||
+         (col.type == ValueType::kDate && pred.date_string_payload))) {
+      const int64_t rhs = pred.int_constant;
+      const BinaryOperation op = pred.op;
+      if (col.IsFlat()) {
+        const bool has_null = col.has_null;
+        const uint8_t* nulls = col.nulls.data();
+        const int64_t* ints = col.ints.data();
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (has_null && nulls[r] != 0) {
+            return false;
+          }
+          return ComparePositional(op, ints[r], rhs);
+        });
+      } else {
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (col.IsNull(r)) {
+            return false;
+          }
+          return ComparePositional(op, col.IntAt(r), rhs);
+        });
+      }
+      return;
+    }
+    if (col.is_uniform && col.type == ValueType::kDouble &&
+        pred.double_payload) {
+      const double rhs = pred.double_constant;
+      const BinaryOperation op = pred.op;
+      if (col.IsFlat()) {
+        const bool has_null = col.has_null;
+        const uint8_t* nulls = col.nulls.data();
+        const double* doubles = col.doubles.data();
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (has_null && nulls[r] != 0) {
+            return false;
+          }
+          return ComparePositional(op, doubles[r], rhs);
+        });
+      } else {
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (col.IsNull(r)) {
+            return false;
+          }
+          return ComparePositional(op, col.DoubleAt(r), rhs);
+        });
+      }
+      return;
+    }
+    if (col.is_uniform && !col.is_interval && col.type == ValueType::kVarChar &&
+        pred.constant.type == ValueType::kVarChar &&
+        !pred.constant.IsCaseInsensitive() &&
+        (pred.plain_string_payload || pred.op == BinaryOperation::kLike ||
+         pred.op == BinaryOperation::kNotLike)) {
+      const std::string_view rhs = pred.constant.value.varchar_value;
+      const BinaryOperation op = pred.op;
+      if (col.encoding == ColumnarColumn::Encoding::kDictionary &&
+          col.dict != nullptr) {
+        auto& cache = worker_dict_caches[worker_id];
+        const DictFilterCacheEntry* cached = nullptr;
+        for (const auto& entry : cache) {
+          if (entry.pred_ptr == &pred && entry.dict == col.dict) {
+            cached = &entry;
+            break;
+          }
+        }
+        if (cached == nullptr) {
+          DictFilterCacheEntry fresh;
+          fresh.pred_ptr = &pred;
+          fresh.dict = col.dict;
+          const size_t ec = col.dict->StringEntryCount();
+          fresh.pass.resize(ec, 0);
+          for (size_t code = 0; code < ec; ++code) {
+            const std::string_view lhs = col.dict->StringEntryAt(code);
+            bool ok = false;
+            if (op == BinaryOperation::kLike ||
+                op == BinaryOperation::kNotLike) {
+              const bool m = FastLikeMatch(lhs, rhs);
+              ok = op == BinaryOperation::kLike ? m : !m;
+            } else {
+              ok = ComparePositional(op, lhs, rhs);
+            }
+            fresh.pass[code] = ok ? 1 : 0;
+          }
+          cache.push_back(std::move(fresh));
+          cached = &cache.back();
+        }
+        const uint8_t* __restrict pass_arr = cached->pass.data();
+        const size_t ec = cached->pass.size();
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          const uint32_t code = col.DictCodeAt(r);
+          return code < ec && pass_arr[code] != 0;
+        });
+        return;
+      }
+      if (col.IsFlat()) {
+        const bool has_null = col.has_null;
+        const uint8_t* nulls = col.nulls.data();
+        const std::string_view* strs = col.strings.data();
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (has_null && nulls[r] != 0) {
+            return false;
+          }
+          const std::string_view lhs = strs[r];
+          if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
+            const bool m = FastLikeMatch(lhs, rhs);
+            return op == BinaryOperation::kLike ? m : !m;
+          }
+          return ComparePositional(op, lhs, rhs);
+        });
+      } else {
+        NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+          if (col.IsNull(r)) {
+            return false;
+          }
+          const std::string_view lhs = col.StringAt(r);
+          if (op == BinaryOperation::kLike || op == BinaryOperation::kNotLike) {
+            const bool m = FastLikeMatch(lhs, rhs);
+            return op == BinaryOperation::kLike ? m : !m;
+          }
+          return ComparePositional(op, lhs, rhs);
+        });
+      }
+      return;
+    }
+    if (scratch_row->values_.size() <= pred.column) {
+      scratch_row->values_.resize(pred.column + 1);
+    }
+    NarrowSelection(nrows, sel, has_sel, [&](uint32_t r) {
+      col.WriteValueInto(r, &scratch_row->values_[pred.column]);
+      return MatchSimpleCompare(*scratch_row, pred);
+    });
+  };
+
+  const auto apply_prefix_in = [&](size_t worker_id, const ColumnarChunk& chunk,
+                                   const PrefixInPredicate& pred,
+                                   std::vector<uint32_t>* sel, bool* has_sel) {
+    if (pred.column >= chunk.columns.size()) {
+      sel->clear();
+      *has_sel = true;
+      return;
+    }
+    const ColumnarColumn& col = chunk.columns[pred.column];
+    if (col.encoding == ColumnarColumn::Encoding::kConstant && col.is_uniform) {
+      if (col.const_is_null || col.type != ValueType::kVarChar ||
+          !std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
+            return col.const_string.starts_with(p);
+          })) {
+        sel->clear();
+        *has_sel = true;
+      }
+      return;
+    }
+    if (col.is_uniform && col.type == ValueType::kVarChar &&
+        col.encoding == ColumnarColumn::Encoding::kDictionary &&
+        col.dict != nullptr) {
+      auto& cache = worker_dict_caches[worker_id];
+      const DictFilterCacheEntry* cached = nullptr;
+      for (const auto& entry : cache) {
+        if (entry.pred_ptr == &pred && entry.dict == col.dict) {
+          cached = &entry;
+          break;
+        }
+      }
+      if (cached == nullptr) {
+        DictFilterCacheEntry fresh;
+        fresh.pred_ptr = &pred;
+        fresh.dict = col.dict;
+        const size_t ec = col.dict->StringEntryCount();
+        fresh.pass.resize(ec, 0);
+        for (size_t code = 0; code < ec; ++code) {
+          const std::string_view sv = col.dict->StringEntryAt(code);
+          fresh.pass[code] = std::ranges::any_of(pred.prefixes,
+                                                 [&](const std::string& p) {
+                                                   return sv.starts_with(p);
+                                                 })
+                                 ? 1
+                                 : 0;
+        }
+        cache.push_back(std::move(fresh));
+        cached = &cache.back();
+      }
+      const uint8_t* __restrict pass_arr = cached->pass.data();
+      const size_t ec = cached->pass.size();
+      NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+        const uint32_t code = col.DictCodeAt(r);
+        return code < ec && pass_arr[code] != 0;
+      });
+      return;
+    }
+    if (col.is_uniform && col.type == ValueType::kVarChar) {
+      if (col.IsFlat()) {
+        const bool has_null = col.has_null;
+        const uint8_t* nulls = col.nulls.data();
+        const std::string_view* strs = col.strings.data();
+        NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+          if (has_null && nulls[r] != 0) {
+            return false;
+          }
+          const std::string_view sv = strs[r];
+          return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
+            return sv.starts_with(p);
+          });
+        });
+      } else {
+        NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+          if (col.IsNull(r)) {
+            return false;
+          }
+          const std::string_view sv = col.StringAt(r);
+          return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
+            return sv.starts_with(p);
+          });
+        });
+      }
+      return;
+    }
+    if (col.is_uniform && col.type != ValueType::kVarChar) {
+      sel->clear();
+      *has_sel = true;
+      return;
+    }
+    Value v;
+    NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+      col.WriteValueInto(r, &v);
+      if (v.IsNull() || v.type != ValueType::kVarChar) {
+        return false;
+      }
+      return std::ranges::any_of(pred.prefixes, [&](const std::string& p) {
+        return v.value.varchar_value.starts_with(p);
+      });
+    });
+  };
+
+  const auto apply_prebuilt_membership =
+      [&](size_t worker_id, const ColumnarChunk& chunk,
+          const PrebuiltMembershipPredicate& pred, Row* scratch_row,
+          std::vector<BytecodeColumnView>* views,
+          std::vector<ColumnarColumn>* view_scratches,
+          std::vector<uint8_t>* flat_view_ready, std::vector<uint32_t>* sel,
+          bool* has_sel) {
+        if (pred.column >= chunk.columns.size()) {
+          sel->clear();
+          *has_sel = true;
+          return;
+        }
+        const ColumnarColumn& col = chunk.columns[pred.column];
+        const auto resolve_flat_int = [&](bool* has_null_out,
+                                          const uint8_t** nulls_out,
+                                          const int64_t** ints_out) -> bool {
+          if (col.IsFlat()) {
+            *has_null_out = col.has_null && !col.nulls.empty();
+            *nulls_out = col.nulls.data();
+            *ints_out = col.ints.data();
+            return true;
+          }
+          if (views != nullptr && view_scratches != nullptr &&
+              flat_view_ready != nullptr &&
+              pred.column < flat_view_ready->size()) {
+            if ((*flat_view_ready)[pred.column] == 0) {
+              (*views)[pred.column] = col.ToBytecodeView(
+                  chunk.rows, &(*view_scratches)[pred.column], nullptr);
+              (*flat_view_ready)[pred.column] = 1;
+            }
+            const BytecodeColumnView& v = (*views)[pred.column];
+            if (v.is_uniform && v.ints != nullptr) {
+              *has_null_out = v.has_null && v.nulls != nullptr;
+              *nulls_out = v.nulls;
+              *ints_out = v.ints;
+              return true;
+            }
+          }
+          return false;
+        };
+        if (col.is_uniform && pred.runtime_filter != nullptr &&
+            col.type == pred.domain_type && !col.is_unsigned) {
+          const RuntimeFilterGroup& rf = *pred.runtime_filter;
+          if (rf.RejectsAll()) {
+            sel->clear();
+            *has_sel = true;
+            return;
+          }
+          if (col.encoding == ColumnarColumn::Encoding::kConstant) {
+            if (col.const_is_null || rf.Reject(col.const_int)) {
+              sel->clear();
+              *has_sel = true;
+            }
+            return;
+          }
+          bool has_null = false;
+          const uint8_t* nulls = nullptr;
+          const int64_t* ints = nullptr;
+          if (resolve_flat_int(&has_null, &nulls, &ints)) {
+            if (rf.has_dense_bits() && rf.has_bounds() && rf.Hi() >= rf.Lo()) {
+              const auto rbase = static_cast<uint64_t>(rf.Lo());
+              const uint64_t rspan_m1 = static_cast<uint64_t>(rf.Hi()) - rbase;
+              if ((rspan_m1 >> 6) < rf.dense_bits_word_count()) {
+                const uint64_t* __restrict dbits = rf.dense_bits_data();
+                if (!has_null) {
+                  NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+                    const uint64_t off = static_cast<uint64_t>(ints[r]) - rbase;
+                    return off <= rspan_m1 &&
+                           (dbits[off >> 6] & (uint64_t{1} << (off & 63))) != 0;
+                  });
+                } else {
+                  NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+                    if (nulls[r] != 0) {
+                      return false;
+                    }
+                    const uint64_t off = static_cast<uint64_t>(ints[r]) - rbase;
+                    return off <= rspan_m1 &&
+                           (dbits[off >> 6] & (uint64_t{1} << (off & 63))) != 0;
+                  });
+                }
+                return;
+              }
+            }
+            NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+              return (!has_null || nulls[r] == 0) && !rf.Reject(ints[r]);
+            });
+          } else {
+            NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+              return !col.IsNull(r) && !rf.Reject(col.IntAt(r));
+            });
+          }
+          return;
+        }
+        if (col.is_uniform && !col.is_interval &&
+            col.type == ValueType::kVarChar && pred.string_values &&
+            !pred.string_values->empty() &&
+            col.encoding == ColumnarColumn::Encoding::kDictionary &&
+            col.dict != nullptr) {
+          auto& cache = worker_dict_caches[worker_id];
+          const DictFilterCacheEntry* cached = nullptr;
+          for (const auto& entry : cache) {
+            if (entry.pred_ptr == &pred && entry.dict == col.dict) {
+              cached = &entry;
+              break;
+            }
+          }
+          if (cached == nullptr) {
+            DictFilterCacheEntry fresh;
+            fresh.pred_ptr = &pred;
+            fresh.dict = col.dict;
+            const size_t ec = col.dict->StringEntryCount();
+            fresh.pass.resize(ec, 0);
+            for (size_t code = 0; code < ec; ++code) {
+              const std::string_view sv = col.dict->StringEntryAt(code);
+              if (!PlainStringComparable(sv)) {
+                fresh.supported = false;
+                break;
+              }
+              const bool found = pred.string_values->contains(sv);
+              const bool ok =
+                  found ? !pred.negated : (!pred.contains_null && pred.negated);
+              fresh.pass[code] = ok ? 1 : 0;
+            }
+            cache.push_back(std::move(fresh));
+            cached = &cache.back();
+          }
+          if (cached->supported) {
+            const uint8_t* __restrict pass_arr = cached->pass.data();
+            const size_t ec = cached->pass.size();
+            NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+              const uint32_t code = col.DictCodeAt(r);
+              return code < ec && pass_arr[code] != 0;
+            });
+            return;
+          }
+        }
+        if (col.is_uniform && pred.runtime_filter == nullptr &&
+            !pred.string_values && pred.values != nullptr &&
+            col.type == pred.domain_type && !col.is_unsigned &&
+            (!pred.values->Empty() || pred.contains_null)) {
+          const FlatIntSet& values = *pred.values;
+          const bool neg = pred.negated;
+          const bool ex = pred.existence;
+          const bool cnull = pred.contains_null;
+          if (col.encoding == ColumnarColumn::Encoding::kConstant) {
+            const bool ok =
+                col.const_is_null
+                    ? (ex && neg)
+                    : (values.Contains(col.const_int) ? !neg : (!cnull && neg));
+            if (!ok) {
+              sel->clear();
+              *has_sel = true;
+            }
+            return;
+          }
+          bool has_null = false;
+          const uint8_t* nulls = nullptr;
+          const int64_t* ints = nullptr;
+          if (resolve_flat_int(&has_null, &nulls, &ints)) {
+            NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+              if (has_null && nulls[r] != 0) {
+                return ex && neg;
+              }
+              const bool found = values.Contains(ints[r]);
+              return found ? !neg : (!cnull && neg);
+            });
+          } else {
+            NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+              if (col.IsNull(r)) {
+                return ex && neg;
+              }
+              const bool found = values.Contains(col.IntAt(r));
+              return found ? !neg : (!cnull && neg);
+            });
+          }
+          return;
+        }
+        if (scratch_row->values_.size() <= pred.column) {
+          scratch_row->values_.resize(pred.column + 1);
+        }
+        NarrowSelection(chunk.rows, sel, has_sel, [&](uint32_t r) {
+          col.WriteValueInto(r, &scratch_row->values_[pred.column]);
+          return MatchPrebuiltMembership(*scratch_row, pred);
+        });
+      };
+
+  const auto eval_chunk_worker = [&](size_t w) {
+    const size_t cbegin = (nchunks * w) / workers;
+    const size_t cend = (nchunks * (w + 1)) / workers;
+    ColumnarChunk cur_chunk;
+    bool cur_chunk_init = false;
+    std::vector<std::shared_ptr<ChunkGatherIndex>> cur_gathers;
+    std::vector<uint32_t> sel;
+    std::vector<uint32_t> disj_sel;
+    std::vector<uint8_t> disj_pass;
+    std::vector<BytecodeColumnView> views;
+    std::vector<ColumnarColumn> view_scratches;
+    std::vector<uint8_t> flat_view_ready;
+    ColumnarColumn truthy_col;
+    Row scratch_row;
+    Row full_row;
+    size_t local_accepted_rows = 0;
+    size_t local_rej = 0;
+    size_t local_null_rej = 0;
+
+    const bool can_columnar_disjunction =
+        !filter.disjunctive_branches.empty() &&
+        std::ranges::all_of(filter.disjunctive_branches, [](const auto& b) {
+          return b.residual.empty() &&
+                 std::ranges::all_of(b.simple, [](const auto& sp) {
+                   return !sp.column_payload;
+                 });
+        });
+
+    std::vector<uint8_t> residual_needed_cols;
+    if (!filter.residual.empty() && programs.residual.has_value()) {
+      for (const BytecodeInstruction& inst :
+           programs.residual->Instructions()) {
+        if (inst.opcode == BytecodeOp::kLoadColumn) {
+          if (residual_needed_cols.size() <= inst.operand) {
+            residual_needed_cols.resize(inst.operand + 1, 0);
+          }
+          residual_needed_cols[inst.operand] = 1;
+        }
+      }
+    }
+
+    for (size_t ci = cbegin; ci < cend; ++ci) {
+      const ColumnarChunk& chunk = input.chunks[ci];
+      if (chunk.rows == 0) {
+        continue;
+      }
+      const size_t nrows = chunk.rows;
+      views.resize(chunk.columns.size());
+      view_scratches.resize(chunk.columns.size());
+      flat_view_ready.assign(chunk.columns.size(), 0);
+      bool has_sel = false;
+      sel.clear();
+      const auto empty_now = [&]() { return has_sel && sel.empty(); };
+
+      if (has_rf) {
+        eval_rf_col(chunk, *runtime_filter, true, &sel, &has_sel, &local_rej,
+                    &local_null_rej);
+        if (empty_now()) {
+          continue;
+        }
+        for (const ScanRuntimeFilter& ext : runtime_filter->extra) {
+          if (!ext.enabled()) {
+            continue;
+          }
+          eval_rf_col(chunk, ext, false, &sel, &has_sel, &local_rej,
+                      &local_null_rej);
+          if (empty_now()) {
+            break;
+          }
+        }
+        if (empty_now()) {
+          continue;
+        }
+      }
+      for (const SimpleComparePredicate& pred : filter.simple) {
+        apply_simple_pred(w, chunk, pred, &scratch_row, &sel, &has_sel);
+        if (empty_now()) {
+          break;
+        }
+      }
+      if (empty_now()) {
+        continue;
+      }
+      for (const PrefixInPredicate& pred : filter.prefix_in) {
+        apply_prefix_in(w, chunk, pred, &sel, &has_sel);
+        if (empty_now()) {
+          break;
+        }
+      }
+      if (empty_now()) {
+        continue;
+      }
+      for (const PrebuiltMembershipPredicate& pred :
+           filter.prebuilt_membership) {
+        apply_prebuilt_membership(w, chunk, pred, &scratch_row, &views,
+                                  &view_scratches, &flat_view_ready, &sel,
+                                  &has_sel);
+        if (empty_now()) {
+          break;
+        }
+      }
+      if (empty_now()) {
+        continue;
+      }
+      for (const PrebuiltScalarComparePredicate& pred :
+           filter.prebuilt_scalar_compare) {
+        const size_t need = std::max<size_t>(pred.column, pred.key_column) + 1;
+        if (scratch_row.values_.size() < need) {
+          scratch_row.values_.resize(need);
+        }
+        NarrowSelection(nrows, &sel, &has_sel, [&](uint32_t r) {
+          if (pred.column < chunk.columns.size()) {
+            chunk.columns[pred.column].WriteValueInto(
+                r, &scratch_row.values_[pred.column]);
+          }
+          if (pred.key_column < chunk.columns.size()) {
+            chunk.columns[pred.key_column].WriteValueInto(
+                r, &scratch_row.values_[pred.key_column]);
+          }
+          return MatchPrebuiltScalarCompare(scratch_row, pred);
+        });
+        if (empty_now()) {
+          break;
+        }
+      }
+      if (empty_now()) {
+        continue;
+      }
+
+      std::vector<uint32_t> chunk_deferred_rows;
+      if (!filter.disjunctive_branches.empty()) {
+        if (can_columnar_disjunction) {
+          disj_pass.assign(nrows, 0);
+          bool any_full_pass = false;
+          for (size_t b = 0; b < filter.disjunctive_branches.size(); ++b) {
+            const auto& branch = filter.disjunctive_branches[b];
+            bool branch_has_sel = true;
+            if (b == 0) {
+              branch_has_sel = has_sel;
+              if (has_sel) {
+                disj_sel = sel;
+              } else {
+                disj_sel.clear();
+              }
+            } else {
+              disj_sel.clear();
+              if (has_sel) {
+                for (uint32_t r : sel) {
+                  if (disj_pass[r] == 0) {
+                    disj_sel.push_back(r);
+                  }
+                }
+              } else {
+                for (uint32_t r = 0; r < static_cast<uint32_t>(nrows); ++r) {
+                  if (disj_pass[r] == 0) {
+                    disj_sel.push_back(r);
+                  }
+                }
+              }
+              if (disj_sel.empty()) {
+                break;
+              }
+            }
+            const auto branch_empty = [&]() {
+              return branch_has_sel && disj_sel.empty();
+            };
+            for (const SimpleComparePredicate& sp : branch.simple) {
+              apply_simple_pred(w, chunk, sp, &scratch_row, &disj_sel,
+                                &branch_has_sel);
+              if (branch_empty()) {
+                break;
+              }
+            }
+            if (!branch_empty()) {
+              for (const PrefixInPredicate& pp : branch.prefix_in) {
+                apply_prefix_in(w, chunk, pp, &disj_sel, &branch_has_sel);
+                if (branch_empty()) {
+                  break;
+                }
+              }
+            }
+            if (!branch_empty()) {
+              for (const PrebuiltMembershipPredicate& pm :
+                   branch.prebuilt_membership) {
+                apply_prebuilt_membership(w, chunk, pm, &scratch_row, &views,
+                                          &view_scratches, &flat_view_ready,
+                                          &disj_sel, &branch_has_sel);
+                if (branch_empty()) {
+                  break;
+                }
+              }
+            }
+            if (!branch_has_sel) {
+              any_full_pass = true;
+              break;
+            }
+            for (uint32_t idx : disj_sel) {
+              disj_pass[idx] = 1;
+            }
+          }
+          if (!any_full_pass) {
+            NarrowSelection(nrows, &sel, &has_sel,
+                            [&](uint32_t r) { return disj_pass[r] != 0; });
+          }
+        } else {
+          NarrowSelection(nrows, &sel, &has_sel, [&](uint32_t r) {
+            bool any_branch_passed = false;
+            for (size_t b = 0; b < filter.disjunctive_branches.size(); ++b) {
+              const auto& branch = filter.disjunctive_branches[b];
+              bool branch_ok = true;
+              for (const SimpleComparePredicate& sp : branch.simple) {
+                const size_t need =
+                    std::max<size_t>(sp.column, sp.right_column) + 1;
+                if (scratch_row.values_.size() < need) {
+                  scratch_row.values_.resize(need);
+                }
+                if (sp.column < chunk.columns.size()) {
+                  chunk.columns[sp.column].WriteValueInto(
+                      r, &scratch_row.values_[sp.column]);
+                }
+                if (sp.column_payload &&
+                    sp.right_column < chunk.columns.size()) {
+                  chunk.columns[sp.right_column].WriteValueInto(
+                      r, &scratch_row.values_[sp.right_column]);
+                }
+                if (!MatchSimpleCompare(scratch_row, sp)) {
+                  branch_ok = false;
+                  break;
+                }
+              }
+              if (branch_ok) {
+                for (const PrefixInPredicate& pp : branch.prefix_in) {
+                  if (scratch_row.values_.size() <= pp.column) {
+                    scratch_row.values_.resize(pp.column + 1);
+                  }
+                  if (pp.column < chunk.columns.size()) {
+                    chunk.columns[pp.column].WriteValueInto(
+                        r, &scratch_row.values_[pp.column]);
+                  }
+                  if (!MatchPrefixIn(scratch_row, pp)) {
+                    branch_ok = false;
+                    break;
+                  }
+                }
+              }
+              if (branch_ok) {
+                for (const PrebuiltMembershipPredicate& pm :
+                     branch.prebuilt_membership) {
+                  if (scratch_row.values_.size() <= pm.column) {
+                    scratch_row.values_.resize(pm.column + 1);
+                  }
+                  if (pm.column < chunk.columns.size()) {
+                    chunk.columns[pm.column].WriteValueInto(
+                        r, &scratch_row.values_[pm.column]);
+                  }
+                  if (!MatchPrebuiltMembership(scratch_row, pm)) {
+                    branch_ok = false;
+                    break;
+                  }
+                }
+              }
+              if (branch_ok && !branch.residual.empty()) {
+                chunk.MaterializeRowInto(r, &full_row);
+                StatusOr<Value> decided =
+                    TryEvaluateRowAuto(*programs.branch_residuals[b], full_row);
+                if (!decided.HasValue()) {
+                  chunk_deferred_rows.push_back(r);
+                  return false;
+                }
+                if (!Truthy(decided.Value())) {
+                  branch_ok = false;
+                }
+              }
+              if (branch_ok) {
+                any_branch_passed = true;
+                break;
+              }
+            }
+            return any_branch_passed;
+          });
+        }
+      }
+
+      if (!filter.residual.empty() && !empty_now()) {
+        const size_t active_count = has_sel ? sel.size() : nrows;
+        for (size_t c = 0; c < chunk.columns.size(); ++c) {
+          if (c < residual_needed_cols.size() && residual_needed_cols[c] != 0) {
+            if (flat_view_ready[c] == 0) {
+              views[c] = chunk.columns[c].ToBytecodeView(
+                  chunk.rows, &view_scratches[c], nullptr);
+              flat_view_ready[c] = 1;
+            }
+          } else {
+            views[c] = BytecodeColumnView{};
+          }
+        }
+        truthy_col.Init(ValueType::kNull, false, false, active_count);
+        BytecodeColumnSink sink = truthy_col.AsBytecodeSink(0);
+        Status eval_err{Status::kSuccess};
+        const auto st = programs.residual->TryEvaluateColumnarBatch(
+            views, has_sel ? sel.data() : nullptr, active_count, &sink,
+            &eval_err);
+        if (st == BytecodeProgram::FastEval::kDone) {
+          truthy_col.SyncFromBytecodeSink(sink, nullptr, active_count);
+          if (!has_sel) {
+            sel.clear();
+            for (size_t i = 0; i < active_count; ++i) {
+              if (BytecodeColumnTruthy(truthy_col, i)) {
+                sel.push_back(static_cast<uint32_t>(i));
+              }
+            }
+            has_sel = true;
+          } else {
+            size_t out = 0;
+            for (size_t i = 0; i < active_count; ++i) {
+              if (BytecodeColumnTruthy(truthy_col, i)) {
+                sel[out++] = sel[i];
+              }
+            }
+            sel.resize(out);
+          }
+        } else {
+          NarrowSelection(nrows, &sel, &has_sel, [&](uint32_t r) {
+            chunk.MaterializeRowInto(r, &full_row);
+            StatusOr<Value> decided =
+                TryEvaluateRowAuto(*programs.residual, full_row);
+            if (!decided.HasValue()) {
+              chunk_deferred_rows.push_back(r);
+              return false;
+            }
+            return Truthy(decided.Value());
+          });
+        }
+      }
+
+      if (!chunk_deferred_rows.empty()) {
+        std::sort(chunk_deferred_rows.begin(), chunk_deferred_rows.end());
+        size_t def_idx = 0;
+        const auto push_def = [&](Row&& r, size_t before_acc) {
+          deferred[w].push_back(DeferredChunkRow{.preceding_rows = before_acc,
+                                                 .row = std::move(r)});
+        };
+        const size_t acc_cnt = has_sel ? sel.size() : nrows;
+        for (size_t i = 0; i < acc_cnt; ++i) {
+          const uint32_t r = has_sel ? sel[i] : static_cast<uint32_t>(i);
+          while (def_idx < chunk_deferred_rows.size() &&
+                 chunk_deferred_rows[def_idx] < r) {
+            chunk.MaterializeRowInto(chunk_deferred_rows[def_idx++], &full_row);
+            push_def(std::move(full_row), local_accepted_rows + i);
+            full_row = Row{};
+          }
+        }
+        while (def_idx < chunk_deferred_rows.size()) {
+          chunk.MaterializeRowInto(chunk_deferred_rows[def_idx++], &full_row);
+          push_def(std::move(full_row), local_accepted_rows + acc_cnt);
+          full_row = Row{};
+        }
+      }
+
+      const size_t keep_count = has_sel ? sel.size() : nrows;
+      if (keep_count == 0) {
+        continue;
+      }
+      if (!has_sel && keep_count == nrows) {
+        if (cur_chunk_init && cur_chunk.rows > 0) {
+          worker_tables[w].AppendChunk(std::move(cur_chunk));
+          cur_chunk = ColumnarChunk{};
+          cur_chunk_init = false;
+          cur_gathers.clear();
+        }
+        worker_tables[w].AppendChunk(ColumnarChunk(chunk));
+        local_accepted_rows += keep_count;
+        continue;
+      }
+      const size_t ncols = chunk.columns.size();
+      const uint32_t* sel_ptr = has_sel ? sel.data() : nullptr;
+      size_t offset = 0;
+      const auto append_keepalive_unique =
+          [&](const std::shared_ptr<const void>& k) {
+            if (k == nullptr) {
+              return;
+            }
+            for (const auto& existing : cur_chunk.keepalives) {
+              if (existing.get() == k.get()) {
+                return;
+              }
+            }
+            cur_chunk.keepalives.push_back(k);
+          };
+      while (offset < keep_count) {
+        if (!cur_chunk_init) {
+          cur_chunk.InitFromSchema(match_schema, 0);
+          cur_chunk_init = true;
+          cur_gathers.clear();
+        }
+        const size_t space = kColumnarChunkRows - cur_chunk.rows;
+        const size_t n = std::min(space, keep_count - offset);
+        const size_t prev_rows = cur_chunk.rows;
+        if (sel_ptr == nullptr && offset > 0) {
+          sel.resize(keep_count);
+          for (size_t i = 0; i < keep_count; ++i) {
+            sel[i] = static_cast<uint32_t>(i);
+          }
+          sel_ptr = sel.data();
+        }
+        const uint32_t* slice_sel =
+            sel_ptr != nullptr ? (sel_ptr + offset) : nullptr;
+        std::vector<std::pair<const ChunkGatherIndex*,
+                              std::shared_ptr<ChunkGatherIndex>>>
+            slice_gi_map;
+        const auto get_filtered_gather =
+            [&](const ColumnarColumn& src_col,
+                size_t col_idx) -> std::shared_ptr<ChunkGatherIndex> {
+          const ChunkGatherIndex* src_gi = src_col.gather_index.get();
+          for (const auto& entry : slice_gi_map) {
+            if (entry.first == src_gi) {
+              return entry.second;
+            }
+          }
+          std::shared_ptr<ChunkGatherIndex> dst_gi;
+          if (prev_rows == 0) {
+            dst_gi = std::make_shared<ChunkGatherIndex>();
+            dst_gi->source_table = src_gi->source_table;
+            dst_gi->src_chunks.reserve(n);
+            dst_gi->src_rows.reserve(n);
+            cur_gathers.push_back(dst_gi);
+          } else if (cur_chunk.columns[col_idx].encoding ==
+                         ColumnarColumn::Encoding::kGathered &&
+                     cur_chunk.columns[col_idx].gather_index != nullptr) {
+            const ChunkGatherIndex* prev_gi_ptr =
+                cur_chunk.columns[col_idx].gather_index.get();
+            for (const auto& cg : cur_gathers) {
+              if (cg.get() == prev_gi_ptr &&
+                  cg->source_table == src_gi->source_table &&
+                  cg->src_rows.size() == prev_rows) {
+                dst_gi = cg;
+                break;
+              }
+            }
+          }
+          if (dst_gi == nullptr) {
+            return nullptr;
+          }
+          const size_t before = dst_gi->src_rows.size();
+          dst_gi->src_chunks.resize(before + n);
+          dst_gi->src_rows.resize(before + n);
+          bool found_null = dst_gi->has_null;
+          for (size_t i = 0; i < n; ++i) {
+            const uint32_t r =
+                slice_sel != nullptr ? slice_sel[i] : static_cast<uint32_t>(i);
+            const uint32_t sr = src_gi->src_rows[r];
+            dst_gi->src_chunks[before + i] = src_gi->src_chunks[r];
+            dst_gi->src_rows[before + i] = sr;
+            if (sr == ChunkGatherIndex::kNullRow) {
+              found_null = true;
+            }
+          }
+          dst_gi->has_null = found_null;
+          slice_gi_map.emplace_back(src_gi, dst_gi);
+          return dst_gi;
+        };
+        for (size_t c = 0; c < ncols; ++c) {
+          const ColumnarColumn& sc = chunk.columns[c];
+          if (sc.encoding == ColumnarColumn::Encoding::kGathered &&
+              sc.gather_index != nullptr &&
+              (prev_rows == 0 || cur_chunk.columns[c].encoding ==
+                                     ColumnarColumn::Encoding::kGathered)) {
+            if (auto dst_gi = get_filtered_gather(sc, c)) {
+              cur_chunk.columns[c].SetGathered(
+                  std::move(dst_gi), sc.gather_col, sc.type, sc.is_unsigned,
+                  sc.is_interval, sc.is_uniform, sc.has_null);
+              continue;
+            }
+          }
+          cur_chunk.columns[c].AppendSliceFrom(sc, slice_sel, n, nullptr,
+                                               prev_rows);
+        }
+        append_keepalive_unique(chunk.string_arena);
+        for (const auto& k : chunk.keepalives) {
+          append_keepalive_unique(k);
+        }
+        cur_chunk.rows += n;
+        offset += n;
+        if (cur_chunk.rows == kColumnarChunkRows) {
+          worker_tables[w].AppendChunk(std::move(cur_chunk));
+          cur_chunk = ColumnarChunk{};
+          cur_chunk_init = false;
+          cur_gathers.clear();
+        }
+      }
+      local_accepted_rows += keep_count;
+    }
+    if (cur_chunk_init && cur_chunk.rows > 0) {
+      worker_tables[w].AppendChunk(std::move(cur_chunk));
+    }
+    if (has_rf) {
+      key_rejected.fetch_add(local_rej, std::memory_order_relaxed);
+      key_null_rejected.fetch_add(local_null_rej, std::memory_order_relaxed);
+    }
+  };
+
+  if (workers <= 1) {
+    eval_chunk_worker(0);
+  } else {
+    const Status st = RunParallelTasks(workers, eval_chunk_worker);
+    if (!st.ok()) {
+      if (error != nullptr && error->ok()) {
+        *error = st;
+      }
+      return true;
+    }
+  }
+
+  auto out = std::make_shared<ColumnarTable>();
+  out->keepalives = input.keepalives;
+  const bool any_deferred =
+      std::ranges::any_of(deferred, [](const auto& d) { return !d.empty(); });
+  if (!any_deferred) {
+    for (size_t w = 0; w < workers; ++w) {
+      out->AppendTable(std::move(worker_tables[w]));
+    }
+  } else {
+    const auto record_error = [&](Status status) {
+      if (error != nullptr && error->ok() && status != Status::kSuccess) {
+        *error = std::move(status);
+      }
+    };
+    ColumnarChunk merged_chunk;
+    bool merged_chunk_init = false;
+    const auto emit_row = [&](const Row& r) {
+      if (!merged_chunk_init) {
+        merged_chunk.InitFromSchema(match_schema, kColumnarChunkRows);
+        merged_chunk_init = true;
+      }
+      merged_chunk.AppendRow(r);
+      if (merged_chunk.rows == kColumnarChunkRows) {
+        out->AppendChunk(std::move(merged_chunk));
+        merged_chunk = ColumnarChunk{};
+        merged_chunk_init = false;
+      }
+    };
+    for (size_t w = 0; w < workers; ++w) {
+      if (deferred[w].empty()) {
+        if (merged_chunk_init && merged_chunk.rows > 0) {
+          out->AppendChunk(std::move(merged_chunk));
+          merged_chunk = ColumnarChunk{};
+          merged_chunk_init = false;
+        }
+        out->AppendTable(std::move(worker_tables[w]));
+        continue;
+      }
+      size_t accepted = 0;
+      size_t di = 0;
+      const auto emit_def = [&] {
+        while (di < deferred[w].size() &&
+               deferred[w][di].preceding_rows == accepted) {
+          Row& r = deferred[w][di++].row;
+          Status def_err{Status::kSuccess};
+          if (MatchScanFilter(r, match_schema, filter, outer, context, ctes,
+                              &def_err)) {
+            emit_row(r);
+          }
+          record_error(std::move(def_err));
+        }
+      };
+      Row r_tmp;
+      for (const ColumnarChunk& wc : worker_tables[w].chunks) {
+        for (size_t r = 0; r < wc.rows; ++r) {
+          emit_def();
+          wc.MaterializeRowInto(r, &r_tmp);
+          emit_row(r_tmp);
+          ++accepted;
+        }
+      }
+      emit_def();
+      deferred[w].clear();
+    }
+    if (merged_chunk_init && merged_chunk.rows > 0) {
+      out->AppendChunk(std::move(merged_chunk));
+    }
+  }
+  const bool out_uniform = ComputeColumnarUniformNonNull(*out);
+  result->SetColumnarTable(std::move(out), out_uniform);
+  if (context.execution_runtime() != nullptr) {
+    context.execution_runtime()->key_filter_rejected += key_rejected.load();
+    context.execution_runtime()->key_filter_null_rejected +=
+        key_null_rejected.load();
+  }
+  return true;
+}
+
+}  // namespace
+
 bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
                            const CompiledScanFilter& filter,
                            const Schema& match_schema, const Scope* outer,
@@ -3000,13 +4998,20 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
                            const ScanRuntimeFilter* runtime_filter,
                            Relation* result, Status* error,
                            Relation* movable_source) {
-  constexpr size_t kMinParallelFilterRows = 32768;
+  constexpr size_t kMinParallelFilterRows = 16384;
   constexpr size_t kMaxParallelFilterWorkers = 16;
   static const bool parallel_filter_disabled =
       std::getenv("TINYLAMB_DISABLE_PARALLEL_RELATION_FILTER") != nullptr;
-  if (parallel_filter_disabled || source.HasSpill() ||
-      (movable_source != nullptr && movable_source != &source) ||
-      source.rows.size() < kMinParallelFilterRows) {
+  if (source.HasSpill() ||
+      (movable_source != nullptr && movable_source != &source)) {
+    return false;
+  }
+  if (source.HasColumnarOnly()) {
+    return TryFilterColumnarTable(context, *source.columnar, filter,
+                                  match_schema, outer, ctes, runtime_filter,
+                                  result, error, parallel_filter_disabled);
+  }
+  if (parallel_filter_disabled || source.rows.size() < kMinParallelFilterRows) {
     return false;
   }
   const WorkerScanFilterPrograms programs =
@@ -3017,7 +5022,7 @@ bool TryParallelFilterRows(TransactionContext& context, const Relation& source,
   const size_t workers =
       std::min({kMaxParallelFilterWorkers,
                 QueryParallelWorkerLimit(std::thread::hardware_concurrency()),
-                source.rows.size() / 8192});
+                source.rows.size() / 4096});
   if (workers <= 1) {
     return false;
   }
@@ -3718,10 +5723,21 @@ StatusOr<bool> TrySelectiveIndexSource(
         if (matches && !filter.disjunctive_branches.empty()) {
           matches = std::ranges::any_of(
               filter.disjunctive_branches, [&](const auto& branch) {
-                return std::ranges::all_of(
-                    branch.simple, [&](const auto& predicate) {
-                      return MatchSimpleCompare(row, predicate);
-                    });
+                return std::ranges::all_of(branch.simple,
+                                           [&](const auto& predicate) {
+                                             return MatchSimpleCompare(
+                                                 row, predicate);
+                                           }) &&
+                       std::ranges::all_of(branch.prefix_in,
+                                           [&](const auto& predicate) {
+                                             return MatchPrefixIn(row,
+                                                                  predicate);
+                                           }) &&
+                       std::ranges::all_of(branch.prebuilt_membership,
+                                           [&](const auto& predicate) {
+                                             return MatchPrebuiltMembership(
+                                                 row, predicate);
+                                           });
               });
         }
       }
@@ -3761,7 +5777,10 @@ StatusOr<bool> TrySelectiveIndexSource(
   }
   if (rows.size() > 1) {
     std::unordered_map<page_id_t, size_t> page_order;
-    const auto morsels = table.BuildScanMorsels(context.txn_);
+    Status morsel_status = Status::kSuccess;
+    const auto morsels =
+        table.BuildScanMorsels(context.txn_, 8, &morsel_status);
+    RETURN_IF_FAIL(morsel_status);
     size_t ordinal = 0;
     for (const auto& morsel : morsels) {
       for (page_id_t page : morsel) {
@@ -4162,12 +6181,26 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                               const CteMap& ctes,
                               const std::vector<slot_t>* projection,
                               const std::vector<Expression>* scan_predicates,
-                              const ScanRuntimeFilter* int_runtime_filter) {
+                              const ScanRuntimeFilter* int_runtime_filter,
+                              const ScanTupleFilter* tuple_filter,
+                              bool columnar_output,
+                              const PushedScanProjection* pushed_projection,
+                              bool* pushed_projection_applied) {
+  if (pushed_projection_applied != nullptr) {
+    *pushed_projection_applied = false;
+  }
+  bool pushed_proj_applied = false;
   const std::vector<Expression>* saved_scan_predicates = scan_predicates;
+  if (int_runtime_filter != nullptr && !int_runtime_filter->enabled()) {
+    int_runtime_filter = nullptr;
+  }
   const ScanRuntimeFilter* saved_int_runtime_filter = int_runtime_filter;
   if (source.sample) {
     scan_predicates = nullptr;
     int_runtime_filter = nullptr;
+    tuple_filter = nullptr;
+    columnar_output = false;
+    pushed_projection = nullptr;
   }
   // Fold row-independent subqueries to constants before filter compilation:
   // the folded compares join the typed SimpleCompare path, and query-free
@@ -4188,9 +6221,23 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                                   context, ctes)));
     result = UnnestValueToRelation(source, array_val);
   } else if (source.query) {
-    ASSIGN_OR_RETURN(Relation, sub,
-                     (ExecuteQuery(context, *source.query, outer, ctes)));
-    result = std::move(sub);
+    const Relation* cached = nullptr;
+    if (outer == nullptr && !source.sample &&
+        source.query->WithQueries().empty() &&
+        source.query->UnionAll().empty() &&
+        !source.query->GetSetOperationTree() && !source.query->Qualify() &&
+        source.query->DistinctOn().empty()) {
+      cached = ExecuteCachedUncorrelated(context, *source.query, ctes);
+    }
+    if (cached != nullptr) {
+      ASSIGN_OR_RETURN(Relation, materialized, MaterializeRelation(*cached));
+      result = std::move(materialized);
+    } else {
+      ASSIGN_OR_RETURN(Relation, sub,
+                       (ExecuteQuery(context, *source.query, outer, ctes,
+                                     nullptr, columnar_output)));
+      result = std::move(sub);
+    }
     // Derived outputs carry bare (or inner-qualified) column names, while
     // outer predicates reference them through this source's alias
     // (QualifyExpression). Without alias qualification, LocalColumnOffset
@@ -4207,7 +6254,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
     result = std::move(materialized);
   } else {
     bool reusable =
-        context.execution_runtime() != nullptr &&
+        tuple_filter == nullptr && context.execution_runtime() != nullptr &&
         context.execution_runtime()->reusable_base_relations.contains(
             source.table);
     const bool reusable_table = reusable;
@@ -4224,6 +6271,26 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                                     : QualifySchema(schema, load_qualifier);
     };
     RelationPtr cached_entry;
+    SharedBaseRelationCache* const shared_cache =
+        context.execution_runtime() != nullptr
+            ? context.execution_runtime()->shared_base_cache.get()
+            : nullptr;
+    struct SharedBaseSlotGuard {
+      SharedBaseRelationCache* cache{nullptr};
+      std::string key;
+      bool active{false};
+      SharedBaseSlotGuard(SharedBaseRelationCache* c, std::string k)
+          : cache(c), key(std::move(k)) {}
+      SharedBaseSlotGuard(const SharedBaseSlotGuard&) = delete;
+      SharedBaseSlotGuard& operator=(const SharedBaseSlotGuard&) = delete;
+      SharedBaseSlotGuard(SharedBaseSlotGuard&&) = delete;
+      SharedBaseSlotGuard& operator=(SharedBaseSlotGuard&&) = delete;
+      ~SharedBaseSlotGuard() {
+        if (active && cache != nullptr) {
+          cache->AbandonBase(key);
+        }
+      }
+    } shared_base_guard(shared_cache, cache_key);
     if (reusable) {
       const auto cached =
           context.execution_runtime()->base_relations.find(cache_key);
@@ -4234,10 +6301,27 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           context.GetTable(source.table);
       const bool large_lstable =
           table_chk.HasValue() &&
-          table_chk.Value()->GetLSTableStore() != nullptr &&
-          table_chk.Value()->GetLSTableStore()->total_rows > 16384;
+          table_chk.Value()->BackingColumnarRowCount() > 131072;
+      if (!cached_entry && !large_lstable && reusable &&
+          int_runtime_filter == nullptr && shared_cache != nullptr &&
+          !cache_key.empty()) {
+        RelationPtr shared_hit;
+        if (!shared_cache->AcquireBaseSlot(cache_key, &shared_hit)) {
+          if (shared_hit) {
+            context.execution_runtime()->base_relations.emplace(cache_key,
+                                                                shared_hit);
+            cached_entry = std::move(shared_hit);
+          }
+        } else {
+          shared_base_guard.active = true;
+        }
+      }
+      // Direct aggregate scans can publish an empty reuse marker for an
+      // in-memory LSTable even when the table has no persisted columnar rows.
+      // Without a row arena this is not a materialized empty relation: rescan
+      // the table, independent of its backing format or current row count.
       if (cached_entry && cached_entry->rows.empty() &&
-          !cached_entry->HasSpill() && large_lstable) {
+          !cached_entry->HasSpill() && !cached_entry->HasColumnarOnly()) {
         const auto arena_it =
             context.execution_runtime()->base_relation_arenas.find(cache_key);
         const bool has_arena =
@@ -4282,11 +6366,17 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       }
       if (scan_predicates == nullptr || scan_predicates->empty()) {
         Status key_error{Status::kSuccess};
-        if (unboxed_arena != nullptr &&
-            (int_runtime_filter != nullptr && int_runtime_filter->enabled()) &&
-            TryFilterArenaCache(context, *unboxed_arena, cached_relation.schema,
-                                nullptr, nullptr, outer, ctes,
-                                int_runtime_filter, &result, &key_error)) {
+        if (cached_relation.HasColumnarOnly() &&
+            (int_runtime_filter == nullptr || !int_runtime_filter->enabled())) {
+          result.SetColumnarTable(cached_relation.columnar,
+                                  cached_relation.uniform_cell_types);
+        } else if (unboxed_arena != nullptr &&
+                   (int_runtime_filter != nullptr &&
+                    int_runtime_filter->enabled()) &&
+                   TryFilterArenaCache(context, *unboxed_arena,
+                                       cached_relation.schema, nullptr, nullptr,
+                                       outer, ctes, int_runtime_filter, &result,
+                                       &key_error)) {
           RETURN_IF_FAIL(key_error);
         } else {
           if (unboxed_arena != nullptr && unboxed_arena->rows >= 32768) {
@@ -4511,7 +6601,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       }
       std::string keyed_cache_key;
       if (context.execution_runtime() != nullptr && reusable_table &&
-          !context.txn_.HasAnyPageVersionChains() &&
+          !columnar_output && !context.txn_.HasAnyPageVersionChains() &&
           (scan_predicates == nullptr || scan_predicates->empty()) &&
           full_key_column.has_value() && int_runtime_filter != nullptr &&
           int_runtime_filter->extra.empty() &&
@@ -4665,6 +6755,26 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
           }
         }
       }
+      bool has_unsigned_view = false;
+      for (size_t i = 0; i < table_schema.ColumnCount(); ++i) {
+        if (table_schema.GetColumn(i).IsUnsigned()) {
+          has_unsigned_view = true;
+          break;
+        }
+      }
+      if (!has_unsigned_view) {
+        for (size_t i = 0; i < filter_view.ColumnCount(); ++i) {
+          if (filter_view.GetColumn(i).IsUnsigned()) {
+            has_unsigned_view = true;
+            break;
+          }
+        }
+      }
+      const bool allow_scan_columnar = columnar_output &&
+                                       keyed_cache_key.empty() &&
+                                       !source.sample && !has_unsigned_view;
+      const PushedScanProjection* scan_pushed_proj =
+          (allow_scan_columnar && !reusable) ? pushed_projection : nullptr;
       const bool parallel_ok =
           indexed_ok ||
           ((filter_group == nullptr || !keyed_parallel_disabled) &&
@@ -4672,7 +6782,8 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
                context, *table.Value(), projection, filter_group, filter_type,
                full_key_column, effective_filter_during_scan,
                effective_filter_during_scan ? &scan_filter : nullptr,
-               filter_view, outer, ctes, &result, &eval_error));
+               filter_view, outer, ctes, &result, &eval_error, tuple_filter,
+               allow_scan_columnar, scan_pushed_proj, &pushed_proj_applied));
       RETURN_IF_FAIL(eval_error);
       if (!parallel_ok) {
         // The canonical row predicate still decides every survivor. Signed
@@ -4743,18 +6854,68 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         if (filter_during_scan) {
           context.execution_runtime()->filter_ms += ElapsedMs(filter_begin);
         }
+        bool filtered_from_cached = false;
         if (reusable && int_runtime_filter == nullptr) {
-          auto cached = std::make_shared<Relation>(std::move(result));
-          context.execution_runtime()->base_relations.emplace(cache_key,
-                                                              cached);
-          // The contents moved into the cache above; start from a fresh
-          // relation before refilling so we never touch a moved-from object.
-          result = Relation{};
-          result.schema = cached->schema;
-          ASSIGN_OR_RETURN(Relation, cached_copy, MaterializeRelation(*cached));
-          result = std::move(cached_copy);
+          if (result.HasColumnarOnly()) {
+            auto cached = std::make_shared<Relation>(nullptr);
+            cached->schema = result.schema;
+            cached->SetColumnarTable(result.columnar,
+                                     result.uniform_cell_types);
+            context.execution_runtime()->base_relations.emplace(cache_key,
+                                                                cached);
+            if (shared_base_guard.active && shared_cache != nullptr) {
+              shared_cache->PublishBase(cache_key, cached);
+              shared_base_guard.active = false;
+            }
+          } else {
+            auto cached = std::make_shared<Relation>(std::move(result));
+            context.execution_runtime()->base_relations.emplace(cache_key,
+                                                                cached);
+            if (shared_base_guard.active && shared_cache != nullptr) {
+              shared_cache->PublishBase(cache_key, cached);
+              shared_base_guard.active = false;
+            }
+            result = Relation(context.execution_runtime());
+            result.schema = cached->schema;
+            if (scan_predicates != nullptr && !scan_predicates->empty()) {
+              const Schema saved_schema = cached->schema;
+              const Schema view = filter_view_of(saved_schema);
+              const FilterCompileEnv compile_env{
+                  .context = &context, .outer = outer, .ctes = &ctes};
+              const CompiledScanFilter fill_filter =
+                  CompileScanFilter(*scan_predicates, view, &compile_env);
+              Status filter_error{Status::kSuccess};
+              if (TryParallelFilterRows(context, *cached, fill_filter, view,
+                                        outer, ctes, nullptr, &result,
+                                        &filter_error, nullptr)) {
+                RETURN_IF_FAIL(filter_error);
+                RETURN_IF_FAIL(result.FinishSpill());
+                RETURN_IF_FAIL(result.GetStatus());
+                result.schema = saved_schema;
+                filtered_from_cached = true;
+              }
+            }
+            if (!filtered_from_cached) {
+              bool copied_parallel = false;
+              if (!cached->HasSpill() && cached->rows.size() >= 16384) {
+                const CompiledScanFilter pass_through;
+                Status copy_error{Status::kSuccess};
+                if (TryParallelFilterRows(context, *cached, pass_through,
+                                          cached->schema, outer, ctes, nullptr,
+                                          &result, &copy_error)) {
+                  RETURN_IF_FAIL(copy_error);
+                  copied_parallel = true;
+                }
+              }
+              if (!copied_parallel) {
+                ASSIGN_OR_RETURN(Relation, cached_copy,
+                                 MaterializeRelation(*cached));
+                result = std::move(cached_copy);
+              }
+            }
+          }
         } else if (!keyed_cache_key.empty() && !result.HasSpill() &&
-                   result.rows.size() <= 65536) {
+                   !result.HasColumnarOnly() && result.rows.size() <= 65536) {
           auto& slot =
               context.execution_runtime()->base_relations[keyed_cache_key];
           if (slot == nullptr ||
@@ -4766,32 +6927,33 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
             slot = std::move(cached);
           }
         }
-      }
-      if (reusable && scan_predicates != nullptr && !scan_predicates->empty()) {
-        // Evaluate this alias's predicates against the alias-qualified view;
-        // the stored schema stays neutral for cache sharing across aliases.
-        const Schema saved_schema = result.schema;
-        const Schema view = filter_view_of(saved_schema);
-        result.schema = view;
-        const FilterCompileEnv compile_env{
-            .context = &context, .outer = outer, .ctes = &ctes};
-        const CompiledScanFilter fill_filter =
-            CompileScanFilter(*scan_predicates, view, &compile_env);
-        Relation filtered(context.execution_runtime());
-        filtered.schema = saved_schema;
-        Status filter_error{Status::kSuccess};
-        if (TryParallelFilterRows(context, result, fill_filter, view, outer,
-                                  ctes, nullptr, &filtered, &filter_error,
-                                  &result)) {
-          RETURN_IF_FAIL(filter_error);
-          RETURN_IF_FAIL(filtered.FinishSpill());
-          RETURN_IF_FAIL(filtered.GetStatus());
-          result = std::move(filtered);
-        } else {
-          RETURN_IF_FAIL(
-              FilterRelation(context, &result, *scan_predicates, outer, ctes));
+        if (reusable && !filtered_from_cached && scan_predicates != nullptr &&
+            !scan_predicates->empty()) {
+          // Evaluate this alias's predicates against the alias-qualified view;
+          // the stored schema stays neutral for cache sharing across aliases.
+          const Schema saved_schema = result.schema;
+          const Schema view = filter_view_of(saved_schema);
+          result.schema = view;
+          const FilterCompileEnv compile_env{
+              .context = &context, .outer = outer, .ctes = &ctes};
+          const CompiledScanFilter fill_filter =
+              CompileScanFilter(*scan_predicates, view, &compile_env);
+          Relation filtered(context.execution_runtime());
+          filtered.schema = saved_schema;
+          Status filter_error{Status::kSuccess};
+          if (TryParallelFilterRows(context, result, fill_filter, view, outer,
+                                    ctes, nullptr, &filtered, &filter_error,
+                                    &result)) {
+            RETURN_IF_FAIL(filter_error);
+            RETURN_IF_FAIL(filtered.FinishSpill());
+            RETURN_IF_FAIL(filtered.GetStatus());
+            result = std::move(filtered);
+          } else {
+            RETURN_IF_FAIL(FilterRelation(context, &result, *scan_predicates,
+                                          outer, ctes));
+          }
+          result.schema = saved_schema;
         }
-        result.schema = saved_schema;
       }
     }
   }
@@ -4804,6 +6966,7 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
         has_unsigned_column || result.schema.GetColumn(i).IsUnsigned();
   }
   if (has_unsigned_column) {
+    result.EnsureRowsMaterialized();
     RETURN_IF_FAIL(result.FinishSpill());
     RETURN_IF_FAIL(result.GetStatus());
     Relation normalized(context.execution_runtime());
@@ -4824,15 +6987,21 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
     CopyExecutionStats(&normalized, result);
     result = std::move(normalized);
   }
-  const std::string qualifier =
-      source.alias.empty() ? source.table : source.alias;
-  // Unnest outputs carry the alias as qualifier too: bare element refs still
-  // match by column name, while alias-qualified and alias-as-row references
-  // (`s.field`, `SELECT s`) resolve uniformly with table sources.
-  if (!qualifier.empty()) {
-    result.schema = QualifySchema(result.schema, qualifier);
+  if (!pushed_proj_applied) {
+    const std::string qualifier =
+        source.alias.empty() ? source.table : source.alias;
+    // Unnest outputs carry the alias as qualifier too: bare element refs still
+    // match by column name, while alias-qualified and alias-as-row references
+    // (`s.field`, `SELECT s`) resolve uniformly with table sources.
+    if (!qualifier.empty()) {
+      result.schema = QualifySchema(result.schema, qualifier);
+    }
+  }
+  if (pushed_projection_applied != nullptr) {
+    *pushed_projection_applied = pushed_proj_applied;
   }
   if (source.sample) {
+    result.EnsureRowsMaterialized();
     ASSIGN_OR_RETURN(Relation, sampled,
                      (ApplyTableSample(context, source, std::move(result))));
     result = std::move(sampled);
@@ -4869,6 +7038,9 @@ StatusOr<Relation> LoadSource(TransactionContext& context,
       RETURN_IF_FAIL(filtered.GetStatus());
       result = std::move(filtered);
     }
+  }
+  if (!columnar_output && result.HasColumnarOnly()) {
+    result.EnsureRowsMaterialized();
   }
   RETURN_IF_FAIL(result.FinishSpill());
   RETURN_IF_FAIL(result.GetStatus());
@@ -4997,62 +7169,7 @@ std::vector<Expression> FoldRowIndependentSubqueries(
   return folded;
 }
 
-std::optional<size_t> LocalColumnOffset(const Schema& schema,
-                                        const ColumnName& name) {
-  // GoogleSQL identifiers are case-insensitive.
-  auto equals = [](std::string_view left, std::string_view right) {
-    if (left.size() != right.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < left.size(); ++i) {
-      const auto lhs = static_cast<unsigned char>(left[i]);
-      const auto rhs = static_cast<unsigned char>(right[i]);
-      if (lhs == rhs) {
-        continue;
-      }
-      if (lhs >= 0x80 || rhs >= 0x80) {
-        if (std::tolower(lhs) != std::tolower(rhs)) {
-          return false;
-        }
-        continue;
-      }
-      const unsigned char folded_left =
-          lhs >= 'A' && lhs <= 'Z' ? lhs + ('a' - 'A') : lhs;
-      const unsigned char folded_right =
-          rhs >= 'A' && rhs <= 'Z' ? rhs + ('a' - 'A') : rhs;
-      if (folded_left != folded_right) {
-        return false;
-      }
-    }
-    return true;
-  };
-  std::optional<size_t> match;
-  for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-    const ColumnName& candidate = schema.GetColumn(i).Name();
-    if (!equals(candidate.name, name.name)) {
-      continue;
-    }
-    if (!name.schema.empty() && !equals(candidate.schema, name.schema)) {
-      continue;
-    }
-    if (match) {
-      return std::nullopt;
-    }
-    match = i;
-  }
-  if (!match && name.schema.empty()) {
-    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
-      const ColumnName& candidate = schema.GetColumn(i).Name();
-      if (equals(candidate.schema, name.name)) {
-        if (match) {
-          return std::nullopt;
-        }
-        match = i;
-      }
-    }
-  }
-  return match;
-}
+// LocalColumnOffset is defined in executor/detail/columnar_table.cpp.
 std::vector<Expression> SplitDisjuncts(  // NOLINT(misc-no-recursion)
     const Expression& expression) {
   if (expression && expression->Type() == TypeTag::kBinaryExp &&
@@ -5092,7 +7209,8 @@ Status FilterRelation(TransactionContext& context, Relation* relation,
   const FilterCompileEnv compile_env{.context = &context,
                                      .outer = outer,
                                      .ctes = &ctes,
-                                     .input_rows = relation->TotalRows()};
+                                     .input_rows = relation->TotalRows(),
+                                     .input_relation = relation};
   const CompiledScanFilter scan_filter =
       CompileScanFilter(effective_predicates, relation->schema, &compile_env);
   RETURN_IF_FAIL(relation->FinishSpill());
@@ -5127,6 +7245,7 @@ Status FilterRelation(TransactionContext& context, Relation* relation,
     if (!TryParallelFilterRows(context, *relation, non_residual,
                                relation->schema, outer, ctes, nullptr,
                                &prefiltered, &pre_error, relation)) {
+      relation->EnsureRowsMaterialized();
       ColumnLookupCache pre_lookup;
       Status pre_iter = relation->ForEachRow([&](const Row& row) {
         if (!pre_error.ok()) {
@@ -5144,6 +7263,7 @@ Status FilterRelation(TransactionContext& context, Relation* relation,
     RETURN_IF_FAIL(prefiltered.GetStatus());
     *relation = std::move(prefiltered);
   }
+  relation->EnsureRowsMaterialized();
   Relation filtered(context.execution_runtime());
   filtered.schema = relation->schema;
   CopyExecutionStats(&filtered, *relation);

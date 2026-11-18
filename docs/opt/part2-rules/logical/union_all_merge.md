@@ -89,4 +89,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.UnionAllMergeFlattensNestedBranches`: `UnionAll(UnionAll(a, b), c)` の論理式を探索した際、子ノード数 3 の平坦な `kUnionAll` 代替式が同一グループに生成されることを検証します。
+- `plan/cascades_test_part1.cpp` の `CascadesTest.UnionAllMergeFlattensNestedBranches`: `UnionAll(UnionAll(a, b), c)` の論理式を探索した際、子ノード数 3 の平坦な `kUnionAll` 代替式が同一グループに生成されることを検証します。

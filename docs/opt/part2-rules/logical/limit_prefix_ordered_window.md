@@ -70,4 +70,4 @@ Window は計算値を入力行位置へ戻すため、出力の先頭部分と�
 
 ## 検証テスト
 
-`plan/cascades_test.cpp` の `LimitPrefixThroughOrderedWindowFusesTopN`、`OrderedWindowRejectsMismatchedSortKeys` と、無順序版の拒否テスト群を参照します。
+`plan/cascades_test_part*.cpp` の `LimitPrefixThroughOrderedWindowFusesTopN`、`OrderedWindowRejectsMismatchedSortKeys` と、無順序版の拒否テスト群を参照します。

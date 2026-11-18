@@ -32,6 +32,7 @@
 #include "common/constants.hpp"
 #include "common/status_or.hpp"
 #include "table/table.hpp"
+#include "transaction/transaction.hpp"
 #include "type/value.hpp"
 
 namespace tinylamb {
@@ -55,7 +56,23 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
   if (finished_) {
     return false;
   }
-  if (mode_ != InsertExecutionMode::kDefault && !enforce_primary_key_) {
+  // Duplicate detection keys: compliance mode mocks the primary key on
+  // column 0; otherwise a declared PRIMARY KEY uses its own columns (in
+  // declaration order). Conflict handling stays undefined for tables with
+  // neither.
+  std::vector<size_t> key_offsets;
+  if (enforce_primary_key_) {
+    key_offsets.push_back(0);
+  } else {
+    const Schema& schema = target_->GetSchema();
+    for (size_t i = 0; i < schema.ColumnCount(); ++i) {
+      if (schema.GetColumn(i).GetConstraint().ctype ==
+          Constraint::kPrimaryKey) {
+        key_offsets.push_back(i);
+      }
+    }
+  }
+  if (mode_ != InsertExecutionMode::kDefault && key_offsets.empty()) {
     // Conflict handling is only defined for tables with a primary key.
     return FailWith(StatusError(
         StatusCode::kDuplicates,
@@ -70,14 +87,30 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
   // Keys inserted by this statement: a later row of the same statement
   // colliding with them modifies the same logical row once.
   std::unordered_set<std::string> batch_keys;
-  if (enforce_primary_key_) {
+  // Length-prefixed composite so ("ab", "c") and ("a", "bc") cannot collide;
+  // a single-column key stays the bare value (the kDefault diagnostic
+  // prints it verbatim).
+  const auto row_key = [&key_offsets](const Row& row) -> std::string {
+    if (key_offsets.size() == 1) {
+      return KeyString(row[key_offsets[0]]);
+    }
+    std::string key;
+    for (const size_t offset : key_offsets) {
+      const std::string part = KeyString(row[offset]);
+      key += std::to_string(part.size());
+      key.push_back(':');
+      key += part;
+    }
+    return key;
+  };
+  if (!key_offsets.empty()) {
     auto it = target_->BeginFullScan(*txn_);
     for (; it.IsValid(); ++it) {
       const Row& current = *it;
       if (current.values_.empty()) {
         continue;
       }
-      std::string key = KeyString(current[0]);
+      std::string key = row_key(current);
       existing_keys.insert(key);
       existing_positions.emplace(std::move(key), it.Position());
     }
@@ -108,7 +141,12 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
       if (check.child_offset >= row.values_.size()) {
         continue;
       }
-      if (IsForeignKeyViolation(fk_counts[c], row[check.child_offset])) {
+      StatusOr<bool> viol =
+          IsForeignKeyViolation(fk_counts[c], row[check.child_offset]);
+      if (!viol.HasValue()) {
+        return viol.GetStatus();
+      }
+      if (viol.Value()) {
         return StatusError(
             StatusCode::kConflicts,
             "insert on table " + std::string(target_->GetSchema().Name()) +
@@ -125,7 +163,7 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
   const auto is_self_reference = [&](const Table* other) {
     return std::string(other->GetSchema().Name()) == target_name;
   };
-  const auto note_inserted_row = [&](const Row& row) {
+  const auto note_inserted_row = [&](const Row& row) -> Status {
     for (size_t c = 0; c < fk_checks_.size(); ++c) {
       const ForeignKeyCheck& check = fk_checks_[c];
       if (!is_self_reference(check.parent) ||
@@ -134,9 +172,10 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
       }
       const Value& key = row[check.parent_offset];
       if (!key.IsNull()) {
-        ++fk_counts[c][ForeignKeyString(key)];
+        RETURN_IF_FAIL(fk_counts[c].IncrementKey(key));
       }
     }
+    return Status::kSuccess;
   };
   // Upsert/replace rewrite an existing row whose old key is unknown here;
   // re-seed the self-referencing multisets instead of guessing.
@@ -155,12 +194,19 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
     }
     return Status::kSuccess;
   };
+  uint64_t step_count = 0;
   DataChunk src_batch;
   while (src_->NextBatch(&src_batch) != 0) {
     for (size_t row_idx = 0; row_idx < src_batch.Size(); ++row_idx) {
+      if ((++step_count & 255U) == 0 && txn_->HasStatementTimeout()) {
+        const Status ts = txn_->CheckStatementTimeout();
+        if (ts != Status::kSuccess) {
+          return FailWith(ts);
+        }
+      }
       new_row = src_batch.RowAt(row_idx);
-      const bool has_key = enforce_primary_key_ && !new_row.values_.empty();
-      const std::string key = has_key ? KeyString(new_row[0]) : std::string();
+      const bool has_key = !key_offsets.empty() && !new_row.values_.empty();
+      const std::string key = has_key ? row_key(new_row) : std::string();
       const bool exists = has_key && existing_keys.contains(key);
       // Rows arrive in full schema layout; listed columns keep their
       // destination offsets.
@@ -192,13 +238,22 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
                 fk_status != Status::kSuccess) {
               return FailWith(fk_status);
             }
-            if (target_->Update(*txn_, pos, updated).GetStatus() !=
-                Status::kSuccess) {
+            // Upsert/REPLACE resolves a pre-existing row without the locking
+            // source scan ordinary UPDATE/DELETE use. Take the write intent
+            // before Table::Update reads its before-image: a writer that
+            // commits in that gap has already released its own intent and
+            // would otherwise be silently overwritten.
+            if (!txn_->AddWriteSet(pos)) {
+              return FailWith(txn_->LastWriteSetFailureStatus());
+            }
+            if (const Status failure =
+                    target_->Update(*txn_, pos, updated).GetStatus();
+                failure != Status::kSuccess) {
               return FailWith(
-                  StatusError(StatusCode::kConflicts,
-
+                  StatusError(failure.GetCode(),
                               "insert failed on table " +
-                                  std::string(target_->GetSchema().Name())));
+                                  std::string(target_->GetSchema().Name()) +
+                                  ": " + ToString(failure)));
             }
             if (const Status reseed_status = reseed_self_counts();
                 reseed_status != Status::kSuccess) {
@@ -215,13 +270,17 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
                 fk_status != Status::kSuccess) {
               return FailWith(fk_status);
             }
-            if (target_->Update(*txn_, pos, new_row).GetStatus() !=
-                Status::kSuccess) {
+            if (!txn_->AddWriteSet(pos)) {
+              return FailWith(txn_->LastWriteSetFailureStatus());
+            }
+            if (const Status failure =
+                    target_->Update(*txn_, pos, new_row).GetStatus();
+                failure != Status::kSuccess) {
               return FailWith(
-                  StatusError(StatusCode::kConflicts,
-
+                  StatusError(failure.GetCode(),
                               "insert failed on table " +
-                                  std::string(target_->GetSchema().Name())));
+                                  std::string(target_->GetSchema().Name()) +
+                                  ": " + ToString(failure)));
             }
             if (const Status reseed_status = reseed_self_counts();
                 reseed_status != Status::kSuccess) {
@@ -263,7 +322,10 @@ bool Insert::Execute(Row* dst, RowPosition* rp) {
         batch_keys.insert(key);
         existing_positions.insert_or_assign(key, inserted.Value());
       }
-      note_inserted_row(new_row);
+      const Status note_st = note_inserted_row(new_row);
+      if (note_st != Status::kSuccess) {
+        return FailWith(note_st);
+      }
       insertion_count++;
     }
   }

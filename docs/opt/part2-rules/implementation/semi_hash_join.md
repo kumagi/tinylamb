@@ -103,7 +103,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `OptimizerTest.CascadesSemiAndAntiJoinImplementationsUseHashJoinKind`: `kSemiJoin` 式が `SemiJoinKind` を持つ `ProductPlan` に実装され、出力スキーマ幅が左側テーブルと完全に一致することを検証。
   - `OptimizerTest.InSubqueryBecomesSemiJoin`: IN サブクエリがオプティマイザ全体を通じてハッシュセミ結合へと正しく落とし込まれることを検証。
   - `OptimizerTest.CorrelatedExistsBecomesSemiJoin`: 相関 EXISTS サブクエリがセミ結合として最適化されることを検証。

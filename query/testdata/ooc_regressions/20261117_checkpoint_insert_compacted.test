@@ -1,0 +1,11 @@
+-- sql_ooc_fuzzer regression
+-- seed: 168
+-- profile: pool=131072 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: INSERT COPY failed unexpectedly | stream: Corrupt :: op 6 `ins_copy t2 t3 400 482 83`: INSERT COPY failed unexpectedly: INSERT INTO t2 SELECT k + 83, g, v, t, pad FROM t3 WHERE k BETWEEN 400 AND 482; |   stream: Corrupt: insert failed on table t2
+create t2 2 4869 3046
+compact t2
+create t3 1 7636 882
+ins_bulk t3 1 482 804
+snap open ro
+checkpoint
+ins_copy t2 t3 400 482 83

@@ -42,11 +42,14 @@ ops to accelerate consecutive ops inside one UPDATE.
   per-table statistics meta record, and every derived estimate
   (Filter/TransformBy/ScaleToRows/ScaleCardinality/Concat/`operator*`) clears
   it. Payload format is TLSTATS v3; v2 still decodes as "no proof".
-- `lstable_bridge.{hpp,cpp}`, `memtable/`, `sorted_run/`, `pax_chunk/`,
-  `fragment/`, `workload/`, `fuzz/` — native `tinylamb` LSM/PAX columnar
-  storage components (`LSTableStore`, `MemTable`, `SkipList`, `SortedRun`,
-  `PaxChunk`, `Fragment`, `WorkloadTracker`) and their 11 libFuzzer / GTest
-  storage harnesses (`row_codec_fuzzer`, `memcmp_fuzzer`, `pax_mutate_fuzzer`,
+- `lstable_bridge.{hpp,cpp}`, `tlcs_file.{hpp,cpp}`, `memtable/`, `sorted_run/`,
+  `pax_chunk/`, `fragment/`, `workload/`, `fuzz/` — native `tinylamb`
+  LSM/PAX columnar storage components (`LSTableStore` reserved under
+  `MemoryPoolKind::kColumnar`, `TlcsFile` `kFormatVersion = 2` persistent
+  columnar files with `DirGroupMeta` directory groups and mmap / paged `Pread`
+  + bounded LRU cache, `MemTable`, `SkipList`, `SortedRun`, `PaxChunk`,
+  `Fragment`, `WorkloadTracker`) and their 11 libFuzzer / GTest storage
+  harnesses (`row_codec_fuzzer`, `memcmp_fuzzer`, `pax_mutate_fuzzer`,
   `lsm_merge_fuzzer`, `memtable_model_fuzzer`, `schema_fuzzer`,
   `chunk_footer_fuzzer`, `region_scheme_fuzzer`, `nullmap_varchar_fuzzer`,
   `footer_sections_fuzzer`, `encode_agree_fuzzer`, replayed in
@@ -74,7 +77,7 @@ ops to accelerate consecutive ops inside one UPDATE.
 Test: `./build/table_test`, `index_test`, `full_scan_iterator_test`,
 `full_scan_mvcc_fastpath_test`, `table_statistics_test` (the layout-generation
 cases are the `*LayoutGeneration*` / `DerivedStatisticsDropTheLayoutGeneration`
-ones).
+ones), `tlcs_file_test`, `pax_storage_fuzzer_test`.
 
 Optimizer statistics: `ColumnStats::EstimateJoinMatches` consumes MCV, NULL mass,
 NDV and histogram domains; `TableStatistics::EstimateDistinctRows` is the shared

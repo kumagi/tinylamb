@@ -85,6 +85,79 @@ class TableTest : public ::testing::Test {
 
 TEST_F(TableTest, Construct_Default_Succeeds) {}
 
+// sql_ooc_fuzzer finding: an open writer whose UPDATE relocated rows onto a
+// new (unpublished) tail page made every concurrent snapshot reader wait the
+// full 5 s tail timeout and then answer as if the table were EMPTY (the
+// morsel planner swallowed the timeout).  The owner's uncommitted growth is
+// invisible to other snapshots, so readers must end the chain there at once.
+TEST_F(TableTest, SnapshotReaderSkipsAnOpenWritersUnpublishedTail) {
+  const std::string name = "tail_reader";
+  constexpr int64_t kRows = 40;
+  {
+    auto setup = rs_->BeginContext();
+    ASSERT_SUCCESS(
+        rs_->CreateTable(setup, Schema(name, {Column("k", ValueType::kInt64),
+                                              Column("v", ValueType::kVarChar)}))
+            .GetStatus());
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, table, setup.GetTable(name));
+    for (int64_t i = 0; i < kRows; ++i) {
+      ASSERT_TRUE(
+          table->Insert(setup.txn_, Row({Value(i), Value(std::string(4000, 'a'))}))
+              .HasValue());
+    }
+    ASSERT_SUCCESS(setup.PreCommit());
+  }
+  auto writer = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, wtable, writer.GetTable(name));
+  std::vector<RowPosition> positions;
+  for (auto it = wtable->BeginFullScan(writer.txn_); it.IsValid(); ++it) {
+    positions.push_back(it.Position());
+  }
+  ASSERT_EQ(positions.size(), static_cast<size_t>(kRows));
+  // Grow a handful of rows past what their pages can hold: they relocate to
+  // a tail page only this writer may see until it commits.
+  for (size_t i = 0; i < 4; ++i) {
+    ASSERT_TRUE(wtable
+                    ->Update(writer.txn_, positions[i],
+                             Row({Value(static_cast<int64_t>(i)),
+                                  Value(std::string(20000, 'b'))}))
+                    .HasValue());
+  }
+  for (const bool read_only : {false, true}) {
+    auto reader =
+        read_only ? rs_->BeginReadOnlyContext() : rs_->BeginContext();
+    ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, rtable, reader.GetTable(name));
+    const auto start = std::chrono::steady_clock::now();
+    size_t rows = 0;
+    Iterator it = rtable->BeginFullScan(reader.txn_);
+    for (; it.IsValid(); ++it) {
+      EXPECT_EQ((*it)[1].AsStringView().size(), 4000U);
+      ++rows;
+    }
+    EXPECT_SUCCESS(it.GetStatus());
+    EXPECT_EQ(rows, static_cast<size_t>(kRows));
+    Status morsel_status = Status::kSuccess;
+    const auto morsels = rtable->BuildScanMorsels(reader.txn_, 2, &morsel_status);
+    EXPECT_SUCCESS(morsel_status);
+    EXPECT_FALSE(morsels.empty());
+    EXPECT_FALSE(reader.txn_.IsFailed());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    ASSERT_SUCCESS(reader.PreCommit());
+  }
+  ASSERT_SUCCESS(writer.PreCommit());
+  auto after = rs_->BeginContext();
+  ASSIGN_OR_ASSERT_FAIL(std::shared_ptr<Table>, atable, after.GetTable(name));
+  size_t grown = 0;
+  size_t rows = 0;
+  for (auto it = atable->BeginFullScan(after.txn_); it.IsValid(); ++it) {
+    ++rows;
+    grown += (*it)[1].AsStringView().size() == 20000U ? 1 : 0;
+  }
+  EXPECT_EQ(rows, static_cast<size_t>(kRows));
+  EXPECT_EQ(grown, 4U);
+  ASSERT_SUCCESS(after.PreCommit());
+}
+
 TEST_F(TableTest, AuditMorselLeaseFailureMarksTransactionFailed) {
   auto pending_reader = rs_->BeginReadOnlyContext();
   auto retired_reader = rs_->BeginReadOnlyContext();

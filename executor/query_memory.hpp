@@ -6,15 +6,18 @@
 #include <cstddef>
 #include <string>
 
+#include "common/memory_budget.hpp"
 #include "type/row.hpp"
 
 namespace tinylamb {
 
 // Process-wide query working-memory budget. Operators should estimate growth
 // with EstimateRowBytes / TryReserve and spill before the OS starts thrashing.
+// Coordinates with ProcessMemoryBudget so storage + columnar + query buffers
+// stay within TINYLAMB_MEMORY_LIMIT_BYTES (16 GiB default).
 //
 // Config: TINYLAMB_QUERY_MEMORY_BYTES
-//   - unset: default 8 GiB (SF=10 stays RAM-resident; see query_memory.cpp)
+//   - unset: default 8 GiB (clamped below TINYLAMB_MEMORY_LIMIT_BYTES)
 //   - "0": unlimited (legacy / debugging)
 class QueryMemoryBudget {
  public:
@@ -23,18 +26,22 @@ class QueryMemoryBudget {
   [[nodiscard]] size_t Limit() const { return limit_; }
   [[nodiscard]] bool Unlimited() const { return limit_ == 0; }
   [[nodiscard]] size_t Used() const {
-    return used_.load(std::memory_order_relaxed);
+    return used_.load(std::memory_order_acquire);
   }
   [[nodiscard]] size_t Remaining() const;
 
-  // Returns false when `bytes` would push usage past the soft limit (80%).
-  // Does not mutate `used_`; pair with ReserveForced / QueryMemoryCharge::Add.
+  // Returns false when `bytes` would push usage past the soft limit (80%) or
+  // when ProcessMemoryBudget signals RSS/global pressure.
   [[nodiscard]] bool CanReserve(size_t bytes) const;
+  // Atomically checks CanReserve-equivalent headroom and reserves `bytes`.
+  [[nodiscard]] bool TryReserve(size_t bytes);
   void ReserveForced(size_t bytes);
   void Release(size_t bytes);
 
-  // Test helper: replace the limit (0 = unlimited).
-  void ResetForTest(size_t limit_bytes);
+  // Test helper: replace the limit (0 = unlimited). By default keeps linkage
+  // to ProcessMemoryBudget::Global(); pass `isolate_from_process = true`
+  // only in standalone unit tests of QueryMemoryBudget itself.
+  void ResetForTest(size_t limit_bytes, bool isolate_from_process = false);
 
  private:
   explicit QueryMemoryBudget(size_t limit_bytes);
@@ -44,12 +51,38 @@ class QueryMemoryBudget {
   // 80% of limit_, precomputed: CanReserve runs once per buffered row.
   size_t soft_;
   std::atomic<size_t> used_{0};
+  bool test_isolated_{false};
   static constexpr size_t kSoftFractionNum = 4;
   static constexpr size_t kSoftFractionDen = 5;  // spill at 80%
 };
 
 [[nodiscard]] size_t EstimateValueBytes(const Value& value);
 [[nodiscard]] size_t EstimateRowBytes(const Row& row);
+
+[[nodiscard]] inline size_t EstimateScalarValueBytes(const Value& value) {
+  constexpr size_t kBase = 32;
+  switch (value.type) {
+    case ValueType::kNull:
+      return kBase;
+    case ValueType::kInt64:
+    case ValueType::kDouble:
+    case ValueType::kDate:
+      return kBase + 8;
+    case ValueType::kVarChar:
+      return kBase + value.value.varchar_value.size();
+    default:
+      return kBase + 16;
+  }
+}
+
+[[nodiscard]] inline size_t EstimateRowBytesFast(const Row& row) {
+  size_t total = 64;  // vector / Row overhead
+  for (const Value& value : row.values_) {
+    total += value.type == ValueType::kArray ? EstimateValueBytes(value)
+                                             : EstimateScalarValueBytes(value);
+  }
+  return total;
+}
 
 // RAII charge against the global budget.
 class QueryMemoryCharge {
@@ -63,6 +96,14 @@ class QueryMemoryCharge {
   ~QueryMemoryCharge();
 
   void Add(size_t bytes);
+  [[nodiscard]] bool TryAdd(size_t bytes);
+  void Release(size_t bytes);
+  void Adopt(size_t bytes) noexcept { bytes_ += bytes; }
+  [[nodiscard]] size_t DetachBytes() noexcept {
+    const size_t detached = bytes_;
+    bytes_ = 0;
+    return detached;
+  }
   void ReleaseAll();
   [[nodiscard]] size_t Bytes() const { return bytes_; }
 

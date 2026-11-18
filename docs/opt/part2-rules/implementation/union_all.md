@@ -121,7 +121,7 @@ std::string SetOperationPlan::ToString() const {
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.UnionAllCanChooseMergeAppendForRequiredOrdering`: 順序要求がある場合に `MergeAppend` が物理計画として選ばれ、適切な順序プロパティを申告することを検証。
   - `CascadesTest.UnionAllMergeFlattensNestedBranches`: 入れ子の `kUnionAll` が適切にマージされる論理 Rule との整合性を検証。
   - `CascadesTest.UnionAllLimitCapsEveryChildAndKeepsGlobalLimit`: 子ごとの LIMIT 最適化と `UNION ALL` の相互作用を検証。

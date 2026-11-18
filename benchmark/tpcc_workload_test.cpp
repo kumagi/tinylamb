@@ -378,7 +378,8 @@ TEST_F(TpccWorkloadTest, NextTransactionTypeSamplesClause52Mix) {
     ++counts[static_cast<size_t>(type)];
   }
 
-  // Assert -- the Clause 5.2 mix is roughly 45/43/4/4/4 percent.
+  // The Clause 5.2 mix targets ~45/43/4/4/4 percent; these minimums only
+  // assert that the dominant NewOrder/Payment transactions were generated.
   EXPECT_GE(counts[0], 150);  // kNewOrder
   EXPECT_GE(counts[1], 150);  // kPayment
   EXPECT_GT(counts[2], 0);    // kOrderStatus

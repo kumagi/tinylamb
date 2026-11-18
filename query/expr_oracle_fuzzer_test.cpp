@@ -395,7 +395,8 @@ TEST(ExprOracleFuzzer, SeededIterationsHoldOracles) {
     EXPECT_EQ(trace.seed, packed);
     EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0)
         << (seed != 0U) << trace.sql;
-    EXPECT_TRUE(trace.sexpr.front() == '(');
+    ASSERT_FALSE(trace.sexpr.empty());
+    EXPECT_EQ(trace.sexpr.front(), '(');
     EXPECT_TRUE(trace.reference.empty() == false);
     if (trace.engine_ran) {
       ++engine_ran;
@@ -427,7 +428,8 @@ TEST(ExprOracleFuzzer, SeededExtendedOpsHoldOracles) {
     ASSERT_EQ(report, "") << "Seed " << seed32 << " failed:\n" << report;
     EXPECT_EQ(trace.seed, packed);
     EXPECT_TRUE(trace.sql.rfind("SELECT ", 0) == 0);
-    EXPECT_TRUE(trace.sexpr.front() == '(');
+    ASSERT_FALSE(trace.sexpr.empty());
+    EXPECT_EQ(trace.sexpr.front(), '(');
     EXPECT_TRUE(trace.reference.empty() == false);
     if (trace.engine_ran) {
       ++engine_ran;

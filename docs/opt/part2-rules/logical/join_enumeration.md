@@ -128,9 +128,9 @@ bool Memo::CutConnected(uint64_t left_mask, uint64_t within_mask) const {
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `JoinEnumerationPrunesDisconnectedBipartitions`: 連結グラフにおいて非連結な分割が枝刈りされ、非連結グラフでは網羅的に列挙されることを検証。
   - `AssociativityRulesEnumerateJoinOrdersWithoutEnumeration`: `join_enumeration` を除外した状態でも結合則により全結合順序が導出可能であることを検証。
   - `ExploreConvergesOnWideJoinGraphsWithoutPassCap`, `ExpressionCapDegradesGracefully`: 多表結合における探索収束性と式上限による縮退動作を検証。
-- `plan/optimizer_test.cpp`:
+- `plan/optimizer_test_part*.cpp`:
   - `JoinChainMatchesGoldenResultUnderRuleSubsets`: 結合順序系 Rule の一部を無効化しても最終的な出力結果が一致することを検証。

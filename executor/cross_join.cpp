@@ -23,6 +23,7 @@
 #include "common/constants.hpp"
 #include "executor_base.hpp"
 #include "page/row_position.hpp"
+#include "transaction/transaction.hpp"
 
 namespace tinylamb {
 CrossJoin::CrossJoin(Executor left, Executor right)
@@ -36,6 +37,9 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   if (!table_constructed_) {
     TableConstruct();
   }
+  if (GetStatus() != Status::kSuccess) {
+    return 0;
+  }
   // An empty right side produces zero rows; without this guard the iterator
   // below would dereference end().
   if (right_table_.empty()) {
@@ -43,6 +47,11 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
   }
   DataChunk left_batch;
   while (destination->Size() < max_rows) {
+    if (const Status ts = Transaction::CheckThreadStatementTimeout();
+        ts != Status::kSuccess) {
+      FailWith(ts);
+      return 0;
+    }
     if (right_iter_ == right_table_.end()) {
       if (left_->NextBatch(&left_batch, 1) == 0) {
         FailWithChildOf(*left_);
@@ -59,6 +68,13 @@ size_t CrossJoin::NextBatch(DataChunk* destination, size_t max_rows) {
 void CrossJoin::TableConstruct() {
   DataChunk batch;
   while (right_->NextBatch(&batch) != 0) {
+    if (const Status ts = Transaction::CheckThreadStatementTimeout();
+        ts != Status::kSuccess) {
+      FailWith(ts);
+      right_iter_ = right_table_.end();
+      table_constructed_ = true;
+      return;
+    }
     for (size_t i = 0; i < batch.Size(); ++i) {
       right_table_.push_back(batch.RowAt(i));
     }

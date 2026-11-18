@@ -98,7 +98,9 @@ std::vector<Row> MakeRows(const Schema& sc, uint8_t shape, uint32_t n) {
           break;
         }
         case ValueType::kDouble: {
-          vals.emplace_back(100.25 + (static_cast<double>(i % 13) * 0.5));
+          vals.emplace_back(FuzzDoubleWithSpecials(
+              static_cast<size_t>(i),
+              100.25 + (static_cast<double>(i % 13) * 0.5)));
           break;
         }
         case ValueType::kInt64:
@@ -220,6 +222,15 @@ int FuzzEncodeAgreeOneInput(const uint8_t* data, size_t size) {
   }
   for (size_t i = 0; i < n; ++i) {
     for (slot_t c = 0; c < sc.ColumnCount(); ++c) {
+      // Compare the freshly encoded chunk against the ORIGINAL rows: comparing
+      // only the two decoded copies would let a systematic encoder/decoder
+      // error pass the round-trip oracle.
+      const StatusOr<Value> fresh = chunk.ReadColumnValue(i, c, sc);
+      if (!fresh.HasValue() || fresh.Value() != rows[i][c]) {
+        std::cerr << "ENCODE/SOURCE MISMATCH: row=" << i << " col=" << c
+                  << " force=" << (adaptive ? "(adaptive)" : force) << "\n";
+        std::abort();
+      }
       const StatusOr<Value> a = chunk.ReadColumnValue(i, c, sc);
       const StatusOr<Value> b = reopened.Value().ReadColumnValue(i, c, sc);
       if (!a.HasValue() || !b.HasValue() || a.Value() != b.Value()) {

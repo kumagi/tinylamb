@@ -46,6 +46,7 @@
 #include "executor/query_memory.hpp"
 #include "executor/spill_file.hpp"
 #include "page/row_position.hpp"
+#include "type/collation.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -106,13 +107,11 @@ uint64_t HashBytesKey(std::string_view key) {
 constexpr char kJoinNegativeIntTag = '\x7f';
 
 bool ContainsUnmatchableNaN(const Value& value) {
-  if (value.type == ValueType::kDouble) {
-    return std::isnan(value.value.double_value);
-  }
-  if (value.type != ValueType::kArray) {
-    return false;
-  }
-  return std::ranges::any_of(value.ArrayElements(), ContainsUnmatchableNaN);
+  // Only a scalar DOUBLE key with NaN is unmatchable under SQL `=`. Array
+  // equality recurses with Value::operator==, where identical NaN payloads
+  // ARE equal; excluding array keys at intake would drop valid matches.
+  return value.type == ValueType::kDouble &&
+         std::isnan(value.value.double_value);
 }
 
 void AppendMemComparableValue(const Value& v, std::string* out) {
@@ -137,8 +136,16 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
       break;
     }
     case ValueType::kVarChar: {
-      const std::string_view s(v.value.varchar_value.data(),
-                               v.value.varchar_value.size());
+      std::string folded;
+      std::string_view s(v.value.varchar_value.data(),
+                         v.value.varchar_value.size());
+      // Case-insensitive VARCHAR keys must fold before encoding so that
+      // 'A' and 'a' land in the same hash bucket, matching the OOC sink
+      // (ooc_hash_join_sink.cpp) and the = ground truth (P372).
+      if (v.IsCaseInsensitive()) {
+        folded = FoldCaseForCollation(s);
+        s = folded;
+      }
       out->push_back(static_cast<char>(ValueType::kVarChar));
       if (s.empty()) {
         out->append(9, '\0');
@@ -195,21 +202,35 @@ void AppendMemComparableValue(const Value& v, std::string* out) {
 // join (both sides) for the whole executor.
 bool EncodeJoinKeyInto(const Row& row, const std::vector<slot_t>& cols,
                        std::string* out,
-                       const std::vector<bool>* null_safe = nullptr) {
+                       const std::vector<bool>* null_safe = nullptr,
+                       bool* has_null = nullptr) {
   out->clear();
+  if (has_null != nullptr) {
+    *has_null = false;
+  }
+  bool saw_null = false;
   for (size_t i = 0; i < cols.size(); ++i) {
     const Value& value = row[cols[i]];
     const bool safe =
         null_safe != nullptr && i < null_safe->size() && (*null_safe)[i];
     if (value.IsNull()) {
       if (!safe) {
-        return false;
+        if (has_null == nullptr) {
+          return false;
+        }
+        saw_null = true;
+        continue;
       }
       out->push_back('\0');
       continue;
     }
     if (!safe && ContainsUnmatchableNaN(value)) {
+      // A prior key column was NULL: preserve has_null=true so ANTI/NOT IN
+      // still treat this probe as UNKNOWN rather than a definite non-match.
       return false;
+    }
+    if (saw_null) {
+      continue;
     }
     if (null_safe != nullptr) {
       out->push_back('\1');
@@ -222,11 +243,18 @@ bool EncodeJoinKeyInto(const Row& row, const std::vector<slot_t>& cols,
       AppendMemComparableValue(value, out);
     }
   }
+  if (saw_null) {
+    if (has_null != nullptr) {
+      *has_null = true;
+    }
+    return false;
+  }
   return true;
 }
 
 struct KeyRef {
   bool valid{false};
+  bool has_null{false};
   int64_t int_key{0};
   std::string_view byte_key;
   uint64_t hash{0};
@@ -238,18 +266,28 @@ KeyRef KeyOf(const Row& row, const std::vector<slot_t>& cols,
              const std::vector<bool>* null_safe = nullptr) {
   if (mode == JoinHashIndex::KeyMode::kInt64) {
     const Value& v = row[cols[0]];
-    if (v.IsNull() || v.type != int_mode_type) {
+    if (v.IsNull()) {
+      KeyRef kr;
+      kr.has_null = true;
+      return kr;
+    }
+    if (v.type != int_mode_type) {
       return {};
     }
     return {.valid = true,
+            .has_null = false,
             .int_key = v.value.int_value,
             .byte_key = {},
             .hash = HashInt64Key(v.value.int_value)};
   }
-  if (!EncodeJoinKeyInto(row, cols, scratch, null_safe)) {
-    return {};
+  bool key_has_null = false;
+  if (!EncodeJoinKeyInto(row, cols, scratch, null_safe, &key_has_null)) {
+    KeyRef kr;
+    kr.has_null = key_has_null;
+    return kr;
   }
   return {.valid = true,
+          .has_null = false,
           .int_key = 0,
           .byte_key = std::string_view(*scratch),
           .hash = HashBytesKey(*scratch)};
@@ -389,9 +427,9 @@ void JoinHashIndex::StoreSlotKey(size_t slot, int64_t int_key,
     slot_int_keys_[slot] = int_key;
     return;
   }
-  const auto off = static_cast<uint32_t>(arena_.size());
+  const size_t off = arena_.size();
   arena_.append(byte_key);
-  slot_byte_keys_[slot] = {off, static_cast<uint32_t>(byte_key.size())};
+  slot_byte_keys_[slot] = {off, byte_key.size()};
 }
 
 bool JoinHashIndex::SlotKeyEquals(size_t slot, int64_t int_key,
@@ -432,7 +470,8 @@ size_t JoinHashIndex::Find(uint64_t hash, int64_t int_key,
   size_t idx = hash & mask_;
   // Warm the next probe slot while the home slot is being fetched: linear
   // probing walks forward and int-key mode reads slot_int_keys_ right after
-  // slots_, so two lines ahead is where the probe usually lands next.
+  // slots_; prefetching a nearby slot is a cheap best-effort hint for the
+  // next linear-probe step.
   __builtin_prefetch(&slots_[(idx + 2) & mask_], 0, 1);
   for (;;) {
     const size_t head = slots_[idx];
@@ -459,7 +498,7 @@ void JoinHashIndex::Grow() {
   const size_t new_mask = new_count - 1;
   std::vector<size_t> new_slots(new_count, kNil);
   std::vector<int64_t> new_int_keys;
-  std::vector<std::pair<uint32_t, uint32_t>> new_byte_keys;
+  decltype(slot_byte_keys_) new_byte_keys;
   if (mode_ == KeyMode::kInt64) {
     new_int_keys.resize(new_count);
   } else {
@@ -706,6 +745,25 @@ struct HashJoin::JoinState {
   }
 };
 
+// The int64/date fast path is decided from the RESIDENT rows only.  Spilling
+// moves rows out of `Side::rows` into partitions, so a mixed-type key column
+// (e.g. UNION-produced INT64 plus VARCHAR values) can leave a resident-only
+// int mode behind: KeyOf() then rejects the spilled values, they never enter
+// the partition's build index, and existence-only joins silently report "no
+// match".  Byte encoding handles every value type, so force it for the whole
+// join whenever a side spilled instead of resurrecting the invalid mode on a
+// per-partition rebuild.
+template <typename LSide, typename RSide>
+static std::optional<ValueType> JoinIntModeAvoidingSpillLoss(
+    const LSide& left, const RSide& right,
+    const std::vector<slot_t>& left_cols,
+    const std::vector<slot_t>& right_cols) {
+  if (left.Spilled() || right.Spilled()) {
+    return std::nullopt;
+  }
+  return JoinIntModeType(left.rows, left_cols, right.rows, right_cols);
+}
+
 HashJoin::HashJoin(Executor left, std::vector<slot_t> left_cols, Executor right,
                    std::vector<slot_t> right_cols, size_t worker_count)
     : HashJoin(std::move(left), std::move(left_cols), std::move(right),
@@ -737,6 +795,10 @@ std::atomic<size_t> HashJoin::semi_reduction_max_domain_keys_{size_t{1} << 20};
 
 void HashJoin::SetSemiReductionMaxDomainKeysForTest(size_t keys) {
   semi_reduction_max_domain_keys_.store(keys, std::memory_order_relaxed);
+}
+
+size_t HashJoin::SemiReductionMaxDomainKeysForTest() {
+  return semi_reduction_max_domain_keys_.load(std::memory_order_relaxed);
 }
 
 bool HashJoin::MaterializeOrThrow() {
@@ -935,7 +997,7 @@ Status HashJoin::MaterializeMarkJoin() {
   std::string scratch;
   size_t output_bytes = 0;
   const std::optional<ValueType> int_mode =
-      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_);
+      JoinIntModeAvoidingSpillLoss(s.left, s.right, left_cols_, right_cols_);
   const auto emit_row = [&](const Row& row, const RowPosition& pos) {
     output_bytes += EstimateRowBytes(row);
     output_.emplace_back(row, pos);
@@ -946,7 +1008,7 @@ Status HashJoin::MaterializeMarkJoin() {
     const KeyRef k = KeyOf(probe.first, left_cols_, build.mode, build.int_type,
                            &scratch, NullSafeArg());
     if (!k.valid) {
-      return -1;
+      return k.has_null ? -1 : 0;
     }
     return build.index.Find(k.hash, k.int_key, k.byte_key) !=
                    JoinHashIndex::kNil
@@ -1007,7 +1069,7 @@ Status HashJoin::MaterializeMarkJoin() {
       const KeyRef k =
           KeyOf(rows[i].first, left_cols_, JoinHashIndex::KeyMode::kBytes,
                 ValueType::kInt64, &scratch_key, NullSafeArg());
-      if (!k.valid) {
+      if (!k.valid && k.has_null) {
         match_state[i] = -1;
       }
     }
@@ -1234,7 +1296,7 @@ Status HashJoin::MaterializeSemiAnti() {
   // The reduced intake replaces the unrestricted one above only for
   // existence-only kinds; everything else keeps the unchanged pipeline.
   return EmitSemiAnti(
-      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_),
+      JoinIntModeAvoidingSpillLoss(s.left, s.right, left_cols_, right_cols_),
       build);
 }
 
@@ -1394,7 +1456,7 @@ Status HashJoin::MaterializeSemiAntiReduced() {
   build.total_rows = semi_reduction_build_rows_;
   build.has_null_key = raw_build_null_key;
   return EmitSemiAnti(
-      JoinIntModeType(s.left.rows, left_cols_, s.right.rows, right_cols_),
+      JoinIntModeAvoidingSpillLoss(s.left, s.right, left_cols_, right_cols_),
       build);
 }
 
@@ -1415,7 +1477,7 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
     const KeyRef k = KeyOf(probe.first, left_cols_, side.mode, side.int_type,
                            &scratch, NullSafeArg());
     if (!k.valid) {
-      return -1;
+      return k.has_null ? -1 : 0;
     }
     return side.index.Find(k.hash, k.int_key, k.byte_key) != JoinHashIndex::kNil
                ? 1
@@ -1505,7 +1567,7 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
       const KeyRef k = KeyOf(s.left.rows[i].first, left_cols_,
                              JoinHashIndex::KeyMode::kBytes, ValueType::kInt64,
                              &scratch, NullSafeArg());
-      if (!k.valid) {
+      if (!k.valid && k.has_null) {
         matched[i] = ProbeState::kNull;
       }
     }
@@ -1550,7 +1612,7 @@ Status HashJoin::EmitSemiAnti(std::optional<ValueType> int_mode,
             const KeyRef k =
                 KeyOf(probe.first, left_cols_, JoinHashIndex::KeyMode::kBytes,
                       ValueType::kInt64, &scratch, NullSafeArg());
-            if (probe_survives(k.valid ? 0 : -1)) {
+            if (probe_survives((!k.valid && k.has_null) ? -1 : 0)) {
               emit_probe(probe);
             }
           }
@@ -1630,10 +1692,21 @@ Status HashJoin::BuildShards() {
   std::vector<uint64_t> hashes(rows.size());
   std::vector<size_t> counts(shard_count + 1, 0);
   std::string scratch;
+  // Keep the keys produced by the partitioning pass so the fill pass never
+  // re-encodes them: a bytes-mode key needs a memcomparable composition plus a
+  // copy per row, and doing that twice doubled the build-side key cost.
+  std::vector<int64_t> int_keys(rows.size(), 0);
+  std::vector<bool> valid_keys(rows.size(), false);
+  std::vector<std::pair<size_t, size_t>> byte_spans(rows.size(), {0, 0});
+  std::string key_arena;
   for (size_t i = 0; i < rows.size(); ++i) {
     const KeyRef k = KeyOf(rows[i].first, cols, s.key_mode, s.int_mode_type,
                            &scratch, NullSafeArg());
     hashes[i] = k.hash;
+    int_keys[i] = k.int_key;
+    valid_keys[i] = k.valid;
+    byte_spans[i] = {key_arena.size(), k.byte_key.size()};
+    key_arena.append(k.byte_key);
     ++counts[shard_of(hashes[i]) + 1];
   }
   for (size_t i = 0; i < shard_count; ++i) {
@@ -1657,19 +1730,18 @@ Status HashJoin::BuildShards() {
   }
 
   const auto fill_range = [&](size_t begin, size_t end) {
-    std::string local_scratch;
     for (size_t pos = begin; pos < end; ++pos) {
       const size_t i = ordered[pos];
-      const KeyRef k = KeyOf(rows[i].first, cols, s.key_mode, s.int_mode_type,
-                             &local_scratch, NullSafeArg());
       // NULL (invalid) build keys must stay out of the index: their default
       // KeyRef carries int_key=0/hash=0, which a probe key of 0 would chain
       // onto as a false inner join (BuildSideIndex enforces the same
       // contract).
-      if (!k.valid) {
+      if (!valid_keys[i]) {
         continue;
       }
-      s.shards[shard_of(k.hash)].Insert(k.hash, k.int_key, k.byte_key, i);
+      const std::string_view byte_key(key_arena.data() + byte_spans[i].first,
+                                      byte_spans[i].second);
+      s.shards[shard_of(hashes[i])].Insert(hashes[i], int_keys[i], byte_key, i);
     }
   };
 

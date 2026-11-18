@@ -84,6 +84,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.MergeSelectionsCollapsesSelectionChain`: 外側 Group に統合述語を持つ Selection 式が追加されることを検証。
 

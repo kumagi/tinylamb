@@ -203,7 +203,7 @@ class OocGroupAggSink final : public PipelineSink {
   std::unique_ptr<RecursivePartitioner> partitioner_;
 };
 
-// --- 4. OOC Adaptive Grace Hash Join (`HashBuildSink` + `AdaptiveProbeSource`)
+// --- 4. OOC Adaptive Grace Hash Join (`OocHashBuildSink` + the OOC hash-join probe source)
 // ---
 
 struct OocHashJoinSpec {
@@ -713,7 +713,6 @@ class IncrementalSortSource final : public PipelineSource {
   Schema schema_;
   std::vector<OocSortSink::KeySpec> prefix_keys_;
   std::vector<OocSortSink::KeySpec> suffix_keys_;
-  std::vector<OocSortSink::KeySpec> combined_suffix_;
 
   std::optional<QueryMemoryGrant::ActiveConsumerGuard> consumer_guard_;
   size_t budget_bytes_{0};
@@ -927,9 +926,7 @@ class OocMergeJoinSource final : public PipelineSource {
   // Active equal-key run cross-product state:
   bool in_run_{false};
   std::unique_ptr<SpillableStore> right_run_store_;
-  bool right_run_has_rows_{false};
   std::vector<uint64_t> right_matched_bits_;
-  bool left_key_row_valid_{false};
   Row active_left_row_;
   RowPosition active_left_pos_;
   bool active_left_matched_{false};
@@ -1157,8 +1154,13 @@ class OocApplySource final : public PipelineSource {
  private:
   struct LruEntry {
     Row key;
-    std::vector<Row> rows;
+    // Shared immutable rows: the cache and the active consumer both hold a
+    // reference instead of deep-copying the whole inner result on every hit.
+    std::shared_ptr<const std::vector<Row>> rows;
     size_t bytes{0};
+    // Cheap pre-filter for the bounded LRU probe: only rows hashing to the
+    // same value need the (collation-aware) exact equality check.
+    size_t key_hash{0};
   };
 
   OocSetOpInputStream outer_;
@@ -1193,7 +1195,10 @@ class OocApplySource final : public PipelineSource {
   Row cur_outer_row_;
   RowPosition cur_outer_pos_;
   bool matched_any_{false};
+  // Mutable build buffer for a freshly evaluated inner result; once complete
+  // it is moved into an immutable shared view used by the cache and reader.
   std::vector<Row> active_inner_rows_;
+  std::shared_ptr<const std::vector<Row>> active_inner_view_;
   std::unique_ptr<SpillableStore> active_inner_spill_;
   bool reading_inner_spill_{false};
   DataChunk active_inner_chunk_;

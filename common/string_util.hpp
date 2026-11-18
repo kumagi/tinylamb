@@ -3,7 +3,10 @@
 #define TINYLAMB_COMMON_STRING_UTIL_HPP
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -113,16 +116,43 @@ namespace tinylamb {
                                                      std::string_view cutset,
                                                      bool leading,
                                                      bool trailing) {
-  std::vector<std::string_view> points;
+  // Membership structure: one-byte points go into a stack 256-bit bitmap,
+  // multi-byte points into a small inline array (a rare overflow vector
+  // covers pathological cutsets).  The previous per-call
+  // vector<string_view> + linear std::ranges::find cost a malloc and
+  // O(text points x cutset points) comparisons on every trimmed row, even
+  // for the six ASCII bytes of the default cutset.
+  std::array<uint64_t, 4> single_byte_bits{};
+  std::array<std::string_view, 8> multi_byte_points{};
+  size_t multi_byte_count = 0;
+  std::vector<std::string_view> overflow_points;
   for (size_t i = 0; i < cutset.size();) {
     const size_t len =
         std::min(Utf8SequenceLength(static_cast<unsigned char>(cutset[i])),
                  cutset.size() - i);
-    points.push_back(cutset.substr(i, len));
+    const std::string_view point = cutset.substr(i, len);
+    if (point.size() == 1) {
+      const auto byte = static_cast<unsigned char>(point[0]);
+      single_byte_bits[byte >> 6] |= uint64_t{1} << (byte & 63U);
+    } else if (multi_byte_count < multi_byte_points.size()) {
+      multi_byte_points[multi_byte_count++] = point;
+    } else {
+      overflow_points.push_back(point);
+    }
     i += len;
   }
-  const auto in_cutset = [&](std::string_view point) {
-    return std::ranges::find(points, point) != points.end();
+  const auto in_cutset = [&](std::string_view point) -> bool {
+    if (point.size() == 1) {
+      const auto byte = static_cast<unsigned char>(point[0]);
+      return ((single_byte_bits[byte >> 6] >> (byte & 63U)) & 1U) != 0U;
+    }
+    for (const std::string_view& known :
+         std::span(multi_byte_points).first(multi_byte_count)) {
+      if (known == point) {
+        return true;
+      }
+    }
+    return std::ranges::find(overflow_points, point) != overflow_points.end();
   };
   // A cutset byte that is not a complete sequence (e.g. a lone 0xAC from a
   // BYTES literal) only ever forms a one-byte point. Match it byte by byte in
@@ -131,9 +161,8 @@ namespace tinylamb {
   // keeps code-point semantics.
   if (leading) {
     while (!text.empty()) {
-      const size_t len =
-          std::min(Utf8SequenceLength(static_cast<unsigned char>(text[0])),
-                   text.size());
+      const size_t len = std::min(
+          Utf8SequenceLength(static_cast<unsigned char>(text[0])), text.size());
       if (in_cutset(text.substr(0, len))) {
         text.remove_prefix(len);
         continue;

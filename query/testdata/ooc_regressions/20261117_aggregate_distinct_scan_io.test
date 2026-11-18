@@ -1,0 +1,79 @@
+-- sql_ooc_fuzzer regression
+-- seed: 455
+-- profile: pool=262144 columnar=0 opmem=65536 spill=1 temp=121856 route=0
+-- failure: sweep io / budget-invariance mismatch [groupby+distinct] (same query, different memory knobs) :: sweep io `q ord=0 heavy=0 take=-1 nv=1 vs=595257859 ex=0 snap=0 :: SELECT g AS c1, t AS c2, COUNT(v) AS c3, COUNTIF(v > 281) AS c4...(192B)` with failure #1: budget-invariance mismatch [groupby+distinct] (same query, different memory knobs): SELECT g AS c1, t AS c2, COUNT(v) AS c3, COUNTIF(v > 281) AS c4, COUNT(DISTINCT v) AS c5, COUNT(DISTINCT v) AS c6 FROM t3 GROUP BY 1, 2 |   reference {opmem=0 spill=0 temp=0 route=0} vs {opmem=65536 spill=1 temp=121856 route=0} |   expected 120 rows, engine ret
+create t0 57 277 9
+create t1 2 144 550 1 2 0
+index t0 ix0 pad
+ins_bulk t0 1 439 962
+ins_bulk t0 440 857 685
+ins_bulk t1 1 57 783
+ins_bulk t1 58 155 880
+ins_bulk t1 156 296 591
+ins_bulk t1 297 787 41
+commit
+commit
+sweep mem 209 :: ins_bulk t0 858 1355 343
+inject mem 90
+check sortpad t0 29
+snap open rw
+check count t1
+upd t0 range 755 995 1 0 pad 425 59 none 0 0
+sweep mem 393 :: check sortpad t1 153
+snap check t1
+ins_bulk t1 788 1110 953
+q ord=0 heavy=0 take=-1 nv=2 vs=73301750 ex=0 snap=0 :: SELECT a.k AS c1, a.v AS c2, a.t AS c3 FROM t0 a WHERE a.k IN (SELECT b.k FROM t1 b WHERE MOD(b.k, 5) = 1)
+sweep io 76 :: q ord=1 heavy=0 take=-1 nv=2 vs=410606349 ex=1 snap=0 :: SELECT k, v, t FROM t1 ORDER BY v DESC NULLS LAST, k DESC
+create t2 39 6 1
+reopen
+inject mem 324
+upd t1 range 710 721 1 0 vadd -6 0 gmod 58 0
+commit
+commit
+ins_copy t0 t1 407 682 451
+sweep mem 288 :: q ord=0 heavy=0 take=-1 nv=2 vs=30395935 ex=0 snap=0 :: SELECT a.k AS c1, a.v AS c2 FROM t0 a WHERE a.k BETWEEN 72 AND 185 AND a.v > (SELECT AVG(b.v) FROM t1 b WHERE b.g = a.g)
+del t1 rmod 228 1337 9 7
+create t3 17 171 1919
+inject io 29
+checkpoint
+q ord=0 heavy=0 take=-1 nv=2 vs=538399835 ex=0 snap=0 :: SELECT a.k AS c1, b.k AS c2, a.v AS c3, b.t AS c4 FROM t1 a JOIN t3 b ON b.k BETWEEN a.k - 0 AND a.k + 3
+snap open ro
+checkpoint
+ins_bulk t3 1 330 427
+sweep io 21 :: checkpoint
+sweep mem 189 :: del t0 padgt 1692 0 1 0
+upd t0 range 262 334 2 1 padapp 0 0 tag 4 0
+ins_copy t3 t0 808 958 151
+inject mem 67
+upd t1 range 567 605 1 0 gmod 42 0 none 0 0
+commit
+upd t3 range 24 381 2 1 pad 389 85 none 0 0
+q ord=1 heavy=0 take=1 nv=1 vs=380121819 ex=0 snap=0 :: SELECT k AS c1, LENGTH(pad) AS c2, SUBSTR(pad, 1, 10) AS c3, MOD(k, 12) AS c4 FROM t3 WHERE pad LIKE '6%' ORDER BY k LIMIT 15 OFFSET 18
+sweep io 56 :: q ord=1 heavy=1 take=16 nv=2 vs=127826315 ex=0 snap=0 :: SELECT k AS c1, g AS c2, v AS c3, pad AS c4 FROM t1 WHERE v BETWEEN 1 AND 2 ORDER BY pad, MOD(k, 3), k LIMIT 222 OFFSET 58
+check joinrows t0 t3
+sweep mem 248 :: upd t3 range 959 1037 1 0 padapp 0 0 none 0 0
+create t4 1 133 1267
+sweep mem 229 :: ins_copy t4 t0 96 384 289
+check tag t1 3 348
+inject mem 361
+q ord=0 heavy=0 take=-1 nv=1 vs=700427197 ex=0 snap=0 :: SELECT DISTINCT MOD(k, 8) AS c1, g AS c2 FROM t4 WHERE t = 'bb' AND LENGTH(pad) > 0
+crash
+upd t0 range 462 484 1 0 vadd 0 0 none 0 0
+ins_bulk t1 788 916 544
+ins_copy t1 t0 612 648 305
+upd t1 range 906 1165 1 0 vset 561 0 pad 141 27
+evict 5962
+ins_values t3 1110 1110 271
+upd t3 range 52 298 1 0 pad 584 27 gmod 6 0
+sweep mem 374 :: ins_bulk t0 1134 1171 438
+q ord=0 heavy=0 take=-1 nv=1 vs=815771128 ex=0 snap=0 :: SELECT a.k AS c1, b.k AS c2, b.v AS c3, a.v AS c4, SUBSTR(b.pad, 1, 13) AS c5 FROM (SELECT * FROM t0 WHERE k BETWEEN 832 AND 1075) a JOIN t4 b ON a.g = b.g
+ins_bulk t1 788 1094 757
+ins_bulk t0 1172 1358 752
+q ord=0 heavy=0 take=-1 nv=2 vs=704359676 ex=1 snap=0 :: SELECT MOD(a.k, 201) AS c1, MIN(a.k) AS c2, SUM(b.v) AS c3 FROM t3 a JOIN t4 b ON a.k = b.k GROUP BY 1
+ins_bulk t1 1095 1430 899
+upd t0 range 163 453 1 0 vset 681 0 pad 1048 45
+sweep mem 399 :: q ord=0 heavy=0 take=-1 nv=1 vs=1031850921 ex=0 snap=0 :: SELECT COUNT(*), SUM(a.k * b.k), SUM(LENGTH(a.pad) + LENGTH(b.pad)), COUNT(a.v + b.v) FROM (SELECT * FROM t1 WHERE k BETWEEN 704 AND 718) a CROSS JOIN t0 b
+sweep io 62 :: ins_copy t3 t0 783 857 327
+ins_values t3 1110 1111 463
+abort
+sweep io 66 :: q ord=0 heavy=0 take=-1 nv=1 vs=595257859 ex=0 snap=0 :: SELECT g AS c1, t AS c2, COUNT(v) AS c3, COUNTIF(v > 281) AS c4, COUNT(DISTINCT v) AS c5, COUNT(DISTINCT v) AS c6 FROM t3 GROUP BY 1, 2

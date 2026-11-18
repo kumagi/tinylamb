@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -33,34 +34,22 @@ std::vector<std::string> ListTestFiles(const std::string& dir) {
     }
   }
   closedir(handle);
+  std::ranges::sort(files);
   return files;
 }
 
-}  // namespace
-
-// Seeded state-tracking sessions: after every statement the full-table dump
-// must equal the C++ mirror.  A mismatch means some layer lost or invented a
-// committed mutation.
-TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
+void RunSeededSessionRange(uint64_t begin_seed, uint64_t end_seed,
+                           bool check_coverage) {
   int total_checks = 0;
   int indexes_created = 0;
   int tables_dropped = 0;
   int commits = 0;
   int crashes = 0;
   int checkpoints = 0;
-  constexpr int kIterations = 64;
-  const char* only = std::getenv("TINYLAMB_SESSION_ONLY_SEED");
-  // A seed asked for via TINYLAMB_SESSION_ONLY_SEED runs even when it
-  // lies outside the sweep range (libFuzzer seeds are full-width; the
-  // old uint32 stoul + 64-iteration loop turned such asks into "run
-  // nothing", tripping the sanity floor below and hiding the repro).
-  const uint64_t only_seed =
-      only != nullptr ? std::strtoull(only, nullptr, 10) : 0;
-  const uint64_t first = only != nullptr ? only_seed : 0;
-  const uint64_t last =
-      only != nullptr ? only_seed + 1 : static_cast<uint64_t>(kIterations);
-  for (uint64_t seed = first; seed < last; ++seed) {
-    std::mt19937 rng(static_cast<uint32_t>(seed));
+  for (uint64_t seed = begin_seed; seed < end_seed; ++seed) {
+    // Same fold as SessionFuzzTry (identical for seeds below 2^32): a recorded
+    // full-width libFuzzer seed must replay the same session.
+    std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
     SessionStats stats;
     std::string report = RunSessionIteration(
         rng, std::getenv("TINYLAMB_SESSION_VERBOSE") != nullptr, &stats);
@@ -72,10 +61,7 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
     crashes += stats.crashes;
     checkpoints += stats.checkpoints;
   }
-  // The coverage floor guards the FULL sweep; a single-seed repro run
-  // (TINYLAMB_SESSION_ONLY_SEED) legitimately exercises a fraction of
-  // the boundary types.
-  if (only == nullptr) {
+  if (check_coverage) {
     EXPECT_GT(total_checks, 0) << "no state checks ran; harness is broken";
     EXPECT_GT(indexes_created, 0) << "index DDL never ran; harness is broken";
     EXPECT_GT(tables_dropped, 0) << "DROP TABLE never ran; harness is broken";
@@ -83,6 +69,70 @@ TEST(SqlSessionFuzzer, SeededSessionsHoldState) {
     EXPECT_GT(crashes, 0) << "no crash boundaries; harness is broken";
     EXPECT_GT(checkpoints, 0) << "no checkpoints ran; harness is broken";
   }
+}
+
+void ReplayCommittedRegressionShard(size_t shard, size_t total_shards) {
+  const char* dir = std::getenv("TINYLAMB_SESSION_REGRESSION_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "set TINYLAMB_SESSION_REGRESSION_DIR to replay .test files";
+  }
+  const std::vector<std::string> files = ListTestFiles(dir);
+  for (size_t i = shard; i < files.size(); i += total_shards) {
+    const std::string& path = files[i];
+    std::ifstream file(path);
+    std::string text((std::istreambuf_iterator<char>(file)),
+                     std::istreambuf_iterator<char>());
+    ASSERT_TRUE(file.good()) << path;
+    uint64_t seed = 0;
+    SessionTrace trace;
+    std::string summary;
+    ASSERT_TRUE(ParseSessionTest(text, &seed, &trace, &summary))
+        << "malformed regression file: " << path;
+    std::string report = ReplaySessionTrace(trace, false);
+    EXPECT_EQ(report, "") << "regression " << path << " still reproduces:\n"
+                          << report << summary;
+  }
+}
+
+}  // namespace
+
+// Seeded state-tracking sessions: after every statement the full-table dump
+// must equal the C++ mirror.  A mismatch means some layer lost or invented a
+// committed mutation.
+TEST(SqlSessionFuzzer, SeededSessionsHoldStateShard0) {
+  constexpr uint64_t kHalfIterations = 32;
+  const char* only = std::getenv("TINYLAMB_SESSION_ONLY_SEED");
+  // A seed asked for via TINYLAMB_SESSION_ONLY_SEED runs even when it
+  // lies outside the sweep range (libFuzzer seeds are full-width; the
+  // old uint32 stoul + 64-iteration loop turned such asks into "run
+  // nothing", tripping the sanity floor below and hiding the repro).
+  uint64_t only_seed = 0;
+  if (only != nullptr) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(only, &end, 10);
+    if (end == only || *end != '\0' || errno == ERANGE || only[0] == '-') {
+      // An invalid repro request must not silently run zero seeds.
+      ADD_FAILURE() << "invalid TINYLAMB_SESSION_ONLY_SEED: " << only;
+    } else {
+      only_seed = static_cast<uint64_t>(parsed);
+    }
+  }
+  const uint64_t first = only != nullptr ? only_seed : 0;
+  const uint64_t last =
+      only != nullptr ? (only_seed == UINT64_MAX ? only_seed : only_seed + 1)
+                      : kHalfIterations;
+  // The coverage floor guards the sweep; a single-seed repro run
+  // (TINYLAMB_SESSION_ONLY_SEED) legitimately exercises a fraction of
+  // the boundary types.
+  RunSeededSessionRange(first, last, only == nullptr);
+}
+
+TEST(SqlSessionFuzzer, SeededSessionsHoldStateShard1) {
+  if (std::getenv("TINYLAMB_SESSION_ONLY_SEED") != nullptr) {
+    return;
+  }
+  RunSeededSessionRange(32, 64, true);
 }
 
 TEST(SqlSessionFuzzer, ResourcePressureSkipsWithoutFailure) {
@@ -246,8 +296,21 @@ TEST(SqlSessionFuzzer, RepeatSeedForNondeterministicBugs) {
   if (seed_env == nullptr || count_env == nullptr) {
     GTEST_SKIP() << "set TINYLAMB_SESSION_SEED + TINYLAMB_SESSION_REPEAT";
   }
-  const uint64_t seed = std::strtoull(seed_env, nullptr, 10);
-  const int repeat = static_cast<int>(std::strtol(count_env, nullptr, 10));
+  char* seed_end = nullptr;
+  errno = 0;
+  const unsigned long long parsed_seed = std::strtoull(seed_env, &seed_end, 10);
+  if (errno != 0 || seed_end == seed_env || *seed_end != '\0') {
+    GTEST_SKIP() << "invalid TINYLAMB_SESSION_SEED";
+  }
+  char* count_end = nullptr;
+  errno = 0;
+  const long parsed_repeat = std::strtol(count_env, &count_end, 10);
+  if (errno != 0 || count_end == count_env || *count_end != '\0' ||
+      parsed_repeat <= 0 || parsed_repeat > std::numeric_limits<int>::max()) {
+    GTEST_SKIP() << "invalid TINYLAMB_SESSION_REPEAT";
+  }
+  const uint64_t seed = static_cast<uint64_t>(parsed_seed);
+  const int repeat = static_cast<int>(parsed_repeat);
   for (int i = 0; i < repeat; ++i) {
     // Same fold as SessionFuzzTry so a .test file's -- seed: value can be
     // passed verbatim.
@@ -304,27 +367,54 @@ TEST(SqlSessionFuzzer, TestFileRoundTripDetectsMismatch) {
       << "tampered dump replayed clean; pipeline is broken";
 }
 
+TEST(SqlSessionFuzzer,
+     PlanCacheRetainsSubqueryTablesAcrossDeleteReplayAndCheckpoint) {
+  SessionTrace trace;
+  trace.steps = {
+      {.sql =
+           "CREATE TABLE tbl2 (u INT64, c1 INT64, c2 INT64, c3 VARCHAR(8));"},
+      {.sql =
+           "CREATE TABLE tbl4 (u INT64, c1 INT64, c2 INT64, c3 VARCHAR(8));"},
+      {.sql = "INSERT INTO tbl2 VALUES (0, 1, 10, 'k1');"},
+      {.sql = "INSERT INTO tbl4 VALUES (0, 7, 70, 'k1');"},
+      {.sql = "INSERT INTO tbl4 VALUES (1, 8, 80, 'k2');"},
+      {.is_commit = true},
+      {.sql =
+           "DELETE FROM tbl4 WHERE (EXISTS (SELECT 1 FROM tbl2 WHERE tbl2.c1 = "
+           "tbl4.c1));"},
+      {.is_checkpoint = true},
+      {.is_abort = true},
+      {.sql =
+           "DELETE FROM tbl4 WHERE (EXISTS (SELECT 1 FROM tbl2 WHERE tbl2.c1 = "
+           "tbl4.c1));"},
+      {.sql =
+           "DELETE FROM tbl4 WHERE (EXISTS (SELECT 1 FROM tbl2 WHERE tbl2.c3 = "
+           "tbl4.c3));"},
+  };
+  SessionCheck remaining;
+  remaining.table = "tbl4";
+  remaining.after_step = trace.steps.size() - 1;
+  remaining.expected = {"[1, 8, 80, \"k2\"]"};
+  trace.checks.push_back(remaining);
+  EXPECT_EQ(ReplaySessionTrace(trace, true), "");
+}
+
 // Any committed sql_session_fuzz-*.test file replays as a permanent
 // regression guard: the recorded dumps must hold now.
-TEST(SqlSessionFuzzer, ReplayCommittedRegressionFiles) {
-  const char* dir = std::getenv("TINYLAMB_SESSION_REGRESSION_DIR");
-  if (dir == nullptr) {
-    GTEST_SKIP() << "set TINYLAMB_SESSION_REGRESSION_DIR to replay .test files";
-  }
-  for (const std::string& path : ListTestFiles(dir)) {
-    std::ifstream file(path);
-    std::string text((std::istreambuf_iterator<char>(file)),
-                     std::istreambuf_iterator<char>());
-    ASSERT_TRUE(file.good()) << path;
-    uint64_t seed = 0;
-    SessionTrace trace;
-    std::string summary;
-    ASSERT_TRUE(ParseSessionTest(text, &seed, &trace, &summary))
-        << "malformed regression file: " << path;
-    std::string report = ReplaySessionTrace(trace, false);
-    EXPECT_EQ(report, "") << "regression " << path << " still reproduces:\n"
-                          << report << summary;
-  }
+TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard0) {
+  ReplayCommittedRegressionShard(0, 4);
+}
+
+TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard1) {
+  ReplayCommittedRegressionShard(1, 4);
+}
+
+TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard2) {
+  ReplayCommittedRegressionShard(2, 4);
+}
+
+TEST(SqlSessionFuzzer, ReplayCommittedRegressionFilesShard3) {
+  ReplayCommittedRegressionShard(3, 4);
 }
 
 }  // namespace tinylamb

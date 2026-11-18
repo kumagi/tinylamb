@@ -3,7 +3,7 @@
 Not a storage layer. Shared relational-IR execution helpers used by both
 `plan/` and `executor/` — hence its own rank in `check_layering.py`
 (longest-prefix match puts `executor/detail/` before `executor/`).
-Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
+Namespace `relational_detail`. Promotion to a real layer is an open item.
 
 ## Key files
 
@@ -59,13 +59,26 @@ Namespace `relational_detail`. Promotion to a real layer is an open A5 item.
   each round's join hashes that delta itself and the term must never read the
   accumulated table. `WorkTableIndexStats()` counts `inserts`/`duplicates`
   so tests can prove the loop consults the index.
+- `ooc/` (`chunk_codec`, `spillable_store`, `external_sorter`,
+  `recursive_partitioner`) — P2 OOC spillable building blocks built over
+  `common/spill/spill_store.hpp` and `common/query_grant.hpp`.
+- `pipeline/` (`pipeline_ir`, `pipeline_ops`, `ooc_sinks`, `ooc_*_sink.cpp`,
+  `ooc_join_cte_sources.cpp`) — P3a/P3b push-breaker pipeline IR, scheduler,
+  and OOC spillable sinks/sources (`OocSortSink`, `OocDistinctSink`,
+  `OocHashJoinSink`, `OocGroupAggSink`, `OocWindowSink`, `OocSetOpSink`,
+  `OocIncrementalSortSink`, `OocMergeJoinSource`, `OocBandJoinSource`,
+  `OocRecursiveCteSource`, `OocApplySource`, etc.).
+- `columnar_table.{hpp,cpp}`, `columnar_tlcs_fast_path.{hpp,cpp}`,
+  `fused_grouped_join*`, `typed_stream_aggregate*` — columnar intermediate
+  representation, TLCS fast path, and specialized grouped aggregation/join
+  kernels.
 
 ## Layering notes
 
 - `executor/detail/* -> executor/*` (detail → executor body) is allowlisted
-  (A5) — do not add new edges; put shared code here, not in `executor/`
+  — do not add new edges; put shared code here, not in `executor/`
   headers.
 - `executor/detail/* -> query/statement.hpp` is V3' debt: the statement IR
   lives above its readers. Read-only use only.
 
-Test via: `./build/relational_regression_test`, `relational_extra_test`.
+Test via: `./build/relational_regression_test`, `columnar_table_test`, `relational_extra_test`.

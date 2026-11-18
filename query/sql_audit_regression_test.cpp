@@ -1,17 +1,21 @@
 /** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "common/memory_budget.hpp"
 #include "common/random_string.hpp"
 #include "common/status_or.hpp"
 #include "database/database.hpp"
 #include "database/transaction_context.hpp"
 #include "executor/detail/explain_format.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/unnest.hpp"
 #include "executor/values.hpp"
 #include "expression/expression.hpp"
@@ -298,6 +302,25 @@ TEST_F(SqlAuditRegressionTest,
             (std::vector<Row>{Row({Value(42)}), Row({Value(42)})}));
 }
 
+TEST_F(SqlAuditRegressionTest,
+       FetchFirstOffsetWithCommentsKeepNumericArgument) {
+  ASSERT_TRUE(Run("CREATE TABLE fetch_c (k INT64)").HasValue());
+  for (int i = 1; i <= 5; ++i) {
+    ASSERT_TRUE(Run("INSERT INTO fetch_c VALUES (" + std::to_string(i) + ")")
+                    .HasValue());
+  }
+  // A comment between FETCH FIRST and the number must not collapse the count
+  // to the "1" fallback; an OFFSET comment must not make the clause vanish.
+  EXPECT_EQ(
+      Rows("SELECT k FROM fetch_c ORDER BY k FETCH FIRST /* c */ 2 ROWS "
+           "ONLY"),
+      (std::vector<Row>{Row({Value(int64_t{1})}), Row({Value(int64_t{2})})}));
+  EXPECT_EQ(
+      Rows("SELECT k FROM fetch_c ORDER BY k OFFSET /* c */ 2 ROWS FETCH "
+           "FIRST 2 ROWS ONLY"),
+      (std::vector<Row>{Row({Value(int64_t{3})}), Row({Value(int64_t{4})})}));
+}
+
 TEST_F(SqlAuditRegressionTest, InvalidTimeZonesAreRejected) {
   for (const char* expression :
        {"CURRENT_DATE('Audit/No_Such_Zone')",
@@ -548,7 +571,9 @@ TEST_F(SqlAuditRegressionTest, MalformedDateUnnestReturnsStatus) {
         ConstantValueExp(Value::Array({Value(std::string(text))}, "DATE")), "d",
         "");
     DataChunk output;
-    EXPECT_NO_THROW(EXPECT_EQ(unnest.NextBatch(&output), 0U));
+    uint64_t batch_rows = 0;
+    EXPECT_NO_THROW(batch_rows = unnest.NextBatch(&output));
+    EXPECT_EQ(batch_rows, 0U);
     EXPECT_NE(unnest.GetStatus(), Status::kSuccess);
   }
 }
@@ -562,9 +587,10 @@ TEST_F(SqlAuditRegressionTest, StreamingAggregateErrorsStayInStatus) {
         "ERROR('having')"}) {
     auto context = database_->BeginContext();
     auto prepared = engine_->Prepare(context, query);
-    if (!prepared.HasValue()) {
-      continue;
-    }
+    // This suite pins that the error surfaces as a Status at execution time.
+    // If Prepare starts rejecting the query, both cases would be silently
+    // skipped and the invariant guard would die; fail loudly instead.
+    ASSERT_TRUE(prepared.HasValue()) << query;
     Row row;
     EXPECT_NO_THROW({
       while (prepared.Value()->Next(&row, nullptr)) {
@@ -586,15 +612,269 @@ TEST_F(SqlAuditRegressionTest, DistinctOnKeepsFirstRowWithCollation) {
                               Row({Value(), Value(4)})}));
 }
 
+TEST_F(SqlAuditRegressionTest, UnionAllNullConstantVarcharPartialSlice) {
+  const std::string payload(80, 'k');
+  for (bool force_relational : {false, true}) {
+    SCOPED_TRACE(force_relational);
+    engine_->SetForceRelationalFallback(force_relational);
+    EXPECT_EQ(
+        Rows("SELECT c FROM ("
+             "SELECT '" +
+             payload +
+             "' AS c "
+             "UNION ALL SELECT '" +
+             payload +
+             "' "
+             "UNION ALL SELECT CAST(NULL AS STRING) "
+             "UNION ALL SELECT '" +
+             payload +
+             "' "
+             "UNION ALL SELECT 'tail'"
+             ") LIMIT 3 OFFSET 1"),
+        (std::vector<Row>{Row({Value(std::string(payload))}), Row({Value()}),
+                          Row({Value(std::string(payload))})}));
+    EXPECT_EQ(
+        Rows("SELECT c FROM ("
+             "SELECT NULL AS c "
+             "UNION ALL SELECT 'hello_after_null' "
+             "UNION ALL SELECT NULL"
+             ")"),
+        (std::vector<Row>{Row({Value()}), Row({Value("hello_after_null")}),
+                          Row({Value()})}));
+  }
+}
+
+TEST_F(SqlAuditRegressionTest, ThreeKeyFastSortHandlesLargeKey3AndDoubleNaN) {
+  Rows("CREATE TABLE audit_sort3 (k1 INT64, k2 STRING, k3 INT64, d DOUBLE)");
+  {
+    std::string sql =
+        "INSERT INTO audit_sort3 VALUES "
+        "(1, 'a', -3000000000, -1.0), "
+        "(1, 'a', -5, CAST('NaN' AS DOUBLE)), "
+        "(1, 'a', 3000000000, 1.0)";
+    // Pad beyond the 256-row inline 3-key fast-sort threshold in one statement.
+    for (int i = 0; i < 260; ++i) {
+      sql += ",(2, 'zzzzzzzzzz', " + std::to_string(i) + ", " +
+             std::to_string(i) + ".0)";
+    }
+    Rows(sql);
+  }
+  EXPECT_EQ(
+      Rows(
+          "SELECT k3 FROM audit_sort3 ORDER BY k1 ASC, k2 ASC, k3 ASC LIMIT 3"),
+      (std::vector<Row>{Row({Value(int64_t{-3000000000LL})}),
+                        Row({Value(int64_t{-5})}),
+                        Row({Value(int64_t{3000000000LL})})}));
+  Rows("DELETE FROM audit_sort3 WHERE k1 = 2");
+  {
+    std::string sql = "INSERT INTO audit_sort3 VALUES (1, 'a', 0, 2.0)";
+    for (int i = 1; i < 260; ++i) {
+      sql += ",(1, 'a', 0, " + std::to_string(i + 2) + ".0)";
+    }
+    Rows(sql);
+  }
+  std::vector<Row> nan_first3 =
+      Rows("SELECT d FROM audit_sort3 ORDER BY d ASC LIMIT 3");
+  ASSERT_EQ(nan_first3.size(), 3U);
+  // GoogleSQL CompareForOrderBy orders NaN before all finite doubles.
+  EXPECT_TRUE(std::isnan(nan_first3[0][0].value.double_value));
+  EXPECT_EQ(nan_first3[1], Row({Value(-1.0)}));
+  EXPECT_EQ(nan_first3[2], Row({Value(1.0)}));
+
+  // Verify 4-key sorting respects the 4th key as well.
+  Rows("CREATE TABLE audit_sort4 (a INT64, b INT64, c INT64, d INT64)");
+  {
+    std::string sql =
+        "INSERT INTO audit_sort4 VALUES (1,1,1,30),(1,1,1,10),(1,1,1,20)";
+    for (int i = 0; i < 260; ++i) {
+      sql += ",(2,1,1," + std::to_string(260 - i) + ")";
+    }
+    Rows(sql);
+  }
+  EXPECT_EQ(
+      Rows("SELECT d FROM audit_sort4 ORDER BY a,b,c,d LIMIT 3"),
+      (std::vector<Row>{Row({Value(10)}), Row({Value(20)}), Row({Value(30)})}));
+}
+
+TEST_F(SqlAuditRegressionTest,
+       NotInTreatsNaNAsNonMatchingAndNullAsUnknownAcrossEngines) {
+  Rows("CREATE TABLE audit_nan_p (k DOUBLE)");
+  Rows("INSERT INTO audit_nan_p VALUES (1.0), (CAST('NaN' AS DOUBLE)), (NULL)");
+  Rows("CREATE TABLE audit_nan_b (k DOUBLE)");
+  Rows("INSERT INTO audit_nan_b VALUES (1.0), (2.0)");
+  for (bool force_relational : {false, true}) {
+    SCOPED_TRACE(force_relational);
+    engine_->SetForceRelationalFallback(force_relational);
+    auto out = Rows(
+        "SELECT k FROM audit_nan_p WHERE k NOT IN (SELECT k FROM audit_nan_b)");
+    ASSERT_EQ(out.size(), 1U);
+    EXPECT_TRUE(std::isnan(out[0][0].value.double_value));
+    EXPECT_EQ(
+        Rows(
+            "SELECT k FROM audit_nan_p WHERE k IN (SELECT k FROM audit_nan_b)"),
+        std::vector<Row>{Row({Value(1.0)})});
+  }
+}
+
+TEST_F(SqlAuditRegressionTest,
+       BoundedTopNAndOffsetLimitRespectTightQueryBudget) {
+  Rows("CREATE TABLE audit_mem_lim (id INT64, pad STRING)");
+  {
+    std::string sql = "INSERT INTO audit_mem_lim VALUES ";
+    for (int i = 0; i < 40; ++i) {
+      if (i > 0) {
+        sql += ",";
+      }
+      sql += "(" + std::to_string(40 - i) + ", REPEAT('z', 512))";
+    }
+    Rows(sql);
+  }
+  const size_t prev_limit = QueryMemoryBudget::Global().Limit();
+  struct Restore {
+    size_t limit;
+    ~Restore() { QueryMemoryBudget::Global().ResetForTest(limit); }
+  } restore{prev_limit};
+  QueryMemoryBudget::Global().ResetForTest(4096);
+  engine_->SetForceRelationalFallback(true);
+  EXPECT_EQ(Rows("SELECT id FROM audit_mem_lim ORDER BY id ASC LIMIT 5"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)}), Row({Value(3)}),
+                              Row({Value(4)}), Row({Value(5)})}));
+  auto off_rows = Rows("SELECT id FROM audit_mem_lim LIMIT 5 OFFSET 10");
+  EXPECT_EQ(off_rows.size(), 5U);
+}
+
+TEST_F(SqlAuditRegressionTest, WindowPartitionCollationAndSpillParity) {
+  Rows(
+      "CREATE TABLE audit_win (id INT64, s STRING, v INT64, step INT64, "
+      "flag BOOL)");
+  Rows(
+      "INSERT INTO audit_win VALUES "
+      "(1, 'A', 10, 1, NULL), "
+      "(2, 'a', 20, 2, NULL), "
+      "(3, 'b', 30, 1, NULL), "
+      "(4, 'B', 40, 2, NULL), "
+      "(5, 'a', 50, 1, NULL)");
+
+  auto run_queries = [&]() {
+    auto pcol = Rows(
+        "SELECT id, ROW_NUMBER() OVER ("
+        "PARTITION BY COLLATE(s, 'und:ci') ORDER BY id) AS rn "
+        "FROM audit_win ORDER BY id");
+    auto pwin = Rows(
+        "SELECT id, "
+        "COUNTIF(flag) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 "
+        "PRECEDING) AS cif_empty, "
+        "COUNTIF(flag) OVER (PARTITION BY COLLATE(s, 'und:ci')) AS cif_null, "
+        "LAG(v, step, -1) OVER (ORDER BY id) AS lag_dyn, "
+        "SUM(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) "
+        "AS rng_sum "
+        "FROM audit_win ORDER BY id");
+    return std::make_pair(std::move(pcol), std::move(pwin));
+  };
+
+  auto expected = run_queries();
+  // Verify case-insensitive PARTITION BY ('A'/'a'/'a' -> 1,2,3; 'b'/'B' -> 1,2)
+  EXPECT_EQ(
+      expected.first,
+      (std::vector<Row>{Row({Value(1), Value(1)}), Row({Value(2), Value(2)}),
+                        Row({Value(3), Value(1)}), Row({Value(4), Value(2)}),
+                        Row({Value(5), Value(3)})}));
+  EXPECT_EQ(expected.second[0][1], Value(int64_t{0}));
+  EXPECT_EQ(expected.second[0][2], Value(int64_t{0}));
+
+  struct KnobRestore {
+    ~KnobRestore() { ProcessMemoryBudget::Global().ResetTestKnobs(); }
+  } restore;
+  ProcessMemoryBudget::Global().SetTestOpMemoryBytes(96ULL << 10);
+  ProcessMemoryBudget::Global().SetTestAlwaysSpill(true);
+  auto actual = run_queries();
+  EXPECT_EQ(actual.first, expected.first);
+  EXPECT_EQ(actual.second, expected.second);
+}
+
+TEST_F(SqlAuditRegressionTest, RepeatWithColumnOperandsNeverHangsOrWraps) {
+  Rows("CREATE TABLE audit_repeat (s STRING, n INT64)");
+  Rows(
+      "INSERT INTO audit_repeat VALUES "
+      "('', 9223372036854775807),('abcdefgh', 2305843009213693952),"
+      "('ab', 3)");
+  for (bool force_relational : {false, true}) {
+    SCOPED_TRACE(force_relational);
+    engine_->SetForceRelationalFallback(force_relational);
+    // '' x huge is '' (used to loop n times); 8 bytes x 2^61 wraps to 0 in a
+    // plain uint64 multiply and must be rejected by the 1MB cap instead.
+    auto empty = Run("SELECT REPEAT(s, n) FROM audit_repeat WHERE s = ''");
+    ASSERT_TRUE(empty.HasValue()) << empty.GetStatus();
+    EXPECT_EQ(empty.MoveValue(),
+              (std::vector<Row>{Row({Value(std::string())})}));
+    EXPECT_FALSE(
+        Run("SELECT REPEAT(s, n) FROM audit_repeat WHERE s = 'abcdefgh'")
+            .HasValue());
+    EXPECT_EQ(Rows("SELECT REPEAT(s, n) FROM audit_repeat WHERE s = 'ab'"),
+              (std::vector<Row>{Row({Value(std::string("ababab"))})}));
+  }
+}
+
+// SUM raises "infinity" on an overflowing total but AVG returns the infinite
+// value; the fused grouped-join path used to share SUM's sticky flag.
+TEST_F(SqlAuditRegressionTest, FusedGroupedJoinAvgReturnsInfinityValue) {
+  Rows("CREATE TABLE audit_inf_l (k INT64, g INT64, x DOUBLE)");
+  Rows("CREATE TABLE audit_inf_r (k INT64)");
+  Rows(
+      "INSERT INTO audit_inf_l VALUES (1, 1, 1e308), (1, 1, 1e308), "
+      "(2, 2, 1.0)");
+  Rows("INSERT INTO audit_inf_r VALUES (1), (2)");
+  const std::vector<Row> avg = Rows(
+      "SELECT g, AVG(x) FROM audit_inf_l JOIN audit_inf_r "
+      "ON audit_inf_l.k = audit_inf_r.k GROUP BY g ORDER BY g");
+  ASSERT_EQ(avg.size(), 2U);
+  EXPECT_EQ(avg[0][1], Value(std::numeric_limits<double>::infinity()));
+  EXPECT_EQ(avg[1][1], Value(1.0));
+}
+
+// The QUALIFY rank-limit fusion used to key off the select-list RANK without
+// checking that the QUALIFY predicate was that RANK, pruning groups by the
+// wrong ordering before an unrelated QUALIFY RANK() ran.
+TEST_F(SqlAuditRegressionTest, QualifyRankLimitIgnoresUnrelatedRankPredicate) {
+  Rows("CREATE TABLE audit_qr (c INT64, k INT64, v INT64, w INT64)");
+  Rows(
+      "INSERT INTO audit_qr VALUES (1, 1, 10, 1), (1, 2, 5, 9), "
+      "(2, 1, 7, 3), (2, 2, 8, 2)");
+  const std::vector<Row> rows = Rows(
+      "SELECT c, k, s, RANK() OVER (PARTITION BY c ORDER BY s DESC) AS r "
+      "FROM (SELECT c, k, SUM(v) AS s, SUM(w) AS s2 FROM audit_qr "
+      "GROUP BY c, k) "
+      "QUALIFY RANK() OVER (PARTITION BY c ORDER BY s2 DESC) <= 1 "
+      "ORDER BY c");
+  // Top s2 per c: (1,2,s=5) and (2,1,s=7); r is the rank by s within c.
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0], Row({Value(int64_t{1}), Value(int64_t{2}),
+                          Value(int64_t{5}), Value(int64_t{2})}));
+  EXPECT_EQ(rows[1], Row({Value(int64_t{2}), Value(int64_t{1}),
+                          Value(int64_t{7}), Value(int64_t{2})}));
+}
+
 // The uncorrelated IN hash set treats every NaN as equal, but SQL equality
 // (and the rescan path) never matches NaN.
 TEST_F(SqlAuditRegressionTest, InSubqueryNeverMatchesNaN) {
   Rows("CREATE TABLE audit_nan (id INT64, d DOUBLE)");
-  Rows("INSERT INTO audit_nan VALUES (1, CAST('nan' AS DOUBLE)), "
-       "(2, CAST('nan' AS DOUBLE)), (3, 1.5)");
+  Rows(
+      "INSERT INTO audit_nan VALUES (1, CAST('nan' AS DOUBLE)), "
+      "(2, CAST('nan' AS DOUBLE)), (3, 1.5)");
   EXPECT_EQ(Rows("SELECT id FROM audit_nan WHERE d IN "
                  "(SELECT d FROM audit_nan) ORDER BY id"),
             (std::vector<Row>{Row({Value(int64_t{3})})}));
+}
+
+TEST_F(SqlAuditRegressionTest, NullSafeJoinFoldsSignedZero) {
+  Rows("CREATE TABLE audit_nsd (k DOUBLE)");
+  Rows("INSERT INTO audit_nsd VALUES (0.0), (-0.0)");
+  // IS NOT DISTINCT FROM must treat +0 and -0 as the same value.
+  const auto rows = Rows(
+      "SELECT COUNT(*) FROM (SELECT 0.0 AS x) a "
+      "JOIN (SELECT k FROM audit_nsd) b ON a.x IS NOT DISTINCT FROM b.k");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{2}));
 }
 
 }  // namespace tinylamb

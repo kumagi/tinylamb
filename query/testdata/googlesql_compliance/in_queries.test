@@ -798,7 +798,7 @@ SELECT x FROM Test WHERE date_col IN ('2015-01-30');
 --
 ARRAY<STRUCT<x INT64>>[{1}]
 ==
-[name=in_clause_timestmap_type]
+[name=timestamp]
 SELECT x FROM Test WHERE timestamp_col IN ('2015-01-29 10:47:20');
 --
 ARRAY<STRUCT<x INT64>>[{1}]
@@ -886,7 +886,7 @@ ARRAY<STRUCT<x INT64, STRING>>[known order:
   {3, "excluded"}
 ]
 ==
-[name=in_clause_case_statment]
+[name=in_clause_case_statement]
 SELECT x, CASE WHEN x IN (1, 2) THEN "value1or2"
                WHEN x IN (3) THEN "value3"
           END FROM Test ORDER BY x;

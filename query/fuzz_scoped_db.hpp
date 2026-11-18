@@ -106,10 +106,28 @@ class ScopedDb {
     }
     db_.reset();
     StatusOr<std::unique_ptr<Database>> reopened = Database::Create(name_);
+    last_reopen_status_ = reopened.GetStatus();
     if (!reopened.HasValue()) {
       // Recovery diagnostics: a silent false here turns long fuzz sweeps
       // into "replay crash reopen failed" mysteries.
       LOG(ERROR) << "ScopedDb::CrashAndReopen: reopen failed: "
+                 << ToString(reopened.GetStatus());
+      return false;
+    }
+    db_ = reopened.MoveValue();
+    return true;
+  }
+
+  // Clean shutdown + reopen: the Database destructor runs its normal
+  // shutdown path (final checkpoint / compacted block file / WAL close), and
+  // the reopen must see exactly the committed state.  Callers must have
+  // ended every transaction first.
+  bool CloseAndReopen() {
+    db_.reset();
+    StatusOr<std::unique_ptr<Database>> reopened = Database::Create(name_);
+    last_reopen_status_ = reopened.GetStatus();
+    if (!reopened.HasValue()) {
+      LOG(ERROR) << "ScopedDb::CloseAndReopen: reopen failed: "
                  << ToString(reopened.GetStatus());
       return false;
     }
@@ -122,6 +140,10 @@ class ScopedDb {
   [[nodiscard]] Database* get() const { return db_.get(); }
   [[nodiscard]] explicit operator bool() const { return db_ != nullptr; }
   [[nodiscard]] const std::string& name() const { return name_; }
+  // Status of the latest CrashAndReopen / CloseAndReopen (why it failed).
+  [[nodiscard]] const Status& last_reopen_status() const {
+    return last_reopen_status_;
+  }
 
  private:
   static std::string ResolveDbName(std::string_view prefix) {
@@ -139,6 +161,7 @@ class ScopedDb {
 
   std::string name_;
   std::unique_ptr<Database> db_;
+  Status last_reopen_status_{Status::kSuccess};
 };
 
 // Fuzzers carry index specs as their own slot-based pseudo-DDL

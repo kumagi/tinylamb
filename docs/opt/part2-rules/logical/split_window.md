@@ -92,4 +92,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.SplitWindowSeparatesPartitionSpecs`: `PARTITION BY p` の `SUM(x)` と `PARTITION BY q` の `SUM(y)` を持つ単一 Window ノードから、出力 1 個ずつの Window が 2 段積みに分割された論理式が生成されることを検証します。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.SplitWindowSeparatesPartitionSpecs`: `PARTITION BY p` の `SUM(x)` と `PARTITION BY q` の `SUM(y)` を持つ単一 Window ノードから、出力 1 個ずつの Window が 2 段積みに分割された論理式が生成されることを検証します。

@@ -651,7 +651,7 @@ SELECT TIMESTAMP '2014-11-12 16:02:20 UTC' > TIMESTAMP '2014-11-12 10:03:20 UTC'
 --
 ARRAY<STRUCT<BOOL>>[{true}]
 ==
-# Seahawks scored first points in Superbowl XLVIII 12 seconds after it started
+# Seahawks scored first points in Super Bowl XLVIII 12 seconds after it started
 [name=timestamp_greater_false]
 SELECT TIMESTAMP '2014-02-02 18:30:00 America/New_York' > TIMESTAMP '2014-02-02 18:30:12 America/New_York'
 --

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +16,7 @@
 #include "expression/constant_value.hpp"
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
+#include "expression/unary_expression.hpp"
 #include "type/column.hpp"
 #include "type/column_name.hpp"
 #include "type/row.hpp"
@@ -72,6 +74,83 @@ TEST(FlatIntSetAuditTest, RejectsOutOfRangeDenseWrites) {
   EXPECT_FALSE(set.Contains(INT64_MIN));
   set.Reserve(4);
   EXPECT_FALSE(set.DenseOverflowed());
+}
+
+TEST(FlatIntSetAuditTest, BufferedDenseWritersKeepOverlapsAndPartialWords) {
+  constexpr int64_t span = 300;
+  for (int64_t base : {INT64_MIN, int64_t{-130}, INT64_MAX - span}) {
+    FlatIntSet set;
+    ASSERT_TRUE(set.TryReserveDense(base, base + span));
+    {
+      std::vector<std::jthread> workers;
+      workers.reserve(3);
+for (int64_t worker = 0; worker < 3; ++worker) {
+        workers.emplace_back([&, worker] {
+          FlatIntSet::DenseWriter writer(set);
+          for (int64_t n = 0; n <= span; ++n) {
+            const int64_t i = worker == 1 ? span - n : n;
+            if (i % 5 >= 3) { continue;
+}
+            if (worker == 2) {
+              set.InsertDenseAtomic(base + i);
+            } else {
+              writer.Insert(base + i);
+              writer.Insert(base + i);
+            }
+          }
+        });
+      }
+    }
+    set.FinalizeDenseBounds();
+    EXPECT_FALSE(set.DenseOverflowed());
+    size_t expected = 0;
+    for (int64_t i = 0; i <= span; ++i) {
+      EXPECT_EQ(set.Contains(base + i), i % 5 < 3);
+      expected += static_cast<size_t>(i % 5 < 3);
+    }
+    EXPECT_EQ(set.Size(), expected);
+    {
+      FlatIntSet::DenseWriter writer(set);
+      writer.Insert(base == INT64_MIN ? INT64_MAX : INT64_MIN);
+    }
+    EXPECT_TRUE(set.DenseOverflowed());
+  }
+}
+
+TEST(FlatIntSetAuditTest, WideDenseMembershipKeepsHolesAndSignedEndpoints) {
+  constexpr int64_t span = 60000000;
+  for (const int64_t base : {INT64_MIN, int64_t{-30000000}, INT64_MAX - span}) {
+    FlatIntSet set;
+    ASSERT_TRUE(set.TryReserveDense(base, base + span));
+    ASSERT_TRUE(set.IsDenseMode());
+    {
+      std::vector<std::jthread> workers;
+      workers.reserve(3);
+for (int64_t w = 0; w < 3; ++w) {
+        workers.emplace_back([&, w] {
+          for (int64_t i = w; i <= span / 1000; i += 3) {
+            set.InsertDenseAtomic(base + (i * 1000));
+            set.InsertDenseAtomic(base + (i * 1000));
+          }
+        });
+      }
+    }
+    set.FinalizeDenseBounds();
+    EXPECT_FALSE(set.DenseOverflowed());
+    EXPECT_EQ(set.Size(), span / 1000 + 1);
+    for (int64_t i = 0; i <= span / 1000; ++i) {
+      EXPECT_TRUE(set.Contains(base + i * 1000));
+      if (i != span / 1000) { EXPECT_FALSE(set.Contains(base + i * 1000 + 1));
+}
+    }
+    if (base > INT64_MIN) { EXPECT_FALSE(set.Contains(base - 1));
+}
+    if (base + span < INT64_MAX) { EXPECT_FALSE(set.Contains(base + span + 1));
+}
+  }
+  FlatIntSet too_wide;
+  EXPECT_FALSE(too_wide.TryReserveDense(INT64_MIN, INT64_MAX));
+  EXPECT_FALSE(too_wide.TryReserveDense(0, FlatIntSet::kMaxDenseSpan + 1));
 }
 
 TEST(ScanFilterTest, DateStringConstantsParseOnceWithoutChangingOtherDomains) {
@@ -498,6 +577,88 @@ TEST(ScanFilterTest, BuildIntegerPeeksRemapsProjectedColumns) {
   ASSERT_EQ(peeks.size(), 1U);
   EXPECT_EQ(peeks[0].column, 3U);
   EXPECT_EQ(peeks[0].constant, 500);
+}
+
+TEST(ScanFilterTest, ConstantInMembershipCompilesTenElementIntAndStringLists) {
+  const Schema schema = MakeTestSchema();
+
+  // >8 constant arithmetic INT64 items: compiles to PrebuiltMembershipPredicate
+  // via TryCompileConstantInMembership (and preserves NULL UNKNOWN semantics).
+  std::vector<Expression> int_items;
+  int_items.reserve(10);
+  for (int64_t i = 0; i < 10; ++i) {
+    int_items.push_back(BinaryExpressionExp(ConstantValueExp(Value(100)),
+                                            BinaryOperation::kAdd,
+                                            ConstantValueExp(Value(i))));
+  }
+  const Expression int_in =
+      InExpressionExp(ColumnValueExp(ColumnName("id")), std::move(int_items));
+  const CompiledScanFilter int_filter = CompileScanFilter({int_in}, schema);
+  ASSERT_TRUE(int_filter.residual.empty());
+  ASSERT_EQ(int_filter.prebuilt_membership.size(), 1U);
+  for (int64_t v = 98; v <= 112; ++v) {
+    EXPECT_EQ(
+        MatchPrebuiltMembership(Row({Value(v), Value(), Value(), Value()}),
+                                int_filter.prebuilt_membership[0]),
+        v >= 100 && v < 110);
+  }
+  EXPECT_FALSE(
+      MatchPrebuiltMembership(Row({Value(), Value(), Value(), Value()}),
+                              int_filter.prebuilt_membership[0]));
+
+  // >8 constant VarChar literals: compiles to PrebuiltMembershipPredicate
+  // string set.
+  std::vector<Expression> str_items;
+  str_items.reserve(10);
+  for (int i = 0; i < 10; ++i) {
+    str_items.push_back(ConstantValueExp(Value("k" + std::to_string(i))));
+  }
+  const Expression str_in =
+      InExpressionExp(ColumnValueExp(ColumnName("code")), std::move(str_items));
+  const CompiledScanFilter str_filter = CompileScanFilter({str_in}, schema);
+  ASSERT_TRUE(str_filter.residual.empty());
+  ASSERT_EQ(str_filter.prebuilt_membership.size(), 1U);
+  EXPECT_TRUE(
+      MatchPrebuiltMembership(Row({Value(), Value(), Value("k7"), Value()}),
+                              str_filter.prebuilt_membership[0]));
+  EXPECT_FALSE(
+      MatchPrebuiltMembership(Row({Value(), Value(), Value("k99"), Value()}),
+                              str_filter.prebuilt_membership[0]));
+  EXPECT_FALSE(
+      MatchPrebuiltMembership(Row({Value(), Value(), Value(), Value()}),
+                              str_filter.prebuilt_membership[0]));
+}
+
+TEST(ScanFilterTest, SingletonInUsesComparisonWithCanonicalNullSemantics) {
+  for (const Value& member : {Value(42), Value(42.5), Value("Electronics")}) {
+    const Schema schema("single", {Column("v", member.type)});
+    for (const bool negated : {false, true}) {
+      Expression predicate = InExpressionExp(ColumnValueExp(ColumnName("v")),
+                                             {ConstantValueExp(member)});
+      if (negated) {
+        predicate = UnaryExpressionExp(predicate, UnaryOperation::kNot);
+      }
+      const auto filter = CompileScanFilter({predicate}, schema);
+      ASSERT_TRUE(filter.residual.empty());
+      ASSERT_EQ(filter.simple.size(), 1U);
+      const Value other = member.type == ValueType::kVarChar  ? Value("Books")
+                          : member.type == ValueType::kDouble ? Value(7.5)
+                                                              : Value(7);
+      for (const Value& probe : {Value(), member, other}) {
+        const Row row({probe});
+        auto canonical = predicate->TryEvaluate(row, schema);
+        ASSERT_TRUE(canonical.HasValue());
+        EXPECT_EQ(MatchSimpleCompare(row, filter.simple.front()),
+                  !canonical.Value().IsNull() && canonical.Value().Truthy());
+      }
+    }
+    // A NULL member must retain UNKNOWN, including under NOT IN.
+    const auto null_filter =
+        CompileScanFilter({InExpressionExp(ColumnValueExp(ColumnName("v")),
+                                           {ConstantValueExp(Value())})},
+                          schema);
+    EXPECT_TRUE(null_filter.simple.empty());
+  }
 }
 
 }  // namespace

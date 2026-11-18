@@ -99,4 +99,4 @@ if (agg.GetType() == AggregationType::kCount) {
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.AggregateUnionTranspose`: `SUM` および `COUNT` を含む集約式が `UnionAll` の各枝へと正しく分配され、最終集約の `COUNT` が `SUM` に変換された等価式が生成されることの検証。
+- `plan/cascades_test_part2.cpp` の `CascadesTest.AggregateUnionTranspose`: `SUM` および `COUNT` を含む集約式が `UnionAll` の各枝へと正しく分配され、最終集約の `COUNT` が `SUM` に変換された等価式が生成されることの検証。

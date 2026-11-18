@@ -68,9 +68,6 @@ namespace tinylamb {
 namespace {
 
 constexpr size_t kRows = 400;
-// The filter the multi-index cases share: a range on `part` (served by
-// IdxPart) AND a range on `qty` (served by IdxQty).  Neither index covers the
-// projected `region` on its own, so the pair has to.
 constexpr int64_t kPartLo = 40;
 constexpr int64_t kPartHi = 320;
 constexpr int64_t kQtyLo = 30;

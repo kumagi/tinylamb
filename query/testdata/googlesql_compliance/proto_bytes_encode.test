@@ -1,0 +1,64 @@
+[load_proto_files=googlesql/testdata/test_schema.proto]
+[load_proto_names=googlesql_test.KitchenSinkPB,googlesql_test.KitchenSinkEnumPB,googlesql_test.Proto3KitchenSink,googlesql_test.TestExtraPB]
+
+# message -> BYTES wire encoding (tracker #762): field markers are sniffed on
+# entry boundaries (a "value:" probe no longer matches inside "str_value:"),
+# KitchenSinkPB carries a double_val fixed64 arm, TestExtraPB and bare
+# required_test_enum payloads route to their own encoders, and enum member
+# names resolve to their registered ordinal instead of silently folding to 0.
+
+[name=str_value_is_no_nullable_int]
+SELECT TO_HEX(CAST('str_value: "x" int32_val1: 7' AS BYTES)) AS hex_bytes
+--
+ARRAY<STRING>["1a01780807"]
+==
+
+[name=required_enum_without_numeric_form]
+SELECT TO_HEX(CAST('required_test_enum: TESTENUM1' AS BYTES)) AS hex_bytes
+--
+ARRAY<STRING>["0801"]
+==
+
+[name=kitchen_sink_double_val_survives]
+SELECT TO_HEX(CAST('int64_key_1: 5 double_val: 2.5' AS BYTES)) AS hex_bytes
+--
+ARRAY<STRING>["0805490000000000000440"]
+==
+
+[name=proto3_enum_name_keeps_ordinal]
+SELECT TO_HEX(CAST('test_enum: ENUM1' AS BYTES)) AS hex_bytes
+--
+ARRAY<STRING>["900301"]
+==
+
+[name=bytes_round_trip_preserves_double]
+SELECT CAST(FROM_HEX(TO_HEX(CAST('int64_key_1: 5 double_val: 2.5' AS BYTES)))
+            AS googlesql_test.KitchenSinkPB) AS msg
+--
+ARRAY<PROTO<googlesql_test.KitchenSinkPB>>[{int64_key_1: 5 double_val: 2.500000 }]
+==
+
+[name=bytes_round_trip_preserves_required_enum]
+SELECT CAST(FROM_HEX(TO_HEX(CAST('required_test_enum: TESTENUM1' AS BYTES)))
+            AS googlesql_test.KitchenSinkEnumPB) AS msg
+--
+ARRAY<PROTO<googlesql_test.KitchenSinkEnumPB>>[{required_test_enum: TESTENUM1 }]
+==
+
+[name=bytes_round_trip_preserves_proto3_enum_name]
+SELECT CAST(FROM_HEX('900301') AS googlesql_test.Proto3KitchenSink) AS msg
+--
+ARRAY<PROTO<googlesql_test.Proto3KitchenSink>>[{test_enum: 1 }]
+==
+
+[name=nullable_int_still_encodes]
+SELECT TO_HEX(CAST('value: 5' AS BYTES)) AS hex_bytes
+--
+ARRAY<STRING>["0805"]
+==
+
+[name=unparseable_scalar_is_an_error]
+SELECT TO_HEX(CAST('int64_key_1: bogus' AS BYTES)) AS hex_bytes
+--
+ERROR: InvalidArgument: cannot encode proto scalar: bogus
+==

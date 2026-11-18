@@ -99,10 +99,10 @@ class LogStream {
 
   template <size_t N>
   LogStream& operator<<(const std::array<char, N>& rhs) {
-    // Route through string_view: streaming the raw array pointer makes the
-    // ostream's internal length computation emit a sign-conversion warning
-    // in strict builds.
-    message_ << std::string_view(rhs.data());
+    // Route through string_view with the explicit array extent: streaming the
+    // raw array pointer would make the ostream call strlen(), reading past the
+    // array when it is not NUL-terminated and truncating embedded NUL bytes.
+    message_ << std::string_view(rhs.data(), N);
     return *this;
   }
 

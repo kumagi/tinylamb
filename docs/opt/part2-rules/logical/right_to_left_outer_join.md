@@ -117,7 +117,7 @@ LEFT 形に揃えることで:
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.RightToLeftOuterJoinRewrite` —
+- `plan/cascades_test_part2.cpp` の `CascadesTest.RightToLeftOuterJoinRewrite` —
   `join_type = 1` の outer join を探索すると、子が `{right, left}` の順に
   入れ替わり `join_type == 0` になった代替が同じ Group に現れることを
   検証します。テストは子の順序まで検査しており、述語は元の式のものを

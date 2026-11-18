@@ -61,7 +61,7 @@ class Transaction;
 // to a prefix point lookup when it is std::nullopt.  Anything the seek cannot
 // decide -- a NULL, NaN or cross-typed bound, a UINT64-tagged INT64 that
 // encodes into a different key space, a value whose type is outside the range
-// whitelist -- falls back per row to the wider prefix scan; the re-check then
+// allowlist -- falls back per row to the wider prefix scan; the re-check then
 // rejects it, so the fallback only costs a wider scan, never a wrong row.
 class LookupJoin : public ExecutorBase {
  public:

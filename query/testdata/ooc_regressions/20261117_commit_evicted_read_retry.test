@@ -1,0 +1,13 @@
+-- sql_ooc_fuzzer regression
+-- seed: 529
+-- profile: pool=65536 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: post-crash count(t#) mismatch :: op 8 `crash`: post-crash count(t1) mismatch: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t1 |   expected 1 rows, engine returned 1 |   row 0: expected [109|5995|57207|99|147410] got [108|5966|56277|98|145765]
+create t0 1 122 1982 7 11 0
+create t1 44 190 2395
+index t1 ix0 gv
+ins_bulk t0 1 336 581
+ins_bulk t1 1 109 553
+inject io 34
+commit
+checkpoint
+crash

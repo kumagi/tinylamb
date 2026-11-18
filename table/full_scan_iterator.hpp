@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_set>
 #include <vector>
 
@@ -32,6 +33,7 @@
 
 namespace tinylamb {
 class Table;
+class TlcsFile;
 class Transaction;
 struct LSTablePageBlock;
 struct LSTableStore;
@@ -149,10 +151,12 @@ class FullScanIterator : public IteratorBase {
   FullScanIterator& operator=(const FullScanIterator&) = delete;
   FullScanIterator(FullScanIterator&&) = delete;
   FullScanIterator& operator=(FullScanIterator&&) = delete;
-  ~FullScanIterator() override = default;
+  ~FullScanIterator() override;
   bool operator==(const FullScanIterator& rhs) const {
     EnsureLSTableRowMaterialized();
     rhs.EnsureLSTableRowMaterialized();
+    EnsureStubRowMaterialized();
+    rhs.EnsureStubRowMaterialized();
     return table_ == rhs.table_ && txn_ == rhs.txn_ &&
            current_row_ == rhs.current_row_;
   }
@@ -228,8 +232,13 @@ class FullScanIterator : public IteratorBase {
   // corrupt image never escapes as a C++ exception across a StatusOr
   // boundary.
   struct PeekOutcome {
-    enum class Kind : uint8_t { kValue, kNull, kFallback, kError } kind;
-    int64_t value;
+    enum class Kind : uint8_t {
+      kValue,
+      kNull,
+      kFallback,
+      kError
+    } kind{Kind::kNull};
+    int64_t value{0};
     Status status{Status::kSuccess};
   };
   [[nodiscard]] static PeekOutcome PeekIntegerPlanned(const PlannedPeek& peek,
@@ -251,6 +260,21 @@ class FullScanIterator : public IteratorBase {
   void EnsureLSTableRowMaterialized() const;
   size_t DecodeNextTypedBatchFromLSTable(TypedCellBatch* batch,
                                          size_t max_rows);
+  [[nodiscard]] const std::shared_ptr<const TlcsFile>& EnsureBackingTlcs()
+      const;
+  void ClearStubBlockState();
+  [[nodiscard]] bool TryEnterStubPage();
+  [[nodiscard]] bool AdvanceFromStubPage();
+  [[nodiscard]] bool StubBlockAllRowsMatch(const TlcsFile& tlcs,
+                                           uint32_t block_idx) const noexcept;
+  void GatherStubFilterCols(bool include_keep_cols,
+                            std::vector<slot_t>* out) const;
+  [[nodiscard]] bool EnsureStubBlockColumns(
+      uint32_t block_idx, page_id_t pid, std::span<const slot_t> columns) const;
+  [[nodiscard]] bool StubRowMatches(uint32_t row) const noexcept;
+  void EnsureStubRowMaterialized() const;
+  size_t DecodeStubBlockBatch(TypedCellBatch* batch, size_t count_offset,
+                              size_t max_rows);
   // Builds the projected-schema decode plan used by DecodeNextTypedBatch;
   // empty (typed decoding refused) for schemas carrying unsupported types.
   void BuildTypedDecodePlan();
@@ -320,7 +344,19 @@ class FullScanIterator : public IteratorBase {
   size_t typed_prefix_kept_{0};
   bool typed_prefix_all_kept_{false};
   bool typed_prefix_identity_{false};
-  Status status_{Status::kSuccess};
+  struct StubBlockCache;
+  mutable std::shared_ptr<const TlcsFile> backing_tlcs_;
+  mutable bool backing_tlcs_checked_{false};
+  uint32_t stub_block_idx_{UINT32_MAX};
+  page_id_t stub_current_pid_{0};
+  page_id_t stub_next_page_id_{0};
+  uint32_t stub_block_row_count_{0};
+  mutable bool stub_row_materialized_{true};
+  mutable std::unique_ptr<StubBlockCache> stub_cache_;
+  page_id_t stub_decoded_pid_{0};
+  std::shared_ptr<const std::vector<std::string>> stub_decoded_rows_;
+  uint64_t advance_steps_{0};
+  mutable Status status_{Status::kSuccess};
 };
 
 }  // namespace tinylamb

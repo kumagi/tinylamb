@@ -86,7 +86,8 @@ TEST(FusedGroupedJoinTest, FlatJoinBucketsChainsDuplicatesAndCollisions) {
   const Row row_c({Value(2), Value("b1")});
 
   EXPECT_TRUE(buckets.emplace(10, &row_a));   // First occurrence returns true
-  EXPECT_FALSE(buckets.emplace(10, &row_b));  // Duplicate returns false
+  // Duplicate key returns false but is still chained (see equal_range below).
+  EXPECT_FALSE(buckets.emplace(10, &row_b));
   EXPECT_TRUE(buckets.emplace(20, &row_c));
 
   buckets.PrefetchBucket(10);

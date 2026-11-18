@@ -91,4 +91,4 @@ if (cross) {
 
 ## 検証テスト
 
-- `plan/optimizer_test.cpp` の `OptimizerTest.UnqualifiedJoinBecomesExplicitCrossJoin`: ON 句を持たない結合が直積として解釈され、正しく計画されることを検証。
+- `plan/optimizer_test_part1.cpp` の `OptimizerTest.UnqualifiedJoinBecomesExplicitCrossJoin`: ON 句を持たない結合が直積として解釈され、正しく計画されることを検証。

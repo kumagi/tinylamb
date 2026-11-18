@@ -1,0 +1,8 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1198
+-- profile: pool=65536 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: sweep io / budget-invariance mismatch [groupby+distinct+stringagg+orderby] (same query, different memory knobs) :: op 3 `sweep io 77 :: q ord=0 heavy=1 take=-1 nv=2 vs=285445208 ex=0 snap=0 :: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XOR(FARM_FINGERPRINT(s)) FR...(519B)`: sweep io `q ord=0 heavy=1 take=-1 nv=2 vs=285445208 ex=0 snap=0 :: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XO...(504B)` with failure #1: budget-invariance mismatch [groupby+distinct+stringagg+orderby] (same query, different memory knobs): SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1
+create t1 8 206 361 1000 3 0
+ins_bulk t1 1 102 69
+ins_bulk t1 103 266 610
+sweep io 77 :: q ord=0 heavy=1 take=-1 nv=2 vs=285445208 ex=0 snap=0 :: SELECT COUNT(*), SUM(MOD(FARM_FINGERPRINT(s), 1000003)), BIT_XOR(FARM_FINGERPRINT(s)) FROM (SELECT CONCAT(IFNULL(CAST(c1 AS STRING), '~'), '|', IFNULL(CAST(c2 AS STRING), '~'), '|', IFNULL(CAST(c3 AS STRING), '~'), '|', IFNULL(c4, '~'), '|', IFNULL(CAST(c5 AS STRING), '~'), '|') AS s FROM (SELECT MOD(k, 240) AS c1, SUM(DISTINCT v) AS c2, LOGICAL_OR(v > 310) AS c3, MAX(pad) AS c4, LENGTH(STRING_AGG(t, ',' ORDER BY k)) AS c5 FROM t1 GROUP BY 1))

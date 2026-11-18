@@ -142,16 +142,22 @@ void SpillStore::MaybeTruncateWhenEmptyLocked() noexcept {
   if (active_blocks_ != 0 || fd_ < 0) {
     return;
   }
+  if (platform::Truncate(fd_, 0) != 0) {
+    return;  // keep the stale byte accounting; the file is still non-empty
+  }
   free_blocks_.clear();
   next_block_index_ = 0;
   physical_file_bytes_ = 0;
-  (void)platform::Truncate(fd_, 0);
 }
 
 StatusOr<SpillSegmentId> SpillStore::AllocateSegment() {
   std::scoped_lock lk(mu_);
   const SpillSegmentId id = next_segment_id_++;
-  segments_.emplace(id, SegmentState{});
+  const auto [it, inserted] = segments_.emplace(id, SegmentState{});
+  if (!inserted) {
+    // The id is still live; never hand an existing segment to a new owner.
+    return StatusError(StatusCode::kCorrupt, "spill segment id already in use");
+  }
   ++segments_created_;
   return id;
 }
@@ -186,7 +192,10 @@ Status SpillStore::Append(SpillSegmentId id, const void* data, size_t len) {
   }
   if (len == 0) {
     std::scoped_lock lk(mu_);
-    if (!segments_.contains(id)) {
+    auto it = segments_.find(id);
+    // Match the zero-length Read path: a segment scheduled for drop is no
+    // longer writable, even for a zero-byte append.
+    if (it == segments_.end() || it->second.pending_drop) {
       return StatusError(StatusCode::kNotExists, "spill segment not found");
     }
     return Status::kSuccess;
@@ -440,7 +449,7 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
       rem -= take;
     }
     // Pin the segment's blocks against DropSegment/Clear block reuse and
-    // file truncation while the plan is preaded outside mu_.
+    // file truncation while PreadAll runs outside mu_.
     ++seg.active_reads;
   }
 
@@ -461,7 +470,7 @@ Status SpillStore::Read(SpillSegmentId id, uint64_t offset, void* dst,
     // unpin, finishing a pending drop, freeing blocks, truncating the file)
     // is a real internal mutation; it is serialized under mu_ like every
     // other segment-state write.
-    SpillStore& self = const_cast<SpillStore&>(*this);
+    auto& self = const_cast<SpillStore&>(*this);
     auto it = self.segments_.find(id);
     if (it != self.segments_.end()) {
       SegmentState& seg = it->second;
@@ -490,7 +499,7 @@ void SpillStore::ReleaseSegmentPageCache(SpillSegmentId id,
   int fd = -1;
   // The newly completed blocks are almost always a single block (one 64 KiB
   // boundary per refill); keep that case allocation- and lock-time free.
-  std::array<uint32_t, 64> stack_blocks;
+  std::array<uint32_t, 64> stack_blocks{};
   std::vector<uint32_t> heap_blocks;
   uint32_t count = 0;
   const uint32_t* pending_blocks = nullptr;
@@ -644,14 +653,14 @@ Status SpillSegmentWriter::EnsureOpen() {
 }
 
 Status SpillSegmentWriter::Write(const void* data, size_t len) {
-  if (len == 0) {
-    return Status::kSuccess;
-  }
   if (finished_) {
     return StatusError(StatusCode::kInvalidArgument,
                        "write to finished SpillSegmentWriter");
   }
   RETURN_IF_FAIL(EnsureOpen());
+  if (len == 0) {
+    return Status::kSuccess;
+  }
 
   if (buffer_capacity_ == 0) {
     RETURN_IF_FAIL(store_->Append(id_, data, len));
@@ -758,9 +767,7 @@ Status SpillSegmentReader::Seek(uint64_t offset) {
     buf_start_ = offset;
     const uint64_t block_boundary =
         (offset / SpillStore::kBlockSize) * SpillStore::kBlockSize;
-    if (block_boundary < last_advised_offset_) {
-      last_advised_offset_ = block_boundary;
-    }
+    last_advised_offset_ = std::min(block_boundary, last_advised_offset_);
   }
   return Status::kSuccess;
 }
@@ -797,7 +804,7 @@ Status SpillSegmentReader::ReadExact(void* dst, size_t len) {
   }
   RETURN_IF_FAIL(Open());
   if (len > total_size_ - cursor_) {
-    return StatusError(StatusCode::kCorrupt,
+    return StatusError(StatusCode::kInvalidArgument,
                        "SpillSegmentReader::ReadExact past EOF");
   }
   auto* out = static_cast<uint8_t*>(dst);

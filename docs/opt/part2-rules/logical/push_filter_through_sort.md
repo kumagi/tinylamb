@@ -136,6 +136,6 @@ Memo 上では、`filter-before-sort:` タグの派生グループに `Selection
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` を含むテストファイルに、この Rule
+- `plan/cascades_test_part*.cpp` を含むテストファイルに、この Rule
   (`push_filter_through_sort`)に対応する個別テストは確認できませんでした。
   `filter-before-sort:` タグへの言及もテスト内にはありません。

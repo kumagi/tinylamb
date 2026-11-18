@@ -137,7 +137,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の
+- `plan/cascades_test_part1.cpp` の
   `CascadesTest.PushLimitThroughProjectionAddsLimitBelow` — `Limit(5)` の下の
   射影の下に `count=5` の Limit が現れることを検証します。
 - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms` が

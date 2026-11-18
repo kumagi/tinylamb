@@ -63,7 +63,7 @@ PaxChunk BuildStrForced(const Schema& sc, const StrCase& c, bool* ok) {
   const int first = slot >= 0 ? slot : 0;
   for (int s = first; std::cmp_less(s, c.nshapes); ++s) {
     PaxChunk chunk;
-    if (TryShape(sc, c, c.shapes[s], &chunk)) {
+    if (TryShape(sc, c, c.shapes[static_cast<size_t>(s)], &chunk)) {
       slot = s;
       *ok = true;
       return chunk;

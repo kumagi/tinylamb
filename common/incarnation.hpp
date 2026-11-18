@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "common/constants.hpp"
+#include "common/memory_budget.hpp"
 
 namespace tinylamb {
 
@@ -41,6 +42,46 @@ class TableIncarnation {
   enum class State : uint8_t { kLive, kDropPending, kRetired };
 
   static constexpr uint64_t kLayoutGenerationStride = 1ULL << 32;
+
+  TableIncarnation() {
+    std::weak_ptr<ColumnarCacheState> weak = columnar_cache_;
+    reclaim_hook_ = ScopedReclaimHook(
+        ReclaimStage::kColumnar,
+        [weak = std::move(weak)](size_t /*target*/) {
+          auto state = weak.lock();
+          if (!state) {
+            return size_t{0};
+          }
+          std::shared_ptr<const void> old_full;
+          std::shared_ptr<const void> old_proj;
+          {
+            std::unique_lock<std::mutex> lk(state->mu, std::try_to_lock);
+            if (!lk.owns_lock()) {
+              return size_t{0};
+            }
+            // A pinned store cannot release bytes. Keep its cache entry so
+            // later readers do not rebuild an identical live representation.
+            if (state->lstable_store.use_count() == 1) {
+              old_full = std::move(state->lstable_store);
+            }
+            if (state->projected_lstable_store.use_count() == 1) {
+              old_proj = std::move(state->projected_lstable_store);
+            }
+          }
+          const size_t before = ProcessMemoryBudget::Global().ColumnarUsed();
+          old_full.reset();
+          old_proj.reset();
+          const size_t after = ProcessMemoryBudget::Global().ColumnarUsed();
+          return before > after ? before - after : size_t{0};
+        },
+        columnar_cache_->recency);
+  }
+
+  ~TableIncarnation() { reclaim_hook_.Reset(); }
+  TableIncarnation(const TableIncarnation&) = delete;
+  TableIncarnation& operator=(const TableIncarnation&) = delete;
+  TableIncarnation(TableIncarnation&&) = delete;
+  TableIncarnation& operator=(TableIncarnation&&) = delete;
 
   bool Acquire(txn_id_t owner) {
     std::scoped_lock lock(mutex_);
@@ -75,6 +116,14 @@ class TableIncarnation {
     }
   }
 
+  // True while no drop has begun on this incarnation.  The compiled-plan
+  // cache probes this (via Database::IsCurrentIncarnation) instead of
+  // paying a catalog read + full Table deserialization per replay.
+  [[nodiscard]] bool IsLive() const {
+    std::scoped_lock lock(mutex_);
+    return state_ == State::kLive;
+  }
+
   bool BeginDrop() {
     std::scoped_lock lock(mutex_);
     if (state_ != State::kLive) {
@@ -94,11 +143,39 @@ class TableIncarnation {
   }
 
   void CommitDrop() {
-    std::scoped_lock lock(mutex_);
-    if (state_ == State::kDropPending) {
-      state_ = State::kRetired;
+    bool retired = false;
+    {
+      std::scoped_lock lock(mutex_);
+      if (state_ == State::kDropPending) {
+        state_ = State::kRetired;
+      }
+      retired = state_ == State::kRetired;
+      quiescent_.notify_all();
     }
-    quiescent_.notify_all();
+    if (retired) {
+      DropColumnarCaches();
+    }
+  }
+
+  // Releases every columnar image this incarnation caches (full / projected
+  // LSTable stores and the backing TLCS file).  Called once nobody can scan
+  // the incarnation any more: DROP TABLE committed, or the owning Database is
+  // closing.  Compiled plans keep Table copies -- and so this object -- alive
+  // until the process-wide plan cache evicts them; before this, a closed
+  // database's columnar bytes stayed charged to the columnar pool (and an
+  // unlinked .tlcs mapping stayed open) for that whole time
+  // (sql_ooc_fuzzer: "memory pool accounting drifted across the session").
+  // Scans already holding a store keep their own reference.
+  void DropColumnarCaches() {
+    std::shared_ptr<const void> old_full;
+    std::shared_ptr<const void> old_proj;
+    std::shared_ptr<const void> old_tlcs;
+    {
+      std::scoped_lock lock(columnar_cache_->mu);
+      old_full = std::move(columnar_cache_->lstable_store);
+      old_proj = std::move(columnar_cache_->projected_lstable_store);
+      old_tlcs = std::move(backing_tlcs_store_);
+    }
   }
 
   void AbortDrop() {
@@ -131,21 +208,37 @@ class TableIncarnation {
   }
 
   [[nodiscard]] std::shared_ptr<const void> GetLSTableStoreRaw() const {
-    std::scoped_lock lock(lstable_mutex_);
-    return lstable_store_;
+    std::scoped_lock lock(columnar_cache_->mu);
+    if (columnar_cache_->lstable_store) {
+      TouchColumnarCache();
+    }
+    return columnar_cache_->lstable_store;
   }
   void SetLSTableStoreRaw(std::shared_ptr<const void> store) {
-    std::scoped_lock lock(lstable_mutex_);
-    lstable_store_ = std::move(store);
+    std::shared_ptr<const void> old;
+    {
+      std::scoped_lock lock(columnar_cache_->mu);
+      old = std::move(columnar_cache_->lstable_store);
+      columnar_cache_->lstable_store = std::move(store);
+      TouchColumnarCache();
+    }
   }
   [[nodiscard]] std::shared_ptr<const void> GetProjectedLSTableStoreRaw()
       const {
-    std::scoped_lock lock(lstable_mutex_);
-    return projected_lstable_store_;
+    std::scoped_lock lock(columnar_cache_->mu);
+    if (columnar_cache_->projected_lstable_store) {
+      TouchColumnarCache();
+    }
+    return columnar_cache_->projected_lstable_store;
   }
   void SetProjectedLSTableStoreRaw(std::shared_ptr<const void> store) {
-    std::scoped_lock lock(lstable_mutex_);
-    projected_lstable_store_ = std::move(store);
+    std::shared_ptr<const void> old;
+    {
+      std::scoped_lock lock(columnar_cache_->mu);
+      old = std::move(columnar_cache_->projected_lstable_store);
+      columnar_cache_->projected_lstable_store = std::move(store);
+      TouchColumnarCache();
+    }
   }
   [[nodiscard]] uint64_t LSTableCapacityRejectedGeneration() const {
     return lstable_capacity_rejected_generation_.load(
@@ -156,30 +249,44 @@ class TableIncarnation {
                                                 std::memory_order_release);
   }
   [[nodiscard]] std::shared_ptr<const void> GetBackingTLCSStoreRaw() const {
-    std::scoped_lock lock(lstable_mutex_);
+    std::scoped_lock lock(columnar_cache_->mu);
     return backing_tlcs_store_;
   }
   void SetBackingTLCSStoreRaw(std::shared_ptr<const void> store) {
-    std::scoped_lock lock(lstable_mutex_);
+    std::scoped_lock lock(columnar_cache_->mu);
     backing_tlcs_store_ = std::move(store);
   }
 
  private:
+  void TouchColumnarCache() const noexcept {
+    static std::atomic<uint64_t> clock{1};
+    columnar_cache_->recency->store(
+        clock.fetch_add(1, std::memory_order_relaxed),
+        std::memory_order_relaxed);
+  }
+
+  struct ColumnarCacheState {
+    ReclaimRecency recency{std::make_shared<std::atomic<uint64_t>>(0)};
+    mutable std::mutex mu;
+    std::shared_ptr<const void> lstable_store;
+    std::shared_ptr<const void> projected_lstable_store;
+  };
+
   static uint64_t NextLayoutGenerationSeed() noexcept {
     static std::atomic<uint64_t> seed{1};
     return seed.fetch_add(kLayoutGenerationStride, std::memory_order_acq_rel);
   }
 
   mutable std::mutex mutex_;
-  mutable std::mutex lstable_mutex_;
   std::condition_variable quiescent_;
   State state_{State::kLive};
   size_t active_leases_{0};
   std::unordered_map<txn_id_t, size_t> owner_leases_;
   std::atomic<uint64_t> layout_generation_{NextLayoutGenerationSeed()};
   std::atomic<bool> rows_rewritten_in_place_{false};
-  std::shared_ptr<const void> lstable_store_;
-  std::shared_ptr<const void> projected_lstable_store_;
+  std::shared_ptr<ColumnarCacheState> columnar_cache_{
+      std::make_shared<ColumnarCacheState>()};
+  ScopedReclaimHook reclaim_hook_;
   std::atomic<uint64_t> lstable_capacity_rejected_generation_{0};
   std::shared_ptr<const void> backing_tlcs_store_;
 };

@@ -31,6 +31,9 @@ struct Reader {
   }
 };
 Status Rewind(std::FILE* file) {
+  if (file == nullptr) {
+    return StatusError(StatusCode::kIOError, "distinct run rewind failed");
+  }
   if (std::fflush(file) != 0 || std::fseek(file, 0, SEEK_SET) != 0) {
     return StatusError(StatusCode::kIOError, "distinct run rewind failed");
   }
@@ -54,8 +57,12 @@ Status SortedDistinctRuns::Add(std::span<const uint64_t> sorted) try {
   return StatusError(StatusCode::kRuntimeError, "distinct run failed");
 }
 
-StatusOr<SortedDistinctRuns::Run> SortedDistinctRuns::Merge(Run left,
-                                                            Run right) {
+StatusOr<SortedDistinctRuns::Run> SortedDistinctRuns::Merge(const Run& left,
+                                                            const Run& right) {
+  if (fail_next_merge_for_test_) {
+    fail_next_merge_for_test_ = false;
+    return StatusError(StatusCode::kIOError, "injected distinct merge failure");
+  }
   RETURN_IF_FAIL(Rewind(left.file.get()));
   RETURN_IF_FAIL(Rewind(right.file.get()));
   Run output{.file = File(std::tmpfile())};
@@ -102,7 +109,7 @@ Status SortedDistinctRuns::Insert(Run run, size_t level) {
     if (!existing) {
       break;
     }
-    ASSIGN_OR_RETURN(Run, merged, Merge(std::move(run), std::move(*existing)));
+    ASSIGN_OR_RETURN(Run, merged, Merge(run, *existing));
     existing.reset();
     run = std::move(merged);
     ++level;
@@ -139,7 +146,7 @@ Status SortedDistinctRuns::ForEach(
     if (!final) {
       final = std::move(run);
     } else {
-      ASSIGN_OR_RETURN(Run, merged, Merge(std::move(*final), std::move(*run)));
+      ASSIGN_OR_RETURN(Run, merged, Merge(*final, *run));
       final = std::move(merged);
     }
   }

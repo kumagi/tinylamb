@@ -109,12 +109,16 @@ void SkipList::ConstIterator::Next() {
 }
 
 std::string_view SkipList::ConstIterator::Key() const {
-  assert(node != nullptr && "Key() on invalid iterator");
+  if (node == nullptr) {
+    throw std::invalid_argument("Key() on invalid iterator");
+  }
   return static_cast<const Node*>(node)->Key();
 }
 
 const RowEntry& SkipList::ConstIterator::Entry() const {
-  assert(node != nullptr && "Entry() on invalid iterator");
+  if (node == nullptr) {
+    throw std::invalid_argument("Entry() on invalid iterator");
+  }
   return static_cast<const Node*>(node)->entry;
 }
 
@@ -137,13 +141,14 @@ void SkipList::InitHead() {
   h->tail9 = 0;
   for (int i = 0; i < kMaxLevel; ++i) {
     h->next(i) = nullptr;
-    tail_[i] = h;
+    tail_[static_cast<size_t>(i)] = h;
   }
   head_ = h;
 }
 
 int SkipList::PickHeight() {
-  // Geometric distribution with p = 1/4 (RocksDB-style): expected tower
+  // Approximate geometric-style height from consecutive LCG bit groups
+  // (the low bits are short-period; this is not an i.i.d. geometric draw):
   // height ~1.33 keeps level-0 traversal cache-friendly.
   uint32_t r = rng_;
   rng_ = (rng_ * 1664525U) + 1013904223U;
@@ -229,10 +234,10 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
       const int height = PickHeight();
       Node* n = NewNode(key, std::move(entry), height);
       for (int level = 0; level < height; ++level) {
-        Node* const previous = tail_[level];
+        Node* const previous = tail_[static_cast<size_t>(level)];
         n->next(level) = previous->next(level);
         previous->next(level) = n;
-        tail_[level] = n;
+        tail_[static_cast<size_t>(level)] = n;
       }
       max_height_ = std::max(height, max_height_);
       ++size_;
@@ -278,11 +283,12 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
   const int previous_max = max_height_;
   max_height_ = std::max(height, max_height_);
   for (int lvl = previous_max; lvl < height; ++lvl) {
-    update[lvl] = head_;
+    update[static_cast<size_t>(lvl)] = head_;
   }
   for (int lvl = 0; lvl < height; ++lvl) {
-    n->next(lvl) = update[lvl]->next(lvl);
-    update[lvl]->next(lvl) = n;
+    Node* const upd = update[static_cast<size_t>(lvl)];
+    n->next(lvl) = upd->next(lvl);
+    upd->next(lvl) = n;
     // tail_[lvl] must track the LAST node at every level. Leaving a stale
     // sentinel here (e.g. head, after this node extends past the old
     // max_height_) made the append fast path link its tower through head
@@ -293,7 +299,7 @@ bool SkipList::Upsert(std::string_view key, RowEntry&& entry) {
     // last node at that level (this also covers the empty-list insert,
     // where every update[lvl] is head).
     if (n->next(lvl) == nullptr) {
-      tail_[lvl] = n;
+      tail_[static_cast<size_t>(lvl)] = n;
     }
   }
   ++size_;

@@ -1,5 +1,68 @@
 # TPC-DS comparison
 
+## SF 1・クエリ順の2倍上限確認（2026-11-17）
+
+Q1→Q99の順に比較し、結果不一致・実行失敗・中央値がDuckDBの2倍を
+超えた時点で次のクエリを中断する `--max-ratio 2` で改善した。
+同じ最終バイナリによる2回の順方向実行で、99件すべて結果一致・2倍以下を確認。
+8スレッド、CPU 8–15、各クエリwarmup 1回＋測定7回の中央値。
+DuckDB 2.0.0、SF 1、DOUBLEを使用する既存の比較条件であり、コールドI/Oの測定ではない。
+
+| 実行 | 一致／上限内 | 最大 tinylamb / DuckDB | tinylamb中央値合計 | DuckDB中央値合計 |
+|---|---:|---:|---:|---:|
+| gate07 | 99 / 99 | 1.728（Q54） | 1,024.11 ms | 1,099.22 ms |
+| gate08 | 99 / 99 | 1.783（Q54） | 1,015.91 ms | 1,094.03 ms |
+
+列キャッシュを最近の利用順で回収し、使用中のキャッシュの重複再構築を抑制した。
+単一要素INの比較への変換、整数条件の重複辞書判定除去、NULLを含む密な
+ランタイムフィルタと少数キーの先行選択によりスキャンを短縮した。
+Q81で見つかった、列形式の結合集約におけるNULL／大きな整数キーの
+フォールバックと文字列辞書の参照寿命も修正した。
+
+[最終結果](../../build/benchmarks/tpcds-sf1-sequential-20261117/gate08/summary.json)・
+[クエリ別の時間](../../build/benchmarks/tpcds-sf1-sequential-20261117/gate08/latency.png)・
+[再測定結果](../../build/benchmarks/tpcds-sf1-sequential-20261117/gate07/summary.json)。
+各実行ディレクトリにバイナリ、ソース差分、入力ハッシュ、全サンプルと回答を保存した。
+関連CTest 351件、Python 9件、layering / OOC invariantsのチェックは通過。
+10分のOOCファズ（1,311セッション、157,604チェック）では21種類の失敗を検出した。
+全種類の代表ケースは作業前のバイナリでも失敗し、一部はハング等の別の失敗形態になった。
+この21種類は後続のOOC修正で解消し、元の全21トレースの再実行と、
+`query/testdata/ooc_regressions/20261117_*.test` の回帰テストで確認した。
+回帰テストは16シャードに分け、各CTestの60秒制限を維持している。
+保存済み40トレースと関連948テストが通過。追加ファズ760セッション・96,862チェックで
+新規失敗0件（無視した失敗0件）。[OOC修正の検証記録](../../build/quality/ooc-fixes-20261117/verification.json)。
+OOC修正後の性能再測定でQ28が2倍を超えたため、範囲条件の選択を分岐なしで
+圧縮し、OR内のBETWEENの値・NULL読取りを一回にまとめた。再測定で超過したQ82も、
+少数のランタイム結合キーをバッチ比較し、一致行だけを後続の条件評価へ渡すようにした。
+副キーのランタイムフィルタも選択率に応じて先に適用する。NULL、INT64両端、NaN、
+無限大、フィルタのAND条件、単調列・複数ワーカーを回帰テストで確認した。
+
+最終バイナリでQ1→Q99を2回通して再測定し、いずれも全件一致・2倍以下。
+条件は上記と同じ（SF 1、8スレッド、CPU 8–15、warmup 1回＋測定7回）。
+
+| 性能修正後 | Q28 tinylamb / DuckDB | Q82 tinylamb / DuckDB | 全クエリ最大比率 |
+|---|---:|---:|---:|
+| gate03 | 20.00 / 17.05 ms（1.174倍） | 4.66 / 2.96 ms（1.576倍） | 1.894（Q2） |
+| gate04 | 20.33 / 19.96 ms（1.018倍） | 4.78 / 3.26 ms（1.465倍） | 1.716（Q76） |
+
+[性能修正の検証記録](../../build/quality/tpcds-performance-20261117/verification.json)・
+[gate03](../../build/quality/tpcds-performance-20261117/gate03/summary.json)・
+[gate04](../../build/quality/tpcds-performance-20261117/gate04/summary.json)。
+関連CTest 305件とlayering / OOC invariantsのチェックも通過。
+最終バイナリの10分OOCファズは1,285セッション・158,616チェック、失敗0件
+（無視した検出0件）。
+[検証記録](../../build/benchmarks/tpcds-sf1-sequential-20261117/validation/verification.json)。
+
+```sh
+/var/tmp/tinylamb-comparison-venv/bin/python benchmark/comparison/tpcds.py \
+  --dataset build/benchmarks/tpcds-sf1-scaling-fixture-20261111/dataset \
+  --fixture build/benchmarks/tpcds-sf1-sequential-20261117/native \
+  --binary build-tpcds-release/tinylamb_tpcds_compare \
+  --output build/benchmarks/tpcds-sf1-next-check \
+  --threads 8 --cpus 8,9,10,11,12,13,14,15 \
+  --warmup 1 --repeats 7 --max-ratio 2
+```
+
 ## データ増量・マルチコア比較（2026-11-11）
 
 SF 0.1（約118万行）とSF 1（約1,956万行）を2・8・16物理コアで比較。各クエリwarmup 1回＋7回、実行順を反転した2実行の範囲。値は99件の中央値合計（ms）。全12実行で3製品とも99/99件一致。
@@ -98,6 +161,14 @@ without measurements. `--queries 1 3 7` runs a diagnostic subset; this must not
 be presented as the full 99-query comparison. `--profile` adds native plan
 statistics and EXPLAIN output for diagnosis, and should be omitted for final
 timings. `--binary` selects a different build.
+
+`--max-ratio 2` runs the requested queries in order and stops before the next
+query if an answer fails validation, execution fails, or the median tinylamb
+time exceeds twice the DuckDB median. Equality passes. Warmup is excluded from
+the ratio, and `--timeout` remains a separate per-response hang guard. A failed
+gate exits nonzero; `summary.json` records performance failures and unattempted
+queries separately from answer mismatches. The default query order is Q1–Q99;
+use `--queries` to remeasure the first failing query during optimization.
 
 Outputs include `results.jsonl` (every sample and final answer), `summary.json`,
 `environment.json` (CPU, versions, flags, source/binary identity), a frozen native

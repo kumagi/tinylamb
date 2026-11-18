@@ -47,7 +47,7 @@ struct ColumnWorkload {
 
 // Redshift-ATO-style observation window: records per-column access events
 // from the scan kernels and infers the AccessHint the chunk encoder should
-// use for the NEXT compaction (MergeOptions). Thread-safe. Keyed by
+// use for the NEXT compaction (the compaction configuration). Thread-safe. Keyed by
 // ColumnName so observations survive ALTERs that only renumber slots.
 //
 // Lifecycle: construct one tracker per table (or per engine), pass it to

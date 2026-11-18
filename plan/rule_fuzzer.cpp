@@ -970,7 +970,9 @@ void Worker(int thread_id, uint64_t base_seed, bool trace_cases,
 
 int main(int argc, char** argv) {
   // atoi neither reports conversion errors nor accepts non-NUL-terminated
-  // string_view tails; parse through an owned, NUL-terminated copy instead.
+  // string_view tails; parse through an owned, NUL-terminated copy. Note the
+  // end pointer is intentionally ignored here: trailing garbage and overflow
+  // are NOT validated by this helper (unlike the strtoull CLI parsers).
   const auto parse_int = [](std::string_view text) {
     const std::string owned(text);
     return static_cast<int>(std::strtol(owned.c_str(), nullptr, 10));

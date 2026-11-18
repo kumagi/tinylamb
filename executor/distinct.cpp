@@ -11,6 +11,7 @@
 #include "common/status_or.hpp"
 #include "page/row_position.hpp"
 #include "type/collation.hpp"
+#include "type/interval.hpp"
 #include "type/row.hpp"
 #include "type/value.hpp"
 #include "type/value_type.hpp"
@@ -49,7 +50,23 @@ size_t DistinctRowHash::operator()(const Row& row) const {
   for (const Value& value : row.values_) {
     size_t h = 0;
     if (value.type == ValueType::kVarChar && !value.IsNull() &&
-        !value.IsInterval()) {
+        value.IsInterval()) {
+      // EqualUnderCollation compares interval-shaped text by its parsed
+      // value ('1 day' == '24 hour'), so raw text hashing would split equal
+      // peers into different buckets. Hash the canonical components instead.
+      const auto parsed = IntervalValue::TryParse(value.value.varchar_value);
+      if (parsed.HasValue()) {
+        size_t seed2 = 0;
+        for (const int64_t part : {parsed.Value().months, parsed.Value().days,
+                                   parsed.Value().nanos}) {
+          seed2 ^= std::hash<int64_t>{}(part) + 0x9e3779b97f4a7c15ULL +
+                   (seed2 << 6U) + (seed2 >> 2U);
+        }
+        h = seed2;
+      } else {
+        h = std::hash<Value>{}(value);
+      }
+    } else if (value.type == ValueType::kVarChar && !value.IsNull()) {
       // Fold every text cell, tagged or not: one CI-tagged side is enough
       // for EqualUnderCollation to compare folded text, so both peers must
       // land in the same bucket. Equal binary text still hashes equally.

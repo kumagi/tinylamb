@@ -152,7 +152,7 @@ semi join の意味は「C にマッチする行だけを probe 側から残す�
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.PushSemiJoinThroughInnerJoin` —
+- `plan/cascades_test_part*.cpp` の `CascadesTest.PushSemiJoinThroughInnerJoin` —
   `(t1 JOIN t2) SEMI t3`(述語は t1 と t3 に触れる)を探索し、
   `SemiJoin(t1, t3)` を左子に持つ `kJoin` 代替が現れることを検証します。
 - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms` —

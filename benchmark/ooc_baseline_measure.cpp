@@ -165,6 +165,9 @@ int main() {
       while (qr.Next(&row)) {
         std::cout << row[0].AsString() << "\n";
       }
+    } else {
+      std::cerr << "WARNING: EXPLAIN ANALYZE failed, peak reflects load only: "
+                << ea.GetStatus().GetMessage() << "\n";
     }
     const uint64_t rss_after_query = platform::CurrentProcessRssBytes();
     std::cout << "Peak after query: RSS=" << ToMiB(rss_after_query)

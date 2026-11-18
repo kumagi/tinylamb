@@ -58,6 +58,15 @@ class WorkTableIndex {
   [[nodiscard]] bool Contains(const Row& row) const;
   [[nodiscard]] size_t size() const { return rows_.size(); }
 
+  // Iterate the owned rows (e.g. to spill the reached set). The index stays
+  // the single owner: callers must not keep a parallel copy of the rows.
+  template <typename Fn>
+  void ForEachRow(Fn&& fn) const {
+    for (const Row& row : rows_) {
+      fn(row);
+    }
+  }
+
  private:
   bool count_stats_{false};
   std::unordered_set<Row, WorkTableRowHash, WorkTableRowEqual> rows_;

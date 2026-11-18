@@ -1,0 +1,10 @@
+-- sql_ooc_fuzzer regression
+-- seed: 286
+-- profile: pool=0 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: snapshot check full(t#) mismatch :: op 5 `snap check t1`: snapshot check full(t1) mismatch: SELECT k, g, v, t, pad FROM t1 ORDER BY k |   expected 7 rows, engine returned 0 |   row 0: expected [2|6|900|NULL|2:sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss...(6977B)] got [<none>] |   row 1: expected [3|6|913|ccc|3:tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt...(7007B)] got [<none>] |   row 2: expected [4|6|926|a|4:uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu
+create t1 7 6026 5636
+ins_bulk t1 2 8 874
+commit
+index t1 ix1 g
+snap open ro
+snap check t1

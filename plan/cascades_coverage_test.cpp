@@ -17,10 +17,8 @@ namespace tinylamb {
 
 namespace {
 // Fresh-build half of CheckComplexMemoEquivalence: the generated memo must
-// build and satisfy its invariants.  (The full equivalence runner currently
-// trips a use-after-free in an aggregate-rewriting rule -- see
-// AggregateExpression::TouchedColumns reached from cascades.cpp:8460 -- so
-// Explore is exercised only through the simpler join-graph oracle.)
+// build and satisfy its invariants. Explore is exercised separately through
+// the simpler join-graph oracle.
 void ExpectFreshBuildInvariants(uint32_t seed,
                                 const ComplexMemoGenConfig& config) {
   std::mt19937 rng(seed);

@@ -473,4 +473,57 @@ TEST(SortShapeExecutorTest, AnEmptyInputSpillsToNothing) {
   EXPECT_TRUE(rows.rows.empty());
 }
 
+// A single INT64 column can hold both signed and unsigned values (UNION / CASE
+// / derived columns). The flipped-sign-bit key mapped signed 1 and unsigned
+// 2^63+1 to the same 0x8000000000000001, so the radix order silently disagreed
+// with Value::TryLess. Check the whole three-band order in both directions.
+TEST(SortShapeExecutorTest, MixedSignednessSingleKeyMatchesCanonicalOrder) {
+  const auto unsigned_value = [](uint64_t bits) {
+    Value v(static_cast<int64_t>(bits));
+    v.SetUnsigned();
+    return v;
+  };
+  // Deliberately unordered input; the label column records the expected rank.
+  const std::vector<std::pair<Value, std::string>> input{
+      {unsigned_value((uint64_t{1} << 63) + 1), "u_high_1"},
+      {Value(int64_t{1}), "i_1"},
+      {unsigned_value(uint64_t{1} << 63), "u_2pow63"},
+      {Value(int64_t{0}), "i_0"},
+      {Value(int64_t{-1}), "i_minus_1"},
+      {unsigned_value(~uint64_t{0}), "u_max"},
+      {Value(int64_t{-2}), "i_minus_2"},
+      {Value(int64_t{2}), "i_2"},
+  };
+  const std::vector<std::string> expected{
+      "i_minus_2", "i_minus_1", "i_0",      "i_1",
+      "i_2",       "u_2pow63",  "u_high_1", "u_max"};
+  for (const bool ascending : {true, false}) {
+    std::vector<Row> rows;
+    rows.reserve(input.size());
+    for (const auto& [key, label] : input) {
+      rows.emplace_back(std::vector<Value>{key, Value(std::string(label))});
+    }
+    auto sort = std::make_shared<SortExecutor>(
+        std::make_shared<PositionedRows>(std::move(rows)), SyntheticSchema(),
+        std::vector<SortExecutor::Key>{SortExecutor::Key{
+            .expression = Key(), .ascending = ascending,
+            .nulls_first = std::nullopt}},
+        1, Buffered(1UL << 20));
+    const Collected out = Collect(sort);
+    ASSERT_EQ(out.status, Status::kSuccess);
+    ASSERT_EQ(out.rows.size(), expected.size());
+    std::vector<std::string> got;
+    got.reserve(out.rows.size());
+for (const Row& row : out.rows) {
+      got.emplace_back(row.values_[1].value.varchar_value);
+    }
+    if (ascending) {
+      EXPECT_EQ(got, expected);
+    } else {
+      EXPECT_EQ(got,
+                std::vector<std::string>(expected.rbegin(), expected.rend()));
+    }
+  }
+}
+
 }  // namespace tinylamb

@@ -100,8 +100,9 @@ void PdqSort::Sort(std::vector<Row>& rows, const Schema& schema,
                    const std::vector<SortExecutor::Key>& keys, Status* error) {
   if (error != nullptr) {
     const Status validation =
-        ValidateSortKeys(rows, schema, keys,
-                         [](const Row& row) -> const Row& { return row; });
+        ValidateSortKeys(rows, schema, keys, [](const Row& row) -> const Row& {
+          return row;  // NOLINT(bugprone-return-const-ref-from-parameter)
+        });
     if (validation != Status::kSuccess) {
       if (*error == Status::kSuccess) {
         *error = validation;

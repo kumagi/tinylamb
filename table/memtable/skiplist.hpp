@@ -122,7 +122,7 @@ class SkipList final {
   void Swap(SkipList& other) noexcept {
     arena_.Swap(other.arena_);
     std::swap(head_, other.head_);
-    for (int level = 0; level < kMaxLevel; ++level) {
+    for (size_t level = 0; level < kMaxLevel; ++level) {
       std::swap(tail_[level], other.tail_[level]);
     }
     std::swap(rng_, other.rng_);

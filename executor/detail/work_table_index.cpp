@@ -27,7 +27,7 @@ bool WorkTableRowEqual::operator()(const Row& left, const Row& right) const {
 size_t WorkTableRowHash::operator()(const Row& row) const {
   uint64_t hash = 14695981039346656037ULL;  // FNV-1a offset basis
   for (const Value& value : row.values_) {
-    uint64_t h;
+    uint64_t h = 0;
     if (value.type == ValueType::kVarChar && !value.IsNull() &&
         !value.IsInterval()) {
       // EqualUnderCollation folds a VARCHAR pair when EITHER side carries a

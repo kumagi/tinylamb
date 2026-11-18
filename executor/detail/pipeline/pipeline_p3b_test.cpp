@@ -434,6 +434,11 @@ TEST(PipelineP3bTest, OocWindowSkewSlidingAggregatesStayIncremental) {
 }
 
 TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
+  const std::string prefix = "p3b_win_fault_" + RandomString();
+  auto db_or = Database::Create(prefix);
+  ASSERT_EQ(db_or.GetStatus(), Status::kSuccess);
+  auto db = db_or.MoveValue();
+  TransactionContext txn = db->BeginContext();
   TestKnobsGuard guard(64ULL << 10, /*always_spill=*/false,
                        /*temp_limit_bytes=*/2ULL * SpillStore::kBlockSize);
   Schema schema("wf", {Column("k", ValueType::kInt64),
@@ -453,10 +458,30 @@ TEST(PipelineP3bTest, OocWindowFaultInjectionPropagatesCleanly) {
   auto sink = std::make_shared<OocWindowSink>(schema, out_schema, outputs,
                                               /*preserve_input_order=*/false,
                                               /*spill_capable_plan=*/true);
+  const std::vector<Row> input_copy = input;
   Status st;
-  std::vector<Row> out = ExecuteSink(out_schema, std::move(input), sink, &st);
+  std::vector<Row> out = ExecuteSink(out_schema, std::move(input), sink, &st,
+                                     nullptr, &txn);
   EXPECT_TRUE(out.empty());
   EXPECT_EQ(st.GetCode(), StatusCode::kNoSpace);
+  // "Cleanly" also means the failed sink released its spill/grant resources:
+  // an identical sink under a normal budget must still be able to run.
+  {
+    // The default-constructed guard only resets on destruction; clear the
+    // injected limits now so the retry really runs with normal budgets.
+    ProcessMemoryBudget::Global().ResetTestKnobs();
+    auto retry = std::make_shared<OocWindowSink>(
+        schema, out_schema, outputs, /*preserve_input_order=*/false,
+        /*spill_capable_plan=*/true);
+    Status retry_status;
+    std::vector<Row> retry_out =
+        ExecuteSink(out_schema, input_copy, retry, &retry_status, nullptr,
+                    &txn);
+    EXPECT_EQ(retry_status, Status::kSuccess);
+    EXPECT_FALSE(retry_out.empty());
+  }
+  txn.txn_.Abort();
+  db->DeleteAll();
 }
 
 TEST(PipelineP3bTest, OocGroupAggNonDecomposableSkewReturnsTooBigData) {
@@ -954,7 +979,8 @@ TEST(PipelineP3bTest,
                    Column("pad", ValueType::kVarChar)});
     std::vector<Row> rows;
     const std::string pad(128, 'D');
-    for (int i = 0; i < 60; ++i) {
+    rows.reserve(60);
+for (int i = 0; i < 60; ++i) {
       rows.push_back(Row({Value(int64_t{i % 5}), Value(std::string(pad))}));
     }
     auto sink = std::make_shared<OocDistinctSink>(
@@ -1082,7 +1108,7 @@ TEST(PipelineP3bTest,
     EXPECT_EQ(ctx.grant.UsedBytes(), 0U);
     EXPECT_EQ(ctx.grant.ActiveConsumerCount(), 0U);
 
-    // SetOpCoordinator (UNION): holds grant bytes while buffering in-memory,
+    // OocSetOpCoordinator (UNION): holds grant bytes while buffering in-memory,
     // releases cleanly on EOF, and deduplicates post-spill widened INT64 vs
     // DOUBLE after crossing `in_mem_budget_`.
     Schema left_s("l", {Column("x", ValueType::kInt64),
@@ -1100,7 +1126,7 @@ TEST(PipelineP3bTest,
     DataChunk lc_spill;
     lc_spill.Reserve(400);
     for (int i = 0; i < 400; ++i) {
-      lc_spill.Append(Row({Value(int64_t{i % 2 + 1}), Value(std::string(sp))}));
+      lc_spill.Append(Row({Value(int64_t{(i % 2) + 1}), Value(std::string(sp))}));
     }
     DataChunk rc;
     rc.Reserve(2);
@@ -1148,7 +1174,8 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
   const std::vector<int64_t> right_keys{0, 1, 2, 7, 7, 9};
   const auto make_rows = [](const std::vector<int64_t>& keys) {
     std::vector<Row> rows;
-    for (int64_t k : keys) {
+    rows.reserve(keys.size());
+for (int64_t k : keys) {
       rows.push_back(Row({Value(k)}));
     }
     return rows;
@@ -1160,8 +1187,6 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
     lrows.push_back(Row({Value(k)}));
   }
 
-  int64_t expected_counts[] = {0, 0, 0, 0};
-  int idx = 0;
   for (BinaryOperation op :
        {BinaryOperation::kLessThan, BinaryOperation::kLessThanEquals,
         BinaryOperation::kGreaterThan, BinaryOperation::kGreaterThanEquals}) {
@@ -1193,13 +1218,12 @@ TEST(PipelineP3bTest, OocBandJoinCandidatePruningMatchesEveryComparison) {
           default:
             break;
         }
-        expected += in_band;
+        expected += static_cast<size_t>(in_band);
         if (in_band) {
           expected_rows.push_back(Row({Value(lv), Value(r)}));
         }
       }
     }
-    expected_counts[idx++] = static_cast<int64_t>(expected);
 
     OocSetOpInputStream l_in{.source = std::make_shared<RowVectorSource>(lrows),
                              .operators = {},

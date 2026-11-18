@@ -71,12 +71,24 @@ class ParallelScan final : public ExecutorBase {
       size_t worker_count,
       const std::function<Status(size_t, const LSTablePageBlock&,
                                  const uint32_t*, size_t)>& consume,
-      const std::vector<slot_t>* required_columns = nullptr);
+      const std::vector<slot_t>* required_columns = nullptr,
+      const std::function<bool(size_t, const LSTablePageBlock&)>& may_match =
+          {});
+  // Prepare a snapshot containing only the physical columns a fold needs,
+  // plus pushed predicates. Does not consume rows or change output layout.
+  StatusOr<bool> PrepareLSTableColumns(
+      const std::vector<slot_t>& required_columns);
+  // Materialize a winning row after a fold (e.g. TopN), preserving the scan's
+  // snapshot and projection. Payload columns need not be in the column store.
+  StatusOr<Row> ReadFoldedRow(RowPosition position) const;
   // Consume the entire immutable snapshot once, without page metadata walks.
   // Only an unstarted, unfiltered, chain-free scan is eligible. Projection
   // offsets still map through TableColumnSlot; the callback sees table columns.
   StatusOr<bool> TryFoldLSTableStore(
       const std::function<Status(const LSTableStore&)>& consume);
+  // Count a single dictionary column's pure predicates using exact physical
+  // code frequencies. No query predicate or result is retained by the store.
+  StatusOr<std::optional<int64_t>> TryCountDictionaryMatches();
   [[nodiscard]] bool WasTypedFolded() const { return typed_folded_; }
 
   // Attach a full row predicate to be decided inside the decode workers
@@ -108,6 +120,8 @@ class ParallelScan final : public ExecutorBase {
   [[nodiscard]] const LSTableStore* GetLSTableStore() const {
     return lstable_store_.get();
   }
+  [[nodiscard]] std::optional<uint64_t> TryExactUnfilteredRowCount()
+      const override;
 
  private:
   [[nodiscard]] bool RejectedByIntegerMembership() const;

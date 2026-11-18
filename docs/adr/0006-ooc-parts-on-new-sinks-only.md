@@ -7,7 +7,7 @@ Status: accepted（2026-11-16 決定、2026-11-17 P2/P3a/P3b 実装済み: `exec
 
 ## 背景
 
-元の Out-of-Core 設計（`ooca.md`）は、旧 `ExecutorBase` 木の演算子を 10 種以上書き直して
+元の Out-of-Core 設計（`ooca-v2.md`）は、旧 `ExecutorBase` 木の演算子を 10 種以上書き直して
 メモリを入力に依存させない形にする計画だった。一方 `TODO.md` は、Executor を
 「パイプライン IR ＋ シンク契約」に置き換え、S10 で旧演算子と手書き融合形を削除する。
 両方を進めると同じ演算子を 2 回書くことになる。

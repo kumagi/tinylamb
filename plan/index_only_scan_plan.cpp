@@ -6,6 +6,7 @@
 #include "index_only_scan_plan.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 #include <ostream>
@@ -27,6 +28,49 @@
 
 namespace tinylamb {
 namespace {
+
+// memcomparable NaN sorts above every DOUBLE, while ORDER BY sorts it first.
+// Without a finite upper bound the index byte order cannot prove ORDER BY.
+bool DoubleKeyOrderIsSound(const Table& table, const Index& index,
+                           const TableStatistics& stats,
+                           const std::vector<Value>& end_key,
+                           const std::vector<ColumnName>& provided_order) {
+  if (provided_order.empty() || index.sc_.key_.empty()) {
+    return true;
+  }
+  size_t key_pos = index.sc_.key_.size();
+  for (size_t k = 0; k < index.sc_.key_.size(); ++k) {
+    if (table.GetSchema().GetColumn(index.sc_.key_[k]).Name() ==
+        provided_order.front()) {
+      key_pos = k;
+      break;
+    }
+  }
+  if (key_pos == index.sc_.key_.size() ||
+      table.GetSchema().GetColumn(index.sc_.key_[key_pos]).Type() !=
+          ValueType::kDouble) {
+    return key_pos != index.sc_.key_.size();
+  }
+  if (end_key.size() > key_pos && end_key[key_pos].type == ValueType::kDouble &&
+      std::isfinite(end_key[key_pos].value.double_value)) {
+    return true;
+  }
+  // ANALYZE ranks NaN first; a finite lowest boundary proves absence.
+  // (An open-ended seek key must not short-circuit this proof.)
+  // Statistics may be older than a newly added index key column: never prove
+  // an order from a column the snapshot does not describe.
+  const size_t key_column = index.sc_.key_[key_pos];
+  if (key_column >= stats.Columns()) {
+    return false;
+  }
+  const ColumnStats& col = stats.Column(key_column);
+  if (col.Unmeasured() || col.NonNullCount() == 0) {
+    return col.NonNullCount() == 0;
+  }
+  const auto& lowest = col.LowestValues();
+  return !lowest.empty() && lowest.front().value.type == ValueType::kDouble &&
+         std::isfinite(lowest.front().value.value.double_value);
+}
 
 bool OrderMatches(const std::vector<ColumnName>& provided, bool scan_ascending,
                   const std::vector<Expression>& expressions,
@@ -166,7 +210,9 @@ size_t IndexOnlyScanPlan::EmitRowCount() const {
 
 bool IndexOnlyScanPlan::IsOrderedBy(const std::vector<Expression>& expressions,
                                     const std::vector<bool>& ascending) const {
-  return OrderMatches(provided_order_, ascending_, expressions, ascending);
+  return OrderMatches(provided_order_, ascending_, expressions, ascending) &&
+         DoubleKeyOrderIsSound(table_, index_, stats_, end_key_,
+                               provided_order_);
 }
 
 bool IndexOnlyScanPlan::IsOrderedBy(
@@ -174,7 +220,9 @@ bool IndexOnlyScanPlan::IsOrderedBy(
     const std::vector<bool>& ascending,
     const std::vector<std::optional<bool>>& nulls_first) const {
   return OrderMatches(provided_order_, ascending_, expressions, ascending,
-                      nulls_first);
+                      nulls_first) &&
+         DoubleKeyOrderIsSound(table_, index_, stats_, end_key_,
+                               provided_order_);
 }
 
 void IndexOnlyScanPlan::Dump(std::ostream& o, int /*indent*/) const {

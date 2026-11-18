@@ -1,0 +1,9 @@
+-- sql_ooc_fuzzer regression
+-- seed: 1076
+-- profile: pool=16384 columnar=0 opmem=0 spill=0 temp=0 route=0
+-- failure: sweep mem / post-sweep rollback count(t#) mismatch :: op 4 `sweep mem 337 :: ins_bulk t0 518 591 749`: sweep mem `ins_bulk t0 518 591 749` after surviving failure #1: post-sweep rollback count(t0) mismatch: SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) FROM t0 |   expected 1 rows, engine returned 1 |   row 0: expected [517|133903|240286|469|690249] got [513|131400|238934|466|675138]
+create t0 36 211 2190
+ins_bulk t0 1 492 367
+compact t0
+ins_copy t0 t0 237 261 256
+sweep mem 337 :: ins_bulk t0 518 591 749

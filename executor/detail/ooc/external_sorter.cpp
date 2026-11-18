@@ -436,9 +436,11 @@ void ExternalSorter::ComputeMergeGeometry(
       std::min<size_t>(32768, std::max<size_t>(4096, budget / 16));
   const size_t usable_for_readers =
       budget > wbuf ? (budget - wbuf) : (budget / 2);
-  // Each merge stream holds `rbuf` + up to ~`kWriteBatchMaxBytes` (16 KiB) of
-  // decoded rows in RAM simultaneously.
-  const size_t per_stream = rbuf + kWriteBatchMaxBytes;
+  // Each merge stream holds `rbuf` plus a decoded row block: a spill block is
+  // up to SpillStore::kBlockSize (64 KiB), not the 16 KiB write-batch size.
+  // Under-estimating this over-provisions fan-in and lets the merge exceed the
+  // operator budget.
+  const size_t per_stream = rbuf + SpillStore::kBlockSize;
   const size_t fan_in = std::clamp<size_t>(
       usable_for_readers / std::max<size_t>(per_stream, 8192), 2, 32);
   *reader_buf_out = rbuf;
@@ -589,8 +591,12 @@ Status ExternalSorter::Finish() {
       SpillSegmentId merged = kInvalidSpillSegmentId;
       RETURN_IF_FAIL(MergeRunGroup(group, reader_buf, writer_buf, &merged));
       // Immediately release merged input runs so SpillStore recycles blocks.
+      // Use the shared liveness token: the store may already have been
+      // dropped by a sibling consumer, and a raw DropSegment would reuse a
+      // recycled id.
       for (const SpillSegmentId consumed : group) {
-        options_.spill_store->DropSegment(consumed);
+        SpillStore::DropSegmentIfAlive(options_.spill_store,
+                                       spill_store_alive_, consumed);
       }
       next_round.push_back(merged);
     }

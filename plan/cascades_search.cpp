@@ -490,7 +490,29 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
                   bin.Right()->Type() == TypeTag::kColumnValue) {
                 const auto& c1 = bin.Left()->AsColumnValue().GetColumnName();
                 const auto& c2 = bin.Right()->AsColumnValue().GetColumnName();
-                push_ec({c1.ToString(), c2.ToString()});
+                // Cross-type numeric equality (INT64 vs DOUBLE around 2^53) is
+                // not transitive; do not merge mismatched catalog types into
+                // one equivalence class (Lean:
+                // `cpp_cross_type_int64_double_nontransitive_bug`).
+                bool proven_mismatched_type = false;
+                if (!c1.schema.empty() && !c2.schema.empty()) {
+                  const auto f1 = table_schemas_.find(c1.schema);
+                  const auto f2 = table_schemas_.find(c2.schema);
+                  if (f1 != table_schemas_.end() &&
+                      f2 != table_schemas_.end()) {
+                    const int o1 = f1->second.Offset(ColumnName("", c1.name));
+                    const int o2 = f2->second.Offset(ColumnName("", c2.name));
+                    if (o1 >= 0 && o2 >= 0) {
+                      proven_mismatched_type =
+                          f1->second.GetColumn(static_cast<size_t>(o1))
+                              .Type() !=
+                          f2->second.GetColumn(static_cast<size_t>(o2)).Type();
+                    }
+                  }
+                }
+                if (!proven_mismatched_type) {
+                  push_ec({c1.ToString(), c2.ToString()});
+                }
                 if (std::ranges::find(left_rels, c1.schema) !=
                         left_rels.end() &&
                     std::ranges::find(right_rels, c2.schema) !=
@@ -529,12 +551,30 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
           const auto& right_props =
               groups_[expr.children[1]].logical_properties;
           if (expr.join_type == 0) {  // LeftOuter
+            // Lean proof: lean/TinylambOpt/CppRuleAudit.lean
+            //   (cpp_outerJoin_selfEq_candidateKey_bug, repairedPinsRightPk)
             for (const auto& nn : left_props.not_null_columns) {
               props.not_null_columns.insert(nn);
             }
             std::unordered_set<std::string> right_join_cols;
             if (expr.predicate && *expr.predicate) {
+              const auto& left_rels = groups_[expr.children[0]].relations;
               const auto& right_rels = groups_[expr.children[1]].relations;
+              const auto binds_per_left_row = [&](const Expression& side) {
+                if (!side) {
+                  return false;
+                }
+                if (side->Type() == TypeTag::kConstantValue) {
+                  return !side->AsConstantValue().GetValue().IsNull();
+                }
+                if (side->Type() == TypeTag::kColumnValue) {
+                  const auto& col = side->AsColumnValue().GetColumnName();
+                  return !col.schema.empty() &&
+                         std::ranges::find(left_rels, col.schema) !=
+                             left_rels.end();
+                }
+                return false;
+              };
               for (const auto& c : SplitConjuncts(*expr.predicate)) {
                 if (!c || c->Type() != TypeTag::kBinaryExp) {
                   continue;
@@ -543,18 +583,22 @@ void Memo::DeriveLogicalProperties(GroupId group_id) {
                 if (bin.Op() != BinaryOperation::kEquals) {
                   continue;
                 }
-                if (bin.Left()->Type() == TypeTag::kColumnValue) {
+                if (bin.Left()->Type() == TypeTag::kColumnValue &&
+                    binds_per_left_row(bin.Right())) {
                   const auto& col = bin.Left()->AsColumnValue().GetColumnName();
-                  if (std::ranges::find(right_rels, col.schema) !=
-                      right_rels.end()) {
+                  if (!col.schema.empty() &&
+                      std::ranges::find(right_rels, col.schema) !=
+                          right_rels.end()) {
                     right_join_cols.insert(col.ToString());
                   }
                 }
-                if (bin.Right()->Type() == TypeTag::kColumnValue) {
+                if (bin.Right()->Type() == TypeTag::kColumnValue &&
+                    binds_per_left_row(bin.Left())) {
                   const auto& col =
                       bin.Right()->AsColumnValue().GetColumnName();
-                  if (std::ranges::find(right_rels, col.schema) !=
-                      right_rels.end()) {
+                  if (!col.schema.empty() &&
+                      std::ranges::find(right_rels, col.schema) !=
+                          right_rels.end()) {
                     right_join_cols.insert(col.ToString());
                   }
                 }
@@ -1175,7 +1219,7 @@ void SearchEngine::Explore(GroupId root) {
   }
 }
 
-// Phase 7 worklist exploration: each group keeps a cursor over its
+// Worklist exploration: each group keeps a cursor over its
 // expressions; rules appending expressions (here or in other groups) extend
 // the work instead of rescanning settled state. No pass cap or convergence
 // exception is needed because the memo is append-only and fingerprints
@@ -1323,10 +1367,11 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
       // Row-filtering and row-shaping operators pass rows through in order.
       return {required};
     case LogicalOperator::kSample: {
+      // LIMIT applies to the sampled OUTPUT, not the scan input. Every sample
+      // method (not just RESERVOIR) therefore clears the downstream prefix
+      // demand so a FullScan below it cannot truncate the sampling population.
       PhysicalProperties child = required;
-      if (expression.sample_method == TableSampleMethod::kReservoir) {
-        child.limit_hint = std::numeric_limits<size_t>::max();
-      }
+      child.limit_hint = std::numeric_limits<size_t>::max();
       return {child};
     }
     case LogicalOperator::kProjection: {

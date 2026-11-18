@@ -85,4 +85,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.SplitSelectionOverJoinPushesConjunctsOfBothSides`: `a.x = 1 AND b.z = 2` の Selection から、テーブル `a` と `b` のそれぞれの単一リレーショングループの filter に対応する連言述語が正常に到達することを検証します。
+- `plan/cascades_test_part2.cpp` の `CascadesTest.SplitSelectionOverJoinPushesConjunctsOfBothSides`: `a.x = 1 AND b.z = 2` の Selection から、テーブル `a` と `b` のそれぞれの単一リレーショングループの filter に対応する連言述語が正常に到達することを検証します。

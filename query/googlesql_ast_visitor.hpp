@@ -2,6 +2,7 @@
 #ifndef TINYLAMB_GOOGLESQL_AST_VISITOR_HPP
 #define TINYLAMB_GOOGLESQL_AST_VISITOR_HPP
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,6 +47,22 @@ ViewRegistry();
 // through the visitor directly).
 void RegisterViewDefinition(std::string_view name,
                             const GoogleSqlAstNode& query);
+
+// Session scope for CREATE [TEMP] FUNCTION definitions, which live in a
+// thread-local registry. Each server connection scopes lookups to its own id,
+// so a function never resolves in another session that shares the event-loop
+// thread; 0 is the unscoped default of the CLI, the plan cache and the
+// single-connection test harness.
+void SetUdfSessionScope(uint64_t session_id);
+uint64_t UdfSessionScope();
+// Drops every definition created by `session_id` (server disconnect).
+void PurgeUdfSessionDefinitions(uint64_t session_id);
+
+// Drop the calling thread's frontend registries: the current scope's UDFs,
+// plus session constants, views and named windows. The server calls this at
+// session boundaries so a later session on the same event-loop thread cannot
+// resolve identifiers through the previous session's temporary objects.
+void ClearSessionRegistries();
 
 class GoogleSqlAstVisitor {
  public:

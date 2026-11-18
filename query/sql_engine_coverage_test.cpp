@@ -204,6 +204,33 @@ TEST_F(SqlEngineCoverageTest, StatementTypeRouting) {
   EXPECT_EQ(Scalar("SELECT COUNT(*) FROM t"), Value(int64_t{2}));
 }
 
+// Folding a DML subquery prepares the inner SELECT recursively. That nested
+// prepare used to leave `last_statement_type_` (and the result column names)
+// describing the inner SELECT, so a pgwire client saw a SELECT tag and an
+// extra RowDescription for an UPDATE/DELETE.
+TEST_F(SqlEngineCoverageTest, DmlWithFoldedSubqueryKeepsStatementType) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE dml_sub (k INT64);");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO dml_sub VALUES (1), (2);");
+
+  const auto check = [&](const std::string& sql, StatementType expected) {
+    StatusOr<QueryResult> result = engine_->Execute(*context_, sql);
+    ASSERT_TRUE(result.HasValue()) << engine_->LastError() << "\nSQL: " << sql;
+    QueryResult query = result.MoveValue();
+    ASSERT_TRUE(engine_->LastStatementType().has_value());
+    EXPECT_EQ(*engine_->LastStatementType(), expected) << sql;
+    ASSERT_TRUE(query.Statement().has_value());
+    EXPECT_EQ(*query.Statement(), expected) << sql;
+    std::ignore = query.Collect();
+    EXPECT_EQ(query.GetStatus(), Status::kSuccess);
+  };
+  check("UPDATE t SET c = 2 WHERE a IN (SELECT k FROM dml_sub)",
+        StatementType::kUpdate);
+  check("DELETE FROM t WHERE a IN (SELECT k FROM dml_sub)",
+        StatementType::kDelete);
+  check("UPDATE t SET c = 3 WHERE EXISTS (SELECT k FROM dml_sub)",
+        StatementType::kUpdate);
+}
+
 TEST_F(SqlEngineCoverageTest, PrimaryKeyDefinitionCreatesUniqueIndex) {
   RunSql(engine_.get(), context_.get(),
          "CREATE TABLE catalog_pk (id STRING PRIMARY KEY, payload INT64);");
@@ -237,25 +264,22 @@ TEST_F(SqlEngineCoverageTest, NullableUniqueDoesNotProveGroupDependency) {
   const std::vector<Row> rows =
       Rows("SELECT id, payload FROM nullable_unique GROUP BY id, payload");
   ASSERT_EQ(rows.size(), 3U);
-  // The plan-shape assertions below pin the Cascades-first grouped route's
-  // EXPLAIN text.  Since the 2026-10-07 route flip the default grouped
-  // route is the relational interpreter (same rows, different plan text),
-  // so the pin only holds under TINYLAMB_GROUPED_ROUTE=cascades.
-  const char* grouped_route = std::getenv("TINYLAMB_GROUPED_ROUTE");
-  if (grouped_route == nullptr ||
-      std::string_view(grouped_route) != "cascades") {
-    GTEST_SKIP() << "plan-shape pin requires the cascades grouped route";
-  }
+  // Nullable UNIQUE permits distinct NULL-key groups. Verify the semantic
+  // contract in both execution and EXPLAIN ANALYZE, regardless of plan shape.
+  EXPECT_NE(std::find(rows.begin(), rows.end(), Row({Value(), Value("first")})),
+            rows.end());
+  EXPECT_NE(
+      std::find(rows.begin(), rows.end(), Row({Value(), Value("second")})),
+      rows.end());
   const std::vector<Row> plan_rows = Rows(
-      "EXPLAIN SELECT id, payload FROM nullable_unique GROUP BY id, payload");
+      "EXPLAIN ANALYZE SELECT id, payload FROM nullable_unique GROUP BY id, "
+      "payload");
   ASSERT_FALSE(plan_rows.empty());
   std::string plan;
   for (const Row& row : plan_rows) {
     plan += row[0].AsString();
   }
-  EXPECT_NE(plan.find("HashDistinct"), std::string::npos) << plan;
-  EXPECT_NE(plan.find("nullable_unique.payload AS payload"), std::string::npos)
-      << plan;
+  EXPECT_NE(plan.find("Actual Rows: 3"), std::string::npos) << plan;
 }
 
 TEST_F(SqlEngineCoverageTest,

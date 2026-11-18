@@ -339,7 +339,7 @@ size_t TableSampleExecutor::NextBatch(DataChunk* destination, size_t max_rows) {
           // row of an included page survives, rows of an excluded page are
           // dropped.  The decision is a hash of the page id (mixed with the
           // REPEATABLE seed when present), so repeated scans of the same
-          // page agree.
+          // page are cached for the duration of the scan.
           const auto [iterator, inserted] = page_decisions_.try_emplace(
               static_cast<uint64_t>(position.page_id), false);
           if (inserted) {

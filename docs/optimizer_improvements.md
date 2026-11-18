@@ -33,8 +33,8 @@ Audit found the plan-level LIMIT work half-wired, producing wrong results:
   rules disabled this returned unrelated row pairs. It now evaluates the full
   join predicate; the physical-rule subset sweep guards this fallback path.
 
-Regression guards added to `query/query_test.cpp`
-(`SqlEngineSelectOrderByLimitOffset` covers unordered ORDER BY+LIMIT+OFFSET,
+Regression guards added to `query/query_test_part*.cpp` (`query_test` target;
+`SqlEngineSelectOrderByLimitOffset` covers unordered ORDER BY+LIMIT+OFFSET,
 plain LIMIT+OFFSET single application, and DISTINCT+LIMIT).
 
 ## Handover Log (2026-09, suite-green pass)
@@ -283,6 +283,6 @@ passes (144 tests as of 2026-08-26).
      wrapper only on proof from the plan (`EnforcesLimit`, `IsOrderedBy`).
 - If reality diverges from this document, update this document in the same
   change.
-- Tests: `plan/cascades_test.cpp` for framework checks,
-  `plan/optimizer_test.cpp` for end-to-end integration, `query/query_test.cpp`
-  for SqlEngine-level behavior.
+- Tests: `plan/cascades_test_part*.cpp` (`cascades_test`) for framework checks,
+  `plan/optimizer_test_part*.cpp` (`optimizer_test`) for end-to-end integration,
+  `query/query_test_part*.cpp` (`query_test`) for SqlEngine-level behavior.

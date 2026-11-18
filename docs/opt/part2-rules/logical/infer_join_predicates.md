@@ -1,7 +1,7 @@
 # infer_join_predicates
 
 - 状態: draft / 執筆基準リビジョン: `3880673` (2026-09-12)
-- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録式。変換はヘルパー `InferJoinConstants` および `EqualityConstant` に委譲）
+- 定義位置: `plan/cascades.cpp` の `RuleSet::Default()`（登録式。変換はヘルパー `InferJoinConstants` および `PropagateEqualityConstants` に委譲）
 
 ## 概要
 
@@ -70,7 +70,7 @@ graph TD
       if (!memo.ContainsRelation({from.schema, to.schema})) {
         return;
       }
-      const std::optional<Value> constant = EqualityConstant(
+      const std::optional<Value> constant = EqualityConstantExpr(
           memo.Get(memo.EnsureGroup({from.schema})).filter, from);
       if (!constant) {
         return;
@@ -84,7 +84,7 @@ graph TD
     push(right, left);
 ```
 
-1. **定数の抽出**: `EqualityConstant` は `from` 側の単一表グループの `filter` を走査し、`from = 定数` または `定数 = from` の形式を持つ連言から定数値を取り出します。
+1. **定数の抽出**: `PropagateEqualityConstants` は `from` 側の単一表グループの `filter` を走査し、`from = 定数` または `定数 = from` の形式を持つ連言から定数値を取り出します。
 2. **述語の合成と合流**: 抽出された定数を用いて `to = 定数` の二項式を構築し、`memo.MergeScanFilter` を呼び出して `to` 側グループのフィルタへ合併します。
 3. **冪等性の保証**: `MergeScanFilter` 内部で `CanonicalizeConjuncts` を経由するため、連言のソートと重複排除が行われ、複数回の同一推論によってフィルタ式が無制限に肥大化することはありません。
 
@@ -106,6 +106,6 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part1.cpp`:
   - `CascadesTest.InferJoinPredicatesCopiesConstantsAcrossEquals`: `a.x = 1` および `a.x = b.y` から、`b` グループの filter に `b.y = 1` が導出・登録されることを検証。
   - `CascadesTest.DefaultRulesIncludePredicateAndProjectionTransforms`: 既定の RuleSet 内に `infer_join_predicates` が正しく登録されていることを検証。

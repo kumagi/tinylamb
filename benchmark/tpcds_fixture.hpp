@@ -332,7 +332,7 @@ inline GeneratedData Generate(int64_t scale) {
                                  : kDaysInMonth[static_cast<size_t>(month - 1)];
         for (int64_t day = 1; day <= days; ++day) {
           const int64_t sk = DateSkFromCivil(year, month, day);
-          const int64_t dow = (sk + 5) % 7;  // 1998-01-01 is a Thursday(4)
+          const int64_t dow = sk % 7;  // 1998-01-01 is a Thursday(4)
           std::array<char, 32> id{};
           [[maybe_unused]] const int printed1 =
               std::snprintf(id.data(), id.size(), "AAAAAA%08ld",

@@ -413,7 +413,7 @@ Status WriteRowRange(SpillSegmentWriter* writer, const DataChunk& chunk,
   RETURN_IF_FAIL(EncodeDataChunk(*payload, buf));
   const size_t payload_bytes = buf->size() - sizeof(uint32_t);
   if (payload_bytes > max_frame_bytes && end - begin > 1) {
-    const size_t mid = begin + (end - begin) / 2;
+    const size_t mid = begin + ((end - begin) / 2);
     RETURN_IF_FAIL(
         WriteRowRange(writer, chunk, begin, mid, max_frame_bytes, buf));
     return WriteRowRange(writer, chunk, mid, end, max_frame_bytes, buf);

@@ -92,10 +92,8 @@ class AggregationExecutor : public ExecutorBase {
   Schema input_schema_;
   std::vector<NamedExpression> aggregates_;
   std::vector<AggregateInput> inputs_;
-  // Aggregates whose semantics live in AggregateAccumulator (buffered or
-  // specialized types such as ARRAY_AGG / ELEMENTWISE_* / statistics) are
-  // delegated instead of using the inline switch in NextGeneric.
-  std::vector<bool> delegates_to_accumulator_;
+  // Specialized aggregates (ARRAY_AGG / ELEMENTWISE_* / statistics) are
+  // delegated to AggregateAccumulator instead of the inline switch.
   std::vector<std::unique_ptr<relational_detail::AggregateAccumulator>>
       accumulators_;
   bool all_typed_{false};
@@ -108,6 +106,9 @@ class AggregationExecutor : public ExecutorBase {
   size_t rows_seen_{0};
   bool jit_attempted_{false};
   std::optional<JitInt64Kernels> jit_sum_;
+  std::optional<JitInt64Kernels> jit_unchecked_sum_;
+  std::optional<JitInt64Kernels> jit_masked_sum_;
+  std::vector<uint8_t> jit_null_bytes_;
   size_t jit_batches_{0};
 };
 

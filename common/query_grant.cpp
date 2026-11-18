@@ -179,8 +179,12 @@ size_t QueryMemoryGrant::OperatorBudgetBytes(size_t b_min) const noexcept {
   }
   const size_t active =
       std::max<size_t>(1, active_consumers_.load(std::memory_order_acquire));
-  const size_t share = grant / active;
-  return std::max(b_min, share);
+  // Hand out only the fair share: applying the b_min floor here can make
+  // active * b_min exceed the whole grant, so operators see a larger budget
+  // than the query actually has and delay spilling. If the share is below
+  // b_min the query is simply over-subscribed; TryConsume still enforces the
+  // hard grant ceiling.
+  return grant / active;
 }
 
 size_t QueryMemoryGrant::ComputeEffectiveDop(size_t requested_dop,

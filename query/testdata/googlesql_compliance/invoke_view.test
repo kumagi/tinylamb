@@ -17,7 +17,7 @@ CREATE TEMP TABLE T2 AS SELECT 2 as b;
 --
 ARRAY<STRUCT<b INT64>>[{2}]
 ==
-[name=invoke_trival_view]
+[name=invoke_trivial_view]
 SELECT * FROM SelectOne;
 --
 ARRAY<STRUCT<a INT64>>[{1}]

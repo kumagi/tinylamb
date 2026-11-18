@@ -39,7 +39,7 @@ C++ コードの実例つきで解説する書籍の原稿を置く場所であ�
    tinylamb 実装への正確な案内にある。一般論に触れるときも、必ず tinylamb の
    どの実装がそれに対応するかを添える。
 6. 既存の正規文書 `docs/cascades_optimizer.md`(規範・要約)、
-   `docs/optimizer_todo.md`、`docs/optimizer_improvements.md` と競合する記述を
+   `docs/optimizer_improvements.md`、`docs/optimizer_rule_audit.md` と競合する記述を
    書かない。本書は「学習書」、それらは「規範」という役割分担を保つ。数値や
    一覧がずれたら必ず規範側か本書側を直す。
 
@@ -79,7 +79,7 @@ tinylamb の最適化は 3 層の独立した Rule セットで構成される
 | 層 | 定義場所 | 本数 | 役割 |
 |---|---|---|---|
 | 式書き換え `ExpressionRuleSet` | `expression/rewrite.cpp` の `ExpressionRuleSet::Default()` | 71 | 定数畳み込み・比較の正規化・ブール恒等式などスカラー式の正規化 |
-| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 86 | Memo へ同値な論理式を追加(探索) |
+| 論理同値 `cascades::RuleSet` | `plan/cascades.cpp` の `RuleSet::Default()` | 91 | Memo へ同値な論理式を追加(探索) |
 | 物理 `cascades::ImplementationRuleSet` | `plan/implementation_rules.cpp` の `DefaultImplementationRules()` | 46 | 論理式を物理プランへ実装(コスト評価の対象) |
 
 第1部で説明すべきインフラ要素:

@@ -91,5 +91,5 @@ changed = true;
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `CascadesTest.CountStarRewriteOnNotNullColumn`: NOT NULL 列に対する `COUNT(t.c)` が子式なしの `COUNT(*)` へと正しく変換されることの検証。
-- `plan/cascades_test.cpp` の `CascadesTest.CountStarRewriteKeepsNullableColumn`: NULL 可能列に対しては変換が安全に抑止されることの検証。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.CountStarRewriteOnNotNullColumn`: NOT NULL 列に対する `COUNT(t.c)` が子式なしの `COUNT(*)` へと正しく変換されることの検証。
+- `plan/cascades_test_part3.cpp` の `CascadesTest.CountStarRewriteKeepsNullableColumn`: NULL 可能列に対しては変換が安全に抑止されることの検証。

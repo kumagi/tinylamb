@@ -107,6 +107,31 @@ TEST_F(SqlScalarCoverageTest, TimestampParsingHandlesFractionsAndTimeOnly) {
   ExpectValue("SELECT parse_timestamp('%Y', NULL, 'UTC') IS NULL", Value(true));
 }
 
+// A format string that produces no output yields an empty string (the
+// GoogleSQL contract); the AST and batch evaluators agree on it.
+TEST_F(SqlScalarCoverageTest, FormatTimestampEmptyFormatIsEmpty) {
+  ExpectValue(
+      "SELECT FORMAT_TIMESTAMP('', TIMESTAMP '2020-01-01 00:00:00+00')",
+      Value(std::string("")));
+}
+
+// PARSE_TIMESTAMP must default unspecified fields from 1970-01-01 (like
+// PARSE_DATE) and reject input bytes the format string did not consume.
+TEST_F(SqlScalarCoverageTest,
+       ParseTimestampDefaultsToUnixEpochAndRejectsGarbage) {
+  ExpectValue(
+      "SELECT format_timestamp('%Y-%m-%d %H:%M:%S', "
+      "parse_timestamp('%H:%M:%S', '12:00:00', 'UTC'), 'UTC')",
+      Value(std::string("1970-01-01 12:00:00")));
+  StatusOr<Executor> bad =
+      engine_->Prepare(*context_, "SELECT parse_timestamp('%Y', '2026 junk')");
+  ASSERT_TRUE(bad.HasValue()) << engine_->LastError();
+  Row sink;
+  while (bad.Value()->Next(&sink, nullptr)) {
+  }
+  EXPECT_EQ(bad.Value()->GetStatus(), Status::kInvalidArgument);
+}
+
 TEST_F(SqlScalarCoverageTest, TimestampFormatRoundTrip) {
   ExpectValue(
       "SELECT format_timestamp('%Y-%m-%d %H:%M:%S', "
@@ -263,8 +288,9 @@ TEST_F(SqlScalarCoverageTest, StructFieldAccessAndMutation) {
   ExpectValue("SELECT get_field(STRUCT(1 AS a), 'zz') IS NULL", Value(true));
   ExpectValue("SELECT __get_field_safe(STRUCT(1 AS a), 'a')",
               Value(int64_t{1}));
-  // get_field surfaces the member's canonical text form.
-  ExpectValue("SELECT get_field(STRUCT(1 AS a), 'a')", Value(std::string("1")));
+  // get_field now shares the AST's typed member extraction (same as
+  // __get_field_safe), so a numeric member remains INT64 rather than text.
+  ExpectValue("SELECT get_field(STRUCT(1 AS a), 'a')", Value(int64_t{1}));
   ExpectValue(
       "SELECT __struct_set(STRUCT(1 AS a, 2 AS b), 'a', 9) = "
       "STRUCT(9 AS a, 2 AS b)",

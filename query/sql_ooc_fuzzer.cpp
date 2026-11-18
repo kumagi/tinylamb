@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -80,7 +81,13 @@ uint64_t EnvU64(const char* name, uint64_t fallback) {
   if (v == nullptr || v[0] == '\0') {
     return fallback;
   }
-  return std::strtoull(v, nullptr, 10);
+  char* end = nullptr;
+  errno = 0;
+  const auto parsed = std::strtoull(v, &end, 10);
+  if (end == v || *end != '\0' || v[0] == '-' || errno == ERANGE) {
+    return fallback;
+  }
+  return parsed;
 }
 
 std::string I(int64_t x) { return std::to_string(x); }
@@ -258,7 +265,7 @@ struct WhereSpec {
       return !r.v.has_value();
     }
     if (kind == "padgt") {
-      return static_cast<int64_t>(r.pad.size()) > a;
+      return std::cmp_greater(r.pad.size(), a);
     }
     if (kind == "tag") {
       return r.tag != 0 && r.tag == a;
@@ -848,7 +855,7 @@ class OocSession {
       if (t == nullptr || !ParseI64(tok[2], &rows)) {
         return "malformed selftest op\n";
       }
-      return static_cast<int64_t>(t->rows.size()) >= rows
+      return std::cmp_greater_equal(t->rows.size(), rows)
                  ? "selftest threshold reached: " + t->name + " holds " +
                        I(static_cast<int64_t>(t->rows.size())) + " rows\n"
                  : "";
@@ -898,7 +905,7 @@ class OocSession {
     return "";
   }
 
-  [[nodiscard]] bool TempCapped() const {
+  [[nodiscard]] static bool TempCapped() {
     return ProcessMemoryBudget::Global().TempLimitBytes() > 0;
   }
 
@@ -920,7 +927,7 @@ class OocSession {
     }
     QueryResult qr = result.MoveValue();
     Row row;
-    while ((take < 0 || static_cast<int64_t>(out.rows.size()) < take) &&
+    while ((take < 0 || std::cmp_less(out.rows.size(), take)) &&
            qr.Next(&row)) {
       out.rows.push_back(RenderRow(row));
     }
@@ -1340,6 +1347,17 @@ class OocSession {
     Bump(&OocStats::tolerated_failures);
     std::ignore = ctx_->txn_.Abort();
     ctx_.emplace(db_->BeginContext());
+    // The ambiguous-commit probes must run with relaxed knobs: under the
+    // session's tight budgets a count/sum probe legitimately fails with
+    // kMemoryLimitExceeded, which ImageMatches would misread as "image does
+    // not match" and report a bogus torn transaction.
+    const Knobs session = CurrentKnobs();
+    SetKnobs(Knobs{});
+    struct RestoreKnobs {
+      OocSession* self;
+      Knobs knobs;
+      ~RestoreKnobs() { self->SetKnobs(knobs); }
+    } restore(this, session);
     if (ImageMatches(committed_)) {
       work_ = committed_;
       return "";
@@ -1546,12 +1564,12 @@ class OocSession {
       }
       sl += static_cast<int64_t>(r.pad.size());
     }
-    return {
-        "SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) "
-        "FROM " +
-            t.name,
-        {Join({I(n), SumOrNull(n, sk), SumOrNull(cv, sv), I(cv),
-               SumOrNull(n, sl)})}};
+    return {.sql =
+                "SELECT COUNT(*), SUM(k), SUM(v), COUNT(v), SUM(LENGTH(pad)) "
+                "FROM " +
+                t.name,
+            .expected = {Join({I(n), SumOrNull(n, sk), SumOrNull(cv, sv), I(cv),
+                               SumOrNull(n, sl)})}};
   }
 
   std::string QuickCheck(const MTable& t, TransactionContext& ctx,
@@ -1643,10 +1661,12 @@ class OocSession {
         sl += static_cast<int64_t>(r.pad.size());
       }
       spec = CheckSpec{
-          "SELECT COUNT(*), SUM(m), SUM(c) FROM (SELECT k, MAX(LENGTH(pad)) "
-          "AS m, COUNT(*) AS c FROM " +
+          .sql =
+              "SELECT COUNT(*), SUM(m), SUM(c) FROM (SELECT k, "
+              "MAX(LENGTH(pad)) "
+              "AS m, COUNT(*) AS c FROM " +
               t->name + " GROUP BY k)",
-          {Join({I(n), SumOrNull(n, sl), SumOrNull(n, n)})}};
+          .expected = {Join({I(n), SumOrNull(n, sl), SumOrNull(n, n)})}};
     } else if (kind == "strag") {
       spec = StringAggSpec(*t);
     } else if (kind == "distinct") {
@@ -1857,7 +1877,7 @@ class OocSession {
                           I(static_cast<int64_t>(it->second.pad.size())),
                           it->second.pad}));
     }
-    for (size_t i = static_cast<size_t>(offset);
+    for (auto i = static_cast<size_t>(offset);
          i < all.size() && s.expected.size() < static_cast<size_t>(limit);
          ++i) {
       s.expected.push_back(all[i]);
@@ -1951,14 +1971,14 @@ class OocSession {
         v.insert(*r.v);
       }
     }
-    return {
-        "SELECT COUNT(DISTINCT g), COUNT(DISTINCT t), COUNT(DISTINCT "
-        "LENGTH(pad)), COUNT(DISTINCT v) FROM " +
-            t.name,
-        {Join({I(static_cast<int64_t>(g.size())),
-               I(static_cast<int64_t>(tag.size())),
-               I(static_cast<int64_t>(len.size())),
-               I(static_cast<int64_t>(v.size()))})}};
+    return {.sql =
+                "SELECT COUNT(DISTINCT g), COUNT(DISTINCT t), COUNT(DISTINCT "
+                "LENGTH(pad)), COUNT(DISTINCT v) FROM " +
+                t.name,
+            .expected = {Join({I(static_cast<int64_t>(g.size())),
+                               I(static_cast<int64_t>(tag.size())),
+                               I(static_cast<int64_t>(len.size())),
+                               I(static_cast<int64_t>(v.size()))})}};
   }
 
   static CheckSpec WindowSpec(const MTable& t) {
@@ -2010,14 +2030,15 @@ class OocSession {
       }
     }
     return {
-        "SELECT COUNT(*), SUM(k * rn), SUM(rk), SUM(w), COUNT(w) FROM "
-        "(SELECT k, ROW_NUMBER() OVER (PARTITION BY g ORDER BY k DESC) AS "
-        "rn, RANK() OVER (PARTITION BY g ORDER BY t) AS rk, SUM(v) OVER "
-        "(PARTITION BY g ORDER BY k ROWS BETWEEN 3 PRECEDING AND 1 "
-        "FOLLOWING) AS w FROM " +
+        .sql =
+            "SELECT COUNT(*), SUM(k * rn), SUM(rk), SUM(w), COUNT(w) FROM "
+            "(SELECT k, ROW_NUMBER() OVER (PARTITION BY g ORDER BY k DESC) AS "
+            "rn, RANK() OVER (PARTITION BY g ORDER BY t) AS rk, SUM(v) OVER "
+            "(PARTITION BY g ORDER BY k ROWS BETWEEN 3 PRECEDING AND 1 "
+            "FOLLOWING) AS w FROM " +
             t.name + ")",
-        {Join({I(n), SumOrNull(n, s_krn), SumOrNull(n, s_rk),
-               SumOrNull(c_w, s_w), I(c_w)})}};
+        .expected = {Join({I(n), SumOrNull(n, s_krn), SumOrNull(n, s_rk),
+                           SumOrNull(c_w, s_w), I(c_w)})}};
   }
 
   static CheckSpec SortPadSpec(const MTable& t, int64_t limit) {
@@ -2035,8 +2056,7 @@ class OocSession {
     CheckSpec s;
     s.sql = "SELECT k, LENGTH(pad), SUBSTR(pad, 1, 16) FROM " + t.name +
             " ORDER BY pad DESC, k LIMIT " + I(limit);
-    for (size_t i = 0; i < order.size() && i < static_cast<size_t>(limit);
-         ++i) {
+    for (size_t i = 0; i < order.size() && std::cmp_less(i, limit); ++i) {
       s.expected.push_back(Join(
           {I(order[i].second), I(static_cast<int64_t>(order[i].first->size())),
            order[i].first->substr(0, 16)}));
@@ -2063,11 +2083,12 @@ class OocSession {
       }
       sl += static_cast<int64_t>(ra.pad.size() + it->second.pad.size());
     }
-    return {
-        "SELECT COUNT(*), SUM(a.k), SUM(b.v), SUM(LENGTH(a.pad) + "
-        "LENGTH(b.pad)) FROM " +
-            a.name + " a JOIN " + b.name + " b ON a.k = b.k",
-        {Join({I(n), SumOrNull(n, sk), SumOrNull(cv, sv), SumOrNull(n, sl)})}};
+    return {.sql =
+                "SELECT COUNT(*), SUM(a.k), SUM(b.v), SUM(LENGTH(a.pad) + "
+                "LENGTH(b.pad)) FROM " +
+                a.name + " a JOIN " + b.name + " b ON a.k = b.k",
+            .expected = {Join({I(n), SumOrNull(n, sk), SumOrNull(cv, sv),
+                               SumOrNull(n, sl)})}};
   }
 
   static CheckSpec JoinGSpec(const MTable& a, const MTable& b) {
@@ -2093,9 +2114,9 @@ class OocSession {
       sa += ca.second * it->second.first;
       sb += ca.first * it->second.second;
     }
-    return {"SELECT COUNT(*), SUM(a.k), SUM(b.k) FROM " + a.name + " a JOIN " +
-                b.name + " b ON a.g = b.g",
-            {Join({I(n), SumOrNull(n, sa), SumOrNull(n, sb)})}};
+    return {.sql = "SELECT COUNT(*), SUM(a.k), SUM(b.k) FROM " + a.name +
+                   " a JOIN " + b.name + " b ON a.g = b.g",
+            .expected = {Join({I(n), SumOrNull(n, sa), SumOrNull(n, sb)})}};
   }
 
   static CheckSpec LeftKSpec(const MTable& a, const MTable& b) {
@@ -2111,9 +2132,9 @@ class OocSession {
         ++matched;
       }
     }
-    return {"SELECT COUNT(*), COUNT(b.k), SUM(a.k) FROM " + a.name +
-                " a LEFT JOIN " + b.name + " b ON a.k = b.k AND b.v > 500",
-            {Join({I(n), I(matched), SumOrNull(n, sk)})}};
+    return {.sql = "SELECT COUNT(*), COUNT(b.k), SUM(a.k) FROM " + a.name +
+                   " a LEFT JOIN " + b.name + " b ON a.k = b.k AND b.v > 500",
+            .expected = {Join({I(n), I(matched), SumOrNull(n, sk)})}};
   }
 
   static CheckSpec SetOpSpec(const MTable& a, const MTable& b, int64_t mode) {
@@ -2122,9 +2143,9 @@ class OocSession {
       for (const auto& [k, r] : a.rows) {
         n += b.rows.contains(k) ? 1 : 0;
       }
-      return {"SELECT COUNT(*) FROM (SELECT k FROM " + a.name +
-                  " INTERSECT DISTINCT SELECT k FROM " + b.name + ")",
-              {I(n)}};
+      return {.sql = "SELECT COUNT(*) FROM (SELECT k FROM " + a.name +
+                     " INTERSECT DISTINCT SELECT k FROM " + b.name + ")",
+              .expected = {I(n)}};
     }
     std::set<std::pair<int64_t, int>> pa;
     std::set<std::pair<int64_t, int>> pb;
@@ -2137,17 +2158,17 @@ class OocSession {
     if (mode == 2) {
       std::set<std::pair<int64_t, int>> u = pa;
       u.insert(pb.begin(), pb.end());
-      return {"SELECT COUNT(*) FROM (SELECT g, t FROM " + a.name +
-                  " UNION DISTINCT SELECT g, t FROM " + b.name + ")",
-              {I(static_cast<int64_t>(u.size()))}};
+      return {.sql = "SELECT COUNT(*) FROM (SELECT g, t FROM " + a.name +
+                     " UNION DISTINCT SELECT g, t FROM " + b.name + ")",
+              .expected = {I(static_cast<int64_t>(u.size()))}};
     }
     int64_t n = 0;
     for (const auto& p : pa) {
       n += pb.contains(p) ? 0 : 1;
     }
-    return {"SELECT COUNT(*) FROM (SELECT g, t FROM " + a.name +
-                " EXCEPT DISTINCT SELECT g, t FROM " + b.name + ")",
-            {I(n)}};
+    return {.sql = "SELECT COUNT(*) FROM (SELECT g, t FROM " + a.name +
+                   " EXCEPT DISTINCT SELECT g, t FROM " + b.name + ")",
+            .expected = {I(n)}};
   }
 
   // ---- budget-invariance oracle (ooca-v2.md G2) --------------------------
@@ -2169,8 +2190,10 @@ class OocSession {
 
   [[nodiscard]] Knobs CurrentKnobs() const {
     const ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
-    return {b.OpMemoryOverrideBytes(), b.AlwaysSpillEnabled(),
-            b.TempLimitBytes(), force_relational_};
+    return {.opmem = b.OpMemoryOverrideBytes(),
+            .spill = b.AlwaysSpillEnabled(),
+            .temp = b.TempLimitBytes(),
+            .route = force_relational_};
   }
 
   void SetKnobs(const Knobs& k) {
@@ -2444,7 +2467,7 @@ class OocSession {
       if (line.starts_with(kActual)) {
         int64_t n = -1;
         if (ParseI64(std::string_view(line).substr(kActual.size()), &n) &&
-            n != static_cast<int64_t>(expected_rows)) {
+            std::cmp_not_equal(n, expected_rows)) {
           return "EXPLAIN ANALYZE reports `" + line +
                  "` but the query returns " + std::to_string(expected_rows) +
                  " rows: " + Shorten(sql, 600) + "\n";
@@ -2556,8 +2579,12 @@ class OocSession {
     const std::string label =
         "sweep " + head[1] + " `" + Shorten(inner, 120) + "` ";
     int points = 0;
+    // Visit every point up to 256 (and to cap when smaller); only beyond that
+    // relax to geometric spacing. The old `n/4` step from 33 onward skipped
+    // ~97% of failure points in 33..400, so off-by-one budget bugs at small
+    // injection counts went untested.
     for (int64_t n = 1; n <= cap;
-         n = n < 32 ? n + 1 : n + std::max<int64_t>(1, n / 4)) {
+         n = n < 256 ? n + 1 : n + std::max<int64_t>(1, n / 4)) {
       (head[1] == "mem" ? pending_mem_ : pending_io_) =
           static_cast<uint64_t>(n);
       std::string r = RunOp(inner);
@@ -2756,18 +2783,174 @@ struct Flavor {
 constexpr Flavor kFlavors[] = {
     // name     ins val cpy dup  upd  del  chk  qry com abo cra reo ckp evi cmp
     //          knb inj swp snp idx ana ddl skew wide narrow tiny rows
-    {"mixed", 110, 40, 30, 10, 120, 60, 150, 120, 70, 25, 25, 15,    30,
-     55,      20,  40, 30, 10, 35,  20, 10,  20,  15, 12, 20, false, 2},
-    {"query", 40, 10, 15, 5,  40, 20, 80, 520, 40, 10, 10, 8,     15,
-     40,      15, 70, 25, 10, 20, 25, 10, 10,  20, 8,  45, false, 6},
-    {"bigtxn", 160, 30, 50, 5, 260, 110, 110, 60, 12, 40, 35, 10,   25,
-     90,       5,   20, 20, 5, 60,  10,  5,   10, 10, 25, 10, true, 2},
-    {"skew", 60, 15, 20, 5,  60, 25, 100, 480, 40, 10, 10, 8,     15,
-     40,     15, 60, 20, 10, 15, 25, 10,  10,  90, 5,  40, false, 4},
-    {"inject", 70, 20, 20,  5,   70, 30, 60, 120, 50, 20, 20, 10,    20,
-     40,       15, 30, 150, 220, 20, 15, 5,  10,  20, 10, 20, false, 2},
-    {"wide", 120, 40, 40, 5,  140, 50, 140, 160, 60, 20, 25, 15,    30,
-     60,     25,  40, 30, 10, 30,  20, 10,  20,  10, 85, 0,  false, 1},
+    {.name = "mixed",
+     .insert = 110,
+     .values = 40,
+     .copy = 30,
+     .dup = 10,
+     .update = 120,
+     .del = 60,
+     .check = 150,
+     .query = 120,
+     .commit = 70,
+     .abort = 25,
+     .crash = 25,
+     .reopen = 15,
+     .checkpoint = 30,
+     .evict = 55,
+     .compact = 20,
+     .knob = 40,
+     .inject = 30,
+     .sweep = 10,
+     .snap = 35,
+     .index = 20,
+     .analyze = 10,
+     .ddl = 20,
+     .skew_pct = 15,
+     .wide_pct = 12,
+     .narrow_pct = 20,
+     .tiny_pool = false,
+     .rows_factor = 2},
+    {.name = "query",
+     .insert = 40,
+     .values = 10,
+     .copy = 15,
+     .dup = 5,
+     .update = 40,
+     .del = 20,
+     .check = 80,
+     .query = 520,
+     .commit = 40,
+     .abort = 10,
+     .crash = 10,
+     .reopen = 8,
+     .checkpoint = 15,
+     .evict = 40,
+     .compact = 15,
+     .knob = 70,
+     .inject = 25,
+     .sweep = 10,
+     .snap = 20,
+     .index = 25,
+     .analyze = 10,
+     .ddl = 10,
+     .skew_pct = 20,
+     .wide_pct = 8,
+     .narrow_pct = 45,
+     .tiny_pool = false,
+     .rows_factor = 6},
+    {.name = "bigtxn",
+     .insert = 160,
+     .values = 30,
+     .copy = 50,
+     .dup = 5,
+     .update = 260,
+     .del = 110,
+     .check = 110,
+     .query = 60,
+     .commit = 12,
+     .abort = 40,
+     .crash = 35,
+     .reopen = 10,
+     .checkpoint = 25,
+     .evict = 90,
+     .compact = 5,
+     .knob = 20,
+     .inject = 20,
+     .sweep = 5,
+     .snap = 60,
+     .index = 10,
+     .analyze = 5,
+     .ddl = 10,
+     .skew_pct = 10,
+     .wide_pct = 25,
+     .narrow_pct = 10,
+     .tiny_pool = true,
+     .rows_factor = 2},
+    {.name = "skew",
+     .insert = 60,
+     .values = 15,
+     .copy = 20,
+     .dup = 5,
+     .update = 60,
+     .del = 25,
+     .check = 100,
+     .query = 480,
+     .commit = 40,
+     .abort = 10,
+     .crash = 10,
+     .reopen = 8,
+     .checkpoint = 15,
+     .evict = 40,
+     .compact = 15,
+     .knob = 60,
+     .inject = 20,
+     .sweep = 10,
+     .snap = 15,
+     .index = 25,
+     .analyze = 10,
+     .ddl = 10,
+     .skew_pct = 90,
+     .wide_pct = 5,
+     .narrow_pct = 40,
+     .tiny_pool = false,
+     .rows_factor = 4},
+    {.name = "inject",
+     .insert = 70,
+     .values = 20,
+     .copy = 20,
+     .dup = 5,
+     .update = 70,
+     .del = 30,
+     .check = 60,
+     .query = 120,
+     .commit = 50,
+     .abort = 20,
+     .crash = 20,
+     .reopen = 10,
+     .checkpoint = 20,
+     .evict = 40,
+     .compact = 15,
+     .knob = 30,
+     .inject = 150,
+     .sweep = 220,
+     .snap = 20,
+     .index = 15,
+     .analyze = 5,
+     .ddl = 10,
+     .skew_pct = 20,
+     .wide_pct = 10,
+     .narrow_pct = 20,
+     .tiny_pool = false,
+     .rows_factor = 2},
+    {.name = "wide",
+     .insert = 120,
+     .values = 40,
+     .copy = 40,
+     .dup = 5,
+     .update = 140,
+     .del = 50,
+     .check = 140,
+     .query = 160,
+     .commit = 60,
+     .abort = 20,
+     .crash = 25,
+     .reopen = 15,
+     .checkpoint = 30,
+     .evict = 60,
+     .compact = 25,
+     .knob = 40,
+     .inject = 30,
+     .sweep = 10,
+     .snap = 30,
+     .index = 20,
+     .analyze = 10,
+     .ddl = 20,
+     .skew_pct = 10,
+     .wide_pct = 85,
+     .narrow_pct = 0,
+     .tiny_pool = false,
+     .rows_factor = 1},
 };
 constexpr int kFlavorCount = static_cast<int>(std::size(kFlavors));
 
@@ -3293,7 +3476,7 @@ std::string GenerateSession(Gen& g, OocSession& s, OocTrace& trace,
       target *= g.Pick(2, 4 * f.rows_factor);
     }
     while (ti < s.Tables().size() &&
-           static_cast<int64_t>(s.Tables()[ti].rows.size()) < target &&
+           std::cmp_less(s.Tables()[ti].rows.size(), target) &&
            elapsed() < budget_seconds / 3) {
       std::string op = d.BulkInsertOp(s.Tables()[ti], false);
       if (op.empty()) {
@@ -3619,8 +3802,11 @@ struct PoolUsage {
 
   static PoolUsage Now() {
     const ProcessMemoryBudget& b = ProcessMemoryBudget::Global();
-    return {b.StorageUsed(), b.ColumnarUsed(), b.QueryUsed(), b.TxUsed(),
-            b.EmergencyUsed()};
+    return {.storage = b.StorageUsed(),
+            .columnar = b.ColumnarUsed(),
+            .query = b.QueryUsed(),
+            .tx = b.TxUsed(),
+            .emergency = b.EmergencyUsed()};
   }
   bool operator==(const PoolUsage&) const = default;
   [[nodiscard]] std::string Text() const {
@@ -3860,9 +4046,8 @@ std::string OocFailureSignature(std::string_view report) {
       nl == std::string_view::npos ? std::string_view{} : report.substr(nl + 1);
   // Drop the statement text and op text that follow the message.
   size_t cut = head.find(": ");
-  if (const size_t tick = head.find(" `"); tick < cut) {
-    cut = tick;
-  }
+  const size_t tick = head.find(" `");
+  cut = std::min(tick, cut);
   head = head.substr(0, cut);
   std::string out = prefix + Digitless(head);
   while (!rest.empty() && rest.front() == ' ') {

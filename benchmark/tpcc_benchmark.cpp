@@ -382,6 +382,11 @@ int main(int argc, char** argv) {
       tinylamb::PlanCacheStats().hits.load(std::memory_order_relaxed);
   const uint64_t plan_misses_before =
       tinylamb::PlanCacheStats().misses.load(std::memory_order_relaxed);
+  const uint64_t plan_replays_before =
+      tinylamb::PlanCacheStats().replays.load(std::memory_order_relaxed);
+  const uint64_t plan_parameter_mismatches_before =
+      tinylamb::PlanCacheStats().parameter_mismatches.load(
+          std::memory_order_relaxed);
 
   std::cout << "clients=" << options.clients << '\n'
             << "synchronous_commit="
@@ -647,10 +652,12 @@ int main(int argc, char** argv) {
       tinylamb::PlanCacheStats().misses.load(std::memory_order_relaxed) -
       plan_misses_before;
   const uint64_t plan_replays =
-      tinylamb::PlanCacheStats().replays.load(std::memory_order_relaxed);
+      tinylamb::PlanCacheStats().replays.load(std::memory_order_relaxed) -
+      plan_replays_before;
   const uint64_t plan_parameter_mismatches =
       tinylamb::PlanCacheStats().parameter_mismatches.load(
-          std::memory_order_relaxed);
+          std::memory_order_relaxed) -
+      plan_parameter_mismatches_before;
   std::cout << "plan_cache_hits=" << plan_hits << '\n'
             << "plan_cache_misses=" << plan_misses << '\n'
             << "plan_cache_replays=" << plan_replays << '\n'

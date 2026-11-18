@@ -88,4 +88,4 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp` の `SemiJoinInnerJoinReorder`: `(r ⋉ s) ⋈ t` の論理式を探索した際、ルートグループに右の子を `s` とする `kSemiJoin` 代替式（`(r ⋈ t) ⋉ s`）が正常に生成されることを検証します。
+- `plan/cascades_test_part*.cpp` の `SemiJoinInnerJoinReorder`: `(r ⋉ s) ⋈ t` の論理式を探索した際、ルートグループに右の子を `s` とする `kSemiJoin` 代替式（`(r ⋈ t) ⋉ s`）が正常に生成されることを検証します。

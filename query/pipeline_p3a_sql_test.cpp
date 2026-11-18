@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <future>
 #include <memory>
@@ -182,6 +183,43 @@ void PopulateJoinAggDataset(PipelineP3aSqlTest* t, size_t fact_rows,
   }
 }
 
+TEST_F(PipelineP3aSqlTest, GroupedMinMaxPoisonsNanLikeCanonical) {
+  // GoogleSQL: any NaN in the group makes MIN/MAX NaN. The typed partitioned
+  // aggregate used to keep only the stored extreme, so MAX silently returned
+  // a finite value for a group containing NaN.
+  ExecDdlOrInsert("CREATE TABLE g_nan (g INT64, f FLOAT64);");
+  ExecDdlOrInsert(
+      "INSERT INTO g_nan VALUES "
+      "(1, 1.5), (1, CAST('NaN' AS FLOAT64)), (1, -2.5), "
+      "(2, 3.0), (2, 4.0)");
+  const auto rows =
+      MustRun("SELECT g, MIN(f), MAX(f) FROM g_nan GROUP BY g ORDER BY g");
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{1}));
+  ASSERT_TRUE(std::isnan(rows[0][1].value.double_value)) << rows[0][1];
+  ASSERT_TRUE(std::isnan(rows[0][2].value.double_value)) << rows[0][2];
+  EXPECT_EQ(rows[1][0], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][1], Value(3.0));
+  EXPECT_EQ(rows[1][2], Value(4.0));
+}
+
+TEST_F(PipelineP3aSqlTest, GroupedDistinctOrderByMatchesRelationalLane) {
+  // DISTINCT + ORDER BY on the grouped OOC lane picked a different survivor
+  // representative for groups sharing the visible prefix than the relational
+  // lane's first-occurrence fold (the hidden order payload of the survivor
+  // decides the final sort position), inverting the row order between lanes.
+  // The combination now delegates to the relational path.
+  ExecDdlOrInsert("CREATE TABLE gd (k INT64, v INT64);");
+  ExecDdlOrInsert(
+      "INSERT INTO gd VALUES (2, 30), (2, 10), (1, 5), (1, 20), (3, 7)");
+  const auto rows =
+      MustRun("SELECT DISTINCT k FROM gd GROUP BY k, v ORDER BY SUM(v) DESC");
+  ASSERT_EQ(rows.size(), 3U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{2}));
+  EXPECT_EQ(rows[1][0], Value(int64_t{1}));
+  EXPECT_EQ(rows[2][0], Value(int64_t{3}));
+}
+
 TEST_F(PipelineP3aSqlTest, G3AndG4ParityUnderSpillAndNormalVsLegacy) {
   OocKnobsResetGuard reset_knobs;
   PopulateJoinAggDataset(this, /*fact_rows=*/2500, /*dim_rows=*/400);
@@ -251,7 +289,7 @@ TEST_F(PipelineP3aSqlTest, G3AndG4ParityUnderSpillAndNormalVsLegacy) {
   const auto pipe_normal = capture_all("pipeline", 0, false);
   // G4: Pipeline under strict AlwaysSpill.
   const auto pipe_always_spill = capture_all("pipeline", 64ULL << 10, true);
-  // G3: Pipeline under 1 MiB budget on >1 MiB rows? Wait: verify 64 KiB + 1 MiB
+  // G3: results must match legacy under both a 64 KiB always-spill budget and
   // both match.
   const auto pipe_1mib = capture_all("pipeline", 1ULL << 20, false);
 
@@ -313,7 +351,8 @@ TEST_F(PipelineP3aSqlTest, G5TempLimitFaultAndMemoryCoordinatorSharing) {
   ASSERT_FALSE(res.HasValue());
   EXPECT_EQ(res.GetStatus().GetCode(), StatusCode::kNoSpace);
 
-  // Clearing temp limit allows subsequent query to succeed cleanly (no leaks).
+  // Clearing the temp limit lets a subsequent query succeed; spill/grant
+  // leak-freedom of the failed query is not asserted by this check.
   ProcessMemoryBudget::Global().SetTestTempLimitBytes(0);
   const auto ok =
       Run("SELECT COUNT(*) FROM fact f JOIN dim d ON f.f_key = d.d_id;");

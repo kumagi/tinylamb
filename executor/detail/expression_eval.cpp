@@ -1525,7 +1525,7 @@ StatusOr<Value> TryBinary(BinaryOperation operation, const Value& left,
   // Canonical evaluation rules live in the AST evaluator (TryEvaluateBinary,
   // binary_expression.cpp): forwarding keeps SQL three-valued logic for
   // AND/OR/XOR, int64 overflow guards and mixed-type promotion identical
-  // across the bytecode, AST and scan-filter paths (improvement3.md A6/S7).
+  // across the bytecode, AST and scan-filter paths.
   StatusOr<Value> result = TryEvaluateBinary(operation, left, right);
   if (!result.HasValue()) {
     // Message texts pinned by executor tests for this path; the semantics
@@ -1559,6 +1559,54 @@ StatusOr<Value> Aggregate(const AggregateExpression& aggregate,
 
 // Recursive descent over the expression tree is the intended evaluation
 // strategy.
+namespace {
+
+bool IsDatePartKeyword(std::string_view name) {
+  std::string upper_name(name);
+  for (char& c : upper_name) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return upper_name == "DAY" || upper_name == "WEEK" || upper_name == "MONTH" ||
+         upper_name == "QUARTER" || upper_name == "YEAR" ||
+         upper_name == "HOUR" || upper_name == "MINUTE" ||
+         upper_name == "SECOND" || upper_name == "MILLISECOND" ||
+         upper_name == "MICROSECOND" || upper_name == "NANOSECOND" ||
+         upper_name == "MONDAY" || upper_name == "TUESDAY" ||
+         upper_name == "WEDNESDAY" || upper_name == "THURSDAY" ||
+         upper_name == "FRIDAY" || upper_name == "SATURDAY" ||
+         upper_name == "SUNDAY" || upper_name == "ISOYEAR" ||
+         upper_name == "ISOWEEK" || upper_name == "DATE";
+}
+
+}  // namespace
+
+Status ValidateExpressionColumnsInScope(const Expression& expression,
+                                        const Schema& schema,
+                                        const Scope* outer) {
+  if (!expression) {
+    return Status::kSuccess;
+  }
+  if (outer != nullptr && outer->row == nullptr) {
+    return Status::kSuccess;
+  }
+  const Row dummy_row(std::vector<Value>(schema.ColumnCount()));
+  const Scope dummy_scope{.row = &dummy_row, .schema = &schema, .outer = outer};
+  for (const ColumnName& name : expression->TouchedColumns()) {
+    if (name.name == "*" && name.schema.empty()) {
+      continue;
+    }
+    StatusOr<Value> lookup = TryLookup(name, dummy_scope);
+    if (lookup.HasValue()) {
+      continue;
+    }
+    if (IsDatePartKeyword(name.name)) {
+      continue;
+    }
+    return lookup.GetStatus();
+  }
+  return Status::kSuccess;
+}
+
 StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
     const Expression& expression, const Scope& scope,
     const AggregateResultMap* aggregates, TransactionContext& context,
@@ -1573,21 +1621,11 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
       if (lookup.HasValue()) {
         return lookup;
       }
-      std::string upper_name = name.name;
-      for (char& c : upper_name) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-      }
-      if (upper_name == "DAY" || upper_name == "WEEK" ||
-          upper_name == "MONTH" || upper_name == "QUARTER" ||
-          upper_name == "YEAR" || upper_name == "HOUR" ||
-          upper_name == "MINUTE" || upper_name == "SECOND" ||
-          upper_name == "MILLISECOND" || upper_name == "MICROSECOND" ||
-          upper_name == "NANOSECOND" || upper_name == "MONDAY" ||
-          upper_name == "TUESDAY" || upper_name == "WEDNESDAY" ||
-          upper_name == "THURSDAY" || upper_name == "FRIDAY" ||
-          upper_name == "SATURDAY" || upper_name == "SUNDAY" ||
-          upper_name == "ISOYEAR" || upper_name == "ISOWEEK" ||
-          upper_name == "DATE") {
+      if (IsDatePartKeyword(name.name)) {
+        std::string upper_name = name.name;
+        for (char& c : upper_name) {
+          c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
         return Value(std::move(upper_name));
       }
       return lookup.GetStatus();
@@ -2137,7 +2175,6 @@ Schema QualifySchema(const Schema& schema, std::string_view qualifier) {
   return {"", std::move(columns)};
 }
 
-namespace {
 // Mutual recursion with CollectStatementColumns below; the statement/expression
 // nesting is bounded by query depth.
 void CollectExpressionColumns(  // NOLINT(misc-no-recursion)
@@ -2155,7 +2192,6 @@ void CollectExpressionColumns(  // NOLINT(misc-no-recursion)
     CollectExpressionColumns(child, columns);
   }
 }
-}  // namespace
 
 void CollectStatementColumns(  // NOLINT(misc-no-recursion)
     const SelectStatement& statement, std::unordered_set<ColumnName>* columns) {
@@ -2206,6 +2242,21 @@ void CollectStatementColumns(  // NOLINT(misc-no-recursion)
   for (const auto& [name, query] : statement.WithQueries()) {
     (void)name;
     CollectStatementColumns(*query, columns);
+  }
+  for (const auto& branch : statement.UnionAll()) {
+    if (branch != nullptr) {
+      CollectStatementColumns(*branch, columns);
+    }
+  }
+  if (const auto& tree = statement.GetSetOperationTree(); tree != nullptr) {
+    if (tree->first != nullptr) {
+      CollectStatementColumns(*tree->first, columns);
+    }
+    for (const auto& branch : tree->branches) {
+      if (branch != nullptr) {
+        CollectStatementColumns(*branch, columns);
+      }
+    }
   }
 }
 

@@ -4,7 +4,7 @@
 
 ## TPC-Cの3製品比較
 
-[2026-11-06の結果](../../docs/tpcc_three_comparison_2026-11-06.md)は、DuckDB／Oracleを除く
+2026-11-06 の結果（`benchmark/comparison/results/2026-11-06-tpcc-three-quiet/`）は、DuckDB／Oracleを除く
 Tinylamb C8・PostgreSQL・MySQLのW=1比較。10接続、warmup5秒＋30秒、3試行。
 SFはTPC-Hの指定で、TPC-Cは倉庫数Wを使う。
 
@@ -89,7 +89,7 @@ DuckDBは永続ファイルと標準WAL設定を使い、in-memory DBや耐久�
 回帰検証: `python -m unittest discover -s benchmark/comparison -p '*_test.py'`。
 DuckDB用の実接続テストにはlocalhostでのlisten権限が必要。
 
-初回の[5製品比較レポート](../../docs/duckdb_comparison_2026-11-05.md)には
+初回の5製品比較結果（`benchmark/comparison/results/2026-11-05-duckdb-5engine-indexed/`）には
 395 OLAP測定・495 OLTP／HTAP試行を保存している。全測定後の容量メタデータ取得が失敗したため、
 元の記録を改変せずSHA-256付きの回復記録と独立監査を添えた。
 現行コードは容量取得SQLを修正し、5製品スモークで終了処理まで検証済み。
@@ -150,12 +150,12 @@ Freeの制限とTPC由来の非認証試験であることは結果レポート�
 [リソース制限](https://docs.oracle.com/en/database/oracle/oracle-database/26/xeinl/licensing-restrictions.html)、
 [Free Use Terms](https://www.oracle.com/downloads/licenses/oracle-free-license.html)。
 
-初回の4製品実測は[2026-10-31のレポート](../../docs/oracle_free_comparison_2026-10-31.md)。
+初回の4製品実測は `benchmark/comparison/results/2026-10-31-oracle-2core-indexed-final/`。
 2コア、共通二次索引、OLAP 316測定・OLTP／HTAP 396試行を保存している。
 
 ## 最新の改善結果
 
-[2026-10-30のPG比2倍以内への改善レポート](../../docs/postgresql_twofold_results_2026-10-30.md)。
+`benchmark/comparison/results/2026-10-30-pg15/` 関連の標準比較:
 C34は全種目の標準比較（OLAP 474測定、Tiny/PG OLTP 396試行）を完了し、
 短時間の13残差を同じバイナリの長窓・101反復・PG状態確認で再評価した。
 最終の元161対象／全456比較は今回PG比2倍以内。標準短窓の結果と精密再測定を
@@ -252,7 +252,7 @@ OLTPは各試行後に行数と残高総和を検査する。更新では全成�
 
 待機やネットワーク停止にはDB／ドライバ側タイムアウトと子プロセスの監督期限を設ける。tinylambにはSQLキャンセル機構がないため、子プロセスを停止してもサーバ内部のクエリ終了は保証しない。タイムアウト発生時の後続値はログと負荷を確認して扱う。
 
-最新の全条件再測定は[2026年10月29日・第5巡のレポート](../../docs/benchmark_full_comparison_2026-10-29.md)。EXISTSとOLTP読み取りの改善後、追加索引なし／共通二次索引ありの両方で、3スケールの共通OLAP、TPC-H全22クエリ、全OLTP／HTAPを測定した。第2巡は[前回のフル測定](../../docs/benchmark_full_rerun_2026-10-29.md)、第1巡は[10月29日の旧レポート](../../docs/olap_oltp_comparison_2026-10-29.md)、修正前の基準値と64／256 MiB時のspill等の追測は[10月28日のレポート](../../docs/olap_oltp_comparison_2026-10-28.md)に保存している。未測定の領域は、キャッシュを超えるデータ、長時間定常負荷、分離異常、障害・再起動、レプリケーション、prepared protocol、TPC-C／TPC-DSの3製品共通実装など。ベンチマークの範囲を広く取っているが、これらまで測定済みとは扱わない。
+最新の全条件再測定は `results/2026-10-29-full5/`（詳細な過去レポートは整理済み; 各実験の一次記録・CSV・プランは `results/` と [`BenchmarkHistory.md`](../../BenchmarkHistory.md) に保存）。EXISTSとOLTP読み取りの改善後、追加索引なし／共通二次索引ありの両方で、3スケールの共通OLAP、TPC-H全22クエリ、全OLTP／HTAPを測定した。未測定の領域は、キャッシュを超えるデータ、長時間定常負荷、分離異常、障害・再起動、レプリケーション、prepared protocol、TPC-C／TPC-DSの3製品共通実装など。ベンチマークの範囲を広く取っているが、これらまで測定済みとは扱わない。
 
 ## 第5巡の全種目比較
 
@@ -323,8 +323,7 @@ p95／p99はtailとして分け、HTAPはreader／transactionの役割別にも�
 既定はPostgreSQL。JSONの参照値・サンプル・エラー・詳細ファイルのキーと
 表の製品名も選択した参照先に合わせる。
 
-[10月29日の指標別改善計画](../../docs/postgresql_gap_plan_2026-10-29.md)と
-[TODO](../../TODO.md)に、各指標の原因候補・修正順序・合格条件を対応付けた。
+各指標の原因候補・修正順序・合格条件の詳細は [`BenchmarkHistory.md`](../../BenchmarkHistory.md) および [TODO](../../TODO.md) を参照。
 
 ### 長時間の差分検証
 
@@ -348,8 +347,7 @@ HTAPの1接続は分析reader単独、4/16接続はreader 1＋writer 3/15。
 
 ## A–Hの最終追測と再集計
 
-[実施レポート](../../docs/postgresql_gap_results_2026-10-29.md)に実装、全41指標、
-未達の5指標、writer側の後退、測定条件の限界を記載した。
+実装、全41指標、未達の5指標、writer側の後退、測定条件の限界の一次データは下記ディレクトリ群に保存している:
 `2026-10-29-gap-post-{unindexed,indexed}-olap`が最終OLAP、
 `2026-10-29-gap-final-g-{unindexed,indexed}`がG/Hの60秒×5試行、
 `2026-10-29-gap-post-f`がFの並列検索。いずれも`results/`以下に保存した。
@@ -405,8 +403,7 @@ python3 benchmark/comparison/gap_results.py \
 
 ## 第3巡のEXISTS改善と交互測定
 
-[EXISTSの追測レポート](../../docs/exists_performance_2026-10-29.md)と
-`results/2026-10-29-exists3-comparison/`に、3規模・両構成の前後比較と、
+`results/2026-10-29-exists3-comparison/` に、3規模・両構成の前後比較と、
 索引あり21反復×3組の交互測定を保存した。
 前後は`876da51b…`／`bef16c9b…`で固定し、内側の等値索引prefixから
 直接キー集合を構築する改善を比較している。
@@ -430,8 +427,7 @@ smokeの性能値は最終比較に混ぜていない。
 
 ## 第4巡のOLTP読み取り改善
 
-[読み取りの調査・改善レポート](../../docs/read_performance_2026-10-29.md)と
-`results/2026-10-29-read4-comparison/`に、非キー検索・100行範囲集計の
+`results/2026-10-29-read4-comparison/` に、非キー検索・100行範囲集計の
 追加索引なし／あり・1／4／16接続の比較を保存した。
 最終測定はsales 100万行、accounts 1万行、warmup 2秒＋5秒×3試行。
 同時期PGだけでなく、第2巡フル測定の速いPG値を固定した比率も判定する。

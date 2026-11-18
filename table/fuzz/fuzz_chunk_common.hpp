@@ -28,6 +28,8 @@
 #ifndef TINYLAMB_FUZZ_CHUNK_COMMON_HPP
 #define TINYLAMB_FUZZ_CHUNK_COMMON_HPP
 
+#include <math.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -35,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -328,6 +331,42 @@ inline SortedRun MakeRun(const std::vector<Row>& rows, const Schema& sc,
 // actually reaches.
 constexpr int64_t kStorageRows = 1200;
 
+// Floating-point bitstream schemes (Chimp/Gorilla/Patas/ALP/Xor/...) have
+// special-value paths -- NaN payload normalization, signed zero, infinities and
+// subnormal exponent crossings -- that benign normal numbers never exercise.
+// Inject a fixed spread of IEEE specials at the head of each generated column;
+// every other row keeps the caller's original fallback value.
+inline double FuzzDoubleWithSpecials(size_t index, double fallback) {
+  const double qnan_pos = [] {
+    uint64_t bits = 0x7ff8000000000001ULL;  // positive quiet NaN, payload 1
+    double value = NAN;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  }();
+  const double qnan_neg = [] {
+    uint64_t bits = 0xfff8000000000123ULL;  // negative quiet NaN, payload 0x123
+    double value = NAN;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  }();
+  static const double kSpecials[] = {
+      qnan_pos,
+      qnan_neg,
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      0.0,
+      -0.0,
+      std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min(),
+      std::numeric_limits<double>::min(),
+      -std::numeric_limits<double>::min(),
+      std::numeric_limits<double>::max(),
+      -std::numeric_limits<double>::max(),
+  };
+  constexpr size_t kSpecialCount = sizeof(kSpecials) / sizeof(kSpecials[0]);
+  return index < kSpecialCount ? kSpecials[index] : fallback;
+}
+
 // `shape` steers the adaptive encoder so different scheme families become
 // feasible:
 //   bit0 arithmetic ramp on qty/score (kArith / kPla / kPfor territory)
@@ -397,9 +436,12 @@ inline std::vector<Row> MakeStorageRows(uint8_t shape) {
     }
     vals.emplace_back("name-" + std::to_string(i % 61));
     if (ramp) {
-      vals.emplace_back(3.0 + (static_cast<double>(i) * 0.25));
+      vals.emplace_back(FuzzDoubleWithSpecials(
+          static_cast<size_t>(i), 3.0 + (static_cast<double>(i) * 0.25)));
     } else {
-      vals.emplace_back(12.5 + (static_cast<double>(i % 97) * 0.5));
+      vals.emplace_back(
+          FuzzDoubleWithSpecials(static_cast<size_t>(i % 97),
+                                 12.5 + (static_cast<double>(i % 97) * 0.5)));
     }
     if (const_flag) {
       vals.emplace_back(int64_t{7});

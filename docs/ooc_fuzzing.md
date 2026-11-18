@@ -77,8 +77,9 @@ bucketed by its `SUMMARY:` line.
 `<out>/findings/<bucket>/` holds `SIGNATURE`, `seed-N.test` (as generated),
 `seed-N.report.txt`, and after `--minimize` / `triage` a `minimized.test`.
 
-`<out>/summary.json` is rewritten after every session, so a campaign stopped
-by SIGINT/SIGTERM still reports; `--resume` adds to it and to the buckets.
+`<out>/summary.json` is rewritten after every session and at most every
+2 seconds during a campaign, so a campaign stopped by SIGINT/SIGTERM can lose
+up to the last 2 seconds of sessions; `--resume` adds to it and the buckets.
 `--max-traces N` caps the `seed-N.test` files kept per bucket (the sessions
 are still counted).  When the trace `--minimize` picked does not fail again
 on replay, the bucket gets an `UNREPRODUCED` marker (`replay holds` in
@@ -140,7 +141,7 @@ met on the way are written next to the output as `*.side-<bucket>.test`.
    query/testdata/ooc_open_findings` prints one verdict per trace:
    `STILL-FAILS`, `CHANGED` (fails differently now) or `FIXED`.
 3. Once `FIXED`, move the trace to `query/testdata/ooc_regressions/`;
-   `SqlOocFuzzer.ReplayCommittedRegressionFiles` replays that directory in
+   `OocCommittedRegressionTest` replays that directory in
    ctest.  Never put a still-failing trace there.
 
 ### Stepping over known findings

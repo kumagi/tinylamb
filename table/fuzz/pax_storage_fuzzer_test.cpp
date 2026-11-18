@@ -111,19 +111,20 @@ TEST(PaxStorageFuzzerTest, PaxMutateSeeds) {
     for (size_t k = 0; k < mask_len; ++k) {
       seed.push_back(static_cast<uint8_t>(rng.Next() & 0xFFU));
     }
+    const auto col = static_cast<uint8_t>(rng.Below(4));
     const int64_t probe = static_cast<int64_t>(rng.Next()) * 1000;
+    seed.push_back(col);
     const auto* p = reinterpret_cast<const uint8_t*>(&probe);
     seed.insert(seed.end(), p, p + 8);
-    seed.push_back(static_cast<uint8_t>(rng.Below(4)));
     EXPECT_EQ(0, FuzzPaxMutateOneInput(seed.data(), seed.size()));
   }
   for (int variant = 0; variant < 2; ++variant) {
     std::vector<uint8_t> seed(64, variant == 0 ? 0x00 : 0xFF);
     const int64_t probe = variant == 0 ? 0 : -1;
-    const auto* p = reinterpret_cast<const uint8_t*>(&probe);
     seed.erase(seed.end() - 9, seed.end());
+    seed.push_back(0);  // col
+    const auto* p = reinterpret_cast<const uint8_t*>(&probe);
     seed.insert(seed.end(), p, p + 8);
-    seed.push_back(0);
     EXPECT_EQ(0, FuzzPaxMutateOneInput(seed.data(), seed.size()));
   }
 }
@@ -210,8 +211,8 @@ TEST(PaxStorageFuzzerTest, ChunkFooterSeeds) {
         seed.push_back(shape);
         seed.push_back(target);
         seed.push_back(static_cast<uint8_t>(
-            0x1U | ((static_cast<uint32_t>(resign) & 1U) << 1) |
-            (rng.Below(4) << 3)));
+            (static_cast<uint32_t>(resign) & 0x1U) |
+            ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
         seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
         for (int k = 0; k < 4; ++k) {
           const uint32_t roll = rng.Next();
@@ -237,8 +238,8 @@ TEST(PaxStorageFuzzerTest, RegionSchemeSeeds) {
       seed.push_back(kase);
       seed.push_back(static_cast<uint8_t>(rng.Below(5)));
       seed.push_back(static_cast<uint8_t>(
-          0x1U | ((static_cast<uint32_t>(resign) & 1U) << 1) |
-          (rng.Below(4) << 3)));
+          (static_cast<uint32_t>(resign) & 0x1U) |
+          ((static_cast<uint32_t>(kase) & 0x3U) << 1)));
       seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
       for (int k = 0; k < 4; ++k) {
         const uint32_t roll = rng.Next();
@@ -264,8 +265,8 @@ TEST(PaxStorageFuzzerTest, NullmapVarcharSeeds) {
         seed.push_back(kase);
         seed.push_back(shape);
         seed.push_back(static_cast<uint8_t>(
-            0x1U | ((static_cast<uint32_t>(resign) & 1U) << 1) |
-            (rng.Below(4) << 3)));
+            (static_cast<uint32_t>(resign) & 0x1U) |
+            ((static_cast<uint32_t>(shape) & 0x3U) << 1)));
         seed.push_back(static_cast<uint8_t>(1U + rng.Below(6)));
         for (int k = 0; k < 4; ++k) {
           const uint32_t roll = rng.Next();

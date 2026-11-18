@@ -90,7 +90,7 @@ graph TD
 
 ## 検証テスト
 
-- `plan/cascades_test.cpp`:
+- `plan/cascades_test_part*.cpp`:
   - `SelfJoinEliminationReplacesJoinWithSingleScan`: 自己結合が単一のScan式に置き換わることを検証。
   - `SelfJoinEliminationRequiresProvenUniqueKey`: カタログ上の一意キー制約が存在しない場合に適用が拒否されることを検証。
   - `SelfJoinEliminationRejectsDistinctRealTables`: 異なる実表名に対する自己結合適用が正しく排除されることを検証。

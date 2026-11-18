@@ -9,9 +9,14 @@ Entry points for CLI, server and benchmarks are `SqlEngine::Execute(ctx, sql)`
 - `sql_engine.{hpp,cpp}` — facade. `QueryResult` unifies `Next`, `ForEach`,
   `Drain`, `Collect`, `AffectedRows` and `Dump`. Routes set operations
   (INTERSECT binds tighter), GROUP BY/HAVING and UNNEST/lateral queries.
+  By default (`TINYLAMB_EXEC_ENGINE` unset or `!= legacy`), SELECT execution
+  lowers plans through `executor/pipeline_lowering.hpp` (or
+  `grouped_pipeline_lowering.{hpp,cpp}` / `ColumnarTlcsScanExecutor`).
   Exposes `LastError`, `LastStatementType`, `LastDmlTable`,
   `ResultColumnNames`, `ThreadExecutionCount`, `RuntimeStats` and
   `CompliancePrimaryKeyMode`.
+- `grouped_pipeline_lowering.{hpp,cpp}` — lowers grouped SELECT pipelines onto
+  the OOC pipeline runtime.
 - `googlesql_frontend.{hpp,cpp}` — spawns the pinned external
   `TINYLAMB_GOOGLESQL_EXECUTABLE --mode=parse -`, feeds stdin and enforces a
   timeout. Uses a 16-shard parse cache (capacity 1024) and one-second negative
@@ -52,7 +57,9 @@ Entry points for CLI, server and benchmarks are `SqlEngine::Execute(ctx, sql)`
 - `testdata/googlesql_compliance/` + `googlesql_compliance_{file,test}.*` —
   corpus-driven compliance (`[mode=explain]` / `[mode=explain_analyze]`
   fragments). `sql_oracle_fuzzer.*`, `expr_oracle_fuzzer.*`,
-  `griffin_fuzzer.*` (+ `scripts/expr_oracle.py` Python oracle).
+  `griffin_fuzzer.*` (+ `scripts/expr_oracle.py` Python oracle),
+  `sql_ooc_fuzzer.*` (+ `testdata/ooc_regressions/`), `sql_session_fuzzer.*`
+  (+ `testdata/session_regressions/`).
 
 ## Before adding syntax
 
@@ -122,9 +129,8 @@ plain `CORRESPONDING` into `corresponding`, and an `ON/BY (col_list)` into
 branch. `SelectStatement::MatchFor(pair_index)` resolves it per term (falling
 back to the head-level `union_by_name_` flag for hand-built statements).
 `ExecuteRecursiveCte` is the consumer that binds values by name; **non-recursive
-set operations still match positionally and silently ignore the mode** — that
-gap is recorded in `docs/next-actions.md` (第42報), so no test should pin the
-positional answer for them.
+set operations still match positionally and silently ignore the mode**, so no
+test should pin the positional answer for them.
 
 WITH lists are resolved in dependency order, not declaration order, and the
 check runs before any rewrite: `SqlEngine::PrepareStatement` calls
@@ -190,9 +196,10 @@ plan-cache fingerprint for `FOR UPDATE` text; without that, a plan filled under
 Regressions: `QueryTest.SqlEngineForUpdate*`,
 `SqlTemplateTest.BindSelectPreservesForUpdate`.
 
-Test: `./build/query_test`, `googlesql_frontend_test`, `googlesql_ast_test`,
+Test: `./build/query_test` (`query_test_part*.cpp`),
+`googlesql_frontend_test`, `googlesql_ast_test`,
 `sql_template_test`, `join_reduction_test`, `sql_clustered_order_test`,
-`sql_collation_test`,
+`sql_collation_test`, `pipeline_p3a_sql_test`, `sql_ooc_fuzzer_test`,
 TPC-H/TPC-C suites (`sql_engine_tpch_test`, `sql_engine_tpcc_test`),
 `sql_extra_test`.
 

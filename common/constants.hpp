@@ -39,29 +39,26 @@ static constexpr size_t kPageHeaderSize = sizeof(uint32_t) +  // magic
                                           sizeof(uint64_t);   // checksum
 static constexpr size_t kPageBodySize = kPageSize - kPageHeaderSize;
 
-#define GET_PAGE_PTR(x) \
-  (reinterpret_cast<Page*>(reinterpret_cast<char*>(x) - kPageHeaderSize))
-#define GET_PAGE_CONST_PTR(x)                                       \
-  (reinterpret_cast<const Page*>(reinterpret_cast<const char*>(x) - \
-                                 kPageHeaderSize))
-#define GET_CONST_PAGE_PTR(x)                                       \
-  (reinterpret_cast<const Page*>(reinterpret_cast<const char*>(x) - \
-                                 kPageHeaderSize))
+#define TINYLAMB_DETAIL_CONCAT_IMPL(a, b) a##b
+#define TINYLAMB_DETAIL_CONCAT(a, b) TINYLAMB_DETAIL_CONCAT_IMPL(a, b)
 
-#define RETURN_IF_FAIL(expr)                               \
-  {                                                        \
-    Status tmp_status = expr;                              \
-    if (tmp_status != Status::kSuccess) return tmp_status; \
+#define RETURN_IF_FAIL(expr)                                                \
+  {                                                                         \
+    Status TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) = (expr); \
+    if (TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) !=           \
+        Status::kSuccess)                                                   \
+      return TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__);        \
   }
 
 #ifndef CRASH_IF_FAIL
-#define CRASH_IF_FAIL(expr)               \
-  {                                       \
-    Status tmp_status = expr;             \
-    if (tmp_status != Status::kSuccess) { \
-      assert(false && #expr);             \
-      abort();                            \
-    }                                     \
+#define CRASH_IF_FAIL(expr)                                                 \
+  {                                                                         \
+    Status TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) = (expr); \
+    if (TINYLAMB_DETAIL_CONCAT(tinylamb_tmp_status_, __LINE__) !=           \
+        Status::kSuccess) {                                                 \
+      assert(false && #expr);                                               \
+      abort();                                                              \
+    }                                                                       \
   }
 #endif
 
@@ -83,6 +80,7 @@ enum class StatusCode : uint8_t {
   kIOError = 13,
   kInvalidArgument = 14,
   kRuntimeError = 15,
+  kMemoryLimitExceeded = 16,
 };
 
 // A status code plus an optional human-readable message. Equality (and every
@@ -115,6 +113,8 @@ class Status {
   static const inline StatusCode kIOError{StatusCode::kIOError};
   static const inline StatusCode kInvalidArgument{StatusCode::kInvalidArgument};
   static const inline StatusCode kRuntimeError{StatusCode::kRuntimeError};
+  static const inline StatusCode kMemoryLimitExceeded{
+      StatusCode::kMemoryLimitExceeded};
 
   [[nodiscard]] StatusCode GetCode() const { return code_; }
   [[nodiscard]] bool ok() const { return code_ == StatusCode::kSuccess; }
@@ -276,8 +276,27 @@ inline std::string_view ToString(StatusCode s) {
       return "InvalidArgument";
     case StatusCode::kRuntimeError:
       return "RuntimeError";
+    case StatusCode::kMemoryLimitExceeded:
+      return "MemoryLimitExceeded";
   }
   return "INVALID STATUS";
+}
+
+// PostgreSQL SQLSTATE mapping for statement-execution errors (ADR 0012).
+[[nodiscard]] inline std::string_view SqlStateForStatus(
+    const Status& s, std::string_view fallback = "XX000") noexcept {
+  switch (s.GetCode()) {
+    case StatusCode::kMemoryLimitExceeded:
+      return "53200";
+    case StatusCode::kNoSpace:
+      return "53100";
+    case StatusCode::kConflicts:
+      return "40001";  // serialization_failure (write-intent conflict/wound)
+    case StatusCode::kDuplicates:
+      return "23505";  // unique_violation
+    default:
+      return fallback;
+  }
 }
 
 inline std::string ToString(const Status& s) {

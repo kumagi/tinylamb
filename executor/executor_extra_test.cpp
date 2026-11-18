@@ -48,6 +48,43 @@
 
 namespace tinylamb {
 
+TEST(JoinHashIndexTest, ByteSpanRetainsOffsetsAboveFourGiB) {
+  if (sizeof(size_t) <= sizeof(uint32_t)) {
+    GTEST_SKIP() << "The backing string cannot exceed 4 GiB on this platform";
+  }
+  JoinHashIndex index;
+  index.Init(JoinHashIndex::KeyMode::kBytes, 0);
+  // Test the actual slot representation without allocating a 4 GiB string.
+  auto& span = index.slot_byte_keys_.front();
+  const size_t offset = static_cast<size_t>(uint64_t{1} << 32) + 19;
+  span = {offset, 7};
+  EXPECT_EQ(span.first, offset);
+  EXPECT_EQ(span.second, 7U);
+}
+
+TEST(JoinHashIndexTest, ByteKeysAndDuplicateChainsSurviveIndexGrowth) {
+  JoinHashIndex index;
+  index.Init(JoinHashIndex::KeyMode::kBytes, 0);
+  for (size_t row = 0; row < 300; ++row) {
+    const std::string key = "key-" + std::to_string(row);
+    index.Insert(JoinHashIndex::HashBytes(key), 0, key, row);
+  }
+  const auto hash = JoinHashIndex::HashBytes("key-0");
+  index.Insert(hash, 0, "key-0", 300);
+  size_t entry = index.Find(hash, 0, "key-0");
+  ASSERT_NE(entry, JoinHashIndex::kNil);
+  EXPECT_EQ(index.RowIndex(entry), 300U);
+  entry = index.ChainNext(entry);
+  ASSERT_NE(entry, JoinHashIndex::kNil);
+  EXPECT_EQ(index.RowIndex(entry), 0U);
+  for (size_t row = 1; row < 300; ++row) {
+    const std::string key = "key-" + std::to_string(row);
+    entry = index.Find(JoinHashIndex::HashBytes(key), 0, key);
+    ASSERT_NE(entry, JoinHashIndex::kNil);
+    EXPECT_EQ(index.RowIndex(entry), row);
+  }
+}
+
 TEST(MinMaxIndexExecutorTest, EmptyAndNullPrefixProduceScalarNull) {
   auto source = std::make_shared<ValuesExecutor>(
       std::vector<Row>{Row({Value()}), Row({Value(int64_t{42})})});

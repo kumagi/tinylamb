@@ -70,6 +70,71 @@ bool TryNarrowCteBody(SelectStatement* body, const SelectStatement& outer,
 bool ReduceGroupByFunctionalDependencies(SelectStatement* select,
                                          TransactionContext& ctx);
 
+// Strips redundant DISTINCT on idempotent aggregates (MIN, MAX, LOGICAL_AND,
+// LOGICAL_OR, BIT_AND, BIT_OR) without group-context modifiers (Lean 3-1).
+bool StripIdempotentDistinctAggregates(SelectStatement* select);
+
+// Pushes HAVING MAX(col) > c / >= c and MIN(col) < c / <= c bounds into WHERE
+// when that single extremum is the only aggregate in the query and `col` has a
+// non-DOUBLE reflexive domain, keeping HAVING intact (Lean Theorems 4-2/4-2').
+bool PushHavingExtremumBounds(SelectStatement* select, TransactionContext& ctx);
+
+// Drops unused LEFT JOIN sources without requiring UNIQUE/PK when the query's
+// output is multiplicity-insensitive (SELECT DISTINCT without aggregates, or
+// solely multiplicity-insensitive aggregates; Lean Theorem 3-4).
+bool EliminateUnusedOuterJoinsForIdempotentResult(SelectStatement* select,
+                                                  TransactionContext& ctx);
+
+// Pulls INNER/CROSS joins ahead of preceding LEFT JOINs when the inner join's
+// ON predicate does not reference the LEFT JOIN's null-supplying relation
+// (Lean: TpcdsDiscovery.lean outer_join_intervening_inner_to_antijoin_sound).
+bool PullInnerJoinsBeforeLeftJoins(SelectStatement* select,
+                                   TransactionContext& ctx);
+
+// Pushes selective dimension joins, WHERE filters, and partial GROUP BY into
+// branches of a UNION ALL derived table (including zero-padded sales/returns
+// unions; Lean: TpcdsDiscovery.lean zero_padded_union_branch_preagg_sound).
+bool DistributeZeroPaddedUnionGroupBy(SelectStatement* select,
+                                      TransactionContext& ctx);
+
+// Splits tag-discriminated UNION ALL CTEs per channel, pushes disjunctive
+// group-key bounds, and pivots multi-year self-joins into single-pass
+// conditional aggregates (Lean: TpcdsDiscovery.lean
+// union_cte_disjunctive_pushdown_and_branch_prune_sound,
+// grouped_self_join_conditional_pivot_sound).
+// Literal-specialized: caller must disarm compiled-plan caching when true.
+bool SpecializeAndPivotUnionCtes(SelectStatement* outer,
+                                 TransactionContext& ctx);
+
+// Rewrites FULL OUTER JOIN indicator SUM(CASE ...) queries over duplicate-free
+// (GROUP BY / SELECT DISTINCT) inputs into inclusion-exclusion counts without
+// FULL OUTER JOIN (Lean: TpcdsDiscovery.lean
+// full_outer_indicator_inclusion_exclusion_sound).
+bool RewriteFullOuterIndicatorSumsToSemiJoin(SelectStatement* select);
+
+// Eliminates self-joins between a derived/CTE scan and a grouped aggregate over
+// the same source by computing the group aggregate as a partitioned window
+// function with an explicit IS NOT NULL key guard (Lean: TpcdsDiscovery.lean
+// self_join_group_agg_to_window_sound, self_join_agg_window_null_key_bug).
+bool RewriteSelfJoinAggregateToWindow(SelectStatement* outer);
+
+// Hoists duplicate expensive uncorrelated derived subqueries into a shared CTE
+// so MaterializeCtes evaluates the subquery once (e.g. TPC-DS Q44 V1/V2).
+bool HoistIdenticalDerivedSubqueriesToCte(SelectStatement* outer);
+
+// Distributes GROUP BY (and Top-N) directly into UNION ALL branches without
+// outer re-aggregation when a grouping column projects pairwise-distinct
+// non-NULL constants across branches (Lean: TpcdsDiscovery.lean
+// disjoint_union_group_by_bypass_sound, agg_union_null_tag_collision_bug).
+// Literal-specialized: caller must disarm compiled-plan caching when true.
+bool BypassDisjointUnionGroupBy(SelectStatement* select);
+
+// Drops redundant constant and duplicate deterministic GROUP BY keys whenever
+// at least one non-constant grouping key remains (e.g. ClickBench Q35
+// `GROUP BY 1, URL` -> `GROUP BY URL`; Lean: ClickBenchDiscovery.lean
+// group_by_functional_expr_reduction_sound).
+bool PruneRedundantGroupByKeys(SelectStatement* select);
+
 // Returns true when a recursive CTE can be lifted to an opaque memo leaf.
 bool RecursiveCteLiftable(const SelectStatement& outer,
                           const std::string& name);

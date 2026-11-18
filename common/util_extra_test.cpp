@@ -93,6 +93,9 @@ TEST(DigestExtraTest, DistinctInputsNeverShareADigest) {
     EXPECT_NE(OneShot(kInputs[0], which), OneShot(kInputs[1], which));
     EXPECT_NE(OneShot(kInputs[1], which), OneShot(kInputs[2], which));
     EXPECT_NE(OneShot(kInputs[2], which), OneShot(kInputs[3], which));
+    EXPECT_NE(OneShot(kInputs[0], which), OneShot(kInputs[2], which));
+    EXPECT_NE(OneShot(kInputs[0], which), OneShot(kInputs[3], which));
+    EXPECT_NE(OneShot(kInputs[1], which), OneShot(kInputs[3], which));
   }
 }
 
