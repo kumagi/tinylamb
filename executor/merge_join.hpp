@@ -8,6 +8,7 @@
 
 #include "common/status_or.hpp"
 #include "executor/executor_base.hpp"
+#include "executor/query_memory.hpp"
 #include "executor/join_kind.hpp"
 #include "expression/expression.hpp"
 #include "type/row.hpp"
@@ -55,6 +56,9 @@ class MergeJoin final : public ExecutorBase {
   std::vector<slot_t> right_columns_;
   std::vector<Row> left_rows_;
   std::vector<Row> right_rows_;
+  // Both sides are materialized before the ordered merge; account for that
+  // resident memory against the query budget (RAII release on destruction).
+  QueryMemoryCharge materialized_charge_;
   std::vector<Row> output_;
   std::vector<RowPosition> left_positions_;
   std::vector<RowPosition> output_positions_;

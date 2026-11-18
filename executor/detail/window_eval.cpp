@@ -324,6 +324,17 @@ double NumericOf(const Value& value) {
   return std::numeric_limits<double>::quiet_NaN();
 }
 
+// RANGE frame arithmetic widens INT64 keys to ExtendedFloat so differences
+// near 2^63 stay exact. A UINT64 cell stores raw bits in `int_value` with an
+// `IsUnsigned()` tag, so a plain signed cast would flip the magnitude (and
+// ordering) of values above 2^63; reinterpret those bits as uint64 first.
+platform::ExtendedFloat FrameNumericOf(const Value& value) {
+  return value.IsUnsigned()
+             ? static_cast<platform::ExtendedFloat>(
+                   static_cast<uint64_t>(value.value.int_value))
+             : static_cast<platform::ExtendedFloat>(value.value.int_value);
+}
+
 std::string ElementSqlTypeOf(const Value& value) {
   switch (value.type) {
     case ValueType::kInt64:
@@ -339,20 +350,30 @@ std::string ElementSqlTypeOf(const Value& value) {
   }
 }
 
-// Exact |a-b| comparison for INT64 keys where double conversion would lose
-// precision near 2^63.
+// Exact first-minus-second distance comparison against `off`, used for RANGE
+// offset frame bounds. Both INT64 keys (where double conversion would lose
+// precision near 2^63) and DOUBLE keys compare in ExtendedFloat so the two
+// key types give identical frame membership for the same SQL.
 bool DistanceWithin(const Value& key, const Value& candidate, double off,
                     bool inclusive_le) {
   if (key.type == ValueType::kInt64 && candidate.type == ValueType::kInt64) {
     const platform::ExtendedFloat diff =
-        static_cast<platform::ExtendedFloat>(key.value.int_value) -
-        static_cast<platform::ExtendedFloat>(candidate.value.int_value);
+        FrameNumericOf(key) - FrameNumericOf(candidate);
     const auto bound = static_cast<platform::ExtendedFloat>(off);
     return inclusive_le ? diff <= bound : diff >= bound;
   }
-  const double dk = NumericOf(key);
-  const double dc = NumericOf(candidate);
-  return inclusive_le ? dk - dc <= off + 1e-9 : dk - dc >= off - 1e-9;
+  // DOUBLE keys: promote before subtracting so the comparison uses the exact
+  // difference of the two doubles (as the INT64 branch and the
+  // CandidateAtMost/AtLeast helpers do).  An absolute epsilon here would
+  // misclassify boundaries at magnitude ~1 -- a candidate just outside the
+  // offset would be pulled inside -- and make DOUBLE keys disagree with
+  // INT64 keys for the same RANGE frame.
+  const platform::ExtendedFloat diff =
+      static_cast<platform::ExtendedFloat>(NumericOf(key)) -
+      static_cast<platform::ExtendedFloat>(NumericOf(candidate));
+  const platform::ExtendedFloat bound =
+      static_cast<platform::ExtendedFloat>(off);
+  return inclusive_le ? diff <= bound : diff >= bound;
 }
 
 // Exact candidate <= key + off / candidate >= key - off.  DESC orderings
@@ -363,12 +384,11 @@ bool CandidateAtMostKeyPlusOffset(const Value& candidate, const Value& key,
                                   double off) {
   const bool key_int = key.type == ValueType::kInt64;
   const platform::ExtendedFloat limit =
-      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) +
-                    static_cast<platform::ExtendedFloat>(off)
+      key_int ? FrameNumericOf(key) + static_cast<platform::ExtendedFloat>(off)
               : static_cast<platform::ExtendedFloat>(NumericOf(key) + off);
   const platform::ExtendedFloat cand =
       candidate.type == ValueType::kInt64
-          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
+          ? FrameNumericOf(candidate)
           : static_cast<platform::ExtendedFloat>(NumericOf(candidate));
   return cand <= limit;
 }
@@ -377,12 +397,11 @@ bool CandidateAtLeastKeyMinusOffset(const Value& candidate, const Value& key,
                                     double off) {
   const bool key_int = key.type == ValueType::kInt64;
   const platform::ExtendedFloat limit =
-      key_int ? static_cast<platform::ExtendedFloat>(key.value.int_value) -
-                    static_cast<platform::ExtendedFloat>(off)
+      key_int ? FrameNumericOf(key) - static_cast<platform::ExtendedFloat>(off)
               : static_cast<platform::ExtendedFloat>(NumericOf(key) - off);
   const platform::ExtendedFloat cand =
       candidate.type == ValueType::kInt64
-          ? static_cast<platform::ExtendedFloat>(candidate.value.int_value)
+          ? FrameNumericOf(candidate)
           : static_cast<platform::ExtendedFloat>(NumericOf(candidate));
   return cand >= limit;
 }
@@ -449,7 +468,8 @@ struct WindowRuntime {
       const WindowFunctionCallExpression& window,
       const std::vector<Row>& /*rows*/, const std::vector<size_t>& ordered,
       const WindowOrderValues& order_values, size_t position,
-      const std::vector<size_t>& peer_end) {
+      const std::vector<size_t>& peer_end,
+      const std::vector<size_t>& group_ends) {
     const size_t m = ordered.size();
     // EXC-SHIM bridge (no-exception-rule-migration.md): the nested bound
     // lambdas below record validation failures here and return a sentinel;
@@ -561,19 +581,27 @@ struct WindowRuntime {
         return StatusError(StatusCode::kInvalidArgument,
                            "GROUPS frame requires an ORDER BY key");
       }
-      std::vector<size_t> group_start;
-      std::vector<size_t> group_end;
-      for (size_t i = 0; i < m;) {
-        const size_t end = peer_end[i];
-        group_start.push_back(i);
-        group_end.push_back(end);
-        i = end + 1;
+      // The partition layout already holds one end position per peer group.
+      // Locate the current group by binary search instead of rebuilding the
+      // group table and scanning it from row zero on every call.
+      std::vector<size_t> fallback_ends;
+      const std::vector<size_t>* ends = &group_ends;
+      if (ends->empty()) {
+        fallback_ends.reserve(m);
+        for (size_t i = 0; i < m;) {
+          const size_t end = peer_end[i];
+          fallback_ends.push_back(end);
+          i = end + 1;
+        }
+        ends = &fallback_ends;
       }
-      size_t current_group = 0;
-      while (group_end[current_group] < position) {
-        ++current_group;
-      }
-      const size_t group_count = group_start.size();
+      const auto group_first = [&](const size_t group) {
+        return group == 0 ? size_t{0} : (*ends)[group - 1] + 1;
+      };
+      const size_t current_group = static_cast<size_t>(
+          std::lower_bound(ends->begin(), ends->end(), position) -
+          ends->begin());
+      const size_t group_count = ends->size();
       auto offset_of = [&](const WindowFrameBound& bound) -> size_t {
         if (!bound.offset || bound.offset->Type() != TypeTag::kConstantValue) {
           frame_error = StatusError(StatusCode::kInvalidArgument,
@@ -618,11 +646,11 @@ struct WindowRuntime {
           case WindowFrameBoundType::kUnboundedPreceding:
             return size_t{0};
           case WindowFrameBoundType::kOffsetPreceding:
-            return group_start[group_for_preceding(offset_of(bound))];
+            return group_first(group_for_preceding(offset_of(bound)));
           case WindowFrameBoundType::kCurrentRow:
-            return group_start[current_group];
+            return group_first(current_group);
           case WindowFrameBoundType::kOffsetFollowing:
-            return group_start[group_for_following(offset_of(bound))];
+            return group_first(group_for_following(offset_of(bound)));
           case WindowFrameBoundType::kUnboundedFollowing:
             return m - 1;
         }
@@ -633,11 +661,11 @@ struct WindowRuntime {
           case WindowFrameBoundType::kUnboundedPreceding:
             return size_t{0};
           case WindowFrameBoundType::kOffsetPreceding:
-            return group_end[group_for_preceding(offset_of(bound))];
+            return (*ends)[group_for_preceding(offset_of(bound))];
           case WindowFrameBoundType::kCurrentRow:
-            return group_end[current_group];
+            return (*ends)[current_group];
           case WindowFrameBoundType::kOffsetFollowing:
-            return group_end[group_for_following(offset_of(bound))];
+            return (*ends)[group_for_following(offset_of(bound))];
           case WindowFrameBoundType::kUnboundedFollowing:
             return m - 1;
         }
@@ -651,24 +679,15 @@ struct WindowRuntime {
       return lo > hi ? std::pair<size_t, size_t>{1, 0}
                      : std::pair<size_t, size_t>{lo, hi};
     }
-    // First row of the current row's peer group; RANGE `CURRENT ROW` start
-    // bounds open at the group head (the end bound already closes on
-    // peer_end), matching the aggregate-with-peers default frame.
-    auto first_peer = [&](size_t idx) {
-      size_t j = idx;
-      while (j > 0) {
-        const auto above = order_values[j - 1];
-        const auto mine = order_values[idx];
-        bool peer = above.size() == mine.size();
-        for (size_t t = 0; peer && t < mine.size(); ++t) {
-          peer = ValuesEqual(above[t], mine[t]);
-        }
-        if (!peer) {
-          break;
-        }
-        --j;
+    // First row of each row's peer group, precomputed once so RANGE
+    // `CURRENT ROW` bounds resolve in O(1) instead of a linear peer scan.
+    std::vector<size_t> first_peer_of(m);
+    for (size_t i = 0; i < m;) {
+      const size_t end = peer_end[i];
+      for (size_t j = i; j <= end; ++j) {
+        first_peer_of[j] = i;
       }
-      return j;
+      i = end + 1;
     };
     // A RANGE frame boundary: a plain numeric offset, or a calendar-aware
     // interval for DATE keys (`RANGE BETWEEN INTERVAL 7 DAY PRECEDING AND
@@ -781,13 +800,43 @@ struct WindowRuntime {
       }
       return days;
     };
+    // Binary search over the sorted order_values[0] column. Predicates must be
+    // monotonic over [begin, end): first_true finds the first index where pred
+    // is true (false...false true...true → returns end if none); last_true finds
+    // the last index where pred is true (true...true false...false → nullopt if
+    // none). NULL keys never satisfy a numeric/interval predicate, so they fall
+    // into the false region regardless of sort direction.
+    auto first_true = [&](size_t begin, size_t end, auto pred) -> size_t {
+      while (begin < end) {
+        const size_t mid = begin + (end - begin) / 2;
+        if (pred(mid)) {
+          end = mid;
+        } else {
+          begin = mid + 1;
+        }
+      }
+      return begin;
+    };
+    auto last_true = [&](size_t begin, size_t end, auto pred)
+        -> std::optional<size_t> {
+      size_t lo = begin, hi = end;
+      while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (!pred(mid)) {
+          hi = mid;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      return lo == begin ? std::nullopt : std::optional<size_t>(lo - 1);
+    };
     auto start_of =
         [&](const WindowFrameBound& bound) -> std::optional<size_t> {
       switch (bound.type) {
         case WindowFrameBoundType::kUnboundedPreceding:
           return 0;
         case WindowFrameBoundType::kCurrentRow:
-          return first_peer(position);
+          return first_peer_of[position];
         case WindowFrameBoundType::kOffsetPreceding: {
           const auto opt_bound = range_bound(bound);
           if (!opt_bound.has_value()) {
@@ -797,7 +846,7 @@ struct WindowRuntime {
           if (key.IsNull()) {
             // NULLs are peers of each other: the offset bound collapses to
             // the peer group, so the frame opens at the group head.
-            return first_peer(position);
+            return first_peer_of[position];
           }
           // ASC: first row with candidate >= key - off.  DESC mirrors the
           // band around the current key: first row with candidate <=
@@ -809,30 +858,28 @@ struct WindowRuntime {
             if (!boundary.has_value()) {
               return std::nullopt;
             }
-            for (size_t j = 0; j <= position; ++j) {
-              const Value& candidate = order_values[j][0];
+            const size_t j = first_true(0, position + 1, [&](size_t idx) {
+              const Value& candidate = order_values[idx][0];
               if (candidate.IsNull()) {
-                continue;
+                return false;
               }
-              if (asc ? candidate.value.int_value >= *boundary
-                      : candidate.value.int_value <= *boundary) {
-                return j;
-              }
-            }
-            return position;
+              return asc ? candidate.value.int_value >= *boundary
+                         : candidate.value.int_value <= *boundary;
+            });
+            return j <= position ? std::optional<size_t>(j)
+                                 : std::optional<size_t>(position);
           }
           const double off = opt_bound->numeric;
-          for (size_t j = 0; j <= position; ++j) {
-            const Value& candidate = order_values[j][0];
+          const size_t j = first_true(0, position + 1, [&](size_t idx) {
+            const Value& candidate = order_values[idx][0];
             if (candidate.IsNull()) {
-              continue;
+              return false;
             }
-            if (asc ? DistanceWithin(key, candidate, off, true)
-                    : CandidateAtMostKeyPlusOffset(candidate, key, off)) {
-              return j;
-            }
-          }
-          return position;
+            return asc ? DistanceWithin(key, candidate, off, true)
+                       : CandidateAtMostKeyPlusOffset(candidate, key, off);
+          });
+          return j <= position ? std::optional<size_t>(j)
+                               : std::optional<size_t>(position);
         }
         case WindowFrameBoundType::kOffsetFollowing: {
           // Start bound `N FOLLOWING`: the FIRST row whose key is >=
@@ -845,7 +892,7 @@ struct WindowRuntime {
           if (key.IsNull()) {
             // NULLs are peers of each other: the offset bound collapses to
             // the peer group, so the frame opens at the group head.
-            return first_peer(position);
+            return first_peer_of[position];
           }
           const bool asc = window.order_by[0].ascending;
           if (opt_bound->is_interval) {
@@ -854,34 +901,28 @@ struct WindowRuntime {
             if (!boundary.has_value()) {
               return std::nullopt;
             }
-            for (size_t j = 0; j < m; ++j) {
-              const Value& candidate = order_values[j][0];
+            const size_t j = first_true(0, m, [&](size_t idx) {
+              const Value& candidate = order_values[idx][0];
               if (candidate.IsNull()) {
-                continue;
+                return false;
               }
-              if (asc ? candidate.value.int_value >= *boundary
-                      : candidate.value.int_value <= *boundary) {
-                return j;
-              }
-            }
-            // No row satisfies the bound: the frame is empty.
-            return std::nullopt;
+              return asc ? candidate.value.int_value >= *boundary
+                         : candidate.value.int_value <= *boundary;
+            });
+            return j < m ? std::optional<size_t>(j) : std::nullopt;
           }
           const double off = opt_bound->numeric;
-          for (size_t j = 0; j < m; ++j) {
-            const Value& candidate = order_values[j][0];
+          const size_t j = first_true(0, m, [&](size_t idx) {
+            const Value& candidate = order_values[idx][0];
             if (candidate.IsNull()) {
-              continue;
+              return false;
             }
-            if (asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
-                          candidate, key, off,
-                          false)  // (scanned, current) order is intentional.
-                    : CandidateAtMostKeyPlusOffset(candidate, key, -off)) {
-              return j;
-            }
-          }
-          // No row satisfies the bound: the frame is empty.
-          return std::nullopt;
+            return asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                         candidate, key, off,
+                         false)  // (scanned, current) order is intentional.
+                       : CandidateAtMostKeyPlusOffset(candidate, key, -off);
+          });
+          return j < m ? std::optional<size_t>(j) : std::nullopt;
         }
         case WindowFrameBoundType::kUnboundedFollowing:
           return m - 1;
@@ -906,39 +947,32 @@ struct WindowRuntime {
           // ASC: last row with candidate <= key + off.  DESC: last row with
           // candidate >= key - off.
           const bool asc = window.order_by[0].ascending;
-          std::optional<size_t> reached;
           if (opt_bound->is_interval) {
             const auto boundary =
                 interval_boundary_days(key, asc ? 1 : -1, opt_bound->interval);
             if (!boundary.has_value()) {
               return std::nullopt;
             }
-            for (size_t j = 0; j < m; ++j) {
-              const Value& candidate = order_values[j][0];
+            return last_true(0, m, [&](size_t idx) {
+              const Value& candidate = order_values[idx][0];
               if (candidate.IsNull()) {
-                continue;
+                return false;
               }
-              if (asc ? candidate.value.int_value <= *boundary
-                      : candidate.value.int_value >= *boundary) {
-                reached = j;
-              }
-            }
-            return reached;
+              return asc ? candidate.value.int_value <= *boundary
+                         : candidate.value.int_value >= *boundary;
+            });
           }
           const double off = opt_bound->numeric;
-          for (size_t j = 0; j < m; ++j) {
-            const Value& candidate = order_values[j][0];
+          return last_true(0, m, [&](size_t idx) {
+            const Value& candidate = order_values[idx][0];
             if (candidate.IsNull()) {
-              continue;
+              return false;
             }
-            if (asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
-                          candidate, key, off,
-                          true)  // (scanned, current) order is intentional.
-                    : CandidateAtLeastKeyMinusOffset(candidate, key, off)) {
-              reached = j;
-            }
-          }
-          return reached.value_or(peer_end[position]);
+            return asc ? DistanceWithin(  // NOLINT(readability-suspicious-call-argument)
+                         candidate, key, off,
+                         true)  // (scanned, current) order is intentional.
+                       : CandidateAtLeastKeyMinusOffset(candidate, key, off);
+          }).value_or(peer_end[position]);
         }
         case WindowFrameBoundType::kUnboundedPreceding:
           // As a frame END bound this is the first row of the partition,
@@ -969,53 +1003,45 @@ struct WindowRuntime {
           // may underflow int64).  NULL keys sort lowest and stay inside an
           // unbounded-start frame.
           const bool asc = window.order_by[0].ascending;
-          std::optional<size_t> reached;
           if (opt_bound->is_interval) {
             const auto boundary =
                 interval_boundary_days(key, asc ? -1 : 1, opt_bound->interval);
             if (!boundary.has_value()) {
               return std::nullopt;
             }
-            for (size_t j = 0; j <= position; ++j) {
-              const Value& candidate = order_values[j][0];
+            return last_true(0, position + 1, [&](size_t idx) {
+              const Value& candidate = order_values[idx][0];
               if (candidate.IsNull()) {
-                continue;
+                return false;
               }
-              if (asc ? candidate.value.int_value <= *boundary
-                      : candidate.value.int_value >= *boundary) {
-                reached = j;
-              }
-            }
-            return reached;
+              return asc ? candidate.value.int_value <= *boundary
+                         : candidate.value.int_value >= *boundary;
+            });
           }
           const double off = opt_bound->numeric;
           const bool key_int = key.type == ValueType::kInt64;
           const platform::ExtendedFloat asc_limit =
               key_int
-                  ? static_cast<platform::ExtendedFloat>(key.value.int_value) -
+                  ? FrameNumericOf(key) -
                         static_cast<platform::ExtendedFloat>(off)
                   : static_cast<platform::ExtendedFloat>(NumericOf(key) - off);
           const platform::ExtendedFloat desc_limit =
               key_int
-                  ? static_cast<platform::ExtendedFloat>(key.value.int_value) +
+                  ? FrameNumericOf(key) +
                         static_cast<platform::ExtendedFloat>(off)
                   : static_cast<platform::ExtendedFloat>(NumericOf(key) + off);
-          for (size_t j = 0; j <= position; ++j) {
-            const Value& candidate = order_values[j][0];
+          return last_true(0, position + 1, [&](size_t idx) {
+            const Value& candidate = order_values[idx][0];
             if (candidate.IsNull()) {
-              continue;
+              return false;
             }
             const platform::ExtendedFloat cand =
                 candidate.type == ValueType::kInt64
-                    ? static_cast<platform::ExtendedFloat>(
-                          candidate.value.int_value)
+                    ? FrameNumericOf(candidate)
                     : static_cast<platform::ExtendedFloat>(
                           NumericOf(candidate));
-            if (asc ? cand <= asc_limit : cand >= desc_limit) {
-              reached = j;
-            }
-          }
-          return reached;
+            return asc ? cand <= asc_limit : cand >= desc_limit;
+          });
         }
       }
       return peer_end[position];
@@ -1954,6 +1980,10 @@ struct WindowPartitionLayout {
   std::vector<size_t> ordered;
   WindowOrderValues order_values;
   std::vector<size_t> peer_end;
+  // End position of each peer group, one entry per group (ascending). Built
+  // once alongside peer_end so GROUPS frames locate a group by binary search
+  // instead of rebuilding the table for every row.
+  std::vector<size_t> group_ends;
 };
 
 struct WindowOrderLayout {
@@ -2341,6 +2371,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
             partition.peer_end.begin() + static_cast<std::ptrdiff_t>(first),
             partition.peer_end.begin() + static_cast<std::ptrdiff_t>(end),
             end - 1);
+        partition.group_ends.push_back(end - 1);
         first = end;
       }
     };
@@ -2499,6 +2530,7 @@ StatusOr<WindowOrderLayout> BuildWindowOrderLayout(
           partition.peer_end.begin() + static_cast<std::ptrdiff_t>(a),
           partition.peer_end.begin() + static_cast<std::ptrdiff_t>(end + 1),
           end);
+      partition.group_ends.push_back(end);
       a = end + 1;
     }
   }
@@ -2829,7 +2861,7 @@ Status ComputeOneWindowImpl(TransactionContext& context,
         ASSIGN_OR_RETURN(
             FrameBounds, frame_bounds,
             (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
-                                         peer_end)));
+                                         peer_end, partition.group_ends)));
         const size_t lo = frame_bounds.first;
         const size_t hi = frame_bounds.second;
         if (hi < lo) {
@@ -2983,7 +3015,7 @@ Status ComputeOneWindowImpl(TransactionContext& context,
         ASSIGN_OR_RETURN(
             FrameBounds, resolved,
             (WindowRuntime::ResolveFrame(window, rows, ordered, order_values, k,
-                                         peer_end)));
+                                         peer_end, partition.group_ends)));
         frame_bounds = resolved;
       }
       ASSIGN_OR_RETURN(Value, agg_value,

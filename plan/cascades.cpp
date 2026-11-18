@@ -802,39 +802,64 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
   // implementation rules route it through the null-safe hash-join key path.
   constexpr BinaryOperation kRowEquality = BinaryOperation::kIsNotDistinctFrom;
 
+  // Resolve set-op output column `i` to the source column inside branch `g`.
+  // The set-op output name may be an alias (`SELECT v AS w`) and, in a
+  // multi-relation branch, `relations.front()` need not be the relation that
+  // owns the column. Recover the real source from the branch's target list;
+  // only fall back to the output name (qualified by the sole relation) when
+  // no target list is available. A multi-relation branch with a bare column
+  // has no provable owner, so the caller must decline the rewrite.
+  const auto resolve_column =
+      [](const Group& g, size_t i, const ColumnName& name,
+         const std::string& rel) -> std::optional<ColumnName> {
+    ColumnName col = name;
+    for (const auto& expr : g.expressions) {
+      if (expr.target_list.empty() || i >= expr.target_list.size()) {
+        continue;
+      }
+      const NamedExpression& target = expr.target_list[i];
+      if (target.expression &&
+          target.expression->Type() == TypeTag::kColumnValue) {
+        col = target.expression->AsColumnValue().GetColumnName();
+      }
+      break;
+    }
+    if (col.schema.empty() && g.relations.size() <= 1 && !rel.empty()) {
+      col.schema = rel;
+    }
+    if (col.schema.empty() && g.relations.size() > 1) {
+      return std::nullopt;
+    }
+    return col;
+  };
+
   std::vector<Expression> conjuncts;
 
   if (expression.output_schema.ColumnCount() > 0) {
     for (size_t i = 0; i < expression.output_schema.ColumnCount(); ++i) {
-      const auto& col = expression.output_schema.GetColumn(i);
-      ColumnName left_col = col.Name();
-      ColumnName right_col = col.Name();
-      if (!left_rel.empty()) {
-        left_col.schema = left_rel;
+      const ColumnName name = expression.output_schema.GetColumn(i).Name();
+      const auto left_col = resolve_column(left_group, i, name, left_rel);
+      const auto right_col = resolve_column(right_group, i, name, right_rel);
+      if (!left_col || !right_col) {
+        return memo.JoinConditionFor(memo.Get(left_group_id),
+                                    memo.Get(right_group_id));
       }
-      if (!right_rel.empty()) {
-        right_col.schema = right_rel;
-      }
-      conjuncts.push_back(BinaryExpressionExp(
-          ColumnValueExp(left_col), kRowEquality, ColumnValueExp(right_col)));
+      conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(*left_col),
+                                              kRowEquality,
+                                              ColumnValueExp(*right_col)));
     }
   } else if (!expression.target_list.empty()) {
-    for (const auto& target : expression.target_list) {
-      ColumnName left_col(target.name);
-      ColumnName right_col(target.name);
-      if (target.expression &&
-          target.expression->Type() == TypeTag::kColumnValue) {
-        left_col = target.expression->AsColumnValue().GetColumnName();
-        right_col = left_col;
+    for (size_t i = 0; i < expression.target_list.size(); ++i) {
+      const ColumnName name(expression.target_list[i].name);
+      const auto left_col = resolve_column(left_group, i, name, left_rel);
+      const auto right_col = resolve_column(right_group, i, name, right_rel);
+      if (!left_col || !right_col) {
+        return memo.JoinConditionFor(memo.Get(left_group_id),
+                                    memo.Get(right_group_id));
       }
-      if (!left_rel.empty()) {
-        left_col.schema = left_rel;
-      }
-      if (!right_rel.empty()) {
-        right_col.schema = right_rel;
-      }
-      conjuncts.push_back(BinaryExpressionExp(
-          ColumnValueExp(left_col), kRowEquality, ColumnValueExp(right_col)));
+      conjuncts.push_back(BinaryExpressionExp(ColumnValueExp(*left_col),
+                                              kRowEquality,
+                                              ColumnValueExp(*right_col)));
     }
   } else {
     const auto find_schema_or_targets =
@@ -862,11 +887,23 @@ Expression BuildEqualityOnAllColumns(const Memo& memo,
       for (size_t i = 0; i < left_sch.ColumnCount(); ++i) {
         ColumnName left_col = left_sch.GetColumn(i).Name();
         ColumnName right_col = right_sch.GetColumn(i).Name();
-        if (left_col.schema.empty() && !left_rel.empty()) {
-          left_col.schema = left_rel;
+        if (left_col.schema.empty()) {
+          if (left_group.relations.size() > 1) {
+            return memo.JoinConditionFor(memo.Get(left_group_id),
+                                    memo.Get(right_group_id));
+          }
+          if (!left_rel.empty()) {
+            left_col.schema = left_rel;
+          }
         }
-        if (right_col.schema.empty() && !right_rel.empty()) {
-          right_col.schema = right_rel;
+        if (right_col.schema.empty()) {
+          if (right_group.relations.size() > 1) {
+            return memo.JoinConditionFor(memo.Get(left_group_id),
+                                    memo.Get(right_group_id));
+          }
+          if (!right_rel.empty()) {
+            right_col.schema = right_rel;
+          }
         }
         conjuncts.push_back(BinaryExpressionExp(
             ColumnValueExp(left_col), kRowEquality, ColumnValueExp(right_col)));
@@ -7520,6 +7557,23 @@ const RuleSet& RuleSet::Default() {
                 }
               }
               if (!other_not_null) {
+                continue;
+              }
+              // The declared-FK fallback below is scan-free: it trusts the
+              // catalog, so it cannot look at the rows that actually survive
+              // on the other side. Any single-relation predicate of the query
+              // already lives in the other-side group's scan filter
+              // (push_selection_through_join merges it there), and such a
+              // filter can remove exactly the row the FOREIGN KEY
+              // certificate guarantees -- `WHERE b.v > 5` on b drops the
+              // guaranteed parent, so a fact row inside the pushed
+              // top-(limit+offset) prefix would emit a row the plain join
+              // filters away. The other side must therefore be
+              // filter-free for the FK fallback; the snapshot proof
+              // (MarkProvenOneToOneJoins) is the filter-aware alternative,
+              // and its own WHERE gate keeps it to predicates that cannot
+              // rescue a filtered other side.
+              if (memo.Get(other_id).filter) {
                 continue;
               }
               // At least one match per pushed row: FOREIGN KEY or snapshot.

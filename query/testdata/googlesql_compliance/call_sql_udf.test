@@ -171,7 +171,7 @@ SELECT 10 * Thousand()
 ARRAY<STRUCT<INT64>>[unknown order:{2000}, {10000}]
 ==
 
-[name=call_unary_function_wit_literal]
+[name=call_unary_function_with_literal]
 SELECT StringIdentity('a')
 UNION ALL
 SELECT StringIdentity('b');

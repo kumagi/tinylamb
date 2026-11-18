@@ -1342,30 +1342,49 @@ std::vector<PhysicalProperties> SearchEngine::RequiredChildProperties(
         std::vector<ColumnName> translated;
         translated.reserve(child.ordering.size());
         for (const ColumnName& column : child.ordering) {
-          bool mapped = false;
-          for (const NamedExpression& output : expression.target_list) {
-            if (!output.expression ||
-                output.expression->Type() != TypeTag::kColumnValue) {
-              continue;
-            }
-            const ColumnName& source =
-                output.expression->AsColumnValue().GetColumnName();
-            const bool name_matches =
-                IdentifierEquals(output.name, column.name) ||
-                IdentifierEquals(source.name, column.name);
-            const bool qualified_matches =
-                !column.schema.empty() && source == column;
-            if (name_matches || qualified_matches) {
-              translated.push_back(source);
-              mapped = true;
-              break;
+          // Resolve in two stages: the parent's ordering is expressed in this
+          // projection's OUTPUT-name space, so an exact output-name hit wins.
+          // A single first-match pass that also accepts a source name can
+          // mis-resolve a cross-alias rename (`SELECT x AS b, a AS x ORDER BY
+          // x`: key `x` would hit `b`'s source `t.x` before output `x`'s
+          // source `t.a`). This mirrors ProjectionPlan::IsOrderedBy, which
+          // resolves keys by output name only. A qualified key additionally
+          // requires the projected source to carry that qualifier. More than
+          // one hit is ambiguous: drop the key so the parent enforces the
+          // order above the projection instead of guessing below it.
+          const NamedExpression* match = nullptr;
+          bool ambiguous = false;
+          for (int stage = 0; stage < 2 && !ambiguous && match == nullptr;
+               ++stage) {
+            for (const NamedExpression& output : expression.target_list) {
+              if (!output.expression ||
+                  output.expression->Type() != TypeTag::kColumnValue) {
+                continue;
+              }
+              const ColumnName& source =
+                  output.expression->AsColumnValue().GetColumnName();
+              const bool name_matches =
+                  stage == 0 ? IdentifierEquals(output.name, column.name)
+                             : IdentifierEquals(source.name, column.name);
+              const bool qualified_matches =
+                  !column.schema.empty() && source == column;
+              if (!name_matches && !qualified_matches) {
+                continue;
+              }
+              if (match != nullptr) {
+                ambiguous = true;
+                break;
+              }
+              match = &output;
             }
           }
-          if (!mapped) {
+          if (ambiguous || match == nullptr) {
             translated.clear();
             child.ordering.clear();
             break;
           }
+          translated.push_back(
+              match->expression->AsColumnValue().GetColumnName());
         }
         if (!translated.empty()) {
           child.ordering = std::move(translated);

@@ -98,6 +98,7 @@ TEST(FlatIntKeyMapTest, PrefetchOnEmptyAndFreshMapsIsSafe) {
   EXPECT_TRUE(inserted);
   // Prefetching after growth exercises the populated path too.
   fresh.Prefetch(43);
+  inserted = false;
   *fresh.TryEmplace(43, &inserted) = 2;
   EXPECT_TRUE(inserted);
   EXPECT_EQ(*fresh.TryEmplace(42, &inserted), 1U);

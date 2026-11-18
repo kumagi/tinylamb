@@ -788,7 +788,7 @@ ARRAY<STRUCT<BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL>>[
 ==
 
 [required_features=LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_ARRAY]
-[name=like_any_array_with_arrayconact_function]
+[name=like_any_array_with_array_concat_function]
 # Test "LIKE ANY ARRAY" with ARRAY_CONCAT function.
 SELECT
   NULL LIKE ANY UNNEST(ARRAY_CONCAT(['abc'], ['xyz', NULL])),
@@ -805,7 +805,7 @@ ARRAY<STRUCT<BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL>>[
 ==
 
 [required_features=LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_ARRAY]
-[name=not_like_any_array_with_arrayconact_function]
+[name=not_like_any_array_with_array_concat_function]
 # Test "NOT LIKE ANY ARRAY" with ARRAY_CONCAT function.
 SELECT
   NULL NOT LIKE ANY UNNEST(ARRAY_CONCAT(['abc'], ['xyz', NULL])),
@@ -822,7 +822,7 @@ ARRAY<STRUCT<BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL>>[
 ==
 
 [required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_ARRAY]
-[name=like_any_array_with_arrayconact_function_with_collation]
+[name=like_any_array_with_array_concat_function_with_collation]
 # Test "LIKE ANY ARRAY" with ARRAY_CONCAT function with collation enabled.
 SELECT
   NULL LIKE ANY UNNEST(ARRAY_CONCAT([collate('abc', 'und:ci')], ['xyz', NULL])),
@@ -839,7 +839,7 @@ ARRAY<STRUCT<BOOL, BOOL, BOOL, BOOL, BOOL, BOOL, BOOL>>[
 ==
 
 [required_features=ANNOTATION_FRAMEWORK,COLLATION_SUPPORT,LIKE_ANY_SOME_ALL,LIKE_ANY_SOME_ALL_ARRAY]
-[name=not_like_any_array_with_arrayconact_function_with_collation]
+[name=not_like_any_array_with_array_concat_function_with_collation]
 # Test "NOT LIKE ANY ARRAY" with ARRAY_CONCAT function with collation enabled.
 SELECT
   NULL NOT LIKE ANY UNNEST(ARRAY_CONCAT([collate('abc', 'und:ci')], ['xyz', NULL])),

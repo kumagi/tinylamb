@@ -2815,13 +2815,10 @@ StatusOr<Value> TryEvaluateFunction(  // NOLINT(misc-no-recursion)
                          (ParseTimeZoneOffset(tz_str, &ct)));
         tz_offset_sec = parsed_offset;
       }
-    } else if (name_view == "format_datetime" ||
-               name_view == "format_timestamp") {
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset,
-                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
-        tz_offset_sec = parsed_offset;
-      }
+    } else if (name_view == "format_timestamp") {
+      // DATETIME has no time zone, so a 2-argument FORMAT_DATETIME must not
+      // consult the mutable default zone. TIMESTAMP renders in UTC by default.
+      tz_offset_sec = 0;
     }
     ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;

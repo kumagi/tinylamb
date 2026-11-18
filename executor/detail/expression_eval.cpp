@@ -1123,6 +1123,14 @@ StatusOr<Value> TryLookup(const ColumnName& name, const Scope& scope) {
           current->schema->ColumnCount() != 1) {
         continue;
       }
+      // Only a genuine proto/value table carries its payload in a single
+      // VARCHAR column. A relation that happens to have been pruned to one
+      // column must not be mistaken for one, otherwise a qualified star over
+      // it silently returns that column instead of failing.
+      if (current->schema->GetColumn(0).Type() != ValueType::kVarChar ||
+          (*current->row)[0].type != ValueType::kVarChar) {
+        continue;
+      }
       const ColumnName& column = current->schema->GetColumn(0).Name();
       if (IdentifierEquals(column.schema, name.schema)) {
         return (*current->row)[0];
@@ -1988,8 +1996,13 @@ StatusOr<Value> TryEvaluate(  // NOLINT(misc-no-recursion)
           // build time) and a miss over a NULL-free build is FALSE.  Neither
           // may trigger the rescan -- Q22-sized builds make a per-miss rescan
           // quadratic (filter_ms 0.8s -> 246s at SF=1).
+          // The hash set's operator== makes every NaN equal; SQL `=` (IEEE)
+          // never matches NaN, so a NaN probe defers to the canonical path.
+          const bool test_is_nan = test.type == ValueType::kDouble &&
+                                   std::isnan(test.value.double_value);
           const bool hash_is_exact =
-              cached->second.uniform_domain && !test.IsCaseInsensitive() &&
+              !test_is_nan && cached->second.uniform_domain &&
+              !test.IsCaseInsensitive() &&
               (test.IsNull() ||
                (cached->second.has_domain &&
                 same_domain(test, cached->second.domain_sample) &&

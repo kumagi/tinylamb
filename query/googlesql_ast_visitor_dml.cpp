@@ -866,16 +866,9 @@ StatusOr<SelectSource> ExpandPivotSource(SelectSource base,
     std::string val_alias = std::move(hv158283_0);
     if (val_alias.empty()) {
       if (val_node->kind == "StringLiteral") {
-        for (const auto& c : val_node->children) {
-          if (c->kind == "StringLiteralComponent") {
-            val_alias = c->detail;
-            if (!val_alias.empty() && val_alias.front() == '\'' &&
-                val_alias.back() == '\'') {
-              val_alias = val_alias.substr(1, val_alias.size() - 2);
-            }
-            break;
-          }
-        }
+        ASSIGN_OR_RETURN(std::string, decoded_alias,
+                         (DecodeString(*val_node)));
+        val_alias = std::move(decoded_alias);
       }
       if (val_alias.empty()) {
         val_alias = val_node->detail;
@@ -996,6 +989,10 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
     if (in_expr_list == nullptr || in_expr_list->children.empty()) {
       return AstError<SelectSource>("GoogleSQL AST: empty UNPIVOT IN item");
     }
+    if (in_expr_list->children.size() > 1) {
+      return AstError<SelectSource>(
+          "GoogleSQL AST: multi-column UNPIVOT IN tuple is not supported");
+    }
     ASSIGN_OR_RETURN(std::string, hv162376_0,
                      (Path(*in_expr_list->children[0])));
     std::string in_col_name = std::move(hv162376_0);
@@ -1004,16 +1001,9 @@ StatusOr<SelectSource> ExpandUnpivotSource(const SelectSource& base,
             item->Child("UnpivotInItemLabel")) {
       if (const GoogleSqlAstNode* str_node =
               label_node->Child("StringLiteral")) {
-        for (const auto& c : str_node->children) {
-          if (c->kind == "StringLiteralComponent") {
-            in_label = c->detail;
-            if (!in_label.empty() && in_label.front() == '\'' &&
-                in_label.back() == '\'') {
-              in_label = in_label.substr(1, in_label.size() - 2);
-            }
-            break;
-          }
-        }
+        ASSIGN_OR_RETURN(std::string, decoded_label,
+                         (DecodeString(*str_node)));
+        in_label = std::move(decoded_label);
       } else if (!label_node->children.empty()) {
         in_label = label_node->children[0]->detail;
       }
@@ -1263,6 +1253,21 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
   RETURN_IF_FAIL(ValidateCreateTableOptions(root));
   const GoogleSqlAstNode* elements = root.Child("TableElementList");
   if (elements != nullptr) {
+    // Fail loudly on table constraints we cannot enforce. Skipping a CHECK or
+    // UNIQUE element would create a table that silently accepts rows the DDL
+    // forbids; the rest of this visitor rejects unsupported DDL the same way
+    // (multi-column FOREIGN KEY, DELETE ... USING, ...). Only the three
+    // element kinds handled below may pass.
+    for (const std::unique_ptr<GoogleSqlAstNode>& owned_element :
+         elements->children) {
+      const GoogleSqlAstNode* element = owned_element.get();
+      if (element->kind == "ColumnDefinition" ||
+          element->kind == "PrimaryKey" || element->kind == "ForeignKey") {
+        continue;
+      }
+      return AstError<std::unique_ptr<Statement>>(
+          "GoogleSQL AST: CREATE TABLE " + element->kind + " is not supported");
+    }
     std::vector<Column> columns;
     std::vector<ForeignKeyDef> foreign_keys;
     for (const GoogleSqlAstNode* definition :
@@ -1290,6 +1295,13 @@ StatusOr<std::unique_ptr<Statement>> VisitCreate(const GoogleSqlAstNode& root) {
           if (kind == "PathExpression" || kind == "TypeParameterList" ||
               kind == "ColumnAttributeList" || kind == "Collate") {
             continue;
+          }
+          // A column-level OPTIONS list is a trailing schema child, not a
+          // DEFAULT expression. Reject it explicitly instead of feeding a
+          // non-expression AST node to the expression visitor.
+          if (kind == "OptionsList") {
+            return AstError<std::unique_ptr<Statement>>(
+                "GoogleSQL AST: column OPTIONS are not supported");
           }
           if (column_default.has_value()) {
             return AstError<std::unique_ptr<Statement>>(

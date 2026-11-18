@@ -57,7 +57,7 @@ SELECT * FROM R;
 ERROR: generic::out_of_range: division by zero: 1 / 0
 ==
 
-# Recursive query used to compute Fibanocci numbers. This demonstrates multiple
+# Recursive query used to compute Fibonacci numbers. This demonstrates multiple
 # columns with aliases.
 [name=recursive_query_fib]
 WITH RECURSIVE
@@ -898,7 +898,7 @@ ARRAY<STRUCT<origin STRING, destination STRING>>[known order:
 ]
 ==
 
-# Repeat fibanocci query using UNION DISTINCT instead of UNION ALL; should not
+# Repeat fibonacci query using UNION DISTINCT instead of UNION ALL; should not
 # affect the result.
 [name=recursive_query_fib_distinct]
 WITH RECURSIVE

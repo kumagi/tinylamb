@@ -50,6 +50,7 @@
 #include "expression/function_call_expression.hpp"
 #include "expression/in_expression.hpp"
 #include "expression/json_doc.hpp"
+#include "expression/lambda_expression.hpp"
 #include "expression/named_expression.hpp"
 #include "expression/proto_schema.hpp"
 #include "expression/query_expression.hpp"
@@ -642,6 +643,54 @@ Expression SubstituteParameters(
       rebuilt->SetArrayResult(query.ArrayResult());
       return {rebuilt};
     }
+    case TypeTag::kWindowFunctionExp: {
+      // A TVF body can carry SUM(x) OVER (PARTITION BY <parameter>): without
+      // walking the window specification the parameter stays a column reference
+      // and silently binds to a same-named column of the caller.
+      const auto& win = expression->AsWindowFunctionCallExpression();
+      auto rebuilt = std::make_shared<WindowFunctionCallExpression>();
+      rebuilt->function = win.function;
+      rebuilt->distinct = win.distinct;
+      rebuilt->frame_unit = win.frame_unit;
+      rebuilt->frame_start.type = win.frame_start.type;
+      rebuilt->frame_end.type = win.frame_end.type;
+      rebuilt->has_frame = win.has_frame;
+      rebuilt->exclusion = win.exclusion;
+      rebuilt->respect_nulls = win.respect_nulls;
+      rebuilt->ignore_nulls = win.ignore_nulls;
+      rebuilt->inner_limit = win.inner_limit;
+      for (const Expression& arg : win.args) {
+        rebuilt->args.push_back(SubstituteParameters(arg, bindings));
+      }
+      if (win.where_filter) {
+        rebuilt->where_filter =
+            SubstituteParameters(win.where_filter, bindings);
+      }
+      for (const WindowOrderTerm& term : win.inner_order_by) {
+        rebuilt->inner_order_by.push_back(
+            SubstituteInOrderTerm(term, bindings));
+      }
+      for (const Expression& key : win.partition_by) {
+        rebuilt->partition_by.push_back(SubstituteParameters(key, bindings));
+      }
+      for (const WindowOrderTerm& term : win.order_by) {
+        rebuilt->order_by.push_back(SubstituteInOrderTerm(term, bindings));
+      }
+      if (win.frame_start.offset) {
+        rebuilt->frame_start.offset =
+            SubstituteParameters(win.frame_start.offset, bindings);
+      }
+      if (win.frame_end.offset) {
+        rebuilt->frame_end.offset =
+            SubstituteParameters(win.frame_end.offset, bindings);
+      }
+      return {rebuilt};
+    }
+    case TypeTag::kLambdaExp: {
+      const auto& lambda = expression->AsLambdaExpression();
+      return std::make_shared<LambdaExpression>(
+          lambda.Parameters(), SubstituteParameters(lambda.Body(), bindings));
+    }
     default:
       // Constants and intervals carry no parameter references.
       return expression;
@@ -961,23 +1010,6 @@ StatusOr<std::string> DecodeSingleComponent(std::string_view value_view) {
   return DecodeStringEscapesImpl(value, is_bytes, is_triple, quote);
 }
 
-StatusOr<std::string> DecodeString(const GoogleSqlAstNode& node) {
-  std::string result;
-  bool found_component = false;
-  for (const auto& child : node.children) {
-    if (child->kind == "StringLiteralComponent") {
-      ASSIGN_OR_RETURN(std::string, hv30550_0,
-                       (DecodeSingleComponent(child->detail)));
-      result += hv30550_0;
-      found_component = true;
-    }
-  }
-  if (found_component) {
-    return result;
-  }
-  return DecodeSingleComponent(node.detail);
-}
-
 // Recognizes the correlated shape `SELECT x FROM UNNEST(<expr>) [AS x]`
 // (no other clauses) used by quantified comparisons over table arrays and
 // returns the array expression node.  Returns nullptr for anything else.
@@ -1091,6 +1123,24 @@ StatusOr<Expression> ExpandUdfCall(const std::string& name,
                                    std::vector<Expression> arguments);
 
 }  // namespace
+
+StatusOr<std::string> DecodeString(const GoogleSqlAstNode& node) {
+  std::string result;
+  bool found_component = false;
+  for (const auto& child : node.children) {
+    if (child->kind == "StringLiteralComponent") {
+      ASSIGN_OR_RETURN(std::string, hv30550_0,
+                       (DecodeSingleComponent(child->detail)));
+      result += hv30550_0;
+      found_component = true;
+    }
+  }
+  if (found_component) {
+    return result;
+  }
+  return DecodeSingleComponent(node.detail);
+}
+
 }  // namespace ast_visitor_detail
 
 bool NeedsRelationalEvaluation(
@@ -3109,8 +3159,8 @@ StatusOr<NamedWindowParts> ParseWindowSpecification(
     }
     if (parts.has_frame && (spec.Child("OrderBy") != nullptr ||
                             spec.Child("WindowFrame") != nullptr)) {
-      return AstError<NamedWindowParts>("GoogleSQL AST: named window " +
-                                        name + " with a frame cannot be "
+      return AstError<NamedWindowParts>("GoogleSQL AST: named window " + name +
+                                        " with a frame cannot be "
                                         "refined");
     }
   }
@@ -3394,8 +3444,7 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
         lead == std::string::npos ? std::string() : tail_raw.substr(lead);
     std::string tail = tail_raw;
     for (char& ch : tail) {
-      ch = static_cast<char>(
-          std::toupper(static_cast<unsigned char>(ch)));
+      ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     }
     // A named zone is accepted only when it names a real zone in the tz
     // database (Europe/London, America/New_York, ...); the UTC/GMT markers
@@ -3412,10 +3461,9 @@ std::optional<std::string> NormalizeTimestampTextImpl(const std::string& text) {
     }
   }
   if (!has_explicit_tz) {
-    total_offset_mins =
-        ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
-                            static_cast<int>(s_val)) /
-        60;
+    total_offset_mins = ParseTimeZoneOffset(GetDefaultTimeZone(), Y, M, D, h, m,
+                                            static_cast<int>(s_val)) /
+                        60;
   }
   struct tm t = {};
   t.tm_year = Y - 1900;
@@ -3799,8 +3847,8 @@ StatusOr<Expression> VisitExpression(
     std::optional<std::string> normalized_timestamp =
         NormalizeTimestampTextImpl(text);
     if (!normalized_timestamp.has_value()) {
-      return AstError<Expression>(
-          "GoogleSQL AST: invalid TIMESTAMP literal " + text);
+      return AstError<Expression>("GoogleSQL AST: invalid TIMESTAMP literal " +
+                                  text);
     }
     return ConstantValueExp(Value(std::move(*normalized_timestamp)));
   }

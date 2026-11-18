@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,22 @@ TEST(CollationTest, NamesRoundTripAndSpecResolution) {
   EXPECT_EQ(CollationFromName("und:ci"), Collation::kCaseInsensitive);
   EXPECT_EQ(CollationFromName("en_US"), Collation::kCaseInsensitive);
   EXPECT_EQ(CollationFromName("czech"), Collation::kCaseInsensitive);
+}
+
+TEST(CollationTest, CollationOfSpecRejectsUnsupportedSpecs) {
+  // Only 'binary' and 'und:ci' are valid collation spec names.
+  EXPECT_EQ(CollationOfSpec("binary"), std::optional<Collation>(Collation::kBinary));
+  EXPECT_EQ(CollationOfSpec("BINARY"), std::optional<Collation>(Collation::kBinary));
+  EXPECT_EQ(CollationOfSpec("und:ci"), std::optional<Collation>(Collation::kCaseInsensitive));
+  EXPECT_EQ(CollationOfSpec("UND:CI"), std::optional<Collation>(Collation::kCaseInsensitive));
+  // Unknown names, typos and the empty string are unsupported.
+  EXPECT_EQ(CollationOfSpec("und"), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec("und:cs"), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec("und-cl"), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec("en_US"), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec("bogus"), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec(""), std::optional<Collation>());
+  EXPECT_EQ(CollationOfSpec("   "), std::optional<Collation>());
 }
 
 TEST(CollationTest, ResolveCollationFoldsWhenEitherSideAsks) {

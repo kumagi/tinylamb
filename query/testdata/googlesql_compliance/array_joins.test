@@ -1,4 +1,4 @@
-# Simiple join
+# Simple join
 [name=array_join_simple]
 SELECT a, b FROM (SELECT 1 a), UNNEST([1, 2, 3]) b
 --

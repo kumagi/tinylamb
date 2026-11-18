@@ -10,6 +10,7 @@
 #include <ios>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -1337,14 +1338,18 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
   if (statement.WhereClause()) {
     // Detect subquery patterns in the WHERE clause and emit the correct
     // join type instead of a plain Filter node.
-    bool emitted_subquery_join = false;
+    // Track emitted conjuncts individually: one EXISTS conjunct producing a
+    // Semi/AntiHashJoin line must not suppress the plain predicates in the
+    // same WHERE clause (the engine still evaluates them).
+    std::vector<Expression> plain_conjuncts;
     for (const Expression& conjunct : SplitConjuncts(statement.WhereClause())) {
       if (!conjunct) {
         continue;
       }
-      // Helper lambda: emit join type for a QueryExpression.
+      // Helper lambda: emit join type for a QueryExpression. Returns whether
+      // a join line was produced.
       auto emit_query_join = [&](const QueryExpression& qe,
-                                 bool outer_negated) {
+                                 bool outer_negated) -> bool {
         const bool exists = qe.Exists();
         const bool negated = qe.Negated() != outer_negated;
         const bool has_test =
@@ -1357,37 +1362,50 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
           if (qe.Query() != nullptr && qe.Query()->Distinct()) {
             output << pad << "DistinctBuild eliminated=true" << '\n';
           }
-          emitted_subquery_join = true;
-        } else if (exists && negated) {
-          output << pad << "AntiHashJoin" << '\n';
-          emitted_subquery_join = true;
-        } else if (!exists && negated && has_test) {
-          output << pad << "NullAwareAntiHashJoin" << '\n';
-          emitted_subquery_join = true;
-        } else if (!exists && !negated && has_test) {
-          output << pad << "SemiHashJoin" << '\n';
-          emitted_subquery_join = true;
+          return true;
         }
+        if (exists && negated) {
+          output << pad << "AntiHashJoin" << '\n';
+          return true;
+        }
+        if (!exists && negated && has_test) {
+          output << pad << "NullAwareAntiHashJoin" << '\n';
+          return true;
+        }
+        if (!exists && !negated && has_test) {
+          output << pad << "SemiHashJoin" << '\n';
+          return true;
+        }
+        return false;
       };
+      bool emitted = false;
       if (conjunct->Type() == TypeTag::kQueryExp) {
-        emit_query_join(conjunct->AsQueryExpression(), false);
+        emitted = emit_query_join(conjunct->AsQueryExpression(), false);
       } else if (conjunct->Type() == TypeTag::kUnaryExp &&
                  conjunct->AsUnaryExpression().Op() == UnaryOperation::kNot &&
                  conjunct->AsUnaryExpression().Child()->Type() ==
                      TypeTag::kQueryExp) {
-        emit_query_join(
+        emitted = emit_query_join(
             conjunct->AsUnaryExpression().Child()->AsQueryExpression(), true);
       }
+      if (!emitted) {
+        plain_conjuncts.push_back(conjunct);
+      }
     }
-    if (!emitted_subquery_join) {
+    if (!plain_conjuncts.empty()) {
       // WHERE filter: emit below window annotations so tests see
       // "Filter X" after "Window" in the plan text.
-      const Expression& where = statement.WhereClause();
+      Expression where;
+      for (const Expression& conjunct : plain_conjuncts) {
+        where =
+            where ? BinaryExpressionExp(where, BinaryOperation::kAnd, conjunct)
+                  : conjunct;
+      }
       bool emitted_derived_pushdown = false;
       if (statement.Sources().size() == 1) {
         const SelectSource& source = statement.Sources()[0];
         if (source.query && !IsTrivialDerivedTable(*source.query)) {
-          for (const Expression& conjunct : SplitConjuncts(where)) {
+          for (const Expression& conjunct : plain_conjuncts) {
             if (CanPushPredicateIntoDerived(
                     conjunct, *source.query,
                     source.alias.empty() ? "d" : source.alias)) {
@@ -1492,9 +1510,18 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
       layout_keys.push_back(key);
     }
-    std::sort(layout_keys.begin(), layout_keys.end());
-    auto uniq = std::unique(layout_keys.begin(), layout_keys.end());
-    const size_t sort_count = static_cast<size_t>(uniq - layout_keys.begin());
+    // Keep `layout_keys` in lockstep with `window_fns` to preserve index
+    // correspondence across the sort.
+    std::vector<size_t> fn_idx(window_fns.size());
+    std::iota(fn_idx.begin(), fn_idx.end(), 0);
+    std::sort(fn_idx.begin(), fn_idx.end(), [&layout_keys](size_t a, size_t b) {
+      return layout_keys[a] < layout_keys[b];
+    });
+    auto uniq_end = std::unique(fn_idx.begin(), fn_idx.end(),
+                                [&layout_keys](size_t a, size_t b) {
+                                  return layout_keys[a] == layout_keys[b];
+                                });
+    const size_t sort_count = static_cast<size_t>(uniq_end - fn_idx.begin());
 
     // Group incompatible window orders.
     // When sort_count > 1, windows have different order specs and need
@@ -1517,9 +1544,10 @@ void WriteEstimatedPhysicalPlan(TransactionContext& context,
       }
     }
     if (has_rank && has_dense_rank) {
-      // Check if they share the same layout
-      for (size_t i = 0; i < window_fns.size(); ++i) {
-        for (size_t j = i + 1; j < window_fns.size(); ++j) {
+      // Check if they share the same layout -- use sorted indices for matching
+      for (size_t m = 0; m < fn_idx.size(); ++m) {
+        for (size_t n = m + 1; n < fn_idx.size(); ++n) {
+          const size_t i = fn_idx[m], j = fn_idx[n];
           if (layout_keys[i] == layout_keys[j] &&
               ((window_fns[i]->function == "RANK" &&
                 window_fns[j]->function == "DENSE_RANK") ||

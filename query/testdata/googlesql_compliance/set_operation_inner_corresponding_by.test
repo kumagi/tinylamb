@@ -13,7 +13,7 @@ SELECT CAST(1 AS INT32) AS b
 ARRAY<STRUCT<b INT32>>[unknown order:{1}, {1}]
 ==
 
-# CORRESPONDING BY literal coercion INNER mode literal cocercion with subquery
+# CORRESPONDING BY literal coercion INNER mode literal coercion with subquery
 [name=corresponding_by_literal_coercion_inner_coercion_with_subquery]
 (
   SELECT 1 AS a, 1 AS b

@@ -49,7 +49,7 @@ int64_t NextI64(Stream& s) {
   return static_cast<int64_t>(v);
 }
 
-// biased=true concentrates on the classic boundary payloads (0, ±1,
+// biased=true concentrates on the classic boundary payloads (0, ±1, 2,
 // INT64_MIN/MAX); biased=false uses the full byte range.
 Value MakeInt(Stream& s, bool biased) {
   if (biased) {
@@ -310,7 +310,7 @@ extern "C" [[maybe_unused]] int LLVMFuzzerTestOneInput(const uint8_t* data,
   }
 
   // Typed value invariants over three derived values (two "biased" toward
-  // boundary payloads, one fully random)..data=
+  // boundary payloads, one fully random).
   Stream stream{.data = data, .size = size};
   const Value a = MakeValue(stream, true);
   const Value b = MakeValue(stream, true);

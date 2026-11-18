@@ -540,7 +540,7 @@ ARRAY<STRUCT<src INT64, amount1 INT64, mid INT64, amount2 INT64, dest INT64>>[kn
   {1010, 200, 1020, 400, 1030}
 ]
 ==
-# TODO: Implement multuiply-declared variables and [NOT] SAME and
+# TODO: Implement multiply-declared variables and [NOT] SAME and
 # ALL_DIFFERENT() predicates.
 [name=fixed_path_patterns_mixed_directions]
 select * from

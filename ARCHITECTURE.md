@@ -111,7 +111,11 @@ $ python3 scripts/check_layering.py --allowlist my_edges.txt
   (ファイル名に `_test.`, `_fuzzer`, `_benchmark.` を含むもの), `main.cpp`
 - **運用**: 既知の負債エッジはスクリプト内 `DEFAULT_ALLOWLIST` にコメント付きで
   許容している。修正が完了したらその行を削る (潰すごとにリストが減る)。
-  新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則
+  新規に赤くなったら、allowlist 追加ではなく層の配置を見直すのが原則。
+  各エッジは完全形 (`src -> include`) で列挙する。ワイルドカード `*` は
+  fnmatch で `/` をも跨いで一致するため、使うと新規エッジまで黙って許容され
+  この運用が最大の負債領域で機能しなくなる (2026-11-18: 全 7 パターンを
+  実エッジへ展開済み)。
 
 ## 5. 現在許容している境界違反 (`scripts/check_layering.py` 出力, 計 78 辺)
 

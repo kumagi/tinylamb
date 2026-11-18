@@ -3969,10 +3969,11 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
   //   (x + c1) + c2 -> x + (c1 + c2)      (x - c1) - c2 -> x - (c1 + c2)
   //   (x + c1) - c2 -> x +/- (c1 - c2)    (x - c1) + c2 -> x +/- (c2 - c1)
   // Only column-plus-constant chains over INT64 take part, and constant
-  // combines use checked arithmetic. A pathological intermediate overflow
-  // ((x + 5) - 8 with x = INT64_MAX errors on x + 5 but not on x - 3) is
-  // accepted: the folded form is the shape the contract pins and every
-  // in-domain input evaluates identically.
+  // combines use checked arithmetic. Like the schema-free rule, only
+  // reassociate steps that share a sign: with opposite signs the original
+  // intermediate operation can overflow (x = INT64_MAX in `(x + 5) - 8`
+  // raises on `x + 5`) while the folded `x - 3` would not, silently eliding
+  // an AST-evaluator error (invariant 3).
   const BinaryOperation op = binary.Op();
   if (op == BinaryOperation::kAdd || op == BinaryOperation::kSubtract) {
     int64_t outer_constant = 0;
@@ -4002,6 +4003,13 @@ Expression RewriteTypedArithmetic(  // NOLINT(misc-no-recursion)
                                        : -inner_constant;
         const int64_t outer_step =
             op == BinaryOperation::kAdd ? outer_constant : -outer_constant;
+        // INT64 add/sub is not associative around overflow: with opposite
+        // signs the intermediate result can overflow even though the folded
+        // total does not. Keep the original shape so the AST's raise is
+        // preserved (mirrors reassociate_add_constants above).
+        if ((inner_step >= 0) != (outer_step >= 0)) {
+          return current;
+        }
         int64_t accumulated = 0;
         if (__builtin_add_overflow(inner_step, outer_step, &accumulated) ||
             accumulated == std::numeric_limits<int64_t>::min()) {

@@ -370,8 +370,14 @@ size_t GroupedAggregateWorkers(size_t child_rows) {
     return 1;
   }
   constexpr size_t kMaxParallelAggregationWorkers = 16;
-  return std::min(kMaxParallelAggregationWorkers,
-                  std::max<size_t>(1, std::thread::hardware_concurrency()));
+  // Match EmitScalarAggregation: respect the per-query admission budget and
+  // scale workers down for smaller inputs instead of always fanning out to
+  // hardware_concurrency().
+  return std::max<size_t>(
+      1, std::min({kMaxParallelAggregationWorkers,
+                   QueryParallelWorkerLimit(static_cast<size_t>(
+                       std::thread::hardware_concurrency())),
+                   child_rows / kParallelAggregationMinRows}));
 }
 
 // The no-GROUP-BY-KEYS path, shared by all three shapes: the historical serial
@@ -1152,9 +1158,11 @@ Executor IndexScanPlan::EmitExecutor(TransactionContext& txn) const {
       EmitRowCount() >= kParallelIndexScanMinRows) {
     constexpr size_t kMaxParallelIndexScanWorkers = 16;
     constexpr size_t kLeavesPerIndexMorsel = 8;
-    const size_t workers =
-        std::min(kMaxParallelIndexScanWorkers,
-                 std::max<size_t>(1, std::thread::hardware_concurrency()));
+    const size_t workers = std::max<size_t>(
+        1, std::min({kMaxParallelIndexScanWorkers,
+                     QueryParallelWorkerLimit(static_cast<size_t>(
+                         std::thread::hardware_concurrency())),
+                     EmitRowCount() / kParallelIndexScanMinRows}));
     Executor scan = std::make_shared<ParallelIndexScan>(
         txn.txn_, table_, index_, begin_key, end_key, ascending_, workers,
         kLeavesPerIndexMorsel, std::move(index_read_guard));
@@ -1437,8 +1445,10 @@ Executor MergeJoinPlan::EmitExecutor(TransactionContext& ctx) const {
   if (Kind() == JoinKind::kInner && !Residual() &&
       Left()->EmitRowCount() + Right()->EmitRowCount() >=
           kParallelMergeJoinMinRows) {
-    const size_t workers = std::min<size_t>(
-        16, std::max<size_t>(1, std::thread::hardware_concurrency()));
+    const size_t workers = std::max<size_t>(
+        1, std::min<size_t>(
+               16, QueryParallelWorkerLimit(static_cast<size_t>(
+                        std::thread::hardware_concurrency()))));
     return std::make_shared<ParallelMergeJoin>(
         Left()->EmitExecutor(ctx), std::move(left), Right()->EmitExecutor(ctx),
         std::move(right), workers, Kind(), Expression(), Schema(),
@@ -1747,8 +1757,10 @@ Executor ProductPlan::EmitExecutor(TransactionContext& ctx) const {
   if (!dynamic_filter && !any_null_safe && fits_budget &&
       left_src_->EmitRowCount() + right_src_->EmitRowCount() >=
           kParallelHashJoinMinRows) {
-    const size_t workers = std::min<size_t>(
-        16, std::max<size_t>(1, std::thread::hardware_concurrency()));
+    const size_t workers = std::max<size_t>(
+        1, std::min<size_t>(
+               16, QueryParallelWorkerLimit(static_cast<size_t>(
+                        std::thread::hardware_concurrency()))));
     return std::make_shared<SharedBuildParallelHashJoin>(
         left_src_->EmitExecutor(ctx), left, right_src_->EmitExecutor(ctx),
         right, workers, JoinKind::kInner,

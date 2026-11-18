@@ -918,4 +918,20 @@ TEST(SelectStatementFingerprintTest, IncludesAggregateFilter) {
   EXPECT_NE(first.Fingerprint(), second.Fingerprint());
 }
 
+TEST_F(SqlUdfTest, QualifiedStarOverDerivedSource) {
+  RunSql(engine_.get(), context_.get(), "CREATE TABLE xy (a INT64, b INT64)");
+  RunSql(engine_.get(), context_.get(), "INSERT INTO xy VALUES (7, 9)");
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT t.* FROM (SELECT a, b FROM xy) t");
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], Value(int64_t{7}));
+  EXPECT_EQ(rows[0][1], Value(int64_t{9}));
+  const auto filtered = RunSql(
+      engine_.get(), context_.get(),
+      "SELECT t.* FROM (SELECT a, b FROM xy) t WHERE t.a > 0");
+  ASSERT_EQ(filtered.size(), 1U);
+  EXPECT_EQ(filtered[0][0], Value(int64_t{7}));
+  EXPECT_EQ(filtered[0][1], Value(int64_t{9}));
+}
+
 }  // namespace tinylamb

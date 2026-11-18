@@ -1,0 +1,331 @@
+/** Copyright 2026 KUMAZAKI Hiroki. Licensed under Apache-2.0. */
+
+// Out-of-process driver for the OOC session fuzzer.  One process runs one
+// session, so a crash, a sanitizer abort or a hang costs exactly one session
+// and still leaves a reproducible trace behind (every op is appended to the
+// trace file before it executes).  scripts/ooc_fuzz.py runs campaigns of
+// these, buckets the findings and minimizes them.
+//
+//   sql_ooc_fuzz gen --seed N [--seconds S] [--scale K] [--flavor NAME]
+//                    [--trace FILE] [--op-timeout S] [--verbose]
+//   sql_ooc_fuzz replay FILE [--lenient] [--op-timeout S] [--verbose]
+//   sql_ooc_fuzz minimize FILE --out FILE [--seconds S]
+//   sql_ooc_fuzz flavors
+//
+// Exit status: 0 every check held, 1 finding (FINDING:/SIGNATURE: lines on
+// stdout), 2 usage or malformed input, 3 an op exceeded --op-timeout.
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include "query/sql_ooc_fuzzer.hpp"
+
+namespace {
+
+using tinylamb::OocProfile;
+using tinylamb::OocRunOptions;
+using tinylamb::OocStats;
+using tinylamb::OocTrace;
+
+int Usage() {
+  std::cerr << "usage:\n"
+               "  sql_ooc_fuzz gen --seed N [--seconds S] [--scale K] "
+               "[--flavor NAME] [--trace FILE] [--op-timeout S] [--verbose]\n"
+               "  sql_ooc_fuzz replay FILE [--lenient] [--op-timeout S] "
+               "[--verbose]\n"
+               "  sql_ooc_fuzz minimize FILE --out FILE [--seconds S]\n"
+               "  sql_ooc_fuzz flavors\n";
+  return 2;
+}
+
+struct Args {
+  std::string command;
+  std::string file;
+  std::string trace_path;
+  std::string out_path;
+  std::string flavor;
+  uint64_t seed{0};
+  double seconds{0};
+  double op_timeout{0};
+  int scale{0};
+  bool verbose{false};
+  bool lenient{false};
+};
+
+bool ParseArgs(int argc, char** argv, Args* a) {
+  if (argc < 2) {
+    return false;
+  }
+  a->command = argv[1];
+  for (int i = 2; i < argc; ++i) {
+    const std::string_view arg = argv[i];
+    auto value = [&]() -> const char* {
+      return i + 1 < argc ? argv[++i] : nullptr;
+    };
+    if (arg == "--verbose") {
+      a->verbose = true;
+    } else if (arg == "--lenient") {
+      a->lenient = true;
+    } else if (arg == "--seed" || arg == "--seconds" || arg == "--scale" ||
+               arg == "--flavor" || arg == "--trace" || arg == "--out" ||
+               arg == "--op-timeout") {
+      const char* v = value();
+      if (v == nullptr) {
+        return false;
+      }
+      if (arg == "--seed") {
+        a->seed = std::strtoull(v, nullptr, 10);
+      } else if (arg == "--seconds") {
+        a->seconds = std::strtod(v, nullptr);
+      } else if (arg == "--scale") {
+        a->scale = static_cast<int>(std::strtol(v, nullptr, 10));
+      } else if (arg == "--flavor") {
+        a->flavor = v;
+      } else if (arg == "--trace") {
+        a->trace_path = v;
+      } else if (arg == "--out") {
+        a->out_path = v;
+      } else {
+        a->op_timeout = std::strtod(v, nullptr);
+      }
+    } else if (!arg.starts_with("--") && a->file.empty()) {
+      a->file = std::string(arg);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Flags an op that runs longer than the timeout: a spill operator waiting
+// for memory it will never get, or a livelock in the eviction path.
+class Watchdog {
+ public:
+  explicit Watchdog(double timeout_seconds) : timeout_(timeout_seconds) {
+    if (timeout_ > 0) {
+      thread_ = std::thread([this]() { Run(); });
+    }
+  }
+  Watchdog(const Watchdog&) = delete;
+  Watchdog& operator=(const Watchdog&) = delete;
+  Watchdog(Watchdog&&) = delete;
+  Watchdog& operator=(Watchdog&&) = delete;
+  ~Watchdog() {
+    stop_.store(true, std::memory_order_release);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  void Tick(const std::string& op) {
+    std::scoped_lock lock(mu_);
+    op_ = op;
+    started_ = std::chrono::steady_clock::now();
+    armed_ = true;
+  }
+  void Disarm() {
+    std::scoped_lock lock(mu_);
+    armed_ = false;
+  }
+
+ private:
+  void Run() {
+    while (!stop_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      std::string op;
+      {
+        std::scoped_lock lock(mu_);
+        if (!armed_ || std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - started_)
+                               .count() < timeout_) {
+          continue;
+        }
+        op = op_;
+      }
+      const std::string kind = op.substr(0, op.find(' '));
+      std::cout << "FINDING: op ran longer than " << timeout_
+                << " s (hang or livelock): " << op.substr(0, 400) << "\n"
+                << "SIGNATURE: hang / " << kind << "\n"
+                << std::flush;
+      std::_Exit(3);
+    }
+  }
+
+  double timeout_;
+  std::mutex mu_;
+  std::string op_;
+  std::chrono::steady_clock::time_point started_;
+  bool armed_{false};
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
+void PrintStats(const OocStats& stats) {
+  std::cout << "STATS: " << stats.Summary() << "\n";
+  std::cout << "SHAPES:";
+  for (const auto& [name, n] : stats.shapes) {
+    std::cout << " " << name << "=" << n;
+  }
+  std::cout << "\nOPERATORS:";
+  for (const auto& [name, n] : stats.operators) {
+    std::cout << " " << name << "=" << n;
+  }
+  std::cout << "\n";
+  for (const auto& [name, n] : stats.routes) {
+    std::cout << "ROUTE: " << n << " " << name << "\n";
+  }
+}
+
+int Report(const std::string& report, const OocStats& stats) {
+  PrintStats(stats);
+  if (report.empty()) {
+    std::cout << "OK\n";
+    return 0;
+  }
+  std::cout << "FINDING: " << report << (report.ends_with('\n') ? "" : "\n")
+            << "SIGNATURE: " << tinylamb::OocFailureSignature(report) << "\n";
+  return 1;
+}
+
+bool LoadTrace(const std::string& path, uint64_t* seed, OocTrace* trace,
+               std::string* summary) {
+  std::ifstream file(path);
+  if (!file) {
+    std::cerr << "cannot read " << path << "\n";
+    return false;
+  }
+  const std::string text((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+  if (!tinylamb::ParseOocTest(text, seed, trace, summary)) {
+    std::cerr << "malformed trace file " << path << "\n";
+    return false;
+  }
+  return true;
+}
+
+int RunGen(const Args& a) {
+  OocRunOptions options;
+  options.verbose = a.verbose;
+  options.budget_seconds = a.seconds;
+  options.scale = a.scale;
+  if (!a.flavor.empty()) {
+    const std::vector<std::string> names = tinylamb::OocFlavorNames();
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (names[i] == a.flavor) {
+        options.flavor = static_cast<int>(i);
+      }
+    }
+    if (options.flavor < 0) {
+      std::cerr << "unknown flavor " << a.flavor << "\n";
+      return 2;
+    }
+  }
+  std::ofstream trace_file;
+  Watchdog watchdog(a.op_timeout);
+  options.on_profile = [&](const OocProfile& profile) {
+    if (!a.trace_path.empty()) {
+      trace_file.open(a.trace_path, std::ios::trunc);
+      trace_file << tinylamb::SerializeOocHeader(a.seed, profile) << std::flush;
+    }
+  };
+  options.on_op = [&](const std::string& op) {
+    if (trace_file.is_open()) {
+      trace_file << op << "\n" << std::flush;
+    }
+    watchdog.Tick(op);
+  };
+  OocStats stats;
+  OocTrace trace;
+  const std::string report =
+      tinylamb::RunOocSession(nullptr, 0, a.seed, options, &stats, &trace);
+  watchdog.Disarm();
+  return Report(report, stats);
+}
+
+int RunReplay(const Args& a) {
+  uint64_t seed = 0;
+  OocTrace trace;
+  std::string summary;
+  if (a.file.empty() || !LoadTrace(a.file, &seed, &trace, &summary)) {
+    return 2;
+  }
+  OocRunOptions options;
+  options.verbose = a.verbose;
+  options.lenient = a.lenient;
+  Watchdog watchdog(a.op_timeout);
+  options.on_op = [&](const std::string& op) { watchdog.Tick(op); };
+  OocStats stats;
+  const std::string report = tinylamb::ReplayOocTrace(trace, options, &stats);
+  watchdog.Disarm();
+  return Report(report, stats);
+}
+
+int RunMinimize(const Args& a) {
+  uint64_t seed = 0;
+  OocTrace trace;
+  std::string summary;
+  if (a.file.empty() || a.out_path.empty() ||
+      !LoadTrace(a.file, &seed, &trace, &summary)) {
+    return 2;
+  }
+  OocRunOptions lenient;
+  lenient.lenient = true;
+  const std::string report = tinylamb::ReplayOocTrace(trace, lenient, nullptr);
+  if (report.empty()) {
+    std::cout << "OK (the trace does not reproduce in-process)\n";
+    return 0;
+  }
+  std::string final_report;
+  const OocTrace minimized = tinylamb::MinimizeOocTrace(
+      trace, report, a.seconds > 0 ? a.seconds : 300, &final_report);
+  std::string one_line = final_report;
+  for (char& c : one_line) {
+    if (c == '\n') {
+      c = ' ';
+    }
+  }
+  std::ofstream(a.out_path)
+      << tinylamb::SerializeOocTest(seed, minimized, one_line.substr(0, 600));
+  std::cout << "MINIMIZED: " << trace.ops.size() << " -> "
+            << minimized.ops.size() << " ops, written to " << a.out_path
+            << "\nFINDING: " << final_report
+            << (final_report.ends_with('\n') ? "" : "\n")
+            << "SIGNATURE: " << tinylamb::OocFailureSignature(final_report)
+            << "\n";
+  return 1;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  Args a;
+  if (!ParseArgs(argc, argv, &a)) {
+    return Usage();
+  }
+  if (a.command == "gen") {
+    return RunGen(a);
+  }
+  if (a.command == "replay") {
+    return RunReplay(a);
+  }
+  if (a.command == "minimize") {
+    return RunMinimize(a);
+  }
+  if (a.command == "flavors") {
+    for (const std::string& name : tinylamb::OocFlavorNames()) {
+      std::cout << name << "\n";
+    }
+    return 0;
+  }
+  return Usage();
+}

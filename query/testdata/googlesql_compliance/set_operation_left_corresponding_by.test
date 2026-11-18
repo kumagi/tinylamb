@@ -22,7 +22,7 @@ SELECT NULL AS a
 ARRAY<STRUCT<a STRING, b INT64>>[unknown order:{"s", 1}, {NULL, NULL}]
 ==
 
-# CORRESPONDING BY Literal coercion LEFT mode literal cocercion with subquery
+# CORRESPONDING BY Literal coercion LEFT mode literal coercion with subquery
 [name=corresponding_by_literal_coercion_left_coercion_with_subquery]
 (
   SELECT 1 AS a, 1 AS b

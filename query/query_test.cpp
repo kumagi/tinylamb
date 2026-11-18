@@ -597,6 +597,40 @@ TEST_F(QueryTest, SiblingDerivedAggregatesFuseIntoSingleScan) {
   }
 }
 
+// Parameter substitution must also reach window specifications and lambdas
+// inside a TVF body. A parameter sharing a name with a base column used to
+// stay a column reference, silently partitioning by the column instead.
+TEST_F(QueryTest, TableValuedFunctionSubstitutesWindowParameters) {
+  TransactionContext ctx = db_->BeginContext();
+  RunSql(ctx, *db_, "CREATE TABLE tvf_w (g INT64, v INT64);");
+  RunSql(ctx, *db_, "INSERT INTO tvf_w VALUES (1, 10), (1, 20), (2, 30);");
+
+  SqlEngine engine(*db_);
+  const auto run = [&](std::string_view sql) {
+    StatusOr<Executor> prepared = engine.Prepare(ctx, sql);
+    EXPECT_EQ(prepared.GetStatus(), Status::kSuccess) << sql << "\n"
+                                                      << engine.LastError();
+    std::vector<Row> rows;
+    if (!prepared.HasValue()) {
+      return rows;
+    }
+    Row row;
+    while (prepared.Value()->Next(&row, nullptr)) {
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  run("CREATE TABLE FUNCTION wsum(g INT64) AS "
+      "SELECT SUM(v) OVER (PARTITION BY g) AS s FROM tvf_w;");
+  const std::vector<Row> rows = run("SELECT s FROM wsum(7);");
+  ASSERT_EQ(rows.size(), 3U);
+  for (const Row& row : rows) {
+    // With g substituted by the constant 7 all rows share one partition.
+    EXPECT_EQ(row[0].value.int_value, 60);
+  }
+}
+
 // CREATE TABLE FUNCTION bodies expand at FROM-reference time with the
 // call-site arguments: constant arguments substitute into the stored query
 // (multi-argument, WHERE, and alias forms), and unknown functions or
@@ -2480,11 +2514,10 @@ TEST_F(QueryTest, SqlEngineUnnestStructFieldNameContainingColon) {
   // quoted name, so the anonymous sibling's f1 was renamed to a broken key
   // and e.`a:b` resolved to NULL for it.
   TransactionContext ctx = db_->BeginContext();
-  EXPECT_EQ(
-      RunSql(ctx, *db_,
-             "SELECT e.`a:b` AS v FROM UNNEST([STRUCT(1 AS `a:b`), "
-             "STRUCT(2)]) e ORDER BY v;"),
-      (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
+  EXPECT_EQ(RunSql(ctx, *db_,
+                   "SELECT e.`a:b` AS v FROM UNNEST([STRUCT(1 AS `a:b`), "
+                   "STRUCT(2)]) e ORDER BY v;"),
+            (std::vector<Row>{Row({Value(1)}), Row({Value(2)})}));
   ctx.txn_.Abort();
 }
 

@@ -27,7 +27,19 @@ bool WorkTableRowEqual::operator()(const Row& left, const Row& right) const {
 size_t WorkTableRowHash::operator()(const Row& row) const {
   uint64_t hash = 14695981039346656037ULL;  // FNV-1a offset basis
   for (const Value& value : row.values_) {
-    hash ^= std::hash<Value>()(CanonicalDistinctValue(value));
+    uint64_t h;
+    if (value.type == ValueType::kVarChar && !value.IsNull() &&
+        !value.IsInterval()) {
+      // EqualUnderCollation folds a VARCHAR pair when EITHER side carries a
+      // case-insensitive tag, so hash every text cell folded (tagged or not)
+      // so CI-tagged and untagged peers land in the same bucket (mirrors
+      // executor/distinct.cpp DistinctRowHash).
+      h = std::hash<std::string>{}(
+          FoldCaseForCollation(value.value.varchar_value));
+    } else {
+      h = std::hash<Value>()(CanonicalDistinctValue(value));
+    }
+    hash ^= h;
     hash *= 1099511628211ULL;  // FNV-1a prime
   }
   return static_cast<size_t>(hash);

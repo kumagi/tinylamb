@@ -23,7 +23,7 @@ SELECT 's' AS a, 1 AS b
 ARRAY<STRUCT<a STRING, b INT64>>[unknown order:{NULL, NULL}, {"s", 1}]
 ==
 
-# CORRESPONDING BY Literal coercion FULL mode literal cocercion with subquery
+# CORRESPONDING BY Literal coercion FULL mode literal coercion with subquery
 [name=corresponding_by_literal_coercion_full_coercion_with_subquery]
 (
   SELECT 1 AS a, 1 AS b

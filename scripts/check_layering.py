@@ -89,7 +89,32 @@ DEFAULT_ALLOWLIST = (
     "plan/implementation_rules.cpp -> executor/hash_join_mode.hpp",
     # V3': statement IR が executor 層より上位にある問題。
     #      移行期間中の直参照を許容する。
-    "executor/detail/* -> query/statement.hpp",
+    # Expanded from wildcard 'executor/detail/* -> query/statement.hpp' (24 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "executor/detail/aggregate_accumulator.cpp -> query/statement.hpp",
+    "executor/detail/build_input.cpp -> query/statement.hpp",
+    "executor/detail/columnar_tlcs_fast_path.hpp -> query/statement.hpp",
+    "executor/detail/explain_format.cpp -> query/statement.hpp",
+    "executor/detail/explain_format.hpp -> query/statement.hpp",
+    "executor/detail/expression_eval.cpp -> query/statement.hpp",
+    "executor/detail/expression_eval.hpp -> query/statement.hpp",
+    "executor/detail/fused_grouped_join.cpp -> query/statement.hpp",
+    "executor/detail/fused_grouped_join.hpp -> query/statement.hpp",
+    "executor/detail/parallel_table_scan.cpp -> query/statement.hpp",
+    "executor/detail/pipeline/ooc_join_cte_sources.cpp -> query/statement.hpp",
+    "executor/detail/planning_heuristics.cpp -> query/statement.hpp",
+    "executor/detail/planning_heuristics.hpp -> query/statement.hpp",
+    "executor/detail/scan_filter.cpp -> query/statement.hpp",
+    "executor/detail/scan_filter.hpp -> query/statement.hpp",
+    "executor/detail/stream_grouped_join.cpp -> query/statement.hpp",
+    "executor/detail/subquery_runtime.cpp -> query/statement.hpp",
+    "executor/detail/subquery_runtime.hpp -> query/statement.hpp",
+    "executor/detail/typed_column_eval.cpp -> query/statement.hpp",
+    "executor/detail/typed_stream_aggregate.cpp -> query/statement.hpp",
+    "executor/detail/typed_stream_aggregate.hpp -> query/statement.hpp",
+    "executor/detail/typed_stream_aggregate_partitioned.hpp -> query/statement.hpp",
+    "executor/detail/window_eval.cpp -> query/statement.hpp",
+    "executor/detail/window_eval.hpp -> query/statement.hpp",
     "executor/relational.cpp -> query/statement.hpp",
     # apply / recursive_cte / unnest 物理演算子とその plan ノードは
     # SelectStatement IR を直接扱う (relational と同じ V3' 系)。
@@ -106,22 +131,85 @@ DEFAULT_ALLOWLIST = (
     "plan/recursive_cte_plan.hpp -> query/statement.hpp",
     # --- 構造上既知だが未対処のエッジ (潰したらこのリストから削る) -------
     # common から type/value_type.hpp (依存ゼロの列挙型ヘッダ) を使う。
-    "common/* -> type/value_type.hpp",
+    # Expanded from wildcard 'common/* -> type/value_type.hpp' (6 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "common/decoder.cpp -> type/value_type.hpp",
+    "common/decoder.hpp -> type/value_type.hpp",
+    "common/encoder.cpp -> type/value_type.hpp",
+    "common/encoder.hpp -> type/value_type.hpp",
+    "common/runtime_filter.hpp -> type/value_type.hpp",
+    "common/serdes.hpp -> type/value_type.hpp",
     # type/column.hpp が page/row_position.hpp (定数のみ) を使う。
     "type/column.hpp -> page/row_position.hpp",
     # V2 後遺症: index_scan_iterator だけ table ターゲット所属の循環回避。
-    "index/index_scan_iterator.cpp -> table/*",
-    "index/index_scan_iterator.hpp -> table/*",
+    # Expanded from wildcard 'index/index_scan_iterator.cpp -> table/*' (2 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "index/index_scan_iterator.cpp -> table/iterator_base.hpp",
+    "index/index_scan_iterator.cpp -> table/table.hpp",
+    # Expanded from wildcard 'index/index_scan_iterator.hpp -> table/*' (2 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "index/index_scan_iterator.hpp -> table/full_scan_iterator.hpp",
+    "index/index_scan_iterator.hpp -> table/iterator_base.hpp",
     # ゾーンマップ/統計が述語式を直接評価する。
-    "table/* -> expression/*",
+    # Expanded from wildcard 'table/* -> expression/*' (7 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "table/table_statistics.cpp -> expression/binary_expression.hpp",
+    "table/table_statistics.cpp -> expression/column_value.hpp",
+    "table/table_statistics.cpp -> expression/constant_value.hpp",
+    "table/table_statistics.cpp -> expression/expression.hpp",
+    "table/table_statistics.cpp -> expression/in_expression.hpp",
+    "table/table_statistics.cpp -> expression/unary_expression.hpp",
+    "table/table_statistics.hpp -> expression/expression.hpp",
     # bytecode が executor/data_chunk.hpp を要求 (S6/A1 で分離候補)。
     "expression/bytecode.hpp -> executor/data_chunk.hpp",
     "expression/bytecode.cpp -> executor/data_chunk.hpp",
 
     # relational(executor/detail) から executor 本体への上向き。A5 で解消予定。
-    "executor/detail/* -> executor/*",
+    # Expanded from wildcard 'executor/detail/* -> executor/*' (34 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "executor/detail/columnar_tlcs_fast_path.cpp -> executor/query_memory.hpp",
+    "executor/detail/columnar_tlcs_internal.hpp -> executor/query_memory.hpp",
+    "executor/detail/explain_format.cpp -> executor/hash_join_mode.hpp",
+    "executor/detail/explain_format.cpp -> executor/query_memory.hpp",
+    "executor/detail/fused_grouped_join.cpp -> executor/hash_join_mode.hpp",
+    "executor/detail/fused_grouped_join.cpp -> executor/query_memory.hpp",
+    "executor/detail/fused_grouped_join.cpp -> executor/spill_file.hpp",
+    "executor/detail/ooc/chunk_codec.hpp -> executor/data_chunk.hpp",
+    "executor/detail/ooc/external_sorter.hpp -> executor/data_chunk.hpp",
+    "executor/detail/ooc/recursive_partitioner.hpp -> executor/data_chunk.hpp",
+    "executor/detail/ooc/spillable_store.hpp -> executor/data_chunk.hpp",
+    "executor/detail/pipeline/ooc_join_cte_sources.cpp -> executor/data_chunk.hpp",
+    "executor/detail/pipeline/ooc_setop_incsort_sink.cpp -> executor/data_chunk.hpp",
+    "executor/detail/pipeline/ooc_sinks.hpp -> executor/grouped_aggregate.hpp",
+    "executor/detail/pipeline/ooc_sinks.hpp -> executor/hash_join.hpp",
+    "executor/detail/pipeline/ooc_sinks.hpp -> executor/join_kind.hpp",
+    "executor/detail/pipeline/ooc_window_sink.cpp -> executor/data_chunk.hpp",
+    "executor/detail/pipeline/pipeline_ir.hpp -> executor/data_chunk.hpp",
+    "executor/detail/pipeline/pipeline_ir.hpp -> executor/executor_base.hpp",
+    "executor/detail/pipeline/pipeline_ops.hpp -> executor/distinct.hpp",
+    "executor/detail/pipeline/pipeline_ops.hpp -> executor/projection.hpp",
+    "executor/detail/pipeline/pipeline_ops.hpp -> executor/selection.hpp",
+    "executor/detail/planning_heuristics.cpp -> executor/hash_join_mode.hpp",
+    "executor/detail/planning_heuristics.cpp -> executor/query_memory.hpp",
+    "executor/detail/planning_heuristics.cpp -> executor/spill_file.hpp",
+    "executor/detail/relation.cpp -> executor/query_memory.hpp",
+    "executor/detail/relation.cpp -> executor/spill_file.hpp",
+    "executor/detail/relation.hpp -> executor/spill_file.hpp",
+    "executor/detail/subquery_runtime.cpp -> executor/aggregation.hpp",
+    "executor/detail/typed_column_eval.cpp -> executor/aggregation.hpp",
+    "executor/detail/typed_stream_aggregate.cpp -> executor/aggregation.hpp",
+    "executor/detail/typed_stream_aggregate.cpp -> executor/query_memory.hpp",
+    "executor/detail/typed_stream_aggregate_partitioned.cpp -> executor/query_memory.hpp",
+    "executor/detail/window_eval.cpp -> executor/query_memory.hpp",
     # optimizer は query_data を使う (CMake 上 tinylamb_executor 所属)。
-    "plan/* -> query/query_data.hpp",
+    # Expanded from wildcard 'plan/* -> query/query_data.hpp' (6 edges).
+    # Exact edges only: a wildcard silently allows future regressions.
+    "plan/cascades.cpp -> query/query_data.hpp",
+    "plan/cascades_search.cpp -> query/query_data.hpp",
+    "plan/implementation_rules.cpp -> query/query_data.hpp",
+    "plan/implementation_rules.hpp -> query/query_data.hpp",
+    "plan/optimizer.cpp -> query/query_data.hpp",
+    "plan/optimizer.hpp -> query/query_data.hpp",
     # サブクエリ脱相関 (tpch Phase2-4) のため optimizer が QueryExpression
     # 内の SelectStatement を解析する。sql 局のステートメント IR を読むだけ
     # で、実行は relational/subquery_runtime 側に留まる。

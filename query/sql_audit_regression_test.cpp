@@ -586,4 +586,15 @@ TEST_F(SqlAuditRegressionTest, DistinctOnKeepsFirstRowWithCollation) {
                               Row({Value(), Value(4)})}));
 }
 
+// The uncorrelated IN hash set treats every NaN as equal, but SQL equality
+// (and the rescan path) never matches NaN.
+TEST_F(SqlAuditRegressionTest, InSubqueryNeverMatchesNaN) {
+  Rows("CREATE TABLE audit_nan (id INT64, d DOUBLE)");
+  Rows("INSERT INTO audit_nan VALUES (1, CAST('nan' AS DOUBLE)), "
+       "(2, CAST('nan' AS DOUBLE)), (3, 1.5)");
+  EXPECT_EQ(Rows("SELECT id FROM audit_nan WHERE d IN "
+                 "(SELECT d FROM audit_nan) ORDER BY id"),
+            (std::vector<Row>{Row({Value(int64_t{3})})}));
+}
+
 }  // namespace tinylamb

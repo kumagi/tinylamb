@@ -624,6 +624,18 @@ TEST(GoogleSqlAstTest, UnsupportedConstructsThrow) {
   EXPECT_THROW(VisitSqlOrThrow("DROP DATABASE t;"), std::runtime_error);
 }
 
+TEST(GoogleSqlAstTest, UnsupportedCreateConstraintsThrow) {
+  // The parser accepts these but the catalog cannot enforce them: skipping
+  // them would create a table that silently accepts rows the DDL forbids.
+  EXPECT_THROW(
+      VisitSqlOrThrow("CREATE TABLE t (k INT64, v INT64, CHECK (v > 0));"),
+      std::runtime_error);
+  EXPECT_THROW(VisitSqlOrThrow(
+                   "CREATE TABLE t (k INT64, v INT64 OPTIONS (description = "
+                   "'x'));"),
+               std::runtime_error);
+}
+
 namespace {
 
 template <typename Fn>

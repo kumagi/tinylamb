@@ -1220,16 +1220,18 @@ TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
                                       ConstantValueExp(Value(5))),
                   BinaryOperation::kSubtract, ConstantValueExp(Value(3))),
               BinaryOperation::kSubtract, 8);
-  expect_form(BinaryExpressionExp(
-                  BinaryExpressionExp(a, BinaryOperation::kAdd,
-                                      ConstantValueExp(Value(5))),
-                  BinaryOperation::kSubtract, ConstantValueExp(Value(8))),
-              BinaryOperation::kSubtract, 3);
-  expect_form(
-      BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
-                                              ConstantValueExp(Value(5))),
-                          BinaryOperation::kAdd, ConstantValueExp(Value(3))),
-      BinaryOperation::kSubtract, 2);
+  // Opposite-sign steps must NOT be reassociated: the original intermediate
+  // can overflow (x = INT64_MAX in `(x + 5) - 8` raises on `x + 5`) while the
+  // folded `x - 3` would not, eliding an AST-evaluator error (invariant 3).
+  const Expression mixed_add_sub = BinaryExpressionExp(
+      BinaryExpressionExp(a, BinaryOperation::kAdd, ConstantValueExp(Value(5))),
+      BinaryOperation::kSubtract, ConstantValueExp(Value(8)));
+  EXPECT_EQ(rewritten(mixed_add_sub)->ToString(), mixed_add_sub->ToString());
+  const Expression mixed_sub_add = BinaryExpressionExp(
+      BinaryExpressionExp(a, BinaryOperation::kSubtract,
+                          ConstantValueExp(Value(5))),
+      BinaryOperation::kAdd, ConstantValueExp(Value(3)));
+  EXPECT_EQ(rewritten(mixed_sub_add)->ToString(), mixed_sub_add->ToString());
 
   // Chains collapse through the rewritten inner form.
   expect_form(BinaryExpressionExp(
@@ -1244,11 +1246,12 @@ TEST(ExpressionRewriteTest, TypedConstantReassociationStaysExact) {
   const Expression folded = rewritten(
       BinaryExpressionExp(BinaryExpressionExp(a, BinaryOperation::kSubtract,
                                               ConstantValueExp(Value(5))),
-                          BinaryOperation::kAdd, ConstantValueExp(Value(3))));
+                          BinaryOperation::kSubtract,
+                          ConstantValueExp(Value(3))));
   ASSERT_EQ(folded->Type(), TypeTag::kBinaryExp);
   for (const int64_t probe : {12, 5, 0, -4}) {
     EXPECT_EQ(folded->Evaluate(Row({Value(probe), Value(0.0)}), schema),
-              Value(probe - 2));
+              Value(probe - 8));
   }
   EXPECT_TRUE(folded->Evaluate(Row({Value(), Value(0.0)}), schema).IsNull());
 

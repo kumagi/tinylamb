@@ -6847,6 +6847,10 @@ StatusOr<Relation> RunTypedParallelStreamAggregate(
                 Value key_value;
                 key_value.type = qualified_schema.GetColumn(offset).Type();
                 key_value.value.int_value = cells[offset];
+                if (key_value.type == ValueType::kInt64 &&
+                    qualified_schema.GetColumn(offset).IsUnsigned()) {
+                  key_value.SetUnsigned();
+                }
                 scratch.push_back(CanonicalDistinctValue(key_value));
               }
               group_index = workers[worker].ClaimSlotForNewGroup(

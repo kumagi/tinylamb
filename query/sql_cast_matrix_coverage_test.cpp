@@ -2,7 +2,7 @@
 
 // SQL-level sweep over the CAST matrix (expression/cast_expression.cpp):
 // conversions between the runtime value kinds (INT64, FLOAT64, BOOL, STRING,
-// BYTES, DATE, ARRAY), boundary values, SAFE_CAST null-on-error semantics,
+// DATE) covered here, boundary values, SAFE_CAST null-on-error semantics,
 // and the error contracts for invalid inputs.
 
 #include <gtest/gtest.h>

@@ -79,6 +79,36 @@
 
 namespace tinylamb::relational_detail {
 
+// A `relation.*` select item may reach the relational interpreter either bare
+// or wrapped by the AST visitor's __value_table_value / __proto_new proto
+// constructor. Unwrap one level here so every star gate sees the same shape.
+// Callers only accept an unwrapped *qualified* star when its qualifier names
+// a FROM source; a genuine proto value table (no such source) keeps its
+// wrapper and its single-row-value semantics.
+struct UnwrappedStar {
+  ColumnName name;
+  bool wrapped{false};
+};
+std::optional<UnwrappedStar> UnwrapStarProjection(const Expression& expression) {
+  if (!expression) return std::nullopt;
+  Expression candidate = expression;
+  bool wrapped = false;
+  if (candidate->Type() == TypeTag::kFunctionCallExp) {
+    const auto& call = candidate->AsFunctionCallExpression();
+    if ((call.FuncName() == "__value_table_value" ||
+         call.FuncName() == "__proto_new") &&
+        call.Args().size() == 1 && call.Args()[0]) {
+      candidate = call.Args()[0];
+      wrapped = true;
+    }
+  }
+  if (candidate->Type() != TypeTag::kColumnValue) return std::nullopt;
+  const ColumnName& column = candidate->AsColumnValue().GetColumnName();
+  if (column.name != "*") return std::nullopt;
+  return UnwrappedStar{column, wrapped};
+}
+
+
 // The grouped-aggregation key index (GroupKeyEqual / GroupKeyMap) lives in
 // executor/detail/expression_eval.hpp: it is the shared "same group" contract
 // between this path and the physical grouped aggregation shapes
@@ -1602,6 +1632,27 @@ StatusOr<Relation> Project(TransactionContext& context,
     }
     return requested.schema.empty();
   };
+  // Unwrap a visitor-injected value-table/proto wrapper for `rel.*` over a
+  // real FROM source. A wrapped star whose qualifier is not a source keeps
+  // its wrapper (legitimate proto row-value semantics, resolved by the
+  // expression evaluator).
+  const auto source_named = [&](std::string_view qualifier) {
+    return std::ranges::any_of(
+        statement.Sources(), [&](const SelectSource& source) {
+          return (!source.alias.empty() &&
+                  IdentifierEquals(source.alias, qualifier)) ||
+                 (!source.table.empty() &&
+                  IdentifierEquals(source.table, qualifier));
+        });
+  };
+  const auto select_star = [&](const Expression& expression)
+      -> std::optional<ColumnName> {
+    auto star = UnwrapStarProjection(expression);
+    if (!star) return std::nullopt;
+    if (star->wrapped && !star->name.schema.empty() &&
+        !source_named(star->name.schema)) return std::nullopt;
+    return star->name;
+  };
   // USING merge: unqualified `*` emits one coalesced entry per declared
   // using column (first), then the remaining columns in schema order;
   // `relation.*` keeps every physical column of the named side.  Each star
@@ -1693,10 +1744,9 @@ StatusOr<Relation> Project(TransactionContext& context,
   }
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     const NamedExpression& projection = statement.SelectList()[i];
-    if (projection.expression->Type() == TypeTag::kColumnValue &&
-        projection.expression->AsColumnValue().GetColumnName().name == "*") {
-      const ColumnName& requested =
-          projection.expression->AsColumnValue().GetColumnName();
+    const auto star = select_star(projection.expression);
+    if (star) {
+      const ColumnName& requested = *star;
       const bool qualified = !requested.schema.empty();
       if (projection.star_modifiers) {
         // The index-group expansion below cannot splice a substitute
@@ -1819,11 +1869,9 @@ StatusOr<Relation> Project(TransactionContext& context,
   // like an unknown column.
   for (size_t i = 0; i < statement.SelectList().size(); ++i) {
     const NamedExpression& projection = statement.SelectList()[i];
-    if (projection.expression->Type() == TypeTag::kColumnValue &&
-        projection.expression->AsColumnValue().GetColumnName().name == "*" &&
-        !star_proto[i] && star_groups[i].empty()) {
-      const ColumnName& requested =
-          projection.expression->AsColumnValue().GetColumnName();
+    const auto star = select_star(projection.expression);
+    if (star && !star_proto[i] && star_groups[i].empty()) {
+      const ColumnName& requested = *star;
       return StatusError(
           StatusCode::kInvalidArgument,
           "unknown relation in select list: " +
@@ -2347,8 +2395,7 @@ StatusOr<Relation> Project(TransactionContext& context,
     values.reserve(output_columns.size());
     for (size_t item = 0; item < statement.SelectList().size(); ++item) {
       const NamedExpression& projection = statement.SelectList()[item];
-      if (projection.expression->Type() == TypeTag::kColumnValue &&
-          projection.expression->AsColumnValue().GetColumnName().name == "*") {
+      if (select_star(projection.expression)) {
         if (star_proto[item]) {
           const ColumnName base = input.schema.GetColumn(0).Name();
           for (const char* field : {"int32_val1", "int32_val2", "str_value"}) {
@@ -3356,10 +3403,22 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   if (statement.HasDistinctOn()) {
     return StatusError(StatusCode::kInvalidArgument, unsupported);
   }
+  const auto window_source_named = [&](std::string_view qualifier) {
+    return std::ranges::any_of(
+        statement.Sources(), [&](const SelectSource& source) {
+          return (!source.alias.empty() &&
+                  IdentifierEquals(source.alias, qualifier)) ||
+                 (!source.table.empty() &&
+                  IdentifierEquals(source.table, qualifier));
+        });
+  };
   for (const NamedExpression& projection : statement.SelectList()) {
-    if (projection.expression &&
-        projection.expression->Type() == TypeTag::kColumnValue &&
-        projection.expression->AsColumnValue().GetColumnName().name == "*") {
+    auto star = UnwrapStarProjection(projection.expression);
+    if (star && star->wrapped && !star->name.schema.empty() &&
+        !window_source_named(star->name.schema)) {
+      star.reset();  // genuine proto value table, not a FROM-source star
+    }
+    if (star) {
       return StatusError(StatusCode::kInvalidArgument, unsupported);
     }
   }
@@ -3600,6 +3659,10 @@ StatusOr<Relation> ExecuteWindowOverAggregate(
   grouped->SetSelectList(std::move(grouped_select));
   grouped->SetOrderBy({});
   grouped->SetQualify(Expression{});
+  // DISTINCT belongs to the final projection (pass 3), after the window
+  // columns are computed. Applying it here would dedupe rows whose only
+  // difference is a still-NULL window placeholder, losing result rows.
+  grouped->SetDistinct(false);
   grouped->SetLimit(std::nullopt);
   grouped->SetOffset(0);
   // When the input has not been built yet, plan the grouping independently.
@@ -5093,17 +5156,37 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
   RETURN_IF_FAIL(anchor_result.ForEachRow(add_anchor));
   delta.FinishSpill();
 
+  // Distinguish a genuine fixed point (or a WITH DEPTH bound) from the loop
+  // simply running out of iterations: the latter must not silently return a
+  // truncated result, just like the row budget above raises an error.
+  bool reached_fixed_point = false;
   for (size_t iteration = 0; iteration < kMaxIterations; ++iteration) {
     if (delta.TotalRows() == 0) {
+      reached_fixed_point = true;
       break;
     }
     const int64_t row_depth = static_cast<int64_t>(iteration) + 1;
     if (track_depth && row_depth > depth_spec->upper) {
+      reached_fixed_point = true;
       break;
     }
     CteMap loop_ctes = inherited_ctes;
     ASSIGN_OR_RETURN(Relation, materialized_delta, MaterializeRelation(delta));
     loop_ctes[name] = std::make_shared<Relation>(std::move(materialized_delta));
+    if (auto* runtime = context.execution_runtime()) {
+      // Every round rebinds this CTE name to a fresh working Relation while
+      // the recursive branch statements keep the same ASTs and addresses.
+      // The uncorrelated-subquery caches (pointer fast path, memoized
+      // structural key, and the node-keyed scalar/membership caches) would
+      // otherwise hand the new round the PREVIOUS round's value for a
+      // subquery that reads this CTE. Drop the CTE-dependent entries so this
+      // round evaluates against the new working table.
+      runtime->uncorrelated_results.clear();
+      runtime->uncorrelated_results_by_fingerprint.clear();
+      runtime->uncorrelated_key_memo.clear();
+      runtime->uncorrelated_membership_by_node.clear();
+      runtime->uncorrelated_scalar_by_node.clear();
+    }
     Relation next(context.execution_runtime());
     next.schema = result.schema;
     for (size_t term_index = 0; term_index < body.UnionAll().size();
@@ -5174,6 +5257,7 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
     RETURN_IF_FAIL(next.FinishSpill());
     RETURN_IF_FAIL(next.GetStatus());
     if (next.TotalRows() == 0) {
+      reached_fixed_point = true;
       break;
     }
     if (result.TotalRows() + next.TotalRows() > kMaxRows) {
@@ -5188,6 +5272,11 @@ StatusOr<Relation> ExecuteRecursiveCte(TransactionContext& context,
     RETURN_IF_FAIL(result.FinishSpill());
     RETURN_IF_FAIL(result.GetStatus());
     delta = std::move(next);
+  }
+  if (!reached_fixed_point) {
+    return StatusError(StatusCode::kInvalidArgument,
+                       "recursive CTE " + name +
+                           " exceeded the iteration budget");
   }
   return result;
 }

@@ -100,6 +100,13 @@ class SqlFrontendCoverageTest : public ::testing::Test {
 
 // ------------------------------------------------------------- set ops -----
 
+TEST_F(SqlFrontendCoverageTest, LimitZeroStillResolvesSelectList) {
+  ExpectError("SELECT bogus_col FROM t LIMIT 0");
+  const auto rows = RunSql(engine_.get(), context_.get(),
+                           "SELECT k FROM t LIMIT 0");
+  EXPECT_TRUE(rows.empty());
+}
+
 TEST_F(SqlFrontendCoverageTest, SetOperationForms) {
   ExpectQuery(
       "SELECT k FROM t WHERE k = 1 UNION ALL "

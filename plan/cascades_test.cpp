@@ -6869,7 +6869,8 @@ struct TopNProvenJoinFixture {
 
   TopNProvenJoinFixture(bool fk, bool mark,
                         std::string fk_reference = "dim(id)",
-                        bool filter_null = true, bool residual = false) {
+                        bool filter_null = true, bool residual = false,
+                        bool other_side_filter = false) {
     std::vector<Column> fact_columns = {
         Column("id", ValueType::kInt64, Constraint(Constraint::kPrimaryKey)),
         Column("dim_id", ValueType::kInt64,
@@ -6909,6 +6910,17 @@ struct TopNProvenJoinFixture {
                        LogicalExpression{.operation = LogicalOperator::kScan,
                                          .table = "dim",
                                          .output_schema = dim_schema});
+    if (other_side_filter) {
+      // The other side carries a single-relation WHERE conjunct, i.e. the
+      // state after push_selection_through_join merged it into this group's
+      // scan filter. It can remove exactly the row the FK certificate
+      // guarantees, so the scan-free FK fallback must not fire.
+      memo.MergeScanFilter(dim,
+                           BinaryExpressionExp(
+                               ColumnValueExp(ColumnName("dim", "val")),
+                               BinaryOperation::kGreaterThan,
+                               ConstantValueExp(Value(int64_t{0}))));
+    }
     const GroupId join = memo.EnsureDerivedGroup({"fact", "dim"}, "inner_join");
     const Expression equality = BinaryExpressionExp(
         ColumnValueExp(ColumnName("fact", "dim_id")), BinaryOperation::kEquals,
@@ -6975,6 +6987,23 @@ TEST(CascadesTest, TopNPushThroughProvenOneToOneJoinRejectsNullableForeignKey) {
   const GroupId topn = fixture.topn;
   SearchEngine search(std::move(fixture.memo), RuleSet::Default());
   search.Explore(topn);
+  EXPECT_FALSE(fixture.HasPushedTopN(search.GetMemo()));
+}
+
+TEST(CascadesTest, TopNPushThroughProvenOneToOneJoinRejectsFilteredOtherSide) {
+  // The FK certificate is scan-free: it cannot see that the other side's
+  // WHERE conjunct (`dim.val > 0`) removes exactly the row it guarantees, so
+  // a fact row inside the pushed top-(limit+offset) prefix would keep a
+  // joined row the plain join filters away.
+  TopNProvenJoinFixture fixture(/*fk=*/true, /*mark=*/false,
+                                /*fk_reference=*/"dim(id)",
+                                /*filter_null=*/true, /*residual=*/false,
+                                /*other_side_filter=*/true);
+  const GroupId topn = fixture.topn;
+  SearchEngine search(std::move(fixture.memo), RuleSet::Default());
+  search.Explore(topn);
+  EXPECT_FALSE(search.AppliedRuleNames().contains(
+      "topn_push_through_proven_one_to_one_join"));
   EXPECT_FALSE(fixture.HasPushedTopN(search.GetMemo()));
 }
 

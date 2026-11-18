@@ -130,7 +130,9 @@ void MergeJoin::Materialize() {
   DataChunk batch;
   while (left_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
-      left_rows_.push_back(batch.RowAt(i));
+      Row row = batch.RowAt(i);
+      materialized_charge_.Add(EstimateRowBytes(row));
+      left_rows_.push_back(std::move(row));
       left_positions_.push_back(batch.PositionAt(i));
     }
   }
@@ -140,7 +142,9 @@ void MergeJoin::Materialize() {
   }
   while (right_->NextBatch(&batch) != 0) {
     for (size_t i = 0; i < batch.Size(); ++i) {
-      right_rows_.push_back(batch.RowAt(i));
+      Row row = batch.RowAt(i);
+      materialized_charge_.Add(EstimateRowBytes(row));
+      right_rows_.push_back(std::move(row));
     }
   }
   if (FailWithChildOf(*right_)) {

@@ -5405,8 +5405,15 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
       }
       // An explicit LIMIT 0 yields zero rows on every route (relational or
       // optimizer); neither LimitExecutor nor LimitedRows can express that
-      // because they read limit==0 as "unbounded" (§6.3).
+      // because they read limit==0 as "unbounded" (§6.3). Lower normally and
+      // evaluate the first batch to surface SELECT-list / function errors,
+      // then return an empty result. A pure zero-row shortcut would hide
+      // semantic errors that LIMIT 1 reports.
       if (select->HasLimit() && select->Limit() == 0) {
+        ASSIGN_OR_RETURN(Executor, validated, emit_relational());
+        DataChunk probe;
+        static_cast<void>(validated->NextBatch(&probe, 1));
+        RETURN_IF_FAIL(validated->GetStatus());
         return Executor(std::make_shared<ConstantExecutor>(std::vector<Row>{}));
       }
       const bool has_unnest = std::any_of(
@@ -5957,6 +5964,21 @@ StatusOr<Executor> SqlEngine::PrepareStatement(
                         : nullptr;
                 if (!column.schema.empty() && column.schema != relation &&
                     column.schema != physical) {
+                  continue;
+                }
+                // A derived source (subquery / UNNEST) has no catalog table
+                // and no lifted leaf schema here. Keep its `rel.*` wrapped
+                // so the relational interpreter expands it from the derived
+                // relation's own schema; do not reject it as unknown.
+                const SelectSource* derived_source = nullptr;
+                for (const SelectSource& src : select->Sources()) {
+                  if (src.alias == relation) { derived_source = &src; break; }
+                }
+                if (derived_source != nullptr &&
+                    (derived_source->query != nullptr ||
+                     derived_source->unnest != nullptr)) {
+                  matched_relation = true;
+                  expanded.push_back(item);
                   continue;
                 }
                 // Lifted CTE leaves (M4) expand from their leaf schemas,

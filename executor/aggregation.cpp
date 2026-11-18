@@ -168,7 +168,13 @@ bool AggregationExecutor::Execute(Row* dst) {
         jit_sum_ = JitInt64Kernels::CompileSumChecked();
       }
       const ColumnVector& column = input_batch_.ColumnAt(jit_sum_column_);
-      if (jit_sum_ &&
+      // The checked kernel folds a batch from 0 and only checks the final
+      // merge. That matches row order only while no prior rows have been
+      // accumulated: with a running total, e.g. [MAX] then [5,-5], the
+      // second batch's partial 0 hides the overflowing MAX+5 the canonical
+      // accumulator raises on. Once any row has contributed, use the exact
+      // row-by-row path below.
+      if (jit_sum_ && !any &&
           input_batch_.ZoneMapAt(jit_sum_column_).NullCount() == 0) {
         // The JIT kernel reads raw int64 storage; verify the child batch
         // really has the declared layout before trusting it.
@@ -184,12 +190,12 @@ bool AggregationExecutor::Execute(Row* dst) {
         if (batch_overflow) {
           return FailWith(StatusError(StatusCode::kIsInfinity,
 
-                                      "integer overflow on '+'"));
+                                      "integer overflow in SUM"));
         }
         if (__builtin_add_overflow(total, partial, &total)) {
           return FailWith(StatusError(StatusCode::kIsInfinity,
 
-                                      "integer overflow on '+'"));
+                                      "integer overflow in SUM"));
         }
         any = any || column.Size() != 0;
         ++jit_batches_;
@@ -202,7 +208,7 @@ bool AggregationExecutor::Execute(Row* dst) {
                                      &total)) {
             return FailWith(StatusError(StatusCode::kIsInfinity,
 
-                                        "integer overflow on '+'"));
+                                        "integer overflow in SUM"));
           }
           any = true;
         }
@@ -972,7 +978,7 @@ StatusOr<bool> AggregationExecutor::TryFoldScan(Row* dst) {
       if (type == AggregationType::kSum &&
           (total + partial.low < std::numeric_limits<int64_t>::min() ||
            total + partial.high > std::numeric_limits<int64_t>::max())) {
-        return StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
+        return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
       }
       total += partial.sum;
       count += partial.count;
@@ -1003,7 +1009,7 @@ namespace {
 StatusOr<int64_t> CheckedAdd(int64_t lhs, int64_t rhs) {
   int64_t result = 0;
   if (__builtin_add_overflow(lhs, rhs, &result)) {
-    return StatusError(StatusCode::kIsInfinity, "integer overflow on '+'");
+    return StatusError(StatusCode::kIsInfinity, "integer overflow in SUM");
   }
   return result;
 }
@@ -1011,7 +1017,7 @@ StatusOr<int64_t> CheckedAdd(int64_t lhs, int64_t rhs) {
 StatusOr<double> CheckedDoubleAdd(double lhs, double rhs) {
   const double result = lhs + rhs;
   if (std::isinf(result) && std::isfinite(lhs) && std::isfinite(rhs)) {
-    return StatusError(StatusCode::kIsInfinity, "double overflow in SUM");
+    return StatusError(StatusCode::kIsInfinity, "SUM overflow: result is infinite");
   }
   return result;
 }
@@ -1107,7 +1113,7 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
               if (__builtin_mul_overflow(static_cast<int64_t>(rows),
                                          constant.value.int_value, &scaled)) {
                 return FailWith(StatusError(StatusCode::kIsInfinity,
-                                            "integer overflow on '+'"));
+                                            "integer overflow in SUM"));
               }
               StatusOr<int64_t> acc =
                   (*results)[i].IsNull()
@@ -1185,93 +1191,66 @@ bool AggregationExecutor::AccumulateTypedBatch(std::vector<Value>* results,
         break;
       }
       case AggregationType::kSum: {
+        // Accumulate straight into the running total, row by row. Folding a
+        // batch into a fresh 0 and only checking batch_sum + total changes
+        // the observable overflow verdict: e.g. [MAX] then [5,-5] folds to
+        // MAX+0 (no error) where the row-order canonical raises on MAX+5.
+        // Per-row checked adds match AggregateAccumulator exactly, regardless
+        // of how the input is split into batches.
+        Value& total = (*results)[i];
+        bool any = false;
         if (is_int) {
-          const bool is_uint64 = column.IsUnsigned();
-          if (is_uint64) {
-            uint64_t batch_sum = 0;
-            bool any = false;
+          if (column.IsUnsigned()) {
+            uint64_t running =
+                total.IsNull() ? 0
+                               : static_cast<uint64_t>(total.value.int_value);
             for (size_t row = 0; row < rows; ++row) {
               if (column.IsNull(row)) {
                 continue;
               }
               const auto value = static_cast<uint64_t>(integers[row]);
-              if (batch_sum > std::numeric_limits<uint64_t>::max() - value) {
+              if (running > std::numeric_limits<uint64_t>::max() - value) {
                 return FailWith(StatusError(StatusCode::kIsInfinity,
                                             "uint64 overflow in SUM"));
               }
-              batch_sum += value;
+              running += value;
               any = true;
             }
-            if (!any) {
-              break;
+            if (any) {
+              total = Value(static_cast<int64_t>(running)).WithUnsigned();
             }
-            Value& total = (*results)[i];
-            const uint64_t prior =
-                total.IsNull() ? 0
-                               : static_cast<uint64_t>(total.value.int_value);
-            if (prior > std::numeric_limits<uint64_t>::max() - batch_sum) {
-              return FailWith(StatusError(StatusCode::kIsInfinity,
-                                          "uint64 overflow in SUM"));
-            }
-            total = Value(static_cast<int64_t>(
-                              static_cast<uint64_t>(prior + batch_sum)))
-                        .WithUnsigned();
-            break;
-          }
-          int64_t batch_sum = 0;
-          bool any = false;
-          for (size_t row = 0; row < rows; ++row) {
-            if (column.IsNull(row)) {
-              continue;
-            }
-            StatusOr<int64_t> next = CheckedAdd(batch_sum, integers[row]);
-            if (!next.HasValue()) {
-              return FailWith(next.GetStatus());
-            }
-            batch_sum = next.Value();
-            any = true;
-          }
-          if (!any) {
-            break;
-          }
-          Value& total = (*results)[i];
-          if (total.IsNull()) {
-            total = Value(batch_sum);
           } else {
-            StatusOr<int64_t> next =
-                CheckedAdd(total.value.int_value, batch_sum);
-            if (!next.HasValue()) {
-              return FailWith(next.GetStatus());
+            int64_t running = total.IsNull() ? 0 : total.value.int_value;
+            for (size_t row = 0; row < rows; ++row) {
+              if (column.IsNull(row)) {
+                continue;
+              }
+              StatusOr<int64_t> next = CheckedAdd(running, integers[row]);
+              if (!next.HasValue()) {
+                return FailWith(next.GetStatus());
+              }
+              running = next.Value();
+              any = true;
             }
-            total = Value(next.Value());
+            if (any) {
+              total = Value(running);
+            }
           }
         } else {
-          double batch_sum = 0.0;
-          bool any = false;
+          double running = total.IsNull() ? 0.0 : total.value.double_value;
           for (size_t row = 0; row < rows; ++row) {
             if (column.IsNull(row)) {
               continue;
             }
-            StatusOr<double> next = CheckedDoubleAdd(batch_sum, doubles[row]);
+            StatusOr<double> next = CheckedDoubleAdd(running, doubles[row]);
             if (!next.HasValue()) {
               return FailWith(next.GetStatus());
             }
-            batch_sum = next.Value();
+            running = next.Value();
             any = true;
           }
-          if (!any) {
-            break;
-          }
-          Value& total = (*results)[i];
-          if (total.IsNull()) {
-            total = Value(batch_sum);
-          } else {
-            StatusOr<double> next =
-                CheckedDoubleAdd(total.value.double_value, batch_sum);
-            if (!next.HasValue()) {
-              return FailWith(next.GetStatus());
-            }
-            total = Value(next.Value());
+          if (any) {
+            total = Value(running);
           }
         }
         break;

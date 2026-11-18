@@ -332,7 +332,7 @@ ARRAY<STRUCT<TIMESTAMP, TIMESTAMP>>[
 # changes, since the calculation happen on the absolute instant of time using
 # fixed width bucket. The only artifact of the time zone existence is the
 # default origin, which is defined as 1950-01-01 in the default time zone.
-# Therefore, it's huseful to think about the operations as if they were
+# Therefore, it's useful to think about the operations as if they were
 # happening in UTC time zone.
 [required_features=TIME_BUCKET_FUNCTIONS,INTERVAL_TYPE]
 [name=timestamp_bucket_interesting_dates]

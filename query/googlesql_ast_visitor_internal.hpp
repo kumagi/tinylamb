@@ -18,6 +18,10 @@
 
 namespace tinylamb::ast_visitor_detail {
 
+// Canonical string-literal decoding (quote stripping, '' / \n / \uXXXX
+// unescaping and multi-component concatenation).
+StatusOr<std::string> DecodeString(const GoogleSqlAstNode& node);
+
 template <typename T>
 [[nodiscard]] inline StatusOr<T> AstError(std::string message) {
   return StatusError(StatusCode::kInvalidArgument, std::move(message));

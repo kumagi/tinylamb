@@ -738,6 +738,22 @@ std::string FormatFloatingForPrintfImpl(double value, char specifier,
   return output.str();
 }
 
+// printf places '0' padding after a leading sign and radix prefix, never
+// before it: %04d of -5 is "-005", %+04d of 5 is "+005", %#06x of 255 is
+// "0x00ff". Return the offset at which zero padding must be inserted.
+size_t ZeroPadStart(const std::string& text) {
+  size_t i = 0;
+  if (i < text.size() &&
+      (text[i] == '-' || text[i] == '+' || text[i] == ' ')) {
+    ++i;
+  }
+  if (i + 1 < text.size() && text[i] == '0' &&
+      (text[i + 1] == 'x' || text[i + 1] == 'X')) {
+    i += 2;
+  }
+  return i;
+}
+
 // FORMAT(fmt, ...): GoogleSQL printf-style rendering.  Ported from the
 // scope-based relational evaluator (executor/detail/expression_eval.cpp) so
 // the AST ground truth stays semantically identical: NULL propagates from the
@@ -1038,8 +1054,10 @@ StatusOr<Value> FormatFunction(const std::string& name,
            spec == 'X' || spec == 'o') &&
           formatted_item != "NULL" &&
           formatted_item.size() < static_cast<size_t>(precision)) {
+        const size_t pad_begin = ZeroPadStart(formatted_item);
         formatted_item.insert(
-            0, static_cast<size_t>(precision) - formatted_item.size(), '0');
+            pad_begin, static_cast<size_t>(precision) - formatted_item.size(),
+            '0');
       }
       // Sign ('+' / ' ') and grouping ('\'') flags apply to numeric
       // specifiers only; irrelevant flags are ignored for %s/%t/%T.  They
@@ -1090,9 +1108,12 @@ StatusOr<Value> FormatFunction(const std::string& name,
           formatted_item.append(pad_len, ' ');
         } else {
           // '0' pads numbers only; for %s/%t/%T it is ignored like any
-          // irrelevant flag.
-          formatted_item.insert(
-              0, pad_len, (zero_pad && (int_spec || float_spec)) ? '0' : ' ');
+          // irrelevant flag. For numbers it goes after any sign / radix
+          // prefix (see ZeroPadStart), matching printf.
+          const bool pad_with_zero = zero_pad && (int_spec || float_spec);
+          const size_t pad_begin =
+              pad_with_zero ? ZeroPadStart(formatted_item) : 0;
+          formatted_item.insert(pad_begin, pad_len, pad_with_zero ? '0' : ' ');
         }
       }
       if (result.size() + formatted_item.size() > kMaxFormatOutputBytes) {
@@ -3833,13 +3854,10 @@ StatusOr<Value> ExecuteBuiltin(const std::string& name,
                          (ParseTimeZoneOffset(tz_str, &ct)));
         tz_offset_sec = parsed_offset;
       }
-    } else if (name_view == "format_datetime" ||
-               name_view == "format_timestamp") {
-      {
-        ASSIGN_OR_RETURN(int, parsed_offset,
-                         (ParseTimeZoneOffset(GetDefaultTimeZone(), &ct)));
-        tz_offset_sec = parsed_offset;
-      }
+    } else if (name_view == "format_timestamp") {
+      // DATETIME is zone-independent: never apply the mutable default zone
+      // to a 2-argument FORMAT_DATETIME. TIMESTAMP defaults to UTC.
+      tz_offset_sec = 0;
     }
     ct = ShiftCivilTimeHours(ct, tz_offset_sec / 3600);
     int rem_mins = (tz_offset_sec % 3600) / 60;

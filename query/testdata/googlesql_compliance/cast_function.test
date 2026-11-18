@@ -449,7 +449,7 @@ ARRAY<STRUCT<INT32,
   18446744073709551615}]
 ==
 
-# Set this in subqueryies to keep literals from being converted prior to
+# Set this in subqueries to keep literals from being converted prior to
 # execution.
 [name=cast_hex_string_integers_from_subquery]
 SELECT CAST(A AS INT32),
